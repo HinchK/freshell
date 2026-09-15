@@ -1,4 +1,5 @@
 import { getRecoveryInventory } from '@/lib/api'
+import { createLogger } from '@/lib/client-logger'
 import { bootCapturedAtMs } from '@/lib/recovery/boot-state'
 import { buildRecoveryPlan } from '@/lib/recovery/build-recovery-plan'
 import type { RecoveryInventory } from '@/lib/recovery/types'
@@ -10,10 +11,14 @@ import { clearPanesForMachine, restoreLayout } from '@/store/panesSlice'
 import type { PaneNode } from '@/store/paneTypes'
 import type { RootState } from '@/store/store'
 
+const log = createLogger('machine-workspace')
+
 type MachineWorkspaceStore = {
   dispatch: (action: any) => unknown
   getState: () => Pick<RootState, 'panes'>
 }
+
+const MACHINE_BOOTSTRAP_RECOVERY_EXCLUSION_PREFIX = 'machine-bootstrap:'
 
 function armTerminalRestores(state: Pick<RootState, 'panes'>, tabIds: string[]): void {
   const walk = (node: PaneNode | undefined): void => {
@@ -54,15 +59,30 @@ export type RestoreMachineWorkspaceOptions = {
 export async function restoreMachineWorkspace(
   store: MachineWorkspaceStore,
   machineId: string,
-  _options: RestoreMachineWorkspaceOptions = {},
+  options: RestoreMachineWorkspaceOptions = {},
 ): Promise<{ restoredTabs: number }> {
+  log.info('rebuilding machine workspace from server inventory', {
+    reason: options.reason,
+    machineId,
+  })
+  // The recovery endpoint treats clientInstanceId as an opaque exclusion key.
+  // The general recovery offer passes the real id so it cannot offer the page
+  // its own already-loaded state. Machine bootstrap is different: a rebuild
+  // WANTS the window's own last durable snapshot included, and a reload keeps
+  // the same sessionStorage id. A reserved, non-client prefix therefore
+  // includes that window's last snapshot without changing the normal
+  // recovery-offer contract.
+  const bootstrapExclusionId =
+    `${MACHINE_BOOTSTRAP_RECOVERY_EXCLUSION_PREFIX}${getCurrentTabRegistryClientInstanceId()}`
   const inventory = await getRecoveryInventory(
-    getCurrentTabRegistryClientInstanceId(),
+    bootstrapExclusionId,
     Math.max(0, Date.now() - bootCapturedAtMs),
     { machineId },
   )
   assertInventoryIsScopedToMachine(inventory, machineId)
-  const plans = inventory.recoverable ? buildRecoveryPlan(inventory) : []
+  const plans = inventory.recoverable
+    ? buildRecoveryPlan(inventory, { preserveIdsForMachine: machineId })
+    : []
 
   // These are local cache actions, not tab/pane closes. Sync is still gated,
   // so no blank or mixed-machine snapshot can reach the server mid-replace.

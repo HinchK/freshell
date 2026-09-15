@@ -82,13 +82,28 @@ describe('restoreMachineWorkspace', () => {
     await restoreMachineWorkspace(store, MACHINE_ID)
 
     expect(getRecoveryInventory).toHaveBeenCalledWith(
-      'client-machine-test',
+      'machine-bootstrap:client-machine-test',
       expect.any(Number),
       { machineId: MACHINE_ID },
     )
     expect(store.getState().tabs.tabs.map((tab) => tab.title)).toEqual(['Recovered workspace'])
+    expect(store.getState().tabs.tabs.map((tab) => tab.id)).toEqual(['recovered-tab'])
+    expect(store.getState().panes.layouts['recovered-tab']?.id).toBe('recovered-pane')
     expect(store.getState().tabs.tabs.map((tab) => tab.id)).not.toContain('foreign-tab')
     expect(store.getState().panes.layouts['foreign-tab']).toBeUndefined()
+  })
+
+  it('requests the machine-bootstrap inventory so the window’s own last snapshot is included', async () => {
+    const store = createStore()
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventoryFor(MACHINE_ID))
+
+    await restoreMachineWorkspace(store, MACHINE_ID, { reason: 'corrupt' })
+
+    expect(getRecoveryInventory).toHaveBeenCalledWith(
+      'machine-bootstrap:client-machine-test',
+      expect.any(Number),
+      { machineId: MACHINE_ID },
+    )
   })
 
   it('refuses an unscoped foreign recovery response and preserves the current cache', async () => {
@@ -118,7 +133,7 @@ describe('restoreMachineWorkspace', () => {
   })
 
   it.each(['absent', 'corrupt', 'foreign', 'stale'] as const)(
-    'still fetches with the plain client id, clears, and restores when told the boot reason is %s',
+    'still fetches with the bootstrap exclusion id, clears, and restores when told the boot reason is %s',
     async (reason) => {
       const store = createStore()
       addForeignWorkspace(store)
@@ -127,7 +142,7 @@ describe('restoreMachineWorkspace', () => {
       const result = await restoreMachineWorkspace(store, MACHINE_ID, { reason })
 
       expect(getRecoveryInventory).toHaveBeenCalledWith(
-        'client-machine-test',
+        'machine-bootstrap:client-machine-test',
         expect.any(Number),
         { machineId: MACHINE_ID },
       )

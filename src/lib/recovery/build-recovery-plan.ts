@@ -101,8 +101,8 @@ function paneContent(p: RecoveryPane): PaneContent {
   return { ...p.payload, kind: p.kind } as PaneContent
 }
 
-function leaf(content: PaneContent): PaneNode {
-  return { type: 'leaf', id: nanoid(), content }
+function leaf(content: PaneContent, paneId?: string): PaneNode {
+  return { type: 'leaf', id: paneId ?? nanoid(), content }
 }
 
 // D6: no split geometry in snapshots - right-leaning binary chain of even splits
@@ -131,6 +131,26 @@ export interface RecoveryTabPlan {
    * (dead panes resume/fresh per the existing rules).
    */
   liveTerminalReattach?: Array<{ paneId: string; terminalId: string }>
+}
+
+export interface BuildRecoveryPlanOptions {
+  /**
+   * Machine bootstrap replaces the local cache with this same machine's
+   * durable workspace. Preserve its tab and pane ids so reload does not break
+   * references or turn every existing tab into a newly-created one. The
+   * opt-in keeps the user-invoked cross-device recovery offer's deliberate
+   * reminting behavior unchanged.
+   */
+  preserveIdsForMachine?: string
+}
+
+function preservedTabId(tabKey: string, machineId: string): string {
+  const prefix = `${machineId}:`
+  const tabId = tabKey.startsWith(prefix) ? tabKey.slice(prefix.length) : ''
+  if (!tabId) {
+    throw new Error(`Recovery tab key ${tabKey} does not belong to machine ${machineId}`)
+  }
+  return tabId
 }
 
 /**
@@ -301,7 +321,10 @@ export function countRecoverablePanes(inv: RecoveryInventory): number {
   return device + joined
 }
 
-export function buildRecoveryPlan(inv: RecoveryInventory): RecoveryTabPlan[] {
+export function buildRecoveryPlan(
+  inv: RecoveryInventory,
+  options: BuildRecoveryPlanOptions = {},
+): RecoveryTabPlan[] {
   // The layout join MUST happen at plan time: restoreLayout no-ops when the
   // tab's layout already exists (panesSlice.ts restoreLayout), so the accept
   // loop (one dispatch per plan) can never graft a row on afterwards. Joined
@@ -324,7 +347,7 @@ export function buildRecoveryPlan(inv: RecoveryInventory): RecoveryTabPlan[] {
       const liveTerminalReattach: Array<{ paneId: string; terminalId: string }> = []
       for (const p of t.panes.filter(isRestorablePane)) {
         const content = paneContent(p)
-        const node = leaf(content)
+        const node = leaf(content, options.preserveIdsForMachine ? p.paneId : undefined)
         const target = liveReattachTarget(p, content, node.id)
         if (target) liveTerminalReattach.push(target)
         leaves.push(node)
@@ -352,7 +375,9 @@ export function buildRecoveryPlan(inv: RecoveryInventory): RecoveryTabPlan[] {
     })
     .filter(({ leaves }) => leaves.length > 0)
     .map(({ tab: t, leaves, liveTerminalReattach }) => ({
-      tabId: nanoid(),
+      tabId: options.preserveIdsForMachine
+        ? preservedTabId(t.tabKey, options.preserveIdsForMachine)
+        : nanoid(),
       title: t.tabName || 'Recovered',
       sourceTabKey: t.tabKey,
       layout: chain(leaves),
