@@ -110,6 +110,7 @@ describe('tabRegistrySync', () => {
     wsReconnectHandlers = []
     broadcastChannels = []
     sessionStorage.clear()
+    localStorage.clear()
     state = createState()
     dispatch = vi.fn()
     ws = {
@@ -588,6 +589,68 @@ describe('tabRegistrySync', () => {
     expect(ws.sendTabsSyncPush).toHaveBeenCalledTimes(1)
     expect(ws.sendTabsSyncQuery.mock.calls[0][0].clientInstanceId).not.toBe(copiedClientId)
     expect(ws.sendTabsSyncPush.mock.calls[0][0].clientInstanceId).not.toBe(copiedClientId)
+    stop()
+  })
+
+  it('the lease-collision rotation remints the layout-window-id: the duplicate becomes a sovereign new window (e3r2 finding 1)', () => {
+    // A duplicated browser tab COPIES both sessionStorage ids; the
+    // registry lease collision resolves on THIS window (the duplicate),
+    // and the SAME rotation step remints the layout-window-id. The
+    // duplicate's new derived layout key is absent (its refresh
+    // classifies absent → inventory rebuild); the ORIGINAL's envelope
+    // under the shared key is untouched (its sessionStorage copy is a
+    // separate storage object — HTML webstorage §12.2.2: each window has
+    // its own individual copy).
+    const sharedLayoutWindowId = 'layout-window-copied-by-duplicate'
+    const sharedRegistryClientId = 'client-copied-by-duplicate'
+    sessionStorage.setItem('freshell.layout-window-id.v1', sharedLayoutWindowId)
+    sessionStorage.setItem('freshell.tabs.client-instance-id.v1', sharedRegistryClientId)
+    const originalEnvelopeRaw = JSON.stringify({ persistedAt: Date.now(), marker: 'original-envelope' })
+    localStorage.setItem(`freshell.layout.v3.${sharedLayoutWindowId}`, originalEnvelopeRaw)
+
+    const stop = startTabRegistrySync(createStore() as any, ws)
+    const initialClaim = broadcastChannels[0].postMessage.mock.calls[0][0]
+
+    broadcastChannels[0].onmessage?.({
+      data: {
+        type: 'tabs-registry-client-active',
+        clientInstanceId: sharedRegistryClientId,
+        leaseId: 'original-window',
+        claimantLeaseId: initialClaim.leaseId,
+      },
+    })
+    vi.advanceTimersByTime(CLIENT_LEASE_GRACE_MS)
+
+    const remintedLayoutWindowId = sessionStorage.getItem('freshell.layout-window-id.v1')
+    expect(remintedLayoutWindowId, 'the rotation reminted the layout-window-id').not.toBe(sharedLayoutWindowId)
+    expect(remintedLayoutWindowId).toMatch(/^layout-window-/)
+    expect(sessionStorage.getItem('freshell.tabs.client-instance-id.v1'), 'the registry id rotated too (the pre-existing lease contract)').not.toBe(sharedRegistryClientId)
+    expect(localStorage.getItem(`freshell.layout.v3.${remintedLayoutWindowId}`), 'the duplicate\'s new derived key is absent').toBeNull()
+    expect(localStorage.getItem(`freshell.layout.v3.${sharedLayoutWindowId}`), 'the ORIGINAL\'s envelope under the shared key is untouched').toBe(originalEnvelopeRaw)
+    stop()
+  })
+
+  it('remints the layout-window-id ONLY on the lease-collision rotation — no other sync path touches it (e3r2 finding 1 stability pin)', () => {
+    const stableLayoutWindowId = 'layout-window-stable-pin'
+    sessionStorage.setItem('freshell.layout-window-id.v1', stableLayoutWindowId)
+    sessionStorage.setItem('freshell.tabs.client-instance-id.v1', 'client-stable-pin')
+    const stop = startTabRegistrySync(createStore() as any, ws)
+
+    // The full sync cycle WITHOUT a collision: interval ticks, heartbeat,
+    // queries, pushes — the mint-once layout-window-id must never change.
+    vi.advanceTimersByTime(HEARTBEAT_INTERVAL_MS + QUERY_INTERVAL_MS)
+    expect(sessionStorage.getItem('freshell.layout-window-id.v1')).toBe(stableLayoutWindowId)
+
+    // A claim from another window is ANSWERED (announce), never rotated on:
+    broadcastChannels[0].onmessage?.({
+      data: {
+        type: 'tabs-registry-client-claim',
+        clientInstanceId: 'client-stable-pin',
+        leaseId: 'other-window',
+      },
+    })
+    vi.advanceTimersByTime(CLIENT_LEASE_GRACE_MS)
+    expect(sessionStorage.getItem('freshell.layout-window-id.v1')).toBe(stableLayoutWindowId)
     stop()
   })
 

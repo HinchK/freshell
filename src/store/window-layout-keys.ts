@@ -15,15 +15,21 @@ import {
  * the last writer's workspace. The layout envelope is now keyed per
  * window: `freshell.layout.v3.<layoutWindowId>`.
  *
- * The id is a DEDICATED IMMUTABLE layout-window-id (the sessionStorage key
- * `freshell.layout-window-id.v1`), minted once per context and NEVER
- * rotated: the tab-registry client id it used
- * to be derived from rotates on lease collisions (a duplicated browser tab
- * claims the copied id), which would strand the duplicate's healthy
- * envelope on its next refresh (boot → absent → geometry-resetting
- * rebuild). Duplicated tabs COPY the layout-window-id like any
- * sessionStorage entry, so they share one envelope — bounded, matching
- * the pre-upgrade duplicate-tab semantics. The registry client id keeps
+ * The id is a DEDICATED mint-once layout-window-id (the sessionStorage key
+ * `freshell.layout-window-id.v1`), minted once per context and reminted
+ * ONLY by the tab-registry lease-collision rotation (e3r2 finding 1): a
+ * duplicated browser tab COPIES the id like any sessionStorage entry, so
+ * without the remint both tabs keep one layout key — either tab's flush
+ * fully hydrates the other (crossTabSync's own-key path), and the last
+ * writer's envelope is what a refresh of either restores. The rotation is
+ * the one moment a window's identity legitimately splits, so it mints the
+ * duplicate a fresh id: the duplicate becomes a sovereign NEW window
+ * whose derived key is absent → boot rebuilds from the inventory, while
+ * the ORIGINAL keeps its id and envelope (sessionStorage copies diverge
+ * at duplication — HTML webstorage §12.2.2: each window has its own
+ * individual copy — so the duplicate's remint write cannot reach it).
+ * Every other path keeps the id stable — that rotation remint is the
+ * ONLY one. The registry client id keeps
  * serving the tab-registry sync and the machine-bootstrap exclusion id
  * (machine-workspace.ts), unchanged.
  *
@@ -83,12 +89,13 @@ export function isDerivedLayoutKey(key: string): boolean {
 
 let inMemoryLayoutWindowId = ''
 
-/** The IMMUTABLE per-window layout-window id: read from sessionStorage,
+/** The mint-once per-window layout-window id: read from sessionStorage,
  * minted once per context when absent, and cached in memory regardless of
  * write success (a quota-exhausted sessionStorage must not re-mint per
- * call — one persistence flush resolves the key repeatedly). Never
- * rotated by lease collisions; duplicated tabs share the copied
- * sessionStorage value. */
+ * call — one persistence flush resolves the key repeatedly). Reminted
+ * ONLY by remintLayoutWindowId() — the tab-registry lease-collision
+ * rotation; every other path keeps it stable. Duplicated tabs share the
+ * copied sessionStorage value until that rotation resolves. */
 export function getLayoutWindowId(): string {
   const storage = safeSessionStorage()
   let layoutWindowId = ''
@@ -114,9 +121,30 @@ export function getLayoutWindowId(): string {
   return layoutWindowId
 }
 
+/** Remint the layout-window-id. EXCLUSIVELY the tab-registry
+ * lease-collision rotation path (tabRegistrySync's
+ * rotateClientInstanceIdAfterCollision — e3r2 finding 1): a duplicated
+ * browser tab that copied the id becomes a sovereign NEW window (its new
+ * derived key is absent → boot rebuilds from the inventory; the
+ * ORIGINAL's copy is a separate sessionStorage object and is unaffected).
+ * No other path may call this — every other consumer relies on the
+ * mint-once stability. */
+export function remintLayoutWindowId(): string {
+  const layoutWindowId = `layout-window-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`
+  inMemoryLayoutWindowId = layoutWindowId
+  try {
+    safeSessionStorage()?.setItem(LAYOUT_WINDOW_ID_STORAGE_KEY, layoutWindowId)
+  } catch {
+    // Keep the per-window in-memory id stable when the write fails.
+  }
+  return layoutWindowId
+}
+
 /** The storage keys of THIS window's layout envelope and its channels.
  * Resolved lazily on every call so tests can seed sessionStorage ids
- * before or after module import; the id itself is stable per window. */
+ * before or after module import, so a rotation remint is picked up
+ * mid-session (persist flushes and event handling re-derive per call);
+ * the id itself is mint-once per window. */
 export function getWindowLayoutKey(): string {
   return derivedLayoutKey(getLayoutWindowId())
 }

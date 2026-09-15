@@ -203,7 +203,7 @@ test.describe('local-first machine workspace', () => {
     // page's own persist middleware flushes its healthy in-memory state:
     // the debounced flush and the pagehide/beforeunload flushNow both
     // rewrite the page's per-window layout key
-    // (freshell.layout.v3.<clientInstanceId>), so corrupting from a live
+    // (freshell.layout.v3.<layoutWindowId>), so corrupting from a live
     // page is always overwritten before the next boot reads it. Listeners
     // registered here run AFTER the middleware's own (attached at module
     // init), so the keys are corrupted last and no further write can

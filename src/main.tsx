@@ -3,7 +3,7 @@ import ReactDOM from 'react-dom/client'
 import { Provider } from 'react-redux'
 // MUST stay ahead of the store/App imports: recover-my-panes boot-state (D1) depends on
 // migrations having re-materialized this window's per-window layout key
-// (freshell.layout.v3.<clientInstanceId>, adopting the legacy envelope when
+// (freshell.layout.v3.<layoutWindowId>, adopting the legacy envelope when
 // the window has none of its own) BEFORE any capture runs (the
 // react/react-dom/react-redux imports above are side-effect-free) — see
 // docs/plans/2026-07-26-recover-my-panes.md and main-import-order.test.ts.

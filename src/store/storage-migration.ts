@@ -33,6 +33,7 @@ import {
   LAYOUT_STORAGE_KEY_PREFIX,
   LAYOUT_PRE_MIGRATION_RAW_KEY_PREFIX,
   derivedLayoutPreMigrationRawKey,
+  getLayoutWindowId,
   getWindowFreshAgentBackupKey,
   getWindowFreshAgentCommitMarkerKey,
   getWindowFreshAgentPendingMarkerKey,
@@ -527,7 +528,28 @@ function preservePersistedLayout(): PersistedLayoutMigrationResult {
  * copying an obsolete envelope (or mis-attributing an unstamped one to a
  * newly selected machine). The legacy key is NEVER deleted: other live
  * pre-change windows may still read it. A window that already has its
- * own envelope ignores later legacy-key writes from pre-change windows. */
+ * own envelope ignores later legacy-key writes from pre-change windows.
+ *
+ * e3r2 finding 2 (claim-then-verify): two simultaneous upgrade boots can
+ * both pass the absent checks above before either sets the marker, each
+ * copying the shared legacy envelope into its own key and the loser
+ * classifying the copied last-writer layout as healthy. The claim is
+ * therefore written FIRST — the marker carrying THIS window's
+ * layout-window-id — and read back immediately; the copy proceeds ONLY
+ * if the read still returns the claimer's own id. A window that reads a
+ * foreign id skips adoption entirely (its key stays absent → boot
+ * rebuilds — the safe outcome). Serialization guarantee relied on: each
+ * single localStorage getItem/setItem is atomic against the shared
+ * per-origin map, but HTML explicitly promises NO locking across agent
+ * clusters — "authors are encouraged to assume that there is no locking
+ * mechanism" (webstorage.html §12.1) — so the other renderer process's
+ * claim CAN land between our setItem and our getItem; the read-back
+ * detects it. Residual, bounded: if the interleave is exactly
+ * A-write → A-read → B-write → B-read, both windows read back their own
+ * id and both adopt — but they copy the SAME shared legacy envelope, so
+ * the worst case equals the pre-upgrade shared-envelope behavior for
+ * exactly those two simultaneously-booting windows; every later window
+ * is still gated by the marker-present check. */
 function adoptLegacyLayoutIntoWindowKey(): void {
   const ownKey = getWindowLayoutKey()
   try {
@@ -535,11 +557,20 @@ function adoptLegacyLayoutIntoWindowKey(): void {
     const legacyRaw = localStorage.getItem(LEGACY_LAYOUT_STORAGE_KEY)
     if (legacyRaw === null) return
     if (localStorage.getItem(LEGACY_LAYOUT_ADOPTION_MARKER_STORAGE_KEY) !== null) return
-    localStorage.setItem(ownKey, legacyRaw)
+    const ownerId = getLayoutWindowId()
     localStorage.setItem(LEGACY_LAYOUT_ADOPTION_MARKER_STORAGE_KEY, JSON.stringify({
       version: 1,
+      ownerId,
       adoptedAt: Date.now(),
     }))
+    let claimedOwnerId: unknown
+    try {
+      claimedOwnerId = (JSON.parse(localStorage.getItem(LEGACY_LAYOUT_ADOPTION_MARKER_STORAGE_KEY) ?? '') as { ownerId?: unknown })?.ownerId
+    } catch {
+      claimedOwnerId = undefined
+    }
+    if (claimedOwnerId !== ownerId) return
+    localStorage.setItem(ownKey, legacyRaw)
     log.info('Adopted the legacy layout envelope into this window\u2019s per-window key (one-shot).')
   } catch (error) {
     warnStructured('layout_legacy_adoption_write_failed', {

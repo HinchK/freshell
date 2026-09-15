@@ -107,7 +107,7 @@ describe('restoreMachineWorkspace', () => {
   })
 
   it('derives the bootstrap exclusion id from the REGISTRY client id, not the per-window layout-window id (e3r1 finding 3c pin)', async () => {
-    // The layout envelope key follows the immutable layout-window-id
+    // The layout envelope key follows the mint-once layout-window-id
     // (window-layout-keys.ts), but the bootstrap exclusion id keeps using
     // the tab-registry client id so the server can still exclude (or, for
     // the reserved prefix, include) the window's own tabs-sync snapshot.

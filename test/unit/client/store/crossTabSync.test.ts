@@ -24,13 +24,15 @@ import { resolveLocalSettings } from '@shared/settings'
 import { sessionMetadataKey } from '@/lib/session-metadata'
 
 // Delta round 3, finding 1 + e3r1 findings 3/4: layout envelopes are keyed
-// per window by the IMMUTABLE layout-window-id
-// (freshell.layout.v3.<layoutWindowId>). Storage events for OTHER windows'
-// keys run the TITLE-ONLY reconciliation path (no hydrateTabs, no
-// hydratePanes — another window's arrangement never replaces this
-// window's); this window's OWN key events (duplicate tabs sharing the
-// layout-window-id, and the install-time own-envelope replacement) keep
-// the full hydrateTabs + hydratePanes path.
+// per window by the mint-once layout-window-id
+// (freshell.layout.v3.<layoutWindowId>; e3r2 finding 1: the registry
+// lease-collision rotation is the only path that remints it). Storage
+// events for OTHER windows' keys run the TITLE-ONLY reconciliation path
+// (no hydrateTabs, no hydratePanes — another window's arrangement never
+// replaces this window's); this window's OWN key events (duplicate tabs
+// before their lease-collision rotation remints their id, and the
+// install-time own-envelope replacement) keep the full hydrateTabs +
+// hydratePanes path.
 const LAYOUT_WINDOW_ID_STORAGE_KEY = 'freshell.layout-window-id.v1'
 const OWN_WINDOW_ID = 'client-crosstab-own'
 const OWN_LAYOUT_KEY = `freshell.layout.v3.${OWN_WINDOW_ID}`
@@ -396,6 +398,43 @@ describe('crossTabSync', () => {
     } finally {
       ;(globalThis as any).BroadcastChannel = original
     }
+  })
+
+  it('evicts the retained raw on a removal storage event — a removed-then-recreated key reprocesses instead of deduping forever', () => {
+    // e3r2 finding 3: lastProcessedRawByKey retained one complete
+    // serialized layout per observed window; removal events
+    // (newValue === null — what the stale-envelope prune sweep's
+    // cross-document key removals look like) fell through the string
+    // check, so pruned blobs accumulated for the life of the window and a
+    // removed-then-recreated key replaying identical bytes was deduped as
+    // already-processed.
+    const dispatchSpy = vi.fn()
+    const storeLike = {
+      dispatch: dispatchSpy,
+      getState: () => ({ tabs: { activeTabId: null }, panes: { activePane: {} } }),
+    }
+    cleanups.push(installCrossTabSync(storeLike as any))
+
+    const raw = JSON.stringify({
+      version: 3,
+      tabs: { activeTabId: null, tabs: [{ id: 't1', title: 'T1', createdAt: 1 }] },
+      panes: { version: 6, layouts: {}, activePane: {}, paneTitles: {}, paneTitleSetByUser: {} },
+      tombstones: [],
+    })
+    const titleOnlyDispatchCount = () =>
+      dispatchSpy.mock.calls
+        .map((c) => c[0])
+        .filter((a: any) => a?.type === 'panes/hydratePaneTitles').length
+
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: raw }))
+    expect(titleOnlyDispatchCount()).toBe(1)
+
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: raw }))
+    expect(titleOnlyDispatchCount(), 'an identical replay is deduped').toBe(1)
+
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: null }))
+    window.dispatchEvent(new StorageEvent('storage', { key: REMOTE_LAYOUT_KEY, newValue: raw }))
+    expect(titleOnlyDispatchCount(), 'the removal event evicted the retained blob — the re-created key reprocesses').toBe(2)
   })
 
   it('hydrates browser-preference changes from storage events', () => {

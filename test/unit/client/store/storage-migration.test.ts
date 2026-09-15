@@ -4,7 +4,7 @@ import { BROWSER_PREFERENCES_STORAGE_KEY, PANES_STORAGE_KEY, TABS_STORAGE_KEY } 
 
 const AUTH_STORAGE_KEY = 'freshell.auth-token'
 // Delta round 3, finding 1 / e3r1 findings 3+6: the migration operates on
-// THIS window's per-window layout key (derived from the immutable
+// THIS window's per-window layout key (derived from the mint-once
 // layout-window-id, sessionStorage freshell.layout-window-id.v1); the bare
 // freshell.layout.v3 stays as the LEGACY adoption source (never deleted).
 const WINDOW_ID = 'client-migration-tests'

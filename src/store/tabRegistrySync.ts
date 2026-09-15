@@ -26,6 +26,7 @@ import {
   TAB_REGISTRY_SNAPSHOT_REVISION_STORAGE_KEY,
 } from './storage-keys'
 import { deriveTabRecencyAt } from '@/lib/tab-recency'
+import { remintLayoutWindowId } from './window-layout-keys'
 
 // Re-exported for the existing call sites (App, TabsView, machine-workspace):
 // the getter now lives in the dependency-free client-instance-id leaf shared
@@ -385,6 +386,16 @@ export function startTabRegistrySync(store: AppStore, ws: TabRegistryWsClient): 
     claimedClientInstanceIds.delete(previousClientInstanceId)
     clientInstanceId = randomClientInstanceId()
     setTabRegistryClientInstanceId(clientInstanceId)
+    // e3r2 finding 1: the duplicated tab's sessionStorage COPIED the
+    // layout-window-id too, and without this remint both tabs keep one
+    // layout key (either tab's flush fully hydrating the other, the last
+    // writer's envelope winning every refresh). The rotation is the one
+    // moment a window's identity legitimately splits — the duplicate
+    // becomes a sovereign NEW window (fresh layout key → absent → boot
+    // rebuilds from the inventory); the ORIGINAL's separate sessionStorage
+    // copy is unaffected. This rotation is the ONLY path that remints the
+    // layout-window-id.
+    remintLayoutWindowId()
     claimedClientInstanceIds.add(clientInstanceId)
     snapshotRevision = 0
     writeSnapshotRevision(snapshotRevision)

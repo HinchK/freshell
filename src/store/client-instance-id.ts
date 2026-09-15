@@ -6,8 +6,9 @@ import { TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, TAB_REGISTRY_SNAPSHOT_REVI
  * leaf so the registry-sync module graph stays importable without cycles.
  * The per-window LAYOUT keys no longer derive from this id (e3r1 finding
  * 3): it is MUTABLE — the lease-collision rotation rewrites it — so the
- * layout envelope is keyed by the immutable layout-window-id instead
- * (window-layout-keys.ts). The registry id keeps serving the
+ * layout envelope is keyed by the dedicated layout-window-id instead
+ * (window-layout-keys.ts), which that same rotation remints (e3r2
+ * finding 1). The registry id keeps serving the
  * machine-bootstrap exclusion id and server-side identity.
  *
  * One window is one JS realm; sessionStorage (unlike localStorage) is NOT

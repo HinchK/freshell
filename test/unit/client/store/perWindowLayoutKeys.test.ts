@@ -4,14 +4,20 @@
 // window restored the last writer's workspace. The layout envelope (and its
 // side channels — the .bak, the fresh-agent centralization backup/markers,
 // and the pre-migration evidence sidecar) are now keyed per window by a
-// DEDICATED IMMUTABLE layout-window-id (sessionStorage
+// DEDICATED mint-once layout-window-id (sessionStorage
 // freshell.layout-window-id.v1 — e3r1 finding 3: decoupled from the
-// MUTABLE tab-registry client id, whose lease-collision rotation must not
-// move the layout key), with ONE-SHOT global legacy adoption (e3r1 finding
+// MUTABLE tab-registry client id; e3r2 finding 1: the registry
+// lease-collision rotation — the one moment a window's identity
+// legitimately splits, i.e. a duplicated browser tab — is the ONLY path
+// that remints it, so a duplicate becomes a sovereign NEW window), with
+// ONE-SHOT global legacy adoption (e3r1 finding
 // 2: only the FIRST fresh window ever adopts; the marker
 // freshell.layout.legacy-adopted.v1 gates every later window to the
-// absent → inventory-rebuild path) and a stale-threshold prune sweep at
-// migration boot (e3r1 finding 5: beyond-STALE_LAYOUT_MS envelopes and
+// absent → inventory-rebuild path; e3r2 finding 2: the adoption is
+// claimed-then-verified — the marker is written FIRST with the claimer's
+// layout-window-id and read back, and only the window whose own id
+// survives copies the legacy envelope) and a stale-threshold prune sweep
+// at migration boot (e3r1 finding 5: beyond-STALE_LAYOUT_MS envelopes and
 // their side channels are removed so closed-window layouts cannot
 // accumulate unboundedly).
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
@@ -71,6 +77,7 @@ describe('per-window layout keys', () => {
 
   afterEach(() => {
     vi.useRealTimers()
+    vi.unstubAllGlobals()
     vi.restoreAllMocks()
   })
 
@@ -122,7 +129,7 @@ describe('per-window layout keys', () => {
     expect(localStorage.getItem(LEGACY_LAYOUT_KEY), 'the bare legacy key is never written post-adoption').toBeNull()
   })
 
-  it('derives the layout key from the IMMUTABLE layout-window-id, not the mutable registry client id', async () => {
+  it('derives the layout key from the layout-window-id, not the registry client id — the raw registry setter never remints the layout id', async () => {
     seedWindow(WINDOW_B_ID)
     sessionStorage.setItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, 'client-registry-b')
 
@@ -131,38 +138,114 @@ describe('per-window layout keys', () => {
 
     expect(getWindowLayoutKey()).toBe(KEY_B)
 
-    // The supported lease-collision rotation path rewrites ONLY the
-    // registry id; the layout key must not follow it.
+    // The low-level registry setter moves ONLY the registry id; the layout
+    // key follows the layout-window-id, which is reminted exclusively by
+    // the lease-collision rotation path (pinned in tabRegistrySync.test.ts
+    // and the duplicate-tab divergence test below).
     setTabRegistryClientInstanceId('client-registry-b-rotated')
-    expect(getWindowLayoutKey(), 'the layout key does not follow the registry id rotation').toBe(KEY_B)
+    expect(getWindowLayoutKey(), 'the layout key does not follow the raw registry id write').toBe(KEY_B)
 
-    // And the registry id the rotation wrote is what the registry reads.
+    // And the registry id the setter wrote is what the registry reads.
     const { getCurrentTabRegistryClientInstanceId } = await import('@/store/client-instance-id')
     expect(getCurrentTabRegistryClientInstanceId()).toBe('client-registry-b-rotated')
   })
 
-  it('duplicate-tab scenario: a copied sessionStorage id whose REGISTRY id rotates keeps the envelope reachable across a refresh (no absent-classified rebuild)', async () => {
-    // A duplicated browser tab copies BOTH sessionStorage ids. The
-    // duplicate's tab-registry lease collides with the original's, so the
-    // registry id ROTATES — the layout key must not, or the duplicate's
-    // next refresh would classify its healthy envelope absent (or adopt
-    // obsolete legacy data) and rebuild, resetting geometry.
+  it('duplicate-tab divergence contract (e3r2 finding 1): the lease-collision rotation remints the layout-window-id — the ORIGINAL keeps its envelope, the duplicate\'s fresh key classifies absent and rebuilds', async () => {
+    // A duplicated browser tab COPIES both sessionStorage ids, so before
+    // the collision resolves the two tabs share one layout key and either
+    // tab's flush fully hydrates the other (the crossTabSync own-key
+    // path), with the last writer replacing the shared envelope on every
+    // refresh. The lease-collision rotation — the one moment a window's
+    // identity legitimately splits — ALSO remints the layout-window-id
+    // (exercised here through the REAL rotation path,
+    // startTabRegistrySync + the lease channel): the duplicate becomes a
+    // sovereign NEW window whose derived key is absent (refresh →
+    // inventory rebuild), while the ORIGINAL's id and envelope stay
+    // untouched (refresh → healthy keep). sessionStorage copies diverge
+    // at duplication (HTML webstorage §12.2.2: each window has its own
+    // individual copy), so the duplicate's remint write cannot reach the
+    // original's copy. The registry id rotates too — that is the
+    // pre-existing lease contract.
+    const sharedRegistryClientId = 'client-shared-before-rotation'
     seedWindow(WINDOW_B_ID)
-    sessionStorage.setItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, WINDOW_B_ID)
-    localStorage.setItem(KEY_B, envelopeFor('tab-window-b'))
+    sessionStorage.setItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, sharedRegistryClientId)
+    localStorage.setItem(KEY_B, envelopeFor('tab-original-window'))
 
-    const { setTabRegistryClientInstanceId } = await import('@/store/client-instance-id')
-    setTabRegistryClientInstanceId('client-rotated-by-collision')
+    const { startTabRegistrySync } = await import('@/store/tabRegistrySync')
+    class LeaseChannel {
+      static instance: LeaseChannel | null = null
+      onmessage: ((event: { data: any }) => void) | null = null
+      postMessage = vi.fn()
+      constructor() {
+        LeaseChannel.instance = this
+      }
+      close() {}
+    }
+    vi.stubGlobal('BroadcastChannel', LeaseChannel)
+    vi.stubGlobal('navigator', { ...globalThis.navigator, sendBeacon: vi.fn(() => true) })
+    try {
+      const stop = startTabRegistrySync({
+        getState: () => ({
+          tabs: { tabs: [], activeTabId: null, tombstones: [] },
+          panes: { layouts: {}, activePane: {} },
+          tabRecency: { paneLastInputAt: {} },
+          tabRegistry: {
+            deviceId: 'device-1',
+            deviceLabel: 'label-1',
+            localClosed: {},
+            closedTabRetentionDays: 30,
+            searchRangeDays: 30,
+          },
+          connection: { serverInstanceId: 'srv-test' },
+        }),
+        dispatch: () => {},
+        subscribe: () => () => {},
+      } as any, {
+        state: 'ready',
+        onMessage: () => () => {},
+        onReconnect: () => () => {},
+      } as any)
 
-    // Refresh: fresh modules re-read sessionStorage for the layout key.
+      const initialClaim = LeaseChannel.instance!.postMessage.mock.calls[0][0]
+      LeaseChannel.instance!.onmessage?.({
+        data: {
+          type: 'tabs-registry-client-active',
+          clientInstanceId: sharedRegistryClientId,
+          leaseId: 'original-window',
+          claimantLeaseId: initialClaim.leaseId,
+        },
+      })
+
+      const duplicateLayoutWindowId = sessionStorage.getItem(LAYOUT_WINDOW_ID_STORAGE_KEY)
+      expect(duplicateLayoutWindowId, 'the rotation reminted the layout-window-id').not.toBe(WINDOW_B_ID)
+      expect(duplicateLayoutWindowId).toMatch(/^layout-window-/)
+      expect(sessionStorage.getItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY), 'the registry id rotated too (the pre-existing lease contract)').not.toBe(sharedRegistryClientId)
+      expect(localStorage.getItem(`freshell.layout.v3.${duplicateLayoutWindowId}`), 'the duplicate\'s new derived key is absent (boot classifies absent)').toBeNull()
+      expect(JSON.parse(localStorage.getItem(KEY_B)!).tabs.tabs.map((t: { id: string }) => t.id), 'the ORIGINAL\'s envelope under the shared key is untouched').toEqual(['tab-original-window'])
+      stop()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+
+    // The duplicate's refresh: fresh modules read the reminted id.
     await bootFreshModules()
     const { classifyPersistedLayoutHealth } = await import('@/lib/recovery/layout-health')
     const { loadPersistedLayout } = await import('@/store/persistMiddleware')
 
-    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
-    const layout = loadPersistedLayout()
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('absent')
+    expect(loadPersistedLayout()).toBeNull()
+
+    // The original's refresh: its sessionStorage copy still holds the
+    // shared id, and its envelope survived the duplicate's rotation.
+    seedWindow(WINDOW_B_ID)
+    await bootFreshModules()
+    const { classifyPersistedLayoutHealth: classifyOriginal } = await import('@/lib/recovery/layout-health')
+    const { loadPersistedLayout: loadOriginal } = await import('@/store/persistMiddleware')
+
+    expect(classifyOriginal('machine-1', { now: NOW })).toBe('healthy')
+    const layout = loadOriginal()
     const tabIds = (layout?.tabs?.tabs as { tabs: Array<{ id: string }> } | undefined)?.tabs?.map((t) => t.id)
-    expect(tabIds).toEqual(['tab-window-b'])
+    expect(tabIds).toEqual(['tab-original-window'])
   })
 
   it('a fresh context mints the layout-window-id exactly once and it is stable across calls', async () => {
@@ -194,10 +277,14 @@ describe('per-window layout keys', () => {
     expect(localStorage.getItem(LEGACY_ADOPTION_MARKER_KEY), 'adoption set the one-shot marker').not.toBeNull()
   })
 
-  it('a LATER fresh window (marker set) NEVER adopts: its derived key stays absent and the boot classifies absent → inventory rebuild', async () => {
+  it('a LATER fresh window (marker set by a foreign claimer) NEVER adopts: its derived key stays absent and the boot classifies absent → inventory rebuild', async () => {
     seedWindow('layout-window-later')
     localStorage.setItem(LEGACY_LAYOUT_KEY, envelopeFor('tab-legacy-first-window'))
-    localStorage.setItem(LEGACY_ADOPTION_MARKER_KEY, JSON.stringify({ version: 1, adoptedAt: NOW - 1_000 }))
+    localStorage.setItem(LEGACY_ADOPTION_MARKER_KEY, JSON.stringify({
+      version: 1,
+      ownerId: 'layout-window-first-claimer',
+      adoptedAt: NOW - 1_000,
+    }))
 
     await bootFreshModules()
     const { classifyPersistedLayoutHealth } = await import('@/lib/recovery/layout-health')
@@ -206,6 +293,68 @@ describe('per-window layout keys', () => {
     expect(localStorage.getItem('freshell.layout.v3.layout-window-later'), 'no adoption for a later window').toBeNull()
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('absent')
     expect(loadPersistedLayout()).toBeNull()
+    expect(localStorage.getItem(LEGACY_LAYOUT_KEY), 'the legacy key is still never deleted').not.toBeNull()
+  })
+
+  it('e3r2 finding 2 (claim-then-verify): the winning adoption claim stamps the claimer\'s layout-window-id into the one-shot marker', async () => {
+    seedWindow(WINDOW_B_ID)
+    localStorage.setItem(LEGACY_LAYOUT_KEY, envelopeFor('tab-adopted'))
+
+    await bootFreshModules()
+
+    const marker = JSON.parse(localStorage.getItem(LEGACY_ADOPTION_MARKER_KEY)!)
+    expect(marker.ownerId, 'the claim is attributed to the window that adopted').toBe(WINDOW_B_ID)
+    expect(localStorage.getItem(KEY_B), 'the verified claimer copied the legacy envelope').not.toBeNull()
+  })
+
+  it('e3r2 finding 2 (claim-then-verify): a foreign claim that wins storage before our read-back skips the copy entirely', async () => {
+    // Two windows boot simultaneously right after the upgrade: both pass
+    // the absent checks, both claim. localStorage is last-writer-wins, so
+    // the OTHER window's claim can replace ours between our write and our
+    // read-back — the verify step must see the foreign ownerId and skip
+    // adoption (this window's key stays absent → boot rebuilds from the
+    // inventory — the safe outcome). The serialization boundary this
+    // exercises: HTML promises NO storage mutex — each single
+    // getItem/setItem is atomic against the shared map, but the spec says
+    // authors "are encouraged to assume that there is no locking
+    // mechanism" for the interaction across agent clusters
+    // (webstorage.html §12.1), so a write→read pair from one script can
+    // interleave with another renderer process's write. (jsdom's Storage
+    // is a Proxy that defeats vi.spyOn — the interleave is simulated by
+    // stubbing the localStorage global with a forwarding Proxy that
+    // lands the foreign claim immediately after the marker write.)
+    seedWindow(WINDOW_B_ID)
+    localStorage.setItem(LEGACY_LAYOUT_KEY, envelopeFor('tab-legacy'))
+    const realStorage = localStorage
+    const foreignClaim = JSON.stringify({
+      version: 1,
+      ownerId: 'layout-window-other-window',
+      adoptedAt: NOW - 1,
+    })
+    const intercepted = new Proxy(realStorage, {
+      get(target, prop) {
+        if (prop === 'setItem') {
+          return (key: string, value: string) => {
+            target.setItem(key, value)
+            if (key === LEGACY_ADOPTION_MARKER_KEY) {
+              target.setItem(LEGACY_ADOPTION_MARKER_KEY, foreignClaim)
+            }
+          }
+        }
+        const value = Reflect.get(target, prop, target)
+        return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value
+      },
+    })
+    vi.stubGlobal('localStorage', intercepted)
+
+    try {
+      await bootFreshModules()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+
+    expect(localStorage.getItem(KEY_B), 'the losing window never copies the legacy envelope').toBeNull()
+    expect(JSON.parse(localStorage.getItem(LEGACY_ADOPTION_MARKER_KEY)!).ownerId, 'the winner\'s claim survives intact').toBe('layout-window-other-window')
     expect(localStorage.getItem(LEGACY_LAYOUT_KEY), 'the legacy key is still never deleted').not.toBeNull()
   })
 
@@ -306,7 +455,7 @@ describe('per-window layout keys', () => {
     expect(localStorage.getItem('freshell_version')).toBe('5')
   })
 
-  it('a fresh clientInstanceId with no envelope of its own and no server records classifies absent (the rebuild-from-inventory path stays sound)', async () => {
+  it('a fresh layout-window id with no envelope of its own and no server records classifies absent (the rebuild-from-inventory path stays sound)', async () => {
     seedWindow('layout-window-fresh')
     // No derived key, no legacy key: the boot must leave the window without
     // an envelope — never adopt another window's key or the shared

@@ -32,7 +32,7 @@ import { TestHarness } from '../helpers/test-harness.js'
  *      (tab count unchanged) -- `findTabIdForSession` joins on the same
  *      extraction (`src/store/tabsSlice.ts:721-763`).
  *   3. Restart durability: the persisted per-window layout
- *      (`freshell.layout.v3.<clientInstanceId>`)
+ *      (`freshell.layout.v3.<layoutWindowId>`)
  *      carries the synthesized `sessionRef` (persist-save strips
  *      `resumeSessionId` outright, `persistMiddleware.ts:245-264` -- the
  *      sessionRef is the ONLY key that survives), so after

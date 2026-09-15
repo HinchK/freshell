@@ -4,7 +4,7 @@ import { openPanePicker } from '../helpers/pane-picker.js'
 import type { TestServerInfo } from '../helpers/test-server.js'
 
 // Delta round 3, finding 1: the live layout envelope is the page's
-// per-window key (freshell.layout.v3.<clientInstanceId>). The legacy
+// per-window key (freshell.layout.v3.<layoutWindowId>). The legacy
 // pre-change envelope this spec seeds goes to the LEGACY key — the boot
 // migration adopts it into the window's own key and migrates it there.
 const LEGACY_LAYOUT_STORAGE_KEY = 'freshell.layout.v3'

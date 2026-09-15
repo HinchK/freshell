@@ -4,7 +4,8 @@ export const STORAGE_KEYS = {
   // deleted (other live pre-change windows may still read it). The live
   // per-window key is `freshell.layout.v3.<layoutWindowId>` — see
   // window-layout-keys.ts (delta round 3, finding 1; e3r1 finding 3: the
-  // id is the immutable layout-window-id, not the registry client id).
+  // id is the dedicated mint-once layout-window-id, not the registry
+  // client id).
   legacyLayout: 'freshell.layout.v3',
   legacyLayoutBackup: 'freshell.layout.v3.bak',
   legacyLayoutPreMigrationRaw: 'freshell.layout.pre-migration-raw.v1',

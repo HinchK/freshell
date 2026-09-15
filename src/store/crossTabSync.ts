@@ -37,9 +37,10 @@ const zPersistBroadcastMsg = z.object({
 /** Delta round 3, finding 1 + e3r1 finding 4: the layout subscription
  * observes the per-window key PREFIX (freshell.layout.v3.<layoutWindowId>).
  * Events for OTHER windows' keys run the TITLE-ONLY reconciliation; events
- * for THIS window's own key (duplicate tabs sharing the layout-window id)
- * keep the full incoming-hydrate path. The exact keys below are the
- * layout-independent sidecars. */
+ * for THIS window's own key (duplicate tabs before their lease-collision
+ * rotation remints the id — e3r2 finding 1 — and pre-change windows
+ * during a deploy transition) keep the full incoming-hydrate path. The
+ * exact keys below are the layout-independent sidecars. */
 function isCrossTabSyncStorageKey(key: string): boolean {
   return key === BROWSER_PREFERENCES_STORAGE_KEY
     || key === TAB_RECENCY_STORAGE_KEY
@@ -351,9 +352,10 @@ function handleIncomingRaw(
 ) {
   if (isDerivedLayoutKey(key)) {
     if (key === getWindowLayoutKey()) {
-      // The OWN key: a duplicate tab sharing this window's layout-window
-      // id (or a pre-change window during a deploy transition) wrote this
-      // envelope — same-window envelope replacement, full hydrate.
+      // The OWN key: a duplicate tab that has not yet reminted its
+      // layout-window id (pre-rotation, or a pre-change window during a
+      // deploy transition) wrote this envelope — same-window envelope
+      // replacement, full hydrate.
       dispatchHydrateLayoutFromPersisted(store, raw, localLayoutPersistedAt)
     } else {
       // ANOTHER window's key: title-only.
@@ -465,6 +467,15 @@ export function installCrossTabSync(store: StoreLike): () => void {
     if (e.storageArea && e.storageArea !== localStorage) return
     const key = e.key
     if (typeof key !== 'string' || !isCrossTabSyncStorageKey(key)) {
+      return
+    }
+    if (e.newValue === null) {
+      // A removal (e3r2 finding 3): the stale-envelope prune sweep deletes
+      // derived keys cross-document, and lastProcessedRawByKey would
+      // otherwise retain one complete serialized layout per observed
+      // window forever — a removed-then-recreated key replaying identical
+      // bytes would be deduped as already-processed.
+      lastProcessedRawByKey.delete(key)
       return
     }
     if (typeof e.newValue !== 'string') return
