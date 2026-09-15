@@ -355,6 +355,25 @@ pub(crate) async fn coordinator_commit_identity(
                 freshell_ownership::CommitOutcome::Committed => {
                     ticket.disarm();
                     let snapshot = ownership.observe(provider, session_id);
+                    // b8ke ext r22 F2: the commit-side ownership stamp — the
+                    // row's delayed-write fence baseline advances to THIS
+                    // commit's pair, so a delayed pre-teardown binding write
+                    // (an older pair) refuses typed and the newer owner's
+                    // recovery row survives.
+                    if let Err(err) = state.pane_ledger.stamp_owner_pair(
+                        provider,
+                        session_id,
+                        snapshot.epoch,
+                        snapshot.generation,
+                    ) {
+                        tracing::warn!(target: "freshell_ws::identity_ownership",
+                            provider = %provider, session_id = %session_id,
+                            error = %err,
+                            "identity_association_stamp_owner_pair_failed: the row's \
+                             ownership stamp refresh failed (the fence baseline is \
+                             stale until the next successful stamp)"
+                        );
+                    }
                     broadcast_owner_frame(
                         state,
                         provider,
@@ -406,6 +425,23 @@ pub(crate) async fn coordinator_commit_identity(
                     ticket.disarm();
                     // The new key's authoritative owner frame.
                     let snapshot = ownership.observe(provider, session_id);
+                    // b8ke ext r22 F2: the commit-side ownership stamp — the
+                    // row's delayed-write fence baseline advances to THIS
+                    // rekey commit's pair (the delayed-write fence).
+                    if let Err(err) = state.pane_ledger.stamp_owner_pair(
+                        provider,
+                        session_id,
+                        snapshot.epoch,
+                        snapshot.generation,
+                    ) {
+                        tracing::warn!(target: "freshell_ws::identity_ownership",
+                            provider = %provider, session_id = %session_id,
+                            error = %err,
+                            "identity_association_stamp_owner_pair_failed: the row's \
+                             ownership stamp refresh failed (the fence baseline is \
+                             stale until the next successful stamp)"
+                        );
+                    }
                     broadcast_owner_frame(
                         state,
                         provider,

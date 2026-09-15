@@ -2212,6 +2212,43 @@ impl PaneLedger {
     /// `resolve_pending`): those own the mode-pane resume paths, which must
     /// rebind after a terminal kill (natural authority split — see the round
     /// 2 report's writer audit).
+    /// b8ke ext r22 F2: stamp the row's ownership (epoch, generation) pair —
+    /// the COMMIT-SIDE refresh. The ownership commits (the terminal identity
+    /// adoption/rebind lanes and the handoff's target commits) know the
+    /// pair at commit time; this carries it onto the row so the
+    /// DELAYED-WRITE FENCE has a current baseline: a delayed pre-teardown
+    /// binding write carrying an OLDER pair then refuses typed and the
+    /// newer owner's recovery row survives. Monotonic: a stamp only ever
+    /// ADVANCES (an older pair never regresses the row's baseline). A
+    /// missing row is a no-op (nothing to fence yet).
+    pub fn stamp_owner_pair(
+        &self,
+        provider: &str,
+        session_id: &str,
+        epoch: u64,
+        generation: u64,
+    ) -> std::io::Result<()> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        let mut index = self.guard();
+        let key = (provider.to_string(), session_id.to_string());
+        let Some(row) = index.bindings.get(&key) else {
+            return Ok(());
+        };
+        if let (Some(row_epoch), Some(row_gen)) = (row.owner_epoch, row.owner_generation) {
+            if (epoch, generation) <= (row_epoch, row_gen) {
+                // Monotonic: never regress the baseline.
+                return Ok(());
+            }
+        }
+        let mut row = row.clone();
+        row.owner_epoch = Some(epoch);
+        row.owner_generation = Some(generation);
+        row.updated_at = crate::terminal::now_ms();
+        self.write_binding(root, &mut index, &row)
+    }
+
     pub fn record_fresh_agent_binding(
         &self,
         w: &FreshAgentBindingWrite<'_>,
