@@ -830,6 +830,14 @@ where
 /// in-process server's reconcile task (tokio::spawn'd by the accept loop) is
 /// polled on THIS thread and observes the guard — the
 /// `diag01_lifecycle_events.rs` convention.
+///
+/// Deliberately NOT a global capture: several tests in this binary drive
+/// dead-session verdicts through their own in-process servers (e.g.
+/// `respawn_cap_turns_the_fourth_answer_into_dead_session`), so a
+/// process-global subscriber would leak their WARNs into any concurrently
+/// armed capture and break the exactly-one assertion below (verified by
+/// repro: a global install made the full binary fail fast on 2 hits where
+/// the thread-local design passes).
 fn log_capture() -> (
     Arc<Mutex<Vec<CapturedEvent>>>,
     tracing::subscriber::DefaultGuard,
