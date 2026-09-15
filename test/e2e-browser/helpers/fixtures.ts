@@ -11,6 +11,7 @@ import {
   isCloudLaneWindowConfigured,
   resolveCloudLaneTestBudgetMs,
   selectShellFromPicker,
+  shouldExtendTestDeadlineToCloudBudget,
 } from './test-harness.js'
 import { TerminalHelper } from './terminal-helpers.js'
 import { createE2eServerHandle, type E2eServerHandle } from './external-target.js'
@@ -31,7 +32,11 @@ export interface E2eMachine {
   label: string
 }
 
-/** Register a machine the Rust server will accept before an isolated context boots. */
+/** Register a machine the Rust server will accept before an isolated context boots.
+ * The registration fetch is independently bounded (delta review r5): an
+ * unbounded fetch would be the only un-wedged-limited operation left in a
+ * test chain whose deadline is unlimited (the contract spec's declared-0
+ * pin resolves exactly this fixture). */
 export async function registerE2eMachine(
   serverInfo: E2eServerInfo,
   label = `Playwright test machine ${Date.now()}`,
@@ -41,6 +46,7 @@ export async function registerE2eMachine(
     method: 'POST',
     headers: { ...headers, 'content-type': 'application/json' },
     body: JSON.stringify({ label }),
+    signal: AbortSignal.timeout(30_000),
   })
   if (!created.ok) {
     throw new Error(`Could not create E2E machine: HTTP ${created.status}`)
@@ -218,17 +224,19 @@ export const test = base.extend<{
   // the env var is unset and the default budget applies unchanged. The
   // mechanism is probe-verified (settings.spec.ts precedent, kata j90s):
   // a setTimeout issued during fixture resolution extends the live
-  // deadline over fixture time. EXTEND-ONLY: specs that declare a larger
-  // deadline (idle-gate 300s, reconcile specs 240s) keep their own
-  // budget — the guard must never shrink a declared deadline to the
-  // cloud budget. A declared 0 is Playwright's UNLIMITED: any finite
-  // budget would shrink it, so the guard skips it too.
+  // deadline over fixture time. EXTEND-ONLY and DEFAULT-CLASS-ONLY (delta
+  // review r5): specs that declare a deadline above the config default —
+  // idle-gate 300s, reconcile 240s, launch-retry-restart-rust 180s — keep
+  // their own budget, whatever the composition: raising an explicit spec
+  // budget decision would touch other flakes' mechanisms, and their own
+  // deflake runs must fix any under-budgeting. A declared 0 is
+  // Playwright's UNLIMITED: any finite budget would shrink it. All three
+  // rules live in the unit-tested shouldExtendTestDeadlineToCloudBudget.
   e2eMachineId: async ({ testServer }, use) => {
     const cloudBudgetMs = resolveCloudLaneTestBudgetMs()
     if (
       cloudBudgetMs !== null
-      && test.info().timeout !== 0
-      && test.info().timeout < cloudBudgetMs
+      && shouldExtendTestDeadlineToCloudBudget(test.info().timeout, cloudBudgetMs)
     ) {
       test.info().setTimeout(cloudBudgetMs)
     }

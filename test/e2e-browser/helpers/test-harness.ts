@@ -66,15 +66,47 @@ export function isCloudLaneWindowConfigured(
  * The permitted worst case of the shell-picker leg of the freshellPage
  * fixture, derived from the picker's OWN exported constants so it can
  * never drift from the implementation (delta-review r2): the
- * stabilization settle, at most one click budget per shell name (every
- * path through the loop makes at most SHELL_NAMES.length clicks, each
- * bounded by SHELL_CLICK_TIMEOUT_MS — including the successful one), and
- * at most one render wait.
+ * stabilization settle, at most one click budget plus one creation-probe
+ * budget per shell name (every path through the loop makes at most
+ * SHELL_NAMES.length clicks, each followed by at most one probe —
+ * including the successful one), and at most one render wait.
  */
 export function shellPickerWorstCaseMs(): number {
   return SHELL_PICKER_SETTLE_MS
-    + SHELL_NAMES.length * SHELL_CLICK_TIMEOUT_MS
+    + SHELL_NAMES.length * (SHELL_CLICK_TIMEOUT_MS + SHELL_PROBE_TIMEOUT_MS)
     + SHELL_RENDER_TIMEOUT_MS
+}
+
+/**
+ * The per-test deadline declared by the Playwright config (both lanes — the
+ * cloud config inherits the base). DEFAULT-CLASS deadlines (at or below
+ * this value) are where the tg4e chain-envelope defect lives: the config
+ * default is smaller than the fixture chain's permitted composition, so
+ * the cloud budget wiring raises default-class deadlines to the
+ * composition. Declarations ABOVE this value are explicit spec budget
+ * decisions (e.g. launch-retry-restart-rust's 180s) the wiring must
+ * respect — raising them would touch other flakes' mechanisms (delta
+ * review r5) and their own runs must fix any under-budgeting.
+ */
+export const DEFAULT_TEST_TIMEOUT_MS = 60_000
+
+/**
+ * Whether the cloud-lane budget wiring should raise a test's current
+ * deadline to the composed budget (delta review r5): EXTEND-ONLY and
+ * DEFAULT-CLASS-ONLY. Never shrinks (a budget below the current deadline
+ * is ignored), never touches unlimited (0 — any finite value would
+ * shrink it), never touches a deadline declared above the config default
+ * (explicit spec budget decisions), and is a no-op without a budget
+ * (local lane).
+ */
+export function shouldExtendTestDeadlineToCloudBudget(
+  currentTimeoutMs: number,
+  cloudBudgetMs: number | null,
+): boolean {
+  return cloudBudgetMs !== null
+    && currentTimeoutMs !== 0
+    && currentTimeoutMs <= DEFAULT_TEST_TIMEOUT_MS
+    && currentTimeoutMs < cloudBudgetMs
 }
 
 /**
@@ -90,8 +122,9 @@ export function shellPickerWorstCaseMs(): number {
  * that scales the window (one source of truth, one parsing rule via
  * resolveWsReadyTimeoutMs) so a custom window scales the budget with it.
  * Callers must treat null as "do not touch the deadline" — the local
- * lane keeps the config default unchanged — and must apply the budget
- * EXTEND-ONLY (never shrink a declared deadline).
+ * lane keeps the config default unchanged — and must apply the budget via
+ * shouldExtendTestDeadlineToCloudBudget (extend-only,
+ * default-class-only).
  */
 export function resolveCloudLaneTestBudgetMs(
   env: Record<string, string | undefined> = process.env,
@@ -138,10 +171,15 @@ export interface WaitForConnectionOptions {
 export class TestHarness {
   constructor(private page: Page) {}
 
-  /** Wait for the test harness to be installed on the page */
+  /** Wait for the test harness to be installed on the page. The timeout is
+   * passed as waitForFunction's OPTIONS (third argument) — the historical
+   * two-arg call bound the timeout object to the predicate's argument,
+   * making every explicit window decorative (the LB-1 defect class,
+   * fixed here in delta review r5). */
   async waitForHarness(timeoutMs = 15_000): Promise<void> {
     await this.page.waitForFunction(
       () => !!window.__FRESHELL_TEST_HARNESS__,
+      undefined,
       { timeout: timeoutMs },
     )
   }
@@ -185,7 +223,11 @@ export class TestHarness {
     // land on top of the envelope under the same CPU contention this change
     // addresses.
     const selfHealStartedAt = Date.now()
-    const phase1Ms = Math.floor(resolvedTimeoutMs / 2)
+    // Math.max(1, ...): floor(W/2) = 0 would hand Playwright an UNLIMITED
+    // phase-1 window (0 means "no timeout") for sub-2ms windows — voiding
+    // the absolute-deadline contract. Degrade to the tightest bounded
+    // phase instead (delta review r5).
+    const phase1Ms = Math.max(1, Math.floor(resolvedTimeoutMs / 2))
     const readyWithinPhase1 = await this.page.waitForFunction(
       wsReadyPredicate,
       undefined,
@@ -489,15 +531,63 @@ export const SHELL_PICKER_SETTLE_MS = 500
  * detachments inside this window. */
 export const SHELL_CLICK_TIMEOUT_MS = 5_000
 
+/**
+ * Post-click-timeout creation-probe budget (ms, delta review r5):
+ * Playwright's click timeout spans EVERY click stage — a timed-out click
+ * does NOT prove the handler never ran. After a click TimeoutError the
+ * picker waits this window for the harness state to show a created
+ * tab/pane: a late dispatch is treated as the success path (render
+ * wait), and only a confirmed nothing-created advances to the next
+ * option (escalating on a late dispatch is the historical
+ * double-creation path). Sized to the click budget: symmetric absorption
+ * of the same dispatch lateness the click window tolerates.
+ */
+export const SHELL_PROBE_TIMEOUT_MS = 5_000
+
 /** The shell options, in the order the picker leg tries them. Every
  * path through the loop makes at most one click per name. */
 export const SHELL_NAMES = ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash'] as const
 
-/** Playwright's click TimeoutError is the not-clickable signal (absent,
- * detached, or obstructed within the window — indistinguishable by name);
- * anything else (page closed, interruption, unexpected errors) is loud. */
-function isClickUnavailableError(err: unknown): boolean {
+/** Playwright's native TimeoutError (click unavailability, probe
+ * nothing-created): the bounded "not within the window" signal; anything
+ * else (page closed, interruption, unexpected errors) is loud. */
+function isTimeoutError(err: unknown): boolean {
   return err instanceof Error && err.name === 'TimeoutError'
+}
+
+/**
+ * Whether the page's harness state shows a created tab or pane layout —
+ * the in-page predicate for the post-click-timeout creation probe. Must
+ * stay self-contained serializable (Playwright ships its source): reads
+ * only the harness state contract (tabs.tabs array, panes.layouts map).
+ */
+function paneCreationProbePredicate(): boolean {
+  const state = window.__FRESHELL_TEST_HARNESS__?.getState?.() as unknown as
+    | { tabs?: { tabs?: unknown[] }; panes?: { layouts?: Record<string, unknown> } }
+    | undefined
+  if (!state) return false
+  const tabCount = state.tabs?.tabs?.length ?? 0
+  const layoutCount = Object.keys(state.panes?.layouts ?? {}).length
+  return tabCount > 0 || layoutCount > 0
+}
+
+/**
+ * Probe whether a timed-out click still dispatched (delta review r5):
+ * waits up to SHELL_PROBE_TIMEOUT_MS for a created tab/pane. A timeout is
+ * "nothing was created" (false); any non-timeout error propagates loudly.
+ */
+async function paneWasCreatedOnLateDispatch(page: Page): Promise<boolean> {
+  try {
+    await page.waitForFunction(
+      paneCreationProbePredicate,
+      undefined,
+      { timeout: SHELL_PROBE_TIMEOUT_MS },
+    )
+    return true
+  } catch (err) {
+    if (!isTimeoutError(err)) throw err
+    return false
+  }
 }
 
 /**
@@ -530,8 +620,14 @@ export async function selectShellFromPicker(page: Page): Promise<void> {
     try {
       await button.click({ timeout: SHELL_CLICK_TIMEOUT_MS })
     } catch (err) {
-      if (!isClickUnavailableError(err)) throw err
-      continue // option not clickable within the window — historical behavior
+      if (!isTimeoutError(err)) throw err
+      // A click timeout does NOT prove the click never dispatched
+      // (Playwright's timeout spans every click stage): probe for the
+      // pane the handler would have created. A late dispatch joins the
+      // success path below; only a confirmed nothing-created advances
+      // (delta review r5 — escalating on a late dispatch is the
+      // historical double-creation path).
+      if (!(await paneWasCreatedOnLateDispatch(page))) continue
     }
     try {
       await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: SHELL_RENDER_TIMEOUT_MS })

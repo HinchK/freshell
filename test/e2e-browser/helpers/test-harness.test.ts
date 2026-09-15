@@ -2,16 +2,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Page } from '@playwright/test'
 import {
   CLOUD_LANE_START_RESERVE_MS,
+  DEFAULT_TEST_TIMEOUT_MS,
   DEFAULT_WS_READY_TIMEOUT_MS,
   SHELL_CLICK_TIMEOUT_MS,
   SHELL_NAMES,
   SHELL_PICKER_SETTLE_MS,
+  SHELL_PROBE_TIMEOUT_MS,
   SHELL_RENDER_TIMEOUT_MS,
   TestHarness,
   isCloudLaneWindowConfigured,
   resolveCloudLaneTestBudgetMs,
   resolveWsReadyTimeoutMs,
   selectShellFromPicker,
+  shouldExtendTestDeadlineToCloudBudget,
   shellPickerWorstCaseMs,
 } from './test-harness'
 
@@ -108,15 +111,17 @@ describe('resolveCloudLaneTestBudgetMs', () => {
     expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '' })).toBeNull()
   })
 
-  it('covers the permitted composition at the cloud default window (delta review r2)', () => {
+  it('covers the permitted composition at the cloud default window (delta reviews r2+r5)', () => {
     // W=90s: connection envelope (W + 1s total-deadline slack) = 91_000;
-    // picker worst case (settle + at most 5 clicks + the render wait) =
-    // 500 + 5 * 5_000 + 60_000 = 85_500; start reserve 30_000. Total 206_500.
-    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '90000' })).toBe(206_500)
+    // picker worst case (settle + at most 5 clicks + 5 probes + the render
+    // wait) = 500 + 5 * (5_000 + 5_000) + 60_000 = 110_500; start reserve
+    // 30_000. Total 231_500 (delta r5: the creation probe's per-shell
+    // budget joined the composition).
+    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '90000' })).toBe(231_500)
   })
 
-  it('scales with the configured window (60s -> 176_500)', () => {
-    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '60000' })).toBe(176_500)
+  it('scales with the configured window (60s -> 201_500)', () => {
+    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '60000' })).toBe(201_500)
   })
 
   it('falls back to the default window composition on malformed values (one parsing rule)', () => {
@@ -138,10 +143,10 @@ describe('resolveCloudLaneTestBudgetMs', () => {
 })
 
 describe('shellPickerWorstCaseMs (single source for the picker budget pieces)', () => {
-  it('derives from the picker\'s real constants: settle + one click budget per shell name + the render wait', () => {
+  it('derives from the picker\'s real constants: settle + one click budget + one creation-probe budget per shell name + the render wait', () => {
     expect(shellPickerWorstCaseMs()).toBe(
       SHELL_PICKER_SETTLE_MS
-        + SHELL_NAMES.length * SHELL_CLICK_TIMEOUT_MS
+        + SHELL_NAMES.length * (SHELL_CLICK_TIMEOUT_MS + SHELL_PROBE_TIMEOUT_MS)
         + SHELL_RENDER_TIMEOUT_MS,
     )
   })
@@ -168,6 +173,36 @@ describe('isCloudLaneWindowConfigured (one presence rule for every cloud-lane ga
   })
 })
 
+describe('shouldExtendTestDeadlineToCloudBudget (default-class extension, delta review r5)', () => {
+  const BUDGET = 231_500
+
+  it('extends only DEFAULT-CLASS deadlines: at or below the config default (the class the tg4e chain-envelope defect lives in)', () => {
+    expect(DEFAULT_TEST_TIMEOUT_MS).toBe(60_000)
+    expect(shouldExtendTestDeadlineToCloudBudget(60_000, BUDGET)).toBe(true)
+    expect(shouldExtendTestDeadlineToCloudBudget(30_000, BUDGET)).toBe(true)
+  })
+
+  it('never touches a deadline declared ABOVE the config default (explicit spec budget decisions, e.g. launch-retry-restart-rust 180_000)', () => {
+    expect(shouldExtendTestDeadlineToCloudBudget(60_001, BUDGET)).toBe(false)
+    expect(shouldExtendTestDeadlineToCloudBudget(120_000, BUDGET)).toBe(false)
+    expect(shouldExtendTestDeadlineToCloudBudget(180_000, BUDGET)).toBe(false)
+    expect(shouldExtendTestDeadlineToCloudBudget(240_000, BUDGET)).toBe(false)
+    expect(shouldExtendTestDeadlineToCloudBudget(BUDGET, BUDGET)).toBe(false)
+  })
+
+  it('never touches unlimited (0): a finite budget would shrink it', () => {
+    expect(shouldExtendTestDeadlineToCloudBudget(0, BUDGET)).toBe(false)
+  })
+
+  it('is a no-op when no cloud budget is configured (local lane)', () => {
+    expect(shouldExtendTestDeadlineToCloudBudget(60_000, null)).toBe(false)
+  })
+
+  it('never shrinks: a budget below the current default-class deadline is ignored', () => {
+    expect(shouldExtendTestDeadlineToCloudBudget(60_000, 50_000)).toBe(false)
+  })
+})
+
 describe('TestHarness.waitForConnection timeout wiring', () => {
   it('binds the default window (+1s slack) as waitForFunction OPTIONS', async () => {
     const { page, calls } = fakePage()
@@ -191,6 +226,18 @@ describe('TestHarness.waitForConnection timeout wiring', () => {
     const { page, calls } = fakePage()
     await new TestHarness(page).waitForConnection(20_000)
     expect(calls[0][2]).toEqual({ timeout: 21_000 })
+  })
+
+  it('waitForHarness binds its timeout as waitForFunction OPTIONS (the LB-1 class binding bug, delta r5)', async () => {
+    // The historical two-arg call bound the timeout object to the
+    // predicate's ARGUMENT, making every explicit window decorative (the
+    // real wait was Playwright's 30s default) — the same defect class this
+    // run fixed in waitForConnection (LB-1).
+    const { page, calls } = fakePage()
+    await new TestHarness(page).waitForHarness(15_000)
+    expect(calls[0]).toHaveLength(3)
+    expect(calls[0][1]).toBeUndefined()
+    expect(calls[0][2]).toEqual({ timeout: 15_000 })
   })
 })
 
@@ -331,12 +378,21 @@ describe('TestHarness.waitForConnection wedge-tolerant self-heal (opt-in)', () =
       vi.useRealTimers()
     }
   })
+
+  it('(i) a sub-2ms window degrades to the tightest BOUNDED phases (Playwright treats a 0 timeout as unlimited)', async () => {
+    const { page, calls } = fakePage()
+    await new TestHarness(page).waitForConnection(1, { selfHealReload: true })
+    // floor(1/2) = 0 would hand Playwright an UNLIMITED phase-1 window —
+    // the absolute-deadline contract would be void. Clamp to >= 1ms.
+    expect(calls[0][2]).toEqual({ timeout: 1 })
+  })
 })
 
 describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
   interface ShellOutcome {
     clickError?: 'page-closed' // not-clickable click by default (TimeoutError)
     renderVisibleAfterMs?: number // omit = render never becomes visible
+    lateDispatch?: boolean // click times out BUT the handler ran: the probe finds a created pane
   }
 
   /**
@@ -355,12 +411,13 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
   function pickerPage(
     shells: Record<string, ShellOutcome>,
     xtermInitiallyVisible = false,
-    opts: { xtermVisibleFromCall?: number } = {},
+    opts: { xtermVisibleFromCall?: number, probeHardError?: boolean } = {},
   ) {
     const clicks: string[] = []
     const renderWaits: number[] = []
     const clickTimeouts: number[] = []
     const settledMs: number[] = []
+    const probeWaits: number[] = []
     let xtermVisibilityChecks = 0
     const xtermVisible = () => {
       xtermVisibilityChecks += 1
@@ -393,6 +450,11 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
           if (outcome?.clickError === 'page-closed') {
             return Promise.reject(Object.assign(new Error('Page closed'), { name: 'TargetClosedError' }))
           }
+          if (outcome?.lateDispatch) {
+            // The click's actionability window expired mid-dispatch: the
+            // timeout fires even though the handler ran (delta r5 probe case).
+            return Promise.reject(Object.assign(new Error(`click: Timeout ${clickOpts?.timeout}ms exceeded`), { name: 'TimeoutError' }))
+          }
           if (!outcome) {
             // Option not clickable (absent/detached/obstructed): Playwright's
             // actionability TimeoutError — indistinguishable by name from any
@@ -406,6 +468,18 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
         settledMs.push(ms)
         return Promise.resolve()
       },
+      // The post-click-timeout creation probe (delta r5): resolves when the
+      // late-dispatched pick created a pane; a plain timeout means nothing
+      // was created; a hard error (page closed) propagates loudly.
+      waitForFunction: (_fn: unknown, _arg: unknown, fnOpts?: { timeout?: number }) => {
+        probeWaits.push(fnOpts?.timeout ?? 0)
+        if (opts.probeHardError) {
+          return Promise.reject(Object.assign(new Error('Page closed'), { name: 'TargetClosedError' }))
+        }
+        const last = shells[clicks[clicks.length - 1]]
+        if (last?.lateDispatch) return Promise.resolve()
+        return Promise.reject(Object.assign(new Error(`probe: Timeout ${fnOpts?.timeout}ms exceeded`), { name: 'TimeoutError' }))
+      },
     }
     return {
       page: page as unknown as Page,
@@ -413,6 +487,7 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
       renderWaits,
       clickTimeouts,
       settledMs,
+      probeWaits,
       xtermVisibilityChecks: () => xtermVisibilityChecks,
     }
   }
@@ -482,6 +557,42 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
     const { page, clicks } = pickerPage({
       Shell: { clickError: 'page-closed' },
     })
+    await expect(selectShellFromPicker(page)).rejects.toThrow('Page closed')
+    expect(clicks).toEqual(['Shell'])
+  })
+
+  it('a click timeout with a LATE DISPATCH (probe finds the created pane) is treated as the success path: render wait, no advance', async () => {
+    // Playwright's click timeout spans every click stage — a timeout does
+    // NOT prove the handler never ran (delta r5). Escalating here is the
+    // historical double-creation path.
+    const { page, clicks, renderWaits, probeWaits } = pickerPage({
+      Shell: { lateDispatch: true, renderVisibleAfterMs: 1_000 },
+      WSL: {}, CMD: {}, PowerShell: {}, Bash: {},
+    })
+    await selectShellFromPicker(page)
+    expect(clicks).toEqual(['Shell']) // no second click — no double creation
+    expect(probeWaits).toEqual([SHELL_PROBE_TIMEOUT_MS])
+    expect(renderWaits).toEqual([SHELL_RENDER_TIMEOUT_MS]) // success-path render wait
+  })
+
+  it('a click timeout with NOTHING created advances to the next shell, and every advance probes once', async () => {
+    const { page, clicks, clickTimeouts, probeWaits } = pickerPage({
+      Bash: { renderVisibleAfterMs: 1_000 }, // Shell/WSL/CMD/PowerShell absent
+    })
+    await selectShellFromPicker(page)
+    expect(clicks).toEqual(['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash'])
+    expect(clickTimeouts).toEqual(Array.from({ length: 5 }, () => SHELL_CLICK_TIMEOUT_MS))
+    // Four absent options -> four probes, each using the exported probe
+    // budget (the fifth click succeeded, so no probe ran for it).
+    expect(probeWaits).toEqual(Array.from({ length: 4 }, () => SHELL_PROBE_TIMEOUT_MS))
+  })
+
+  it('a probe hard error (page closed) propagates loudly, never "option absent"', async () => {
+    const { page, clicks } = pickerPage(
+      {},
+      false,
+      { probeHardError: true },
+    )
     await expect(selectShellFromPicker(page)).rejects.toThrow('Page closed')
     expect(clicks).toEqual(['Shell'])
   })

@@ -544,11 +544,13 @@ cmd_run() {
   # spend at most W+1s together) survives the observed wedge class with
   # margin. Every module-chain spec's per-test deadline derives from this
   # window COMPOSED with the fixture chain's other permitted waits
-  # (extend-only, via the e2eMachineId fixture in
+  # (extend-only and default-class-only, via the e2eMachineId fixture in
   # test/e2e-browser/helpers/fixtures.ts — kata tg4e): window + 1s
-  # connection slack + the picker's permitted worst case (~85.5s) + a
-  # 30s start/body reserve, ~206.5s at this default window — no spec
-  # carries a private budget hook anymore. Override by exporting
+  # connection slack + the picker's permitted worst case (~110.5s, incl.
+  # the post-click-timeout creation probe) + a 30s start/body reserve,
+  # ~231.5s at this default window — specs keep any deadline declared
+  # above the config default, and no spec carries a private budget hook
+  # anymore. Override by exporting
   # FRESHELL_E2E_WS_READY_TIMEOUT_MS (ms) before this script; the derived
   # per-test budget scales with the override.
   echo "FRESHELL_E2E_WS_READY_TIMEOUT_MS: \"${FRESHELL_E2E_WS_READY_TIMEOUT_MS:-90000}\"" >> "$RUN_ENV_FILE"

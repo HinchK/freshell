@@ -67,12 +67,32 @@ test.describe('declared budgets smaller than the wedge budget', () => {
 // Extend-only contract, unlimited side (delta review r4): Playwright's
 // timeout value 0 means UNLIMITED. Replacing an unlimited deadline with
 // any finite budget SHRINKS it, so the wiring must leave a declared 0
-// untouched on both lanes.
+// untouched on both lanes. Resolves ONLY e2eMachineId — the fixture the
+// guard lives in — so the unlimited deadline never wraps a full page
+// boot (goto/picker chains whose wedges could otherwise hang the cloud
+// task to its own kill timer; delta review r5). The registration fetch
+// is independently bounded (AbortSignal) inside the fixture.
 test.describe('declared unlimited (0) deadline', () => {
   test.beforeEach(() => {
     test.setTimeout(0)
   })
-  test('stays unlimited on both lanes (a finite budget would shrink it)', ({ freshellPage }) => {
+  test('stays unlimited on both lanes (a finite budget would shrink it)', ({ e2eMachineId }) => {
     expect(test.info().timeout).toBe(0)
+  })
+})
+
+// Default-class-only contract (delta review r5): a deadline declared
+// ABOVE the config default is an explicit spec budget decision — the
+// wiring must NOT raise it, even when the composed budget is larger.
+// Raising it would touch other flakes' mechanisms (e.g.
+// launch-retry-restart-rust's declared 180s is the deadline its own
+// recorded flake exhausts — that spec's budget belongs to its own
+// deflake run, not to this wiring).
+test.describe('declared deadlines above the config default stay as declared', () => {
+  test.beforeEach(() => {
+    test.setTimeout(180_000)
+  })
+  test('keeps exactly its declared budget on both lanes', ({ freshellPage }) => {
+    expect(test.info().timeout).toBe(180_000)
   })
 })
