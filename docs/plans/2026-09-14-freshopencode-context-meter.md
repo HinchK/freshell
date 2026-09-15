@@ -39,7 +39,7 @@
 - Rust style gates before push: `cargo fmt --all --check`, `cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings`.
 - TypeScript relative imports need `.js` extensions (NodeNext/ESM).
 - No PR creation without explicit user approval; do not push behavior changes to `origin/main`.
-- Focused test commands (delegated, no coordinator gate): `cargo test -p <crate> --locked <selector>`, `npm run test:vitest -- run <file>`, `npm run typecheck`. Broad `npm test`/`check`/`verify` only through the coordinated gate.
+- Focused test commands (delegated, no coordinator gate): NARROWED selectors only — `cargo test -p <crate> --locked <test-file-or-name-filter>`, `npm run test:vitest -- run <file>`, `npm run typecheck`. Whole-crate/zero-filter cargo runs and the repo lanes (`npm run test:server`, `test:integration`, `test`, `check`, `verify`) are BROAD and coordinator-gated — never invoke them raw mid-task; the run's final full-suite verification goes through the coordinated gate at the end.
 - The meter's three client-required fields (`compactPercent`, `contextTokens`, `compactThresholdTokens`) must be all-present or all-absent per session; the client guard (`src/lib/fresh-agent-context-usage.ts:67-80`) renders muted otherwise. `compactThresholdTokens` must be positive on the wire; `compactPercent` an integer 0–100; and `modelContextWindow` is positive-optional — NEVER emit 0 or negative (the wire zod is `.positive()` and both page consumers hard-`.parse` at `src/lib/api.ts:646`/`:681` — one violating item rejects the entire session-directory page for ALL providers).
 - Server-side computation mirrors opencode v1.18.31 exactly (evidence: `reports/load-bearing-opencode-overflow-formula.md`): count = `tokens.total || (input + output + cache.read + cache.write)` (fallback omits `reasoning`, upstream's `||` semantics); `usable` returns 0 when `limit.context === 0` (upstream then disables auto-compaction — the meter must stay unknown, not divide by zero). opencode's `compaction.reserved`/`compaction.auto` user-config overrides are NOT visible to the server (accepted residual; the user's config sets neither).
 - Structured logging (`tracing::debug!`/`warn!`) on every degrade/probe-failure path; no secrets/keys in logs.
@@ -295,9 +295,9 @@ If the scripted-probe fixtures in `model_capabilities.rs` tests grew duplicated 
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Impacted set: every consumer of `ModelCapability` literals and the registry (freshell-opencode lib, freshell-freshagent lib + all its suites that touch capabilities, freshell-ws which depends on freshell-opencode transport types). `ModelCapability` gains a field, so run the full two crates plus freshell-ws:
+Impacted set: every consumer of `ModelCapability` literals and the registry. `ModelCapability` gains a field, so all construction sites must compile — rg-verified they live ONLY in `crates/freshell-opencode/src/catalog.rs` and `crates/freshell-freshagent/src/model_capabilities.rs` (freshell-ws and freshell-server reference the type not at all). Narrowed, delegated runs:
 
-Run: `cargo test -p freshell-opencode --locked && cargo test -p freshell-freshagent --locked && cargo test -p freshell-ws --locked`
+Run: `cargo test -p freshell-opencode --locked --lib catalog && cargo test -p freshell-freshagent --locked --lib model_capabilities`
 Expected: PASS.
 
 - [ ] **Step 7: Commit the task**
@@ -387,10 +387,11 @@ fn insert_message(conn: &Connection, id: &str, session_id: &str, time_created: i
 }
 
 fn insert_part(conn: &Connection, id: &str, message_id: &str, session_id: &str, data: &str) {
-    // The real schema stamps parts with time_created (NOT NULL) +
-    // time_updated; the usage SQL orders by time_created. Tests insert in
-    // story order, so a monotonic counter mirrors "later insert = newer
-    // part" (same order the lexicographic ULID ids would give).
+    // Real-schema fidelity: parts carry time_created (NOT NULL) +
+    // time_updated. The usage WALK orders messages by time_created and a
+    // message's parts by id; tests insert in story order, so a monotonic
+    // counter mirrors "later insert = newer part" (the order lexicographic
+    // ids would give).
     static PART_TIME: AtomicI64 = AtomicI64::new(1000);
     let time_created = PART_TIME.fetch_add(1, Ordering::SeqCst);
     conn.execute(
@@ -577,11 +578,14 @@ In-file unit tests in `crates/freshell-sessions/src/parse/opencode.rs` (`mod tes
         // lunaroute case: context 524288, output 131072, no input limit
         let limits = OpencodeModelLimits { context: 524_288, input: None, output: Some(131_072) };
         assert_eq!(opencode_usable_context(&limits), 524_288 - 32_000);
-        // input branch: reserved = min(20000, maxOutputTokens)
+        // input branch: reserved = min(20000, maxOutputTokens); input: 0 is
+        // JS-falsy upstream and must take the CONTEXT branch, not yield 0
         let input_limited = OpencodeModelLimits { context: 1_000_000, input: Some(100_000), output: Some(131_072) };
         assert_eq!(opencode_usable_context(&input_limited), 100_000 - 20_000);
         let small_output = OpencodeModelLimits { context: 1_000_000, input: Some(100_000), output: Some(8_192) };
         assert_eq!(opencode_usable_context(&small_output), 100_000 - 8_192);
+        let zero_input = OpencodeModelLimits { context: 524_288, input: Some(0), output: Some(131_072) };
+        assert_eq!(opencode_usable_context(&zero_input), 524_288 - 32_000);
         // context 0 disables (upstream returns 0, never a threshold)
         assert_eq!(opencode_usable_context(&OpencodeModelLimits { context: 0, input: None, output: None }), 0);
         // count: total wins; fallback omits reasoning
@@ -685,17 +689,20 @@ pub fn opencode_max_output_tokens(output_limit: Option<i64>) -> i64 {
 /// opencode `session/overflow.ts` `usable()`: the context-token budget the
 /// auto-compaction trigger compares against (`count >= usable`). `context`
 /// of 0 returns 0 exactly as upstream (auto-compaction disabled there).
+/// The `input` branch mirrors JS truthiness: only a NON-ZERO `input` takes
+/// the `input - reserved` branch — `input: 0` is falsy upstream and falls
+/// through to the `context - maxOutputTokens` branch.
 pub fn opencode_usable_context(limits: &OpencodeModelLimits) -> i64 {
     if limits.context == 0 {
         return 0;
     }
     match limits.input {
-        Some(input) => {
+        Some(input) if input != 0 => {
             let reserved =
                 OPENCODE_COMPACTION_BUFFER_TOKENS.min(opencode_max_output_tokens(limits.output));
             (input - reserved).max(0)
         }
-        None => (limits.context - opencode_max_output_tokens(limits.output)).max(0),
+        _ => (limits.context - opencode_max_output_tokens(limits.output)).max(0),
     }
 }
 
@@ -773,71 +780,130 @@ fn opencode_model_composite(raw: &str) -> Option<String> {
 
 and the SELECT gains `, {model_expr}` after `{marker_expr} AS hasThreeViewsMarker` (append as positional index 7); the row mapping closure gains `model: to_opt_string(&row.get::<_, SqlValue>(7)?),`.
 
-4. Bounded usage lookup — the `FIRST_USER_MESSAGE_SQL` discipline verbatim (prepare_cached + query_row + degrade-to-None; pure index searches via `message_session_time_created_id_idx` and `part_message_id_id_idx`):
+4. Bounded usage lookup — a NEWEST-FIRST MESSAGE WALK with two `prepare_cached` statements (the `FIRST_USER_MESSAGE_SQL` degrade discipline; pure index searches via `message_session_time_created_id_idx` and `part_message_id_id_idx`). A single "newest step-finish of the session" scan was tried first and rejected in review: it reads EVERY part of the session and builds a temp B-tree per session per re-list — on this production DB (505k parts, re-lists on every WAL move) that is a proportional scan, not a bounded query. The walk instead probes `1 + (trailing unfinished steps)` MESSAGES, each probe an index search — live-validated read-only on the real DB (the running session's first probe misses its in-flight message, the second probe hits the previous step's usage; both EXPLAIN QUERY PLANs show index searches only — recorded in the round-1 review log):
 
 ```rust
-/// Bounded per-session lookup: the NEWEST `step-finish` part's token usage —
-/// opencode's `lastFinished` (the last FINISHED assistant step). An in-flight
-/// newest step must NOT hide the previous step's usage: live-DB verified
-/// (reports/load-bearing-strategist.md §2) that a running session's newest
-/// assistant message carries only step-start/reasoning parts while the newest
-/// step-finish belongs to an earlier message — so the lookup is "newest
-/// step-finish part of the session", not "last message's step-finish".
-/// opencode writes exactly one step-finish part per assistant step message
-/// and parts are created in step order, so the newest such part IS the last
-/// finished step; the role join is belt-and-braces against odd rows.
-/// O(session parts) — measured read-only ~10–25 ms at 1.8–2.2k parts on the
-/// real DB (no `(session_id, time_created)` part index exists and the
-/// read-only DB cannot gain one; this is the floor for a correct query) —
-/// acceptable because it runs only on token-gated re-lists. Degrades to
-/// `None` on ANY schema/query error.
-const LAST_STEP_FINISH_SQL: &str = "\
-    WITH last_finished AS (\
-        SELECT p.id AS pid, p.data AS pdata \
-        FROM part p JOIN message m ON m.id = p.message_id \
-        WHERE p.session_id = ?1 \
-          AND json_extract(m.data, '$.role') = 'assistant' \
-          AND json_extract(p.data, '$.type') = 'step-finish' \
-        ORDER BY p.time_created DESC, p.id DESC \
-        LIMIT 1\
-    ) \
-    SELECT json_extract(pdata, '$.tokens.total'), \
-           json_extract(pdata, '$.tokens.input'), \
-           json_extract(pdata, '$.tokens.output'), \
-           json_extract(pdata, '$.tokens.cache.read'), \
-           json_extract(pdata, '$.tokens.cache.write') \
-    FROM last_finished";
+/// Assistant messages of a session, newest-first — the usage walk's cursor.
+/// EXPLAIN (live, read-only): `SEARCH m USING INDEX
+/// message_session_time_created_id_idx (session_id=?)` — pure index walk.
+const ASSISTANT_MESSAGES_NEWEST_FIRST_SQL: &str = "\
+    SELECT m.id FROM message m \
+    WHERE m.session_id = ?1 AND json_extract(m.data, '$.role') = 'assistant' \
+    ORDER BY m.time_created DESC, m.id DESC";
 
+/// One message's newest step-finish part — the usage walk's probe. EXPLAIN
+/// (live, read-only): `SEARCH p USING INDEX part_message_id_id_idx
+/// (message_id=?)`.
+const MESSAGE_STEP_FINISH_SQL: &str = "\
+    SELECT json_extract(p.data, '$.tokens.total'), \
+           json_extract(p.data, '$.tokens.input'), \
+           json_extract(p.data, '$.tokens.output'), \
+           json_extract(p.data, '$.tokens.cache.read'), \
+           json_extract(p.data, '$.tokens.cache.write') \
+    FROM part p \
+    WHERE p.message_id = ?1 AND json_extract(p.data, '$.type') = 'step-finish' \
+    ORDER BY p.id DESC LIMIT 1";
+
+/// Bounded per-session lookup: the NEWEST finished assistant step's token
+/// usage — opencode's `lastFinished`. Walks assistant messages newest-first
+/// (index order), probing each for a step-finish part; the FIRST hit is the
+/// last finished step, so an in-flight or interrupted trailing step is
+/// skipped naturally (live-DB verified: a running session's newest message
+/// carries only step-start/reasoning parts). Work is
+/// `1 + trailing-unfinished-steps` message probes, each a pure index
+/// search — never a whole-session part scan. Degrades to `None` on ANY
+/// schema/query error.
 fn last_step_finish_usage_for_session(conn: &Connection, session_id: &str) -> Option<OpencodeStepUsage> {
-    let mut stmt = match conn.prepare_cached(LAST_STEP_FINISH_SQL) {
+    let mut messages = match conn.prepare_cached(ASSISTANT_MESSAGES_NEWEST_FIRST_SQL) {
         Ok(stmt) => stmt,
         Err(e) => {
             tracing::debug!(
                 session_id,
                 error = %e,
-                "opencode step-finish prepare failed; degrading to None"
+                "opencode usage walk prepare failed; degrading to None"
             );
             return None;
         }
     };
-    match stmt.query_row(rusqlite::params![session_id], |row| {
-        Ok(OpencodeStepUsage {
-            total: row.get(0)?,
-            input: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-            output: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
-            cache_read: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
-            cache_write: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
-        })
-    }) {
-        Ok(usage) => Some(usage),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+    let mut probe = match conn.prepare_cached(MESSAGE_STEP_FINISH_SQL) {
+        Ok(stmt) => stmt,
         Err(e) => {
             tracing::debug!(
                 session_id,
                 error = %e,
-                "opencode step-finish query failed; degrading to None"
+                "opencode usage probe prepare failed; degrading to None"
             );
-            None
+            return None;
+        }
+    };
+    let mut rows = match messages.query(rusqlite::params![session_id]) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::debug!(
+                session_id,
+                error = %e,
+                "opencode usage walk query failed; degrading to None"
+            );
+            return None;
+        }
+    };
+    let mut probes: u32 = 0;
+    loop {
+        let message_id: Option<String> = match rows.next() {
+            Ok(Some(row)) => match row.get(0) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::debug!(
+                        session_id,
+                        error = %e,
+                        "opencode usage walk row read failed; degrading to None"
+                    );
+                    return None;
+                }
+            },
+            Ok(None) => return None,
+            Err(e) => {
+                tracing::debug!(
+                    session_id,
+                    error = %e,
+                    "opencode usage walk advance failed; degrading to None"
+                );
+                return None;
+            }
+        };
+        let Some(message_id) = message_id else { continue };
+        probes += 1;
+        match probe.query_row(rusqlite::params![message_id], |row| {
+            Ok(OpencodeStepUsage {
+                total: row.get(0)?,
+                input: row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                output: row.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                cache_read: row.get::<_, Option<i64>>(3)?.unwrap_or(0),
+                cache_write: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
+            })
+        }) {
+            Ok(usage) => {
+                if probes > 8 {
+                    // Observability, not truncation: a session with many
+                    // trailing unfinished steps pays more probes — still
+                    // bounded by its own message count, all index searches.
+                    tracing::debug!(
+                        session_id,
+                        probes,
+                        "opencode usage walk probed several messages"
+                    );
+                }
+                return Some(usage);
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => continue,
+            Err(e) => {
+                tracing::debug!(
+                    session_id,
+                    error = %e,
+                    "opencode step-finish probe failed; degrading to None"
+                );
+                return None;
+            }
         }
     }
 }
@@ -872,9 +938,9 @@ Check the two per-session bounded lookups (`first_user_message_for_session`, `la
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Impacted set: every suite touching the opencode parser and `OpencodeSession`/`OpencodeSessionRow` shape — listing parity, first-message, by-id probes, quarantine, directory_index lib tests, plus the server's fixture-driven suites that read opencode DBs.
+Impacted set: every suite touching the opencode parser and `OpencodeSession`/`OpencodeSessionRow` shape — listing parity, first-message, by-id probes, quarantine, directory_index lib tests, plus the server's fixture-driven suites that read opencode DBs. Narrowed, delegated runs:
 
-Run: `cargo test -p freshell-sessions --locked && cargo test -p freshell-server --locked -- session_directory:: && cargo test -p freshell-server --locked -- existence`
+Run: `cargo test -p freshell-sessions --locked --test opencode_usage --test opencode_first_message --test opencode_sqlite --test opencode_exists_by_id --test opencode_row_by_id --test opencode_subagent_by_id --test malformed_data_quarantine && cargo test -p freshell-sessions --locked --lib -- parse::opencode && cargo test -p freshell-server --locked -- session_directory:: existence auto_title_sweep`
 Expected: PASS (server suites pass because the default construction is unchanged so far — `token_usage` is still `None` at this point).
 
 - [ ] **Step 7: Commit the task**
@@ -893,14 +959,14 @@ git commit -m "feat(sessions): parse opencode session model and last step-finish
 
 **Interfaces:**
 - Consumes (Task 2): `OpencodeSession.model/.last_usage`, `OpencodeModelLimits`, `opencode_usable_context`, `opencode_context_count`, `opencode_compact_percent`.
-- Produces: `freshell_sessions::directory_index::OpencodeModelLimitResolver = Arc<dyn Fn(&str) -> Option<parse::OpencodeModelLimits> + Send + Sync>`; `OpencodeSource::with_model_limit_resolver(OpencodeModelLimitResolver) -> Self`; `IndexedSession.token_usage` populated for opencode rows when usage + resolvable limits exist. Task 4 consumes the resolver seam.
+- Produces: `freshell_sessions::directory_index::OpencodeModelLimitResolver = Arc<dyn Fn(&str /* session cwd */, &str /* "provider/model" }) -> Option<parse::OpencodeModelLimits> + Send + Sync>`; `OpencodeSource::with_model_limit_resolver(OpencodeModelLimitResolver) -> Self`; `IndexedSession.token_usage` populated for opencode rows when usage + resolvable limits exist. Task 4 consumes the resolver seam.
 - No changes to `IndexedSession`, `DirItem`, or any wire type.
 
 - [ ] **Step 1: Write the failing tests**
 
 In `directory_index.rs`'s in-file test module (`mod tests`, `pub(crate)` — the fixture builders live at `:3802-3866`):
 
-1. Extend the fixture builder `opencode_data_home_with_sessions` so its session schema includes a `model TEXT` column (existing rows unaffected — NULL) and keep its signature; if the builder builds the DB through an internal writable conn helper, expose that conn (or a sibling builder) so tests can seed messages/parts. The fixture `part` table must mirror the real schema's `time_created` (NOT NULL) + `time_updated` columns — the corrected usage SQL orders by `part.time_created` — and the seed helper stamps them monotonically (later insert = newer part).
+1. Extend the fixture builder `opencode_data_home_with_sessions` so its session schema includes a `model TEXT` column (existing rows unaffected — NULL) and keep its signature; if the builder builds the DB through an internal writable conn helper, expose that conn (or a sibling builder) so tests can seed messages/parts. The fixture `message`/`part` tables must mirror the real schema's column shape (id/linkage/time as real columns — the usage walk orders messages by `time_created` and a message's parts by `id`; payloads in the JSON `data` column).
 2. Add seed helpers next to it (same writable-conn convention as `seed_opencode_user_message` at `:3833-3866`):
 
 ```rust
@@ -915,9 +981,9 @@ In `directory_index.rs`'s in-file test module (`mod tests`, `pub(crate)` — the
         )
         .unwrap();
         // Column list must match the fixture part schema (id, message_id,
-        // session_id, time_created NOT NULL, time_updated, data) — the
-        // corrected usage SQL orders by part.time_created; later inserts
-        // stamp later times.
+        // session_id, time_created NOT NULL, time_updated, data) — the usage
+        // walk orders a message's parts by id; time columns are real-schema
+        // fidelity, later inserts stamp later times.
         conn.execute(
             "INSERT INTO part VALUES ('prt_usage', 'msg_usage', ?1, 900, 900, ?2)",
             rusqlite::params![
@@ -950,7 +1016,33 @@ In `directory_index.rs`'s in-file test module (`mod tests`, `pub(crate)` — the
     ) -> freshell_sessions::directory_index::OpencodeModelLimitResolver {
         let map: std::collections::HashMap<String, freshell_sessions::parse::OpencodeModelLimits> =
             pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
-        std::sync::Arc::new(move |model: &str| map.get(model).cloned())
+        std::sync::Arc::new(move |_cwd: &str, model: &str| map.get(model).cloned())
+    }
+
+    #[test]
+    fn opencode_resolver_receives_the_session_cwd() {
+        // The resolver's FIRST parameter is the session cwd (per-catalog
+        // provenance); the sessions crate must hand it through verbatim.
+        let (dir, _guard) = opencode_data_home_with_sessions("usage-cwd", vec![("ses_cwd", "Named")]);
+        set_opencode_session_model(&dir, "ses_cwd", OPENCODE_TEST_MODEL);
+        seed_opencode_step_finish(
+            &dir,
+            "ses_cwd",
+            r#"{"total":1000,"input":10,"output":20,"cache":{"write":0,"read":970}}"#,
+        );
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_for_resolver = seen.clone();
+        let resolver: freshell_sessions::directory_index::OpencodeModelLimitResolver =
+            std::sync::Arc::new(move |cwd: &str, model: &str| {
+                seen_for_resolver.lock().unwrap().push((cwd.to_string(), model.to_string()));
+                Some(freshell_sessions::parse::OpencodeModelLimits { context: 524_288, input: None, output: Some(131_072) })
+            });
+        let source = OpencodeSource::new(/* builder's data home */).with_model_limit_resolver(resolver);
+        assert!(source.scan()[0].token_usage.is_some());
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [(/* builder's session directory */ "/repo/x".to_string(), "lunaroute/glm-5.3-vision-background".to_string())],
+        );
     }
 
     #[test]
@@ -1051,13 +1143,16 @@ In `crates/freshell-sessions/src/directory_index.rs`:
 
 ```rust
 /// Sync model-limit resolver handed to [`OpencodeSource`] by the
-/// freshell-server composition root: `model id ("provider/model") ->
-/// limits`. The directory sweep runs on `spawn_blocking`, so the seam is
-/// synchronous by contract — production reads a pre-warmed snapshot, and
-/// the default (no resolver) always answers `None`, keeping every
-/// existing construction meter-unknown.
-pub type OpencodeModelLimitResolver =
-    std::sync::Arc<dyn Fn(&str) -> Option<crate::parse::OpencodeModelLimits> + Send + Sync>;
+/// freshell-server composition root: `(session cwd, model id
+/// ("provider/model")) -> limits`. The directory sweep runs on
+/// `spawn_blocking`, so the seam is synchronous by contract — production
+/// reads a pre-warmed snapshot (cwd-keyed so a project-scoped catalog can
+/// never leak another project's limits), and the default (no resolver)
+/// always answers `None`, keeping every existing construction
+/// meter-unknown.
+pub type OpencodeModelLimitResolver = std::sync::Arc<
+    dyn Fn(&str, &str) -> Option<crate::parse::OpencodeModelLimits> + Send + Sync,
+>;
 ```
 
 2. `OpencodeSource` gains the field + builder (keeping `new` signature unchanged — every existing call site stays valid):
@@ -1095,7 +1190,7 @@ impl OpencodeSource {
             .provider
             .list_sessions(now_ms())
             .map_err(|e| e.to_string())?;
-        let resolver: Option<&dyn Fn(&str) -> Option<crate::parse::OpencodeModelLimits>> =
+        let resolver: Option<&dyn Fn(&str, &str) -> Option<crate::parse::OpencodeModelLimits>> =
             self.model_limit_resolver.as_deref();
         Ok(listing
             .sessions
@@ -1116,7 +1211,7 @@ impl OpencodeSource {
 ```
 
 and the mapping fn gains the `resolver` parameter (signature:
-`fn opencode_session_to_indexed(s: crate::parse::OpencodeSession, resolver: Option<&dyn Fn(&str) -> Option<crate::parse::OpencodeModelLimits>>) -> IndexedSession`), plus the new assembly helper next to it:
+`fn opencode_session_to_indexed(s: crate::parse::OpencodeSession, resolver: Option<&dyn Fn(&str, &str) -> Option<crate::parse::OpencodeModelLimits>>) -> IndexedSession`), plus the new assembly helper next to it:
 
 ```rust
 /// Assemble the opencode [`TokenSummary`]: the four required counters plus
@@ -1127,13 +1222,13 @@ and the mapping fn gains the `resolver` parameter (signature:
 /// client guard keeps the meter muted); no usage emits `None`.
 fn opencode_token_usage(
     s: &crate::parse::OpencodeSession,
-    resolver: Option<&dyn Fn(&str) -> Option<crate::parse::OpencodeModelLimits>>,
+    resolver: Option<&dyn Fn(&str, &str) -> Option<crate::parse::OpencodeModelLimits>>,
 ) -> Option<crate::meta::TokenSummary> {
     let usage = s.last_usage.as_ref()?;
     let count = crate::parse::opencode_context_count(usage);
     let cached = usage.cache_read.max(0).saturating_add(usage.cache_write.max(0));
     let (model_context_window, compact_threshold_tokens, compact_percent) =
-        match s.model.as_deref().and_then(|model| resolver?(model)) {
+        match s.model.as_deref().and_then(|model| resolver?(s.cwd.as_str(), model)) {
             None => (None, None, None),
             Some(limits) => {
                 let usable = crate::parse::opencode_usable_context(&limits);
@@ -1160,7 +1255,7 @@ fn opencode_token_usage(
 }
 ```
 
-(`resolver?(model)` — the `?` on `Option<&dyn Fn…>` short-circuits to the `None` arm when no resolver is installed.)
+(`resolver?(s.cwd.as_str(), model)` — the `?` on `Option<&dyn Fn…>` short-circuits to the `None` arm when no resolver is installed. The session cwd rides along so the server-side snapshot can resolve per-project catalogs without cross-project limit leaks.)
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -1173,9 +1268,9 @@ Keep `opencode_token_usage` beside `opencode_session_to_indexed`; no further ref
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Impacted set: the full sessions crate (the mapping fn signature changed and `OpencodeSource` grew a field) plus every server suite that constructs `OpencodeSource` or asserts on opencode listings (existence, auto_title_sweep, session_directory fixture suites).
+Impacted set: the sessions crate's opencode surfaces (the mapping fn signature changed and `OpencodeSource` grew a field) plus every server suite that constructs `OpencodeSource` or asserts on opencode listings (existence, auto_title_sweep, session_directory fixture suites). Narrowed, delegated runs:
 
-Run: `cargo test -p freshell-sessions --locked && cargo test -p freshell-server --locked`
+Run: `cargo test -p freshell-sessions --locked --lib -- directory_index::tests::opencode parse::opencode && cargo test -p freshell-sessions --locked --test opencode_usage --test opencode_first_message --test opencode_sqlite && cargo test -p freshell-server --locked -- session_directory:: existence auto_title_sweep`
 Expected: PASS (server behavior unchanged — production wiring is still meter-unknown until Task 4).
 
 - [ ] **Step 7: Commit the task**
@@ -1202,19 +1297,15 @@ git commit -m "feat(sessions): compute opencode TokenSummary via injected model-
 
 - [ ] **Step 1: Write the failing tests**
 
-1. In `crates/freshell-server/src/opencode_limits.rs` (create the module with its `mod tests` from the start — the production parts come in Step 3):
+1. Add `mod opencode_limits;` to `crates/freshell-server/src/main.rs` NOW (next to the other crate-local module declarations) — a bin-crate module file is undiscovered without the declaration, and the red step below must actually see these tests fail. Then create `crates/freshell-server/src/opencode_limits.rs` with its `mod tests` (the production parts come in Step 3; the helpers below are what the tests exercise):
 
 ```rust
     #[test]
-    fn merge_catalog_converts_and_upserts_limits_only() {
-        let mut map = std::collections::HashMap::new();
-        merge_catalog(
-            vec![
-                model_capability("lunaroute/glm-5.3", Some((524_288, None, Some(131_072)))),
-                model_capability("lunaroute/unlimited", None),
-            ],
-            &mut map,
-        );
+    fn limit_map_keeps_limit_bearing_models() {
+        let map = limit_map(vec![
+            model_capability("lunaroute/glm-5.3", Some((524_288, None, Some(131_072)))),
+            model_capability("lunaroute/unlimited", None),
+        ]);
         assert_eq!(
             map.get("lunaroute/glm-5.3"),
             Some(&OpencodeModelLimits { context: 524_288, input: None, output: Some(131_072) })
@@ -1243,38 +1334,74 @@ git commit -m "feat(sessions): compute opencode TokenSummary via injected model-
     }
 
     #[test]
-    fn resolver_exact_match_wins_then_single_effort_strip() {
+    fn replace_bucket_wholesale_learns_removals_and_reports_change() {
+        // Wholesale bucket replacement: a catalog that DROPPED a limit
+        // removes the stale entry (that model's sessions meter-unknown
+        // again — never a permanently-stale threshold), and only real
+        // content changes report `true` (the re-list nudge signal).
         let snap = snapshot();
-        snap.write().unwrap().insert(
-            "lunaroute/deepseek-4.1-flash".into(),
-            OpencodeModelLimits { context: 1_048_576, input: None, output: Some(262_144) },
-        );
-        snap.write().unwrap().insert(
-            "lunaroute/glm-5.3-vision-background".into(),
-            OpencodeModelLimits { context: 524_288, input: None, output: Some(131_072) },
-        );
-        // exact match wins — never strips
-        let exact = resolve_from_snapshot(&snap, "lunaroute/glm-5.3-vision-background").unwrap();
-        assert_eq!(exact.context, 524_288);
-        // effort-suffixed composite (3+ segments) resolves its base
-        let stripped = resolve_from_snapshot(&snap, "lunaroute/deepseek-4.1-flash/low").unwrap();
-        assert_eq!(stripped.context, 1_048_576);
-        // 2-segment miss stays a miss — never strips
-        assert!(resolve_from_snapshot(&snap, "lunaroute/unknown").is_none());
-        // org/name composites resolve exact too
-        let org_name = resolve_from_snapshot(&snap, "ms-runpod/moonshotai/Kimi-K3");
-        assert_eq!(org_name, None); // not in THIS snapshot; the strip test above covers 3-segment hits
+        let a = OpencodeModelLimits { context: 1, input: None, output: None };
+        assert!(replace_bucket(&snap, "/repo/a", [("m/x".into(), a.clone())].into())); // first fill: change
+        assert!(!replace_bucket(&snap, "/repo/a", [("m/x".into(), a.clone())].into())); // identical: no change
+        let changed = OpencodeModelLimits { context: 2, input: None, output: None };
+        assert!(replace_bucket(&snap, "/repo/a", [("m/x".into(), changed)].into())); // value changed: change
+        // a probe that now returns NO limit-bearing models empties the
+        // bucket (removal learned) and reports change
+        assert!(replace_bucket(&snap, "/repo/a", std::collections::HashMap::new()));
+        assert!(resolve_from_snapshot(&snap, "/repo/a", "m/x").is_none());
     }
 
     #[test]
-    fn upsert_reports_gains_only() {
+    fn resolver_prefers_session_cwd_bucket_then_default_with_effort_strip() {
+        // cwd-keyed buckets: a project-scoped catalog can never leak
+        // another project's limits, and a cwd without its own catalog falls
+        // back to the default (cwd-less) one. Effort strip: 3+ segment
+        // composites resolve their configured base; 2-segment misses stay
+        // misses.
         let snap = snapshot();
-        let a = OpencodeModelLimits { context: 1, input: None, output: None };
-        assert!(upsert_limits(&snap, [("m/x".into(), a.clone())].into())); // first fill: gain
-        assert!(!upsert_limits(&snap, [("m/x".into(), a.clone())].into())); // same value: no gain
-        let a2 = OpencodeModelLimits { context: 2, input: None, output: None };
-        assert!(upsert_limits(&snap, [("m/x".into(), a2.clone())].into())); // changed value: gain
-        assert!(upsert_limits(&snap, [("m/y".into(), a2.clone())].into())); // new key: gain
+        replace_bucket(
+            &snap,
+            "",
+            [("lunaroute/deepseek-4.1-flash".into(), OpencodeModelLimits { context: 1_048_576, input: None, output: Some(262_144) })].into(),
+        );
+        replace_bucket(
+            &snap,
+            "/repo/a",
+            [("lunaroute/glm-5.3".into(), OpencodeModelLimits { context: 200_000, input: None, output: Some(131_072) })].into(),
+        );
+        // the cwd bucket wins for its own project
+        assert_eq!(resolve_from_snapshot(&snap, "/repo/a", "lunaroute/glm-5.3").unwrap().context, 200_000);
+        // a different project does NOT see /repo/a's limits (no leak), and
+        // falls back to the default catalog
+        assert_eq!(resolve_from_snapshot(&snap, "/repo/other", "lunaroute/glm-5.3"), None);
+        assert_eq!(resolve_from_snapshot(&snap, "/repo/other", "lunaroute/deepseek-4.1-flash").unwrap().context, 1_048_576);
+        // exact match is tried first; 2-segment misses never strip
+        assert!(resolve_from_snapshot(&snap, "/repo/other", "lunaroute/unknown").is_none());
+        // effort-suffixed composite (3+ segments) resolves its base
+        assert_eq!(resolve_from_snapshot(&snap, "/repo/other", "lunaroute/deepseek-4.1-flash/low").unwrap().context, 1_048_576);
+    }
+
+    #[tokio::test]
+    async fn refresh_once_fills_the_snapshot_relists_and_lights_the_meter() {
+        // The production-chain test (plan-review finding 3): registry →
+        // refresh_once → snapshot → the PRODUCTION resolver closure →
+        // mark_provider_dirty → re-list → meter visible. A REAL
+        // `ModelCapabilityRegistry` built via its test seams with a
+        // scripted catalog probe (one ModelCapability with a limit —
+        // mirrors the registry's existing scripted-probe tests), a REAL
+        // `SessionIndex` over a fixture opencode.db whose `OpencodeSource`
+        // carries `build_opencode_limit_resolver(snapshot.clone())`, and
+        // the fixture session seeded with a model + a last step-finish
+        // part (mirror the Task 3 fixture helpers). After ONE
+        // `refresh_once(...)` cycle the test asserts, driving the index's
+        // refresh the same way the existing mark_provider_dirty tests do
+        // (directory_index.rs:5900+; generation-bump pins at :2925+):
+        //   (a) the snapshot's default bucket contains the probe's limits;
+        //   (b) `resolve_from_snapshot` now resolves the fixture model;
+        //   (c) the re-listed indexed row's `token_usage` carries
+        //       compactThresholdTokens/compactPercent (the meter is lit)
+        //       — WITHOUT any new opencode DB write (proves the F2 nudge);
+        //   (d) the index's change generation advanced (broadcast armed).
     }
 ```
 
@@ -1293,7 +1420,7 @@ git commit -m "feat(sessions): compute opencode TokenSummary via injected model-
         // tests (~:4309-4323), adding a `model` column value and an
         // assistant message + step-finish part.
         let resolver: freshell_sessions::directory_index::OpencodeModelLimitResolver =
-            std::sync::Arc::new(|model: &str| match model {
+            std::sync::Arc::new(|_cwd: &str, model: &str| match model {
                 "lunaroute/glm-5.3-vision-background" => Some(
                     freshell_sessions::parse::OpencodeModelLimits { context: 524_288, input: None, output: Some(131_072) },
                 ),
@@ -1382,7 +1509,7 @@ with:
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
 Run: `cargo test -p freshell-server --locked -- opencode_limits`
-Expected: FAIL (module/function missing — compile error).
+Expected: FAIL — compile error (`mod opencode_limits;` is declared from Step 1, so the tests ARE discovered; `limit_map`/`replace_bucket`/`resolve_from_snapshot`/`build_opencode_limit_resolver`/`refresh_once` do not exist yet). A passing zero-test run here means the module declaration was forgotten — do not proceed on a vacuous green.
 
 Run: `cargo test -p freshell-server --locked -- session_directory::tests`
 Expected: FAIL (new tests fail: `with_model_limit_resolver` missing and/or tokenUsage absent on opencode items — compile-first, then assertion).
@@ -1402,15 +1529,21 @@ Expected: PASS (comment-only client change) — run it here to catch accidental 
 //! resolver (the directory sweep runs on `spawn_blocking`); the catalog
 //! probe is async and process-spawning. This module owns the bridge: an
 //! async refresh task reads the freshagent `ModelCapabilityRegistry`
-//! (TTL/single-flight inside the registry) and merges
-//! `model id -> limits` into a sync-read snapshot; the resolver closure
-//! handed to `OpencodeSource` reads that snapshot. A cold or failed
-//! refresh keeps the meter unknown — the accepted graceful degradation.
-//! A refresh that GAINS entries marks the opencode provider dirty so the
-//! index re-lists and broadcasts without needing an opencode DB write (a
-//! warm snapshot alone would leave frozen DirectEntry rows meter-muted
-//! until unrelated activity). The resolver lookup is exact-match first
-//! with a single effort-suffix strip (opencode stores the runtime model as
+//! (TTL/single-flight inside the registry) and stores per-catalog buckets
+//! — `bucket ("" = the default cwd-less catalog, else the cwd) -> model id
+//! -> limits` — in a sync-read snapshot; the resolver closure handed to
+//! `OpencodeSource` (built by [`build_opencode_limit_resolver`], the exact
+//! production wiring) reads it with the SESSION's cwd, so a project-scoped
+//! catalog can never leak another project's limits. Buckets are replaced
+//! WHOLESALE on every successful probe, so a config edit that removes a
+//! limit is learned — that model's sessions meter-unknown again instead of
+//! carrying a stale threshold forever. A cold or failed refresh keeps the
+//! meter unknown — the accepted graceful degradation. A refresh that
+//! CHANGES any bucket marks the opencode provider dirty so the index
+//! re-lists and broadcasts without needing an opencode DB write (a warm
+//! snapshot alone would leave frozen DirectEntry rows meter-muted until
+//! unrelated activity). The resolver lookup is exact-match first with a
+//! single effort-suffix strip (opencode stores the runtime model as
 //! `model/effort`; the catalog keys base models only — live-verified).
 
 use std::collections::HashMap;
@@ -1418,7 +1551,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use freshell_freshagent::model_capabilities::{ModelCapability, ModelCapabilityRegistry, SessionType};
-use freshell_sessions::directory_index::SessionIndex;
+use freshell_sessions::directory_index::{OpencodeModelLimitResolver, SessionIndex};
 use freshell_sessions::parse::OpencodeModelLimits;
 use freshell_sessions::IndexedSession;
 
@@ -1430,65 +1563,104 @@ pub const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// so a directory full of distinct worktrees can never spawn an
 /// unbounded probe storm.
 pub const PER_CWD_SESSION_WINDOW: usize = 16;
+/// The bucket key for the cwd-less default catalog (mirrors the registry's
+/// own blank-cwd-as-default discipline, `catalog_cache_key`).
+pub const DEFAULT_BUCKET: &str = "";
 
-pub type Snapshot = Arc<RwLock<HashMap<String, OpencodeModelLimits>>>;
+/// `bucket -> (model id -> limits)`. Buckets keep per-project catalogs
+/// separate; wholesale replacement keeps entries honest.
+pub type Snapshot = Arc<RwLock<HashMap<String, HashMap<String, OpencodeModelLimits>>>>;
 
 pub fn snapshot() -> Snapshot {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
-/// Convert + upsert: only limit-bearing models enter the snapshot (a
-/// catalog that omits a model's limit leaves any earlier entry in place —
-/// the same staleness class as the registry's own TTL).
-pub(crate) fn merge_catalog(models: Vec<ModelCapability>, into: &mut HashMap<String, OpencodeModelLimits>) {
-    for model in models {
-        if let Some(limit) = model.limit {
-            into.insert(
-                model.id,
-                OpencodeModelLimits { context: limit.context, input: limit.input, output: limit.output },
-            );
-        }
-    }
+/// The snapshot bucket a catalog belongs to: the trimmed cwd, or the
+/// default bucket for a missing/blank cwd.
+fn bucket_for_cwd(cwd: Option<&str>) -> String {
+    cwd.map(str::trim)
+        .filter(|c| !c.is_empty())
+        .unwrap_or(DEFAULT_BUCKET)
+        .to_string()
 }
 
-/// Snapshot lookup with the effort-variant fallback (F4): exact composite
-/// match first (`provider/model`); if that misses and the composite has 3+
-/// segments (`provider/model/effort` — opencode stores the runtime model
-/// with the effort suffix; live-verified the catalog keys only base
-/// models), strip ONE trailing segment and retry the base. Two-segment
-/// composites never strip (a stripped one-segment key could never match a
-/// snapshot key anyway — snapshot keys always contain a slash).
-/// Residual (accepted): a `provider/org/name/effort` id whose stripped base
-/// is configured resolves the base's limits — the same model family, the
-/// same base-then-variant resolution order opencode itself uses.
-pub(crate) fn resolve_from_snapshot(snap: &Snapshot, model: &str) -> Option<OpencodeModelLimits> {
+/// One successful catalog's limit-bearing models, keyed by composite model
+/// id (models without a limit block are absent — unresolvable, meter
+/// unknown).
+pub(crate) fn limit_map(models: Vec<ModelCapability>) -> HashMap<String, OpencodeModelLimits> {
+    models
+        .into_iter()
+        .filter_map(|model| {
+            model.limit.map(|limit| {
+                (
+                    model.id,
+                    OpencodeModelLimits { context: limit.context, input: limit.input, output: limit.output },
+                )
+            })
+        })
+        .collect()
+}
+
+/// Snapshot lookup for a session: its OWN cwd's bucket first, then the
+/// default catalog's bucket. Within each bucket: exact composite match
+/// first; if that misses and the composite has 3+ segments
+/// (`provider/model/effort` — opencode stores the runtime model with the
+/// effort suffix; live-verified the catalog keys only base models), strip
+/// ONE trailing segment and retry the base. Two-segment composites never
+/// strip. Residual (accepted): a `provider/org/name/effort` id whose
+/// stripped base is configured resolves the base's limits — the same
+/// model family, the same base-then-variant resolution order opencode
+/// itself uses.
+pub(crate) fn resolve_from_snapshot(
+    snap: &Snapshot,
+    cwd: &str,
+    model: &str,
+) -> Option<OpencodeModelLimits> {
     let map = snap.read().ok()?;
-    if let Some(limits) = map.get(model) {
-        return Some(limits.clone());
-    }
-    if model.matches('/').count() >= 2 {
-        if let Some((base, _)) = model.rsplit_once('/') {
-            return map.get(base).cloned();
+    let try_bucket = |models: &HashMap<String, OpencodeModelLimits>| -> Option<OpencodeModelLimits> {
+        if let Some(limits) = models.get(model) {
+            return Some(limits.clone());
+        }
+        if model.matches('/').count() >= 2 {
+            if let Some((base, _)) = model.rsplit_once('/') {
+                return models.get(base).cloned();
+            }
+        }
+        None
+    };
+    let bucket = bucket_for_cwd(Some(cwd));
+    if !bucket.is_empty() {
+        if let Some(limits) = map.get(&bucket).and_then(try_bucket) {
+            return Some(limits);
         }
     }
-    None
+    map.get(DEFAULT_BUCKET).and_then(try_bucket)
 }
 
-/// Upsert `fresh` into the snapshot; `true` when any entry is new or changed
-/// (the F2 re-list nudge signal). A poisoned lock returns false — the next
-/// cycle retries.
-pub(crate) fn upsert_limits(snap: &Snapshot, fresh: HashMap<String, OpencodeModelLimits>) -> bool {
+/// The production resolver closure `main.rs` hands to `OpencodeSource` —
+/// factored out so the exact production wiring is unit-testable (the
+/// plan-review chain test drives the same closure).
+pub fn build_opencode_limit_resolver(snap: Snapshot) -> OpencodeModelLimitResolver {
+    Arc::new(move |cwd: &str, model: &str| resolve_from_snapshot(&snap, cwd, model))
+}
+
+/// Replace one bucket's contents WHOLESALE with a successful catalog's
+/// limit map (a catalog that dropped a limit removes the stale entry —
+/// that model's sessions meter-unknown again; never a permanently-stale
+/// threshold). Returns `true` when the bucket content changed (the re-list
+/// nudge signal — an identical refresh must not nudge). A poisoned lock
+/// returns false — the next cycle retries.
+pub(crate) fn replace_bucket(snap: &Snapshot, bucket: &str, fresh: HashMap<String, OpencodeModelLimits>) -> bool {
     let Ok(mut map) = snap.write() else {
         return false;
     };
-    let mut gained = false;
-    for (id, limits) in fresh {
-        if map.get(&id) != Some(&limits) {
-            gained = true;
-        }
-        map.insert(id, limits);
+    let changed = map.get(bucket) != Some(&fresh);
+    if fresh.is_empty() {
+        map.remove(bucket);
+    } else {
+        map.insert(bucket.to_string(), fresh);
     }
-    gained
+    changed
 }
 
 /// The distinct cwds of the `window` most recent opencode sessions,
@@ -1520,26 +1692,35 @@ async fn refresh_once(
     session_index: &SessionIndex,
     snap: &Snapshot,
 ) {
-    let mut fresh = HashMap::new();
+    // `?e` (Debug): CapabilityError implements Debug, not Display.
+    let mut nudge = false;
     match registry.models(SessionType::FreshOpencode, None).await {
-        Ok(models) => merge_catalog(models, &mut fresh),
-        Err(e) => tracing::warn!(error = %e, "opencode default catalog probe failed; keeping previous model limits"),
+        Ok(models) => {
+            if replace_bucket(snap, DEFAULT_BUCKET, limit_map(models)) {
+                nudge = true;
+            }
+        }
+        Err(e) => tracing::warn!(error = ?e, "opencode default catalog probe failed; keeping previous limits"),
     }
     let sessions = session_index.snapshot().await;
     for cwd in recent_opencode_cwds(&sessions, PER_CWD_SESSION_WINDOW) {
         match registry.models(SessionType::FreshOpencode, Some(cwd.clone())).await {
-            Ok(models) => merge_catalog(models, &mut fresh),
-            Err(e) => tracing::debug!(cwd = %cwd, error = %e, "opencode per-cwd catalog probe failed; keeping previous model limits"),
+            Ok(models) => {
+                if replace_bucket(snap, &bucket_for_cwd(Some(&cwd)), limit_map(models)) {
+                    nudge = true;
+                }
+            }
+            Err(e) => tracing::debug!(cwd = %cwd, error = ?e, "opencode per-cwd catalog probe failed; keeping previous limits"),
         }
     }
-    if upsert_limits(snap, fresh) {
-        // F2: the snapshot gained entries (first fill after boot, or a new
-        // model) — nudge a re-list so already-listed opencode rows pick the
-        // limits up without waiting for an unrelated opencode DB write
-        // (DirectEntry rows are change-token/dirty-gated only). The forced
-        // re-list counts as changed and advances the change generation, so
-        // `subscribe_changes` consumers broadcast and idle sessions' meters
-        // light up.
+    if nudge {
+        // F2: a bucket changed (first fill after boot, a new model, a
+        // config edit) — nudge a re-list so already-listed opencode rows
+        // pick the new limits up without waiting for an unrelated opencode
+        // DB write (DirectEntry rows are change-token/dirty-gated only).
+        // The forced re-list counts as changed and advances the change
+        // generation, so `subscribe_changes` consumers broadcast and idle
+        // sessions' meters light up.
         session_index.mark_provider_dirty("opencode");
     }
 }
@@ -1559,21 +1740,18 @@ pub async fn refresh_loop(
 
 `crates/freshell-server/src/main.rs`:
 
-1. Module decl: `mod opencode_limits;` (next to the other crate-local modules).
+1. Module decl: already added in Step 1 (`mod opencode_limits;`).
 2. Before the `session_index` construction (~line 703): `let opencode_limits = opencode_limits::snapshot();`
-3. In the sources vec, the `OpencodeSource` arm (~line 711) becomes:
+3. In the sources vec, the `OpencodeSource` arm (~line 711) becomes — note this uses the SAME factory the chain test exercises, so the production wiring is exactly the tested artifact:
 
 ```rust
             Arc::new(
                 freshell_sessions::directory_index::OpencodeSource::new(
                     freshell_sessions::parse::default_opencode_data_home(),
                 )
-                .with_model_limit_resolver({
-                    let snap = opencode_limits.clone();
-                    std::sync::Arc::new(move |model: &str| {
-                        opencode_limits::resolve_from_snapshot(&snap, model)
-                    })
-                }),
+                .with_model_limit_resolver(opencode_limits::build_opencode_limit_resolver(
+                    opencode_limits.clone(),
+                )),
             ) as Arc<dyn freshell_sessions::directory_index::SessionSource>,
 ```
 
@@ -1608,9 +1786,9 @@ If `session_index.snapshot()`'s `Arc<Vec<IndexedSession>>` forced an awkward `&s
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Impacted set: this task touches the server composition root, the directory response, and a client comment. Server: full freshell-server crate. Client: the comment-only change touches `FreshAgentView` (unit tests for it) — run its unit tests + the strip tests; the e2e fresh-agent specs exercise the meter render path end-to-end and are provider-agnostic (they seed the indexer directly, past the seam this change modified — the freshell-server integration test added above is the e2e-of-record for the new data path; run the e2e fresh-agent spec once to prove no regression on the cloud backend).
+Impacted set: this task touches the server composition root, the directory response, and a client comment. Server: the new `opencode_limits` module tests + the session_directory suites (narrowed, delegated — the whole-crate run happens in the run's final coordinated full-suite gate, never as a raw broad cargo invocation mid-task). Client: the comment-only change touches `FreshAgentView` (its unit tests + the strip tests + the sessionsSlice tests that consume tokenUsage); the e2e fresh-agent specs exercise the meter render path end-to-end and are provider-agnostic (they seed the indexer directly, past the seam this change modified — the session_directory wire tests plus the `refresh_once` production-chain test added above are the e2e-of-record pair for the new data path; run the e2e fresh-agent spec once through the repo-owned lane to prove no regression on the cloud backend).
 
-Run: `cargo test -p freshell-server --locked`
+Run: `cargo test -p freshell-server --locked -- opencode_limits session_directory:: existence auto_title_sweep`
 Expected: PASS.
 
 Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx test/unit/client/components/fresh-agent/FreshAgentStatusStrip.test.tsx test/unit/client/store/sessionsSlice.test.ts`
@@ -1630,7 +1808,7 @@ git commit -m "feat(server): wire opencode model limits into the session-directo
 
 ## Coverage summary (why no new Playwright spec)
 
-The client needs zero functional changes: the wire chain (`DirItem.tokenUsage` → `contextUsageExtras` → `sessionsSlice.contextUsageByKey` → `guardContextUsageTokenSummary` → `FreshAgentStatusStrip`) is provider-agnostic and already covered by `test/unit/client/components/fresh-agent/FreshAgentStatusStrip.test.tsx`, `FreshAgentView.test.tsx`, and `test/e2e-browser/specs/fresh-agent.spec.ts` (which seeds the session indexer's tokenUsage directly — past the server seam this change modifies). The new behavior is the server data path, whose end-to-end proof is the `session_directory` integration test added in Task 4 (real fixture DB → real parser → real index → real axum router → exact wire JSON), plus the Task 2/3 parser and indexer tests over real-schema fixture DBs. `docs/index.html` shows the meter provider-agnostically and needs no change.
+The client needs zero functional changes: the wire chain (`DirItem.tokenUsage` → `contextUsageExtras` → `sessionsSlice.contextUsageByKey` → `guardContextUsageTokenSummary` → `FreshAgentStatusStrip`) is provider-agnostic and already covered by `test/unit/client/components/fresh-agent/FreshAgentStatusStrip.test.tsx`, `FreshAgentView.test.tsx`, and `test/e2e-browser/specs/fresh-agent.spec.ts` (which seeds the session indexer's tokenUsage directly — past the server seam this change modifies). The new behavior is the server data path, whose end-to-end proof is a pair added in Task 4: the `session_directory` integration tests (real fixture DB → real parser → real index → real axum router → exact wire JSON) and the `refresh_once` production-chain test (real registry with a scripted probe → real snapshot → the production resolver closure → dirty-mark → re-list → meter lit — so breaking the refresh task or the wiring CANNOT stay green), plus the Task 2/3 parser and indexer tests over real-schema fixture DBs. `docs/index.html` shows the meter provider-agnostically and needs no change.
 
 Out-of-scope pre-existing finding (recorded, not addressed — scope rule): `parse/codex.rs:189`/`:234` can emit a non-positive `model_context_window` verbatim (`to_finite_number` filters only non-finiteness, not sign), which would violate the same zod `.positive()` rule today; sampled real rollouts carry 258400 (clean). Suggested follow-up: a one-line sign gate in the codex parser. This plan adds no new violating arm — the opencode arm gates per Task 3.
 
