@@ -879,7 +879,8 @@ function FreshAgentTurnArticle({
         ) : null}
         {turn.error && turn.error.name !== 'MessageAbortedError' ? (
           <div
-            role="alert"
+            role="note"
+            aria-label="Agent error"
             data-testid="fresh-agent-turn-error"
             className="fresh-agent-error-module rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
           >

@@ -1361,7 +1361,10 @@ describe('FreshAgentTranscript', () => {
       )
 
       const module = screen.getByTestId('fresh-agent-turn-error')
-      expect(module).toHaveAttribute('role', 'alert')
+      expect(module).toHaveAttribute('role', 'note')
+      expect(module).toHaveAttribute('aria-label', 'Agent error')
+      expect(module).not.toHaveAttribute('aria-live')
+      expect(module).toBeVisible()
       expect(module).toHaveTextContent('request deadline exceeded after 1195s before the response completed')
       expect(module).toHaveTextContent('request_deadline_exceeded')
       const article = module.closest('article')
@@ -1414,7 +1417,10 @@ describe('FreshAgentTranscript', () => {
       )
 
       const module = screen.getByTestId('fresh-agent-turn-error')
-      expect(module).toHaveAttribute('role', 'alert')
+      expect(module).toHaveAttribute('role', 'note')
+      expect(module).toHaveAttribute('aria-label', 'Agent error')
+      expect(module).not.toHaveAttribute('aria-live')
+      expect(module).toBeVisible()
       expect(module).toHaveTextContent(deadlineRaw)
     })
 
@@ -1440,7 +1446,10 @@ describe('FreshAgentTranscript', () => {
       )
 
       const module = screen.getByTestId('fresh-agent-turn-error')
-      expect(module).toHaveAttribute('role', 'alert')
+      expect(module).toHaveAttribute('role', 'note')
+      expect(module).toHaveAttribute('aria-label', 'Agent error')
+      expect(module).not.toHaveAttribute('aria-live')
+      expect(module).toBeVisible()
       expect(module).toHaveTextContent('request deadline exceeded after 1195s before the response completed')
     })
 
