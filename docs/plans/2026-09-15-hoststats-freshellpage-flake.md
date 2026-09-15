@@ -580,7 +580,7 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
 })
 ```
 
-(The fake above is a draft: the implementer must adapt it to the real call shapes in the source — how the shell-name RegExp is built, how `locator('.xterm').first()` chains, and the exact click option object — so `clicks` records the real button names. Keep the eight behavioral assertions exactly as specified, including the two `SHELL_RENDER_TIMEOUT_MS` pins and the mid-wait recheck pin.)
+(The fake above is a draft: the implementer must adapt it to the real call shapes in the source — how the shell-name RegExp is built, how `locator('.xterm').first()` chains, and the exact click option object — so `clicks` records the real button names. Keep the eight behavioral assertions exactly as specified, including the three `SHELL_RENDER_TIMEOUT_MS` renderWaits pins and the mid-wait recheck pin.)
 
 - [ ] **Step 2: Run the tests and verify the intended BEHAVIORAL failures**
 

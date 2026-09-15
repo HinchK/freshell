@@ -259,12 +259,12 @@ export const test = base.extend<{
     // select a shell to create a terminal. On WSL/Windows the picker shows
     // CMD/PowerShell/WSL instead of a generic "Shell".
     //
-    // Race condition: The PanePicker options depend on `connection.platform`
-    // from Redux. When the WS handshake completes, platform info arrives and
-    // the options list may change (e.g., "Shell" → "CMD/PowerShell/WSL"),
-    // detaching the old buttons mid-click. We handle this by:
-    // 1. Waiting briefly for the PanePicker to stabilize after connection
-    // 2. Using a retry loop with force-click to handle transient detachments
+    // The picker options depend on `connection.platform` from Redux and may
+    // change as the handshake settles (detaching buttons mid-click). The
+    // shared helper (kata tg4e) handles that: a not-clickable option
+    // advances to the next candidate, and a successful click waits out the
+    // render envelope without escalating — see selectShellFromPicker in
+    // test-harness.ts for the full contract.
     await selectShellFromPicker(page)
 
     await use(page)

@@ -239,7 +239,7 @@ describe('TestHarness.waitForConnection wedge-tolerant self-heal (opt-in)', () =
 
 describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
   interface ShellOutcome {
-    clickError?: 'timeout' | 'page-closed' // absent click by default
+    clickError?: 'page-closed' // not-clickable click by default (TimeoutError)
     renderVisibleAfterMs?: number // omit = render never becomes visible
   }
 
