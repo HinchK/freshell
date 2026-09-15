@@ -176,6 +176,13 @@ export class TestHarness {
       )
       return
     }
+    // ABSOLUTE deadline (kata tg4e, delta review r3): the clock starts
+    // BEFORE phase 1, and phase-2 receives W minus the TOTAL elapsed
+    // (phase-1 + reload), so the whole self-heal path spends at most
+    // W + 1s wall clock regardless of which phase burns the time. A
+    // reload-only clock would let a delayed phase-1 land on top of the
+    // envelope under the same CPU contention this change addresses.
+    const selfHealStartedAt = Date.now()
     const phase1Ms = Math.floor(resolvedTimeoutMs / 2)
     const remainingMs = resolvedTimeoutMs - phase1Ms
     const readyWithinPhase1 = await this.page.waitForFunction(
@@ -184,15 +191,9 @@ export class TestHarness {
       { timeout: phase1Ms },
     ).then(() => true, () => false)
     if (!readyWithinPhase1) {
-      // Enforce W as a SINGLE TOTAL deadline (kata tg4e): the reload's
-      // navigation and phase-2's poll SHARE the remaining budget, so the
-      // self-heal path spends at most W + 1s wall clock. The previous
-      // shape let each step consume its own full sub-window (up to 1.5W
-      // sequentially — 135s at W=90s: phase-1 W/2 + reload W/2 + phase-2
-      // W/2), a drift that outgrew any per-test budget.
-      const reloadStartedAt = Date.now()
       await this.page.reload({ timeout: remainingMs })
-      const phase2Ms = Math.max(0, remainingMs - (Date.now() - reloadStartedAt)) + 1000
+      const elapsedMs = Date.now() - selfHealStartedAt
+      const phase2Ms = Math.max(0, resolvedTimeoutMs - elapsedMs) + 1000
       await this.page.waitForFunction(
         wsReadyPredicate,
         undefined,

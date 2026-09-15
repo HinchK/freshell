@@ -38,7 +38,7 @@ interface FakeWaitOutcome {
  */
 function fakePage(
   outcomes: FakeWaitOutcome[] = [],
-  opts: { reloadAdvanceMs?: number } = {},
+  opts: { reloadAdvanceMs?: number, phase1AdvanceMs?: number } = {},
 ) {
   const calls: unknown[][] = []
   const reloads: unknown[][] = []
@@ -47,6 +47,12 @@ function fakePage(
     waitForFunction: (...args: unknown[]) => {
       calls.push(args)
       const outcome = queue.shift()
+      // The FIRST poll is phase 1: optionally advance the (faked) clock to
+      // simulate a phase-1 that burned wall-clock time before expiring —
+      // the absolute-deadline contract (delta review r3) must charge it.
+      if (calls.length === 1 && opts.phase1AdvanceMs) {
+        vi.setSystemTime(Date.now() + opts.phase1AdvanceMs)
+      }
       if (outcome?.reject) return Promise.reject(outcome.reject)
       return Promise.resolve()
     },
@@ -210,7 +216,7 @@ describe('TestHarness.waitForConnection wedge-tolerant self-heal (opt-in)', () =
     expect(calls[0][2]).toEqual({ timeout: Math.floor(DEFAULT_WS_READY_TIMEOUT_MS / 2) })
   })
 
-  it('(c) self-heal ON + phase-1 timeout: exactly ONE reload, then a second poll with the remaining budget', async () => {
+  it('(c) self-heal ON + phase-1 timeout: exactly ONE reload, then a second poll bounded by the absolute deadline', async () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     try {
       const phase1 = Math.floor(DEFAULT_WS_READY_TIMEOUT_MS / 2)
@@ -225,10 +231,10 @@ describe('TestHarness.waitForConnection wedge-tolerant self-heal (opt-in)', () =
       // bug this kata already fixed once.
       expect(calls[1]).toHaveLength(3)
       expect(calls[1][1]).toBeUndefined()
-      // Total-deadline contract: phase 2 receives the remainder AFTER the
-      // reload's elapsed time (+1s slack) — with the fake clock's elapsed
-      // 0, exactly remaining + 1000, never a fresh full window.
-      expect(calls[1][2]).toEqual({ timeout: remaining + 1000 })
+      // Absolute-deadline contract: the clock starts BEFORE phase 1, so
+      // with the fake clock's elapsed 0 phase 2 receives the whole window
+      // W minus nothing (+1s slack) — never a fresh multi-window envelope.
+      expect(calls[1][2]).toEqual({ timeout: DEFAULT_WS_READY_TIMEOUT_MS + 1000 })
     } finally {
       vi.useRealTimers()
     }
@@ -245,10 +251,9 @@ describe('TestHarness.waitForConnection wedge-tolerant self-heal (opt-in)', () =
       await new TestHarness(page).waitForConnection(W, { selfHealReload: true })
       expect(calls[0][2]).toEqual({ timeout: phase1 })
       expect(reloads[0]).toEqual([{ timeout: remaining }])
-      // Total-deadline contract: phase 2 receives the remainder AFTER the
-      // reload's elapsed time (+1s slack) — with the fake clock's elapsed
-      // 0, exactly remaining + 1000, never a fresh full window.
-      expect(calls[1][2]).toEqual({ timeout: remaining + 1000 })
+      // Absolute-deadline contract: phase 2 = W - totalElapsed + 1s, and
+      // with the fake clock's elapsed 0 that is W + 1000 exactly.
+      expect(calls[1][2]).toEqual({ timeout: W + 1000 })
     } finally {
       vi.useRealTimers()
     }
@@ -264,7 +269,7 @@ describe('TestHarness.waitForConnection wedge-tolerant self-heal (opt-in)', () =
     expect(calls).toHaveLength(2)
   })
 
-  it('(f) total-deadline: the reload elapsed time is charged to phase 2 (no 3xW sequential envelope)', async () => {
+  it('(f) absolute deadline: the reload elapsed time is charged to phase 2 (no multi-window envelope)', async () => {
     vi.useFakeTimers({ toFake: ['Date'] })
     try {
       const phase1 = Math.floor(DEFAULT_WS_READY_TIMEOUT_MS / 2)
@@ -277,9 +282,28 @@ describe('TestHarness.waitForConnection wedge-tolerant self-heal (opt-in)', () =
       expect(reloads).toHaveLength(1)
       expect(reloads[0]).toEqual([{ timeout: remaining }])
       expect(calls).toHaveLength(2)
-      // The reload "took" 10s of wall clock: phase 2 must receive the
-      // remainder MINUS that time (+1s slack), not a fresh full window.
-      expect(calls[1][2]).toEqual({ timeout: remaining - 10_000 + 1000 })
+      // The reload "took" 10s of wall clock: phase 2 receives W minus the
+      // TOTAL elapsed (+1s slack) — never a fresh full window.
+      expect(calls[1][2]).toEqual({ timeout: DEFAULT_WS_READY_TIMEOUT_MS - 10_000 + 1000 })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('(g) absolute deadline: a slow PHASE-1 is charged to phase 2 too (the clock starts before phase 1)', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      const phase1 = Math.floor(DEFAULT_WS_READY_TIMEOUT_MS / 2)
+      const { page, calls } = fakePage(
+        [{ reject: nativeTimeout(phase1) }, {}],
+        { phase1AdvanceMs: 8_000 },
+      )
+      await new TestHarness(page).waitForConnection(undefined, { selfHealReload: true })
+      expect(calls).toHaveLength(2)
+      // Phase 1 burned 8s of wall clock before its poll expired; an
+      // absolute deadline must charge it: phase 2 = W - 8s (+1s slack).
+      // A reload-only clock would hand phase 2 a fresh window.
+      expect(calls[1][2]).toEqual({ timeout: DEFAULT_WS_READY_TIMEOUT_MS - 8_000 + 1000 })
     } finally {
       vi.useRealTimers()
     }
@@ -298,8 +322,12 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
    * waitFor({ state, timeout }); getByRole('button', { name }) chains to
    * click({ timeout }); waitForTimeout(ms) is the stabilization pause.
    * `clicks` records the real button names (the implementation builds its
-   * locator RegExp as `^Name$`), and `renderWaits` records every post-click
-   * .xterm wait window.
+   * locator RegExp as `^Name$`), `renderWaits` records every post-click
+   * .xterm wait window, `clickTimeouts` records every click's timeout
+   * argument, and `settledMs` records the stabilization pause — the last
+   * two connect the picker's ACTUAL call arguments to the exported
+   * constants that compose the per-test budget (delta review r3: the
+   * budget's picker envelope must derive from the timeouts really used).
    */
   function pickerPage(
     shells: Record<string, ShellOutcome>,
@@ -308,6 +336,8 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
   ) {
     const clicks: string[] = []
     const renderWaits: number[] = []
+    const clickTimeouts: number[] = []
+    const settledMs: number[] = []
     let xtermVisibilityChecks = 0
     const xtermVisible = () => {
       xtermVisibilityChecks += 1
@@ -332,7 +362,8 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
         }),
       }),
       getByRole: (_kind: string, roleOpts: { name: RegExp }) => ({
-        click: (_clickOpts: { timeout?: number }) => {
+        click: (clickOpts: { timeout?: number }) => {
+          clickTimeouts.push(clickOpts?.timeout ?? 0)
           const name = roleOpts.name.source.replace(/^\^/, '').replace(/\$$/, '')
           clicks.push(name)
           const outcome = shells[name]
@@ -343,14 +374,24 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
             // Option not clickable (absent/detached/obstructed): Playwright's
             // actionability TimeoutError — indistinguishable by name from any
             // other not-clickable timeout, which is exactly the contract.
-            return Promise.reject(Object.assign(new Error('click: Timeout 5000ms exceeded'), { name: 'TimeoutError' }))
+            return Promise.reject(Object.assign(new Error(`click: Timeout ${clickOpts?.timeout}ms exceeded`), { name: 'TimeoutError' }))
           }
           return Promise.resolve()
         },
       }),
-      waitForTimeout: () => Promise.resolve(),
+      waitForTimeout: (ms: number) => {
+        settledMs.push(ms)
+        return Promise.resolve()
+      },
     }
-    return { page: page as unknown as Page, clicks, renderWaits, xtermVisibilityChecks: () => xtermVisibilityChecks }
+    return {
+      page: page as unknown as Page,
+      clicks,
+      renderWaits,
+      clickTimeouts,
+      settledMs,
+      xtermVisibilityChecks: () => xtermVisibilityChecks,
+    }
   }
 
   it('returns immediately when .xterm is already visible', async () => {
@@ -369,13 +410,17 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
   })
 
   it('a successful click waits the full render budget and never escalates to other shells', async () => {
-    const { page, clicks, renderWaits } = pickerPage({
+    const { page, clicks, renderWaits, clickTimeouts, settledMs } = pickerPage({
       Shell: { renderVisibleAfterMs: 5_000 },
       WSL: {}, CMD: {}, PowerShell: {}, Bash: {},
     })
     await selectShellFromPicker(page)
     expect(clicks).toEqual(['Shell'])
     expect(renderWaits).toEqual([SHELL_RENDER_TIMEOUT_MS])
+    // The budget's picker envelope derives from THESE call arguments —
+    // pin that the picker really uses the exported constants (delta r3).
+    expect(clickTimeouts).toEqual([SHELL_CLICK_TIMEOUT_MS])
+    expect(settledMs).toEqual([SHELL_PICKER_SETTLE_MS])
   })
 
   it('survives a render slower than the historical 30s wait (the recorded episode shape)', async () => {
@@ -400,11 +445,14 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
   })
 
   it('a not-clickable option (click TimeoutError: absent, detached, or obstructed) advances to the next shell', async () => {
-    const { page, clicks } = pickerPage({
+    const { page, clicks, clickTimeouts } = pickerPage({
       Bash: { renderVisibleAfterMs: 1_000 }, // Shell/WSL/CMD/PowerShell not clickable
     })
     await selectShellFromPicker(page)
     expect(clicks).toEqual(['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash'])
+    // Every click attempt uses the exported per-option budget — the same
+    // constant shellPickerWorstCaseMs() composes from.
+    expect(clickTimeouts).toEqual(Array.from({ length: 5 }, () => SHELL_CLICK_TIMEOUT_MS))
   })
 
   it('a non-timeout click error propagates (page closure is loud, never "option absent")', async () => {
