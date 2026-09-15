@@ -1,14 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Page } from '@playwright/test'
 import {
-  CLOUD_LANE_BUDGET_OVERHEAD_MS,
+  CLOUD_LANE_START_RESERVE_MS,
   DEFAULT_WS_READY_TIMEOUT_MS,
+  SHELL_CLICK_TIMEOUT_MS,
+  SHELL_NAMES,
+  SHELL_PICKER_SETTLE_MS,
   SHELL_RENDER_TIMEOUT_MS,
   TestHarness,
   isCloudLaneWindowConfigured,
   resolveCloudLaneTestBudgetMs,
   resolveWsReadyTimeoutMs,
   selectShellFromPicker,
+  shellPickerWorstCaseMs,
 } from './test-harness'
 
 const ENV_VAR = 'FRESHELL_E2E_WS_READY_TIMEOUT_MS'
@@ -98,19 +102,42 @@ describe('resolveCloudLaneTestBudgetMs', () => {
     expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '' })).toBeNull()
   })
 
-  it('derives window + overhead at the cloud default window (90s -> 120s)', () => {
-    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '90000' })).toBe(120_000)
+  it('covers the permitted composition at the cloud default window (delta review r2)', () => {
+    // W=90s: connection envelope (W + 1s total-deadline slack) = 91_000;
+    // picker worst case (settle + at most 5 clicks + the render wait) =
+    // 500 + 5 * 5_000 + 60_000 = 85_500; start reserve 30_000. Total 206_500.
+    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '90000' })).toBe(206_500)
   })
 
-  it('scales with the configured window (60s -> 90s)', () => {
-    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '60000' })).toBe(90_000)
+  it('scales with the configured window (60s -> 176_500)', () => {
+    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '60000' })).toBe(176_500)
   })
 
-  it('falls back to the default window plus overhead on malformed values (one parsing rule)', () => {
+  it('falls back to the default window composition on malformed values (one parsing rule)', () => {
     for (const malformed of ['not-a-number', '0', '-5']) {
       expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: malformed }))
-        .toBe(DEFAULT_WS_READY_TIMEOUT_MS + CLOUD_LANE_BUDGET_OVERHEAD_MS)
+        .toBe(30_000 + 1_000 + shellPickerWorstCaseMs() + CLOUD_LANE_START_RESERVE_MS)
     }
+  })
+
+  it('always covers the permitted composition: connection envelope + picker worst + start reserve', () => {
+    for (const windowMs of ['30000', '45000', '90000', '150000']) {
+      const budget = resolveCloudLaneTestBudgetMs({ [ENV_VAR]: windowMs })
+      expect(budget).not.toBeNull()
+      expect(budget!).toBeGreaterThanOrEqual(
+        Number(windowMs) + 1_000 + shellPickerWorstCaseMs() + CLOUD_LANE_START_RESERVE_MS,
+      )
+    }
+  })
+})
+
+describe('shellPickerWorstCaseMs (single source for the picker budget pieces)', () => {
+  it('derives from the picker\'s real constants: settle + one click budget per shell name + the render wait', () => {
+    expect(shellPickerWorstCaseMs()).toBe(
+      SHELL_PICKER_SETTLE_MS
+        + SHELL_NAMES.length * SHELL_CLICK_TIMEOUT_MS
+        + SHELL_RENDER_TIMEOUT_MS,
+    )
   })
 })
 

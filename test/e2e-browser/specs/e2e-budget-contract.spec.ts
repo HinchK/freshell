@@ -15,10 +15,16 @@ import { resolveCloudLaneTestBudgetMs } from '../helpers/test-harness.js'
 test('per-test deadline covers the harness wedge budget on the cloud lane', ({ freshellPage }) => {
   const cloudBudgetMs = resolveCloudLaneTestBudgetMs()
   if (cloudBudgetMs === null) {
-    // Local lane: the historical default budget must be preserved
-    // (playwright.config.ts timeout: 60_000). If the config default ever
-    // changes, update this pin consciously.
-    expect(test.info().timeout).toBe(60_000)
+    // Local lane: the wiring must be a NO-OP. The only value the fixture
+    // could ever set is the derived cloud budget, so pin that it did NOT
+    // set it — the config default (60_000) and any legitimate forwarded
+    // --timeout override both pass; only an actual extension fails.
+    const wouldBeCloudBudgetMs = resolveCloudLaneTestBudgetMs({
+      ...process.env,
+      FRESHELL_E2E_WS_READY_TIMEOUT_MS: '90000',
+    })
+    expect(wouldBeCloudBudgetMs).not.toBeNull()
+    expect(test.info().timeout).not.toBe(wouldBeCloudBudgetMs)
     return
   }
   expect(test.info().timeout).toBeGreaterThanOrEqual(cloudBudgetMs)

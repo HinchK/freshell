@@ -209,7 +209,7 @@ export const test = base.extend<{
   // retained trace: a container-wide CPU-contention episode starved the
   // post-click .xterm render and the old picker loop silently burned the
   // remaining budget escalating through options absent on this platform) —
-  // has an evidence-shaped envelope larger than the config's 60s default,
+  // has a permitted-composed envelope (connection W+1s + picker worst + start reserve) larger than the config's 60s default,
   // which killed fixture setup mid-envelope: the recorded
   // "Test timeout of 60000ms exceeded while setting up freshellPage"
   // flake. Extending the deadline from inside this fixture makes the

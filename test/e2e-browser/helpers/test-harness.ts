@@ -36,17 +36,13 @@ export function resolveWsReadyTimeoutMs(
 }
 
 /**
- * Overhead added to the resolved WS-ready window when computing the
- * cloud-lane per-test budget. Covers the fixture steps that are not the
- * connection wait itself: page.goto + waitForHarness (1-3s healthy), the
- * selectShellFromPicker envelope in the evidence-shaped single-episode
- * case (click + up-to-60s render wait; see selectShellFromPicker), and
- * body-start margin. 30s matches the probe-verified settings.spec.ts
- * precedent (120s budget at the 90s cloud window). The connection wait
- * itself needs no extra room: waitForConnection enforces its window W as
- * a single total deadline (W + 1s slack).
+ * Start/body reserve added to the connection and picker envelopes when
+ * computing the cloud-lane per-test budget: healthy page.goto +
+ * waitForHarness (~3s — their maxima are self-limiting: each throws its
+ * own distinct navigation/wait timeout well before the test deadline) and
+ * a body-start margin for the test's first steps.
  */
-export const CLOUD_LANE_BUDGET_OVERHEAD_MS = 30_000
+export const CLOUD_LANE_START_RESERVE_MS = 30_000
 
 /**
  * Whether the cloud-lane window env key is configured (present AND
@@ -67,14 +63,31 @@ export function isCloudLaneWindowConfigured(
 }
 
 /**
+ * The permitted worst case of the shell-picker leg of the freshellPage
+ * fixture, derived from the picker's OWN exported constants so it can
+ * never drift from the implementation (delta-review r2): the
+ * stabilization settle, at most one click budget per shell name (every
+ * path through the loop makes at most SHELL_NAMES.length clicks, each
+ * bounded by SHELL_CLICK_TIMEOUT_MS — including the successful one), and
+ * at most one render wait.
+ */
+export function shellPickerWorstCaseMs(): number {
+  return SHELL_PICKER_SETTLE_MS
+    + SHELL_NAMES.length * SHELL_CLICK_TIMEOUT_MS
+    + SHELL_RENDER_TIMEOUT_MS
+}
+
+/**
  * Resolve the cloud-lane per-test deadline budget, or null on the local
- * lane (kata tg4e): the freshellPage fixture's boot chain — self-healing
- * waitForConnection (a total-deadline window of W + 1s) plus the
- * picker/render tail — has an evidence-shaped envelope larger than the
- * config's 60s default, and the 60s deadline kills fixture setup
- * mid-envelope ("Test timeout of 60000ms exceeded while setting up
- * freshellPage"). The budget derives from the SAME env that scales the
- * window (one source of truth, one parsing rule via
+ * lane (kata tg4e). The budget COVERS THE PERMITTED COMPOSITION of the
+ * fixture chain (delta-review r2): the connection envelope (waitForConnection
+ * enforces its window W as a single total deadline, W + 1s slack) plus the
+ * picker's permitted worst case plus a start/body reserve. The config's 60s
+ * default deadline kills fixture setup mid-composition ("Test timeout of
+ * 60000ms exceeded while setting up freshellPage" — the recorded tg4e flake,
+ * whose retained trace shows connection AND render slowness co-occurring
+ * in one container-wide disturbance). The budget derives from the SAME env
+ * that scales the window (one source of truth, one parsing rule via
  * resolveWsReadyTimeoutMs) so a custom window scales the budget with it.
  * Callers must treat null as "do not touch the deadline" — the local
  * lane keeps the config default unchanged — and must apply the budget
@@ -84,7 +97,8 @@ export function resolveCloudLaneTestBudgetMs(
   env: Record<string, string | undefined> = process.env,
 ): number | null {
   if (!isCloudLaneWindowConfigured(env)) return null
-  return resolveWsReadyTimeoutMs(undefined, env) + CLOUD_LANE_BUDGET_OVERHEAD_MS
+  const connectionEnvelopeMs = resolveWsReadyTimeoutMs(undefined, env) + 1000
+  return connectionEnvelopeMs + shellPickerWorstCaseMs() + CLOUD_LANE_START_RESERVE_MS
 }
 
 /**
@@ -173,8 +187,9 @@ export class TestHarness {
       // Enforce W as a SINGLE TOTAL deadline (kata tg4e): the reload's
       // navigation and phase-2's poll SHARE the remaining budget, so the
       // self-heal path spends at most W + 1s wall clock. The previous
-      // shape let each step consume its own full window (up to 3xW
-      // sequentially at W=90s), a drift that outgrew any per-test budget.
+      // shape let each step consume its own full sub-window (up to 1.5W
+      // sequentially — 135s at W=90s: phase-1 W/2 + reload W/2 + phase-2
+      // W/2), a drift that outgrew any per-test budget.
       const reloadStartedAt = Date.now()
       await this.page.reload({ timeout: remainingMs })
       const phase2Ms = Math.max(0, remainingMs - (Date.now() - reloadStartedAt)) + 1000
@@ -452,9 +467,22 @@ export class TestHarness {
  * same window), so a 30s wait conflated "slow render" with "wrong
  * option" and the loop escalated into absent options, silently burning
  * the test budget. 60s fits the recorded single-episode envelope inside
- * the 120s cloud budget (24s slow boot + click + render < 120s).
+ * the composed cloud budget.
  */
 export const SHELL_RENDER_TIMEOUT_MS = 60_000
+
+/** The PanePicker stabilization settle after WS connection (ms). */
+export const SHELL_PICKER_SETTLE_MS = 500
+
+/** Per-option click budget (ms): a timeout means "not clickable within
+ * the window" (absent, detached, or obstructed) — the historical advance
+ * case; Playwright's click auto-retry already absorbs transient
+ * detachments inside this window. */
+export const SHELL_CLICK_TIMEOUT_MS = 5_000
+
+/** The shell options, in the order the picker leg tries them. Every
+ * path through the loop makes at most one click per name. */
+export const SHELL_NAMES = ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash'] as const
 
 /** Playwright's click TimeoutError is the not-clickable signal (absent,
  * detached, or obstructed within the window — indistinguishable by name);
@@ -483,16 +511,15 @@ export async function selectShellFromPicker(page: Page): Promise<void> {
 
   // Wait a moment for the PanePicker to stabilize after WS connection
   // (platform info arrives and may change the option set).
-  await page.waitForTimeout(500)
+  await page.waitForTimeout(SHELL_PICKER_SETTLE_MS)
 
   const xtermNow = await page.locator('.xterm').first().isVisible().catch(() => false)
   if (xtermNow) return
 
-  const shellNames = ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']
-  for (const name of shellNames) {
+  for (const name of SHELL_NAMES) {
     const button = page.getByRole('button', { name: new RegExp(`^${name}$`, 'i') })
     try {
-      await button.click({ timeout: 5_000 })
+      await button.click({ timeout: SHELL_CLICK_TIMEOUT_MS })
     } catch (err) {
       if (!isClickUnavailableError(err)) throw err
       continue // option not clickable within the window — historical behavior
