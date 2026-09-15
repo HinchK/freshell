@@ -5,7 +5,6 @@ import { test, expect } from '../helpers/fixtures.js'
 const PERSIST_DEBOUNCE_WAIT_MS = 600
 
 test.describe('Settings', () => {
-
   // Helper: navigate to the settings view.
   // Sidebar nav buttons have title="Settings (Ctrl+B ,)" which Playwright
   // matches via getByRole with name /settings/i (title is used as accessible name).
