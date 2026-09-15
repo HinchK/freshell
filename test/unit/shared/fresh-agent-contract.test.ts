@@ -8,6 +8,7 @@ import {
   FreshAgentRequestIdSchema,
   FreshAgentSessionCommandSchema,
   FreshAgentSnapshotSchema,
+  FreshAgentTranscriptItemSchema,
   FreshAgentTurnBodySchema,
   FreshAgentTurnPageSchema,
   FreshAgentTurnSchema,
@@ -243,5 +244,89 @@ describe('rollback surface (kata 1wxv)', () => {
         settingScopes: { model: 'sometimes' },
       })).toThrow()
     })
+  })
+})
+
+describe('task_delegation transcript item', () => {
+  const fullItem = {
+    id: 'part_task_1',
+    kind: 'task_delegation',
+    status: 'running',
+    title: 'General Task — Fix the flaky harness',
+    description: 'Fix the flaky harness',
+    subagent: 'general',
+    background: false,
+    childSessionId: 'ses_child_1',
+    startedAtMs: 1789406370320,
+    endedAtMs: 1789408126081,
+    durationMs: 1755761,
+    activity: [
+      { tool: 'bash', status: 'completed', preview: 'sed -n 92,112p src/store/paneTypes.ts' },
+      { tool: 'grep', status: 'failed', preview: 'reasoningEffort in src' },
+    ],
+    result: '<task id="ses_child_1" state="completed"><task_result>ok</task_result></task>',
+  }
+
+  it('parses a full task_delegation item', () => {
+    expect(FreshAgentTranscriptItemSchema.safeParse(fullItem).success).toBe(true)
+  })
+
+  it('parses a minimal task_delegation item (title + status only)', () => {
+    expect(FreshAgentTranscriptItemSchema.safeParse({
+      id: 'part_task_1', kind: 'task_delegation', status: 'completed', title: 'General Task — x',
+    }).success).toBe(true)
+  })
+
+  it('rejects unknown keys on task_delegation (strict)', () => {
+    expect(FreshAgentTranscriptItemSchema.safeParse({ ...fullItem, bogus: 1 }).success).toBe(false)
+  })
+
+  it('rejects an invalid delegation status', () => {
+    expect(FreshAgentTranscriptItemSchema.safeParse({ ...fullItem, status: 'finished' }).success).toBe(false)
+  })
+})
+
+describe('retry transcript item', () => {
+  it('parses attempt with error', () => {
+    expect(FreshAgentTranscriptItemSchema.safeParse({
+      id: 'part_retry_1', kind: 'retry', attempt: 2, error: 'stream disconnected',
+    }).success).toBe(true)
+  })
+
+  it('parses attempt without error', () => {
+    expect(FreshAgentTranscriptItemSchema.safeParse({ id: 'part_retry_1', kind: 'retry', attempt: 1 }).success).toBe(true)
+  })
+
+  it('rejects non-positive attempts', () => {
+    expect(FreshAgentTranscriptItemSchema.safeParse({ id: 'r', kind: 'retry', attempt: 0 }).success).toBe(false)
+  })
+})
+
+describe('delegated_task transcript item', () => {
+  it('parses agent, description and command', () => {
+    expect(FreshAgentTranscriptItemSchema.safeParse({
+      id: 'part_sub_1', kind: 'delegated_task', agent: 'general',
+      description: 'Fix the flaky harness', command: '/fix',
+    }).success).toBe(true)
+  })
+
+  it('parses a bare marker', () => {
+    expect(FreshAgentTranscriptItemSchema.safeParse({ id: 'part_sub_1', kind: 'delegated_task' }).success).toBe(true)
+  })
+})
+
+describe('reasoning duration and title fields', () => {
+  it('parses reasoning with durationMs and title', () => {
+    expect(FreshAgentTranscriptItemSchema.safeParse({
+      id: 'part_reasoning_1', kind: 'reasoning',
+      summary: ['weighing options'], content: ['weighing options'], text: 'weighing options',
+      durationMs: 1831, title: 'planning the fix',
+    }).success).toBe(true)
+  })
+
+  it('rejects negative durationMs', () => {
+    expect(FreshAgentTranscriptItemSchema.safeParse({
+      id: 'p', kind: 'reasoning', summary: [], content: [], durationMs: -1,
+    }).success).toBe(false)
   })
 })
