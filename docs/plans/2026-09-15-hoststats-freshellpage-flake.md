@@ -570,10 +570,9 @@ git commit -m "test(e2e): waitForConnection self-heal enforces its window as a s
 
 **Files:**
 - Modify: `test/e2e-browser/helpers/fixtures.ts` (convert `freshellPage` to the tuple form with its own `{ timeout }` option — the fixture-timeout mechanism, delta review r9; make `e2eMachineId` deadline-neutral with its CONDITIONALLY-bounded registration fetch — delta reviews r5+r6; extend the module's existing `import` from `'./test-harness.js'`)
-- Modify: `test/e2e-browser/helpers/test-harness.test.ts` (the wiring-presence regression pin, delta review r10)
 - Modify: `test/e2e-browser/playwright.config.ts` (import `DEFAULT_TEST_TIMEOUT_MS` from the helpers and use it as the config's `timeout` — one source of truth for the body ceiling both lanes share; the cloud config inherits the base value)
 - Create: `test/e2e-browser/specs/e2e-budget-contract.spec.ts`
-- Test: the new contract spec is this task's behavioral test (it runs on both lanes; on the cloud lane — env always present — it pins the real budget).
+- Test: the new contract spec is this task's behavioral test (it runs on both lanes; on the cloud lane — env always present — it pins the real wiring), and its fixture-timeout MECHANISM pin is the deterministic behavioral regression test for the property the whole fix depends on.
 
 **Interfaces:**
 - Consumes: `freshellPageFixtureTimeoutMs()` (Task 1), `isCloudLaneWindowConfigured()` (the self-heal opt-in gate), the exported `test` object from `helpers/fixtures.ts` (tuple-form fixture definitions), `FRESHELL_E2E_WS_READY_TIMEOUT_MS` env presence.
@@ -581,28 +580,60 @@ git commit -m "test(e2e): waitForConnection self-heal enforces its window as a s
 
 - [ ] **Step 1: Write the failing behavioral test (the contract spec + the wiring-presence pin)**
 
-Create `test/e2e-browser/specs/e2e-budget-contract.spec.ts`, and add the wiring-presence regression pin to `test/e2e-browser/helpers/test-harness.test.ts` (the committed form, delta review r10 — it reads `fixtures.ts` as source because Playwright exposes no runtime API for a fixture's registered timeout, and the regression that recreates tg4e's 60s setup ceiling is silent under healthy boots; validated by mutation: removing the tuple options fails the first assertion, and reintroducing deadline mutation inside `e2eMachineId` fails the second):
+Create `test/e2e-browser/specs/e2e-budget-contract.spec.ts`, whose FIRST block is the fixture-timeout MECHANISM pin (the committed form, delta review r11 — the deterministic BEHAVIORAL test that setup may outlive the test's own deadline; it replaced the r10 source-text pin, which the repo's quality rule rejects — a source check runs no behavior):
 
 ```ts
-describe('freshellPage fixture-timeout wiring presence (delta review r10)', () => {
-  const fixturesSource = readFileSync(path.resolve(import.meta.dirname, 'fixtures.ts'), 'utf8')
+import { test as base, expect } from '../helpers/fixtures.js'
+import { DEFAULT_TEST_TIMEOUT_MS } from '../helpers/test-harness.js'
 
-  it('fixtures.ts declares freshellPage in the tuple form carrying its own composed-budget timeout', () => {
-    expect(fixturesSource).toMatch(/freshellPage:\s*\[/)
-    expect(fixturesSource).toMatch(/\{\s*timeout:\s*freshellPageFixtureTimeoutMs\(\)\s*\}/)
-  })
+// The fixture-timeout mechanism pin (delta review r11): a test-scoped
+// fixture whose setup DETERMINISTICALLY outlives the test's own declared
+// deadline, carrying its own larger fixture timeout. The test below
+// reaches its body only if Playwright runs fixture setup on the fixture's
+// separate timeout slot — the exact property the tg4e fix depends on
+// (slow boot SETUP may outlive the test's own 60s ceiling). If the
+// mechanism breaks, or the tuple wiring loses its timeout, the setup dies
+// at the test's own deadline instead. Constant 30s on both lanes: this
+// pin tests the MECHANISM; the lane-derived composed value is behaviorally
+// unit-pinned by freshellPageFixtureTimeoutMs, and the real tuple wiring
+// runs on every healthy boot of the legs and the full lane. Semantics
+// empirically probed on Playwright 1.58.2 (r11 remediation research): the
+// function form (no fixture timeout) fails with the EXACT tg4e signature
+// — "Test timeout of 3000ms exceeded while setting up \"slowSetupWitness\""
+// — and the tuple form carries the 8s setup to a body that still observes
+// its own 3s slot.
+const test = base.extend<{ slowSetupWitness: void }>({
+  slowSetupWitness: [async ({}, use) => {
+    // 8s of real time vs the test's own 3s deadline: only the fixture's
+    // own slot can carry this setup.
+    await new Promise((resolve) => setTimeout(resolve, 8_000))
+    await use()
+  }, { timeout: 30_000 }],
+})
+```
 
-  it('e2eMachineId never mutates the test deadline (deadline-neutral wiring)', () => {
-    const body = fixturesSource.slice(
-      fixturesSource.indexOf('e2eMachineId:'),
-      fixturesSource.indexOf('serverInfo:', fixturesSource.indexOf('e2eMachineId:')),
-    )
-    expect(body).not.toContain('test.info().setTimeout')
+and whose LAST block pins the mechanism behaviorally:
+
+```ts
+// The behavioral pin itself: the describe declares a 3s test deadline;
+// the witness fixture's 8s setup survives ONLY on the fixture's own 30s
+// slot. Reaching the body is the assertion — a mechanism regression fails
+// this test with the test's own 3s timeout (deterministically, on every
+// lane). Validated by mutation during the r11 remediation: the function
+// form (no fixture timeout) fails with "Test timeout of 3000ms exceeded
+// while setting up \"slowSetupWitness\"" — the tg4e signature.
+test.describe('the fixture-timeout mechanism (delta review r11)', () => {
+  test.setTimeout(3_000)
+  test('a fixture setup that outlives the test\'s own deadline passes when the fixture carries its own larger timeout', async ({ slowSetupWitness }) => {
+    void slowSetupWitness
+    // The test's own slot is intact after the slow setup: the wiring never
+    // touched the test's deadline.
+    expect(test.info().timeout).toBe(3_000)
   })
 })
 ```
 
-Then the contract spec:
+Then the contract spec's deadline-neutrality pins:
 
 ```ts
 import { test, expect } from '../helpers/fixtures.js'
@@ -703,7 +734,7 @@ Run (env-set local invocation reproduces the cloud-shaped path; first local run 
 FRESHELL_E2E_WS_READY_TIMEOUT_MS=90000 npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/e2e-budget-contract.spec.ts
 ```
 
-Expected (delta review r10, against the TRUE pre-wiring state — freshellPage still in function form, NO fixture timeout, no deadline wiring anywhere): the WIRING-PRESENCE unit pin (Task 1's test file, `freshellPage fixture-timeout wiring presence` describe) is the RED — fixtures.ts lacks the tuple form and its `{ timeout: freshellPageFixtureTimeoutMs() }` options, so the pin fails; deleting the options or reverting to the function form fails it (validated by mutation during the r10 remediation). The contract spec's deadline-neutrality pins PASS pre-wiring BY DESIGN — they pin the ABSENCE of deadline modification, which the unwired state already satisfies; their RED value is against deadline-MUTATING wiring (demonstrated against the r2-r8 whole-test extension during the r9 remediation: three pins failed until the wiring was removed). Run both legs to see exactly that: the env-set and no-env contract-spec legs green, the wiring pin red.
+Expected (delta review r11 — the honest protection story; there is NO intermediate Red for the wiring APPLICATION itself): the MECHANISM pin is green pre-wiring BY DESIGN — it tests Playwright's fixture-timeout mechanism with its own local witness fixture (its mutation story proves its teeth: the function form fails with the tg4e signature, validated during the r11 remediation). The deadline-neutrality pins are green pre-wiring BY DESIGN — they pin the ABSENCE of deadline modification, and their RED value is against deadline-MUTATING wiring (demonstrated against the r2-r8 whole-test extension during the r9 remediation: three pins failed until the wiring was removed). The wiring's three failure modes are each covered: a wrong VALUE fails freshellPageFixtureTimeoutMs's unit pins (Task 1); a broken MECHANISM fails the witness pin; a broken APPLICATION (the tuple options lost) is observable only under a wedged boot — the full-lane zero-flake gate (Task 7) is its protection, exactly as it was pre-run. Playwright exposes no runtime API for a fixture's registered timeout, and the repo's quality bar rejects source-text pins — this hierarchy is the qualifying coverage.
 
 ```bash
 env -u FRESHELL_E2E_WS_READY_TIMEOUT_MS npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/e2e-budget-contract.spec.ts

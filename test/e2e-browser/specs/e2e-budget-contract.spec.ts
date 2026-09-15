@@ -1,5 +1,25 @@
-import { test, expect } from '../helpers/fixtures.js'
+import { test as base, expect } from '../helpers/fixtures.js'
 import { DEFAULT_TEST_TIMEOUT_MS } from '../helpers/test-harness.js'
+
+// The fixture-timeout mechanism pin (delta review r11): a test-scoped
+// fixture whose setup DETERMINISTICALLY outlives the test's own declared
+// deadline, carrying its own larger fixture timeout. The test below
+// reaches its body only if Playwright runs fixture setup on the fixture's
+// separate timeout slot — the exact property the tg4e fix depends on
+// (slow boot SETUP may outlive the test's own 60s ceiling). If the
+// mechanism breaks, or the tuple wiring loses its timeout, the setup dies
+// at the test's own deadline instead. Constant 30s on both lanes: this
+// pin tests the MECHANISM; the lane-derived composed value is behaviorally
+// unit-pinned by freshellPageFixtureTimeoutMs, and the real tuple wiring
+// runs on every healthy boot of the legs and the full lane.
+const test = base.extend<{ slowSetupWitness: void }>({
+  slowSetupWitness: [async ({}, use) => {
+    // 8s of real time vs the test's own 3s deadline: only the fixture's
+    // own slot can carry this setup.
+    await new Promise((resolve) => setTimeout(resolve, 8_000))
+    await use()
+  }, { timeout: 30_000 }],
+})
 
 // Contract (kata tg4e, main-green campaign, delta review r9): the cloud
 // wedge budget is the freshellPage FIXTURE's own setup timeout — Playwright
@@ -84,5 +104,21 @@ test.describe('declared deadlines above the config default stay as declared', ()
   })
   test('keeps exactly its declared budget on both lanes', ({ e2eMachineId }) => {
     expect(test.info().timeout).toBe(180_000)
+  })
+})
+
+
+// The behavioral pin itself: the describe declares a 3s test deadline;
+// the witness fixture's 8s setup survives ONLY on the fixture's own 30s
+// slot. Reaching the body is the assertion — a mechanism regression fails
+// this test with the test's own 3s timeout (deterministically, on every
+// lane).
+test.describe('the fixture-timeout mechanism (delta review r11)', () => {
+  test.setTimeout(3_000)
+  test('a fixture setup that outlives the test\'s own deadline passes when the fixture carries its own larger timeout', async ({ slowSetupWitness }) => {
+    void slowSetupWitness
+    // The test's own slot is intact after the slow setup: the wiring never
+    // touched the test's deadline.
+    expect(test.info().timeout).toBe(3_000)
   })
 })

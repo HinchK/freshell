@@ -1,5 +1,3 @@
-import { readFileSync } from 'node:fs'
-import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Page } from '@playwright/test'
 import {
@@ -199,32 +197,7 @@ describe('freshellPageFixtureTimeoutMs (the boot chain owns its own setup allowa
   })
 })
 
-describe('freshellPage fixture-timeout wiring presence (delta review r10)', () => {
-  const fixturesSource = readFileSync(path.resolve(import.meta.dirname, 'fixtures.ts'), 'utf8')
 
-  // Playwright exposes no runtime API to read a fixture's registered
-  // timeout (TestType internals are private; test.info() reports the
-  // TEST's slots only), and a behavioral e2e pin would need a wedged
-  // boot to observe the difference — the regression that recreates
-  // tg4e's 60s setup ceiling is silent under healthy boots. The
-  // resolver's VALUE and lane derivation are behaviorally pinned above;
-  // this pin guards the wiring application itself (validated by
-  // mutation: removing the tuple options or reverting to the function
-  // form fails the first assertion, and reintroducing deadline mutation
-  // inside e2eMachineId fails the second).
-  it('fixtures.ts declares freshellPage in the tuple form carrying its own composed-budget timeout', () => {
-    expect(fixturesSource).toMatch(/freshellPage:\s*\[/)
-    expect(fixturesSource).toMatch(/\{\s*timeout:\s*freshellPageFixtureTimeoutMs\(\)\s*\}/)
-  })
-
-  it('e2eMachineId never mutates the test deadline (deadline-neutral wiring)', () => {
-    const body = fixturesSource.slice(
-      fixturesSource.indexOf('e2eMachineId:'),
-      fixturesSource.indexOf('serverInfo:', fixturesSource.indexOf('e2eMachineId:')),
-    )
-    expect(body).not.toContain('test.info().setTimeout')
-  })
-})
 
 describe('TestHarness.waitForConnection timeout wiring', () => {
   it('binds the default window (+1s slack) as waitForFunction OPTIONS', async () => {

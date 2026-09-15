@@ -79,14 +79,12 @@ export function shellPickerWorstCaseMs(): number {
 
 /**
  * The per-test deadline declared by the Playwright config (both lanes — the
- * cloud config inherits the base). DEFAULT-CLASS deadlines (at or below
- * this value) are where the tg4e chain-envelope defect lives: the config
- * default is smaller than the fixture chain's permitted composition, so
- * the cloud budget wiring raises default-class deadlines to the
- * composition. Declarations ABOVE this value are explicit spec budget
- * decisions (e.g. launch-retry-restart-rust's 180s) the wiring must
- * respect — raising them would touch other flakes' mechanisms (delta
- * review r5) and their own runs must fix any under-budgeting.
+ * cloud config inherits the base; delta review r9): this is the TEST BODY
+ * ceiling on every lane. The cloud wiring NEVER modifies it — the boot
+ * chain's larger allowance is the freshellPage fixture's OWN timeout (see
+ * freshellPageFixtureTimeoutMs). A spec may declare a larger body deadline
+ * wherever its body envelope genuinely needs one (e.g. settings' two
+ * mid-body reload tests, cloud-gated at the removed hook's exact value).
  */
 export const DEFAULT_TEST_TIMEOUT_MS = 60_000
 
@@ -126,8 +124,8 @@ export function freshellPageFixtureTimeoutMs(
  * resolveWsReadyTimeoutMs) so a custom window scales the budget with it.
  * Callers must treat null as "do not touch the deadline" — the local
  * lane keeps the config default unchanged — and must apply the budget via
- * shouldExtendTestDeadlineToCloudBudget (extend-only,
- * default-class-only).
+ * freshellPageFixtureTimeoutMs as the fixture's OWN setup timeout (delta
+ * review r9: never a test-deadline modification).
  */
 export function resolveCloudLaneTestBudgetMs(
   env: Record<string, string | undefined> = process.env,
