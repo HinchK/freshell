@@ -1,6 +1,8 @@
 import { parsePersistedLayoutRaw, type ParsedPersistedLayout } from '@/store/persistedState'
 import { isWellFormedPaneTree } from '@/store/paneTreeValidation'
 import { LAYOUT_STORAGE_KEY } from '@/store/storage-keys'
+import { getPreMigrationLayoutRaw } from '@/store/storage-migration'
+import { sanitizeRestoreError } from '@shared/session-contract'
 
 /** A local layout older than this rebuilds from the server instead of being
  * kept. 7 days is far beyond any terminal lifetime (15-minute default idle
@@ -48,29 +50,69 @@ function collectLeafContents(node: unknown, into: Map<string, Record<string, unk
   for (const child of n.children) collectLeafContents(child, into)
 }
 
-/** Parse-side migrations that deliberately DROP a raw content key while
- * carrying its durable value into another parsed key — verified against
- * the loader (persistedState.ts):
- * - resumeSessionId (terminal + fresh-agent): destructured out and never
- *   re-added (persistedState.ts:238, :307-315); its durable value lands in
- *   parsed sessionRef via migrateLegacyTerminalDurableState
+/** Verified deliberate migrations that DROP a raw content key — parse-side
+ * (persistedState.ts) or boot-migration-side (storage-migration.ts, whose
+ * PRE-rewrite raw the salvage comparison reads via
+ * getPreMigrationLayoutRaw) — as distinct from SILENT salvage of a
+ * malformed durable field, which is corruption by definition. Each entry
+ * cites its verified implementation:
+ * - resumeSessionId (terminal + fresh-agent): parse destructures it out
+ *   and never re-adds it (persistedState.ts:238, :307-315); its durable
+ *   value lands in parsed sessionRef via migrateLegacyTerminalDurableState
  *   (persistedState.ts:231-261, shared/session-contract.ts:115-158).
  *   Current flushes never write it (stripTransientSessionFields,
  *   persistMiddleware.ts:261), so a raw resumeSessionId is legacy-only —
  *   its drop is migration, not salvage.
- * - model (freshopencode fresh-agent): migrated into modelSelection and
- *   the raw key dropped (persistedState.ts:316-333) — and a LEGITIMATE
- *   current flush DOES write model alongside modelSelection
- *   (FreshAgentModelDialog.tsx:348-372), so without this exemption a
- *   healthy model-pinned pane would misclassify corrupt.
- * Every other raw-key drop is silent salvage of a malformed durable field
- * — corruption by definition. */
-function isParseMigratedContentKey(content: Record<string, unknown>, key: string): boolean {
+ * - model (freshopencode fresh-agent): parse migrates it into
+ *   modelSelection and drops the raw key (persistedState.ts:316-333) —
+ *   and a LEGITIMATE current flush DOES write model alongside
+ *   modelSelection (FreshAgentModelDialog.tsx:348-372), so without this
+ *   exemption a healthy model-pinned pane would misclassify corrupt.
+ * - restoreError (terminal, any shape): the boot migration's terminal
+ *   branch destructures the pane's EXISTING restoreError out and
+ *   re-adds only the resume-migration's own error
+ *   (storage-migration.ts:160, :177), so every boot's rewrite sheds a
+ *   flush-carried restoreError — and current writers do produce it
+ *   (TerminalView.tsx:4998 dead_live_handle, :5193
+ *   durable_artifact_missing, panesSlice.ts:2556) while the flush
+ *   keeps it (persistMiddleware.ts:255-285). Without this exemption
+ *   any window holding a restore-errored terminal pane would
+ *   misclassify corrupt on every boot.
+ * - sessionRef on a legacy codex recovery_failed terminal: the remint
+ *   sheds the invalid legacy identity and ANNOUNCES it — a fresh
+ *   restoreError/status lands in the migrated content
+ *   (storage-migration.ts:163-177; pinned by
+ *   storage-migration.test.ts:291-345).
+ * - sessionRef / timelineSessionId / cliSessionId on a fresh-agent
+ *   pane carrying a VALID restoreError: the restore-unavailable
+ *   identity shed — the boot migration drops sessionRef with the
+ *   error kept (storage-migration.ts:182-214), and the timeline/cli
+ *   ids only under reason invalid_legacy_restore_target
+ *   (:195-205); the in-memory normalizer mirrors the shed and never
+ *   keeps sessionRef alongside a valid restoreError
+ *   (panesSlice.ts:143-194). showThinking/showTools are vestigial
+ *   display overrides with no writer since 2026-04
+ *   (persistMiddleware.ts:271-274 scrubs them on the next flush). */
+function isVerifiedMigrationContentDrop(content: Record<string, unknown>, key: string): boolean {
   if (key === 'resumeSessionId') return true
-  return key === 'model'
+  if (key === 'model'
     && content.kind === 'fresh-agent'
     && content.sessionType === 'freshopencode'
-    && content.provider === 'opencode'
+    && content.provider === 'opencode') return true
+  if (key === 'restoreError' && content.kind === 'terminal') return true
+  if (key === 'sessionRef'
+    && content.kind === 'terminal'
+    && content.mode === 'codex'
+    && content.status === 'recovery_failed') return true
+  if (content.kind === 'fresh-agent') {
+    if (key === 'showThinking' || key === 'showTools') return true
+    if (key === 'sessionRef') return !!sanitizeRestoreError(content.restoreError)
+    if (key === 'timelineSessionId' || key === 'cliSessionId') {
+      const restoreError = sanitizeRestoreError(content.restoreError)
+      return !!restoreError && restoreError.reason === 'invalid_legacy_restore_target'
+    }
+  }
+  return false
 }
 
 /** Content-salvage detection (delta review round 2, finding 3): the
@@ -84,14 +126,19 @@ function isParseMigratedContentKey(content: Record<string, unknown>, key: string
  * FRESH session. Pair RAW and PARSED leaf contents by pane id: any
  * top-level raw content key the parsed content dropped (outside the
  * verified migration set above) means the loader will silently discard
- * durable data → corruption. Parsed may have MORE keys (normalization
- * adds sessionRef/codexDurability/restoreError/modelSelection) — the rule
- * is raw-keys ⊆ parsed-keys. Legit current flushes never produce a
- * dropped key: in-memory content is normalized on every write path
- * (normalizePaneContent, panesSlice.ts:60-108 — sessionRef via
- * sanitizeSessionRef :72, codexDurability :73, restoreError :74) and the
- * flush strips the volatile keys the parse also drops
- * (persistMiddleware.ts:255-285). */
+ * durable data → corruption. The RAW side is the pre-migration envelope
+ * on rewrite boots (see classifyPersistedLayoutHealth) — the boot
+ * migration rewrites freshell.layout.v3 before the classifier runs, and
+ * its normalizeLayoutNode strips the same keys the parse does
+ * (storage-migration.ts:148-290), so only the captured pre-rewrite raw
+ * still shows them (e2r1 review finding 1). Parsed may have MORE keys
+ * (normalization adds sessionRef/codexDurability/restoreError/
+ * modelSelection) — the rule is raw-keys ⊆ parsed-keys. Legit current
+ * flushes never produce a dropped key: in-memory content is normalized
+ * on every write path (normalizePaneContent, panesSlice.ts:60-108 —
+ * sessionRef via sanitizeSessionRef :72, codexDurability :73,
+ * restoreError :74) and the flush strips the volatile keys the parse
+ * also drops (persistMiddleware.ts:255-285). */
 function hasSalvagedLeafContent(
   rawEnvelope: { panes?: { layouts?: unknown } } | undefined,
   parsed: ParsedPersistedLayout,
@@ -113,7 +160,7 @@ function hasSalvagedLeafContent(
     const parsedKeys = new Set(Object.keys(parsedContent))
     for (const key of Object.keys(rawContent)) {
       if (parsedKeys.has(key)) continue
-      if (isParseMigratedContentKey(rawContent, key)) continue
+      if (isVerifiedMigrationContentDrop(rawContent, key)) continue
       return true
     }
   }
@@ -220,8 +267,10 @@ export function classifyPersistedLayoutHealth(
   // so a parsed result can be healthy-looking while the loader actually
   // discarded part of the workspace. One extra JSON.parse of the same raw
   // tells us how many tabs the loader SAW; if the parsed result kept fewer,
-  // salvage dropped rows → corrupt. The same raw envelope also feeds the
-  // content-salvage check below.
+  // salvage dropped rows → corrupt. This tab-count check reads the CURRENT
+  // stored raw — the loader parses exactly that. The content-salvage
+  // comparison below additionally needs the PRE-migration envelope when
+  // this boot's storage migration rewrote the key.
   let rawEnvelope: { tabs?: { tabs?: unknown[] }; panes?: { layouts?: unknown } } | undefined
   try {
     rawEnvelope = JSON.parse(raw)
@@ -236,8 +285,23 @@ export function classifyPersistedLayoutHealth(
   // strips (tree checks pass on the sanitized result) is corruption — the
   // pane would rehydrate without its durable identity. See
   // hasSalvagedLeafContent for the pairing rule and the verified
-  // migration exemptions.
-  if (hasSalvagedLeafContent(rawEnvelope, parsed)) return 'corrupt'
+  // migration exemptions. The raw side is the PRE-migration envelope
+  // when this boot's storage migration rewrote freshell.layout.v3
+  // (main.tsx imports the self-executing migration before the store, and
+  // on essentially every boot the marker guard fails — any flush changes
+  // the raw hash — so migratePersistedLayout rewrites): the rewrite
+  // normalizes the same leaves the parse does, so a POST-rewrite raw can
+  // never show a stripped key (e2r1 review finding 1). No rewrite this
+  // boot → the getter returns null and the stored raw still carries any
+  // invalid content, so it is its own pre-migration truth.
+  const salvageRaw = getPreMigrationLayoutRaw() ?? raw
+  let salvageEnvelope: { panes?: { layouts?: unknown } } | undefined
+  try {
+    salvageEnvelope = JSON.parse(salvageRaw)
+  } catch {
+    salvageEnvelope = undefined
+  }
+  if (hasSalvagedLeafContent(salvageEnvelope, parsed)) return 'corrupt'
   // Referential integrity, BOTH directions — verified against the actual
   // loaders: a layout entry whose tabId is not among the parsed tabs is
   // DROPPED at load (cleanOrphanedLayouts, panesSlice.ts:328-371, called

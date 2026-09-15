@@ -6,7 +6,7 @@ import {
   terminalInventoryTitleReplayMiddleware,
 } from '@/lib/terminal-inventory-titles'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
-import panesReducer, { initLayout, updatePaneTitle } from '@/store/panesSlice'
+import panesReducer, { initLayout, updatePaneTitle, updatePaneTitleByTerminalId } from '@/store/panesSlice'
 
 function seedTerminalPane(store: ReturnType<typeof buildStore>, tabId: string, paneId: string, terminalId: string) {
   store.dispatch(addTab({ id: tabId, title: tabId }))
@@ -270,5 +270,97 @@ describe('terminal inventory title cache + replay', () => {
     const before = store.getState()
     expect(replayTerminalInventoryTitles(store)).toBe(0)
     expect(store.getState().panes).toBe(before.panes)
+  })
+})
+
+// e2r1 review finding 2: the replay cache treated the boot snapshot as
+// permanently authoritative. The live title writers — the
+// terminal.title.updated fold (TerminalView.tsx:4780) and the OSC
+// onTitleChange fold (TerminalView.tsx:2595) — write through
+// updatePaneTitle, and the open-tab-with-title / rename cascade paths
+// (tabsSlice.ts:1098, titleSync.ts:40, OverviewView.tsx:59,
+// ContextMenuProvider.tsx:829) write through
+// updatePaneTitleByTerminalId — none of them touch the cache, so any
+// later listed action replayed the STALE cached title over the newer
+// one. The cache is a FALLBACK for late-bound panes only: a newer
+// differing title write EVICTS that terminal's cache entry (regardless
+// of any churn guard); an equal write keeps it (the fold's own
+// dispatches never self-evict); a new inventory frame re-populates it.
+// The module-level cache is shared across the whole file, so every test
+// here owns a UNIQUE terminalId — a previous test's leaked cache entry
+// then matches no pane in this test's store (vitest shuffles order).
+describe('inventory title cache eviction on newer title writes', () => {
+  function shellContentFor(tid: string, createRequestId: string) {
+    return { kind: 'terminal', mode: 'shell', shell: 'wsl', terminalId: tid, createRequestId, status: 'running' } as const
+  }
+
+  function retriggerReplay(store: ReturnType<typeof buildStore>, tid: string) {
+    store.dispatch({
+      type: 'panes/updatePaneContent',
+      payload: { tabId: 'tab-1', paneId: 'pane-1', content: shellContentFor(tid, 'cr-evict') },
+    })
+  }
+
+  function splitSecondPaneBound(store: ReturnType<typeof buildStore>, tid: string) {
+    store.dispatch({
+      type: 'panes/splitPane',
+      payload: {
+        tabId: 'tab-1', paneId: 'pane-1', direction: 'horizontal', newPaneId: 'pane-2',
+        newContent: shellContentFor(tid, 'cr-split-2'),
+      },
+    })
+  }
+
+  it('a newer live title (updatePaneTitle — the terminal.title.updated/OSC action) evicts the entry: a replay trigger keeps the newer title and a later late-bound pane gets nothing', () => {
+    const store = buildStore()
+    seedTerminalPane(store, 'tab-1', 'pane-1', 't-ev-live')
+    expect(foldTerminalInventoryTitles(store, [{ terminalId: 't-ev-live', title: 'Boot snapshot' }])).toBe(1)
+    store.dispatch(updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'Live newer title', setByUser: false }))
+    retriggerReplay(store, 't-ev-live')
+    expect(store.getState().panes.paneTitles['tab-1']['pane-1']).toBe('Live newer title')
+    splitSecondPaneBound(store, 't-ev-live')
+    expect(store.getState().panes.paneTitles['tab-1']['pane-2']).not.toBe('Boot snapshot')
+  })
+
+  it('a newer title through updatePaneTitleByTerminalId (open-tab-with-title, tabsSlice.ts:1098) evicts the entry the same way', () => {
+    const store = buildStore()
+    seedTerminalPane(store, 'tab-1', 'pane-1', 't-ev-open')
+    expect(foldTerminalInventoryTitles(store, [{ terminalId: 't-ev-open', title: 'Boot snapshot' }])).toBe(1)
+    store.dispatch(updatePaneTitleByTerminalId({ terminalId: 't-ev-open', title: 'Open-tab title', setByUser: false }))
+    retriggerReplay(store, 't-ev-open')
+    expect(store.getState().panes.paneTitles['tab-1']['pane-1']).toBe('Open-tab title')
+    splitSecondPaneBound(store, 't-ev-open')
+    expect(store.getState().panes.paneTitles['tab-1']['pane-2']).not.toBe('Boot snapshot')
+  })
+
+  it('eviction holds regardless of the user-set guard: a user rename evicts too, so a sibling pane sharing the terminal never replays the stale snapshot', () => {
+    const store = buildStore()
+    seedTerminalPane(store, 'tab-1', 'pane-1', 't-ev-user')
+    expect(foldTerminalInventoryTitles(store, [{ terminalId: 't-ev-user', title: 'Boot snapshot' }])).toBe(1)
+    store.dispatch(updatePaneTitleByTerminalId({ terminalId: 't-ev-user', title: 'My own name', setByUser: true }))
+    splitSecondPaneBound(store, 't-ev-user')
+    expect(store.getState().panes.paneTitles['tab-1']['pane-1']).toBe('My own name')
+    expect(store.getState().panes.paneTitles['tab-1']['pane-2']).not.toBe('Boot snapshot')
+  })
+
+  it('an EQUAL title write keeps the entry: the fold\u2019s own dispatches never self-evict, and a late-bound pane still replays', () => {
+    const store = buildStore()
+    seedTerminalPane(store, 'tab-1', 'pane-1', 't-ev-equal')
+    expect(foldTerminalInventoryTitles(store, [{ terminalId: 't-ev-equal', title: 'Same title' }])).toBe(1)
+    store.dispatch(updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'Same title', setByUser: false }))
+    store.dispatch(updatePaneTitleByTerminalId({ terminalId: 't-ev-equal', title: 'Same title', setByUser: false }))
+    splitSecondPaneBound(store, 't-ev-equal')
+    expect(store.getState().panes.paneTitles['tab-1']['pane-2']).toBe('Same title')
+  })
+
+  it('a new inventory frame re-populates the cache after an eviction (reconnect recovers)', () => {
+    const store = buildStore()
+    seedTerminalPane(store, 'tab-1', 'pane-1', 't-ev-refold')
+    expect(foldTerminalInventoryTitles(store, [{ terminalId: 't-ev-refold', title: 'Boot snapshot' }])).toBe(1)
+    store.dispatch(updatePaneTitle({ tabId: 'tab-1', paneId: 'pane-1', title: 'Live newer title', setByUser: false }))
+    expect(foldTerminalInventoryTitles(store, [{ terminalId: 't-ev-refold', title: 'Newest snapshot' }])).toBe(1)
+    splitSecondPaneBound(store, 't-ev-refold')
+    expect(store.getState().panes.paneTitles['tab-1']['pane-2']).toBe('Newest snapshot')
+    expect(store.getState().panes.paneTitles['tab-1']['pane-1']).toBe('Newest snapshot')
   })
 })

@@ -289,6 +289,22 @@ function normalizeLayoutNode(node: unknown): unknown {
   return node
 }
 
+// The raw `freshell.layout.v3` envelope as it stood just BEFORE this
+// boot's rewrite landed (e2r1 review finding 1). The every-boot
+// normalizeLayoutNode pass strips content keys the recovery health
+// classifier must still see (e.g. a terminal sessionRef that fails
+// sanitizeSessionRef) from the STORED raw before classification runs,
+// so the classifier reads the pre-rewrite envelope through
+// getPreMigrationLayoutRaw() instead. Null when no rewrite occurred
+// this boot (marker-guard held) — then the stored raw is its own
+// pre-migration truth. One browser window is one JS realm, so one
+// capture per boot is the correct scope.
+let preMigrationLayoutRaw: string | null = null
+
+export function getPreMigrationLayoutRaw(): string | null {
+  return preMigrationLayoutRaw
+}
+
 function writeMigratedLayoutWithRecovery(originalRaw: string, migratedRaw: string, expectedCurrentRaw: string): boolean {
   try {
     localStorage.setItem(LAYOUT_FRESH_AGENT_BACKUP_KEY, originalRaw)
@@ -340,6 +356,7 @@ function writeMigratedLayoutWithRecovery(originalRaw: string, migratedRaw: strin
     return false
   }
 
+  preMigrationLayoutRaw = originalRaw
   try {
     localStorage.setItem(LAYOUT_STORAGE_KEY, migratedRaw)
   } catch (error) {

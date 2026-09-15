@@ -1,8 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { backfillPersistedLayoutMachineId, classifyPersistedLayoutHealth, STALE_LAYOUT_MS } from '@/lib/recovery/layout-health'
 import { LAYOUT_STORAGE_KEY, MACHINE_ID_STORAGE_KEY } from '@/store/storage-keys'
+import {
+  hashPersistedLayoutRaw,
+  LAYOUT_FRESH_AGENT_BACKUP_KEY,
+  LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY,
+  LAYOUT_FRESH_AGENT_MIGRATION_ID,
+} from '@/store/persistedState'
 
 const NOW = 1_760_000_000_000
+const VALID_CLAUDE_SESSION_ID = '11111111-2222-4333-8444-555555555555'
 
 function seedEnvelope(raw: unknown): void {
   localStorage.setItem(LAYOUT_STORAGE_KEY, typeof raw === 'string' ? raw : JSON.stringify(raw))
@@ -349,6 +356,117 @@ describe('classifyPersistedLayoutHealth', () => {
     }
     seedEnvelope(envelope)
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+})
+
+// e2r1 review finding 1: the content-salvage check could never fire in the
+// REAL boot order. main.tsx imports the self-executing storage-migration
+// BEFORE the store and App (main.tsx:8 vs :9-10), and on essentially every
+// boot the fresh-agent migration marker no longer matches the stored raw
+// (any tabs/panes flush changes it), so migratePersistedLayout REWRITES
+// freshell.layout.v3 — and its normalizeLayoutNode strips an invalid
+// terminal sessionRef from the stored raw (storage-migration.ts:160
+// destructure, :175 re-add only when durableState.sessionRef is truthy)
+// BEFORE classifyPersistedLayoutHealth runs (App.tsx:836, during machine
+// resolution). Post-rewrite, raw and parsed BOTH lack the key → healthy.
+// These tests exercise the real order: seed storage, run the actual
+// migration module (fresh instance — the same self-executing side effect
+// main.tsx triggers), THEN classify through a fresh classifier instance
+// bound to that same migration module.
+describe('classifyPersistedLayoutHealth in the real boot order (migration rewrite runs first)', () => {
+  beforeEach(() => { localStorage.clear() })
+
+  async function classifyAfterRealBoot(): Promise<PersistedLayoutHealthAfterBoot> {
+    localStorage.setItem('freshell_version', '5')
+    vi.resetModules()
+    await import('@/store/storage-migration')
+    const { classifyPersistedLayoutHealth: classify } = await import('@/lib/recovery/layout-health')
+    return { classify: (machineId: string) => classify(machineId, { now: NOW }) }
+  }
+
+  type PersistedLayoutHealthAfterBoot = { classify: (machineId: string) => ReturnType<typeof classifyPersistedLayoutHealth> }
+
+  function terminalPaneEnvelope(content: Record<string, unknown>): Record<string, unknown> {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': { type: 'leaf', id: 'pane-a', content },
+    }
+    return envelope
+  }
+
+  it('classifies corrupt when the boot migration rewrite stripped an invalid terminal sessionRef from the raw (the finding\u2019s exact case)', async () => {
+    seedEnvelope(terminalPaneEnvelope({
+      kind: 'terminal', mode: 'claude', createRequestId: 'cr-a', status: 'running',
+      sessionRef: { provider: 'claude', sessionId: '' },
+    }))
+    const { classify } = await classifyAfterRealBoot()
+    expect(classify('machine-1')).toBe('corrupt')
+  })
+
+  it('classifies healthy through the same real order when the terminal sessionRef is valid (the rewrite preserves it)', async () => {
+    seedEnvelope(terminalPaneEnvelope({
+      kind: 'terminal', mode: 'claude', createRequestId: 'cr-a', status: 'running',
+      sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+    }))
+    const { classify } = await classifyAfterRealBoot()
+    expect(classify('machine-1')).toBe('healthy')
+  })
+
+  it('classifies corrupt via the stored raw when the migration guard holds (marker matches — no rewrite this boot)', async () => {
+    const envelope = terminalPaneEnvelope({
+      kind: 'terminal', mode: 'claude', createRequestId: 'cr-a', status: 'running',
+      sessionRef: { provider: 'claude', sessionId: '' },
+    })
+    seedEnvelope(envelope)
+    const raw = localStorage.getItem(LAYOUT_STORAGE_KEY)!
+    localStorage.setItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY, JSON.stringify({
+      version: 1,
+      migration: LAYOUT_FRESH_AGENT_MIGRATION_ID,
+      backupKey: LAYOUT_FRESH_AGENT_BACKUP_KEY,
+      originalHash: hashPersistedLayoutRaw(raw),
+      migratedHash: hashPersistedLayoutRaw(raw),
+      committedAt: NOW,
+    }))
+    const { classify } = await classifyAfterRealBoot()
+    expect(classify('machine-1')).toBe('corrupt')
+  })
+
+  // Verified migration drops that must NOT classify corrupt once the
+  // salvage comparison sees the pre-rewrite raw: the boot migration
+  // deliberately sheds these keys, so their absence in the parsed result
+  // is migration, not silent salvage.
+  it('stays healthy when the migration sheds a flush-carried terminal restoreError (current-writer shape: dead_live_handle)', async () => {
+    seedEnvelope(terminalPaneEnvelope({
+      kind: 'terminal', mode: 'claude', createRequestId: 'cr-a', status: 'running',
+      sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'dead_live_handle' },
+    }))
+    const { classify } = await classifyAfterRealBoot()
+    expect(classify('machine-1')).toBe('healthy')
+  })
+
+  it('stays healthy for the legacy codex recovery_failed remint (announced identity shed — pinned by storage-migration tests)', async () => {
+    seedEnvelope(terminalPaneEnvelope({
+      kind: 'terminal', mode: 'codex', createRequestId: 'cr-c', status: 'recovery_failed',
+      sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'provider_runtime_failed' },
+    }))
+    const { classify } = await classifyAfterRealBoot()
+    expect(classify('machine-1')).toBe('healthy')
+  })
+
+  it('stays healthy for a fresh-agent restoreError pane (identity shed with the restore-unavailable error, plus vestigial display overrides)', async () => {
+    seedEnvelope(terminalPaneEnvelope({
+      kind: 'fresh-agent', sessionType: 'freshopencode', provider: 'opencode',
+      createRequestId: 'cr-fa', status: 'idle',
+      sessionRef: { provider: 'opencode', sessionId: 'sess-x' },
+      restoreError: { code: 'RESTORE_UNAVAILABLE', reason: 'invalid_legacy_restore_target' },
+      timelineSessionId: 'sess-x',
+      cliSessionId: 'sess-x',
+      showThinking: true,
+    }))
+    const { classify } = await classifyAfterRealBoot()
+    expect(classify('machine-1')).toBe('healthy')
   })
 })
 

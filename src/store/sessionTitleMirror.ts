@@ -1,5 +1,5 @@
 import type { Middleware } from '@reduxjs/toolkit'
-import { updatePaneTitleBySessionRef } from './panesSlice'
+import { updatePaneTitle } from './panesSlice'
 import { collectPaneEntries, paneContentMatchesSessionRef } from '@/lib/pane-utils'
 import type { RootState } from './store'
 
@@ -65,30 +65,42 @@ function collectTitledSessionRows(sessions: RootState['sessions']): TitledSessio
 }
 
 /**
- * Any FRESH-AGENT pane bound to this session holding a different title?
- * The walk targets fresh-agent panes ONLY (delta review round 2, finding
- * 1): terminal panes' titles are owned by the registry-title pipeline
- * (server auto-title sweep, terminal renames via
- * PATCH /api/terminals/:id, the terminal.inventory fold, the live
- * terminal.title fold) — mirroring session-directory titles into
- * session-bound terminal panes UNDID terminal renames on every
- * sessions/* commit. The reducer action updatePaneTitleBySessionRef keeps
- * its terminal branch (the pre-existing session-rename cascade); only
- * this middleware's pane-walk filters to the fresh-agent kind. A pane
- * whose user-set flag is true is NEVER a fold target — treat it as NOT
- * differing so no no-op dispatch fires for it on every refresh.
+ * Collect the exact (tabId, paneId) pairs of FRESH-AGENT panes bound to
+ * this session that need the directory title. The walk targets
+ * fresh-agent panes ONLY (delta review round 2, finding 1): terminal
+ * panes' titles are owned by the registry-title pipeline (server
+ * auto-title sweep, terminal renames via PATCH /api/terminals/:id, the
+ * terminal.inventory fold, the live terminal.title fold) — mirroring
+ * session-directory titles into session-bound terminal panes UNDID
+ * terminal renames on every sessions/* commit. The mirror then
+ * dispatches PER-PANE (updatePaneTitle, by tabId+paneId with the same
+ * user-set guard) for exactly the pairs collected here, so the reducer
+ * can never over-reach into a same-session TERMINAL pane
+ * (updatePaneTitleBySessionRef's reducer deliberately matches both pane
+ * kinds via paneContentMatchesSessionRef — e2r1 review finding 3); that
+ * shared action keeps its all-kinds semantics for the session-rename
+ * cascade (titleSync.ts:42). A pane whose user-set flag is true is
+ * NEVER a target.
  */
-function sessionTitleDiffers(panes: RootState['panes'], provider: string, sessionId: string, title: string): boolean {
+function collectFreshAgentTitleTargets(
+  panes: RootState['panes'],
+  provider: string,
+  sessionId: string,
+  title: string,
+): Array<{ tabId: string; paneId: string }> {
+  const targets: Array<{ tabId: string; paneId: string }> = []
   for (const [tabId, layout] of Object.entries(panes.layouts ?? {})) {
     if (!layout) continue
     for (const { paneId, content } of collectPaneEntries(layout)) {
       if (content.kind !== 'fresh-agent') continue
       if (!paneContentMatchesSessionRef(content, provider, sessionId)) continue
       if (panes.paneTitleSetByUser?.[tabId]?.[paneId]) continue
-      if ((panes.paneTitles?.[tabId]?.[paneId] ?? '') !== title) return true
+      if ((panes.paneTitles?.[tabId]?.[paneId] ?? '') !== title) {
+        targets.push({ tabId, paneId })
+      }
     }
   }
-  return false
+  return targets
 }
 
 /**
@@ -134,12 +146,14 @@ const SESSION_BINDING_PANE_ACTIONS = new Set([
  * panes stayed on derived defaults forever. This middleware folds titled
  * session rows into their open FRESH-AGENT panes after every sessions-state
  * change AND after the pane-binding actions above (a pane created after
- * its row is loaded must still get titled — the missed-ordering case),
- * through updatePaneTitleBySessionRef with setByUser:false (rename scope
- * contract: user renames stick; nothing durable is written; no dispatch
- * when the title already matches). Terminal panes are NEVER targets —
- * their titles are owned by the registry-title pipeline (see
- * sessionTitleDiffers).
+ * its row is loaded must still get titled — the missed-ordering case).
+ * Dispatches are PER-PANE through updatePaneTitle with setByUser:false
+ * (rename scope contract: user renames stick; nothing durable is written;
+ * no dispatch when the title already matches), so the walk's
+ * fresh-agent-only filter is also the reducer's target set — a
+ * session-bound TERMINAL pane can never be re-titled by the directory
+ * (e2r1 review finding 3). Terminal panes' titles stay owned by the
+ * registry-title pipeline (see collectFreshAgentTitleTargets).
  */
 export const sessionTitleMirrorMiddleware: Middleware = (store) => (next) => (action: any) => {
   const result = next(action)
@@ -147,13 +161,9 @@ export const sessionTitleMirrorMiddleware: Middleware = (store) => (next) => (ac
   if (typeof type === 'string' && (type.startsWith('sessions/') || SESSION_BINDING_PANE_ACTIONS.has(type))) {
     const state = store.getState() as RootState
     for (const row of collectTitledSessionRows(state.sessions)) {
-      if (!sessionTitleDiffers(state.panes, row.provider, row.sessionId, row.title)) continue
-      store.dispatch(updatePaneTitleBySessionRef({
-        provider: row.provider,
-        sessionId: row.sessionId,
-        title: row.title,
-        setByUser: false,
-      }))
+      for (const { tabId, paneId } of collectFreshAgentTitleTargets(state.panes, row.provider, row.sessionId, row.title)) {
+        store.dispatch(updatePaneTitle({ tabId, paneId, title: row.title, setByUser: false }))
+      }
     }
   }
   return result

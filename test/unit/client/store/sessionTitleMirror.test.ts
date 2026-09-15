@@ -1,7 +1,7 @@
 import { configureStore } from '@reduxjs/toolkit'
 import { describe, expect, it } from 'vitest'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
-import { panesSlice, initLayout, updatePaneTitle } from '@/store/panesSlice'
+import { panesSlice, initLayout, updatePaneTitle, updatePaneTitleBySessionRef } from '@/store/panesSlice'
 import sessionsReducer, { commitSessionWindowVisibleRefresh } from '@/store/sessionsSlice'
 import { sessionTitleMirrorMiddleware } from '@/store/sessionTitleMirror'
 
@@ -314,5 +314,88 @@ describe('sessionTitleMirrorMiddleware', () => {
       payload: { tabId: 'tab-z', paneId: 'pane-z', sessionRef: { provider: 'opencode', sessionId: 'sess-2' } },
     })
     expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('My name')
+  })
+
+  // e2r1 review finding 3: the fresh-agent-only walk gated only the
+  // dispatch TRIGGER, not the reducer's targets — the shared
+  // updatePaneTitleBySessionRef reducer deliberately matches BOTH
+  // fresh-agent and terminal panes (paneContentMatchesSessionRef), so
+  // with a fresh-agent pane AND a same-session TERMINAL pane in one tab,
+  // the mirror's single dispatch re-titled the terminal pane too,
+  // overwriting its registry/REST title — the exact precedence defect
+  // the repair claimed to eliminate. The mirror must dispatch per-pane
+  // (by tabId+paneId, through updatePaneTitle's user-set guard) so the
+  // reducer can never over-reach; updatePaneTitleBySessionRef keeps its
+  // all-kinds semantics for the session-rename cascade.
+  describe('combined fresh-agent + terminal panes on one session', () => {
+    function seedCombinedSessionPanes(store: ReturnType<typeof buildStore>) {
+      store.dispatch(addTab({ id: 'tab-z', title: 'Combined panes' }))
+      store.dispatch(initLayout({
+        tabId: 'tab-z',
+        paneId: 'pane-fa',
+        content: {
+          kind: 'fresh-agent',
+          provider: 'claude',
+          sessionType: 'freshclaude',
+          sessionId: DURABLE_CLAUDE,
+          createRequestId: 'req-fa',
+          status: 'connected',
+          sessionRef: { provider: 'claude', sessionId: DURABLE_CLAUDE },
+        },
+      }))
+      store.dispatch({
+        type: 'panes/splitPane',
+        payload: {
+          tabId: 'tab-z',
+          paneId: 'pane-fa',
+          direction: 'horizontal',
+          newPaneId: 'pane-term',
+          newContent: {
+            kind: 'terminal',
+            mode: 'claude',
+            createRequestId: 'req-term',
+            status: 'running',
+            terminalId: 'term-1',
+            sessionRef: { provider: 'claude', sessionId: DURABLE_CLAUDE },
+          },
+        },
+      })
+      store.dispatch(updatePaneTitle({ tabId: 'tab-z', paneId: 'pane-fa', title: 'Derived default', setByUser: false }))
+      store.dispatch(updatePaneTitle({ tabId: 'tab-z', paneId: 'pane-term', title: 'Renamed via REST', setByUser: false }))
+    }
+
+    it('re-titles ONLY the fresh-agent pane: the same-session terminal pane keeps its registry/REST title (the reviewer\u2019s exact combined case)', () => {
+      const store = buildStore()
+      seedCombinedSessionPanes(store)
+      landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider: 'claude', title: 'Session directory title' })
+      expect(store.getState().panes.paneTitles['tab-z']['pane-fa']).toBe('Session directory title')
+      expect(store.getState().panes.paneTitles['tab-z']['pane-term']).toBe('Renamed via REST')
+      expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-term']).toBeFalsy()
+    })
+
+    it('user-set precedence holds on both pane kinds in the combined case', () => {
+      const store = buildStore()
+      seedCombinedSessionPanes(store)
+      store.dispatch(updatePaneTitle({ tabId: 'tab-z', paneId: 'pane-fa', title: 'My agent name', setByUser: true }))
+      store.dispatch(updatePaneTitle({ tabId: 'tab-z', paneId: 'pane-term', title: 'My terminal name', setByUser: true }))
+      landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider: 'claude', title: 'Session directory title' })
+      expect(store.getState().panes.paneTitles['tab-z']['pane-fa']).toBe('My agent name')
+      expect(store.getState().panes.paneTitles['tab-z']['pane-term']).toBe('My terminal name')
+    })
+
+    it('the session-rename cascade action (updatePaneTitleBySessionRef, titleSync.ts:42) still updates BOTH pane kinds — its default semantics are unchanged', () => {
+      const store = buildStore()
+      seedCombinedSessionPanes(store)
+      store.dispatch(updatePaneTitleBySessionRef({
+        provider: 'claude',
+        sessionId: DURABLE_CLAUDE,
+        title: 'Renamed from history',
+        setByUser: true,
+      }))
+      expect(store.getState().panes.paneTitles['tab-z']['pane-fa']).toBe('Renamed from history')
+      expect(store.getState().panes.paneTitles['tab-z']['pane-term']).toBe('Renamed from history')
+      expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-fa']).toBe(true)
+      expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-term']).toBe(true)
+    })
   })
 })
