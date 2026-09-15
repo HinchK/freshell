@@ -1978,7 +1978,7 @@ impl RuntimeOwnershipRegistry {
                     initiator,
                     since_ms,
                     ..
-                } if op == operation_id => (kind.clone(), initiator.clone(), *since_ms),
+                } if op == operation_id => (*kind, initiator.clone(), *since_ms),
                 _ => {
                     tracing::error!(target: "invariant",
                         event = "ownership.rekey_starting.old_claim_mismatch",
