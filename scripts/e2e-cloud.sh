@@ -173,6 +173,17 @@ Environment:
   FRESHELL_E2E_BACKEND  "local" (default) or "cloud"
   FRESHELL_GCP_JOB      Cloud Run job-name prefix (default: freshell-e2e)
   FRESHELL_GCP_ACCOUNT  GCP account override pinned on every gcloud call (optional)
+  FRESHELL_E2E_WS_READY_TIMEOUT_MS  Cloud-lane TestHarness.waitForConnection
+                                    window in ms (default 90000; overrides
+                                    the 30s in-code default). Set per-run
+                                    job env on `run --cloud`; sized to the
+                                    observed gVisor wedge class plus the
+                                    harness's one-shot self-heal reload.
+  FRESHELL_E2E_SERVER_VERBOSE       Set to "1" on cloud runs (always
+                                    emitted by `run --cloud`) to pipe the
+                                    e2e TestServer's stdout/stderr into
+                                    the container log stream so server
+                                    logs reach Cloud Logging.
 
 Identity (cloud lanes only — details: docs/development/gcloud-robot.md):
   Cloud subcommands resolve a gcloud identity lazily, in this order:
@@ -521,6 +532,25 @@ cmd_run() {
   else
     echo 'PLAYWRIGHT_ARGS: ""' > "$RUN_ENV_FILE"
   fi
+
+  # Cloud-lane WS-ready tolerance (kata j90s). Under gVisor the e2e Node
+  # TestServer occasionally suffers a ~40-60s zero-CPU wedge of in-flight
+  # I/O: a timeout-less boot-chain fetch hangs, the WS never starts, and
+  # waitForConnection can never see ready regardless of window size (see
+  # the j90s stall investigation). Wedges self-heal — a fresh boot chain
+  # completes in ~6s afterwards — so the harness's opt-in self-heal
+  # (ONE mid-wait page.reload once ready misses half the window) plus this
+  # 90s window (phase 1 + reload + phase 2) survives the observed wedge
+  # class with margin; the settings:185 spec carries a cloud-only 120s
+  # per-test budget for the same reason. Override by exporting
+  # FRESHELL_E2E_WS_READY_TIMEOUT_MS (ms) before this script.
+  echo "FRESHELL_E2E_WS_READY_TIMEOUT_MS: \"${FRESHELL_E2E_WS_READY_TIMEOUT_MS:-90000}\"" >> "$RUN_ENV_FILE"
+  # Server-log visibility (kata j90s): the TestServer pipes its
+  # stdout/stderr into the container log stream only when the e2e
+  # fixtures see FRESHELL_E2E_SERVER_VERBOSE=1 — without it, server logs
+  # stay in in-memory buffers and a wedge episode is undiagnosable from
+  # Cloud Logging (the cost of the first two j90s cloud cycles).
+  echo "FRESHELL_E2E_SERVER_VERBOSE: \"1\"" >> "$RUN_ENV_FILE"
 
   # Create THIS run's own unique job (see unique_job_name). Create-only: a
   # name collision would mean the job is not unique to this run, so fail
