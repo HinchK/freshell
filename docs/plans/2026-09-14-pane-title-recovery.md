@@ -1188,7 +1188,7 @@ git commit -m "test(e2e): pin local-first reload — healthy layout kept exactly
 - Test: create `test/unit/client/components/App.inventory-title-fold.test.tsx` (wiring pin, same harness family as App.machine-identity.test.tsx)
 
 **Interfaces:**
-- Consumes: `updatePaneTitleByTerminalId` (panesSlice.ts:2212, existing, `setByUser:false`-guarded), the WS `TerminalInventoryMessage.terminals[]` rows (shared/ws-protocol.ts:1587-1606).
+- Consumes: `updatePaneTitleByTerminalId` (panesSlice.ts:2206, existing, `setByUser:false`-guarded), the WS `TerminalInventoryMessage.terminals[]` rows (shared/ws-protocol.ts:1587-1606).
 - Produces: `export function foldTerminalInventoryTitles(store: { getState: () => RootState; dispatch: (a: unknown) => unknown }, terminals: Array<{ terminalId?: string; title?: string }> | undefined): number`
 
 - [ ] **Step 1: Write the failing behavioral tests**
@@ -1377,7 +1377,7 @@ git commit -m "feat(client): fold terminal inventory titles into pane titles on 
 - Modify: `src/store/store.ts` (the root `configureStore` at :51 and its middleware concat chain at :85-102 — LB-16: NOT `src/store/index.ts`; add the middleware to the existing chain)
 
 **Interfaces:**
-- Consumes: `updatePaneTitleBySessionRef` (panesSlice.ts:2242, existing, `setByUser:false`-guarded; matches fresh-agent panes by `provider`+`sessionId` and terminal panes by `content.sessionRef` — Task 6 ALSO extends this action to update ALL matching panes in every tab; today it updates only the FIRST matching pane per tab via `findPaneIdBySessionRef`, :448-461), sessions slice state (`state.sessions.windows[surface].projects[]` rows carrying `sessionId`/`provider`/`title?`/`lastActivityAt`, sessionsSlice.ts:66-96; every committed row also carries the per-row client-side fetch stamp `fetchSeq` — a monotonic store-level counter (module-local in sessionsSlice.ts) stamped at the shared window-commit reducer `commitWindowPayload` (sessionsSlice.ts:227-244): each committed row that does not already carry a numeric `fetchSeq` gets the next counter value, so rows freshly fetched in a commit are strictly newer than rows RETAINED from an earlier fetch (the deep-page silent-refresh merge, sessionsThunks.ts:602-609, passes the previous window's row objects through unchanged — sessionsThunks.ts:184-204 — and the stamp field rides on the row object through both carry paths: normalizeProjects' reference pass-through at sessionsSlice.ts:43-64 or its `...session` spread at :80-83; no existing per-row field reflects fetch recency — `SessionDirectoryItem` carries only activity times `lastActivityAt`/`createdAt`, shared/read-models.ts:51-86, and `revision`/`snapshotSeq` are page-level, not per-row — hence the client-side counter) — which the row-selection rule below keys on; surfaces are `'sidebar' | 'history' | 'bootstrap'` per sessionsThunks.ts:27), and the pane-binding action types `panes/initLayout`, `panes/updatePaneContent`, `panes/mergePaneContent`, `panes/materializeFreshAgentSession`, `panes/reconcileTerminalSessionRefByTerminalId`, `panes/splitPane`, `panes/addPane`, `panes/restoreLayout`, `panes/hydratePanes` (all verified against panesSlice.ts — slice name `'panes'` at :1223; reducers at :1226/:1741/:1841/:1809/:2265 and splitPane :1308, addPane :1370, restoreLayout :1248, hydratePanes :2082; real binding paths: REST/MCP agent split via ui-commands.ts:119-127, sidebar split-open via Sidebar.tsx:551-562, tab-registry reconstruction via tab-registry-open.ts:278-280, machine-bootstrap/recovery-offer rebuild via machine-workspace.ts:67 + RecoveryOfferPanel.tsx:165, cross-window hydration via crossTabSync.ts:206-219).
+- Consumes: `updatePaneTitleBySessionRef` (panesSlice.ts:2236, existing, `setByUser:false`-guarded; matches fresh-agent panes by `provider`+`sessionId` and terminal panes by `content.sessionRef` — Task 6 ALSO extends this action to update ALL matching panes in every tab; today it updates only the FIRST matching pane per tab via `findPaneIdBySessionRef`, :448-461), sessions slice state (`state.sessions.windows[surface].projects[]` rows carrying `sessionId`/`provider`/`title?`/`lastActivityAt`, sessionsSlice.ts:66-96; every committed row also carries the per-row client-side fetch stamp `fetchSeq` — a monotonic store-level counter (module-local in sessionsSlice.ts) stamped at the shared window-commit reducer `commitWindowPayload` (sessionsSlice.ts:234-243): each committed row that does not already carry a numeric `fetchSeq` gets the next counter value, so rows freshly fetched in a commit are strictly newer than rows RETAINED from an earlier fetch (the deep-page silent-refresh merge, sessionsThunks.ts:602-609, passes the previous window's row objects through unchanged — sessionsThunks.ts:184-204 — and the stamp field rides on the row object through both carry paths: normalizeProjects' reference pass-through at sessionsSlice.ts:43-64 or its `...session` spread at :80-83; no existing per-row field reflects fetch recency — `SessionDirectoryItem` carries only activity times `lastActivityAt`/`createdAt`, shared/read-models.ts:51-86, and `revision`/`snapshotSeq` are page-level, not per-row — hence the client-side counter) — which the row-selection rule below keys on; surfaces are `'sidebar' | 'history' | 'bootstrap'` per sessionsThunks.ts:27), and the pane-binding action types `panes/initLayout`, `panes/updatePaneContent`, `panes/mergePaneContent`, `panes/materializeFreshAgentSession`, `panes/reconcileTerminalSessionRefByTerminalId`, `panes/splitPane`, `panes/addPane`, `panes/restoreLayout`, `panes/hydratePanes` (all verified against panesSlice.ts — slice name `'panes'` at :1217; reducers at :1220/:1735/:1835/:1803/:2260 and splitPane :1302, addPane :1364, restoreLayout :1242, hydratePanes :2076; real binding paths: REST/MCP agent split via ui-commands.ts:119-127, sidebar split-open via Sidebar.tsx:551-562, tab-registry reconstruction via tab-registry-open.ts:278-280, machine-bootstrap/recovery-offer rebuild via machine-workspace.ts:95 + RecoveryOfferPanel.tsx:165, cross-window hydration via crossTabSync.ts:206-219).
 - Produces: `export const sessionTitleMirrorMiddleware: Middleware` (registered once in the store setup).
 
 - [ ] **Step 1: Write the failing behavioral test**
@@ -1672,7 +1672,7 @@ function sessionTitleDiffers(panes: RootState['panes'], provider: string, sessio
  * (Sidebar.tsx:551-562) and tab-registry reconstruction
  * (tab-registry-open.ts:278-280); panes/restoreLayout — the
  * machine-bootstrap/recovery-offer rebuild plan loops
- * (machine-workspace.ts:67, RecoveryOfferPanel.tsx:165);
+ * (machine-workspace.ts:95, RecoveryOfferPanel.tsx:165);
  * panes/hydratePanes — cross-window hydration (crossTabSync.ts:206-219). */
 const SESSION_BINDING_PANE_ACTIONS = new Set([
   'panes/initLayout',
@@ -1882,7 +1882,7 @@ Expected: FAIL — the older-incoming-layout test fails (an older incoming layou
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-Extract the current `mergeHydratedPaneMetadata` (panesSlice.ts:578-648) VERBATIM into `src/store/hydrate-pane-metadata-merge.ts`, exporting it plus the meta type if needed, and add the recency rule:
+Extract the current `mergeHydratedPaneMetadata` (panesSlice.ts:572-642) VERBATIM into `src/store/hydrate-pane-metadata-merge.ts`, exporting it plus the meta type if needed, and add the recency rule:
 
 ```typescript
 import type { HydratePanesMeta } from '@/store/panesSlice'   // or move the type here and re-export
@@ -1948,7 +1948,7 @@ export function mergeHydratedPaneMetadata(
 }
 ```
 
-(The exact `state`/return types come from the moved function — move it as-is, change only the `preferredTitleSource` selection and the added parameter. In `panesSlice.ts`, delete the private copy, import the moved function, and pass `action.meta` from `hydratePanes` at the call site (~:2127-2130). panesSlice.ts must net-SHRINK by roughly the moved function's size.)
+(The exact `state`/return types come from the moved function — move it as-is, change only the `preferredTitleSource` selection and the added parameter. In `panesSlice.ts`, delete the private copy, import the moved function, and pass `action.meta` from `hydratePanes` at the call site (~:2121). panesSlice.ts must net-SHRINK by roughly the moved function's size.)
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -2038,13 +2038,13 @@ test('an older persisted layout from a second page does not clobber a newer loca
   // event on page2 only — the real crossTabSync path hydrates page2 with
   // remoteLayoutPersistedAt < localLayoutPersistedAt.
   // Envelope shape verified against the real writer/reader:
-  //  - paneTitles live at panes.paneTitles (persistMiddleware.ts:630-639
+  //  - paneTitles live at panes.paneTitles (persistMiddleware.ts:625-654
   //    writes `panes: persistablePanesSection` — the state.panes spread
-  //    minus volatile fields; parsed at persistedState.ts:552). The old
+  //    minus volatile fields; parsed at persistedState.ts:553). The old
   //    sketch's top-level `env.paneTitles` dereferenced undefined and
   //    threw — fixed.
-  //  - persistedAt is TOP-LEVEL (persistMiddleware.ts:631, read at
-  //    persistedState.ts:556).
+  //  - persistedAt is TOP-LEVEL (persistMiddleware.ts:647, read at
+  //    persistedState.ts:557).
   //  - the storage key literal 'freshell.layout.v3' matches
   //    LAYOUT_STORAGE_KEY (storage-keys.ts:2/:25).
   //  - Task 1's machineId is TOP-LEVEL; the staging touches ONLY the
@@ -2158,7 +2158,7 @@ server = new RustServer({
 ```
 
 2. Navigate; wait harness + connection; remove the auto-created shell tab FIRST (Task 4's idiom: read the tab id from the harness state, dispatch `tabs/removeTab` with the BARE id payload — the fresh home auto-creates a shell tab whose layout would otherwise own the pane tree); poll the harness state until the seeded row appears in the sessions window (`sessions.windows.sidebar.projects[].sessions[]` — the App fetches `/api/session-directory` and the server's live watcher indexes the seeded file without a restart, per the recover-my-panes/auto-title precedences).
-3. Create the pane PROPERLY — `panes/initLayout` no-ops when `state.layouts[tabId]` already exists (panesSlice.ts:1233), so it can never claim the auto shell tab's layout, and an initLayout for a tab id that was never added would orphan the layout (the loader drops it; the pane never mounts). So: `tabs/addTab` with an explicit id (`{ id: 'tab-mirror', title: 'Mirror probe' }`), then `panes/initLayout` with `{ tabId: 'tab-mirror', paneId: 'pane-mirror', content: { kind: 'fresh-agent', provider: 'claude', sessionId: SEED_SESSION_ID, sessionType: 'freshclaude', sessionRef: { provider: 'claude', sessionId: SEED_SESSION_ID } } }` — the normalized fresh-agent content shape (layout-sync-authoritative.spec.ts:345-351), whose provider+sessionId match the seeded session row.
+3. Create the pane PROPERLY — `panes/initLayout` no-ops when `state.layouts[tabId]` already exists (panesSlice.ts:1227), so it can never claim the auto shell tab's layout, and an initLayout for a tab id that was never added would orphan the layout (the loader drops it; the pane never mounts). So: `tabs/addTab` with an explicit id (`{ id: 'tab-mirror', title: 'Mirror probe' }`), then `panes/initLayout` with `{ tabId: 'tab-mirror', paneId: 'pane-mirror', content: { kind: 'fresh-agent', provider: 'claude', sessionId: SEED_SESSION_ID, sessionType: 'freshclaude', sessionRef: { provider: 'claude', sessionId: SEED_SESSION_ID } } }` — the normalized fresh-agent content shape (layout-sync-authoritative.spec.ts:345-351), whose provider+sessionId match the seeded session row.
 4. Assert the pane title mirrors the session-directory row's `title` (read the actual row title from the harness sessions state — for a Claude row the directory derives it from the seeded project path — do not hard-code), with `paneTitleSetByUser` falsy.
    At base this FAILS: an MCP/REST-created pane never receives the directory title (the exact symptom Task 6 fixes).
 
