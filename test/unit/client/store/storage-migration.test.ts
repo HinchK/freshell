@@ -67,6 +67,23 @@ describe('storage-migration', () => {
     expect(document.cookie).not.toContain('freshell-auth=')
   })
 
+  it('spares the pre-migration raw evidence sidecar in the version-bump full wipe (e2r4 finding 1)', async () => {
+    // The sidecar holds the OLDEST pre-rewrite raw the health classifier
+    // needs after a reload (clearFreshellKeysExcept wipes every freshell.*
+    // key on a version bump); it must sit on the wipe's keep list with the
+    // auth token and browser preferences.
+    localStorage.setItem('freshell_version', '2')
+    localStorage.setItem(AUTH_STORAGE_KEY, 'token-123')
+    localStorage.setItem('freshell.tabs.v1', 'legacy-tabs')
+    localStorage.setItem('freshell.layout.pre-migration-raw.v1', 'original-corrupt-raw')
+
+    await importFreshStorageMigration()
+
+    expect(localStorage.getItem('freshell.layout.pre-migration-raw.v1')).toBe('original-corrupt-raw')
+    expect(localStorage.getItem('freshell.tabs.v1')).toBeNull()
+    expect(localStorage.getItem('freshell_version')).toBe('5')
+  })
+
   it('preserves legacy terminal font migration when storage cleanup runs before browser preferences load', async () => {
     localStorage.setItem('freshell_version', '2')
     localStorage.setItem('freshell.terminal.fontFamily.v1', 'Fira Code')

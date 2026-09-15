@@ -49,6 +49,7 @@ const mocks = vi.hoisted(() => ({
   restoreMachineWorkspace: vi.fn(),
   classifyPersistedLayoutHealth: vi.fn(),
   backfillPersistedLayoutMachineId: vi.fn(),
+  clearPreMigrationLayoutEvidence: vi.fn(),
   installCrossTabSync: vi.fn(),
   startTabRegistrySync: vi.fn(),
   setHelloExtensionProvider: vi.fn(),
@@ -84,6 +85,7 @@ vi.mock('@/lib/machine-workspace', () => ({
 vi.mock('@/lib/recovery/layout-health', () => ({
   classifyPersistedLayoutHealth: (...args: unknown[]) => mocks.classifyPersistedLayoutHealth(...args),
   backfillPersistedLayoutMachineId: (...args: unknown[]) => mocks.backfillPersistedLayoutMachineId(...args),
+  clearPreMigrationLayoutEvidence: (...args: unknown[]) => mocks.clearPreMigrationLayoutEvidence(...args),
 }))
 
 vi.mock('@/store/crossTabSync', () => ({
@@ -264,6 +266,9 @@ describe('App machine identity bootstrap', () => {
     )
     expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledTimes(1)
     expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledWith(MACHINE.id)
+    // Consume-clear (e2r4 finding 1): a healthy-keep boot retires the
+    // durable pre-migration evidence sidecar.
+    expect(mocks.clearPreMigrationLayoutEvidence).toHaveBeenCalledTimes(1)
     expect(store.getState().machineIdentity.status).toBe('ready')
   })
 
@@ -286,6 +291,27 @@ describe('App machine identity bootstrap', () => {
       )
       expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledTimes(1)
       expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledWith(MACHINE.id)
+      // A completed rebuild also retires the evidence sidecar (e2r4
+      // finding 1): the clear runs only after restoreMachineWorkspace
+      // resolves.
+      expect(mocks.clearPreMigrationLayoutEvidence).toHaveBeenCalledTimes(1)
+      expect(
+        mocks.restoreMachineWorkspace.mock.invocationCallOrder[0],
+      ).toBeLessThan(mocks.clearPreMigrationLayoutEvidence.mock.invocationCallOrder[0])
     },
   )
+
+  it('leaves the pre-migration evidence sidecar when the rebuild fails — the next boot retries with the corrupt raw intact (e2r4 finding 1)', async () => {
+    mocks.classifyPersistedLayoutHealth.mockReturnValue('corrupt')
+    mocks.restoreMachineWorkspace.mockRejectedValue(new Error('inventory fetch failed'))
+    localStorage.setItem(MACHINE_ID_STORAGE_KEY, MACHINE.id)
+    mocks.getMachines.mockResolvedValue([MACHINE])
+    const store = createStore()
+
+    render(<Provider store={store}><App /></Provider>)
+
+    await waitFor(() => expect(store.getState().machineIdentity.status).toBe('error'))
+    expect(mocks.restoreMachineWorkspace).toHaveBeenCalledTimes(1)
+    expect(mocks.clearPreMigrationLayoutEvidence).not.toHaveBeenCalled()
+  })
 })

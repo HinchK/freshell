@@ -72,7 +72,7 @@ import {
   resolveMachineIdentity,
 } from '@/lib/machine-identity'
 import { restoreMachineWorkspace } from '@/lib/machine-workspace'
-import { backfillPersistedLayoutMachineId, classifyPersistedLayoutHealth } from '@/lib/recovery/layout-health'
+import { backfillPersistedLayoutMachineId, classifyPersistedLayoutHealth, clearPreMigrationLayoutEvidence } from '@/lib/recovery/layout-health'
 import { buildLocalSettingsPatch } from '@/store/browserPreferencesPersistence'
 import Sidebar, { AppView } from '@/components/Sidebar'
 import TabBar from '@/components/TabBar'
@@ -847,6 +847,12 @@ export default function App() {
             await restoreMachineWorkspace(appStore, resolution.machine.id, { reason: layoutHealth })
             if (cancelled) return false
           }
+          // Consume-and-clear the durable pre-migration evidence sidecar
+          // (e2r4 review finding 1): healthy-keep or a COMPLETED rebuild
+          // retires it; a failed rebuild throws past this point and leaves
+          // it, so the next boot retries with the original corrupt raw
+          // intact.
+          clearPreMigrationLayoutEvidence()
           dispatch(setMachineReady({ machine: resolution.machine, mode: 'server-managed' }))
           return true
         } catch (err) {

@@ -1,6 +1,7 @@
 export const STORAGE_KEYS = {
   layout: 'freshell.layout.v3',
   layoutBackup: 'freshell.layout.v3.bak',
+  layoutPreMigrationRaw: 'freshell.layout.pre-migration-raw.v1',
   tabs: 'freshell.tabs.v2',
   panes: 'freshell.panes.v2',
   sessionActivity: 'freshell.sessionActivity.v2',
@@ -24,6 +25,7 @@ export const STORAGE_KEYS = {
 
 export const LAYOUT_STORAGE_KEY = STORAGE_KEYS.layout
 export const LAYOUT_BACKUP_STORAGE_KEY = STORAGE_KEYS.layoutBackup
+export const LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY = STORAGE_KEYS.layoutPreMigrationRaw
 export const TABS_STORAGE_KEY = STORAGE_KEYS.tabs
 export const PANES_STORAGE_KEY = STORAGE_KEYS.panes
 export const SESSION_ACTIVITY_STORAGE_KEY = STORAGE_KEYS.sessionActivity

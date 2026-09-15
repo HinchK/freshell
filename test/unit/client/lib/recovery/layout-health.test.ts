@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { backfillPersistedLayoutMachineId, classifyPersistedLayoutHealth, STALE_LAYOUT_MS } from '@/lib/recovery/layout-health'
-import { LAYOUT_STORAGE_KEY, MACHINE_ID_STORAGE_KEY } from '@/store/storage-keys'
+import { LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, LAYOUT_STORAGE_KEY, MACHINE_ID_STORAGE_KEY } from '@/store/storage-keys'
 import {
   hashPersistedLayoutRaw,
   LAYOUT_FRESH_AGENT_BACKUP_KEY,
@@ -357,6 +357,40 @@ describe('classifyPersistedLayoutHealth', () => {
     seedEnvelope(envelope)
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
   })
+
+  it('prefers the durable pre-migration evidence sidecar over the stored raw when one is present (e2r4 finding 1)', () => {
+    // The sanitized stored envelope is its own healthy truth — its raw
+    // carries no key the parse drops. But the sidecar still holds the
+    // ORIGINAL pre-rewrite envelope whose invalid terminal sessionRef the
+    // boot migration stripped, so the cross-boot comparison the
+    // process-local capture cannot make after a reload still classifies
+    // the layout corrupt.
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'terminal', mode: 'claude', createRequestId: 'cr-a', status: 'running' },
+      },
+    }
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+    const originalEnvelope = healthyEnvelope('machine-1')
+    ;(originalEnvelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'leaf',
+        id: 'pane-a',
+        content: {
+          kind: 'terminal', mode: 'claude', createRequestId: 'cr-a', status: 'running',
+          sessionRef: { provider: 'claude', sessionId: '' },
+        },
+      },
+    }
+    localStorage.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, JSON.stringify(originalEnvelope))
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+    localStorage.removeItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
 })
 
 // e2r1 review finding 1: the content-salvage check could never fire in the
@@ -467,6 +501,78 @@ describe('classifyPersistedLayoutHealth in the real boot order (migration rewrit
     }))
     const { classify } = await classifyAfterRealBoot()
     expect(classify('machine-1')).toBe('healthy')
+  })
+
+  // e2r4 review finding 1: the pre-migration raw existed only in the
+  // process-local capture (storage-migration.ts preMigrationLayoutRaw), so
+  // an interrupted recovery — the rebuild failed (e.g. the inventory fetch
+  // rejected) and the page reloaded — lost its corruption evidence: the
+  // next boot started with the capture empty and compared the
+  // already-sanitized stored envelope with itself, classifying healthy and
+  // permanently bypassing the corrupt-must-rebuild behavior. The
+  // migration's forced-rewrite path now mirrors the pre-rewrite raw into a
+  // DEDICATED sidecar key (oldest evidence wins), the classifier prefers
+  // that sidecar, and the boot gate consume-and-clears it after
+  // adjudication — healthy-keep or a completed rebuild retires it, a failed
+  // rebuild leaves it for the next boot's retry.
+  it('e2r4 interrupted recovery: the sidecar keeps a failed-rebuild layout corrupt across boots until the rebuild succeeds', async () => {
+    const corruptRaw = JSON.stringify(terminalPaneEnvelope({
+      kind: 'terminal', mode: 'claude', createRequestId: 'cr-a', status: 'running',
+      sessionRef: { provider: 'claude', sessionId: '' },
+    }))
+    seedEnvelope(corruptRaw)
+
+    // Boot 1: the migration rewrites (sanitizes) and writes the evidence
+    // sidecar; classification sees the stripped sessionRef through it.
+    const boot1 = await classifyAfterRealBoot()
+    expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBe(corruptRaw)
+    const sanitizedRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)!
+    expect(sanitizedRaw).not.toBe(corruptRaw)
+    expect(JSON.parse(sanitizedRaw).panes.layouts['tab-a'].content.sessionRef).toBeUndefined()
+    expect(boot1.classify('machine-1')).toBe('corrupt')
+
+    // The rebuild FAILS (the gate leaves the sidecar alone) and the page
+    // reloads. A flush lands between boots (the user kept using the window),
+    // so the next migration's marker guard fails and the rewrite runs again
+    // — this time on the already-sanitized envelope. Oldest evidence wins:
+    // the sidecar must NOT be overwritten, and classification must still
+    // see the ORIGINAL corrupt raw.
+    const flushed = JSON.parse(sanitizedRaw)
+    ;(flushed.tabs as { tabs: Array<Record<string, unknown>> }).tabs[0].title = 'After the failed rebuild'
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(flushed))
+    const boot2 = await classifyAfterRealBoot()
+    expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBe(corruptRaw)
+    expect(boot2.classify('machine-1')).toBe('corrupt')
+
+    // The rebuild SUCCEEDS: the gate consume-and-clears the sidecar...
+    const boot2Module = await import('@/lib/recovery/layout-health')
+    boot2Module.clearPreMigrationLayoutEvidence()
+    expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBeNull()
+
+    // ...and the next boot classifies the rebuilt envelope on its own raw.
+    const boot3 = await classifyAfterRealBoot()
+    expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBeNull()
+    expect(boot3.classify('machine-1')).toBe('healthy')
+  })
+
+  it('e2r4 healthy path: the migration writes the sidecar, healthy-keep consume-and-clears it, and the next boot has no sidecar', async () => {
+    const healthyRaw = JSON.stringify(terminalPaneEnvelope({
+      kind: 'terminal', mode: 'claude', createRequestId: 'cr-a', status: 'running',
+      sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+    }))
+    seedEnvelope(healthyRaw)
+
+    const boot1 = await classifyAfterRealBoot()
+    expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBe(healthyRaw)
+    expect(boot1.classify('machine-1')).toBe('healthy')
+
+    const boot1Module = await import('@/lib/recovery/layout-health')
+    boot1Module.clearPreMigrationLayoutEvidence()
+    expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBeNull()
+
+    const boot2 = await classifyAfterRealBoot()
+    expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBeNull()
+    expect(boot2.classify('machine-1')).toBe('healthy')
   })
 })
 

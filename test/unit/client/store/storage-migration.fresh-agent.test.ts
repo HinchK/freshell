@@ -4,6 +4,7 @@ const LAYOUT_KEY = 'freshell.layout.v3'
 const BACKUP_KEY = 'freshell.layout.v3.backup-before-fresh-agent-centralization'
 const MARKER_KEY = 'freshell.layout.v3.fresh-agent-centralization-commit'
 const PENDING_KEY = 'freshell.layout.v3.fresh-agent-centralization-pending'
+const SIDECAR_KEY = 'freshell.layout.pre-migration-raw.v1'
 const VERSION_KEY = 'freshell_version'
 
 type StorageHooks = {
@@ -243,6 +244,36 @@ describe('storage-migration fresh-agent', () => {
     })
     expect(content.sessionRef).toBeUndefined()
     expect(content.resumeSessionId).toBeUndefined()
+  })
+
+  it('writes the pre-rewrite raw to the pre-migration evidence sidecar on the forced-rewrite path (e2r4 finding 1)', async () => {
+    const originalRaw = makeLegacyLayoutRaw()
+    const storage = createStorage()
+    Object.defineProperty(globalThis, 'localStorage', { value: storage, writable: true })
+    storage.seed(VERSION_KEY, '5')
+    storage.seed(LAYOUT_KEY, originalRaw)
+
+    await import('@/store/storage-migration')
+
+    expect(localStorage.getItem(SIDECAR_KEY)).toBe(originalRaw)
+  })
+
+  it('does not overwrite a pre-existing pre-migration evidence sidecar on a later forced rewrite (oldest evidence wins)', async () => {
+    const originalRaw = makeLegacyLayoutRaw()
+    const oldestEvidence = JSON.stringify({ version: 1, note: 'oldest pre-rewrite evidence' })
+    const storage = createStorage()
+    Object.defineProperty(globalThis, 'localStorage', { value: storage, writable: true })
+    storage.seed(VERSION_KEY, '5')
+    storage.seed(LAYOUT_KEY, originalRaw)
+    storage.seed(SIDECAR_KEY, oldestEvidence)
+
+    await import('@/store/storage-migration')
+
+    // The rewrite ran (layout migrated) but the sidecar still holds the
+    // EARLIER boot's capture — a later rewrite must never replace the
+    // original evidence.
+    expect(localStorage.getItem(LAYOUT_KEY)).toContain('"fresh-agent"')
+    expect(localStorage.getItem(SIDECAR_KEY)).toBe(oldestEvidence)
   })
 
   it('aborts before touching the original layout when the backup write fails', async () => {

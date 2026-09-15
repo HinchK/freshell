@@ -26,7 +26,7 @@ import {
   parseLayoutFreshAgentCommitMarker,
   readRecoverablePersistedLayoutRaw,
 } from './persistedState'
-import { BROWSER_PREFERENCES_STORAGE_KEY, LAYOUT_STORAGE_KEY } from './storage-keys'
+import { BROWSER_PREFERENCES_STORAGE_KEY, LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, LAYOUT_STORAGE_KEY } from './storage-keys'
 import {
   buildRestoreError,
   migrateLegacyTerminalDurableState,
@@ -298,7 +298,11 @@ function normalizeLayoutNode(node: unknown): unknown {
 // getPreMigrationLayoutRaw() instead. Null when no rewrite occurred
 // this boot (marker-guard held) — then the stored raw is its own
 // pre-migration truth. One browser window is one JS realm, so one
-// capture per boot is the correct scope.
+// capture per boot is the correct scope; the rewrite ALSO mirrors this
+// raw into the DURABLE pre-migration evidence sidecar
+// (LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY) because this capture is empty
+// again after a reload — see writeMigratedLayoutWithRecovery (e2r4
+// review finding 1).
 let preMigrationLayoutRaw: string | null = null
 
 export function getPreMigrationLayoutRaw(): string | null {
@@ -354,6 +358,24 @@ function writeMigratedLayoutWithRecovery(originalRaw: string, migratedRaw: strin
       error: error instanceof Error ? error.message : String(error),
     })
     return false
+  }
+
+  // Durable evidence sidecar (e2r4 review finding 1): mirror the PRE-rewrite
+  // raw into a dedicated key so the health classifier can still see what the
+  // rewrite sanitized after a reload — the process-local capture below is
+  // empty in the next JS realm. Written ONLY when the key holds no value:
+  // OLDEST EVIDENCE WINS, a later boot's rewrite must never overwrite the
+  // original corrupt raw. A failed write only warns; this boot still
+  // classifies through the process-local capture.
+  try {
+    if (localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY) === null) {
+      localStorage.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, originalRaw)
+    }
+  } catch (error) {
+    warnStructured('fresh_agent_layout_evidence_write_failed', {
+      key: LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY,
+      error: error instanceof Error ? error.message : String(error),
+    })
   }
 
   preMigrationLayoutRaw = originalRaw
@@ -495,6 +517,7 @@ export function runStorageMigration(): void {
       LAYOUT_STORAGE_KEY,
       LAYOUT_FRESH_AGENT_BACKUP_KEY,
       LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY,
+      LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY,
       ...LEGACY_BROWSER_PREFERENCE_KEYS,
     ])
 

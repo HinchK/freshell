@@ -1,6 +1,6 @@
 import { parsePersistedLayoutRaw, type ParsedPersistedLayout } from '@/store/persistedState'
 import { isWellFormedPaneTree } from '@/store/paneTreeValidation'
-import { LAYOUT_STORAGE_KEY } from '@/store/storage-keys'
+import { LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, LAYOUT_STORAGE_KEY } from '@/store/storage-keys'
 import { getPreMigrationLayoutRaw } from '@/store/storage-migration'
 import { LEGACY_FRESHOPENCODE_DEFAULT_MODEL } from '@/store/paneTypes'
 import { sanitizeRestoreError, sanitizeSessionRef } from '@shared/session-contract'
@@ -17,6 +17,34 @@ function safeStorage(): Storage | undefined {
     return typeof localStorage === 'undefined' ? undefined : localStorage
   } catch {
     return undefined
+  }
+}
+
+/** The durable pre-migration evidence sidecar (e2r4 review finding 1):
+ * the OLDEST pre-rewrite `freshell.layout.v3` raw, written by the boot
+ * migration's forced-rewrite path only while the key holds no value
+ * (oldest evidence wins) and spared by the version-bump wipe. Null when
+ * no rewrite ever captured evidence (or the key was consumed below). */
+function readPreMigrationEvidenceRaw(storage: Storage | undefined): string | null {
+  if (!storage) return null
+  try {
+    return storage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)
+  } catch {
+    return null
+  }
+}
+
+/** Consume-and-clear the evidence sidecar after the boot gate's
+ * adjudication: healthy-keep or a COMPLETED rebuild retires it; a failed
+ * rebuild leaves it so the next boot retries with the original corrupt raw
+ * intact. A failing removeItem also leaves it — retention is the
+ * fail-safe direction, costing at most one redundant rebuild. */
+export function clearPreMigrationLayoutEvidence(storage: Storage | undefined = safeStorage()): void {
+  if (!storage) return
+  try {
+    storage.removeItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)
+  } catch {
+    // retention is fail-safe; nothing user-visible to report
   }
 }
 
@@ -371,16 +399,30 @@ export function classifyPersistedLayoutHealth(
   // strips (tree checks pass on the sanitized result) is corruption — the
   // pane would rehydrate without its durable identity. See
   // hasSalvagedLeafContent for the pairing rule and the verified
-  // migration exemptions. The raw side is the PRE-migration envelope
-  // when this boot's storage migration rewrote freshell.layout.v3
-  // (main.tsx imports the self-executing migration before the store, and
-  // on essentially every boot the marker guard fails — any flush changes
-  // the raw hash — so migratePersistedLayout rewrites): the rewrite
-  // normalizes the same leaves the parse does, so a POST-rewrite raw can
-  // never show a stripped key (e2r1 review finding 1). No rewrite this
-  // boot → the getter returns null and the stored raw still carries any
-  // invalid content, so it is its own pre-migration truth.
-  const salvageRaw = getPreMigrationLayoutRaw() ?? raw
+  // migration exemptions. The raw side prefers the DURABLE pre-migration
+  // evidence sidecar FIRST (e2r4 review finding 1): the migration's
+  // rewrite mirrors the pre-rewrite raw into a dedicated key (oldest
+  // evidence wins), so an interrupted recovery — the rebuild failed and
+  // the page reloaded, or the page died before the gate adjudicated —
+  // still classifies corrupt on the NEXT boot, when the process-local
+  // capture is empty and the stored raw is already sanitized. The sidecar
+  // also outranks this boot's process-local capture when both exist: the
+  // capture reflects the CURRENT pre-rewrite envelope, while a surviving
+  // sidecar means an earlier adjudication never completed — its original
+  // evidence keeps driving corrupt-until-rebuilt (a legit later flush
+  // only adds keys, and a genuinely restored pane re-adds the dropped key,
+  // so the comparison converges on the first completed adjudication).
+  // Then this boot's pre-rewrite capture (main.tsx imports the
+  // self-executing migration before the store, and on essentially every
+  // boot the marker guard fails — any flush changes the raw hash — so
+  // migratePersistedLayout rewrites): the rewrite normalizes the same
+  // leaves the parse does, so a POST-rewrite raw can never show a
+  // stripped key (e2r1 review finding 1). No capture this boot → the
+  // getter returns null and the stored raw still carries any invalid
+  // content, so it is its own pre-migration truth.
+  const salvageRaw = readPreMigrationEvidenceRaw(storage)
+    ?? getPreMigrationLayoutRaw()
+    ?? raw
   let salvageEnvelope: { panes?: { layouts?: unknown } } | undefined
   try {
     salvageEnvelope = JSON.parse(salvageRaw)
