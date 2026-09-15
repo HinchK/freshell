@@ -374,6 +374,7 @@ export const RUST_ONLY_SPECS = [
   // for restartAbrupt(); proves terminal.create wire sends are spaced
   // >=400ms on reload. See docs/plans/2026-09-08-stagger-restore-launches.md
   /restore-create-stagger-rust\.spec\.ts$/,
+  /local-first-reload-rust\.spec\.ts$/,
 ]
 
 export default defineConfig({
@@ -657,6 +658,7 @@ export default defineConfig({
         // owns its RustServer on an ephemeral port; proves terminal.create
         // wire sends are spaced >=400ms on reload.
         /restore-create-stagger-rust\.spec\.ts$/,
+        /local-first-reload-rust\.spec\.ts$/,
       ],
     },
     // CONTINUITY SMOKE (pre-deploy gate): REAL freshell-server binary + REAL
