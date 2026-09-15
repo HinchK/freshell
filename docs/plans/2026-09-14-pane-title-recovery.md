@@ -55,8 +55,9 @@ All facts below were verified against the worktree at `bab7d5189` by five explor
 
 > **Delta round 3 remediation (post-review):** the layout envelope is no
 > longer the origin-wide `freshell.layout.v3` key. It is now PER WINDOW —
-> `freshell.layout.v3.<clientInstanceId>` (the SAME sessionStorage id the
-> tab-registry sync uses), with one-time LEGACY adoption
+> `freshell.layout.v3.<layoutWindowId>` (a DEDICATED sessionStorage id,
+> `freshell.layout-window-id.v1`, separate from the tab-registry client
+> id), with one-time LEGACY adoption
 > (`storage-migration.ts` copies the bare legacy key byte-identically into
 > a window's derived key on its first post-change boot and NEVER deletes
 > the legacy key), per-window `.bak` / fresh-agent-centralization /
@@ -68,7 +69,7 @@ All facts below were verified against the worktree at `bab7d5189` by five explor
 > per-window key (`src/store/window-layout-keys.ts`).
 
 - `restoreMachineWorkspace` (src/lib/machine-workspace.ts:47-77) is called unconditionally by `resolveMachineBeforeTransport` (src/App.tsx:805-863, call at :831) and always dispatches `clearTabsForMachine` + `clearPanesForMachine` + `clearTabRegistryLocalClosed` before rebuilding from `buildRecoveryPlan` — whose `paneTitles` is always `{}` (build-recovery-plan.ts:359).
-- The persisted envelope — the window's per-window key `freshell.layout.v3.<clientInstanceId>` (version 4; delta round 3, previously the origin-wide `freshell.layout.v3`) — is written by `persistMiddleware.flush()` (persistMiddleware.ts:630-639) with a top-level `persistedAt`; `parsePersistedLayoutRaw` (persistedState.ts:525-558) is passthrough-tolerant but reconstructs a fixed shape, so a new `machineId` field must be surfaced explicitly. `clearTabsForMachine` sets `userClosedTabsIntent=true` (persistMiddleware.ts:739-747) making an empty restore destructively overwrite the cache.
+- The persisted envelope — the window's per-window key `freshell.layout.v3.<layoutWindowId>` (version 4; delta round 3, previously the origin-wide `freshell.layout.v3`) — is written by `persistMiddleware.flush()` (persistMiddleware.ts:630-639) with a top-level `persistedAt`; `parsePersistedLayoutRaw` (persistedState.ts:525-558) is passthrough-tolerant but reconstructs a fixed shape, so a new `machineId` field must be surfaced explicitly. `clearTabsForMachine` sets `userClosedTabsIntent=true` (persistMiddleware.ts:739-747) making an empty restore destructively overwrite the cache.
 - Slices rehydrate from localStorage at module eval, BEFORE the App effect — so the health classification reads the same envelope the slices just rehydrated.
 - `updatePaneTitleByTerminalId` and `updatePaneTitleBySessionRef` already exist (panesSlice.ts:2212/2242) with the `setByUser:false` user-set guard; `terminal.inventory` is sent on every connection (crates/freshell-ws/src/lib.rs:614-622) with rows carrying `title` (server_messages.rs:1125), and the sole client handler (App.tsx:1419-1470) ignores it.
 - Session-directory rows (`SessionDirectoryItem`, shared/read-models.ts:51-86) carry `sessionId`, `provider`, `title?` and arrive via `/api/session-directory` fetches triggered by `sessions.changed` broadcasts; the sessions slice normalizes them under `state.sessions.windows[surface].projects` (sessionsSlice.ts:66-96).
