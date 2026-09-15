@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { FreshAgentItemCard, FreshAgentToolBlock, stripSystemReminders } from '@/components/fresh-agent/FreshAgentItemCard'
+import { FreshAgentItemCard, FreshAgentDelegationBlock, FreshAgentOpenSessionContext, FreshAgentToolBlock, stripSystemReminders } from '@/components/fresh-agent/FreshAgentItemCard'
+import { formatThoughtDuration } from '@/components/fresh-agent/shared/format-duration'
 
 vi.mock('@/components/markdown/LazyMarkdown', async () => {
   const { MarkdownRenderer } = await import('@/components/markdown/MarkdownRenderer')
@@ -184,5 +185,124 @@ describe('FreshAgentItemCard', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'opencode.bash tool call' }))
     expect(container.querySelector('[data-tool-output]')).toHaveTextContent('PASS')
+  })
+})
+
+const longTaskResult = Array.from({ length: 30 }, (_, i) => `line ${i + 1}: harness output sample`).join('\n')
+
+const delegationItem = {
+  id: 'part_t1',
+  kind: 'task_delegation' as const,
+  status: 'running' as const,
+  title: 'General Task — Fix the flaky harness',
+  description: 'Fix the flaky harness',
+  subagent: 'general',
+  childSessionId: 'ses_child_1',
+  durationMs: 1755761,
+  activity: [
+    { tool: 'bash', status: 'completed' as const, preview: 'sed -n 92,112p src/store/paneTypes.ts' },
+    { tool: 'grep', status: 'failed' as const, preview: 'reasoningEffort' },
+    { tool: 'read', status: 'running' as const, preview: 'src/index.css' },
+  ],
+  result: longTaskResult,
+}
+
+describe('task_delegation rendering', () => {
+  afterEach(() => cleanup())
+
+  it('renders the delegation header with title, duration and running spinner', () => {
+    render(<FreshAgentDelegationBlock item={delegationItem} />)
+    expect(screen.getByText('General Task — Fix the flaky harness')).toBeInTheDocument()
+    expect(screen.getByText('29m 16s')).toBeInTheDocument() // formatThoughtDuration(1755761)
+    expect(screen.getByLabelText('running')).toBeInTheDocument()
+  })
+
+  it('renders nested child rows with title-cased tool labels and (failed) on errors', () => {
+    render(<FreshAgentDelegationBlock item={delegationItem} />)
+    expect(screen.getByText('Bash')).toBeInTheDocument()
+    expect(screen.getByText('Grep')).toBeInTheDocument()
+    expect(screen.getByText(/sed -n 92,112p src\/store\/paneTypes\.ts/)).toBeInTheDocument()
+    expect(screen.getByText('(failed)')).toBeInTheDocument()
+  })
+
+  it('renders the clamped task result: full content in a bounded, scrollable box', () => {
+    render(<FreshAgentDelegationBlock item={delegationItem} />)
+    const result = screen.getByTestId('fresh-agent-delegation-result')
+    // Content-presence: the LAST line proves the whole result body is carried…
+    expect(result).toHaveTextContent('line 30: harness output sample')
+    // …and the clamp classes prove the box is bounded + scrollable.
+    expect(result.className).toContain('max-h-24')
+    expect(result.className).toContain('overflow-y-auto')
+  })
+
+  it('renders an Open session button that calls the context handler with the child session', () => {
+    const openSession = vi.fn()
+    render(
+      <FreshAgentOpenSessionContext.Provider value={openSession}>
+        <FreshAgentDelegationBlock item={delegationItem} />
+      </FreshAgentOpenSessionContext.Provider>,
+    )
+    fireEvent.click(screen.getByRole('button', { name: /open session/i }))
+    expect(openSession).toHaveBeenCalledWith('ses_child_1', 'Fix the flaky harness')
+  })
+
+  it('omits the Open session button without a child session id', () => {
+    render(<FreshAgentDelegationBlock item={{ ...delegationItem, childSessionId: undefined }} />)
+    expect(screen.queryByRole('button', { name: /open session/i })).not.toBeInTheDocument()
+  })
+
+  it('shows completed check and failed cross statuses', () => {
+    const { rerender } = render(<FreshAgentDelegationBlock item={delegationItem} />)
+    rerender(<FreshAgentDelegationBlock item={{ ...delegationItem, status: 'completed' }} />)
+    expect(screen.getByLabelText('complete')).toBeInTheDocument()
+    rerender(<FreshAgentDelegationBlock item={{ ...delegationItem, status: 'failed' }} />)
+    expect(screen.getByLabelText('error')).toBeInTheDocument()
+  })
+})
+
+describe('retry rendering', () => {
+  afterEach(() => cleanup())
+
+  it('renders a muted retry row with attempt and error text', () => {
+    render(<FreshAgentItemCard item={{ id: 'rr', kind: 'retry', attempt: 2, error: 'stream disconnected' }} />)
+    expect(screen.getByTestId('fresh-agent-retry-row')).toHaveTextContent('Retrying (attempt 2) — stream disconnected')
+  })
+})
+
+describe('delegated_task rendering', () => {
+  afterEach(() => cleanup())
+
+  it('renders a one-line muted caption with the title-cased agent', () => {
+    render(<FreshAgentItemCard item={{ id: 's1', kind: 'delegated_task', agent: 'general', description: 'Fix the flaky harness' }} />)
+    expect(screen.getByTestId('fresh-agent-delegated-task')).toHaveTextContent('Delegated — General · Fix the flaky harness')
+  })
+})
+
+describe('FreshAgentToolBlock previewOverride', () => {
+  afterEach(() => cleanup())
+
+  it('prefers previewOverride over the input-derived preview', () => {
+    render(
+      <FreshAgentToolBlock
+        tool={{
+          id: 'tool-override-1',
+          name: 'Task',
+          input: { command: 'ignored raw input' },
+          previewOverride: 'General Task — Fix the flaky harness',
+          status: 'complete',
+        }}
+      />,
+    )
+    expect(screen.getByText('General Task — Fix the flaky harness')).toBeInTheDocument()
+    expect(screen.queryByText(/ignored raw input/)).not.toBeInTheDocument()
+  })
+})
+
+describe('formatThoughtDuration', () => {
+  it('formats seconds, minutes and hours', () => {
+    expect(formatThoughtDuration(1831)).toBe('1.8s')
+    expect(formatThoughtDuration(3400)).toBe('3.4s')
+    expect(formatThoughtDuration(61_000)).toBe('1m 1s')
+    expect(formatThoughtDuration(3_720_000)).toBe('1h 2m')
   })
 })

@@ -139,8 +139,8 @@ use freshell_opencode::transport::{
     LoopbackPortAllocator, ReqwestEventSource, ReqwestServeHttp, TokioProcessSpawner,
 };
 use freshell_opencode::{
-    normalize_opencode_effort, normalize_opencode_model, OpencodeServeManager, ServeConfig,
-    ServeDeps, ServeError,
+    normalize_opencode_effort, normalize_opencode_model, OpencodeServeManager, Route, ServeConfig,
+    ServeDeps, ServeError, SessionSignal,
 };
 use freshell_protocol::{
     FreshAgentEvent, FreshAgentSessionMaterialized, ServerMessage, SessionLocator, SessionsChanged,
@@ -338,6 +338,12 @@ pub struct FreshAgentState {
     /// wired fields above, production construction is unconditional); tests
     /// install a scripted probe via [`Self::with_model_capability_probe`].
     pub(crate) model_capabilities: Arc<model_capabilities::ModelCapabilityRegistry>,
+    /// Task-3 child-session join (freshopencode TUI parity): child session id
+    /// → the parent session id whose live watcher exists (Stage-2 ledger
+    /// LB-2/LB-8). A watcher self-removes its entry on exit, so every parent
+    /// snapshot build re-arms missing watchers — dead watchers never cause
+    /// permanent refresh loss. std Mutex, short critical sections.
+    child_watchers: Arc<Mutex<HashMap<String, String>>>,
     /// Task 4 test seam: the REST resume probe's `get_session` budget override
     /// (a wedged fake serve must NEVER wait the real 10s). Production
     /// resolution reads the same `FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS`
@@ -440,6 +446,7 @@ impl FreshAgentState {
             model_capabilities: Arc::new(model_capabilities::ModelCapabilityRegistry::new(
                 Arc::new(model_capabilities::OpencodeCatalogProbe::default()),
             )),
+            child_watchers: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             resume_probe_timeout_ms: Arc::new(Mutex::new(None)),
         }
@@ -873,12 +880,87 @@ impl FreshAgentState {
         let rollback = self
             .identity_sink()
             .and_then(|s| s.load_rollback(PROVIDER, thread_id));
-        Ok(build_opencode_snapshot_json(
-            thread_id,
-            &info,
-            &messages,
-            rollback.as_ref(),
-        ))
+        let mut snapshot =
+            build_opencode_snapshot_json(thread_id, &info, &messages, rollback.as_ref());
+        // Server-side child-session join (Stage-2 ledger LB-2): this REST builder
+        // is the single client-visible snapshot producer, so the join AND the
+        // live-refresh registry live here, on FreshAgentState — reachable for
+        // every session (live or sidebar-opened durable), re-armed on every
+        // build (LB-8).
+        // ORDER (plan-review round 1, Finding 4): watch FIRST, fetch SECOND. The
+        // subscribe call creates the broadcast receiver synchronously BEFORE the
+        // child-history fetch runs, so a child event racing the fetch is buffered
+        // in the channel instead of lost — a tokio broadcast receiver does not
+        // replay.
+        self.ensure_child_watchers(&manager, thread_id, &snapshot);
+        attach_child_activity(&manager, &route, &mut snapshot).await;
+        Ok(snapshot)
+    }
+
+    /// Ensure a live child→parent watcher exists for every child session this
+    /// snapshot's `task_delegation` items reference (the live-refresh half of
+    /// the Task-3 child-session join). Subscribe BEFORE spawning
+    /// (`spawn_serve_bridge` discipline): the tokio broadcast receiver is
+    /// created synchronously here, so child events racing the spawned task's
+    /// startup are buffered, not lost. The watcher maps child `message.*`
+    /// events to a `freshAgent.session.changed` frame for the PARENT session
+    /// (reason `opencode-message`) — the frame that drives the client's
+    /// existing snapshot refetch — and self-removes its registry entry on exit
+    /// so the next parent build re-arms it (LB-8).
+    fn ensure_child_watchers(
+        &self,
+        manager: &OpencodeServeManager,
+        parent_id: &str,
+        snapshot: &Value,
+    ) {
+        for child in opencode_snapshot_child_session_ids(snapshot) {
+            let mut watchers = self.child_watchers.lock().expect("child_watchers poisoned");
+            if watchers.contains_key(&child) {
+                continue;
+            }
+            watchers.insert(child.clone(), parent_id.to_string());
+            drop(watchers);
+            // The registry entry is inserted BEFORE subscribe+spawn, so a
+            // concurrent build never double-spawns for the same child.
+            let rx = manager.subscribe(&child);
+            let fresh_agent = self.clone();
+            let parent_id = parent_id.to_string();
+            tokio::spawn(async move {
+                let mut rx = rx;
+                loop {
+                    match tokio::time::timeout(
+                        Duration::from_secs(OPENCODE_CHILD_WATCHER_IDLE_SECS),
+                        rx.recv(),
+                    )
+                    .await
+                    {
+                        Err(_elapsed) => break,
+                        Ok(Ok(SessionSignal::Event(parsed))) => {
+                            if !parsed.kind.starts_with("message.") {
+                                continue;
+                            }
+                            fresh_agent.broadcast(&opencode_ws::event_frame(
+                                &parent_id,
+                                opencode_ws::changed_event(&parent_id, "opencode-message"),
+                            ));
+                        }
+                        // Same tolerance arms as `spawn_serve_bridge`: a lost
+                        // sidecar is surfaced by the parent's own serve bridge,
+                        // and a Lagged burst must not kill the live refresh
+                        // (LB-3).
+                        Ok(Ok(SessionSignal::Lost)) => {}
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                        Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                    }
+                }
+                // Self-remove: the next parent snapshot build re-arms (LB-8).
+                fresh_agent
+                    .child_watchers
+                    .lock()
+                    .expect("child_watchers poisoned")
+                    .remove(&child);
+            });
+        }
     }
 }
 
@@ -1286,6 +1368,328 @@ fn opencode_compute_tool_after_by_part_index(parts: &[Value]) -> Vec<bool> {
     tool_after
 }
 
+/// Duration of a wire part from its `time` (ms). Absent/incomplete time yields None.
+/// Takes the object CARRYING the `time` key -- the part itself for `reasoning` parts,
+/// the `state` sub-object for `tool` parts.
+fn opencode_part_duration_ms(holder: &Value) -> Option<u64> {
+    let time = holder.get("time")?;
+    let start = time.get("start").and_then(Value::as_i64)?;
+    let end = time.get("end").and_then(Value::as_i64)?;
+    (end >= start).then_some((end - start) as u64)
+}
+
+/// Mirror of the opencode TUI's `reasoningSummary` (thinking.ts): a leading bold
+/// block `**Title**` followed by a blank line (or end of text -- a title still
+/// awaiting its body while streaming) is disclosure metadata; the text after the
+/// blank line is the body. The TUI regex is `/^\*\*([^*\n]+)\*\*(?:\r?\n\r?\n|$)/`.
+fn opencode_reasoning_title_and_body(raw: &str) -> (Option<String>, String) {
+    let content = raw.trim();
+    let Some(rest) = content.strip_prefix("**") else {
+        return (None, content.to_string());
+    };
+    let Some(close) = rest.find("**") else {
+        return (None, content.to_string());
+    };
+    let candidate = &rest[..close];
+    if candidate.is_empty() || candidate.contains('\n') || candidate.contains('*') {
+        return (None, content.to_string());
+    }
+    let after = rest[close + 2..].trim_start_matches('\r');
+    // Require end-of-text or a blank line (the TUI's `\r?\n\r?\n`), matching \r\n too.
+    let body = if after.is_empty() {
+        String::new()
+    } else if let Some(stripped) = after.strip_prefix('\n') {
+        let stripped = stripped.trim_start_matches('\r');
+        if stripped.starts_with('\n') {
+            stripped.trim().to_string()
+        } else {
+            return (None, content.to_string());
+        }
+    } else {
+        return (None, content.to_string());
+    };
+    (Some(candidate.trim().to_string()), body)
+}
+
+/// Unwrap the opencode task output envelope -- `state.output` carries
+/// `<task …><task_result>BODY</task_result></task>` -- so users see the task-result
+/// content, never the internal markup. Any other shape passes through raw.
+fn opencode_task_result_text(output: &str) -> String {
+    const OPEN: &str = "<task_result>";
+    const CLOSE: &str = "</task_result>";
+    let Some(open) = output.find(OPEN) else {
+        return output.to_string();
+    };
+    let Some(close) = output.rfind(CLOSE) else {
+        return output.to_string();
+    };
+    if close > open {
+        output[open + OPEN.len()..close].trim().to_string()
+    } else {
+        output.to_string()
+    }
+}
+
+/// The opencode TUI header: `titlecase(subagent_type ?? "General") + " Task"` (+ " (background)")
+/// + " — " + description.
+fn opencode_task_delegation_title(subagent: &str, background: bool, description: &str) -> String {
+    let mut chars = subagent.chars();
+    let titlecased = match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    };
+    let name = if titlecased.trim().is_empty() {
+        "General".to_string()
+    } else {
+        titlecased
+    };
+    let marker = if background { " (background)" } else { "" };
+    format!("{name} Task{marker} — {description}")
+}
+
+/// Wire `state.status` triple shared by every opencode tool-shaped part: the
+/// contract's `running | completed | failed` enum.
+fn opencode_tool_status(state: &Value) -> &'static str {
+    match state.get("status").and_then(Value::as_str) {
+        Some("completed") => "completed",
+        Some("error") => "failed",
+        _ => "running",
+    }
+}
+
+/// One-line child-activity preview (the client's `getToolPreview` core cases).
+/// Unknown tools (or known tools with no preview key) fall back to compact JSON
+/// verbatim, braces included.
+pub(crate) fn opencode_child_activity_preview(tool: &str, input: &Value) -> String {
+    let get = |key: &str| input.get(key).and_then(Value::as_str).unwrap_or("");
+    let preview = match tool {
+        "bash" | "shell" => get("command"),
+        "read" | "write" | "edit" => get("filePath"),
+        "grep" => get("pattern"),
+        "glob" => get("pattern"),
+        "task" => get("description"),
+        "webfetch" => get("url"),
+        _ => "",
+    };
+    let text = if preview.is_empty() {
+        serde_json::to_string(input).unwrap_or_else(|_| "{}".to_string())
+    } else {
+        preview.to_string()
+    };
+    text.chars().take(120).collect()
+}
+
+/// Task-3 join: the most child-activity rows embedded per delegation. Full
+/// detail lives in the child session pane (sidebar + "Open session"); this is a
+/// summary strip (recorded residual).
+const OPENCODE_CHILD_ACTIVITY_ROW_CAP: usize = 200;
+
+/// Idle retire bound for orphaned watchers (plan review round 1, Finding 5):
+/// 2 hours covers realistic long-running delegations and post-"Open session"
+/// child resumes; a quieter child than that rearms on the parent's next build.
+const OPENCODE_CHILD_WATCHER_IDLE_SECS: u64 = 7200;
+
+/// Compact child-session activity rows for a task delegation (the opencode TUI's
+/// nested `↳ <tool> <summary>` lines, joined server-side from the child
+/// session's message page): tool parts only, in wire order, each with the
+/// contract's `running | completed | failed` status and a one-line preview,
+/// capped at [`OPENCODE_CHILD_ACTIVITY_ROW_CAP`].
+pub(crate) fn opencode_child_activity_rows(messages: &[Value]) -> Vec<Value> {
+    messages
+        .iter()
+        .flat_map(|message| {
+            message
+                .get("parts")
+                .and_then(Value::as_array)
+                .map(|parts| parts.as_slice())
+                .unwrap_or(&[])
+        })
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("tool"))
+        .map(|part| {
+            let tool = part.get("tool").and_then(Value::as_str).unwrap_or("tool");
+            let state = part.get("state").cloned().unwrap_or_else(|| json!({}));
+            let input = state.get("input").cloned().unwrap_or_else(|| json!({}));
+            json!({
+                "tool": tool,
+                "status": opencode_tool_status(&state),
+                "preview": opencode_child_activity_preview(tool, &input),
+            })
+        })
+        .take(OPENCODE_CHILD_ACTIVITY_ROW_CAP)
+        .collect()
+}
+
+/// Background delegations (plan-review round 2, Finding 12): opencode completes
+/// the outer task part IMMEDIATELY for a background launch while the child
+/// session keeps running. The TUI (session/index.tsx) shows the delegation as
+/// running while the child session isn't idle, and derives its duration from
+/// the child's messages (first user `info.time.created` → last assistant
+/// `info.time.completed`). Mirror that. The AUTHORITATIVE liveness signal is
+/// the serve's session-status map entry for the child (`type` busy/retry —
+/// `is_running_status_type`, plan-review round 3, Finding 17 — it applies even
+/// when the child message page is empty); the message shapes (any tool part
+/// still `running`, or an assistant message lacking `info.time.completed`) are
+/// the secondary signal covering a serve whose status map lags. Non-background
+/// items keep the parent part's authoritative status (a foreground task part
+/// completes only when the child finishes), and a parent `running`/`failed`
+/// status always stays authoritative.
+pub(crate) fn opencode_apply_background_child_status(
+    item: &mut Value,
+    messages: &[Value],
+    child_status: Option<&Value>,
+) {
+    if item.get("background").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    if item.get("status").and_then(Value::as_str) != Some("completed") {
+        return;
+    }
+    // Authoritative signal first: the serve's session-status map entry
+    // (`{type:'busy'|'retry'|…}`).
+    let status_type = child_status.and_then(|status| status.get("type"));
+    let mut child_active = freshell_opencode::events::is_running_status_type(status_type);
+    if !child_active {
+        for message in messages {
+            if let Some(parts) = message.get("parts").and_then(Value::as_array) {
+                if parts.iter().any(|part| {
+                    part.pointer("/state/status").and_then(Value::as_str) == Some("running")
+                }) {
+                    child_active = true;
+                }
+            }
+            if message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")
+                && message.pointer("/info/time/completed").is_none()
+            {
+                child_active = true;
+            }
+        }
+    }
+    if child_active {
+        // Live background work: spinner, no duration (the TUI shows none while
+        // running).
+        item["status"] = json!("running");
+        if let Some(map) = item.as_object_mut() {
+            map.remove("durationMs");
+        }
+        return;
+    }
+    // Child finished: duration = last assistant completed − first user created.
+    let first_user_created = messages
+        .iter()
+        .find(|message| message.pointer("/info/role").and_then(Value::as_str) == Some("user"))
+        .and_then(|message| {
+            message
+                .pointer("/info/time/created")
+                .and_then(Value::as_i64)
+        });
+    let last_assistant_completed = messages
+        .iter()
+        .filter(|message| {
+            message.pointer("/info/role").and_then(Value::as_str) == Some("assistant")
+        })
+        .filter_map(|message| {
+            message
+                .pointer("/info/time/completed")
+                .and_then(Value::as_i64)
+        })
+        .max();
+    if let (Some(start), Some(end)) = (first_user_created, last_assistant_completed) {
+        if end >= start {
+            item["durationMs"] = json!((end - start) as u64);
+        }
+    }
+}
+
+/// Child session ids referenced by this snapshot's `task_delegation` items —
+/// the one parent-scan traversal both the watcher registration and the join's
+/// fetch gate walk.
+fn opencode_snapshot_child_session_ids(snapshot: &Value) -> Vec<String> {
+    snapshot
+        .get("turns")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|turn| turn.get("items").and_then(Value::as_array))
+        .flatten()
+        .filter(|item| item.get("kind").and_then(Value::as_str) == Some("task_delegation"))
+        .filter_map(|item| {
+            item.get("childSessionId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// Server-side child-session join: for every task_delegation item referencing a
+/// child session, fetch the child's message page and embed compact activity
+/// rows, then apply the child-derived live status for background delegations.
+/// Graceful on any child fetch failure (pruned child, sidecar hiccup): the item
+/// keeps its own fields and simply gains no `activity` — a 404 maps to an empty
+/// page (silent BY DESIGN; `tracing::warn!` fires only on transport errors).
+async fn attach_child_activity(
+    manager: &OpencodeServeManager,
+    route: &Route,
+    snapshot: &mut Value,
+) {
+    // No delegations -> no join: a snapshot without task_delegation items must
+    // not pay the status-map round trip (the fetch happens ONCE per join, only
+    // when there is a join).
+    if opencode_snapshot_child_session_ids(snapshot).is_empty() {
+        return;
+    }
+    // Plan-review round 3, Finding 17: the AUTHORITATIVE child liveness signal
+    // is the serve's session-status map (GET /session/status — the same
+    // endpoint the TUI uses). Message-shape inference alone misses a
+    // freshly-busy child that has only its first user message.
+    let status_map = manager
+        .get_session_status_map(route)
+        .await
+        .unwrap_or_default();
+    let Some(turns) = snapshot.get_mut("turns").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for turn in turns.iter_mut() {
+        let Some(items) = turn.get_mut("items").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for item in items.iter_mut() {
+            if item.get("kind").and_then(Value::as_str) != Some("task_delegation") {
+                continue;
+            }
+            let Some(child) = item
+                .get("childSessionId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            match manager.list_messages(&child, route).await {
+                Ok(Value::Array(messages)) => {
+                    if !messages.is_empty() {
+                        item["activity"] = Value::Array(opencode_child_activity_rows(&messages));
+                    }
+                    // Background live status applies even for an empty message
+                    // page (Finding 17).
+                    let child_status = status_map.get(&child);
+                    opencode_apply_background_child_status(item, &messages, child_status);
+                }
+                // A 200 that is not a message array: nothing to embed, nothing
+                // to warn about.
+                Ok(_) => {}
+                Err(err) => {
+                    // Structured warn, never a hard failure: a pruned child or
+                    // a sidecar hiccup must not break the parent's snapshot.
+                    tracing::warn!(
+                        child_session = %child,
+                        error = %err,
+                        "opencode child activity join skipped"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// `itemFromPart(part, fallbackId, role, followedByTool)` (`normalize.ts:191-238`), covering
 /// `text`, `reasoning`, `tool`, `file`, `patch`, and `compaction` part types -- the full set the
 /// task scope calls for. Structural parts (`step-start`/`step-finish`) and any other
@@ -1318,19 +1722,25 @@ fn opencode_item_from_part(
             }
         }
         Some("reasoning") => {
-            let text = part
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
+            let raw = part.get("text").and_then(Value::as_str).unwrap_or("");
+            // The opencode TUI (packages/tui/src/context/thinking.ts reasoningSummary)
+            // treats a leading bold block — "**Title**\n\n<body>" — as disclosure
+            // metadata, styling the header independently of the markdown body.
+            // Mirror that: the title splits off and the body carries the rest.
+            let (title, text) = opencode_reasoning_title_and_body(raw);
             let segment = if text.is_empty() {
                 vec![]
             } else {
                 vec![text.clone()]
             };
-            vec![
-                json!({ "id": id, "kind": "reasoning", "summary": segment.clone(), "content": segment, "text": text }),
-            ]
+            let mut item = json!({ "id": id, "kind": "reasoning", "summary": segment.clone(), "content": segment, "text": text });
+            if let Some(duration) = opencode_part_duration_ms(part) {
+                item["durationMs"] = json!(duration);
+            }
+            if let Some(title) = title {
+                item["title"] = json!(title);
+            }
+            vec![item]
         }
         Some("tool") => {
             let state = part
@@ -1338,44 +1748,87 @@ fn opencode_item_from_part(
                 .filter(|v| v.is_object())
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let status = match state.get("status").and_then(Value::as_str) {
-                Some("completed") => "completed",
-                Some("error") => "failed",
-                _ => "running",
-            };
-            let arguments = state.get("input").cloned().unwrap_or_else(|| json!({}));
-            let content_items = state
-                .get("output")
-                .and_then(Value::as_str)
-                .map(|s| json!([s]));
-            let success = if status == "completed" {
-                Some(true)
-            } else {
-                None
-            };
-            let error_text = if status == "failed" {
-                state
-                    .get("error")
+            if part.get("tool").and_then(Value::as_str) == Some("task") {
+                // The `task` tool is a subagent delegation, not a plain dynamic tool:
+                // render it as the first-class task_delegation item the client's
+                // activity strip folds into one delegation block.
+                let input = state.get("input").cloned().unwrap_or_else(|| json!({}));
+                let description = input
+                    .get("description")
                     .and_then(Value::as_str)
-                    .filter(|error| !error.trim().is_empty())
-                    .map(str::to_string)
+                    .or_else(|| state.get("title").and_then(Value::as_str))
+                    .unwrap_or("");
+                let subagent = input
+                    .get("subagent_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("general");
+                let background = state
+                    .pointer("/metadata/background")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let status = opencode_tool_status(&state);
+                let mut item = json!({
+                    "id": id, "kind": "task_delegation", "status": status,
+                    "title": opencode_task_delegation_title(subagent, background, description),
+                    "subagent": subagent, "background": background,
+                });
+                if !description.is_empty() {
+                    item["description"] = json!(description);
+                }
+                if let Some(child) = state.pointer("/metadata/sessionId").and_then(Value::as_str) {
+                    item["childSessionId"] = json!(child);
+                }
+                if let Some(start) = state.pointer("/time/start").and_then(Value::as_i64) {
+                    item["startedAtMs"] = json!(start);
+                }
+                if let Some(end) = state.pointer("/time/end").and_then(Value::as_i64) {
+                    item["endedAtMs"] = json!(end);
+                }
+                if let Some(duration) = opencode_part_duration_ms(&state) {
+                    item["durationMs"] = json!(duration);
+                }
+                if let Some(output) = state.get("output").and_then(Value::as_str) {
+                    item["result"] = json!(opencode_task_result_text(output));
+                }
+                vec![item]
             } else {
-                None
-            };
-            let mut item = json!({
-                "id": id,
-                "kind": "dynamic_tool",
-                "namespace": "opencode",
-                "tool": part.get("tool").and_then(Value::as_str).unwrap_or("tool"),
-                "status": status,
-                "arguments": arguments,
-                "contentItems": content_items,
-                "success": success,
-            });
-            if let Some(error_text) = error_text {
-                item["error"] = json!(error_text);
+                let status = opencode_tool_status(&state);
+                let arguments = state.get("input").cloned().unwrap_or_else(|| json!({}));
+                let content_items = state
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .map(|s| json!([s]));
+                let success = if status == "completed" {
+                    Some(true)
+                } else {
+                    None
+                };
+                // PR #779 (opencode-error-projection): failed dynamic tools carry
+                // their persisted wire error text for durable client rendering.
+                let error_text = if status == "failed" {
+                    state
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .filter(|error| !error.trim().is_empty())
+                        .map(str::to_string)
+                } else {
+                    None
+                };
+                let mut item = json!({
+                    "id": id,
+                    "kind": "dynamic_tool",
+                    "namespace": "opencode",
+                    "tool": part.get("tool").and_then(Value::as_str).unwrap_or("tool"),
+                    "status": status,
+                    "arguments": arguments,
+                    "contentItems": content_items,
+                    "success": success,
+                });
+                if let Some(error_text) = error_text {
+                    item["error"] = json!(error_text);
+                }
+                vec![item]
             }
-            vec![item]
         }
         Some("file") => vec![json!({
             "id": id,
@@ -1390,6 +1843,40 @@ fn opencode_item_from_part(
             "extensions": { "opencode": part },
         })],
         Some("compaction") => vec![json!({ "id": id, "kind": "context_compaction" })],
+        Some("retry") => {
+            let attempt = part
+                .get("attempt")
+                .and_then(Value::as_i64)
+                .unwrap_or(1)
+                .max(1);
+            // Serialized NamedError shape is {name, data:{message,…}} (retry.ts reads
+            // error.data.message); tolerate legacy {message} and bare-string shapes.
+            let error = part.get("error").and_then(|err| {
+                err.pointer("/data/message")
+                    .and_then(Value::as_str)
+                    .or_else(|| err.get("message").and_then(Value::as_str))
+                    .or_else(|| err.as_str())
+                    .or_else(|| err.get("name").and_then(Value::as_str))
+            });
+            let mut item = json!({ "id": id, "kind": "retry", "attempt": attempt });
+            if let Some(error) = error {
+                item["error"] = json!(error);
+            }
+            vec![item]
+        }
+        Some("subtask") => {
+            let mut item = json!({ "id": id, "kind": "delegated_task" });
+            if let Some(agent) = part.get("agent").and_then(Value::as_str) {
+                item["agent"] = json!(agent);
+            }
+            if let Some(description) = part.get("description").and_then(Value::as_str) {
+                item["description"] = json!(description);
+            }
+            if let Some(command) = part.get("command").and_then(Value::as_str) {
+                item["command"] = json!(command);
+            }
+            vec![item]
+        }
         _ => vec![],
     }
 }
@@ -3593,6 +4080,292 @@ mod tests {
         assert!(matches!(err, OpencodeSnapshotError::NotFound));
     }
 
+    // ── Task 3 (freshopencode TUI parity): the server-side child-session join ──
+
+    /// Routed per-session fake serve HTTP: answers `GET /session/:id` and
+    /// `GET /session/:id/message` per session id, `GET /session/status` with a
+    /// scripted status map, and optionally fails any URL containing
+    /// `fail_substring` with a transport error (the join's warn path). Unknown
+    /// session paths 404 (the pruned-child case).
+    struct RoutedSessionHttp {
+        sessions: HashMap<String, Value>,
+        messages: HashMap<String, Value>,
+        status_map: Value,
+        fail_substring: Option<String>,
+    }
+
+    impl RoutedSessionHttp {
+        fn new(sessions: HashMap<String, Value>, messages: HashMap<String, Value>) -> Self {
+            Self {
+                sessions,
+                messages,
+                status_map: json!({}),
+                fail_substring: None,
+            }
+        }
+    }
+
+    /// The session id a serve URL addresses: the segment after the LAST
+    /// `/session/`, with `suffix` (e.g. `/message`) stripped.
+    fn session_id_in_url(url: &str, suffix: &str) -> Option<String> {
+        let path = url.split('?').next().unwrap_or(url);
+        let rest = path.strip_suffix(suffix)?;
+        let (_, id) = rest.rsplit_once("/session/")?;
+        (!id.is_empty()).then(|| id.to_string())
+    }
+
+    impl ServeHttp for RoutedSessionHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                if let Some(sub) = &self.fail_substring {
+                    if req.url.contains(sub.as_str()) {
+                        return Err(ServeHttpError::Ambiguous(
+                            "simulated transport failure".to_string(),
+                        ));
+                    }
+                }
+                if req.url.contains("/global/health") {
+                    return Ok(ServeHttpResponse::new(200, b"{}".to_vec()));
+                }
+                // Before the bare `/session/` arm: `/session/status` is the
+                // status map, not a session.
+                if req.url.contains("/session/status") {
+                    return Ok(ServeHttpResponse::new(
+                        200,
+                        serde_json::to_vec(&self.status_map).unwrap(),
+                    ));
+                }
+                if req.url.contains("/message") {
+                    let Some(id) = session_id_in_url(&req.url, "/message") else {
+                        return Ok(ServeHttpResponse::new(200, b"{}".to_vec()));
+                    };
+                    let Some(body) = self.messages.get(&id) else {
+                        return Ok(ServeHttpResponse::new(404, b"not found".to_vec()));
+                    };
+                    return Ok(ServeHttpResponse::new(
+                        200,
+                        serde_json::to_vec(body).unwrap(),
+                    ));
+                }
+                if let Some(id) = session_id_in_url(&req.url, "") {
+                    let Some(body) = self.sessions.get(&id) else {
+                        return Ok(ServeHttpResponse::new(404, b"not found".to_vec()));
+                    };
+                    return Ok(ServeHttpResponse::new(
+                        200,
+                        serde_json::to_vec(body).unwrap(),
+                    ));
+                }
+                Ok(ServeHttpResponse::new(200, b"{}".to_vec()))
+            })
+        }
+    }
+
+    async fn state_with_routed_http(http: RoutedSessionHttp) -> FreshAgentState {
+        let st = state();
+        let deps = ServeDeps {
+            spawner: Arc::new(NoopSpawner),
+            http: Arc::new(http),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        st.set_manager_for_test(manager).await;
+        st
+    }
+
+    /// The parent fixture every join test shares: an assistant turn carrying the
+    /// Task-2 task tool part whose `state.metadata.sessionId` is the child
+    /// `ses_c`.
+    fn join_parent_fixture() -> (HashMap<String, Value>, HashMap<String, Value>) {
+        let sessions = HashMap::from([(
+            "ses_p".to_string(),
+            json!({
+                "id": "ses_p", "title": "parent",
+                "time": { "created": 1_700_000_000_000i64, "updated": 1_700_000_005_000i64 },
+            }),
+        )]);
+        let messages = HashMap::from([(
+            "ses_p".to_string(),
+            json!([
+                { "info": { "id": "msg-u", "role": "user" }, "parts": [
+                    { "type": "text", "text": "delegate this" } ] },
+                { "info": { "id": "msg-a", "role": "assistant" }, "parts": [
+                    { "type": "tool", "id": "part_task", "tool": "task", "state": {
+                        "status": "completed",
+                        "input": { "description": "Fix the flaky harness", "subagent_type": "general" },
+                        "metadata": { "sessionId": "ses_c", "parentSessionId": "ses_p" },
+                        "output": "<task id=\"ses_c\" state=\"completed\"><task_result>ok</task_result></task>",
+                        "time": { "start": 1000, "end": 3000 }
+                    } } ] },
+            ]),
+        )]);
+        (sessions, messages)
+    }
+
+    /// The child fixture: bash completed / grep error / read running — the
+    /// exact three-row activity the join must embed.
+    fn join_child_messages() -> Value {
+        json!([
+            { "info": { "id": "m_u", "role": "user" }, "parts": [
+                { "type": "subtask", "agent": "general", "description": "Fix the flaky harness" },
+                { "type": "text", "text": "go" } ] },
+            { "info": { "id": "m_a", "role": "assistant" }, "parts": [
+                { "type": "reasoning", "text": "hmm" },
+                { "type": "tool", "tool": "bash", "state": { "status": "completed", "input": { "command": "sed -n 92,112p src/store/paneTypes.ts" } } },
+                { "type": "tool", "tool": "grep", "state": { "status": "error", "input": { "pattern": "reasoningEffort" } } },
+                { "type": "tool", "tool": "read", "state": { "status": "running", "input": { "filePath": "src/index.css" } } } ] },
+        ])
+    }
+
+    /// The snapshot's single task_delegation item (panics when absent).
+    fn snapshot_delegation_item(snapshot: &Value) -> Value {
+        snapshot["turns"]
+            .as_array()
+            .expect("turns array")
+            .iter()
+            .flat_map(|turn| turn["items"].as_array().cloned().unwrap_or_default())
+            .find(|item| item["kind"] == "task_delegation")
+            .expect("the snapshot carries the task_delegation item")
+    }
+
+    #[tokio::test]
+    async fn get_opencode_snapshot_joins_child_activity_rows_into_the_delegation() {
+        let (sessions, mut messages) = join_parent_fixture();
+        messages.insert("ses_c".to_string(), join_child_messages());
+        let st = state_with_routed_http(RoutedSessionHttp::new(sessions, messages)).await;
+
+        let snapshot = st
+            .get_opencode_snapshot("ses_p", None)
+            .await
+            .expect("snapshot builds");
+        let delegation = snapshot_delegation_item(&snapshot);
+        assert_eq!(delegation["childSessionId"], json!("ses_c"));
+        assert_eq!(
+            delegation["activity"],
+            json!([
+                { "tool": "bash", "status": "completed", "preview": "sed -n 92,112p src/store/paneTypes.ts" },
+                { "tool": "grep", "status": "failed", "preview": "reasoningEffort" },
+                { "tool": "read", "status": "running", "preview": "src/index.css" },
+            ])
+        );
+    }
+
+    /// Graceful degradation: a pruned child (its message page 404s, which
+    /// `list_messages` maps to an empty array) contributes no rows — silent BY
+    /// DESIGN — and the parent's snapshot still builds, the delegation simply
+    /// carrying no `activity` key.
+    #[tokio::test]
+    async fn get_opencode_snapshot_survives_a_pruned_child_session() {
+        let (sessions, messages) = join_parent_fixture();
+        let st = state_with_routed_http(RoutedSessionHttp::new(sessions, messages)).await;
+
+        let snapshot = st
+            .get_opencode_snapshot("ses_p", None)
+            .await
+            .expect("snapshot builds");
+        let delegation = snapshot_delegation_item(&snapshot);
+        assert!(delegation.get("activity").is_none());
+    }
+
+    /// Graceful degradation: a child fetch failing on transport logs a warn and
+    /// moves on — the parent's snapshot must still build, with no `activity`.
+    #[tokio::test]
+    async fn get_opencode_snapshot_survives_a_child_transport_error() {
+        let (sessions, messages) = join_parent_fixture();
+        let mut http = RoutedSessionHttp::new(sessions, messages);
+        http.fail_substring = Some("/session/ses_c/message".to_string());
+        let st = state_with_routed_http(http).await;
+
+        let snapshot = st
+            .get_opencode_snapshot("ses_p", None)
+            .await
+            .expect("snapshot builds");
+        let delegation = snapshot_delegation_item(&snapshot);
+        assert!(delegation.get("activity").is_none());
+    }
+
+    /// Collect bus frames (in arrival order) until `pred` matches one of them,
+    /// returning everything seen INCLUDING the matching frame. Bounded: panics
+    /// after 5s with no match, so a missing frame fails loudly instead of
+    /// hanging the suite (same shape as `opencode_ws`'s tests helper).
+    async fn frames_until(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        pred: impl Fn(&Value) -> bool,
+    ) -> Vec<Value> {
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let raw = rx.recv().await.expect("the bus stays open");
+                let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+                    continue;
+                };
+                let hit = pred(&v);
+                out.push(v);
+                if hit {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("a matching frame arrives within the budget");
+        out
+    }
+
+    /// Live refresh (LB-4 ordering): the child watcher's broadcast receiver is
+    /// created synchronously BEFORE the join fetch, so a `message.*` serve event
+    /// for the CHILD dispatched after the build returns must surface as a
+    /// `freshAgent.session.changed` frame for the PARENT (reason
+    /// `opencode-message`) — the frame that drives the client's snapshot
+    /// refetch.
+    #[tokio::test]
+    async fn child_message_events_refresh_the_parent_session_changed_frame() {
+        let (sessions, mut messages) = join_parent_fixture();
+        messages.insert("ses_c".to_string(), join_child_messages());
+        let st = state_with_routed_http(RoutedSessionHttp::new(sessions, messages)).await;
+        let mut rx = st.broadcast_tx.subscribe();
+
+        // The build RETURNS with the watcher armed: dispatch only after this
+        // await, so the test is deterministic (the receiver pre-existed the
+        // fetch).
+        let snapshot = st
+            .get_opencode_snapshot("ses_p", None)
+            .await
+            .expect("snapshot builds");
+        assert_eq!(
+            snapshot_delegation_item(&snapshot)["childSessionId"],
+            json!("ses_c")
+        );
+
+        let event = freshell_opencode::parse_serve_event(&json!({
+            "type": "message.updated",
+            "properties": { "info": { "sessionID": "ses_c" } }
+        }))
+        .expect("a well-formed message.updated event");
+        st.ensure_manager().await.dispatch_event(event);
+
+        frames_until(&mut rx, |frame| {
+            frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.session.changed"
+                && frame["event"]["sessionId"] == "ses_p"
+                && frame["event"]["reason"] == "opencode-message"
+        })
+        .await;
+    }
+
     // -- P1.13 Task 7: REST send-keys materialization writes a binding row --
 
     /// Like `opencode_ws::tests::FakeHttp`: `POST /session` mints `ses_1`; everything
@@ -4200,6 +4973,363 @@ mod tests {
                 json!({ "id": "part-10", "kind": "text", "text": "<thinking>not reasoning</thinking>" })
             ]
         );
+    }
+
+    // -- freshopencode TUI parity: reasoning duration/title, task delegations, retries, subtasks --
+
+    #[test]
+    fn opencode_item_from_part_reasoning_part_carries_duration_without_title() {
+        let items = opencode_item_from_part(
+            &json!({
+                "type": "reasoning", "id": "part_r1", "text": "weighing options",
+                "time": { "start": 1789417896153i64, "end": 1789417897984i64 },
+                "metadata": { "anthropic": { "signature": "sig" } }
+            }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        assert_eq!(
+            items,
+            vec![json!({
+                "id": "part_r1", "kind": "reasoning",
+                "summary": ["weighing options"], "content": ["weighing options"],
+                "text": "weighing options", "durationMs": 1831u64
+            })]
+        );
+    }
+
+    #[test]
+    fn opencode_item_from_part_reasoning_without_time_has_no_duration() {
+        let items = opencode_item_from_part(
+            &json!({ "type": "reasoning", "id": "part_r2", "text": "hmm" }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        assert_eq!(items[0].get("durationMs"), None);
+        assert_eq!(items[0].get("title"), None);
+    }
+
+    #[test]
+    fn opencode_item_from_part_reasoning_leading_bold_block_becomes_title() {
+        // Mirrors the opencode TUI's reasoningSummary (thinking.ts): a leading bold
+        // block "**Title**" followed by a blank line is disclosure metadata.
+        let items = opencode_item_from_part(
+            &json!({
+                "type": "reasoning", "id": "part_r3",
+                "text": "**Planning the fix**\n\nweighing options",
+                "time": { "start": 1000, "end": 4200 }
+            }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        assert_eq!(items[0]["durationMs"], json!(3200u64));
+        assert_eq!(items[0]["title"], json!("Planning the fix"));
+        assert_eq!(items[0]["text"], json!("weighing options"));
+        assert_eq!(items[0]["summary"], json!(["weighing options"]));
+    }
+
+    #[test]
+    fn opencode_item_from_part_reasoning_bold_title_awaiting_body_is_title_only() {
+        // The TUI also treats a complete title still awaiting its body (streaming)
+        // as disclosure metadata: "**Title**" with nothing after it.
+        let items = opencode_item_from_part(
+            &json!({ "type": "reasoning", "id": "part_r4", "text": "**Planning**" }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        assert_eq!(items[0]["title"], json!("Planning"));
+        assert_eq!(items[0]["summary"], json!([]));
+    }
+
+    #[test]
+    fn opencode_item_from_part_reasoning_bold_without_blank_line_is_not_a_title() {
+        // No blank line after the bold block => the TUI regex does not match; the
+        // text stays whole and no title is emitted.
+        let items = opencode_item_from_part(
+            &json!({ "type": "reasoning", "id": "part_r5", "text": "**bold intro** still the same paragraph" }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        assert_eq!(items[0].get("title"), None);
+        assert_eq!(
+            items[0]["text"],
+            json!("**bold intro** still the same paragraph")
+        );
+    }
+
+    #[test]
+    fn opencode_item_from_part_task_tool_part_becomes_task_delegation() {
+        let items = opencode_item_from_part(
+            &json!({
+                "type": "tool", "tool": "task", "id": "part_t1",
+                "state": {
+                    "status": "completed",
+                    "input": { "description": "Fix the flaky harness", "prompt": "…", "subagent_type": "general" },
+                    "metadata": { "parentSessionId": "ses_p", "sessionId": "ses_c", "model": { "modelID": "m", "providerID": "p" } },
+                    "output": "<task id=\"ses_c\" state=\"completed\"><task_result>ok</task_result></task>",
+                    "title": "Fix the flaky harness",
+                    "time": { "start": 1000, "end": 3000 }
+                }
+            }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        // The <task …><task_result>…</task_result></task> envelope is unwrapped:
+        // users see the task-result content, never the internal markup.
+        assert_eq!(
+            items,
+            vec![json!({
+                "id": "part_t1", "kind": "task_delegation", "status": "completed",
+                "title": "General Task — Fix the flaky harness",
+                "description": "Fix the flaky harness", "subagent": "general", "background": false,
+                "childSessionId": "ses_c", "startedAtMs": 1000i64, "endedAtMs": 3000i64,
+                "durationMs": 2000u64,
+                "result": "ok"
+            })]
+        );
+    }
+
+    #[test]
+    fn opencode_task_result_text_unwraps_envelope_and_passes_raw_through() {
+        assert_eq!(
+            opencode_task_result_text("<task id=\"x\" state=\"completed\"><task_result>\n  all green  \n</task_result></task>"),
+            "all green"
+        );
+        assert_eq!(opencode_task_result_text("plain output"), "plain output");
+        assert_eq!(opencode_task_result_text(""), "");
+    }
+
+    #[test]
+    fn opencode_item_from_part_task_tool_part_minimal_has_title_and_no_child() {
+        let items = opencode_item_from_part(
+            &json!({ "type": "tool", "tool": "task", "id": "part_t2",
+                "state": { "status": "running", "input": { "description": "Do things" } } }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        assert_eq!(items[0]["kind"], json!("task_delegation"));
+        assert_eq!(items[0]["title"], json!("General Task — Do things"));
+        assert_eq!(items[0].get("childSessionId"), None);
+        assert_eq!(items[0].get("result"), None);
+    }
+
+    #[test]
+    fn opencode_item_from_part_task_tool_part_background_and_custom_subagent() {
+        let items = opencode_item_from_part(
+            &json!({ "type": "tool", "tool": "task", "id": "part_t3",
+                "state": { "status": "error", "input": { "description": "side quest", "subagent_type": "fixer" },
+                           "metadata": { "background": true, "sessionId": "ses_bg" } } }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        assert_eq!(
+            items[0]["title"],
+            json!("Fixer Task (background) — side quest")
+        );
+        assert_eq!(items[0]["status"], json!("failed"));
+        assert_eq!(items[0]["background"], json!(true));
+        assert_eq!(items[0]["childSessionId"], json!("ses_bg"));
+    }
+
+    #[test]
+    fn opencode_item_from_part_retry_part_becomes_retry_item() {
+        // Authoritative serialized shape: NamedError.toObject() => {name, data:{message,…}}
+        // (retry.ts reads error.data.message).
+        let items = opencode_item_from_part(
+            &json!({ "type": "retry", "id": "part_rr1", "attempt": 2,
+                     "error": { "name": "APIError", "data": { "message": "stream disconnected" } } }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        assert_eq!(
+            items,
+            vec![json!({
+                "id": "part_rr1", "kind": "retry", "attempt": 2i64, "error": "stream disconnected"
+            })]
+        );
+    }
+
+    #[test]
+    fn opencode_item_from_part_retry_part_defaults_attempt_and_string_error() {
+        let items = opencode_item_from_part(
+            &json!({ "type": "retry", "id": "part_rr2", "error": "boom" }),
+            "fallback",
+            Some("assistant"),
+            false,
+        );
+        assert_eq!(items[0]["attempt"], json!(1i64));
+        assert_eq!(items[0]["error"], json!("boom"));
+    }
+
+    #[test]
+    fn opencode_item_from_part_subtask_part_becomes_delegated_task() {
+        let items = opencode_item_from_part(
+            &json!({ "type": "subtask", "id": "part_s1", "agent": "general",
+                     "description": "Fix the flaky harness", "command": "/fix" }),
+            "fallback",
+            Some("user"),
+            false,
+        );
+        assert_eq!(
+            items,
+            vec![json!({
+                "id": "part_s1", "kind": "delegated_task", "agent": "general",
+                "description": "Fix the flaky harness", "command": "/fix"
+            })]
+        );
+    }
+
+    #[test]
+    fn opencode_child_activity_preview_formats_common_tools() {
+        assert_eq!(
+            opencode_child_activity_preview(
+                "bash",
+                &json!({ "command": "sed -n 92,112p src/store/paneTypes.ts" })
+            ),
+            "sed -n 92,112p src/store/paneTypes.ts"
+        );
+        assert_eq!(
+            opencode_child_activity_preview("read", &json!({ "filePath": "src/index.css" })),
+            "src/index.css"
+        );
+        assert_eq!(
+            opencode_child_activity_preview("grep", &json!({ "pattern": "reasoningEffort" })),
+            "reasoningEffort"
+        );
+        assert_eq!(
+            opencode_child_activity_preview("glob", &json!({ "pattern": "*.rs" })),
+            "*.rs"
+        );
+        assert_eq!(
+            opencode_child_activity_preview("task", &json!({ "description": "inner task" })),
+            "inner task"
+        );
+        assert_eq!(
+            opencode_child_activity_preview(
+                "webfetch",
+                &json!({ "url": "https://example.test/x" })
+            ),
+            "https://example.test/x"
+        );
+        assert_eq!(
+            opencode_child_activity_preview("unknown", &json!({ "a": "b" })),
+            r#"{"a":"b"}"#
+        );
+    }
+
+    #[test]
+    fn opencode_child_activity_rows_collects_tool_parts_from_child_messages() {
+        let messages = json!([
+            { "info": { "id": "m_u", "role": "user" }, "parts": [
+                { "type": "subtask", "agent": "general", "description": "Fix the flaky harness" },
+                { "type": "text", "text": "go" } ] },
+            { "info": { "id": "m_a", "role": "assistant" }, "parts": [
+                { "type": "reasoning", "text": "hmm" },
+                { "type": "tool", "tool": "bash", "state": { "status": "completed", "input": { "command": "sed -n 92,112p src/store/paneTypes.ts" } } },
+                { "type": "tool", "tool": "grep", "state": { "status": "error", "input": { "pattern": "reasoningEffort" } } },
+                { "type": "tool", "tool": "read", "state": { "status": "running", "input": { "filePath": "src/index.css" } } } ] },
+        ]);
+        let rows = opencode_child_activity_rows(messages.as_array().unwrap());
+        assert_eq!(
+            rows,
+            vec![
+                json!({ "tool": "bash", "status": "completed", "preview": "sed -n 92,112p src/store/paneTypes.ts" }),
+                json!({ "tool": "grep", "status": "failed", "preview": "reasoningEffort" }),
+                json!({ "tool": "read", "status": "running", "preview": "src/index.css" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn opencode_child_activity_rows_cap_at_200() {
+        let parts: Vec<Value> = (0..250)
+            .map(|i| json!({ "type": "tool", "tool": "bash", "state": { "status": "completed", "input": { "command": format!("echo {i}") } } }))
+            .collect();
+        let messages = vec![json!({ "info": { "id": "m", "role": "assistant" }, "parts": parts })];
+        assert_eq!(opencode_child_activity_rows(&messages).len(), 200);
+    }
+
+    #[test]
+    fn background_delegation_stays_running_while_child_is_active() {
+        // opencode completes the outer task part immediately for background
+        // launches (plan-review round 2, Finding 12); the child's live state
+        // must win.
+        let mut item = json!({ "kind": "task_delegation", "status": "completed", "background": true, "durationMs": 200u64 });
+        let messages = vec![
+            json!({ "info": { "id": "u", "role": "user", "time": { "created": 1000 } }, "parts": [] }),
+            json!({ "info": { "id": "a", "role": "assistant", "time": { "created": 1100 } }, "parts": [
+                json!({ "type": "tool", "tool": "bash", "state": { "status": "running", "input": {} } })
+            ] }),
+        ];
+        opencode_apply_background_child_status(&mut item, &messages, None);
+        assert_eq!(item["status"], json!("running"));
+        assert!(item.get("durationMs").is_none());
+    }
+
+    #[test]
+    fn background_delegation_with_busy_status_map_and_only_user_message_stays_running() {
+        // Plan-review round 3, Finding 17: a freshly-busy child with only its
+        // first user message (or an empty message page) is running per the
+        // AUTHORITATIVE serve session-status map — message-shape inference
+        // alone would miss it.
+        let mut item = json!({ "kind": "task_delegation", "status": "completed", "background": true, "durationMs": 200u64 });
+        let messages = vec![
+            json!({ "info": { "id": "u", "role": "user", "time": { "created": 1000 } }, "parts": [] }),
+        ];
+        opencode_apply_background_child_status(
+            &mut item,
+            &messages,
+            Some(&json!({ "type": "busy" })),
+        );
+        assert_eq!(item["status"], json!("running"));
+        assert!(item.get("durationMs").is_none());
+
+        // Even an empty child message page honors the status map.
+        let mut item =
+            json!({ "kind": "task_delegation", "status": "completed", "background": true });
+        opencode_apply_background_child_status(&mut item, &[], Some(&json!({ "type": "busy" })));
+        assert_eq!(item["status"], json!("running"));
+    }
+
+    #[test]
+    fn background_delegation_completes_with_child_span_duration() {
+        let mut item = json!({ "kind": "task_delegation", "status": "completed", "background": true, "durationMs": 5u64 });
+        let messages = vec![
+            json!({ "info": { "id": "u", "role": "user", "time": { "created": 1000 } }, "parts": [] }),
+            json!({ "info": { "id": "a", "role": "assistant", "time": { "created": 1100, "completed": 61000 } }, "parts": [
+                json!({ "type": "tool", "tool": "bash", "state": { "status": "completed", "input": {} } })
+            ] }),
+        ];
+        opencode_apply_background_child_status(
+            &mut item,
+            &messages,
+            Some(&json!({ "type": "idle" })),
+        );
+        assert_eq!(item["status"], json!("completed"));
+        assert_eq!(item["durationMs"], json!(60000u64));
+    }
+
+    #[test]
+    fn non_background_and_errored_delegations_keep_parent_status() {
+        let mut item = json!({ "kind": "task_delegation", "status": "completed", "background": false, "durationMs": 7u64 });
+        opencode_apply_background_child_status(
+            &mut item,
+            &[json!({ "info": { "role": "assistant" }, "parts": [] })],
+            Some(&json!({ "type": "busy" })),
+        );
+        assert_eq!(item["durationMs"], json!(7u64));
+        let mut item = json!({ "kind": "task_delegation", "status": "failed", "background": true });
+        opencode_apply_background_child_status(&mut item, &[], Some(&json!({ "type": "busy" })));
+        assert_eq!(item["status"], json!("failed"));
     }
 
     #[test]

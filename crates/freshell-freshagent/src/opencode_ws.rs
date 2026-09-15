@@ -3355,8 +3355,10 @@ fn now_ms() -> i64 {
 // ── PR-3: `freshAgent.event` frame builders (sdk-events.ts + serve-events.ts shapes) ─
 
 /// Wrap `inner` in a `freshAgent.event` envelope (mirrors codex.rs's
-/// `adapter_event_to_frame` / claude.rs's `sdk_line_to_frame`).
-fn event_frame(session_id: &str, inner: Value) -> ServerMessage {
+/// `adapter_event_to_frame` / claude.rs's `sdk_line_to_frame`). `pub(crate)`:
+/// also consumed by lib.rs's Task-3 child-session watcher (the child→parent
+/// `freshAgent.session.changed` refresh frame).
+pub(crate) fn event_frame(session_id: &str, inner: Value) -> ServerMessage {
     ServerMessage::FreshAgentEvent(FreshAgentEvent {
         event: inner,
         provider: PROVIDER.to_string(),
@@ -3373,7 +3375,8 @@ fn snapshot_event(session_id: &str, status: &str) -> Value {
 
 /// `sdk.session.changed → freshAgent.session.changed` (sdk-events.ts:51-52; the transcript
 /// / non-lifecycle-status invalidation `bindServeStream` forwards, adapter.ts:296).
-fn changed_event(session_id: &str, reason: &str) -> Value {
+/// `pub(crate)`: also consumed by lib.rs's Task-3 child-session watcher.
+pub(crate) fn changed_event(session_id: &str, reason: &str) -> Value {
     json!({ "type": "freshAgent.session.changed", "sessionId": session_id, "reason": reason })
 }
 

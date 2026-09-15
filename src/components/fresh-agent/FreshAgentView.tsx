@@ -21,6 +21,7 @@ import { api, getFreshAgentModelCapabilities, getFreshAgentThreadSnapshot, setSe
 import { clearReconcilePendingPane, consumePaneRefreshRequest, mergePaneContent, updatePaneContent } from '@/store/panesSlice'
 import { FRESH_AGENT_MODEL_CATALOG_UNAVAILABLE_NOTICE } from '@/lib/fresh-agent-model-capabilities'
 import { clearPendingCreateFailure, clearRestoreFailure, clearSessionError, clearSessionLost, sessionError, setSessionStatus } from '@/store/freshAgentSlice'
+import { openSessionTab } from '@/store/tabsSlice'
 import { buildReconcileRequestForPanes, foldVerdicts, isFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
@@ -84,6 +85,7 @@ import type { FreshAgentTurn } from '@shared/fresh-agent-contract'
 import { finalizeCodingAgentSessionName } from '@/store/codingAgentNaming'
 import { FreshAgentApprovalBanner } from './FreshAgentApprovalBanner'
 import { FreshAgentApprovalCard } from './FreshAgentApprovalCard'
+import { FreshAgentOpenSessionContext } from './FreshAgentItemCard'
 import FreshAgentQuestionBanner from './FreshAgentQuestionBanner'
 import { FreshAgentTranscript, type FreshAgentTranscriptHandle } from './FreshAgentTranscript'
 import { FreshAgentComposer, type FreshAgentComposerHandle } from './FreshAgentComposer'
@@ -2699,6 +2701,23 @@ export function FreshAgentView({
       })
   }, [snapshot?.turns])
 
+  // Task 6 (freshopencode TUI parity): the delegation block's "Open session"
+  // link resumes the child durable session in its own pane, like the sidebar
+  // row does. The cwd uses the view's existing opencode route resolution —
+  // the pane's starting directory falling back to the LIVE session cwd — so a
+  // resumed/API-created pane still opens the child in the right project; when
+  // no cwd resolves at all, undefined lets the thunk locate the session itself.
+  const openDelegationSession = useCallback((sessionId: string, title?: string) => {
+    dispatch(openSessionTab({
+      sessionId,
+      title: title ?? sessionId,
+      cwd: freshOpenCodeRouteCwd,
+      provider: 'opencode',
+      sessionType: 'freshopencode',
+      isSubagent: true,
+    }))
+  }, [dispatch, freshOpenCodeRouteCwd])
+
   const content = useMemo(() => {
     const turns = snapshot?.turns ?? []
     const pendingApprovals = snapshot?.pendingApprovals ?? []
@@ -2976,63 +2995,65 @@ export function FreshAgentView({
                 onComment={(text) => composerRef.current?.insertText(text)}
               />
             </div>
-            <FreshAgentTranscript
-              ref={transcriptRef}
-              paneId={paneId}
-              turns={localEcho
-                ? [...turns, {
-                    id: `__local-echo:${localEcho.requestId}`,
-                    turnId: localEcho.submittedTurnId ?? `__local-echo:${localEcho.requestId}`,
-                    requestId: localEcho.requestId,
-                    role: 'user',
-                    summary: localEcho.text,
-                    items: [{ id: `__local-echo-item:${localEcho.requestId}`, kind: 'text', text: localEcho.text }],
-                  } as FreshAgentTurn]
-                : turns}
-              canFork={canFork}
-              canRollback={canRollback}
-              rollbackBusy={isBusy}
-              rolledBackTurns={snapshot?.rolledBackTurns ?? []}
-              canRedo={canRedoNow}
-              redoableTurnIds={snapshot?.rollback?.redoableTurnIds}
-              // Conversation identity for the disclosure's conversation scoping.
-              // Codex snapshots carry NO sessionId (codex.rs stamps threadId
-              // only) — fall back to threadId so a codex pane re-collapses the
-              // history line across conversation switches too.
-              sessionId={snapshot?.sessionId ?? snapshot?.threadId}
-              agentLabel={descriptor?.label}
-              expandThinking={globalExpandThinking}
-              expandTools={globalExpandTools}
-              showTimecodes={effectiveShowTimecodes}
-              isStreaming={isBusy}
-              onForkFromTurn={(turnId) => sendFork(turnId)}
-              onRollbackToTurn={(turnId) => {
-                // The busy pre-flight gate picks copy by DIRECTION (decision 7)…
-                if (isBusy) {
-                  setNotice(ROLLBACK_BUSY_UNDO_NOTICE)
-                  return
-                }
-                // …and a capability-false provider gets an explicit refusal (decision 8:
-                // no confirmations, explicit rejections, tooltips name the step).
-                if (canRollback) {
-                  sendRollback('undo', 'toTurn', turnId)
-                  return
-                }
-                setNotice(rollbackUnsupportedNotice(descriptor?.label ?? paneContent.provider))
-              }}
-              onRedoToTurn={(turnId) => {
-                if (isBusy) {
-                  setNotice(ROLLBACK_BUSY_REDO_NOTICE)
-                  return
-                }
-                if (canRedoNow) {
-                  sendRollback('redo', 'toTurn', turnId)
-                  return
-                }
-                setNotice(REDO_DESTROYED_NOTICE)
-              }}
-              onRewindToTurn={paneContent.initialCwd ? rewindToTurn : undefined}
-            />
+            <FreshAgentOpenSessionContext.Provider value={openDelegationSession}>
+              <FreshAgentTranscript
+                ref={transcriptRef}
+                paneId={paneId}
+                turns={localEcho
+                  ? [...turns, {
+                      id: `__local-echo:${localEcho.requestId}`,
+                      turnId: localEcho.submittedTurnId ?? `__local-echo:${localEcho.requestId}`,
+                      requestId: localEcho.requestId,
+                      role: 'user',
+                      summary: localEcho.text,
+                      items: [{ id: `__local-echo-item:${localEcho.requestId}`, kind: 'text', text: localEcho.text }],
+                    } as FreshAgentTurn]
+                  : turns}
+                canFork={canFork}
+                canRollback={canRollback}
+                rollbackBusy={isBusy}
+                rolledBackTurns={snapshot?.rolledBackTurns ?? []}
+                canRedo={canRedoNow}
+                redoableTurnIds={snapshot?.rollback?.redoableTurnIds}
+                // Conversation identity for the disclosure's conversation scoping.
+                // Codex snapshots carry NO sessionId (codex.rs stamps threadId
+                // only) — fall back to threadId so a codex pane re-collapses the
+                // history line across conversation switches too.
+                sessionId={snapshot?.sessionId ?? snapshot?.threadId}
+                agentLabel={descriptor?.label}
+                expandThinking={globalExpandThinking}
+                expandTools={globalExpandTools}
+                showTimecodes={effectiveShowTimecodes}
+                isStreaming={isBusy}
+                onForkFromTurn={(turnId) => sendFork(turnId)}
+                onRollbackToTurn={(turnId) => {
+                  // The busy pre-flight gate picks copy by DIRECTION (decision 7)…
+                  if (isBusy) {
+                    setNotice(ROLLBACK_BUSY_UNDO_NOTICE)
+                    return
+                  }
+                  // …and a capability-false provider gets an explicit refusal (decision 8:
+                  // no confirmations, explicit rejections, tooltips name the step).
+                  if (canRollback) {
+                    sendRollback('undo', 'toTurn', turnId)
+                    return
+                  }
+                  setNotice(rollbackUnsupportedNotice(descriptor?.label ?? paneContent.provider))
+                }}
+                onRedoToTurn={(turnId) => {
+                  if (isBusy) {
+                    setNotice(ROLLBACK_BUSY_REDO_NOTICE)
+                    return
+                  }
+                  if (canRedoNow) {
+                    sendRollback('redo', 'toTurn', turnId)
+                    return
+                  }
+                  setNotice(REDO_DESTROYED_NOTICE)
+                }}
+                onRewindToTurn={paneContent.initialCwd ? rewindToTurn : undefined}
+              />
+            </FreshAgentOpenSessionContext.Provider>
             {/* Every fresh-agent pane gets the strip (unknown state included):
                 the model chip opens the shared model dialog and the strip owns
                 the bottom-chrome divider (the composer draws no border-top). */}
@@ -3141,6 +3162,7 @@ export function FreshAgentView({
     queuedMessages,
     restartStuckSidecar,
     rewindToTurn,
+    openDelegationSession,
     runShellCommand,
     sessionEnded,
     sessionErrorMessage,

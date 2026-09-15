@@ -1,12 +1,15 @@
 import { forwardRef, memo, useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { ChevronDown, ChevronRight, ChevronUp, Loader2, Redo2, X } from 'lucide-react'
 import SlotReel from '@/components/fresh-agent/shared/SlotReel'
+import { formatThoughtDuration } from '@/components/fresh-agent/shared/format-duration'
 import { getToolPreview } from '@/components/fresh-agent/shared/tool-preview'
 import { cn } from '@/lib/utils'
 import type { FreshAgentTranscriptItem, FreshAgentTurn } from '@shared/fresh-agent-contract'
 import {
+  FreshAgentDelegationBlock,
   FreshAgentItemCard,
   FreshAgentMarkdownBody,
+  FreshAgentRetryRow,
   FreshAgentToolBlock,
   itemToToolDisplay,
   stripSystemReminders,
@@ -58,14 +61,17 @@ function isToolLike(item: FreshAgentTranscriptItem): boolean {
     || item.kind === 'web_search'
     || item.kind === 'image_view'
     || item.kind === 'image_generation'
+    || item.kind === 'task_delegation'
 }
 
 /**
  * Thinking and reasoning roll through the activity strip alongside tools, so a
  * working turn occupies one line instead of stacking disclosures down the pane.
+ * Retries are activity-like too — they render the strip's own muted row, never
+ * a tool block.
  */
 function isActivityLike(item: FreshAgentTranscriptItem): boolean {
-  return isToolLike(item) || item.kind === 'thinking' || item.kind === 'reasoning'
+  return isToolLike(item) || item.kind === 'thinking' || item.kind === 'reasoning' || item.kind === 'retry'
 }
 
 function formatJson(value: unknown): string {
@@ -78,8 +84,10 @@ function formatJson(value: unknown): string {
 }
 
 type ActivityRow =
-  | { type: 'thinking'; id: string; text: string }
+  | { type: 'thinking'; id: string; text: string; durationMs?: number; title?: string }
   | { type: 'tool'; tool: FreshAgentToolDisplay }
+  | { type: 'delegation'; id: string; item: Extract<FreshAgentTranscriptItem, { kind: 'task_delegation' }>; tool: FreshAgentToolDisplay }
+  | { type: 'retry'; id: string; attempt: number; error?: string }
   | { type: 'caption'; id: string; text: string }
 
 function buildActivity(
@@ -93,24 +101,59 @@ function buildActivity(
   const rowStartItemIndexes: number[] = []
   const toolIndexById = new Map<string, number>()
   // Providers stream thinking in chunks; consecutive thinking/reasoning items
-  // merge into one row instead of stacking N "Thinking:" fragments.
-  const pushThinking = (id: string, text: string, itemIndex: number) => {
-    if (!text) return
+  // merge into one row instead of stacking N "Thinking:" fragments. A row
+  // survives even with empty text when it carries a TITLE: a streaming
+  // `**Planning**` heading arrives before its body, and dropping it would leave
+  // the live strip on the unnamed spinner instead of the Thinking behavior.
+  const pushThinking = (row: { id: string; text: string; durationMs?: number; title?: string }, itemIndex: number) => {
+    if (!row.text && row.title === undefined) return
     const last = rows[rows.length - 1]
     if (last?.type === 'thinking') {
-      rows[rows.length - 1] = { ...last, text: `${last.text}\n\n${text}` }
+      rows[rows.length - 1] = {
+        ...last,
+        text: row.text && last.text ? `${last.text}\n\n${row.text}` : (row.text || last.text),
+        durationMs: row.durationMs !== undefined ? row.durationMs : last.durationMs,
+        title: row.title !== undefined ? row.title : last.title,
+      }
       return
     }
     rowStartItemIndexes.push(itemIndex)
-    rows.push({ type: 'thinking', id, text })
+    rows.push({ type: 'thinking', ...row })
   }
   for (const [itemIndex, item] of items.entries()) {
     if (item.kind === 'thinking') {
-      pushThinking(item.id, stripSystemReminders(item.text), itemIndex)
+      pushThinking({ id: item.id, text: stripSystemReminders(item.text) }, itemIndex)
       continue
     }
     if (item.kind === 'reasoning') {
-      pushThinking(item.id, item.summary.length > 0 ? item.summary.join('\n') : (item.text ?? ''), itemIndex)
+      pushThinking({
+        id: item.id,
+        text: item.summary.length > 0 ? item.summary.join('\n') : (item.text ?? ''),
+        durationMs: item.durationMs,
+        title: item.title,
+      }, itemIndex)
+      continue
+    }
+    if (item.kind === 'task_delegation') {
+      rowStartItemIndexes.push(itemIndex)
+      rows.push({
+        type: 'delegation',
+        id: item.id,
+        item,
+        tool: {
+          id: item.id,
+          name: 'Task',
+          previewOverride: item.title,
+          output: item.result,
+          isError: item.status === 'failed',
+          status: item.status === 'running' ? 'running' : 'complete',
+        },
+      })
+      continue
+    }
+    if (item.kind === 'retry') {
+      rowStartItemIndexes.push(itemIndex)
+      rows.push({ type: 'retry', id: item.id, attempt: item.attempt, error: item.error })
       continue
     }
     if (item.kind === 'tool_result') {
@@ -174,9 +217,11 @@ function buildActivity(
 }
 
 function activityTools(rows: ActivityRow[]): FreshAgentToolDisplay[] {
-  return rows
-    .filter((row): row is Extract<ActivityRow, { type: 'tool' }> => row.type === 'tool')
-    .map((row) => row.tool)
+  // Delegation rows contribute their tool display so settledSummary counts a
+  // delegation as a used tool and hasErrors sees its isError.
+  return rows.flatMap((row) => (
+    row.type === 'tool' || row.type === 'delegation' ? [row.tool] : []
+  ))
 }
 
 const FILE_CHANGING_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit'])
@@ -534,7 +579,20 @@ function selectLiveActivityBlockIdFromLayout(
   return null
 }
 
-function FreshAgentThinkingRow({ text, expanded, onToggle }: { text: string; expanded: boolean; onToggle: () => void }) {
+function FreshAgentThinkingRow({ text, durationMs, title, expanded, onToggle }: {
+  text: string
+  durationMs?: number
+  title?: string
+  expanded: boolean
+  onToggle: () => void
+}) {
+  // Settled reasoning rows carry their wire duration (opencode thought parts):
+  // `Thought · 3.4s`, or `Thought: <topic> · <duration>` with a disclosure
+  // title. Rows without a duration keep the plain streaming "Thinking" label.
+  // The button's aria-label MUST equal the visible label.
+  const label = durationMs !== undefined
+    ? `Thought${title ? `: ${title}` : ''} · ${formatThoughtDuration(durationMs)}`
+    : 'Thinking'
   // Controlled/presentational: the expansion state lives in the owning
   // FreshAgentActivityStrip, which never unmounts across the collapsed/
   // expanded branch swap — so a user's toggle survives the strip toggle.
@@ -545,10 +603,10 @@ function FreshAgentThinkingRow({ text, expanded, onToggle }: { text: string; exp
         onClick={onToggle}
         className="fresh-agent-thinking-trigger flex w-full items-center gap-2 rounded-r px-2 py-0.5 text-left transition-colors hover:bg-accent/50"
         aria-expanded={expanded}
-        aria-label="Thinking"
+        aria-label={label}
       >
         <ChevronRight className={cn('h-3 w-3 shrink-0 transition-transform', expanded && 'rotate-90')} />
-        <span className="font-medium">Thinking</span>
+        <span className="font-medium">{label}</span>
       </button>
       {expanded ? (
         <div className="fresh-agent-thinking-body border-t border-border/50 px-2 py-1 text-sm text-muted-foreground">
@@ -595,18 +653,34 @@ function FreshAgentActivityStrip({
   // Liveness judges the last NON-caption row: a caption positioned after a
   // merged thinking row must not kill thinkingLive/the spinner.
   const lastRow = [...displayRows].reverse().find((row) => row.type !== 'caption') ?? null
-  const runningTool = live ? [...tools].reverse().find((tool) => tool.status === 'running') ?? null : null
   const thinkingLive = live && lastRow?.type === 'thinking'
-  const liveTool = !thinkingLive && live ? (tools[tools.length - 1] ?? null) : null
+  // runningTool is NOT gated on `live`: a task_delegation display whose status
+  // is 'running' (background child active, server-joined) is live information
+  // even while the parent session is idle — background children outlive the
+  // parent turn. normalizeActivityRows only settles type:'tool' rows, so a
+  // running delegation survives an idle strip.
+  const runningTool = [...tools].reverse().find((tool) => tool.status === 'running') ?? null
+  // A trailing retry IS the running thing while the turn streams between
+  // attempts; a settled tool display must not mask it (LB-4).
+  const retryLast = live && lastRow?.type === 'retry' ? lastRow : null
+  const liveTool = !thinkingLive && live && !runningTool && !retryLast ? (tools[tools.length - 1] ?? null) : null
   const activeTool = runningTool ?? liveTool
-  const running = live && (activeTool !== null || thinkingLive)
+  const reelName = retryLast ? 'Retrying' : activeTool ? activeTool.name : thinkingLive ? 'Thinking' : null
+  const reelPreview = retryLast
+    ? `attempt ${retryLast.attempt}`
+    : activeTool
+      ? (activeTool.previewOverride ?? getToolPreview(activeTool.name, activeTool.input))
+      : null
+  const running = (live && (activeTool !== null || thinkingLive || retryLast !== null)) || runningTool !== null
 
   const thinkingRows = displayRows.filter((row): row is Extract<ActivityRow, { type: 'thinking' }> => row.type === 'thinking')
 
-  const renderThinkingRow = (row: { id: string; text: string }) => (
+  const renderThinkingRow = (row: Extract<ActivityRow, { type: 'thinking' }>) => (
     <FreshAgentThinkingRow
       key={row.id}
       text={row.text}
+      durationMs={row.durationMs}
+      title={row.title}
       expanded={thinkingExpandedById[row.id] ?? initialThinkingExpanded}
       onToggle={() => setThinkingExpandedById((prev) => ({
         ...prev,
@@ -614,6 +688,33 @@ function FreshAgentActivityStrip({
       }))}
     />
   )
+
+  // One renderer per activity-row type (keys are per-type: captions, thinking,
+  // delegations and retries key on their row/item id, tool rows on the tool
+  // display id). The thinking-row expansion override stays owned by the strip
+  // via renderThinkingRow/thinkingExpandedById.
+  const renderActivityRow = (row: ActivityRow) => {
+    if (row.type === 'caption') {
+      // Non-interactive text — a folded echo caption needs no role/tabIndex.
+      return (
+        <div
+          key={row.id}
+          data-testid="fresh-agent-activity-caption"
+          className="fresh-agent-activity-caption my-0.5 px-2 py-0.5 text-xs italic text-muted-foreground"
+        >
+          {row.text}
+        </div>
+      )
+    }
+    if (row.type === 'thinking') return renderThinkingRow(row)
+    if (row.type === 'delegation') {
+      return <FreshAgentDelegationBlock key={row.id} item={row.item} />
+    }
+    if (row.type === 'retry') {
+      return <FreshAgentRetryRow key={row.id} attempt={row.attempt} error={row.error} />
+    }
+    return <FreshAgentToolBlock key={row.tool.id} tool={row.tool} initialExpanded={initialExpanded || singleToolExpand} />
+  }
 
   if (displayRows.length === 0) {
     if (!live) return null
@@ -631,9 +732,6 @@ function FreshAgentActivityStrip({
       </div>
     )
   }
-
-  const reelName = activeTool ? activeTool.name : thinkingLive ? 'Thinking' : null
-  const reelPreview = activeTool ? getToolPreview(activeTool.name, activeTool.input) : null
 
   return (
     <div role="region" aria-label="Activity strip" className="fresh-agent-activity-strip my-0.5">
@@ -688,23 +786,7 @@ function FreshAgentActivityStrip({
           >
             <ChevronRight className="h-3 w-3 rotate-90 transition-transform" />
           </button>
-          {displayRows.map((row) => {
-            if (row.type === 'caption') {
-              // Non-interactive text — a folded echo caption needs no role/tabIndex.
-              return (
-                <div
-                  key={row.id}
-                  data-testid="fresh-agent-activity-caption"
-                  className="fresh-agent-activity-caption my-0.5 px-2 py-0.5 text-xs italic text-muted-foreground"
-                >
-                  {row.text}
-                </div>
-              )
-            }
-            return row.type === 'thinking'
-              ? renderThinkingRow(row)
-              : <FreshAgentToolBlock key={row.tool.id} tool={row.tool} initialExpanded={initialExpanded || singleToolExpand} />
-          })}
+          {displayRows.map(renderActivityRow)}
         </div>
       )}
     </div>

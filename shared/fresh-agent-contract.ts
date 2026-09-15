@@ -83,6 +83,8 @@ export const FreshAgentTranscriptItemSchema = z.discriminatedUnion('kind', [
     summary: z.array(z.string()),
     content: z.array(z.string()),
     text: z.string().optional(),
+    durationMs: z.number().nonnegative().optional(),
+    title: z.string().optional(),
   }).strict(),
   z.object({
     id: z.string().min(1),
@@ -138,6 +140,38 @@ export const FreshAgentTranscriptItemSchema = z.discriminatedUnion('kind', [
     // in the TUI's failed tool blocks. Optional: absent on every non-error
     // state and on other providers.
     error: z.string().min(1).optional(),
+  }).strict(),
+  z.object({
+    id: z.string().min(1),
+    kind: z.literal('task_delegation'),
+    status: z.enum(['running', 'completed', 'failed']),
+    title: z.string(),
+    description: z.string().optional(),
+    subagent: z.string().optional(),
+    background: z.boolean().optional(),
+    childSessionId: z.string().optional(),
+    startedAtMs: z.number().optional(),
+    endedAtMs: z.number().optional(),
+    durationMs: z.number().nonnegative().optional(),
+    activity: z.array(z.object({
+      tool: z.string(),
+      status: z.enum(['running', 'completed', 'failed']),
+      preview: z.string(),
+    }).strict()).optional(),
+    result: z.string().optional(),
+  }).strict(),
+  z.object({
+    id: z.string().min(1),
+    kind: z.literal('retry'),
+    attempt: z.number().int().positive(),
+    error: z.string().optional(),
+  }).strict(),
+  z.object({
+    id: z.string().min(1),
+    kind: z.literal('delegated_task'),
+    agent: z.string().optional(),
+    description: z.string().optional(),
+    command: z.string().optional(),
   }).strict(),
   z.object({
     id: z.string().min(1),
