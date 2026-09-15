@@ -1,6 +1,7 @@
 import type { Middleware } from '@reduxjs/toolkit'
 import { updatePaneTitle } from './panesSlice'
 import { collectPaneEntries, paneContentMatchesSessionRef } from '@/lib/pane-utils'
+import { getCachedTerminalTitle } from '@/lib/terminal-inventory-titles'
 import type { RootState } from './store'
 
 type TitledSessionRow = {
@@ -67,25 +68,34 @@ function collectTitledSessionRows(sessions: RootState['sessions']): TitledSessio
 /**
  * Collect the exact (tabId, paneId) pairs of panes bound to this session
  * that need the directory title (e2r2 review finding 4, replacing the
- * delta-round-2 fresh-agent-only walk): a TERMINAL pane mirrors IFF its
- * content has NO terminalId — a session-bound terminal pane with a valid
- * sessionRef but no usable terminalId (exited, unavailable,
- * not-yet-reattached after rebuild) can't receive inventory or live
- * terminal-title events, so the directory row is its only runtime title
- * source. Once a terminalId exists, the inventory fold/replay owns that
- * pane's title (the registry-title pipeline: server auto-title sweep,
- * terminal renames via PATCH /api/terminals/:id, the terminal.inventory
- * fold, the live terminal.title fold) — mirroring into it would undo a
- * terminal rename on every sessions/* commit. Fresh-agent panes keep
- * matching unconditionally (their titles have no registry pipeline).
- * The mirror then dispatches PER-PANE (updatePaneTitle, by tabId+paneId
- * with the same user-set guard) for exactly the pairs collected here, so
- * the reducer can never over-reach into a pane outside this target set
- * (updatePaneTitleBySessionRef's reducer deliberately matches both pane
- * kinds via paneContentMatchesSessionRef — e2r1 review finding 3); that
- * shared action keeps its all-kinds semantics for the session-rename
- * cascade (titleSync.ts:42). A pane whose user-set flag is true is
- * NEVER a target.
+ * delta-round-2 fresh-agent-only walk; cache-aware since e2r5 review
+ * finding 3): a TERMINAL pane mirrors IFF its content has NO terminalId
+ * — a session-bound terminal pane with a valid sessionRef but no usable
+ * terminalId (exited, unavailable, not-yet-reattached after rebuild) can't
+ * receive inventory or live terminal-title events, so the directory row
+ * is its only runtime title source — OR NO cached terminal-level title
+ * exists for that terminalId: the replay cache holds only this window's
+ * last-connection snapshot, so a terminal another client created after
+ * this window's handshake never appears in it, no live terminal.title
+ * event addresses the unopened pane, and terminal.attach.ready carries no
+ * title — the blanket terminalId skip left such a pane on its derived
+ * default forever. Once a cached terminal-level title exists, the
+ * inventory fold/replay owns that pane's title (the registry-title
+ * pipeline: server auto-title sweep, terminal renames via PATCH
+ * /api/terminals/:id, the terminal.inventory fold, the live
+ * terminal.title fold) — mirroring into it would undo a terminal rename
+ * on every sessions/* commit; a terminal-level title that arrives LATER
+ * (record → replay) overwrites the non-user-set mirror title exactly as
+ * today. Fresh-agent panes keep matching unconditionally (their titles
+ * have no registry pipeline). The mirror then dispatches PER-PANE
+ * (updatePaneTitle, by tabId+paneId with the same user-set guard) for
+ * exactly the pairs collected here, so the reducer can never over-reach
+ * into a pane outside this target set (updatePaneTitleBySessionRef's
+ * reducer deliberately matches both pane kinds via
+ * paneContentMatchesSessionRef — e2r1 review finding 3); that shared
+ * action keeps its all-kinds semantics for the session-rename cascade
+ * (titleSync.ts:42). A pane whose user-set flag is true is NEVER a
+ * target.
  */
 function collectSessionTitleTargets(
   panes: RootState['panes'],
@@ -98,7 +108,7 @@ function collectSessionTitleTargets(
     if (!layout) continue
     for (const { paneId, content } of collectPaneEntries(layout)) {
       if (!paneContentMatchesSessionRef(content, provider, sessionId)) continue
-      if (content.kind === 'terminal' && content.terminalId) continue
+      if (content.kind === 'terminal' && content.terminalId && getCachedTerminalTitle(content.terminalId) !== undefined) continue
       if (panes.paneTitleSetByUser?.[tabId]?.[paneId]) continue
       if ((panes.paneTitles?.[tabId]?.[paneId] ?? '') !== title) {
         targets.push({ tabId, paneId })
@@ -156,9 +166,10 @@ const SESSION_BINDING_PANE_ACTIONS = new Set([
  * contract: user renames stick; nothing durable is written; no dispatch
  * when the title already matches). The target set is the precedence rule
  * in collectSessionTitleTargets: fresh-agent panes always, terminal panes
- * only while they hold NO terminalId — once the inventory fold/replay can
- * address a terminal pane, the registry-title pipeline owns it and the
- * directory mirror never re-titles it.
+ * only while they hold NO terminalId or NO cached terminal-level title —
+ * once the inventory fold/replay can address a terminal pane, the
+ * registry-title pipeline owns it and the directory mirror never
+ * re-titles it.
  */
 export const sessionTitleMirrorMiddleware: Middleware = (store) => (next) => (action: any) => {
   const result = next(action)

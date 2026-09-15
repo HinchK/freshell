@@ -34,17 +34,62 @@ function readPreMigrationEvidenceRaw(storage: Storage | undefined): string | nul
   }
 }
 
+/** The pending post-rebuild evidence clear (e2r5 review finding 1): armed
+ * by the boot gate after a COMPLETED rebuild, consumed ONLY by the persist
+ * middleware's successful layout-write path. Module-level for the same
+ * reason the capture above is: the middleware sees redux's middleware-API
+ * object, not the store object the gate holds. Process-local by design —
+ * a reload before the durable write loses the arm, which is exactly the
+ * fail-safe direction (the sidecar evidence survives in storage and the
+ * next boot rebuilds again). */
+let preMigrationEvidenceClearPending = false
+
+/** Arm the post-rebuild evidence clear. The App gate calls this instead of
+ * clearing directly once a rebuild completes: persistence is debounced
+ * (PERSIST_DEBOUNCE_MS, persistMiddleware.ts:37) and a failed write is
+ * caught while the dirty flags clear (persistMiddleware.ts:696-704), so a
+ * direct clear at the Redux boundary could strand the sanitized old
+ * envelope in storage with the evidence DELETED — the next boot would
+ * classify it healthy and permanently skip the required rebuild. */
+export function armPreMigrationEvidenceClear(): void {
+  preMigrationEvidenceClearPending = true
+}
+
+export function resetPreMigrationEvidenceArmForTests(): void {
+  preMigrationEvidenceClearPending = false
+}
+
+/** Clear the evidence key; false when the remove failed (or no storage),
+ * so the caller can keep the arm for a later retry. */
+function clearPreMigrationLayoutEvidenceKey(storage: Storage | undefined): boolean {
+  if (!storage) return false
+  try {
+    storage.removeItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)
+    return true
+  } catch {
+    // retention is fail-safe; nothing user-visible to report
+    return false
+  }
+}
+
 /** Consume-and-clear the evidence sidecar after the boot gate's
  * adjudication: healthy-keep or a COMPLETED rebuild retires it; a failed
  * rebuild leaves it so the next boot retries with the original corrupt raw
  * intact. A failing removeItem also leaves it — retention is the
  * fail-safe direction, costing at most one redundant rebuild. */
 export function clearPreMigrationLayoutEvidence(storage: Storage | undefined = safeStorage()): void {
-  if (!storage) return
-  try {
-    storage.removeItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)
-  } catch {
-    // retention is fail-safe; nothing user-visible to report
+  clearPreMigrationLayoutEvidenceKey(storage)
+}
+
+/** The DURABLE boundary (e2r5 review finding 1): the persist middleware
+ * calls this immediately after a SUCCESSFUL layout write — the rebuilt
+ * envelope is now the durable state, so retiring the evidence can no longer
+ * strand the sanitized old envelope. Unarmed calls are no-ops; a failed
+ * evidence remove keeps the arm so the next successful write retries. */
+export function consumeArmedPreMigrationEvidenceClear(storage: Storage | undefined = safeStorage()): void {
+  if (!preMigrationEvidenceClearPending) return
+  if (clearPreMigrationLayoutEvidenceKey(storage)) {
+    preMigrationEvidenceClearPending = false
   }
 }
 

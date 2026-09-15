@@ -18,6 +18,7 @@ import {
 import { LAYOUT_BACKUP_STORAGE_KEY, LAYOUT_STORAGE_KEY, PANES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY, TURN_COMPLETION_STORAGE_KEY } from './storage-keys'
 import { createLogger } from '@/lib/client-logger'
 import { getSelectedMachineId } from '@/lib/machine-identity'
+import { consumeArmedPreMigrationEvidenceClear } from '@/lib/recovery/layout-health'
 import { flushPersistedLayoutNow } from './persistControl'
 import { sanitizeSessionRef } from '@shared/session-contract'
 import { normalizeFreshAgentEffortOverride, normalizeFreshAgentPaneModelSelection } from './paneTypes'
@@ -661,6 +662,13 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
         localStorage.removeItem(LAYOUT_FRESH_AGENT_COMMIT_MARKER_KEY)
         localStorage.removeItem(LAYOUT_FRESH_AGENT_PENDING_MARKER_KEY)
         broadcastPersistedRaw(LAYOUT_STORAGE_KEY, raw)
+        // Durable boundary (e2r5 review finding 1): an armed post-rebuild
+        // pre-migration evidence clear is consumed ONLY here — after the
+        // rebuilt envelope is durably written. A reload before this line
+        // (debounce never fired) or a throwing setItem (caught below, which
+        // skips this line and keeps the arm) leaves the evidence intact, so
+        // the next boot still classifies corrupt and rebuilds again.
+        consumeArmedPreMigrationEvidenceClear()
       }
 
       if (tabRecencyDirty) {

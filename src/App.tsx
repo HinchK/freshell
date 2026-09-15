@@ -72,7 +72,7 @@ import {
   resolveMachineIdentity,
 } from '@/lib/machine-identity'
 import { restoreMachineWorkspace } from '@/lib/machine-workspace'
-import { backfillPersistedLayoutMachineId, classifyPersistedLayoutHealth, clearPreMigrationLayoutEvidence } from '@/lib/recovery/layout-health'
+import { armPreMigrationEvidenceClear, backfillPersistedLayoutMachineId, classifyPersistedLayoutHealth, clearPreMigrationLayoutEvidence } from '@/lib/recovery/layout-health'
 import { buildLocalSettingsPatch } from '@/store/browserPreferencesPersistence'
 import Sidebar, { AppView } from '@/components/Sidebar'
 import TabBar from '@/components/TabBar'
@@ -846,13 +846,25 @@ export default function App() {
           if (layoutHealth !== 'healthy') {
             await restoreMachineWorkspace(appStore, resolution.machine.id, { reason: layoutHealth })
             if (cancelled) return false
+            // e2r5 review finding 1: a completed rebuild ARMS the evidence
+            // clear — the sidecar is never deleted at the Redux boundary.
+            // The rebuild's own dispatches schedule the debounced persist
+            // flush; when it lands, the persist middleware consumes the arm
+            // (a reload before it fires, or a failed write, leaves the
+            // evidence intact so the next boot rebuilds again — a stranded
+            // arm costs at most one redundant rebuild). Forcing the flush
+            // HERE is deliberately NOT done: a synchronous gate-time write
+            // splits the rebuild's persistence in two, and the second
+            // (mount-dirtied) flush can land after ANOTHER page's newer
+            // write and clobber it with a fresh persistedAt —
+            // local-first-reload-rust.spec.ts scenario 3.
+            armPreMigrationEvidenceClear()
+          } else {
+            // Healthy-keep: the durable envelope already classifies
+            // healthy — no pending write can strand the evidence, so the
+            // gate retires it directly.
+            clearPreMigrationLayoutEvidence()
           }
-          // Consume-and-clear the durable pre-migration evidence sidecar
-          // (e2r4 review finding 1): healthy-keep or a COMPLETED rebuild
-          // retires it; a failed rebuild throws past this point and leaves
-          // it, so the next boot retries with the original corrupt raw
-          // intact.
-          clearPreMigrationLayoutEvidence()
           dispatch(setMachineReady({ machine: resolution.machine, mode: 'server-managed' }))
           return true
         } catch (err) {

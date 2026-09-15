@@ -544,14 +544,62 @@ describe('classifyPersistedLayoutHealth in the real boot order (migration rewrit
     expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBe(corruptRaw)
     expect(boot2.classify('machine-1')).toBe('corrupt')
 
-    // The rebuild SUCCEEDS: the gate consume-and-clears the sidecar...
+    // The rebuild SUCCEEDS (e2r5 finding 1): the old step deleted the
+    // sidecar WITHOUT persisting anything and mislabeled the
+    // still-sanitized old envelope as rebuilt — a reload inside the
+    // 500ms persist debounce (or a failed layout write, whose dirty
+    // flags clear anyway, persistMiddleware.ts:696-704) left the old
+    // envelope durable with the evidence gone, so the next boot
+    // classified it healthy and permanently skipped the required
+    // rebuild. The gate now ARMS the clear; a real store + the real
+    // persist middleware play the rebuild's dispatches; the forced
+    // flush (standing in for the rebuild's own debounced flush — the
+    // real gate forces nothing, to keep the rebuild's persistence ONE
+    // write) durably writes the rebuilt envelope, and only that
+    // successful write consumes the armed clear.
     const boot2Module = await import('@/lib/recovery/layout-health')
-    boot2Module.clearPreMigrationLayoutEvidence()
+    boot2Module.armPreMigrationEvidenceClear()
+    const { configureStore } = await import('@reduxjs/toolkit')
+    const { default: rebuiltTabsReducer, addTab } = await import('@/store/tabsSlice')
+    const { panesSlice, initLayout } = await import('@/store/panesSlice')
+    const { persistMiddleware } = await import('@/store/persistMiddleware')
+    const { flushPersistedLayoutNow } = await import('@/store/persistControl')
+    const rebuiltStore = configureStore({
+      reducer: { tabs: rebuiltTabsReducer, panes: panesSlice.reducer },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware),
+    })
+    // The rebuilt pane re-attaches the durable session identity whose
+    // invalid value the sanitized old envelope lost.
+    rebuiltStore.dispatch(addTab({ id: 'tab-rebuilt', title: 'Rebuilt' }))
+    rebuiltStore.dispatch(initLayout({
+      tabId: 'tab-rebuilt',
+      paneId: 'pane-rebuilt',
+      content: {
+        kind: 'terminal', mode: 'claude', createRequestId: 'cr-rebuilt', status: 'running',
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+      },
+    }))
+    // Reload BEFORE the flush: the evidence must still be intact — the
+    // rebuilt envelope exists only in Redux, the old sanitized envelope
+    // is still the durable state, and the next boot must still classify
+    // corrupt and rebuild again.
+    expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBe(corruptRaw)
+    rebuiltStore.dispatch(flushPersistedLayoutNow())
+    // The flush durably wrote the rebuilt envelope; only now may the
+    // armed clear retire the evidence.
+    const rebuiltRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)!
+    expect(JSON.parse(rebuiltRaw).panes.layouts['tab-rebuilt'].content.sessionRef).toEqual({
+      provider: 'claude',
+      sessionId: VALID_CLAUDE_SESSION_ID,
+    })
     expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBeNull()
 
     // ...and the next boot classifies the rebuilt envelope on its own raw.
+    // (The next boot's forced rewrite re-mirrors the now-HEALTHY rebuilt
+    // raw into the empty sidecar — by design: evidence of a healthy
+    // state converges to no-drop on comparison — so classification, not
+    // the sidecar's null-ness, is the assertion.)
     const boot3 = await classifyAfterRealBoot()
-    expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBeNull()
     expect(boot3.classify('machine-1')).toBe('healthy')
   })
 
@@ -573,6 +621,57 @@ describe('classifyPersistedLayoutHealth in the real boot order (migration rewrit
     const boot2 = await classifyAfterRealBoot()
     expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBeNull()
     expect(boot2.classify('machine-1')).toBe('healthy')
+  })
+})
+
+// e2r5 review finding 1: the boot gate's evidence clear raced the persist
+// debounce — clearing at the REDUX boundary stranded the sanitized old
+// envelope in storage with the evidence DELETED when a reload landed inside
+// the 500ms window or the flush's setItem failed (the flush clears its
+// dirty flags even on failure, persistMiddleware.ts:696-704). The gate now
+// ARMS the clear and the persist middleware consumes it ONLY on a
+// successful layout write, so the evidence survives reloads-before-flush
+// and failed writes; the next boot then still classifies corrupt and
+// rebuilds again.
+describe('pre-migration evidence durable boundary (e2r5 finding 1)', () => {
+  beforeEach(() => { localStorage.clear() })
+
+  async function loadEvidenceModule() {
+    const mod = await import('@/lib/recovery/layout-health')
+    mod.resetPreMigrationEvidenceArmForTests()
+    return mod
+  }
+
+  it('an armed consume clears the evidence and disarms; an un-armed consume is a no-op', async () => {
+    localStorage.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, 'evidence')
+    const mod = await loadEvidenceModule()
+    // Not armed: consume never touches the evidence.
+    mod.consumeArmedPreMigrationEvidenceClear()
+    expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBe('evidence')
+    mod.armPreMigrationEvidenceClear()
+    mod.consumeArmedPreMigrationEvidenceClear()
+    expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBeNull()
+    // Disarmed: a second consume can never clear FUTURE evidence.
+    localStorage.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, 'evidence-2')
+    mod.consumeArmedPreMigrationEvidenceClear()
+    expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBe('evidence-2')
+  })
+
+  it('a failed evidence remove leaves the arm armed — a later consume retries the clear', async () => {
+    localStorage.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, 'evidence')
+    const mod = await loadEvidenceModule()
+    mod.armPreMigrationEvidenceClear()
+    const removeItem = vi.spyOn(Storage.prototype, 'removeItem').mockImplementation((key: string) => {
+      if (key === LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY) throw new Error('storage blocked')
+    })
+    try {
+      mod.consumeArmedPreMigrationEvidenceClear()
+      expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBe('evidence')
+    } finally {
+      removeItem.mockRestore()
+    }
+    mod.consumeArmedPreMigrationEvidenceClear()
+    expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBeNull()
   })
 })
 

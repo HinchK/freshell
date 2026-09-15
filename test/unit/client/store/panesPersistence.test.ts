@@ -29,6 +29,14 @@ import {
 } from '../../../../src/store/persistMiddleware'
 import { PANES_SCHEMA_VERSION } from '../../../../src/store/persistedState'
 import { isWellFormedPaneTree } from '../../../../src/store/paneTreeValidation'
+import {
+  LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY,
+  LAYOUT_STORAGE_KEY,
+} from '../../../../src/store/storage-keys'
+import {
+  armPreMigrationEvidenceClear,
+  resetPreMigrationEvidenceArmForTests,
+} from '../../../../src/lib/recovery/layout-health'
 
 describe('Panes Persistence Integration', () => {
   beforeEach(() => {
@@ -1313,5 +1321,97 @@ describe('schema version consistency', () => {
     const parsed = JSON.parse(raw)
     // The version written by persist middleware must match persistedState's version
     expect(parsed.panes.version).toBe(PANES_SCHEMA_VERSION)
+  })
+})
+
+// e2r5 review finding 1: the boot gate's pre-migration evidence clear must
+// be consumed at the DURABLE boundary — the persist middleware's SUCCESSFUL
+// layout-write path — never at the Redux boundary. Persistence is debounced
+// 500ms (PERSIST_DEBOUNCE_MS) and a failed write is caught while the dirty
+// flags still clear (persistMiddleware flush catch), so a reload inside the
+// debounce window or a failed write must leave the evidence intact for the
+// next boot to classify corrupt and rebuild again. The arm API is imported
+// STATICALLY: this file's later tests call vi.resetModules(), and a dynamic
+// import would then mint a second layout-health instance whose arm flag
+// the (already-instantiated) persistMiddleware can never see — the module
+// object captured at file-eval time is the same instance the middleware
+// holds, immune to mid-file registry resets.
+describe('pre-migration evidence sidecar: durable-boundary consumption (e2r5 review finding 1)', () => {
+  const EVIDENCE_RAW = 'pre-migration corrupt raw'
+
+  beforeEach(() => {
+    localStorageMock.clear()
+    vi.clearAllMocks()
+    vi.useFakeTimers()
+    resetPersistFlushListenersForTests()
+    resetPersistedPanesCacheForTests()
+    resetPersistedLayoutCacheForTests()
+    resetPreMigrationEvidenceArmForTests()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  function buildPersistStore() {
+    return configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: (getDefault) => getDefault().concat(persistMiddleware as any),
+    })
+  }
+
+  it('consumes the armed clear only after the debounced flush durably writes the layout', () => {
+    localStorageMock.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, EVIDENCE_RAW)
+    const store = buildPersistStore()
+    armPreMigrationEvidenceClear()
+    // The rebuild's dispatches dirty the store, but the 500ms debounce has
+    // not fired — a reload HERE must leave the evidence intact (the rebuilt
+    // envelope exists only in Redux; the old envelope is still durable).
+    store.dispatch(addTab({ mode: 'shell' }))
+    expect(localStorageMock.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBe(EVIDENCE_RAW)
+    // The debounced flush lands: the layout write succeeds, and only that
+    // successful write consumes the armed clear.
+    vi.runAllTimers()
+    expect(localStorageMock.getItem(LAYOUT_STORAGE_KEY)).not.toBeNull()
+    expect(localStorageMock.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBeNull()
+  })
+
+  it('keeps the armed evidence when the layout write fails; the next successful flush retries the clear', () => {
+    localStorageMock.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, EVIDENCE_RAW)
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const originalSetItem = localStorageMock.setItem
+    localStorageMock.setItem = (key: string, value: string) => {
+      if (key === LAYOUT_STORAGE_KEY) throw new Error('quota exceeded')
+      originalSetItem(key, value)
+    }
+    const store = buildPersistStore()
+    try {
+      armPreMigrationEvidenceClear()
+      store.dispatch(addTab({ mode: 'shell' }))
+      vi.runAllTimers()
+      // The flush's setItem failed (persistMiddleware catches and logs);
+      // the dirty flags cleared without a durable write, so the evidence
+      // MUST survive — the old sanitized envelope is still the durable
+      // state and the next boot must still rebuild.
+      expect(localStorageMock.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBe(EVIDENCE_RAW)
+    } finally {
+      localStorageMock.setItem = originalSetItem
+      consoleError.mockRestore()
+    }
+    // Storage recovers; a later dirty cycle's successful write consumes the
+    // still-armed clear.
+    store.dispatch(addTab({ title: 'after recovery' }))
+    vi.runAllTimers()
+    expect(localStorageMock.getItem(LAYOUT_STORAGE_KEY)).not.toBeNull()
+    expect(localStorageMock.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBeNull()
+  })
+
+  it('never touches the evidence when the clear was not armed', () => {
+    localStorageMock.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, EVIDENCE_RAW)
+    const store = buildPersistStore()
+    store.dispatch(addTab({ mode: 'shell' }))
+    vi.runAllTimers()
+    expect(localStorageMock.getItem(LAYOUT_STORAGE_KEY)).not.toBeNull()
+    expect(localStorageMock.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBe(EVIDENCE_RAW)
   })
 })

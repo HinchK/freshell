@@ -4,7 +4,11 @@ import tabsReducer, { addTab } from '@/store/tabsSlice'
 import { panesSlice, initLayout, updatePaneTitle, updatePaneTitleBySessionRef } from '@/store/panesSlice'
 import sessionsReducer, { commitSessionWindowVisibleRefresh } from '@/store/sessionsSlice'
 import { sessionTitleMirrorMiddleware } from '@/store/sessionTitleMirror'
-import { foldTerminalInventoryTitles, terminalInventoryTitleReplayMiddleware } from '@/lib/terminal-inventory-titles'
+import {
+  foldTerminalInventoryTitles,
+  recordTerminalTitleForReplay,
+  terminalInventoryTitleReplayMiddleware,
+} from '@/lib/terminal-inventory-titles'
 
 function buildStore() {
   return configureStore({
@@ -285,7 +289,14 @@ describe('sessionTitleMirrorMiddleware', () => {
   it('does not overwrite a session-bound terminal pane\u2019s folded terminal title when its session row lands (the reviewer\u2019s exact conflict)', () => {
     const store = buildStore()
     seedSessionBoundTerminalPane(store)
-    store.dispatch(updatePaneTitle({ tabId: 'tab-z', paneId: 'pane-z', title: 'Renamed via REST', setByUser: false }))
+    // e2r5 finding 3: the pane's registry title arrives through the REAL
+    // registry pipeline — the inventory frame that titles the pane also
+    // caches the terminal-level title (the title source the mirror's
+    // cache-aware skip checks). The old pin seeded the pane title with a
+    // bare updatePaneTitle, which no longer represents any real sequence:
+    // a pane holding a terminal-level title implies its window holds the
+    // terminal-level title source that delivered it.
+    expect(foldTerminalInventoryTitles(store, [{ terminalId: 'term-1', title: 'Renamed via REST' }])).toBe(1)
     landSessionRow(store, { surface: 'sidebar', sessionId: 's1', provider: 'claude', title: 'Session directory title' })
     expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Renamed via REST')
     expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-z']).toBeFalsy()
@@ -294,7 +305,7 @@ describe('sessionTitleMirrorMiddleware', () => {
   it('leaves a session-bound terminal pane untouched when applyReconcileAttach rebinds it to a different titled session (registry-title pipeline owns terminal pane titles)', () => {
     const store = buildStore()
     seedSessionBoundTerminalPane(store)
-    store.dispatch(updatePaneTitle({ tabId: 'tab-z', paneId: 'pane-z', title: 'Renamed via REST', setByUser: false }))
+    expect(foldTerminalInventoryTitles(store, [{ terminalId: 'term-1', title: 'Renamed via REST' }])).toBe(1)
     landSessionRow(store, { surface: 'sidebar', sessionId: 's1', provider: 'claude', title: 'First claude title' })
     landSessionRow(store, { surface: 'sidebar', sessionId: 's2', provider: 'claude', title: 'Second claude title' })
     expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Renamed via REST')
@@ -362,7 +373,10 @@ describe('sessionTitleMirrorMiddleware', () => {
         },
       })
       store.dispatch(updatePaneTitle({ tabId: 'tab-z', paneId: 'pane-fa', title: 'Derived default', setByUser: false }))
-      store.dispatch(updatePaneTitle({ tabId: 'tab-z', paneId: 'pane-term', title: 'Renamed via REST', setByUser: false }))
+      // e2r5 finding 3: pane-term's registry title arrives through the
+      // real registry pipeline (the inventory frame that also caches the
+      // terminal-level title the mirror's cache-aware skip checks).
+      expect(foldTerminalInventoryTitles(store, [{ terminalId: 'term-1', title: 'Renamed via REST' }])).toBe(1)
     }
 
     it('re-titles ONLY the fresh-agent pane: the same-session terminal pane keeps its registry/REST title (the reviewer\u2019s exact combined case)', () => {
@@ -451,8 +465,95 @@ describe('sessionTitleMirrorMiddleware', () => {
         payload: { tabId: 'tab-z', paneId: 'pane-z', terminalId: 'term-1' },
       })
       // The binding action triggers BOTH middlewares: the mirror now skips
-      // the pane (it holds a terminalId) and the replay writes the cached
-      // registry title — the fold's write beats the earlier mirror write.
+      // the pane (it holds a terminalId with a CACHED terminal title) and
+      // the replay writes the cached registry title — the fold's write
+      // beats the earlier mirror write.
+      expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Registry title')
+      expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-z']).toBeFalsy()
+    })
+  })
+
+  // e2r5 review finding 3: a truthy terminalId is NOT proof that a
+  // terminal-level title source exists — the replay cache holds only the
+  // LAST CONNECTION's snapshot. A terminal created by ANOTHER client after
+  // this window's handshake never appears in this window's inventory
+  // frame, no live terminal.title event addresses its unopened pane, and
+  // terminal.attach.ready carries no title, so the blanket terminalId skip
+  // left the pane on its derived default forever. The mirror updates a
+  // terminal pane IFF it holds NO terminalId OR NO cached terminal-level
+  // title for that terminalId; a later terminal-level title (record →
+  // replay) still overwrites the non-user-set mirror title exactly as
+  // before.
+  describe('cache-aware terminal-pane mirror precedence (e2r5 finding 3)', () => {
+    function buildMirrorAndReplayStore() {
+      return configureStore({
+        reducer: { tabs: tabsReducer, panes: panesSlice.reducer, sessions: sessionsReducer },
+        middleware: (gDM) => gDM({ serializableCheck: false })
+          .concat(terminalInventoryTitleReplayMiddleware, sessionTitleMirrorMiddleware),
+      })
+    }
+
+    function seedSessionTerminalPaneWithTerminalId(store: ReturnType<typeof buildMirrorAndReplayStore>, terminalId: string) {
+      store.dispatch(addTab({ id: 'tab-z', title: 'Post-handshake probe' }))
+      store.dispatch(initLayout({
+        tabId: 'tab-z',
+        paneId: 'pane-z',
+        content: {
+          kind: 'terminal',
+          mode: 'claude',
+          createRequestId: 'req-e2r5',
+          status: 'running',
+          terminalId,
+          sessionRef: { provider: 'claude', sessionId: 's1' },
+        },
+      }))
+    }
+
+    it('mirrors the directory title into a post-handshake terminal pane (terminalId present, NO cached terminal title — its only runtime title source)', () => {
+      const store = buildMirrorAndReplayStore()
+      // The user opens another client's already-titled session row: the
+      // pane arrives with terminalId + sessionRef, but this window's
+      // replay cache holds NO entry for the terminal (created after this
+      // window's last inventory frame).
+      foldTerminalInventoryTitles(store, [])
+      seedSessionTerminalPaneWithTerminalId(store, 'term-e2r5-new')
+      landSessionRow(store, { surface: 'sidebar', sessionId: 's1', provider: 'claude', title: 'Directory title for a post-handshake terminal' })
+      expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Directory title for a post-handshake terminal')
+      expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-z']).toBeFalsy()
+    })
+
+    it('a terminal WITH a cached terminal-level title stays skipped (the delta-round-2 precedence, cache-aware)', () => {
+      const store = buildMirrorAndReplayStore()
+      seedSessionTerminalPaneWithTerminalId(store, 'term-e2r5-cached')
+      // The real registry pipeline titled the pane AND cached the
+      // terminal-level title.
+      expect(foldTerminalInventoryTitles(store, [{ terminalId: 'term-e2r5-cached', title: 'Registry title' }])).toBe(1)
+      landSessionRow(store, { surface: 'sidebar', sessionId: 's1', provider: 'claude', title: 'Directory title' })
+      expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Registry title')
+      expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-z']).toBeFalsy()
+    })
+
+    it('a later-recorded terminal title REPLACES the mirrored directory title, and later session commits never undo it', () => {
+      const store = buildMirrorAndReplayStore()
+      foldTerminalInventoryTitles(store, [])
+      seedSessionTerminalPaneWithTerminalId(store, 'term-e2r5-new')
+      landSessionRow(store, { surface: 'sidebar', sessionId: 's1', provider: 'claude', title: 'Directory title' })
+      expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Directory title')
+      // A terminal-level title later arrives (attach →
+      // terminal.title.updated → record): the record REPLACES the mirror
+      // as the pane's owner...
+      recordTerminalTitleForReplay('term-e2r5-new', 'Registry title')
+      // ...the next binding action replays it over the non-user-set
+      // mirrored title...
+      store.dispatch({
+        type: 'panes/applyReconcileAttach',
+        payload: { tabId: 'tab-z', paneId: 'pane-z', terminalId: 'term-e2r5-new' },
+      })
+      expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Registry title')
+      // ...and the mirror now skips the pane (cache entry exists), so a
+      // later sessions commit never re-mirrors the directory title over
+      // the registry title.
+      landSessionRow(store, { surface: 'sidebar', sessionId: 's1', provider: 'claude', title: 'Directory title again' })
       expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Registry title')
       expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-z']).toBeFalsy()
     })

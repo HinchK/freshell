@@ -156,6 +156,19 @@ function replaceStaleInventoryTitle(terminalId: string | undefined, title: unkno
   lastInventoryTitles.set(terminalId, title)
 }
 
+/**
+ * The cached terminal-level title this window holds for the terminal —
+ * undefined when NO terminal-level title source has delivered one (e.g. a
+ * terminal another client created after this window's last inventory
+ * frame). The session-title mirror uses this to decide whether the
+ * registry-title pipeline can address a terminal pane (e2r5 review finding
+ * 3): a truthy terminalId alone does not prove a title source exists.
+ */
+export function getCachedTerminalTitle(terminalId: string | undefined): string | undefined {
+  if (!terminalId) return undefined
+  return lastInventoryTitles.get(terminalId)
+}
+
 /** Record a live TERMINAL-LEVEL title write into the replay cache (e2r3
  * review finding 3). Called ONLY by the two authoritative live handlers
  * in TerminalView — the terminal.title.updated fold (~:4780) and the OSC

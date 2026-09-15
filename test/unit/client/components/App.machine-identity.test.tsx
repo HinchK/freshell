@@ -50,6 +50,7 @@ const mocks = vi.hoisted(() => ({
   classifyPersistedLayoutHealth: vi.fn(),
   backfillPersistedLayoutMachineId: vi.fn(),
   clearPreMigrationLayoutEvidence: vi.fn(),
+  armPreMigrationEvidenceClear: vi.fn(),
   installCrossTabSync: vi.fn(),
   startTabRegistrySync: vi.fn(),
   setHelloExtensionProvider: vi.fn(),
@@ -86,6 +87,7 @@ vi.mock('@/lib/recovery/layout-health', () => ({
   classifyPersistedLayoutHealth: (...args: unknown[]) => mocks.classifyPersistedLayoutHealth(...args),
   backfillPersistedLayoutMachineId: (...args: unknown[]) => mocks.backfillPersistedLayoutMachineId(...args),
   clearPreMigrationLayoutEvidence: (...args: unknown[]) => mocks.clearPreMigrationLayoutEvidence(...args),
+  armPreMigrationEvidenceClear: (...args: unknown[]) => mocks.armPreMigrationEvidenceClear(...args),
 }))
 
 vi.mock('@/store/crossTabSync', () => ({
@@ -267,8 +269,12 @@ describe('App machine identity bootstrap', () => {
     expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledTimes(1)
     expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledWith(MACHINE.id)
     // Consume-clear (e2r4 finding 1): a healthy-keep boot retires the
-    // durable pre-migration evidence sidecar.
+    // durable pre-migration evidence sidecar directly — the healthy
+    // envelope is ALREADY the durable state, so no pending write can
+    // strand the evidence. The durable-boundary arm is never used on a
+    // healthy-keep boot.
     expect(mocks.clearPreMigrationLayoutEvidence).toHaveBeenCalledTimes(1)
+    expect(mocks.armPreMigrationEvidenceClear).not.toHaveBeenCalled()
     expect(store.getState().machineIdentity.status).toBe('ready')
   })
 
@@ -291,13 +297,21 @@ describe('App machine identity bootstrap', () => {
       )
       expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledTimes(1)
       expect(mocks.backfillPersistedLayoutMachineId).toHaveBeenCalledWith(MACHINE.id)
-      // A completed rebuild also retires the evidence sidecar (e2r4
-      // finding 1): the clear runs only after restoreMachineWorkspace
-      // resolves.
-      expect(mocks.clearPreMigrationLayoutEvidence).toHaveBeenCalledTimes(1)
-      expect(
-        mocks.restoreMachineWorkspace.mock.invocationCallOrder[0],
-      ).toBeLessThan(mocks.clearPreMigrationLayoutEvidence.mock.invocationCallOrder[0])
+      // e2r5 finding 1: a completed rebuild ARMS the evidence clear — the
+      // sidecar is never deleted at the Redux boundary. Persistence is
+      // debounced 500ms and a failed write clears the dirty flags without
+      // a durable write, so a reload inside that window (or a failed
+      // write) would strand the sanitized old envelope with the evidence
+      // gone; the persist middleware consumes the arm only on the rebuild's
+      // own successful layout write. (No forced gate-time flush: it splits
+      // the rebuild's persistence in two, and the mount-dirtied second
+      // flush can clobber another page's newer write — pinned by
+      // local-first-reload-rust.spec.ts scenario 3.)
+      expect(mocks.armPreMigrationEvidenceClear).toHaveBeenCalledTimes(1)
+      expect(mocks.clearPreMigrationLayoutEvidence).not.toHaveBeenCalled()
+      expect(mocks.restoreMachineWorkspace.mock.invocationCallOrder[0]).toBeLessThan(
+        mocks.armPreMigrationEvidenceClear.mock.invocationCallOrder[0],
+      )
     },
   )
 
@@ -313,5 +327,8 @@ describe('App machine identity bootstrap', () => {
     await waitFor(() => expect(store.getState().machineIdentity.status).toBe('error'))
     expect(mocks.restoreMachineWorkspace).toHaveBeenCalledTimes(1)
     expect(mocks.clearPreMigrationLayoutEvidence).not.toHaveBeenCalled()
+    // e2r5 finding 1: a failed rebuild never arms the durable-boundary
+    // clear either — the evidence must drive the next boot's retry.
+    expect(mocks.armPreMigrationEvidenceClear).not.toHaveBeenCalled()
   })
 })
