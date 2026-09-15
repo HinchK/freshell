@@ -1969,13 +1969,27 @@ async fn a_stale_stop_fence_recovers_through_the_handoff_runner() {
         ),
         "the clear lands the TYPED cleared-unverified state — never plain Vacant"
     );
-    // The cleared state was broadcast with the reason-typed clear event.
-    let frames = await_owner_frames(&mut rig.rx, &["released"]).await;
-    let released = runtime_owner_frame(&frames, "released");
+    // b8ke ext r28 F1: the clear's broadcast carries the AUTHORITATIVE
+    // post-clear state — the FENCED truth (Fenced{ClearedUnverified}),
+    // never a bare "released"/vacant frame (pre-r28 the two assertions
+    // contradicted each other: a fenced coordinator plus a vacant
+    // broadcast online panes folded as an available session).
+    let frames = await_owner_frames(&mut rig.rx, &["handoff-failed"]).await;
+    let cleared_frame = runtime_owner_frame(&frames, "handoff-failed");
     assert_eq!(
-        released["reason"],
-        json!("STALE_STOP_FORCE_CLEARED"),
-        "the clear broadcast names the typed stale-stop force-clear: {released}"
+        cleared_frame["ownerKind"],
+        json!("fresh-agent"),
+        "the fenced frame names the retained prior's kind: {cleared_frame}"
+    );
+    assert_eq!(
+        cleared_frame["fenced"],
+        json!(true),
+        "the fenced marker rides the clear's broadcast: {cleared_frame}"
+    );
+    assert_eq!(
+        cleared_frame["reason"],
+        json!("cleared-unverified"),
+        "the frame carries the authoritative fence's typed wire reason: {cleared_frame}"
     );
 
     // (c) An UNACKNOWLEDGED retry on the cleared-unverified key answers
@@ -3453,13 +3467,29 @@ async fn a_stale_start_fence_recovers_through_the_acknowledged_force_clear() {
         ),
         "the clear lands the TYPED cleared-unverified state — never plain Vacant"
     );
-    // The cleared state was broadcast for cross-device convergence.
-    let frames = await_owner_frames(&mut rig.rx, &["released"]).await;
-    let released = runtime_owner_frame(&frames, "released");
+    // b8ke ext r28 F1: the clear's broadcast carries the AUTHORITATIVE
+    // post-clear state — the FENCED truth (Fenced{ClearedUnverified}),
+    // never a bare "released"/vacant frame. This stale-START fence retains
+    // a VACANT prior (the R4-7 fenced-vacant shape), so the frame names
+    // "vacant" WITH the fenced marker + reason — the client's fenced
+    // branch (which precedes the vacant early-return) renders the typed
+    // recovery card from the marker, never an available session.
+    let frames = await_owner_frames(&mut rig.rx, &["handoff-failed"]).await;
+    let cleared_frame = runtime_owner_frame(&frames, "handoff-failed");
     assert_eq!(
-        released["reason"],
-        json!("STALE_START_FORCE_CLEARED"),
-        "the clear broadcast names the typed stale-start force-clear: {released}"
+        cleared_frame["ownerKind"],
+        json!("vacant"),
+        "the fenced frame names the retained VACANT prior's kind: {cleared_frame}"
+    );
+    assert_eq!(
+        cleared_frame["fenced"],
+        json!(true),
+        "the fenced marker rides the clear's broadcast: {cleared_frame}"
+    );
+    assert_eq!(
+        cleared_frame["reason"],
+        json!("cleared-unverified"),
+        "the frame carries the authoritative fence's typed wire reason: {cleared_frame}"
     );
 
     // (c) An UNACKNOWLEDGED retry on the cleared-unverified key answers
@@ -3626,14 +3656,31 @@ async fn a_platform_limited_fence_recovers_only_through_the_acknowledged_force_c
         other => panic!("the force-clear must leave the key cleared-unverified, got {other:?}"),
     }
     // No handoff-started frame rode the clear (no handoff ran), and the
-    // cleared state was broadcast for cross-device convergence.
-    let frames = await_owner_frames(&mut rig.rx, &["released"]).await;
-    let released = runtime_owner_frame(&frames, "released");
-    assert_eq!(released["ownerKind"], json!("vacant"));
+    // clear's broadcast carries the AUTHORITATIVE post-clear state — the
+    // FENCED truth: the key is Fenced{ClearedUnverified} (the r16-F4
+    // pipeline), so the frame names the retained prior's kind with the
+    // fenced marker and the cleared-unverified wire reason. b8ke ext r28
+    // F1: pre-r28 this emitted a bare "released"/vacant frame, which
+    // online panes folded as an AVAILABLE session — discarding the
+    // required recovery state while the coordinator still refused
+    // ordinary starts (the reconnect replay then flipped the UI back to
+    // the fence).
+    let frames = await_owner_frames(&mut rig.rx, &["handoff-failed"]).await;
+    let cleared_frame = runtime_owner_frame(&frames, "handoff-failed");
     assert_eq!(
-        released["reason"],
-        json!("PLATFORM_LIMITED_FORCE_CLEARED"),
-        "the clear broadcast names the typed force-clear: {released}"
+        cleared_frame["ownerKind"],
+        json!("fresh-agent"),
+        "the fenced frame names the retained prior's kind: {cleared_frame}"
+    );
+    assert_eq!(
+        cleared_frame["fenced"],
+        json!(true),
+        "the fenced marker rides the clear's broadcast: {cleared_frame}"
+    );
+    assert_eq!(
+        cleared_frame["reason"],
+        json!("cleared-unverified"),
+        "the frame carries the authoritative fence's typed wire reason: {cleared_frame}"
     );
     assert!(
         !frames.iter().any(|f| f["transition"] == "handoff-started"),

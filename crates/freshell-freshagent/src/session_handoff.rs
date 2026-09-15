@@ -820,24 +820,40 @@ impl SessionHandoffRunner {
                         tracing::warn!(target: "freshell_ownership",
                             event = "ownership.handoff.unconfirmable_force_cleared",
                             fence_reason = ?reason,
+                            clear_event = clear_event,
                             operation_id = %operation_id, provider = %req.provider, session_id = %req.session_id,
                             epoch = self.ownership.boot_epoch(), generation = observed.generation,
-                            from_kind = ?prior.as_ref().map(|(o, _)| o.kind),
+                            from_kind = ?prior.as_ref().map(|(owner, _)| owner.kind),
                             acknowledged = clear_ack,
                             "{clear_log}");
-                        // Broadcast the cleared state so every device
-                        // holding the sessionRef converges on the Vacant
-                        // key (their fenced recovery cards clear).
+                        // Broadcast the AUTHORITATIVE post-clear state so
+                        // every device holding the sessionRef converges on
+                        // the coordinator's truth. b8ke ext r28 F1: the
+                        // clear lands the key in
+                        // Fenced{ClearedUnverified} (the r16-F4 pipeline —
+                        // never plain Vacant), so the frame is the FENCED
+                        // truth — the same shape the failure-broadcast and
+                        // ready-replay paths emit for fenced records: the
+                        // retained prior's kind, the fenced marker, and
+                        // the cleared-unverified wire reason. Pre-r28 this
+                        // emitted a bare "released"/vacant frame, which
+                        // online panes folded as an AVAILABLE session —
+                        // discarding the required recovery state while
+                        // the coordinator still refused ordinary starts;
+                        // the reconnect replay then flipped the UI back to
+                        // the fence.
                         self.broadcast_owner(
                             &req,
-                            "released",
-                            None,
-                            None,
+                            "handoff-failed",
+                            prior.as_ref().map(|(owner, _)| owner.kind),
+                            prior
+                                .as_ref()
+                                .and_then(|(owner, _)| owner.terminal_id.clone()),
                             &operation_id,
                             observed.generation,
                             prior.as_ref().map(|(owner, _)| owner.kind),
-                            Some(clear_event),
-                            None,
+                            Some(freshell_ownership::FenceReason::ClearedUnverified.wire_str()),
+                            Some(true),
                         );
                         // The typed clear — the force-clear's own answer.
                         // NOT a handoff success: no owner is committed.
