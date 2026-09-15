@@ -1156,6 +1156,16 @@ pub use session_handoff::{
 const SESSION_TYPE: &str = "freshopencode";
 /// The runtime provider (`AGENT_SESSION_TYPES.opencode.provider`).
 const PROVIDER: &str = "opencode";
+
+/// b8ke ext r22 F1: the pane-scoped PROVISIONAL identity for the REST/MCP
+/// materialization's pre-spawn claim — the pane id the caller already
+/// carries, namespaced so it can never collide with a provider-minted
+/// session id. The claim under this key owns the whole cold-start window
+/// (the shared serve's spawn + the POST /session); at the mint the SAME
+/// ticket rekeys to the durable `ses_*` id (rekey_starting). The cancel
+/// closure stays a NO-OP — the shared serve daemon is never a kill handle
+/// (OpenCode invariant).
+const PENDING_CREATE_PREFIX: &str = "pending-create-";
 /// `makePlaceholderSessionId(requestId)`'s prefix (`adapter.ts:75`, mirrored by
 /// `create_tab` above and `opencode_ws::handle_create`): this port's ONE placeholder-id
 /// format, `format!("freshopencode-{request_id}")`. By construction, an id with this shape
@@ -3985,6 +3995,82 @@ async fn send_keys(
         // without reducing fork concurrency. Moving the acquire inside
         // the single-flight would invert lock order (cycle hazard).
         // Decision record: docs/plans/2026-07-29-znhn-bccd-followups.md §D-7.
+        //
+        // b8ke ext r22 F1: the REST/MCP materialization is coordinator-owned
+        // from BEFORE the spawn — the pane-scoped provisional claim under the
+        // pane id the caller already carries (the pre-spawn-claim discipline
+        // of the other fresh lanes). The whole cold-start window (the shared
+        // serve's spawn + health wait + the POST /session — worst case
+        // ~50-70s) then has a Starting generation and the typed recovery
+        // record; the settle witness registers with the ticket so the
+        // watchdog's stale-start sweep SKIPS the live slow cold-start (the
+        // r20 F1 discipline). The cancel closure is a NO-OP by design: the
+        // shared serve daemon is NOT the per-session writer and must never
+        // be killed (OpenCode invariant). A duplicate send-keys for this
+        // pane while the cold-start runs hits the pane key's Starting
+        // record and answers the typed 409 — never a silent double
+        // materialization.
+        let provisional_id = format!("{PENDING_CREATE_PREFIX}{pane_id}");
+        let materialize_op = format!("rest-materialize-{pane_id}");
+        let start_pid_slot = ownership_lane::sidecar_pid_cancel_slot();
+        let mut _start_cancellation: Option<ownership_lane::StartCancellationGuard> = None;
+        let mut own_ticket: Option<freshell_ownership::OperationTicket> = None;
+        let claim_key = state
+            .ownership
+            .as_ref()
+            .map(|r| r.resolve_canonical(PROVIDER, &provisional_id))
+            .unwrap_or_else(|| provisional_id.clone());
+        match ownership_lane::begin_lane_claim(
+            &state.ownership,
+            PROVIDER,
+            &claim_key,
+            &materialize_op,
+            None,
+            "freshopencode/rest-materialize",
+            session_lease::now_epoch_ms(),
+        ) {
+            ownership_lane::LaneClaim::Granted(ticket) => {
+                own_ticket = Some(ticket);
+                _start_cancellation = Some(ownership_lane::register_start_cancellation_for_ticket(
+                    &state.ownership,
+                    PROVIDER,
+                    &claim_key,
+                    &own_ticket,
+                    ownership_lane::pid_slot_cancellation(&start_pid_slot),
+                ));
+            }
+            ownership_lane::LaneClaim::Unwired => {}
+            ownership_lane::LaneClaim::Adopt => {
+                // The pane-scoped key resolves to a LIVE same-kind owner —
+                // an earlier materialization for this pane completed (the
+                // key is `Aliased{to: the durable id}` after its rekey);
+                // the duplicate drive answers the typed conflict.
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    provider = PROVIDER, pane_id = %pane_id, resolved_session_id = %claim_key,
+                    "freshagent.opencode.materialize_claim_refused: the pane-scoped \
+                     materialization key resolves to a live owner; the pane is not \
+                     materialized by this drive"
+                );
+                return fail_json(
+                    StatusCode::CONFLICT,
+                    "SESSION_RESERVED: another lifecycle operation owns this session".to_string(),
+                );
+            }
+            ownership_lane::LaneClaim::Refused(outcome) => {
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    provider = PROVIDER, pane_id = %pane_id, resolved_session_id = %claim_key,
+                    outcome = ?outcome,
+                    "freshagent.opencode.materialize_claim_refused: the coordinator \
+                     refused the pane-scoped pre-spawn claim; the pane is not \
+                     materialized (kata b8ke r22 F1)"
+                );
+                return fail_json(
+                    StatusCode::CONFLICT,
+                    "SESSION_RESERVED: another lifecycle operation owns this session".to_string(),
+                );
+            }
+        }
+
         let created = match manager
             .create_session(None, None, pane.cwd.as_deref())
             .await
@@ -3994,50 +4080,49 @@ async fn send_keys(
         };
         let durable_id = created.id;
 
-        // kata b8ke Task 3: the placeholder→durable materialization MINTS
-        // the canonical `ses_*` key — claim Starting under a ticket NOW
-        // (before anything else registers runtime state for it) so the
-        // coordinator is the cross-kind authority from the session's
-        // first moment. A minted id cannot collide with an observed key,
-        // so no fence is carried (round-2 lifecycle audit).
-        let materialize_op = format!("rest-materialize-{durable_id}");
-        let mut own_ticket = match ownership_lane::begin_lane_claim(
-            &state.ownership,
-            PROVIDER,
-            &durable_id,
-            &materialize_op,
-            None,
-            "freshopencode/rest-materialize",
-            session_lease::now_epoch_ms(),
-        ) {
-            ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
-            ownership_lane::LaneClaim::Unwired => None,
-            ownership_lane::LaneClaim::Adopt => {
-                // A minted `ses_*` id cannot be live under another
-                // operation — treat the impossible adopt as reserved.
-                tracing::warn!(target: "freshell_freshagent::opencode",
-                    provider = PROVIDER, session_id = %durable_id,
-                    "freshagent.opencode.materialize_claim_refused: the coordinator \
-                     refused the materialization claim; the pane is not materialized"
-                );
-                return fail_json(
-                    StatusCode::CONFLICT,
-                    "SESSION_RESERVED: another lifecycle operation owns this session".to_string(),
-                );
+        // b8ke ext r22 F1: the MINT-TIME REKEY — the SAME ticket's
+        // in-flight record moves from the pane-scoped provisional key to
+        // the minted durable `ses_*` id in ONE atomic step
+        // (`rekey_starting`: the provisional key becomes
+        // `Aliased{to: the durable id}` — the rekey family's resolution
+        // record — and the durable key holds the SAME operation's
+        // `Starting`; the ticket survives via `rekey_session_id`, so the
+        // registration tail's `commit_lane_claim` below lands under the
+        // CANONICAL key). The durable key is coordinator-owned from the
+        // moment the id exists: a competitor that claimed the freshly
+        // discoverable session inside the cold-start window left a record
+        // under it and the rekey REFUSES typed — the pane is NOT bound
+        // (the daemon-side session is abandoned; the shared serve is
+        // never killed — OpenCode invariant), never two writers.
+        if let Some(ticket) = own_ticket.as_mut() {
+            let Some(registry) = state.ownership.as_ref() else {
+                unreachable!("a live ticket implies a wired coordinator");
+            };
+            match registry.rekey_starting(
+                PROVIDER,
+                ticket.session_id(),
+                &durable_id,
+                ticket.operation_id(),
+                ticket.generation(),
+            ) {
+                freshell_ownership::CommitOutcome::Committed => {
+                    ticket.rekey_session_id(&durable_id);
+                }
+                outcome => {
+                    tracing::error!(target: "invariant",
+                        provider = PROVIDER, pane_id = %pane_id, session_id = %durable_id,
+                        outcome = ?outcome,
+                        "freshagent.opencode.materialize_rekey_refused: the minted \
+                         session id was claimed by another owner during the cold-start \
+                         window — the pane is not bound (kata b8ke ext r22 F1)"
+                    );
+                    return fail_json(
+                        StatusCode::CONFLICT,
+                        "SESSION_RESERVED: the minted session id was claimed by another owner during the create".to_string(),
+                    );
+                }
             }
-            ownership_lane::LaneClaim::Refused(outcome) => {
-                tracing::warn!(target: "freshell_freshagent::opencode",
-                    provider = PROVIDER, session_id = %durable_id,
-                    outcome = ?outcome,
-                    "freshagent.opencode.materialize_claim_refused: the coordinator \
-                     refused the materialization claim; the pane is not materialized"
-                );
-                return fail_json(
-                    StatusCode::CONFLICT,
-                    "SESSION_RESERVED: another lifecycle operation owns this session".to_string(),
-                );
-            }
-        };
+        }
         // The shared `opencode serve` daemon is NOT the per-session writer
         // and must never be killed — pid stays `None` (OpenCode
         // invariant): the watchdog has no partial runtime to reap.
@@ -5850,6 +5935,345 @@ mod tests {
                 .is_empty(),
             "the refused dispatch must not leave a REST turn witness behind"
         );
+    }
+
+    // ── b8ke ext r22 F1: the REST/MCP materialization is coordinator-owned from BEFORE spawn ──
+
+    /// b8ke ext r22 F1: the create-HOLDING http — POST /session answers
+    /// after a bounded delay (the deterministic cold-start window the
+    /// provisional-record tests poll inside), then either the healthy
+    /// `ses_1` body or a 500 (the spawn-time provider rejection shape).
+    struct CreateHoldingHttp {
+        delay_ms: u64,
+        fail: bool,
+    }
+    impl ServeHttp for CreateHoldingHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let is_create = matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            let delay_ms = self.delay_ms;
+            let fail = self.fail;
+            Box::pin(async move {
+                if is_create {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    if fail {
+                        return Ok(ServeHttpResponse::new(500, b"{}".to_vec()));
+                    }
+                    return Ok(ServeHttpResponse::new(
+                        200,
+                        serde_json::to_vec(&json!({ "id": "ses_1", "directory": null })).unwrap(),
+                    ));
+                }
+                Ok(ServeHttpResponse::new(200, b"{}".to_vec()))
+            })
+        }
+    }
+
+    /// b8ke ext r22 F1 (a+c): during the REST cold-start window (the
+    /// holding http keeps the POST /session open) the coordinator shows a
+    /// Starting record under the pane-scoped provisional identity — a
+    /// competing claim on that key is refused typed — and at the mint the
+    /// SAME ticket rekeys, so the materialization commits Live at the
+    /// minted `ses_1` with the provisional key left as the resolution
+    /// alias.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rest_send_keys_window_holds_a_coordinator_starting_record() {
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let st = state().with_ownership(Arc::clone(&registry));
+        let deps = ServeDeps {
+            spawner: Arc::new(NoopSpawner),
+            http: Arc::new(CreateHoldingHttp {
+                delay_ms: 1_500,
+                fail: false,
+            }),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        st.set_manager_for_test(manager).await;
+        st.panes.lock().expect("panes mutex").insert(
+            "pane-r22-window".to_string(),
+            PaneEntry {
+                placeholder_id: "freshopencode-r22-window".to_string(),
+                cwd: Some("/w".to_string()),
+                model: None,
+                effort: None,
+                durable_id: None,
+            },
+        );
+        let provisional = "pending-create-pane-r22-window";
+
+        let st2 = st.clone();
+        let drive = tokio::spawn(async move {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-auth-token", "tok".parse().unwrap());
+            send_keys(
+                State(st2),
+                Path("pane-r22-window".to_string()),
+                headers,
+                Json(json!({ "text": "hello", "timeout": 0 })),
+            )
+            .await
+        });
+
+        // THE WINDOW: the pane-scoped provisional record is
+        // Starting{FreshAgent} while the cold-start is held open (red
+        // pre-r22: no record at all — the poll starves).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if matches!(
+                registry.observe(PROVIDER, provisional).state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the REST cold-start window never showed the provisional \
+                 Starting record (r22 F1)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // A competing claim on the pane-scoped key is refused typed.
+        assert!(matches!(
+            registry.begin_start(
+                PROVIDER,
+                provisional,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "op-r22-rest-compete",
+                None,
+                "test",
+                crate::session_lease::now_epoch_ms(),
+            ),
+            freshell_ownership::BeginOutcome::Blocked { .. }
+        ));
+
+        // Let the drive finish: the mint rekey lands, the materialization
+        // commits Live at the minted `ses_1`, and the provisional key is
+        // the resolution alias.
+        let resp = drive.await.expect("the drive joins");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, "ses_1").state,
+                freshell_ownership::OwnershipState::Live {
+                    owner,
+                    ..
+                } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            ),
+            "the materialization commits Live at the minted key — got {:?}",
+            registry.observe(PROVIDER, "ses_1").state
+        );
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, provisional).state,
+                freshell_ownership::OwnershipState::Aliased { to, .. } if to == "ses_1",
+            ),
+            "the provisional key is the rekey family's resolution alias — got {:?}",
+            registry.observe(PROVIDER, provisional).state
+        );
+    }
+
+    /// b8ke ext r22 F1 (b): a spawn-time create failure during the window
+    /// settles the provisional record typed through the ticket — the
+    /// record is never left wedged in Starting and the drive answers the
+    /// typed failure.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rest_send_keys_create_failure_settles_the_provisional_record() {
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let st = state().with_ownership(Arc::clone(&registry));
+        let deps = ServeDeps {
+            spawner: Arc::new(NoopSpawner),
+            http: Arc::new(CreateHoldingHttp {
+                delay_ms: 800,
+                fail: true,
+            }),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        st.set_manager_for_test(manager).await;
+        st.panes.lock().expect("panes mutex").insert(
+            "pane-r22-fail".to_string(),
+            PaneEntry {
+                placeholder_id: "freshopencode-r22-fail".to_string(),
+                cwd: Some("/w".to_string()),
+                model: None,
+                effort: None,
+                durable_id: None,
+            },
+        );
+        let provisional = "pending-create-pane-r22-fail";
+
+        let st2 = st.clone();
+        let drive = tokio::spawn(async move {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-auth-token", "tok".parse().unwrap());
+            send_keys(
+                State(st2),
+                Path("pane-r22-fail".to_string()),
+                headers,
+                Json(json!({ "text": "hello", "timeout": 0 })),
+            )
+            .await
+        });
+
+        // The window's record exists before the failure lands.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if matches!(
+                registry.observe(PROVIDER, provisional).state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the spawn-failure drive never showed the provisional record"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The failure lands: the ticket's RAII typed fail settles the
+        // provisional record — never a wedged Starting.
+        let resp = drive.await.expect("the drive joins");
+        assert!(
+            !resp.status().is_success(),
+            "the create failure answers the typed error"
+        );
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, provisional).state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "the provisional record settles typed (Vacant) — got {:?}",
+            registry.observe(PROVIDER, provisional).state
+        );
+    }
+
+    /// b8ke ext r22 F1 (d): the minted-key-lost race — a competitor (a
+    /// terminal) owns the id the fixture will mint (`ses_1`); the
+    /// mint-time rekey REFUSES typed (409), the pane is NOT bound, and
+    /// the competitor's record is untouched (never two writers).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rest_send_keys_refuses_typed_when_the_minted_key_was_lost() {
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let st = state().with_ownership(Arc::clone(&registry));
+        // The competitor: a terminal owns the minted id from before the drive.
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            PROVIDER,
+            "ses_1",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-r22-terminal",
+            None,
+            "test",
+            crate::session_lease::now_epoch_ms(),
+        ) else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            registry.commit_live(
+                PROVIDER,
+                "ses_1",
+                "op-r22-terminal",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-r22".to_string()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                }
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+
+        let deps = ServeDeps {
+            spawner: Arc::new(NoopSpawner),
+            http: Arc::new(CreateHoldingHttp {
+                delay_ms: 0,
+                fail: false,
+            }),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        st.set_manager_for_test(manager).await;
+        st.panes.lock().expect("panes mutex").insert(
+            "pane-r22-lost".to_string(),
+            PaneEntry {
+                placeholder_id: "freshopencode-r22-lost".to_string(),
+                cwd: Some("/w".to_string()),
+                model: None,
+                effort: None,
+                durable_id: None,
+            },
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-auth-token", "tok".parse().unwrap());
+        let resp = send_keys(
+            State(st.clone()),
+            Path("pane-r22-lost".to_string()),
+            headers,
+            Json(json!({ "text": "hello", "timeout": 0 })),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "the minted-key-lost race answers the typed conflict"
+        );
+        // The pane is NOT bound to the minted session (the daemon-side
+        // session is abandoned; the shared serve is never killed —
+        // OpenCode invariant).
+        assert!(
+            st.panes
+                .lock()
+                .expect("panes mutex")
+                .get("pane-r22-lost")
+                .unwrap()
+                .durable_id
+                .is_none(),
+            "the refused rekey never binds the pane"
+        );
+        // The competitor's record is untouched.
+        assert!(matches!(
+            registry.observe(PROVIDER, "ses_1").state,
+            freshell_ownership::OwnershipState::Live {
+                owner,
+                ..
+            } if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal,
+        ));
+        // The provisional record settles typed (the ticket's RAII drop —
+        // the rekey never rekeyed it).
+        assert!(matches!(
+            registry
+                .observe(PROVIDER, "pending-create-pane-r22-lost")
+                .state,
+            freshell_ownership::OwnershipState::Vacant
+        ));
     }
 
     /// Task 3 (corrected semantics — this test previously asserted the WAVE-B
