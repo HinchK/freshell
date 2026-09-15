@@ -67,8 +67,11 @@ import {
 } from '@/store/machineIdentitySlice'
 import type { Machine } from '@/lib/machine-identity'
 import {
+  consumeActiveMachineSelectionMark,
   getSuggestedMachineLabel,
+  markActiveMachineSelection,
   persistSelectedMachineId,
+  peekActiveMachineSelectionMark,
   resolveMachineIdentity,
 } from '@/lib/machine-identity'
 import { restoreMachineWorkspace } from '@/lib/machine-workspace'
@@ -557,12 +560,17 @@ export default function App() {
   }, [])
 
   const selectMachineFromChooser = useCallback(async (machine: Machine) => {
+    // An ACTIVE choice: arm the one-shot marker so the next boot's restore
+    // knows the local layout may be a foreign machine's cache (the
+    // non-recoverable-inventory clear must still apply after the reload).
+    markActiveMachineSelection()
     persistSelectedMachineId(machine.id)
     restartAfterMachineSelection()
   }, [restartAfterMachineSelection])
 
   const addMachineFromChooser = useCallback(async (label: string) => {
     const machine = await createMachine(label)
+    markActiveMachineSelection()
     persistSelectedMachineId(machine.id)
     restartAfterMachineSelection()
   }, [restartAfterMachineSelection])
@@ -830,10 +838,21 @@ export default function App() {
             deviceId: resolution.machine.id,
             deviceLabel: resolution.machine.label,
           }))
+          // The chooser's one-shot active-selection marker (#774, merged into
+          // the Choice B gate): PEEK before the (async) inventory request and
+          // CONSUME only after the boot's adjudication completes — a restore
+          // failure, cancellation, or in-flight manual reload leaves the
+          // marker armed, so the retry always knows the machine was actively
+          // chosen. The peeked marker feeds the classifier: an armed marker
+          // makes an otherwise-healthy UNSTAMPED legacy envelope classify
+          // foreign (the one case the machine-id stamp cannot prove), while
+          // a STAMPED same-machine healthy layout still keeps — Choice B
+          // window sovereignty wins over #774's clear-on-active-choice.
+          const activeSelection = peekActiveMachineSelectionMark()
           // Local-first (Choice B): a healthy local layout IS this window's newest
           // truth — keep it and skip the inventory entirely. Only an absent,
           // corrupt, stale, or foreign layout rebuilds from the server.
-          const layoutHealth = classifyPersistedLayoutHealth(resolution.machine.id)
+          const layoutHealth = classifyPersistedLayoutHealth(resolution.machine.id, { activeSelection })
           // Stamp backfill — classify FIRST, then backfill (AFTER the health gate
           // reads the envelope). Unstamped is a one-boot transitional state: this
           // is the only deterministic restamp for a terminal-free healthy layout.
@@ -865,6 +884,10 @@ export default function App() {
             // gate retires it directly.
             clearPreMigrationLayoutEvidence()
           }
+          // Adjudication complete (healthy-keep or successful rebuild): the
+          // one-shot marker is spent. Any earlier return (cancellation) or a
+          // thrown restore leaves it armed for the retry boot.
+          consumeActiveMachineSelectionMark()
           dispatch(setMachineReady({ machine: resolution.machine, mode: 'server-managed' }))
           return true
         } catch (err) {
@@ -1941,6 +1964,14 @@ export default function App() {
       void exitFullscreen()
     }
   }, [exitFullscreen, isFullscreen, isLandscapeTerminalView, isMobile, view])
+
+  // Machine discovery is authenticated. If that bootstrap request rejects the
+  // current token, the auth prompt must take precedence over the machine gate;
+  // otherwise the user is stranded forever on "Preparing this machine" with
+  // no way to supply a valid token.
+  if (machineIdentity && machineIdentity.status !== 'ready' && authRequiredVisible) {
+    return <AuthRequiredModal />
+  }
 
   if (machineIdentity && machineIdentity.status !== 'ready') {
     if (machineIdentity.status === 'choosing') {

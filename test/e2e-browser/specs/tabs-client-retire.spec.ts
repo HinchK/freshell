@@ -1,37 +1,39 @@
 import type { Browser, Page } from '@playwright/test'
-import { test, expect } from '../helpers/fixtures.js'
+import {
+  createE2eBrowserContext,
+  type E2eMachine,
+  registerE2eMachine,
+  test,
+  expect,
+} from '../helpers/fixtures.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-offer.js'
 
 const RETIRED_TAB_TITLE = 'Retire endpoint e2e tab'
 const RETIRED_DEVICE_LABEL = 'closing-device-e2e'
 
+interface DevicePage {
+  page: Page
+  machine: E2eMachine
+}
+
+interface RetireBeaconCapture {
+  url: string
+  body: string
+}
+
 async function newDevicePage(
   browser: Browser,
-  input: {
-    baseUrl: string
-    token: string
-    deviceId: string
-    deviceLabel: string
-  },
-): Promise<Page> {
-  const context = await browser.newContext()
-  // RESTORE-01: manual contexts bypass the fixtures' `context` override, so
-  // this spec adopts the shared recovery auto-decline watcher directly
-  // (docs/plans/df1/RESTORE-01.md). No-op unless a recoverable offer is made.
+  serverInfo: E2eServerInfo,
+  deviceLabel: string,
+): Promise<DevicePage> {
+  const machine = await registerE2eMachine(serverInfo, deviceLabel)
+  const context = await createE2eBrowserContext(browser, serverInfo, machine.id)
   installRecoveryOfferAutoDeclineOnContext(context)
-  await context.addInitScript((device) => {
-    localStorage.setItem('freshell.device-id.v2', device.deviceId)
-    localStorage.setItem('freshell.device-label.v2', device.deviceLabel)
-    localStorage.setItem('freshell.device-label-custom.v2', '1')
-    localStorage.setItem('freshell.device-fingerprint.v2', `${navigator.platform}|${navigator.userAgent}`)
-  }, {
-    deviceId: input.deviceId,
-    deviceLabel: input.deviceLabel,
-  })
   const page = await context.newPage()
-  await page.goto(`${input.baseUrl}/?token=${input.token}&e2e=1`)
+  await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
   await waitForReady(page)
-  return page
+  return { page, machine }
 }
 
 async function waitForReady(page: Page): Promise<void> {
@@ -94,7 +96,7 @@ async function seedBrowserTab(page: Page, title: string): Promise<void> {
   }, title, { timeout: 15_000 })
 }
 
-async function retireByPagehideWithoutWebSocket(page: Page): Promise<void> {
+async function retireByPagehideWithoutWebSocket(page: Page, machineId: string): Promise<void> {
   await page.evaluate(() => {
     const harness = window.__FRESHELL_TEST_HARNESS__
     if (!harness) throw new Error('Freshell test harness is not installed')
@@ -105,46 +107,70 @@ async function retireByPagehideWithoutWebSocket(page: Page): Promise<void> {
     return state !== 'ready'
   }, { timeout: 5_000 })
   await page.evaluate(() => {
+    const originalSendBeacon = navigator.sendBeacon.bind(navigator)
+    const capturedKey = '__FRESHELL_E2E_RETIRED_BEACON__'
+    Object.defineProperty(navigator, 'sendBeacon', {
+      configurable: true,
+      value: (url: string, data?: BodyInit | null) => {
+        if (url === '/api/tabs-sync/client-retire' && data instanceof Blob) {
+          void data.text().then((body) => {
+            ;(window as Window & { [capturedKey]?: RetireBeaconCapture })[capturedKey] = { url, body }
+          })
+        }
+        return originalSendBeacon(url, data)
+      },
+    })
+  })
+  const receipt = page.waitForResponse((response) => {
+    const request = response.request()
+    return request.method() === 'POST'
+      && new URL(response.url()).pathname === '/api/tabs-sync/client-retire'
+  })
+  await page.evaluate(() => {
     window.dispatchEvent(new Event('pagehide'))
   })
+  const response = await receipt
+  expect(response.status()).toBe(200)
+  await expect(response.json()).resolves.toEqual({ ok: true, accepted: true })
+  const captured = await page.waitForFunction(() => {
+    return (window as Window & { __FRESHELL_E2E_RETIRED_BEACON__?: RetireBeaconCapture })
+      .__FRESHELL_E2E_RETIRED_BEACON__
+  }, undefined, { timeout: 5_000 })
+  const beacon = await captured.jsonValue() as RetireBeaconCapture
+  expect(beacon.url).toBe('/api/tabs-sync/client-retire')
+  const body = JSON.parse(beacon.body) as {
+    deviceId?: unknown
+    clientInstanceId?: unknown
+    snapshotRevision?: unknown
+  }
+  expect(body.deviceId).toBe(machineId)
+  expect(typeof body.clientInstanceId).toBe('string')
+  expect((body.clientInstanceId as string).length).toBeGreaterThan(0)
+  expect(typeof body.snapshotRevision).toBe('number')
+  expect(body.snapshotRevision).toBeGreaterThanOrEqual(0)
   await page.close()
 }
 
 test('closed browser client is removed from the Tabs UI through the unload retire API', async ({ browser, serverInfo }) => {
-  const closingPage = await newDevicePage(browser, {
-    baseUrl: serverInfo.baseUrl,
-    token: serverInfo.token,
-    deviceId: 'closing-device-id-e2e',
-    deviceLabel: RETIRED_DEVICE_LABEL,
-  })
-  await seedBrowserTab(closingPage, RETIRED_TAB_TITLE)
+  const closing = await newDevicePage(browser, serverInfo, RETIRED_DEVICE_LABEL)
+  await seedBrowserTab(closing.page, RETIRED_TAB_TITLE)
 
-  const beforePage = await newDevicePage(browser, {
-    baseUrl: serverInfo.baseUrl,
-    token: serverInfo.token,
-    deviceId: 'observer-before-device-id-e2e',
-    deviceLabel: 'observer-before-e2e',
-  })
-  await waitForTabsSnapshot(beforePage)
-  await openTabsView(beforePage)
-  await expect(beforePage.getByRole('button', {
+  const before = await newDevicePage(browser, serverInfo, 'observer-before-e2e')
+  await waitForTabsSnapshot(before.page)
+  await openTabsView(before.page)
+  await expect(before.page.getByRole('button', {
     name: `${RETIRED_DEVICE_LABEL}: ${RETIRED_TAB_TITLE}`,
   })).toBeVisible()
-  await beforePage.context().close()
+  await before.page.context().close()
 
-  await retireByPagehideWithoutWebSocket(closingPage)
+  await retireByPagehideWithoutWebSocket(closing.page, closing.machine.id)
 
-  const afterPage = await newDevicePage(browser, {
-    baseUrl: serverInfo.baseUrl,
-    token: serverInfo.token,
-    deviceId: 'observer-after-device-id-e2e',
-    deviceLabel: 'observer-after-e2e',
-  })
-  await waitForTabsSnapshot(afterPage)
-  await openTabsView(afterPage)
-  await expect(afterPage.getByRole('button', {
+  const after = await newDevicePage(browser, serverInfo, 'observer-after-e2e')
+  await waitForTabsSnapshot(after.page)
+  await openTabsView(after.page)
+  await expect(after.page.getByRole('button', {
     name: `${RETIRED_DEVICE_LABEL}: ${RETIRED_TAB_TITLE}`,
   })).toHaveCount(0)
 
-  await afterPage.context().close()
+  await after.page.context().close()
 })

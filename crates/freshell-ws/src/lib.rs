@@ -22,9 +22,9 @@
 
 /// The git commit THIS binary was built from, baked into this crate at
 /// compile time by this crate's `build.rs` (`FRESHELL_WS_BUILD_COMMIT`).
-/// Falls back to the literal `"unknown"` when git was unavailable at build
-/// time (e.g. a source tarball or the Cloud Run image, which builds without
-/// git metadata) -- never a runtime failure. Build provenance is
+/// Falls back to the literal `"unknown"` when neither a validated build input
+/// nor git metadata was available at build time (e.g. a source tarball) --
+/// never a runtime failure. Build provenance is
 /// BUILD-scoped, so this deliberately does NOT ride on `WsState`.
 pub fn ready_build_id() -> Option<String> {
     Some(

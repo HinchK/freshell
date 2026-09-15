@@ -13,7 +13,8 @@ import * as path from 'node:path'
 import * as os from 'node:os'
 import { randomUUID } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
-import { RustServer, ensureRustServerBuilt, type TestServerInfo } from '../helpers/rust-server.js'
+import { RustServer, ensureRustServerBuilt, type E2eServerInfo } from '../helpers/rust-server.js'
+import { createE2eBrowserContext, createFreshE2ePage } from '../helpers/fixtures.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -95,7 +96,6 @@ function collectLeaves(node: any): any[] {
 }
 
 function buildClaudeSessionJsonl(sessionId: string, cwd: string, title: string): string {
-  // Donor shape: session-directory-matrix.spec.ts:36 (buildSessionJsonl).
   // Field names verified against the donor (system/init: session_id, uuid,
   // timestamp, cwd; turns: parentUuid, sessionId, cwd, message, uuid, timestamp).
   const t0 = '2026-07-20T08:00:00.000Z'
@@ -147,38 +147,12 @@ async function declineRecoveryOfferIfShowing(page: import('@playwright/test').Pa
   await panel.waitFor({ state: 'hidden', timeout: 5_000 })
 }
 
-// Copied VERBATIM from recover-my-panes-rust.spec.ts:125-131 (its `connect`).
-// NOT bootAndConnect: the fresh recovery context boots UNDER the offer
-// overlay, so shell-picker clicking must not run before the accept.
-async function connectWithoutShellPick(
-  page: import('@playwright/test').Page,
-  info: { baseUrl: string; token: string },
-): Promise<TestHarness> {
-  await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
-  const harness = new TestHarness(page)
-  await harness.waitForHarness()
-  await harness.waitForConnection()
-  return harness
-}
-
-// Copied VERBATIM from recover-my-panes-rust.spec.ts:134-143.
-/** Triage aid: log inventory request failures/non-200s (kept quiet on success). */
-function traceInventoryFailures(page: import('@playwright/test').Page, label: string): void {
-  page.on('response', (r) => {
-    if (!r.url().includes('/api/recovery/inventory') || r.status() === 200) return
-    console.log(`[${label}] inventory response ${r.status()} ${r.url()}`)
-  })
-  page.on('requestfailed', (req) => {
-    if (!req.url().includes('/api/recovery/inventory')) return
-    console.log(`[${label}] inventory request FAILED: ${req.failure()?.errorText}`)
-  })
-}
-
 test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
   test.setTimeout(240_000)
   let server: RustServer
-  let info: TestServerInfo
+  let info: E2eServerInfo
   let sharedRoot: string
+  const ownedContexts = new Set<import('@playwright/test').BrowserContext>()
 
   test.beforeAll(async () => {
     // Same hook-timeout + prebuild pattern as recover-my-panes-rust.spec.ts:194-195:
@@ -240,6 +214,11 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     await server?.stop()
   })
 
+  test.afterEach(async () => {
+    await Promise.all([...ownedContexts].map((context) => context.close().catch(() => {})))
+    ownedContexts.clear()
+  })
+
   // Copied VERBATIM from recover-my-panes-rust.spec.ts:175-191 (capturedHome
   // -> info.homeDir; this suite's RustServer exposes the isolated HOME there).
   /**
@@ -279,28 +258,16 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
    */
   const FRESH_CONTEXT_OPTIONS = { serviceWorkers: 'block' as const }
 
-  // Copied VERBATIM from recover-my-panes-rust.spec.ts:228-246 (its
-  // openFreshContextWithOffer; connect -> connectWithoutShellPick).
-  /**
-   * Open a FRESH context (empty storage) and REQUIRE the recovery offer --
-   * one context, one hard `toBeVisible` assertion. No retry loop: with
-   * service workers blocked (above) the only known cause of transient offer
-   * suppression is gone, and a retry here would quietly absorb exactly the
-   * flaky-offer regression class this feature already exhibited once.
-   */
-  async function openFreshContextWithOffer(
+  async function createOwnedPage(
     browser: import('@playwright/test').Browser,
-    label: string,
-  ): Promise<{ ctx: import('@playwright/test').BrowserContext; page: import('@playwright/test').Page; harness: TestHarness }> {
-    const ctx = await browser.newContext(FRESH_CONTEXT_OPTIONS)
-    const page = await ctx.newPage()
-    traceInventoryFailures(page, label)
-    const harness = await connectWithoutShellPick(page, info)
-    await expect(page.getByTestId('recovery-offer-panel')).toBeVisible({ timeout: 15_000 })
-    return { ctx, page, harness }
+  ) {
+    const owned = await createFreshE2ePage(browser, info, FRESH_CONTEXT_OPTIONS)
+    ownedContexts.add(owned.context)
+    return owned
   }
 
-  test('case-c: fresh codex terminal collapses to a single green row', async ({ page }) => {
+  test('case-c: fresh codex terminal collapses to a single green row', async ({ browser }) => {
+    const { page } = await createOwnedPage(browser)
     const harness = await bootAndConnect(page, info)
 
     // REST-create a fresh codex terminal tab (no resume id) --
@@ -313,6 +280,12 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     const body = await res.json()
     const restTabId: string = body?.data?.tabId
     expect(restTabId).toBeTruthy()
+
+    // REST creates are deliberately focus-neutral. Select the returned tab
+    // before waiting for its renderer-backed terminal buffer; a hidden xterm
+    // must not be treated as ready just because the create request returned.
+    await page.locator(`[data-context="tab"][data-tab-id="${restTabId}"]`).click()
+    await expect.poll(async () => harness.getActiveTabId(), { timeout: 10_000 }).toBe(restTabId)
 
     // Wait for the codex PTY to attach and print its prompt BEFORE typing --
     // same gate as donor codex-terminal-restore-rust.spec.ts:226-229. An
@@ -330,11 +303,6 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
       const buffer = await harness.getTerminalBuffer(codexTerminalId!)
       return typeof buffer === 'string' && buffer.includes('codex> ')
     }, { timeout: 15_000 }).toBe(true)
-
-    // REST creates are focus-neutral; reveal the codex tab explicitly (user-
-    // equivalent tab-strip click) before driving its terminal.
-    await page.locator(`[data-context="tab"][data-tab-id="${restTabId}"]`).click()
-    await expect.poll(async () => harness.getActiveTabId(), { timeout: 10_000 }).toBe(restTabId)
 
     // The driven client shows the pane; type Enter so the fake codex
     // terminal materializes its rollout (Enter-gated, fixture contract).
@@ -359,7 +327,8 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     }).toPass({ timeout: 45_000 })
   })
 
-  test('case-b: REST-created resume tabs are green and dedupe on click', async ({ page }) => {
+  test('case-b: REST-created resume tabs are green and dedupe on click', async ({ browser }) => {
+    const { page } = await createOwnedPage(browser)
     const harness = await bootAndConnect(page, info) // keep the TestHarness -- the dedupe gate below needs it
     await declineRecoveryOfferIfShowing(page) // case-c's server-memory panes trigger the offer overlay
     await seedCodexRollout(info.homeDir, SEEDED_CODEX_THREAD_ID, PROJECT_DIR)
@@ -407,7 +376,8 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     }
   })
 
-  test('case-a: sidebar joins survive a graceful server restart', async ({ page }) => {
+  test('case-a: sidebar joins survive a graceful server restart', async ({ browser }) => {
+    const { page } = await createOwnedPage(browser)
     await bootAndConnect(page, info)
     // Server memory still holds panes from case-b/case-c on this shared
     // serial server, so the fresh browser context gets the recovery offer
@@ -637,7 +607,8 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
   // KEEP THIS SCENARIO LAST in the serial suite: it destroys the local
   // client layout (the "lost client" is simulated by abandoning the boot
   // context entirely) and SIGKILLs the server.
-  test('case-d: recovered panes join green in the sidebar', async ({ page, browser }) => {
+  test('case-d: recovered panes join green in the sidebar', async ({ browser }) => {
+    const { page, machine } = await createOwnedPage(browser)
     await bootAndConnect(page, info)
     // Pre-restart boot offer: earlier cases' panes are still in server memory,
     // so THIS boot gets a recovery offer too. Decline it -- it is suite-order
@@ -696,31 +667,27 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     }).toPass({ timeout: 15_000 })
     await waitForSnapshotContaining([SEEDED_CLAUDE_ID_D, restTabId])
 
-    // Lost client + abrupt server death. Closing the WHOLE context (donor
-    // :290) is the validated lost-client simulation: the fresh context below
-    // starts with empty localStorage (no freshell.layout.*) AND empty
-    // sessionStorage -- the clientInstanceId persists in sessionStorage
-    // (tabRegistrySync.ts:42-92), and if it survived, the server's
-    // self-pollution filter (recovery_inventory.rs:30-33) would drop this
-    // client's own generations and NO recovery offer would ever appear.
+    // Lost client + abrupt server death. The fresh context below deliberately
+    // keeps this server-owned machine id while discarding browser storage, so
+    // Rust's supported machine bootstrap restores only this machine's layout.
     await page.context().close()
     await server.restartAbrupt()
 
-    // Fresh context = new machine; the offer is REQUIRED. ACCEPT it.
-    const { ctx, page: page2 } = await openFreshContextWithOffer(browser, 'case-d')
-    const panel = page2.getByTestId('recovery-offer-panel')
-    await expect(panel.getByRole('heading')).toHaveText(/restore \d+ pane/i)
-    await page2.getByTestId('recovery-accept').click()
-    await expect(panel).toHaveCount(0)
+    const recoveryContext = await createE2eBrowserContext(browser, info, machine.id, FRESH_CONTEXT_OPTIONS)
+    ownedContexts.add(recoveryContext)
+    const page2 = await recoveryContext.newPage()
+    const inventoryResponse = page2.waitForResponse((response) => {
+      const url = new URL(response.url())
+      return url.pathname === '/api/recovery/inventory'
+        && url.searchParams.get('machineId') === machine.id
+    })
+    await bootAndConnect(page2, info)
+    expect((await inventoryResponse).ok()).toBe(true)
+    await expect(page2.getByTestId('recovery-offer-panel')).toHaveCount(0)
 
-    // Panes recreated: a recovered terminal pane MOUNTS. The donor (:305)
-    // asserts visibility, but there the recovered tab is the active one; on
-    // this shared serial server the recovery set includes earlier cases'
-    // picker-bearing "New Tab" generations, and the active tab after accept
-    // can be one of those pickers while the recovered claude terminal mounts
-    // in a background tab. Every tab's TabContent stays alive (App.tsx:1611),
-    // so ATTACHMENT is the recreate signal here -- visibility would fail on a
-    // mounted-but-backgrounded terminal (observed on the first full-suite run).
+    // Panes recreate automatically for the same machine. Every tab's
+    // TabContent stays alive, so attachment proves the recovered terminal
+    // mounted even when its tab is not selected after bootstrap.
     await expect(page2.locator('.xterm').first()).toBeAttached({ timeout: 30_000 })
 
     // THE CONTRACT: the recovered session is green again, exactly once.
@@ -728,6 +695,5 @@ test.describe.serial('P1.14 sidebar registry sync (rust)', () => {
     await expect(row).toHaveAttribute('data-has-tab', 'true', { timeout: 45_000 })
     await expect(row).toHaveCount(1)
 
-    await ctx.close()
   })
 })

@@ -772,12 +772,12 @@ async fn handle_client_text(
     // (silent drop, no terminal, no error). Presence must be read here, at
     // the raw layer, before dedupe/restore planning (zero side effects on
     // reject). The two INVALID_MESSAGE families (terminal.create,
-    // codingcli.create) were armed in Task 6; Task 7 armed the freshAgent
+    // terminal.create was armed in Task 6; Task 7 armed the freshAgent
     // families (create.failed envelope / attach event channel).
     if let Some(resume_value) = value.get("resumeSessionId") {
         let _ = resume_value; // presence is what matters; the value is never read
         match value.get("type").and_then(|t| t.as_str()) {
-            Some("terminal.create") | Some("codingcli.create") => {
+            Some("terminal.create") => {
                 let reply = ServerMessage::Error(ErrorMsg {
                     code: ErrorCode::InvalidMessage,
                     message: LEGACY_RESUME_IDENTITY_REFUSAL.to_string(),
@@ -1839,9 +1839,7 @@ async fn handle_client_text(
         // (`src/store/layoutMirrorMiddleware.ts`) feeds the shared
         // Deliberately inert remainder -- every arm here is unreachable from the
         // frozen client's live surface: `hello` was already consumed by the
-        // pre-loop handshake (`evaluate_hello`); `codingcli.*` has
-        // no runtime here and the frozen client never sends it (zero senders in
-        // `src/`). The user-reachable fresh-agent control frames
+        // pre-loop handshake (`evaluate_hello`). The user-reachable fresh-agent control frames
         // (approval.respond / question.respond / fork / compact) are refused or
         // dispatched BEFORE/INSIDE this match by `fresh_agent_control_refusal` + the
         // claude arms above -- they must never fall through to this silent arm again.
@@ -5512,37 +5510,47 @@ fn handle_attach(
     // registry crate is identity-agnostic, so it's resolved here.
     let canonical_session_ref = state.identity.session_ref_for(&attach.terminal_id);
 
-    // TERM-07 (`broker.ts:358-397` parity): apply the attach-supplied viewport
-    // geometry to the PTY BEFORE attach/replay. The intent + pre-attach
-    // subscriber condition lives in `resize_for_attach`; the session-identity
-    // guard (Node `resizeIfSessionMatches`) lives here because this crate owns
-    // the identity registry. This MUST run before `registry.attach`: attach's
-    // subscriber insert would destroy the pre-attach evidence the condition
-    // needs, and resizing under attach's per-terminal lock would deadlock.
-    if attach_geometry_identity_ok(
+    // TERM-07 (`broker.ts:358-397` parity): the session-identity guard lives
+    // here because this crate owns the identity registry. When it permits the
+    // geometry, the registry applies it AND installs this subscriber in one
+    // terminal-state handoff. That prevents concurrent first viewers from
+    // both observing an empty subscriber map and silently replacing each
+    // other's PTY dimensions before either attach reaches replay.
+    let geometry_identity_ok = attach_geometry_identity_ok(
         attach.expected_session_ref.as_ref(),
         canonical_session_ref.as_ref(),
-    ) {
+    );
+    let outcome = if geometry_identity_ok {
         let cols = attach.cols.clamp(0, u16::MAX as i64) as u16;
         let rows = attach.rows.clamp(0, u16::MAX as i64) as u16;
-        state
-            .registry
-            .resize_for_attach(&attach.terminal_id, conn_id, attach.intent, cols, rows);
-    }
-
-    let outcome = state.registry.attach(
-        &attach.terminal_id,
-        conn_id,
-        Arc::clone(conn_sink),
-        attach.attach_request_id.clone(),
-        attach.since_seq.unwrap_or(0),
-        terminal_output_batch_v1,
-        canonical_session_ref,
-        // Mode replay-sync: the client's positive surface-fresh marker
-        // (xterm recreation / user reset). Forwards the wire field 1:1; the
-        // registry owns the emit-vs-skip gating.
-        attach.surface_reset,
-    );
+        state.registry.attach_with_geometry(
+            &attach.terminal_id,
+            conn_id,
+            Arc::clone(conn_sink),
+            attach.attach_request_id.clone(),
+            attach.since_seq.unwrap_or(0),
+            terminal_output_batch_v1,
+            canonical_session_ref,
+            // Mode replay-sync: the client's positive surface-fresh marker
+            // (xterm recreation / user reset). Forwards the wire field 1:1; the
+            // registry owns the emit-vs-skip gating.
+            attach.surface_reset,
+            attach.intent,
+            cols,
+            rows,
+        )
+    } else {
+        state.registry.attach(
+            &attach.terminal_id,
+            conn_id,
+            Arc::clone(conn_sink),
+            attach.attach_request_id.clone(),
+            attach.since_seq.unwrap_or(0),
+            terminal_output_batch_v1,
+            canonical_session_ref,
+            attach.surface_reset,
+        )
+    };
     if outcome.found {
         return None;
     }

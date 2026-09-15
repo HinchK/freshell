@@ -10,7 +10,6 @@
  *      sessionRef (transcripts deleted server-side) yields the LOUD
  *      dead_session adjudication flow -- never a silent wrong-session attach
  *      and never a silent fresh.
- * Rust-only: registered in RUST_ONLY_SPECS + rust-chromium testMatch.
  * Helpers copied, not imported, per this suite's per-spec-ownership
  * convention (donor: restore-contract-wall-rust.spec.ts).
  */
@@ -18,11 +17,13 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import type { Page } from '@playwright/test'
-import { test, expect } from '../helpers/fixtures.js'
-import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
+import type { BrowserContext, Page } from '@playwright/test'
+import { createE2eBrowserContext, test, expect } from '../helpers/fixtures.js'
+import { RustServer } from '../helpers/rust-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
+import { MACHINE_ID_STORAGE_KEY } from '../../../src/store/storage-keys.js'
 // NOTE: `Page` comes from '@playwright/test' (fixtures.ts exports only
 // `test`/`expect`, as every donor spec does). `openPanePicker` is IMPORTED,
 // not copied -- the copied `createFreshclaudePane` body calls it (wall :29,
@@ -132,7 +133,7 @@ async function bootWall(
     env?: Record<string, string>
     setupHome?: (homeDir: string) => Promise<void>
   } = {},
-): Promise<{ server: RustServer; info: TestServerInfo; harness: TestHarness }> {
+): Promise<{ server: RustServer; info: E2eServerInfo; harness: TestHarness }> {
   const server = new RustServer({ env: options.env, setupHome: options.setupHome })
   const info = await server.start()
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -152,6 +153,33 @@ function findFreshAgentLeaf(node: any): any {
     }
   }
   return null
+}
+
+async function persistedFreshAgentIdentity(page: Page, tabId: string): Promise<string> {
+  return page.evaluate((id) => {
+    const raw = window.localStorage.getItem('freshell.layout.v3')
+    if (!raw) return ''
+    try {
+      const layout = JSON.parse(raw)
+      const visit = (node: any): string => {
+        if (!node) return ''
+        if (node.type === 'leaf' && node.content?.kind === 'fresh-agent') {
+          return node.content.sessionRef?.sessionId
+            ?? node.content.resumeSessionId
+            ?? node.content.sessionId
+            ?? ''
+        }
+        for (const child of node.children ?? []) {
+          const found = visit(child)
+          if (found) return found
+        }
+        return ''
+      }
+      return visit(layout?.panes?.layouts?.[id])
+    } catch {
+      return ''
+    }
+  }, tabId)
 }
 
 /** Send one chat turn in the last fresh-agent pane and wait for idle. */
@@ -221,8 +249,7 @@ async function createFreshclaudePane(page: Page, harness: TestHarness, cwd: stri
 test.describe('Freshclaude identity persistence (P0.2)', () => {
   test.setTimeout(180_000)
 
-  test('durable identity survives browser reload, then SIGKILL restart resumes the SAME conversation', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('durable identity survives browser reload, then SIGKILL restart resumes the SAME conversation', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-identity-freshclaude-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })
@@ -338,8 +365,7 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
     }
   })
 
-  test('real-user reload: identity survives with NO manual persist flush (natural persistence path only)', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('real-user reload: identity survives with NO manual persist flush (natural persistence path only)', async ({ page }) => {
     // COUNCIL FOLLOW-UP (PR #562/#563 close-out, user-advocate's held
     // finding): every other journey in this suite (and the wall's leg G)
     // hand-cranks `persist/flushNow` before reloading -- a lever no real
@@ -376,6 +402,14 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
         .poll(async () => durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId!))), { timeout: 15_000 })
         .toMatch(CANONICAL_UUID_RE)
       const originalDurable: string = durableIdentity(findFreshAgentLeaf(await harness.getPaneLayout(tabId!)))
+
+      // Wait for the real 500 ms debounce to persist the identity. This does
+      // not dispatch the test-only flush action: it proves the natural writer
+      // completed before navigation, removing cloud scheduling from whether
+      // the behavior under test gets exercised.
+      await expect
+        .poll(() => persistedFreshAgentIdentity(page, tabId!), { timeout: 15_000 })
+        .toBe(originalDurable)
 
       // Audit the reload window like test 1 does (any create fired must
       // carry the original id -- never a bare identity-losing create).
@@ -415,8 +449,7 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
     }
   })
 
-  test('cold-open: persisted localStorage ALONE drives resume in a fresh browser context', async ({ page, browser, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('cold-open: persisted localStorage ALONE drives resume in a fresh browser context', async ({ page, browser }) => {
     // COUNCIL FOLLOW-UP (PR #562/#563 close-out, brian's cell): test 1
     // proves persistence in COMPOSITION (same page object reloads, so any
     // in-memory residue could in principle assist). This cell proves the
@@ -432,7 +465,7 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
       env: { FRESHELL_CLAUDE_SIDECAR: FAKE_CLAUDE_SIDECAR_SOURCE },
       setupHome: seedWallConfig({ providers: ['claude'], freshAgent: true }),
     })
-    let coldContext: Awaited<ReturnType<typeof browser.newContext>> | null = null
+    let coldContext: BrowserContext | null = null
     try {
       await selectShellIfPickerShowing(page)
       const tabId = (await harness.getActiveTabId())!
@@ -451,10 +484,14 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
         Object.entries(localStorage),
       )
       expect(persistedEntries.length).toBeGreaterThan(0)
+      const persistedMachineId = persistedEntries.find(([key]) => key === MACHINE_ID_STORAGE_KEY)?.[1]
+      if (!persistedMachineId) {
+        throw new Error('Expected persisted browser storage to retain the selected machine id')
+      }
       await page.close()
 
       // Cold open: fresh context, seeded ONLY with the persisted entries.
-      coldContext = await browser.newContext()
+      coldContext = await createE2eBrowserContext(browser, info, persistedMachineId)
       const coldPage = await coldContext.newPage()
       await coldPage.addInitScript((entries: Array<[string, string]>) => {
         for (const [k, v] of entries) localStorage.setItem(k, v)
@@ -488,8 +525,7 @@ test.describe('Freshclaude identity persistence (P0.2)', () => {
     }
   })
 
-  test('HAZARD GUARD: stale persisted sessionRef yields loud dead_session, never silent wrong-session attach or silent fresh', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust')
+  test('HAZARD GUARD: stale persisted sessionRef yields loud dead_session, never silent wrong-session attach or silent fresh', async ({ page }) => {
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-identity-stale-'))
     const projectDir = path.join(sharedRoot, 'project')
     await fs.mkdir(projectDir, { recursive: true })

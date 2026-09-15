@@ -5,13 +5,12 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test, expect } from '../helpers/fixtures.js'
-import { findFreePort, applyTestServerHomeEnvironment } from '../helpers/test-server.js'
+import { findFreePort, applyServerHomeEnvironment } from '../helpers/server-fixture-support.js'
 import { ensureRustServerBuilt, rustClientDistPath } from '../helpers/rust-server.js'
 
 /**
  * CFG-01 — rust-only spec: "Make every `config.json` write lossless. Preserve
  * `sessionOverrides`, `terminalOverrides`, `projectColors`, `recentDirectories`,
- * `completedMigrations`, `legacyLocalSettingsSeed`, Codex secrets, and unknown
  * future keys on every writer."
  *
  * Checklist validation (`PW-RUST`): "Seed unique sentinels and parameterize
@@ -33,18 +32,13 @@ import { ensureRustServerBuilt, rustClientDistPath } from '../helpers/rust-serve
  *                              listener risk on the owned server)
  *   provider migration +
  *   startup normalization      the boot persist in `SettingsStore::load`
- *                              (knownProviders seed + legacy-seed strip)
  *   recent-directory update    NOT a Rust writer (CFG-09 open) — the CFG-01
  *   title migration            obligation for `recentDirectories`/
  *                              `completedMigrations` is PRESERVATION across
  *                              every other writer, asserted as sentinels in
  *                              every leg below.
  *
- * Why rust-only (not MATRIX_SPECS): the acceptance is `PW-RUST`, and the
- * Rust writer is a deliberate strict SUPERSET of the frozen legacy store —
- * legacy's `loadInternal` normalization REBUILDS `serverSecrets` down to
  * only `codexDisplayIdSecret` (`server/config-store.ts:348-355`), so the
- * sibling-secret sentinel below would legitimately fail on legacy. Legacy
  * cannot be a parity control for a guarantee it never provided.
  *
  * Why this spec spawns the binary directly (cfg03 precedent): it must seed
@@ -165,7 +159,7 @@ async function spawnRustServer(homeDir: string, emptyExtDir: string): Promise<Sp
     const port = await findFreePort()
     const baseUrl = `http://127.0.0.1:${port}`
     const stderrRef = { buf: '' }
-    const env = applyTestServerHomeEnvironment({
+    const env = applyServerHomeEnvironment({
       ...(process.env as Record<string, string>),
       PORT: String(port),
       FRESHELL_BIND_HOST: '127.0.0.1',
@@ -380,7 +374,7 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
     }
   })
 
-  test('every REST writer preserves all sentinels; restart writes nothing', async () => {
+  test('every REST writer preserves all sentinels; restart writes only its supported migration once', async () => {
     test.setTimeout(120_000)
     const homeDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-e2e-cfg01-'))
     const emptyExtDir = path.join(homeDir, 'no-extensions')
@@ -404,18 +398,35 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
     }
     await writeConfig(homeDir, seeded)
 
-    // ── Restart leg: a fully-normalized config boots to a NO-OP — the file
-    // after boot 2 must be byte-for-byte semantically identical (knownProviders
-    // present, stored seed canonical, no stray local keys).
+    // ── Restart leg: startup records the one supported migration exactly once.
+    // Everything else remains byte-for-byte semantically identical.
     await stopProcessGracefully(server.proc)
     server = await spawnRustServer(homeDir, emptyExtDir)
     const afterRestart = await readConfig(homeDir)
+    const expectedAfterRestart = {
+      ...seeded,
+      completedMigrations: [...seeded.completedMigrations, 'ai-title-shadow-cleanup'],
+    }
+    expect(afterRestart.completedMigrations).toEqual(expectedAfterRestart.completedMigrations)
     expectDiffWithin(
-      collectDiffPaths(seeded, afterRestart),
+      collectDiffPaths(expectedAfterRestart, afterRestart),
       [],
       'normalized boot with sentinels present',
     )
-    expectSentinelsIntact(seeded, afterRestart, 'restart')
+    expectSentinelsIntact(expectedAfterRestart, afterRestart, 'restart')
+
+    // The migration is idempotent: a later restart neither appends it again
+    // nor changes any unrelated config field.
+    await stopProcessGracefully(server.proc)
+    server = await spawnRustServer(homeDir, emptyExtDir)
+    const afterSecondRestart = await readConfig(homeDir)
+    expect(afterSecondRestart.completedMigrations).toEqual(expectedAfterRestart.completedMigrations)
+    expectDiffWithin(
+      collectDiffPaths(expectedAfterRestart, afterSecondRestart),
+      [],
+      'second normalized boot with sentinels present',
+    )
+    expectSentinelsIntact(expectedAfterRestart, afterSecondRestart, 'second restart')
 
     // ── Writer legs: after each action, only that writer's intended paths
     // may differ, and every sentinel key must be intact.
@@ -533,7 +544,6 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
     const firstWrite = await readConfig(homeDir)
     await stopProcessGracefully(server.proc)
 
-    // Corrupt the normalization inputs the way a legacy/pre-split config does:
     // knownProviders REMOVED (provider-seed trigger) + stray browser-local keys
     // INSIDE settings (seed-strip trigger) + the full sentinel block.
     const regressed: any = {
@@ -564,6 +574,24 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
     const afterBoot = await readConfig(homeDir)
     await stopProcessGracefully(server.proc)
 
+    const expectedAfterBoot: any = {
+      ...regressed,
+      completedMigrations: [...regressed.completedMigrations, 'ai-title-shadow-cleanup'],
+      settings: {
+        ...regressed.settings,
+        codingCli: {
+          ...regressed.settings.codingCli,
+          knownProviders: [],
+        },
+      },
+      legacyLocalSettingsSeed: {
+        theme: 'dark',
+        uiScale: 1.5,
+      },
+    }
+    delete expectedAfterBoot.settings.theme
+    delete expectedAfterBoot.settings.uiScale
+
     expectDiffWithin(
       collectDiffPaths(regressed, afterBoot),
       [
@@ -571,8 +599,15 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
         ['settings', 'theme'],
         ['settings', 'uiScale'],
         ['legacyLocalSettingsSeed'],
+        ['completedMigrations'],
       ],
       'provider-seed + seed-strip boot persist',
+    )
+    expect(afterBoot.completedMigrations).toEqual(expectedAfterBoot.completedMigrations)
+    expectDiffWithin(
+      collectDiffPaths(expectedAfterBoot, afterBoot),
+      [],
+      'provider-seed + seed-strip normalized boot has no other drift',
     )
     expect(afterBoot.settings?.codingCli?.knownProviders).toEqual([])
     expect(afterBoot.settings?.theme).toBeUndefined()
@@ -580,12 +615,25 @@ test.describe('CFG-01 lossless config.json writes (rust)', () => {
     expect(afterBoot.legacyLocalSettingsSeed?.theme).toBe('dark')
     expect(afterBoot.legacyLocalSettingsSeed?.uiScale).toBe(1.5)
     expectSentinelsIntact(
-      { ...regressed, legacyLocalSettingsSeed: afterBoot.legacyLocalSettingsSeed },
+      expectedAfterBoot,
       afterBoot,
       'boot normalization persist',
     )
     expect(afterBoot.serverSecrets?.codexDisplayIdSecret).toBe(
       firstWrite.serverSecrets?.codexDisplayIdSecret,
     )
+
+    // The supported migration is once-only: another boot leaves this exact
+    // normalized snapshot unchanged, including every sentinel.
+    server = await spawnRustServer(homeDir, emptyExtDir)
+    const afterSecondBoot = await readConfig(homeDir)
+    await stopProcessGracefully(server.proc)
+    expect(afterSecondBoot.completedMigrations).toEqual(expectedAfterBoot.completedMigrations)
+    expectDiffWithin(
+      collectDiffPaths(expectedAfterBoot, afterSecondBoot),
+      [],
+      'second provider-seed + seed-strip boot is idempotent',
+    )
+    expectSentinelsIntact(expectedAfterBoot, afterSecondBoot, 'second boot normalization persist')
   })
 })

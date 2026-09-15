@@ -5100,7 +5100,7 @@ describe('panesSlice', () => {
   })
 
   describe('restoreLayout', () => {
-    it('restores a leaf layout with normalized content', () => {
+    it('remints createRequestId by default when restoring a leaf layout with normalized content', () => {
       const layout: PaneNode = {
         type: 'leaf',
         id: 'old-pane',
@@ -5134,6 +5134,41 @@ describe('panesSlice', () => {
       }
       expect(result.paneTitles['tab-1']).toEqual(paneTitles)
       expect(result.activePane['tab-1']).toBe('old-pane')
+    })
+
+    it('preserves an authorized same-machine terminal createRequestId while stripping runtime state', () => {
+      const layout: PaneNode = {
+        type: 'leaf',
+        id: 'same-machine-terminal',
+        content: {
+          kind: 'terminal',
+          terminalId: 'stale-terminal-id',
+          createRequestId: 'server-terminal-create-request-id',
+          status: 'running',
+          mode: 'shell',
+        },
+      }
+
+      const result = panesReducer(
+        initialState,
+        restoreLayout({
+          tabId: 'same-machine-terminal-tab',
+          layout,
+          paneTitles: {},
+          preserveCreateRequestIds: true,
+        }),
+      )
+
+      const restored = result.layouts['same-machine-terminal-tab']
+      if (restored?.type !== 'leaf' || restored.content.kind !== 'terminal') {
+        throw new Error('expected restored terminal leaf')
+      }
+      expect(restored.content).toMatchObject({
+        createRequestId: 'server-terminal-create-request-id',
+        status: 'creating',
+        mode: 'shell',
+      })
+      expect(restored.content.terminalId).toBeUndefined()
     })
 
     it('restores a split layout with multiple leaves', () => {
@@ -5247,6 +5282,57 @@ describe('panesSlice', () => {
       })
       expect((restoredLayout.content as { showThinking?: unknown }).showThinking).toBeUndefined()
       expect((restoredLayout.content as { showTools?: unknown }).showTools).toBeUndefined()
+    })
+
+    it('preserves an authorized same-machine fresh-agent createRequestId while stripping runtime state', () => {
+      const layout: PaneNode = {
+        type: 'leaf',
+        id: 'same-machine-agent',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshclaude',
+          provider: 'claude',
+          sessionId: 'stale-live-session',
+          createRequestId: 'server-agent-create-request-id',
+          status: 'running',
+          serverInstanceId: 'stale-server',
+          createError: { code: 'STALE', message: 'stale', retryable: true },
+          reconcileEpoch: 4,
+          pendingReconcile: 'respawn',
+          reconcileNotice: 'stale notice',
+          sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+          resumeSessionId: VALID_CLAUDE_SESSION_ID,
+        },
+      } as PaneNode
+
+      const result = panesReducer(
+        initialState,
+        restoreLayout({
+          tabId: 'same-machine-agent-tab',
+          layout,
+          paneTitles: {},
+          preserveCreateRequestIds: true,
+        }),
+      )
+
+      const restored = result.layouts['same-machine-agent-tab']
+      if (restored?.type !== 'leaf' || restored.content.kind !== 'fresh-agent') {
+        throw new Error('expected restored fresh-agent leaf')
+      }
+      expect(restored.content).toMatchObject({
+        createRequestId: 'server-agent-create-request-id',
+        status: 'creating',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        sessionRef: { provider: 'claude', sessionId: VALID_CLAUDE_SESSION_ID },
+        resumeSessionId: VALID_CLAUDE_SESSION_ID,
+      })
+      expect(restored.content.sessionId).toBeUndefined()
+      expect(restored.content.serverInstanceId).toBeUndefined()
+      expect(restored.content.createError).toBeUndefined()
+      expect(restored.content.reconcileEpoch).toBeUndefined()
+      expect(restored.content.pendingReconcile).toBeUndefined()
+      expect(restored.content.reconcileNotice).toBeUndefined()
     })
 
     it('does not overwrite an existing layout', () => {

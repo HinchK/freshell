@@ -1,5 +1,7 @@
 # Port Plan — Amplifier as a Freshell CLI Agent
 
+> **Historical Node-server plan (September 2026).** This plan is preserved as migration history. It describes the retired Node server, so its `server/` paths and commands are not current development instructions. Freshell now runs the Rust server; the standalone TypeScript CLI lives in `tools/freshell-cli/`.
+
 ## Goal & scope
 
 Integrate Microsoft **Amplifier** (`amplifier` CLI) into freshell **exactly the way the

@@ -1,6 +1,8 @@
 import { test, expect } from '../helpers/fixtures.js'
 
 test.describe('server-owned machine identity', () => {
+  test.use({ machineIdentityHandling: 'manual' })
+
   test('a fresh browser chooses a machine before it opens a websocket or pushes tabs', async ({
     page,
     serverInfo,
@@ -33,4 +35,24 @@ test.describe('server-owned machine identity', () => {
     expect(await harness.getSentWsMessages()).toEqual([])
     expect(await harness.getConnectionStatus()).not.toBe('ready')
   })
+})
+
+test.describe.serial('default E2E machine selection', () => {
+  for (const ordinal of ['first', 'second']) {
+    test(`${ordinal} fresh browser context reaches ready on its isolated test machine`, async ({
+      page,
+      serverInfo,
+      harness,
+      machineIdentityHandling,
+      e2eMachineId,
+    }) => {
+      expect(machineIdentityHandling).toBe('auto-select')
+      expect(e2eMachineId).toBeTruthy()
+      await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+      await harness.waitForHarness()
+      expect(await page.evaluate(() => localStorage.getItem('freshell.machine-id.v1'))).toBe(e2eMachineId)
+      await harness.waitForConnection()
+      expect(await harness.getConnectionStatus()).toBe('ready')
+    })
+  }
 })

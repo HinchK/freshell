@@ -1,10 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, cleanup, screen } from '@testing-library/react'
+import { render, cleanup, screen, fireEvent, act } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 
 import HistoryView from '@/components/HistoryView'
-import sessionsReducer from '@/store/sessionsSlice'
+import sessionsReducer, { commitSessionWindowVisibleRefresh } from '@/store/sessionsSlice'
 import tabsReducer from '@/store/tabsSlice'
 
 // HistoryView calls into api helpers for refresh/rename/delete; keep tests isolated.
@@ -137,5 +137,62 @@ describe('HistoryView a11y', () => {
     const alert = screen.getByTestId('history-session-directory-integrity-error')
     expect(alert).toHaveAttribute('role', 'alert')
     expect(alert).toHaveTextContent('Running terminals remain available')
+  })
+
+  it('the integrity-error banner is dismissable with an X; a changed collision count re-shows it', () => {
+    function storeWithIntegrityError(collisionCount: number) {
+      return configureStore({
+        reducer: {
+          sessions: sessionsReducer,
+          tabs: tabsReducer,
+        },
+        middleware: (getDefault) =>
+          getDefault({
+            serializableCheck: {
+              ignoredPaths: ['sessions.expandedProjects'],
+            },
+          }),
+        preloadedState: {
+          sessions: {
+            projects: [],
+            expandedProjects: new Set(),
+            windows: {
+              history: {
+                projects: [],
+                integrityError: {
+                  kind: 'identity_collision',
+                  collisionCount,
+                  duplicateItemCount: collisionCount * 2,
+                },
+              },
+            },
+          },
+          tabs: { tabs: [], activeTabId: null },
+        } as any,
+      })
+    }
+
+    const store = storeWithIntegrityError(2)
+    render(
+      <Provider store={store}>
+        <HistoryView />
+      </Provider>,
+    )
+    expect(screen.getByTestId('history-session-directory-integrity-error')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    expect(screen.queryByTestId('history-session-directory-integrity-error')).toBeNull()
+
+    // A NEW collision count (fresh data problem) re-arms the banner.
+    act(() => {
+      store.dispatch(commitSessionWindowVisibleRefresh({
+        surface: 'history',
+        projects: [],
+        totalSessions: 0,
+        hasMore: false,
+        integrityError: { kind: 'identity_collision', collisionCount: 3, duplicateItemCount: 6 },
+      }))
+    })
+    expect(screen.getByTestId('history-session-directory-integrity-error')).toHaveTextContent('3 conflicting saved session')
   })
 })

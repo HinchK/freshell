@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import { test as base, expect } from '../helpers/fixtures.js'
+import { createE2eBrowserContext, test as base, expect } from '../helpers/fixtures.js'
 import { createE2eServerHandle } from '../helpers/external-target.js'
 
 const BROWSER_PREFERENCES_STORAGE_KEY = 'freshell.browser-preferences.v1'
@@ -16,11 +16,8 @@ const BROWSER_PREFERENCES_STORAGE_KEY = 'freshell.browser-preferences.v1'
  * a full server restart on the same home/port/token (`RustServer.restart()`).
  *
  * The companion spec `settings-persistence-split.spec.ts` covers the SAME
- * split on the matrix, but its journey depends on `legacyLocalSettingsSeed`
  * (CFG-04/SESSION-13, unimplemented in Rust -- it is `test.fail`-annotated on
- * rust-chromium). This spec is the rust-green closure: seed-free, relative
  * theme assertions (toggle AWAY from whatever the context starts with), plus
- * the restart durability leg the matrix spec never exercises.
  */
 
 // Rust-only by registration (playwright.config.ts) AND by construction: the
@@ -35,7 +32,6 @@ const BROWSER_PREFERENCES_STORAGE_KEY = 'freshell.browser-preferences.v1'
 const test = base.extend({
   testServer: [async ({}, use) => {
     const server = await createE2eServerHandle(process.env, {
-      kind: 'rust',
       construct: {},
     })
     await server.start()
@@ -76,13 +72,13 @@ async function getServerSettings(
 test.describe('Settings split (rust)', () => {
   test.setTimeout(120_000)
 
-  test('browser-local appearance stays per-context while server settings replicate and survive a restart', async ({ browser, serverInfo, testServer }) => {
-    const contextA = await browser.newContext()
+  test('browser-local appearance stays per-context while server settings replicate and survive a restart', async ({ browser, serverInfo, testServer, e2eMachineId }) => {
+    const contextA = await createE2eBrowserContext(browser, serverInfo, e2eMachineId)
     const pageA = await contextA.newPage()
     await pageA.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await waitForReady(pageA)
 
-    const contextB = await browser.newContext()
+    const contextB = await createE2eBrowserContext(browser, serverInfo, e2eMachineId)
     const pageB = await contextB.newPage()
     await pageB.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await waitForReady(pageB)

@@ -72,13 +72,13 @@ surprises, and next steps.
 
 ## 5. tmux Interface
 
-**Status:** Comprehensive tmux-inspired CLI exists at `server/cli/index.ts` with `freshell` binary.
+**Status:** Comprehensive tmux-inspired CLI exists at `tools/freshell-cli/index.ts` with `freshell` binary.
 
 Commands: `new-tab`, `list-tabs`, `select-tab`, `kill-tab`, `rename-tab`, `split-pane`, `send-keys`, `capture-pane`, `wait-for`, etc. Has tmux aliases (`new-window` → `new-tab`, etc.).
 
 **Design spec:** `docs/plans/tmux-semantics-proposal.md` (775 lines). Transport is HTTP+token, not Unix sockets.
 
-**Orchestration surface:** the `freshell` MCP tool in `server/mcp/freshell-tool.ts` provides the canonical automation guidance and action reference.
+**Orchestration surface:** the `freshell` MCP tool in `tools/freshell-mcp/freshell-tool.ts` provides the canonical automation guidance and action reference.
 
 ---
 

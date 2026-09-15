@@ -129,6 +129,14 @@ bash scripts/vitest-cloud.sh build 2>&1 > /dev/null || true
 check "vitest-cloud.sh build (default) calls gcloud builds submit" \
   grep -q 'builds submit' "$FAKE_GCLOUD_LOG"
 
+# Check 17b: the Cloud Build submission receives the immutable source commit
+# that the Docker build stamps into the Rust and client artifacts. This is a
+# process-level wrapper contract: the fake gcloud records the argv produced by
+# the real wrapper, rather than inspecting wrapper source text.
+EXPECTED_BUILD_COMMIT="$(git rev-parse HEAD)"
+check "vitest-cloud.sh Cloud Build receives the exact HEAD build commit" \
+  grep -q -- "_FRESHELL_BUILD_COMMIT=${EXPECTED_BUILD_COMMIT}" "$FAKE_GCLOUD_LOG"
+
 # Check 18: e2e-cloud.sh build --local-build uses docker build (not Cloud Build)
 rm -f "$FAKE_GCLOUD_LOG" "$FAKE_DOCKER_LOG"; touch "$FAKE_GCLOUD_LOG" "$FAKE_DOCKER_LOG"
 bash scripts/e2e-cloud.sh build --local-build 2>&1 > /dev/null || true

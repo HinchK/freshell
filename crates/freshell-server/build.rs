@@ -1,5 +1,6 @@
 //! Compile-time provenance stamp for `freshell-server`: bakes the git commit
-//! SHA + a "was the tree dirty at build time" flag into two `rustc-env`
+//! validated `FRESHELL_BUILD_COMMIT` input (or checkout SHA) + a "was the tree
+//! dirty at build time" flag into two `rustc-env`
 //! variables (`FRESHELL_BUILD_COMMIT` / `FRESHELL_BUILD_DIRTY`) that
 //! `src/diag.rs` reads via `option_env!` and surfaces additively on
 //! `GET /api/server-info` (`commit` / `buildDirty`). Prevention lane for the
@@ -9,7 +10,8 @@
 //!
 //! Never fails the build over a missing/unavailable `git`: every git
 //! invocation here degrades to a documented fallback (`"unknown"` for the
-//! commit; `"unknown"` -> treated as dirty, fail-closed, for `buildDirty`)
+//! commit when the explicit input is absent; `"unknown"` -> treated as dirty,
+//! fail-closed, for `buildDirty`)
 //! rather than panicking or returning a non-zero exit from `main()` -- a
 //! build script that could abort `cargo build` over a diagnostics nicety
 //! would be strictly worse than the problem it solves.
@@ -43,15 +45,35 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    let commit = git_head_commit().unwrap_or_else(|| "unknown".to_string());
+    let commit = build_commit_override()
+        .or_else(git_head_commit)
+        .unwrap_or_else(|| "unknown".to_string());
     let dirty = git_tree_dirty();
 
     println!("cargo:rustc-env=FRESHELL_BUILD_COMMIT={commit}");
     println!("cargo:rustc-env=FRESHELL_BUILD_DIRTY={dirty}");
+    println!("cargo:rerun-if-env-changed=FRESHELL_BUILD_COMMIT");
 
     for path in rerun_paths() {
         println!("cargo:rerun-if-changed={}", path.display());
     }
+}
+
+/// The Cloud Build provenance input is intentionally stricter than a generic
+/// string: only a full lowercase Git object id may replace checkout discovery.
+/// Invalid values preserve the ordinary git -> `"unknown"` fallback while
+/// `git_tree_dirty` continues to report its own fail-closed provenance.
+fn build_commit_override() -> Option<String> {
+    std::env::var("FRESHELL_BUILD_COMMIT")
+        .ok()
+        .filter(|value| is_lowercase_commit(value))
+}
+
+fn is_lowercase_commit(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 /// `git rev-parse HEAD`, trimmed. `None` on any failure (git not on `PATH`,

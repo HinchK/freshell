@@ -140,16 +140,48 @@ describe('classifyPersistedLayoutHealth', () => {
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('stale')
   })
 
-  it('treats an unstamped (legacy) envelope as healthy — never foreign — so a same-machine chooser re-pick keeps the layout', () => {
-    // The accepted tradeoff pinned as a test: the re-pick persists its
-    // selection before the reload (App.tsx:557-560), so resolution sees
-    // remembered == resolved; the envelope is unstamped legacy data assumed
-    // local, classifies healthy, and the layout is KEPT (no rebuild).
+  it('treats an UNARMED unstamped (legacy) envelope as healthy — never foreign — so a natural reload keeps the layout', () => {
+    // MERGED (Choice B + #774): this is the unarmed natural-reload lane. The
+    // pre-merge comment framed it as the same-machine chooser re-pick, but
+    // #774's pick handler now ARMS the one-shot active-selection marker on
+    // every chooser pick, so the re-pick boot peeks it and classifies with
+    // activeSelection:true (the foreign pin below); the unarmed unstamped
+    // case is the ordinary reload of a remembered selection, whose layout
+    // is this machine's newest truth and must be KEPT.
     localStorage.setItem(MACHINE_ID_STORAGE_KEY, 'machine-1')
     const envelope = healthyEnvelope('machine-1')
     delete envelope.machineId
     seedEnvelope(envelope)
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
+  it('classifies an otherwise-healthy UNSTAMPED envelope as foreign under an armed active-selection marker (#774 merged into Choice B)', () => {
+    // MERGED SEMANTICS (red-first pin): the chooser's one-shot marker proves
+    // the machine was ACTIVELY chosen this boot, so an unstamped legacy
+    // envelope cannot be assumed local — it may be the PREVIOUS machine's
+    // cache, and the chosen machine's durable truth must replace it. This
+    // is the one classification the machine-id stamp cannot make on its own
+    // (unstamped data has no origin proof). #774's active-choice intent,
+    // preserved at the classifier layer instead of its superseded
+    // restoreMachineWorkspace({ activeSelection }) option.
+    localStorage.setItem(MACHINE_ID_STORAGE_KEY, 'machine-1')
+    const envelope = healthyEnvelope('machine-1')
+    delete envelope.machineId
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW, activeSelection: true })).toBe('foreign')
+  })
+
+  it('keeps a STAMPED same-machine healthy layout under an armed active-selection marker — Choice B wins the #774 boot-gate conflict', () => {
+    // MERGED SEMANTICS (red-first pin): an armed marker alone must NOT
+    // demote a provably-own healthy layout — the stamp is the stronger,
+    // durable origin proof. The pick handler arms the marker on EVERY
+    // chooser pick (#774), including a same-machine re-pick whose layout
+    // is stamped-healthy; Choice B window sovereignty keeps it. #774's
+    // clear-on-active-choice is thereby narrowed to the unstamped case,
+    // where foreignness is actually plausible.
+    localStorage.setItem(MACHINE_ID_STORAGE_KEY, 'machine-1')
+    seedEnvelope(healthyEnvelope('machine-1'))
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW, activeSelection: true })).toBe('healthy')
   })
 
   // Duplicate/empty identity corruption (delta review round 1, finding 3):

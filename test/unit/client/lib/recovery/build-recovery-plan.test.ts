@@ -27,6 +27,124 @@ describe('buildRecoveryPlan', () => {
     expect(content.sessionRef).toBeUndefined()
   })
 
+  it('produces one plan per device tab, in the inventory device.tabs order', () => {
+    const p = () => pane()
+    const inventory = {
+      recoverable: true, contentId: 'cid',
+      device: {
+        deviceId: 'd', deviceLabel: 'l', capturedAt: 1,
+        tabs: [
+          { tabKey: 'd:tab-mango', tabName: 'Mango', panes: [p()] },
+          { tabKey: 'd:tab-apple', tabName: 'Apple', panes: [p()] },
+          { tabKey: 'd:tab-zebra', tabName: 'Zebra', panes: [p()] },
+        ],
+      },
+      otherDevices: [], ledgerOnly: [],
+    } as RecoveryInventory
+    const plans = buildRecoveryPlan(inventory)
+    expect(plans.map((plan) => plan.title)).toEqual(['Mango', 'Apple', 'Zebra'])
+  })
+
+  it('same-machine recovery preserves a terminal snapshot createRequestId with its pane and tab identities', () => {
+    const inventory = inv([pane({ payload: { createRequestId: 'terminal-snapshot-key' } })])
+    inventory.device!.tabs[0].tabKey = 'd:tab-1'
+
+    const [tab] = buildRecoveryPlan(inventory, { preserveIdsForMachine: 'd' })
+    const leaf = tab.layout as { id: string; content: Record<string, unknown> }
+    expect(tab.tabId).toBe('tab-1')
+    expect(leaf.id).toBe('p1')
+    expect(leaf.content.createRequestId).toBe('terminal-snapshot-key')
+  })
+
+  it.each([
+    ['freshclaude', 'claude'],
+    ['kilroy', 'claude'],
+    ['freshcodex', 'codex'],
+    ['freshopencode', 'opencode'],
+  ])('same-machine recovery preserves the %s snapshot createRequestId', (sessionType, provider) => {
+    const createRequestId = `${sessionType}-snapshot-key`
+    const inventory = inv([pane({
+      paneId: `${sessionType}-pane`,
+      kind: 'fresh-agent',
+      mode: null,
+      payload: { sessionType, provider, createRequestId, sessionRef: { provider, sessionId: 'stale' } },
+      sessionRef: { provider, sessionId: `${sessionType}-authoritative` },
+      ledgerState: 'bound',
+    })])
+    inventory.device!.tabs[0].tabKey = 'd:tab-1'
+
+    const [tab] = buildRecoveryPlan(inventory, { preserveIdsForMachine: 'd' })
+    const leaf = tab.layout as { id: string; content: Record<string, unknown> }
+    expect(leaf.id).toBe(`${sessionType}-pane`)
+    expect(leaf.content).toMatchObject({
+      kind: 'fresh-agent',
+      sessionType,
+      provider,
+      createRequestId,
+      sessionRef: { provider, sessionId: `${sessionType}-authoritative` },
+    })
+  })
+
+  it.each([undefined, '', 17, {}, []])(
+    'same-machine recovery mints a terminal and fresh-agent createRequestId for malformed snapshot value %j',
+    (createRequestId) => {
+      const inventory = inv([
+        pane({ paneId: 'terminal-pane', payload: { createRequestId } }),
+        pane({
+          paneId: 'agent-pane',
+          kind: 'fresh-agent',
+          mode: null,
+          payload: { sessionType: 'freshcodex', provider: 'codex', createRequestId },
+          sessionRef: { provider: 'codex', sessionId: 'thread-1' },
+          ledgerState: 'bound',
+        }),
+      ])
+      inventory.device!.tabs[0].tabKey = 'd:tab-1'
+
+      const [tab] = buildRecoveryPlan(inventory, { preserveIdsForMachine: 'd' })
+      expect(leavesOf(tab.layout).map((leaf) => leaf.content.createRequestId)).toEqual([
+        expect.stringMatching(/^nid-\d+$/),
+        expect.stringMatching(/^nid-\d+$/),
+      ])
+    },
+  )
+
+  it('cross-device recovery remints terminal and fresh-agent snapshot createRequestIds', () => {
+    const [tab] = buildRecoveryPlan(inv([
+      pane({ paneId: 'terminal-pane', payload: { createRequestId: 'terminal-snapshot-key' } }),
+      pane({
+        paneId: 'agent-pane',
+        kind: 'fresh-agent',
+        mode: null,
+        payload: { sessionType: 'freshopencode', provider: 'opencode', createRequestId: 'agent-snapshot-key' },
+        sessionRef: { provider: 'opencode', sessionId: 'session-1' },
+        ledgerState: 'bound',
+      }),
+    ]))
+
+    expect(leavesOf(tab.layout).map((leaf) => leaf.content.createRequestId)).toEqual([
+      expect.stringMatching(/^nid-\d+$/),
+      expect.stringMatching(/^nid-\d+$/),
+    ])
+  })
+
+  it('same-machine recovery still mints ledger-only terminal and fresh-agent createRequestIds', () => {
+    const inventory = inv([pane()], [
+      { provider: 'claude', sessionId: 'terminal-row', mode: 'claude', cwd: '/terminal', tabKey: 'd:tab-1', createRequestId: 'ledger-terminal-key' },
+      { provider: 'codex', sessionId: 'agent-row', mode: 'freshcodex', cwd: '/agent', tabKey: 'd:tab-1', paneKind: 'fresh-agent', createRequestId: 'ledger-agent-key' },
+    ])
+    inventory.device!.tabs[0].tabKey = 'd:tab-1'
+
+    const [tab] = buildRecoveryPlan(inventory, { preserveIdsForMachine: 'd' })
+    const contents = leavesOf(tab.layout).map((leaf) => leaf.content)
+    expect(contents.slice(1).map((content) => content.createRequestId)).toEqual([
+      expect.stringMatching(/^nid-\d+$/),
+      expect.stringMatching(/^nid-\d+$/),
+    ])
+    expect(contents.slice(1).map((content) => content.createRequestId)).not.toContain('ledger-terminal-key')
+    expect(contents.slice(1).map((content) => content.createRequestId)).not.toContain('ledger-agent-key')
+  })
+
   it('ledger-corrected sessionRef is used verbatim (authority chain applied server-side)', () => {
     const [tab] = buildRecoveryPlan(inv([pane({ sessionRef: { provider: 'claude', sessionId: 'S2' }, ledgerState: 'bound', mode: 'claude' })]))
     const content = (tab.layout as { content: Record<string, unknown> }).content

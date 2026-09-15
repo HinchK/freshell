@@ -182,6 +182,9 @@ case "$args" in
     esac
     exit 0 ;;
   *"logs read"*) echo "  6 passed (4.2s)"; exit 0 ;;
+  *"logging read"*)
+    echo '[{"jsonPayload":{"event":"e2e_playwright_task_complete","execution":"exec-stub","taskIndex":0,"taskCount":1,"recoveredRetryCount":0}}]'
+    exit 0 ;;
   *) exit 0 ;;
 esac
 STUB
@@ -373,7 +376,10 @@ case "$*" in
   *"artifacts docker images describe"*) exit 0 ;;
   *"auth print-access-token"*) echo stub-token; exit 0 ;;
   *"builds submit"*) exit 0 ;;
-  *"run jobs create"*) exit 0 ;;
+  *"run jobs create"*)
+    tasks=$(grep -o -- '--tasks=[0-9]\+' <<< "$*" | tail -1 | cut -d= -f2)
+    echo "${tasks:-1}" > "$STUB2_CAPTURE/tasks"
+    exit 0 ;;
   *"run jobs delete"*) exit 0 ;;
   *"run jobs execute"*)
     if [ -n "${STUB2_EXECUTE_SLEEP:-}" ]; then sleep "$STUB2_EXECUTE_SLEEP"; exit 0; fi
@@ -394,7 +400,22 @@ case "$*" in
       *) echo "1" ;;
     esac
     exit 0 ;;
-  *"logs read"*) echo "  6 passed (4.2s)"; exit 0 ;;
+  *"logs read"*)
+    if [ -n "${STUB2_LOGS:-}" ]; then printf '%s\n' "$STUB2_LOGS"; else echo "  6 passed (4.2s)"; fi
+    exit 0 ;;
+  *"logging read"*)
+    if [ -n "${STUB2_STRUCTURED_LOGS:-}" ]; then
+      printf '%s\n' "$STUB2_STRUCTURED_LOGS"
+      exit 0
+    fi
+    tasks=$(cat "$STUB2_CAPTURE/tasks" 2>/dev/null || echo 1)
+    printf '['
+    for ((task = 0; task < tasks; task++)); do
+      [ "$task" -gt 0 ] && printf ','
+      printf '{"jsonPayload":{"event":"e2e_playwright_task_complete","execution":"exec-stub-7","taskIndex":%s,"taskCount":%s,"recoveredRetryCount":0}}' "$task" "$tasks"
+    done
+    printf ']\n'
+    exit 0 ;;
   *) exit 0 ;;
 esac
 STUB2
@@ -442,6 +463,33 @@ if ! grep "run jobs create" "$STUB2_CAPTURE/gcloud.args" | grep -q -- "--tasks=2
   echo "FAIL: --tasks not applied for this run"; rm -rf "$STUB2_DIR"; exit 1
 fi
 echo "PASS: unique job created/executed/deleted with its own config"
+
+# A recovered Playwright retry has a successful Cloud Run task, so its only
+# useful receipt is the structured first-attempt evidence the entrypoint put
+# in Cloud Logging. The runner must call that out without dumping base64 trace
+# chunks into the terminal receipt.
+echo "Testing: recovered retry evidence is surfaced with a durable artifact id"
+stub2_reset
+RETRY_RECEIPT_OUT=$(env PATH="$STUB2_DIR:$PATH" \
+  STUB2_STRUCTURED_LOGS='[{"jsonPayload":{"event":"e2e_playwright_task_complete","execution":"exec-stub-7","taskIndex":0,"taskCount":1,"recoveredRetryCount":1}},{"jsonPayload":{"event":"e2e_playwright_retry_evidence","execution":"exec-stub-7","taskIndex":0,"taskCount":1,"failureAttempt":0,"trace":{"artifactId":"playwright-retry-trace-test","traceAttempt":0,"retained":false},"error":{"stack":"first attempt stack"}}}]' \
+  "$SCRIPT" run --cloud --shards=1 2>&1) && RETRY_RECEIPT_RC=0 || RETRY_RECEIPT_RC=$?
+if [ "$RETRY_RECEIPT_RC" -eq 0 ]; then
+  echo "FAIL: recovered Playwright retry was accepted as a zero-flake cloud receipt"
+  echo "$RETRY_RECEIPT_OUT" | tail -30; rm -rf "$STUB2_DIR"; exit 1
+fi
+if ! grep -q "Recovered Playwright retry evidence retained in Cloud Logging" <<< "$RETRY_RECEIPT_OUT"; then
+  echo "FAIL: runner did not surface recovered retry evidence in its receipt"
+  echo "$RETRY_RECEIPT_OUT" | tail -30; rm -rf "$STUB2_DIR"; exit 1
+fi
+if ! grep -q "playwright-retry-trace-test" <<< "$RETRY_RECEIPT_OUT"; then
+  echo "FAIL: runner receipt omitted the durable retry trace artifact id"
+  echo "$RETRY_RECEIPT_OUT" | tail -30; rm -rf "$STUB2_DIR"; exit 1
+fi
+if grep -q "All tasks completed successfully" <<< "$RETRY_RECEIPT_OUT"; then
+  echo "FAIL: runner printed a green receipt despite recovered Playwright retry evidence"
+  echo "$RETRY_RECEIPT_OUT" | tail -30; rm -rf "$STUB2_DIR"; exit 1
+fi
+echo "PASS: recovered retry evidence is surfaced and fails the zero-flake receipt"
 
 # a second run must get a different job
 stub2_reset

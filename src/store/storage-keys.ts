@@ -30,10 +30,17 @@ export const STORAGE_KEYS = {
   machineSelections: 'freshell.machine-selections.v1',
   machineSelectionReset: 'freshell.machine-selection-reset.v1',
   layoutWindowId: 'freshell.layout-window-id.v1',
+  // The selected-machine key changes before a switch reload. Keep the origin
+  // of the hydrated local workspace separately so local-only decorations
+  // cannot cross into the newly selected machine during that reload.
+  machineWorkspaceOrigin: 'freshell.machine-workspace-origin.v1',
   tabRegistryClientInstanceId: 'freshell.tabs.client-instance-id.v1',
   tabRegistrySnapshotRevision: 'freshell.tabs.snapshot-revision.v1',
   inputHistory: 'freshell.input-history.v1',
 } as const
+
+export const STORAGE_VERSION_KEY = 'freshell_version'
+export const STORAGE_VERSION = 5
 
 export const LEGACY_LAYOUT_STORAGE_KEY = STORAGE_KEYS.legacyLayout
 export const LEGACY_LAYOUT_BACKUP_STORAGE_KEY = STORAGE_KEYS.legacyLayoutBackup
@@ -56,5 +63,6 @@ export const DEVICE_DISMISSED_STORAGE_KEY = STORAGE_KEYS.deviceDismissed
 export const MACHINE_ID_STORAGE_KEY = STORAGE_KEYS.machineId
 export const MACHINE_SELECTIONS_STORAGE_KEY = STORAGE_KEYS.machineSelections
 export const MACHINE_SELECTION_RESET_STORAGE_KEY = STORAGE_KEYS.machineSelectionReset
+export const MACHINE_WORKSPACE_ORIGIN_STORAGE_KEY = STORAGE_KEYS.machineWorkspaceOrigin
 export const TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY = STORAGE_KEYS.tabRegistryClientInstanceId
 export const TAB_REGISTRY_SNAPSHOT_REVISION_STORAGE_KEY = STORAGE_KEYS.tabRegistrySnapshotRevision

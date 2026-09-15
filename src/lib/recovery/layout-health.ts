@@ -443,21 +443,38 @@ function hasLifecycleInvalidTerminalContent(node: unknown, seenCreateRequestIds:
  *             while tabs are non-empty; activePane[tabId] absent or not a
  *             leaf of that tab's layout).
  * - foreign: IFF the envelope is STAMPED and the stamp names a different
- *            machine. An unstamped envelope is legacy (pre-stamp) data
- *            assumed local — it can NEVER classify foreign, so a
- *            same-machine chooser re-pick keeps a healthy unstamped
+ *            machine, OR (#774 merged) the boot peeked an ARMED
+ *            active-selection marker (the chooser pick's one-shot
+ *            sessionStorage mark) and the envelope is UNSTAMPED — the
+ *            marker proves the machine was actively chosen, so an
+ *            unstamped legacy envelope cannot be assumed local (it may
+ *            be the previous machine's cache). A STAMPED same-machine
+ *            healthy layout still keeps under an armed marker: the stamp
+ *            is the stronger origin proof, and Choice B window
+ *            sovereignty wins over #774's clear-on-active-choice. An
+ *            UNARMED unstamped envelope is legacy (pre-stamp) data
+ *            assumed local — it can never classify foreign, so a natural
+ *            reload of a remembered selection keeps a healthy unstamped
  *            layout; Task 2's stamp backfill makes unstamped a one-boot
  *            transitional state.
- *            Accepted migration residual: a pre-migration envelope that
- *            actually belonged to a different machine (an origin remap
- *            before the first boot of this code) is mis-kept for one boot
- *            under this rule; the backfill then stamps it with the
- *            resolved machine id, so every later boot classifies correctly.
+ *            Accepted migration residual: an unarmed unstamped envelope
+ *            that actually belonged to a different machine (an origin
+ *            remap before the first boot of this code) is mis-kept for
+ *            one boot under this rule; the backfill then stamps it with
+ *            the resolved machine id, so every later boot classifies
+ *            correctly.
  * - stale:   older than STALE_LAYOUT_MS.
  * - healthy: everything else — the window keeps its local layout. */
 export function classifyPersistedLayoutHealth(
   resolvedMachineId: string,
-  opts: { now?: number; storage?: Storage } = {},
+  opts: {
+    now?: number
+    storage?: Storage
+    /** True when the boot peeked the chooser's armed active-selection
+     * marker (#774): an otherwise-healthy UNSTAMPED envelope then
+     * classifies foreign (see the foreign case above). */
+    activeSelection?: boolean
+  } = {},
 ): PersistedLayoutHealth {
   const storage = opts.storage ?? safeStorage()
   const now = opts.now ?? Date.now()
@@ -618,11 +635,18 @@ export function classifyPersistedLayoutHealth(
     }
   }
   // Foreign IFF stamped AND the stamp names a different machine. Unstamped
-  // = legacy (pre-stamp) data assumed local — never foreign (a same-machine
-  // chooser re-pick keeps a healthy unstamped layout; Task 2's backfill then
-  // stamps it so the next boot is unambiguous).
+  // = legacy (pre-stamp) data assumed local — never foreign on its own (a
+  // natural reload of a remembered selection keeps a healthy unstamped
+  // layout; Task 2's backfill then stamps it so the next boot is
+  // unambiguous) — EXCEPT under an ARMED active-selection marker (#774
+  // merged): the chooser pick proved the machine was actively chosen this
+  // boot, so an unstamped envelope may be the PREVIOUS machine's cache and
+  // the chosen machine's durable truth must replace it. A stamped
+  // same-machine layout keeps even under an armed marker (Choice B wins).
   const stamp = parsed.machineId
-  if (typeof stamp === 'string' && stamp && stamp !== resolvedMachineId) return 'foreign'
+  const stamped = typeof stamp === 'string' && !!stamp
+  if (stamped && stamp !== resolvedMachineId) return 'foreign'
+  if (opts.activeSelection === true && !stamped) return 'foreign'
   const persistedAt = typeof parsed.persistedAt === 'number' ? parsed.persistedAt : 0
   if (now - persistedAt > STALE_LAYOUT_MS) return 'stale'
   return 'healthy'

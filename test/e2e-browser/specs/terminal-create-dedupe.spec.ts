@@ -7,17 +7,13 @@
  * PTY PID, one terminal ID, one pane owner, and one fixture launch record."
  *
  * The dedupe is a SERVER-side contract with byte-identical semantics on both
- * implementations (legacy parity source: `server/ws-handler.ts` global
  * `createdTerminalByRequestId` settled cache :575/:891-936 + per-connection
  * `REPAIR_PENDING_SENTINEL` :2329-:2704 + create lock :2218; rust answer:
  * `crates/freshell-ws/src/create_dedupe.rs` + the dispatch arm at
  * `crates/freshell-ws/src/terminal.rs:564-624`). This spec therefore runs in
- * BOTH matrix projects — rust-chromium is the PW-RUST proof leg,
- * legacy-chromium is a true parity control.
  *
  * Fixture launcher: HARNESS-03's `fake-claude.mjs` wired in via the
  * established `CLAUDE_CMD` server-env seam (same pattern as
- * `truly-idle-alerting.spec.ts`, matrix-green). Every provider spawn appends
  * one JSONL row to `FRESHELL_FAKE_LEDGER` — "one fixture launch record" is
  * `rows === 1`, and the row's `pid` is THE PTY PID.
  *
@@ -38,9 +34,13 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { expect } from '@playwright/test'
-import { test } from '../helpers/fixtures.js'
+import {
+  createE2eBrowserContext,
+  createFreshE2eBrowserContext,
+  test,
+} from '../helpers/fixtures.js'
 import { createE2eServerHandle, type E2eServerHandle } from '../helpers/external-target.js'
-import type { TestServerInfo } from '../helpers/test-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { RawWsClient, rawHttpRequest } from '../helpers/raw-clients.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { TerminalHelper } from '../helpers/terminal-helpers.js'
@@ -87,7 +87,7 @@ async function waitForLedgerRows(ledgerPath: string, count: number, timeoutMs = 
 }
 
 /** Running-terminal inventory via the shared REST surface (x-auth-token authed). */
-async function runningTerminalIds(info: TestServerInfo): Promise<string[]> {
+async function runningTerminalIds(info: E2eServerInfo): Promise<string[]> {
   const res = await rawHttpRequest(info.baseUrl, {
     path: '/api/terminals',
     headers: { 'x-auth-token': info.token },
@@ -112,7 +112,7 @@ function findTerminalLeaf(node: any): any {
 
 /** The plain create frame — byte-identical on every send, exactly what the
  * frozen client mints and resends (TerminalView.tsx); mode claude rides the
- * same dispatch arm as shell and reaches the fake CLI on both servers. */
+ * same dispatch arm as shell and reaches the fake CLI on the Rust server. */
 function plainCreateFrame(requestId: string, cwd: string) {
   return { type: 'terminal.create', requestId, mode: 'claude', shell: 'system', cwd }
 }
@@ -124,16 +124,15 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
   let ledgerPath: string
   let cwdDir: string
   let server: E2eServerHandle | undefined
-  let info: TestServerInfo
+  let info: E2eServerInfo
 
-  test.beforeEach(async ({ e2eServerKind }) => {
+  test.beforeEach(async () => {
     root = await fs.mkdtemp(path.join(os.tmpdir(), 'freshell-term04-'))
     ledgerPath = path.join(root, 'ledger.jsonl')
     cwdDir = path.join(root, 'cwd')
     await fs.mkdir(cwdDir, { recursive: true })
     const fakeClaude = await installFakeClaudeCli(path.join(root, 'bin'))
     server = await createE2eServerHandle(process.env, {
-      kind: e2eServerKind,
       construct: {
         env: {
           CLAUDE_CMD: fakeClaude,
@@ -212,7 +211,6 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
     // this server, nothing else spawned).
     const rows = await waitForLedgerRows(ledgerPath, 1)
     expect(rows).toHaveLength(1)
-    // childPidsOf is /proc-based (Linux-only by design); the e2e matrix is
     // Linux-hosted, but keep the assert honest off-Linux ([] there).
     if (process.platform === 'linux') {
       expect(childPidsOf(info.pid)).toContain(rows[0].pid)
@@ -262,7 +260,6 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
 
     const rows = await waitForLedgerRows(ledgerPath, 1)
     expect(rows).toHaveLength(1)
-    // childPidsOf is /proc-based (Linux-only by design); the e2e matrix is
     // Linux-hosted, but keep the assert honest off-Linux ([] there).
     if (process.platform === 'linux') {
       expect(childPidsOf(info.pid)).toContain(rows[0].pid)
@@ -279,7 +276,7 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
   })
 
   test('C: two pages — pane owner survives forced reconnect; a second page re-issuing the create spawns nothing', async ({ browser }) => {
-    const contextA = await browser.newContext()
+    const { context: contextA, machine } = await createFreshE2eBrowserContext(browser, info)
     const pageA = await contextA.newPage()
     const harnessA = new TestHarness(pageA)
     await pageA.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
@@ -344,7 +341,7 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
     //    hit the socket, never for reconcile-held or pre-ready-queued ones;
     //  - the server's answer: Playwright's own WS tap on page B sees the
     //    `terminal.created` frame the dedupe guard replays/forwards.
-    const contextB = await browser.newContext()
+    const contextB = await createE2eBrowserContext(browser, info, machine.id)
     const pageB = await contextB.newPage()
     const harnessB = new TestHarness(pageB)
     // Attach the tap BEFORE navigation creates the socket. (The tap binds
@@ -397,21 +394,27 @@ test.describe('TERM-04 terminal.create requestId dedupe', () => {
     const leafAfter = findTerminalLeaf(await harnessA.getPaneLayout(tabIdA))
     expect(leafAfter.content.terminalId).toBe(terminalId)
     expect(leafAfter.content.createRequestId).toBe(requestId)
-    // One pane owner, BOTH halves: page B's own pane tree must not have
-    // adopted the terminal either (the checklist's "one pane owner").
-    const pageBOwnersT: boolean = await pageB.evaluate((tid) => {
+    // Page B is another view of the same machine workspace. It must render
+    // the already-created terminal with its exact durable identities rather
+    // than minting a second terminal or a remapped create request.
+    const pageBTerminal = await pageB.evaluate((tid) => {
       const st = window.__FRESHELL_TEST_HARNESS__?.getState()
       const layouts = st?.panes?.layouts ?? {}
       const stack: any[] = Object.values(layouts)
       while (stack.length) {
         const node = stack.pop()
         if (!node) continue
-        if (node.type === 'leaf' && node.content?.terminalId === tid) return true
+        if (node.type === 'leaf' && node.content?.terminalId === tid) {
+          return {
+            terminalId: node.content.terminalId,
+            createRequestId: node.content.createRequestId,
+          }
+        }
         for (const child of node.children ?? []) stack.push(child)
       }
-      return false
+      return null
     }, terminalId)
-    expect(pageBOwnersT).toBe(false)
+    expect(pageBTerminal).toEqual({ terminalId, createRequestId: requestId })
     // Page B stays healthy (its unicast reply must not wedge its app).
     expect(await harnessB.getConnectionStatus()).toBe('ready')
 

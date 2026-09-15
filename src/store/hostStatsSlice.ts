@@ -107,6 +107,14 @@ const hostStatsSlice = createSlice({
       // refresh slot clears and records the error text.
       state.refresh = { inFlight: false, requestId: null, error: action.payload.error }
     },
+    /**
+     * Dismiss the refresh-error banner: clears ONLY the error slot (the last
+     * values stay — they are still the freshest known). A later failed
+     * refresh re-records a fresh error and re-shows the banner.
+     */
+    hostStatsRefreshErrorDismissed(state) {
+      state.refresh.error = null
+    },
     hostStatsReset(state) {
       // On ws disconnect/'ready': the subscription died with the old socket,
       // but the last live/manual values are still the freshest known — keep them.
@@ -123,6 +131,7 @@ export const {
   hostStatsRefreshStarted,
   hostStatsRefreshResolved,
   hostStatsRefreshFailed,
+  hostStatsRefreshErrorDismissed,
   hostStatsReset,
 } = hostStatsSlice.actions
 
@@ -214,5 +223,16 @@ export function failHostStatsRefresh(payload: { requestId: string; error: string
     if (!refresh?.inFlight || refresh.requestId !== payload.requestId) return
     clearRefreshDeadline(payload.requestId)
     dispatch(hostStatsRefreshFailed({ error: payload.error }))
+  }
+}
+
+/**
+ * Dismiss the refresh-error banner — the sanctioned component entry point for
+ * the pure [`hostStatsRefreshErrorDismissed`] reducer (components never
+ * dispatch raw reducers; this thunk keeps the slice's convention).
+ */
+export function dismissHostStatsRefreshError() {
+  return (dispatch: AppDispatch): void => {
+    dispatch(hostStatsRefreshErrorDismissed())
   }
 }

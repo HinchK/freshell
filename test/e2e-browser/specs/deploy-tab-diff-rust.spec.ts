@@ -25,8 +25,6 @@ import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
  *       partial-coverage set-difference guard -- with a fake `curl` proving
  *       verify makes ZERO network calls in --after mode.
  *
- * Rust-only: legacy has no persisted snapshot generations. Registered ONLY
- * under `rust-chromium`; testIgnore'd via RUST_ONLY_SPECS everywhere else.
  *
  * EPHEMERAL-ONLY SAFETY: the server is constructed DIRECTLY via `new
  * RustServer(...)` -- throwaway binary, ephemeral loopback port, mkdtemp HOME.
@@ -80,8 +78,8 @@ async function closeCodexTab(page: import('@playwright/test').Page, harness: Tes
 }
 
 test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
-  test('verify passes when identity survives a restart and fails loudly + remediates when it does not', async ({ page, e2eServerKind }) => {
-    expect(e2eServerKind).toBe('rust') // rust-only guard (also in every match-all project's testIgnore)
+  test('verify passes when identity survives a restart and fails loudly + remediates when it does not', async ({ page }) => {
+    // rust-only guard (also in every match-all project's testIgnore)
     test.setTimeout(240_000)
     // EPHEMERAL-ONLY: new RustServer(...) directly (never createE2eServerHandle).
     const sharedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'fakecodex-'))
@@ -157,8 +155,9 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
         body: JSON.stringify({ mode: 'codex', name: 'work',
           sessionRef: { provider: 'codex', sessionId: SESSION_ID } }) })).json()
       expect(codex.data.terminalId).toBeTruthy()
-      await fetch(`${info.baseUrl}/api/tabs`, { method: 'POST', headers: auth,
-        body: JSON.stringify({ mode: 'shell', name: 'sh' }) })
+      const shell = await (await fetch(`${info.baseUrl}/api/tabs`, { method: 'POST', headers: auth,
+        body: JSON.stringify({ mode: 'shell', name: 'sh' }) })).json()
+      expect(shell.data.tabId).toBeTruthy()
       // wait for a persisted generation carrying both tabs (union recordCount)
       await expect(async () => {
         const r = await (await fetch(`${info.baseUrl}/api/tabs-sync/snapshots`, { headers: auth })).json()
@@ -177,6 +176,12 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
       const beforeCap = await capturedAtOf(before)
       await expect(async () => {
         expect(await codexPaneSession(harness)).toBe(SESSION_ID) // respawned, same identity (Redux)
+        // A ready socket and a newer snapshot are not enough: either pane can
+        // still be waiting for its post-restart terminal creation. The exact
+        // two captured pane identities must both have a restored terminal
+        // before tab-diff verifies the happy path.
+        expect((await harness.getPaneLayout(codex.data.tabId))?.content?.terminalId).toBeTruthy()
+        expect((await harness.getPaneLayout(shell.data.tabId))?.content?.terminalId).toBeTruthy()
         const terms = await (await fetch(`${info.baseUrl}/api/terminals`, { headers: auth })).json()
         expect(terms.some((t: any) => t.mode === 'codex')).toBe(true) // RAW array; codex has no sessionRef here
         const r = await (await fetch(`${info.baseUrl}/api/tabs-sync/snapshots`, { headers: auth })).json()

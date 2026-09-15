@@ -256,6 +256,30 @@ describe('TerminalView pre-verdict create wait (reload-path race, terminal leg)'
     expect(sentOfType('terminal.create')).toHaveLength(0)
   })
 
+  it('allows the three deliberate live-terminal attach sources after reconnect', async () => {
+    const { store } = await renderTerminalPane({ terminalId: 'term-1', status: 'running' })
+    wsHarness.send.mockClear() // exclude the mount attach from this reconnect episode
+
+    wsHarness.fireReconnect()
+    await flushEffects()
+
+    act(() => {
+      store.dispatch(setReconcilePendingPanes({ paneKeys: [PANE_KEY], startedAt: Date.now() }))
+    })
+    await flushEffects()
+
+    act(() => {
+      store.dispatch(applyReconcileAttach({ tabId: TAB_ID, paneId: PANE_ID, terminalId: 'term-1' }))
+    })
+    await flushEffects()
+
+    const attaches = sentOfType('terminal.attach')
+    expect(attaches).toHaveLength(3)
+    expect(attaches.map((attach) => attach.terminalId)).toEqual(['term-1', 'term-1', 'term-1'])
+    expect(new Set(attaches.map((attach) => attach.attachRequestId)).size).toBe(3)
+    expect(sentOfType('terminal.create')).toHaveLength(0)
+  })
+
   it('a mid-window reconnect does NOT fire the ungated re-drive while the pane is reconcile-pending', async () => {
     const { store } = await renderTerminalPane({ terminalId: undefined, status: 'creating' }, { pending: true })
     wsHarness.fireReconnect()

@@ -4,9 +4,12 @@ import {
   MACHINE_ID_STORAGE_KEY,
   MACHINE_SELECTIONS_STORAGE_KEY,
   clearSelectedMachineId,
+  consumeActiveMachineSelectionMark,
   getBrowserMachineLabel,
   getSelectedMachineId,
   getSuggestedMachineLabel,
+  markActiveMachineSelection,
+  peekActiveMachineSelectionMark,
   persistSelectedMachineId,
   resolveMachineIdentity,
   type Machine,
@@ -169,5 +172,52 @@ describe('machine identity', () => {
     expect(getSelectedMachineId()).toBeUndefined()
     expect(getSelectedMachineId('srv-a')).toBeUndefined()
     expect(localStorage.getItem(MACHINE_SELECTIONS_STORAGE_KEY)).toBeNull()
+  })
+})
+
+describe('active machine selection marker (reload-safety)', () => {
+  beforeEach(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+  })
+
+  afterEach(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+  })
+
+  it('is one-shot: armed by the chooser pick, consumed once by the next boot', () => {
+    // Unarmed default: a natural reload consumes nothing.
+    expect(consumeActiveMachineSelectionMark()).toBe(false)
+
+    markActiveMachineSelection()
+    // Armed and consumed exactly once (the chooser reload lane reads true).
+    expect(consumeActiveMachineSelectionMark()).toBe(true)
+    // A later natural reload never inherits the consumed marker.
+    expect(consumeActiveMachineSelectionMark()).toBe(false)
+  })
+
+  it('peek reads without consuming — the boot peek-before/consume-after-success protocol', () => {
+    markActiveMachineSelection()
+
+    // PEEK: read armed without clearing (the pre-restore read).
+    expect(peekActiveMachineSelectionMark()).toBe(true)
+    expect(peekActiveMachineSelectionMark()).toBe(true)
+    // Still armed: an in-flight reload, failure, or cancellation between the
+    // peek and the consume leaves the marker for the retry boot.
+    expect(sessionStorage.getItem('freshell.machine.active-selection')).toBe('1')
+
+    // CONSUME after success: cleared exactly once.
+    expect(consumeActiveMachineSelectionMark()).toBe(true)
+    expect(peekActiveMachineSelectionMark()).toBe(false)
+  })
+
+  it('arms in sessionStorage (per-tab, survives the chooser reload lane) — never localStorage', () => {
+    markActiveMachineSelection()
+
+    expect(sessionStorage.getItem('freshell.machine.active-selection')).toBe('1')
+    expect(localStorage.getItem('freshell.machine.active-selection')).toBeNull()
+    expect(consumeActiveMachineSelectionMark()).toBe(true)
+    expect(sessionStorage.getItem('freshell.machine.active-selection')).toBeNull()
   })
 })

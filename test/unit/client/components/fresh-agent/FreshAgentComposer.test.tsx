@@ -34,6 +34,15 @@ describe('FreshAgentComposer', () => {
   })
   afterEach(() => cleanup())
 
+  it('blocks shell escapes without a Rust shell route', () => {
+    const onSend = vi.fn()
+    render(<FreshAgentComposer commands={GROUPED_COMMANDS} onSend={onSend} />)
+    fireEvent.change(getInput(), { target: { value: '!pwd' } })
+    fireEvent.keyDown(getInput(), { key: 'Enter' })
+    expect(screen.getByRole('status')).toHaveTextContent('Shell commands are unavailable here; open a shell pane instead')
+    expect(onSend).not.toHaveBeenCalled()
+  })
+
   it('opens the slash menu when typing / and runs the highlighted command', () => {
     const onCommand = vi.fn()
     render(<FreshAgentComposer commands={GROUPED_COMMANDS} onCommand={onCommand} />)
@@ -450,14 +459,9 @@ describe('FreshAgentComposer', () => {
 
   describe('attachmentUploadErrorMessage', () => {
     it.each<[number, { error?: string; message?: string } | null, string, string]>([
-      // 404 = route absent on this server (e.g. Rust build without attachments).
       [404, { error: 'Not found' }, 'a.txt', 'Attachments are not supported by this server'],
-      // 413 trips the 10 MB cap; express's HTML error body is unparseable, so
-      // the limit is spelled out client-side.
       [413, null, 'big.txt', '"big.txt" exceeds the 10 MB attachment size limit'],
-      // Anything else: the server's own error/message text wins.
       [401, { error: 'Unauthorized' }, 'a.txt', 'Unauthorized'],
-      // message worded without error: the message branch is exercised.
       [500, { message: 'server exploded' }, 'a.txt', 'server exploded'],
       [500, null, 'a.txt', 'upload failed (500)'],
     ])('status %i with %s maps to a clear chip message', (status, data, filename, expected) => {
@@ -527,7 +531,7 @@ describe('FreshAgentComposer', () => {
       ).toBeInTheDocument()
     })
 
-    it('shows a visible error chip for an unparsable 413 (express HTML error page)', async () => {
+    it('shows a visible error chip for an unparsable 413 response', async () => {
       const user = userEvent.setup()
       fetchMock.mockResolvedValue({
         ok: false,
@@ -541,8 +545,6 @@ describe('FreshAgentComposer', () => {
         new File(['x'.repeat(64)], 'huge.txt', { type: 'text/plain' }),
       )
 
-      // Fetch WAS called: .txt passes the client-side extension gate, so the
-      // failure provenance is the server, not a pre-fetch client rejection.
       expect(fetchMock).toHaveBeenCalledWith(
         '/api/fresh-agent/attachments?name=huge.txt',
         expect.objectContaining({ method: 'POST' }),
