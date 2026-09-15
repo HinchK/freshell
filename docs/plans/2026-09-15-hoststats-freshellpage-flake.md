@@ -734,13 +734,13 @@ Expected: PASS both (settings still green with and without the env; the budget n
 
 - [ ] **Step 5: Refactor while green**
 
-The deletion IS the refactor. Confirm the env-gated hook pattern is gone from every spec — the corrected check (the raw `setTimeout(120` grep matches ~28 benign unconditional declaration-time timeouts in other specs; the env-gated cloud hook is uniquely identified by its env reference):
+The deletion IS the refactor. Confirm the env-gated BUDGET HOOK pattern is gone from every spec — the corrected check (the raw `setTimeout(120` grep matches ~28 benign unconditional declaration-time timeouts in other specs; the env-gated cloud hook is uniquely identified by its env reference):
 
 ```bash
 grep -rn "FRESHELL_E2E_WS_READY_TIMEOUT_MS" test/e2e-browser/specs/
 ```
 
-Expected: no output (settings.spec.ts was the only spec referencing the env var). Also confirm the j90s script suite `scripts/test/e2e-harness-timeout-env.test.sh` is unaffected (it uses settings.spec.ts only as a stubbed pass-through arg and pins the e2e-cloud.sh env plumbing, not the hook).
+Expected: exactly one remaining match — settings.spec.ts's mid-test self-heal opt-in line (`selfHealReload: process.env.FRESHELL_E2E_WS_READY_TIMEOUT_MS !== undefined`), which is the legitimate j90s-era fresh-boot gate on the reload-leg test, NOT a budget hook. Any `test.setTimeout` gated on this env var anywhere in the specs is a failure. Also confirm the j90s script suite `scripts/test/e2e-harness-timeout-env.test.sh` is unaffected (it uses settings.spec.ts only as a stubbed pass-through arg and pins the e2e-cloud.sh env plumbing, not the hook).
 
 - [ ] **Step 6: Run impacted-test verification**
 
