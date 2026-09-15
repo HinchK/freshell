@@ -5,20 +5,6 @@ import { test, expect } from '../helpers/fixtures.js'
 const PERSIST_DEBOUNCE_WAIT_MS = 600
 
 test.describe('Settings', () => {
-  test.beforeEach(async ({}) => {
-    // Cloud-only wedge budget (kata j90s): Playwright 1.58.2 silently
-    // discards a `timeout` in the test-details position (probe-verified),
-    // so the budget is set here — hooks run BEFORE the freshellPage
-    // fixture resolves, and a setTimeout from a hook extends the deadline
-    // to cover fixture time (probe-verified: a fixture outliving the
-    // config timeout completes under a hook-granted budget). On the cloud
-    // lane (env var present) the 90s window + one-shot self-heal reload
-    // can need well past the default 60s before a test body starts
-    // (observed ~40-60s zero-CPU gVisor I/O wedges + ~6s fresh-boot
-    // recovery + body); 120s covers the observed wedge class. Locally the
-    // env var is unset and the default budget applies.
-    if (process.env.FRESHELL_E2E_WS_READY_TIMEOUT_MS) test.setTimeout(120_000)
-  })
 
   // Helper: navigate to the settings view.
   // Sidebar nav buttons have title="Settings (Ctrl+B ,)" which Playwright
