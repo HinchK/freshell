@@ -216,7 +216,7 @@ Add to the self-heal describe (after test (e)):
 
 Run: `npm run test:e2e:helpers -- test-harness`
 
-Expected: test (f) FAILs because the current phase-2 poll is bound to the full `remaining` window (`calls[1][2]` = `{ timeout: remaining }` = 45000, not `remaining - 10_000 + 1000` = 36000) — the total-deadline behavior is absent.
+Expected: test (f) FAILs because the current phase-2 poll is bound to the full `remaining` window (`calls[1][2]` = `{ timeout: remaining }` = 15000 at the default W=30_000, not `remaining - 10_000 + 1000` = 6000) — the total-deadline behavior is absent.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -246,18 +246,17 @@ Run: `npm run test:e2e:helpers -- test-harness`
 
 Expected: test (f) PASSes. Tests (c) and (d) FAIL their `calls[1][2]` assertions (the instant fake reload makes phase-2 = `remaining + 1000`, no longer exactly `remaining`) — update them per Step 5. This is expected mid-task red on those two assertions only; do not weaken any other assertion.
 
-- [ ] **Step 5: Refactor while green (update the two affected assertions to the total-deadline semantics)**
+- [ ] **Step 5: Refactor while green (update the two affected assertions to the total-deadline semantics, deterministically)**
 
-In test (c), replace `expect(calls[1][2]).toEqual({ timeout: remaining })` with:
+Tests (c) and (d) must run under the same faked clock as test (f) so the instant fake reload makes the elapsed time exactly 0 and the phase-2 window exactly `remaining + 1000` — a real-clock `toBeGreaterThan(remaining)` assertion would itself flake under a scheduler pause (the elapsed ms would eat the slack). Wrap each of (c) and (d) in `vi.useFakeTimers({ toFake: ['Date'] })` / `try { ... } finally { vi.useRealTimers() }` exactly like test (f), and replace each `expect(calls[1][2]).toEqual({ timeout: remaining })` with the exact deterministic assertion:
 
 ```ts
-    // Total-deadline semantics: an (instant) reload leaves phase 2 the
-    // remainder minus elapsed (+1s slack), not a fresh full window.
-    expect((calls[1][2] as { timeout: number }).timeout).toBeGreaterThan(remaining)
-    expect((calls[1][2] as { timeout: number }).timeout).toBeLessThanOrEqual(remaining + 1000)
+    // Total-deadline semantics: an instant (fake-clock elapsed 0) reload
+    // leaves phase 2 the remainder plus the 1s slack — exactly.
+    expect(calls[1][2]).toEqual({ timeout: remaining + 1000 })
 ```
 
-In test (d), apply the identical replacement against its own `remaining` variable (keep its `reloads[0]` and `calls[0][2]` assertions unchanged). Then re-run:
+Then re-run:
 
 Run: `npm run test:e2e:helpers -- test-harness`
 
@@ -439,7 +438,7 @@ git commit -m "test(e2e): extend the per-test deadline to the cloud wedge budget
 
 **Interfaces:**
 - Consumes: `Page` (type-only).
-- Produces: `SHELL_RENDER_TIMEOUT_MS: number` (60_000) and `selectShellFromPicker(page: Page): Promise<void>` with the contract: (a) early returns unchanged (xterm already visible, or appears within the 500ms stabilization wait); (b) a click that fails with Playwright's `TimeoutError` means the option was absent/detached — advance to the next shell name (the historical detachment-race behavior); (c) a click that fails with ANY OTHER error (page closed, test interrupted, actionability errors) propagates — loud, never swallowed; (d) a SUCCESSFUL click never escalates: it waits up to `SHELL_RENDER_TIMEOUT_MS` for `.xterm` to become visible and on timeout throws a diagnostic error naming the clicked shell and the wait; (e) the all-options-absent fall-through contract is preserved (returns normally).
+- Produces: `SHELL_RENDER_TIMEOUT_MS: number` (60_000) and `selectShellFromPicker(page: Page): Promise<void>` with the contract: (a) early returns unchanged (xterm already visible, or appears during the 500ms stabilization wait); (b) a click that fails with Playwright's `TimeoutError` means the option was not clickable within its 5s window — absent, detached, or not actionable — and advances to the next shell name (the historical detachment-race behavior; the click's auto-retry already absorbs transient detachments inside the window); (c) a click that fails with ANY non-timeout error (page closed, test interrupted, unexpected errors) propagates — loud, never swallowed; (d) a SUCCESSFUL click never escalates: it waits up to `SHELL_RENDER_TIMEOUT_MS` for `.xterm` to become visible and on timeout throws a diagnostic error naming the clicked shell and the wait; (e) the every-option-not-clickable fall-through contract is preserved (returns normally).
 
 **Why this is required scope (not residual):** the retained trace (validator LB-C, `reports/load-bearing-validator-LB-C.md`) proves the recorded tg4e failure was exactly this conflation: after a successful Shell click (terminal created server-side, active, `hasClients:true`), the 30s `.xterm` render wait failed under container-wide CPU contention, and the loop escalated into WSL/CMD — options absent on the Linux picker — silently burning the remaining budget until the 60s deadline (and double-creating terminals whenever escalation reaches an option that exists, e.g. Bash). The budget fix alone does not survive this episode class; the loop's semantics are the defect.
 
@@ -457,14 +456,23 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
   function pickerPage(
     shells: Record<string, ShellOutcome>,
     xtermInitiallyVisible = false,
+    opts: { xtermVisibleFromCall?: number } = {},
   ) {
     const clicks: string[] = []
     const renderWaits: number[] = []
+    let xtermVisibilityChecks = 0
+    const xtermVisible = () => {
+      xtermVisibilityChecks += 1
+      if (opts.xtermVisibleFromCall !== undefined) {
+        return xtermVisibilityChecks >= opts.xtermVisibleFromCall
+      }
+      return xtermInitiallyVisible
+    }
     const currentShell = () => (clicks.length ? shells[clicks[clicks.length - 1]] : undefined)
     const page = {
       locator: (selector: string) => ({
         first: () => ({
-          isVisible: () => Promise.resolve(selector === '.xterm' && xtermInitiallyVisible),
+          isVisible: () => Promise.resolve(selector === '.xterm' && xtermVisible()),
           waitFor: ({ timeout }: { timeout: number }) => {
             renderWaits.push(timeout)
             const visibleAfter = currentShell()?.renderVisibleAfterMs
@@ -484,7 +492,9 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
             return Promise.reject(Object.assign(new Error('Page closed'), { name: 'TargetClosedError' }))
           }
           if (!outcome) {
-            // Option absent: Playwright's actionability TimeoutError.
+            // Option not clickable (absent/detached/obstructed): Playwright's
+            // actionability TimeoutError — indistinguishable by name from any
+            // other not-clickable timeout, which is exactly the contract.
             return Promise.reject(Object.assign(new Error('click: Timeout 5000ms exceeded'), { name: 'TimeoutError' }))
           }
           return Promise.resolve()
@@ -492,13 +502,22 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
       }),
       waitForTimeout: () => Promise.resolve(),
     }
-    return { page: page as unknown as Page, clicks, renderWaits }
+    return { page: page as unknown as Page, clicks, renderWaits, xtermVisibilityChecks: () => xtermVisibilityChecks }
   }
 
   it('returns immediately when .xterm is already visible', async () => {
     const { page, clicks } = pickerPage({}, true)
     await selectShellFromPicker(page)
     expect(clicks).toEqual([])
+  })
+
+  it('returns without clicking when .xterm appears during the stabilization wait', async () => {
+    // The mid-wait recheck: a regression that skipped the second isVisible
+    // check would fall into the click loop and double-create a terminal.
+    const { page, clicks, xtermVisibilityChecks } = pickerPage({}, false, { xtermVisibleFromCall: 2 })
+    await selectShellFromPicker(page)
+    expect(clicks).toEqual([])
+    expect(xtermVisibilityChecks()).toBe(2)
   })
 
   it('a successful click waits the full render budget and never escalates to other shells', async () => {
@@ -532,9 +551,9 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
     expect(renderWaits).toEqual([SHELL_RENDER_TIMEOUT_MS])
   })
 
-  it('an absent option (click TimeoutError) advances to the next shell', async () => {
+  it('a not-clickable option (click TimeoutError: absent, detached, or obstructed) advances to the next shell', async () => {
     const { page, clicks } = pickerPage({
-      Bash: { renderVisibleAfterMs: 1_000 }, // Shell/WSL/CMD/PowerShell absent
+      Bash: { renderVisibleAfterMs: 1_000 }, // Shell/WSL/CMD/PowerShell not clickable
     })
     await selectShellFromPicker(page)
     expect(clicks).toEqual(['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash'])
@@ -548,14 +567,14 @@ describe('selectShellFromPicker slow-render contract (kata tg4e)', () => {
     expect(clicks).toEqual(['Shell'])
   })
 
-  it('falls through silently only when every option is absent (historical contract)', async () => {
+  it('falls through silently only when every option is not clickable (historical contract)', async () => {
     const { page } = pickerPage({})
     await expect(selectShellFromPicker(page)).resolves.toBeUndefined()
   })
 })
 ```
 
-(The fake above is a draft: the implementer must adapt it to the real call shapes in the source — how the shell-name RegExp is built, how `locator('.xterm').first()` chains, and the exact click option object — so `clicks` records the real button names. Keep the seven behavioral assertions exactly as specified, including the two `SHELL_RENDER_TIMEOUT_MS` pins.)
+(The fake above is a draft: the implementer must adapt it to the real call shapes in the source — how the shell-name RegExp is built, how `locator('.xterm').first()` chains, and the exact click option object — so `clicks` records the real button names. Keep the eight behavioral assertions exactly as specified, including the two `SHELL_RENDER_TIMEOUT_MS` pins and the mid-wait recheck pin.)
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -580,24 +599,26 @@ In `test/e2e-browser/helpers/test-harness.ts` (exported, near TestHarness):
  */
 export const SHELL_RENDER_TIMEOUT_MS = 60_000
 
-/** Playwright's actionability timeout is the "option absent" signal;
+/** Playwright's click TimeoutError is the not-clickable signal (absent,
+ * detached, or obstructed within the window — indistinguishable by name);
  * anything else (page closed, interruption, unexpected errors) is loud. */
-function isClickAbsenceError(err: unknown): boolean {
+function isClickUnavailableError(err: unknown): boolean {
   return err instanceof Error && err.name === 'TimeoutError'
 }
 
 /**
  * Select a shell from the PanePicker. Handles the race where buttons
  * detach during the platform-info Redux update: a click TimeoutError
- * means the option was absent/detached — advance to the next candidate
- * (Playwright's click auto-retry already absorbs transient detachments
- * inside its window). A SUCCESSFUL click is different: the terminal
- * create is in flight, and a slow render is NOT evidence the option was
- * wrong — wait generously and fail loudly on timeout instead of
- * escalating (escalation after a successful click double-creates
- * terminals and, in the recorded tg4e failure, burned the remaining
- * test budget on options absent on this platform). Never reloads: the
- * picker may already have created state.
+ * means the option was not clickable within its window — absent,
+ * detached, or obstructed — advance to the next candidate (Playwright's
+ * click auto-retry already absorbs transient detachments inside its
+ * window). A SUCCESSFUL click is different: the terminal create is in
+ * flight, and a slow render is NOT evidence the option was wrong — wait
+ * generously and fail loudly on timeout instead of escalating
+ * (escalation after a successful click double-creates terminals and, in
+ * the recorded tg4e failure, burned the remaining test budget on
+ * options absent on this platform). Never reloads: the picker may already
+ * have created state.
  */
 export async function selectShellFromPicker(page: Page): Promise<void> {
   const xtermAlreadyVisible = await page.locator('.xterm').first().isVisible().catch(() => false)
@@ -616,8 +637,8 @@ export async function selectShellFromPicker(page: Page): Promise<void> {
     try {
       await button.click({ timeout: 5_000 })
     } catch (err) {
-      if (!isClickAbsenceError(err)) throw err
-      continue // option absent/detached — historical behavior
+      if (!isClickUnavailableError(err)) throw err
+      continue // option not clickable within the window — historical behavior
     }
     try {
       await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: SHELL_RENDER_TIMEOUT_MS })
@@ -642,7 +663,7 @@ In `test/e2e-browser/helpers/fixtures.ts`: delete the module-private `selectShel
 
 Run: `npm run test:e2e:helpers -- test-harness`
 
-Expected: PASS (all seven new contract tests green; all pre-existing tests green).
+Expected: PASS (all eight new contract tests green; all pre-existing tests green).
 
 - [ ] **Step 5: Refactor while green**
 
@@ -762,7 +783,13 @@ No tracked changes in this task (evidence lives outside the tree). If investigat
 - Consumes: the final committed HEAD of all tasks.
 - Produces: the run's gate evidence — standard suite green; e2e lane green under the-usual's ledger-exemption criterion.
 
-**Gate criterion (stated precisely):** the gate passes when every suite is green EXCEPT failures that are ledger-recorded pre-existing failures — each reproduced at base_ref 39192e8aa with receipts (the campaign baseline receipts at `.worktrees/.the-usual-logs/main-green-campaign/baseline-receipts.md`). The three pre-existing e2e flakes (katas 38hj, 5kyg, ebp6) are exactly that: reproduced at base_ref, recorded, and slated as the campaign's next one-test-at-a-time runs per the User Request. The e2e zero-flake receipt itself therefore remains red-by-design until those later campaign runs land — this run's gate does NOT claim a green receipt, it claims green-exempted-per-ledger. Any retry-evidence case that is NOT one of the three ledger-recorded flakes is a gate failure requiring root-cause.
+**Gate criterion (stated precisely):** the gate passes when every suite is green EXCEPT failures that are ledger-recorded pre-existing failures — each reproduced at base_ref 39192e8aa with receipts (the campaign baseline receipts at `.worktrees/.the-usual-logs/main-green-campaign/baseline-receipts.md`). The three pre-existing e2e flakes (katas 38hj, 5kyg, ebp6) are exactly that: reproduced at base_ref, recorded, and slated as the campaign's next one-test-at-a-time runs per the User Request. The e2e zero-flake receipt itself therefore remains red-by-design until those later campaign runs land — this run's gate does NOT claim a green receipt, it claims green-exempted-per-ledger.
+
+The e2e lane gate is NOT satisfied by the retry-evidence subset check alone: the receipt exporter records only failures that later pass (`scripts/e2e-cloud-retry-receipt.mjs` — a test that exhausts all retries leaves NO recovered-retry case), and infrastructure/receipt-parse failures also exit 1. An exit-1 e2e lane run is a PASSING gate only when ALL of the following hold, each verified from the saved full run log:
+
+1. **No terminal Playwright failure**: the per-task Playwright summary shows every test ultimately passed (e.g. "N passed" with zero "failed" entries in the final summary; a test that exhausted its retries appears as failed there and fails this condition even though it produced no retry-evidence case).
+2. **Every recovered-retry case is one of the three ledger-recorded flakes** (`restore-contract-wall-rust.spec.ts:579`, `recover-my-panes-rust.spec.ts:733`, `reconcile-client-adoption-rust.spec.ts:542`) — the empty set satisfies this condition only in combination with condition 1.
+3. **No infrastructure failure**: the per-shard summary shows `Succeeded tasks: <shards>` and `Failed tasks: 0`, and the run did not fail in receipt parsing/validation (those exits are distinguishable by the runner's own error lines in the log).
 
 - [ ] **Step 1: Standard coordinated suite**
 
@@ -778,7 +805,7 @@ Expected: PASS (exit 0). This covers client/tooling vitest, source-runtime, Rust
 FRESHELL_TEST_SUMMARY='the-usual hoststats-freshellpage-flake: final e2e lane gate at HEAD' npm run test:e2e
 ```
 
-Expected: exit 0 with a zero-flake receipt, OR exit 1 whose recovered-retry cases are EXACTLY a subset of {`restore-contract-wall-rust.spec.ts:579`, `recover-my-panes-rust.spec.ts:733`, `reconcile-client-adoption-rust.spec.ts:542`} — the ledger-recorded pre-existing flakes. A receipt containing any retry-evidence case for `host-stats-pane.spec.ts`, `e2e-budget-contract.spec.ts`, `settings.spec.ts`, or any other spec is a gate failure: this run's fix is incomplete or regressed something.
+Expected: exit 0 with a zero-flake receipt, OR exit 1 that satisfies ALL THREE gate conditions above (no terminal Playwright failure; every recovered-retry case one of the three ledger-recorded flakes; no infrastructure failure — each verified from the saved full run log). Save the complete run log under the run's reports directory as the gate evidence. A receipt containing a retry-evidence case for `host-stats-pane.spec.ts`, `e2e-budget-contract.spec.ts`, `settings.spec.ts`, any other non-ledger spec, OR any terminal failure, OR any infrastructure failure is a gate failure: this run's fix is incomplete or regressed something.
 
 - [ ] **Step 3: Record the gate entry**
 
