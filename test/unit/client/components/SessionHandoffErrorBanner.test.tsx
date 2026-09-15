@@ -42,7 +42,13 @@ describe('SessionHandoffErrorBanner (kata b8ke R4-4 force-clear action)', () => 
         paneId="pane-1"
       />,
     )
-    const button = screen.getByRole('button', { name: /force clear/i })
+    // b8ke ext r19 F2: the accessible name matches the ACTUAL behavior —
+    // the action clears the blockage ONLY; the reopen is the separate
+    // explicit "Start reopen again" action (the pre-r19 name promised
+    // "and reopen", misleading screen-reader users).
+    const button = screen.getByRole('button', {
+      name: 'Force clear the platform-limited fence, acknowledging unverified descendant processes may remain — the reopen is a separate explicit action',
+    })
     expect(button).toBeDefined()
     await user.click(button)
     await waitFor(() => {

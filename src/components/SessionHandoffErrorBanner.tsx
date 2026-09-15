@@ -98,7 +98,7 @@ export function SessionHandoffErrorBanner({ error, appStore, tabId, paneId }: {
           <button
             type="button"
             className="rounded border border-amber-500/70 px-2 py-1 text-xs disabled:opacity-60"
-            aria-label="Force clear the platform-limited fence and reopen, acknowledging unverified descendant processes may remain"
+            aria-label="Force clear the platform-limited fence, acknowledging unverified descendant processes may remain — the reopen is a separate explicit action"
             data-testid="session-handoff-force-clear-button"
             disabled={forceClearArmed}
             onClick={() => {
