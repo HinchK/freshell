@@ -7213,6 +7213,23 @@ impl FreshClaudeState {
                 }
             };
         }
+        // b8ke ext r22 F2: the binding row's fence pair — the pre-commit
+        // ticket's generation (the delayed-write fence baseline the durable
+        // row carries below). `None` when no ticket was claimed (the Adopt
+        // arms — the record is already authoritative) or the coordinator
+        // is unwired.
+        // b8ke ext r27 F2: the UNDER-TICKET handoff continuation holds NO
+        // own ticket — the session's recorded HANDOFF generation (the
+        // runner's supplied pair, read in the phase-1 scope above) stamps
+        // the row instead, so the target's durable row carries the
+        // handoff's generation.
+        let (binding_epoch, binding_generation) = (
+            self.ownership.as_ref().map(|r| r.boot_epoch()),
+            adoption_ticket
+                .as_ref()
+                .map(|t| t.generation())
+                .or(owning_generation),
+        );
         // The (re-gated) publication: abandons when the kill gate armed
         // between the read scope and here — the kill owns the session.
         if !self
@@ -7221,32 +7238,61 @@ impl FreshClaudeState {
         {
             return SessionInitAdoptionOutcome::Abandoned;
         }
+        // b8ke ext r27 F4: the durable binding write runs BEFORE the
+        // commit-Live, inside the SAME coordinator operation (the claim
+        // held above). Pre-r27 the adoption committed Live FIRST and then
+        // wrote the binding, so once the commit released the coordinator
+        // operation a handoff or stop could begin while the binding write
+        // was blocked, and a later failure tore the runtime down only
+        // after the owner was already authoritative. The write stays
+        // AFTER the alias publication deliberately: the publication is
+        // what makes the durable id resolvable to a concurrent kill (the
+        // tombstone fold + the sink's orphan-write suppression key off
+        // it), so a kill landing while the binding write is in flight
+        // still fences the released write. The row is also UNCONDITIONAL
+        // now: an all-blank settings snapshot records a LINEAGE-only row
+        // (blank settings verbatim) — pre-r27 default-settings sessions
+        // skipped the binding entirely; the sink's was_recorded/
+        // load_settings keying (Task 3) keeps a legitimately-default
+        // session from ever arming a false SETTINGS_RESET on a later
+        // resume (the codex REST lane's unconditional-lineage discipline).
+        if let Some(sink) = &identity_sink {
+            if let Err(e) = sink
+                .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+                    provider: PROVIDER.into(),
+                    session_id: cli_id.to_string(),
+                    mode: session_type.to_string(),
+                    create_request_id: None,
+                    resolves_pending: None,
+                    supersedes: supersedes.map(str::to_string),
+                    provenance: provenance.cloned().into(),
+                    observed_epoch: binding_epoch,
+                    observed_generation: binding_generation,
+                    settings: settings.cloned().unwrap_or_default(),
+                })
+                .await
+            {
+                // b8ke ext r27 F4: the binding failure PROPAGATES — the
+                // freshly adopted runtime is torn down and the adoption is
+                // ABANDONED BEFORE the publish and the commit (the ticket's
+                // RAII drop settles the claim typed; the key never goes
+                // Live), never a bare LEDGER_WRITE_FAILED notification and
+                // never a committed Live with no recoverable registration.
+                tracing::error!(target: "invariant",
+                    error = %e, session = %cli_id,
+                    "freshagent.claude.binding_write_failed_typed: the durable row write \
+                     failed — the freshly adopted runtime is torn down (kata b8ke ext r27 F4)"
+                );
+                self.teardown_unadopted_session(session_id, session_type)
+                    .await;
+                return SessionInitAdoptionOutcome::Abandoned;
+            }
+        }
         // b8ke delta round-2 F1: the canonical-key adoption commit — for
         // the ordinary-create path (no fork re-key), a Granted claim
         // commits the authoritative Live{FreshAgent} ownership under the
         // durable id and broadcasts the owner record so every device
         // converges.
-        // b8ke ext r22 F2: the binding row's fence pair — captured at the
-        // moment THIS adoption's commit runs (the pre-commit ticket's
-        // generation; the delayed-write fence baseline the durable row
-        // carries below). `None` when no ticket was claimed (the Adopt
-        // arms — the record is already authoritative) or the coordinator
-        // is unwired.
-        // b8ke ext r27 F2: the UNDER-TICKET handoff continuation holds NO
-        // own ticket — the session's recorded HANDOFF generation (the
-        // runner's supplied pair, read in the phase-1 scope above) stamps
-        // the row instead, so the target's durable row carries the
-        // handoff's generation (pre-r27 the write carried a None
-        // generation here, the row preserved the PRIOR generation, and a
-        // delayed prior-generation write could pass the ledger's
-        // comparison and replace the new owner's recovery metadata).
-        let (binding_epoch, binding_generation) = (
-            self.ownership.as_ref().map(|r| r.boot_epoch()),
-            adoption_ticket
-                .as_ref()
-                .map(|t| t.generation())
-                .or(owning_generation),
-        );
         if let Some(ticket) = adoption_ticket.as_ref() {
             let generation = ticket.generation();
             let operation_id = ticket.operation_id().to_string();
@@ -7310,9 +7356,7 @@ impl FreshClaudeState {
         // ever demotes), so mint-time persistence is the ONLY write that
         // reaches the post-restart kill naming this pane's bare placeholder.
         // Best-effort: warn-loud on failure, never a lane blocker (the
-        // in-memory store still answers this process's kills). Runs even on
-        // the unrecordable row arm below: the mapping's purpose (retire
-        // resolution) is independent of the row's settings record.
+        // in-memory store still answers this process's kills).
         if let Some(sink) = &identity_sink {
             if let Err(e) = sink
                 .record_alias_tombstone(
@@ -7326,48 +7370,6 @@ impl FreshClaudeState {
                 tracing::warn!(error = %e, session = %cli_id, placeholder = %session_id,
                     "freshagent.claude.alias_tombstone_write_failed");
             }
-        }
-        let recordable = settings
-            .filter(|s| **s != crate::identity_sink::FreshAgentSettings::default())
-            .is_some()
-            || supersedes.is_some();
-        if !recordable {
-            // The alias publication landed; only the ledger row is
-            // skipped — this is a Published outcome.
-            return SessionInitAdoptionOutcome::Published;
-        }
-        let Some(sink) = identity_sink else {
-            return SessionInitAdoptionOutcome::Published;
-        };
-        if let Err(e) = sink
-            .record_binding(crate::identity_sink::FreshAgentBindingUpsert {
-                provider: PROVIDER.into(),
-                session_id: cli_id.to_string(),
-                mode: session_type.to_string(),
-                create_request_id: None,
-                resolves_pending: None,
-                supersedes: supersedes.map(str::to_string),
-                provenance: provenance.cloned().into(),
-                // b8ke ext r22 F2: the commit-time pair (the fence).
-                observed_epoch: binding_epoch,
-                observed_generation: binding_generation,
-                settings: settings.cloned().unwrap_or_default(),
-            })
-            .await
-        {
-            // b8ke ext r22 F2: the binding failure PROPAGATES — the
-            // freshly adopted runtime is torn down and the adoption is
-            // ABANDONED (the claim settles typed through the teardown's
-            // release), never a bare LEDGER_WRITE_FAILED notification
-            // under a committed Live that a restart cannot recover.
-            tracing::error!(target: "invariant",
-                error = %e, session = %cli_id,
-                "freshagent.claude.binding_write_failed_typed: the durable row write \
-                 failed — the freshly adopted runtime is torn down (kata b8ke ext r22 F2)"
-            );
-            self.teardown_unadopted_session(session_id, session_type)
-                .await;
-            return SessionInitAdoptionOutcome::Abandoned;
         }
         SessionInitAdoptionOutcome::Published
     }
@@ -13379,14 +13381,21 @@ rl.on('line', (line) => {
 
     /// b8ke focused episode-2 post-cap F3: a STALE/FOREIGN ownership
     /// commit tears the runtime down AND the adoption answers ABANDONED —
-    /// the pre-fix fall-through persisted the alias tombstone/binding and
-    /// reported Published for a runtime that no longer exists. The
-    /// deterministic window: the pre-commit park holds the adoption with
-    /// its claim granted; the test fences the claimed key (the watchdog's
-    /// own recovery seizure); the released commit fails, the teardown
-    /// runs, and NOTHING durable is persisted for the dead runtime.
+    /// the pre-fix fall-through reported Published for a runtime that no
+    /// longer exists. The deterministic window: the pre-commit park holds
+    /// the adoption with its claim granted; the test fences the claimed
+    /// key (the watchdog's own recovery seizure); the released commit
+    /// fails, the teardown runs, and the adoption answers ABANDONED.
+    /// b8ke ext r27 F4 reshape: the durable binding now writes BEFORE the
+    /// commit (inside the coordinator operation, after the publication),
+    /// so it HAS legitimately landed by the park point — the stale
+    /// commit's abandonment no longer implies "nothing durable
+    /// persists"; the row is the same Bound-after-death shape every
+    /// crashed session's row has (the ledger's load-bearing normal), and
+    /// the claim settles typed through the teardown (the key never goes
+    /// Live).
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_stale_commit_teares_down_and_abandons_persisting_nothing() {
+    async fn a_stale_commit_tears_down_and_abandons_after_the_in_operation_binding() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let _env = FakeClaudeSidecarEnv::install();
         let (mut st, mut rx) = state_with_bus();
@@ -13477,10 +13486,14 @@ rl.on('line', (line) => {
             answer, None,
             "the stale commit answers ABANDONED — never Published for a torn-down runtime"
         );
+        // r27 F4: the binding wrote INSIDE the operation, BEFORE the commit
+        // — it legitimately landed for the (now torn-down) runtime, exactly
+        // like a crashed session's Bound row; the stale commit's
+        // abandonment is proven by the ABANDONED answer and the claim's
+        // typed settle, not by row absence.
         assert!(
-            !sink.was_recorded("claude", stale_dur),
-            "NOTHING durable persists for the abandoned runtime (pre-fix: the \
-             fall-through persisted the binding for a runtime it tore down)"
+            sink.was_recorded("claude", stale_dur),
+            "the in-operation binding landed before the stale commit was known"
         );
     }
 
@@ -17318,15 +17331,19 @@ rl.on('line', (line) => {
         assert!(b.settings.cwd.is_some());
     }
 
-    /// No-laundering guard (V7/A10, parity with codex's `record_codex_binding`):
-    /// a create carrying NO optional settings (model/permissionMode/effort/cwd all
-    /// None) must NOT persist an all-blank binding row at `sdk.session.init`. A blank
-    /// row makes `was_recorded` true while `load_settings` returns None (the server
-    /// sink's blank-snapshot guard) — the exact SETTINGS_RESET alarm condition — so a
-    /// legitimately-default session would false-alarm on a later resume. The init
-    /// frame itself still broadcasts; only the ledger write is skipped.
+    /// b8ke ext r27 F4 reshape (was
+    /// `session_init_with_all_blank_settings_records_no_binding`): an
+    /// all-blank settings snapshot now records a LINEAGE-ONLY row — the
+    /// binding write is UNCONDITIONAL inside the coordinator operation
+    /// (pre-r27 default-settings sessions skipped the binding entirely,
+    /// leaving no authoritative recovery registration). The Task 3
+    /// keying (the fake mirrors the production sink) keeps the
+    /// legitimately-default session from ever arming a false
+    /// SETTINGS_RESET on a later resume: the row exists, records blank
+    /// settings verbatim, and answers neither `was_recorded` nor
+    /// `load_settings`.
     #[tokio::test(flavor = "multi_thread")]
-    async fn session_init_with_all_blank_settings_records_no_binding() {
+    async fn session_init_with_all_blank_settings_records_the_lineage_row() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
         let env = FakeClaudeSidecarEnv::install();
         let (state, mut rx) = state_with_bus();
@@ -17340,7 +17357,7 @@ rl.on('line', (line) => {
             .await;
         await_claude_created(&mut rx, "req-binding-blank").await;
 
-        // The init frame still broadcasts (the skip affects ONLY the ledger write).
+        // The init frame still broadcasts (durable-before-answer landed).
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let frame: Value = match rx.recv().await {
@@ -17360,10 +17377,189 @@ rl.on('line', (line) => {
         .await
         .expect("freshAgent.session.init consumed within budget");
 
+        // THE r27 F4 CONTRACT: the lineage row IS recorded (blank settings
+        // verbatim) — the no-skip truth.
+        let b = {
+            let bindings = fake.bindings.lock().unwrap();
+            bindings
+                .iter()
+                .rev()
+                .find(|b| b.provider == "claude" && b.session_id == FRESH_CREATE_DURABLE_ID)
+                .expect("an all-blank create records its lineage row (r27 F4)")
+                .clone()
+        };
+        assert_eq!(
+            b.settings,
+            crate::identity_sink::FreshAgentSettings::default(),
+            "blank settings recorded verbatim"
+        );
+        // ...but a lineage-only row is NOT a settings-bearing record: the
+        // Task 3 keying keeps a later resume from arming a FALSE
+        // SETTINGS_RESET for this legitimately-default session.
         assert!(
-            fake.bindings.lock().unwrap().is_empty(),
-            "an all-blank settings snapshot must not be persisted \
-             (it would arm a false SETTINGS_RESET on resume)"
+            fake.load_settings("claude", FRESH_CREATE_DURABLE_ID)
+                .is_none(),
+            "lineage-only row answers no settings snapshot"
+        );
+        assert!(
+            !fake.was_recorded("claude", FRESH_CREATE_DURABLE_ID),
+            "lineage-only row must not count as recorded (false SETTINGS_RESET)"
+        );
+        drop(env);
+    }
+
+    /// b8ke ext r27 F4: the session-init adoption's durable binding write
+    /// runs BEFORE the commit-Live (after the alias publication, which a
+    /// concurrent kill's tombstone fold resolves through) — while the
+    /// write is parked (the sink's binding stall), the coordinator
+    /// operation still COVERS the session: the key holds the adoption's
+    /// `Starting` claim, so a competing handoff BEGIN is refused typed
+    /// (Blocked). Pre-r27 the commit had already released the operation at
+    /// this point — the key read Live and a handoff could begin while the
+    /// binding was blocked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_session_init_binding_write_precedes_the_commit_and_holds_the_operation() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        // Park the adoption's binding write (keyed by the fixed fake cli id).
+        let stall = fake.arm_binding_stall("claude", FRESH_CREATE_DURABLE_ID);
+        let st2 = st.clone();
+        let create_task = tokio::spawn(async move {
+            // Settings-bearing so the write is recordable under BOTH the
+            // pre- and post-fix contracts (the red must park, not hang).
+            let mut msg = dedup_create_msg("req-r27-f4-order");
+            msg.model = Some("opus-x".to_string());
+            st2.handle_create(msg, None).await;
+        });
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the adoption reached its binding write");
+
+        // THE r27 F4 CONTRACT: the write is parked BEFORE the commit — the
+        // coordinator operation still covers the session. Pre-r27 the key
+        // read Live here (the commit preceded the write) and a handoff
+        // could BEGIN while the binding was blocked.
+        assert!(
+            matches!(
+                registry.observe("claude", FRESH_CREATE_DURABLE_ID).state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            ),
+            "the binding write runs INSIDE the coordinator operation (the \
+             pre-commit Starting claim) — got {:?}",
+            registry.observe("claude", FRESH_CREATE_DURABLE_ID).state
+        );
+        assert!(
+            matches!(
+                registry.begin_handoff(
+                    "claude",
+                    FRESH_CREATE_DURABLE_ID,
+                    freshell_ownership::RuntimeOwnerKind::Terminal,
+                    "competing-mid-write",
+                    None,
+                    "test",
+                    crate::session_lease::now_epoch_ms(),
+                ),
+                freshell_ownership::BeginOutcome::Blocked { .. }
+            ),
+            "a competing handoff cannot begin while the binding write is \
+             still inside the coordinator operation"
+        );
+        // Restore the key for the release (the probe handoff never entered).
+        let _ = registry.fail(
+            "claude",
+            FRESH_CREATE_DURABLE_ID,
+            "competing-mid-write",
+            u64::MAX,
+            false,
+        );
+
+        // Release: the publish + commit complete, the create answers green.
+        let _ = stall.release.send(());
+        let created = await_claude_created(&mut rx, "req-r27-f4-order").await;
+        assert_eq!(created["type"], "freshAgent.created", "{created}");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !matches!(
+            registry.observe("claude", FRESH_CREATE_DURABLE_ID).state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the adoption never committed after the release"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let _ = create_task.await;
+        drop(env);
+    }
+
+    /// b8ke ext r27 F4: a session-init adoption whose binding write FAILS
+    /// tears the freshly adopted runtime down and lands the TYPED
+    /// recoverable state — BEFORE the commit-Live (no owner broadcast, no
+    /// Live; the ticket's RAII drop settles the claim typed). Pre-r27 the
+    /// commit had already made the owner authoritative (and broadcast it)
+    /// before the failed write tore the runtime down underneath it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_session_init_binding_write_abandons_before_the_commit() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        // The ledger refuses every write (disk-full/permission shape).
+        fake.set_fail_writes(true);
+        let mut msg = dedup_create_msg("req-r27-f4-fail");
+        msg.model = Some("opus-x".to_string());
+        st.handle_create(msg, None).await;
+        let created = await_claude_created(&mut rx, "req-r27-f4-fail").await;
+        assert_eq!(created["type"], "freshAgent.created", "{created}");
+
+        // The adoption runs on the sidecar's init event: the binding write
+        // fails → the runtime is torn down and the adoption ABANDONS
+        // BEFORE the publish/commit. Bounded-poll for the settled state.
+        let created_session_id = created["sessionId"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let settled = matches!(
+                registry.observe("claude", FRESH_CREATE_DURABLE_ID).state,
+                freshell_ownership::OwnershipState::Vacant
+            );
+            let session_gone = !st.has_live_session(&created_session_id).await;
+            if settled && session_gone {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the failed binding write never settled (state {:?})",
+                registry.observe("claude", FRESH_CREATE_DURABLE_ID).state
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // NO owner broadcast was ever made (the commit never ran).
+        let mut saw_owner = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "session.runtimeOwner"
+                && frame["sessionId"] == json!(FRESH_CREATE_DURABLE_ID)
+            {
+                saw_owner = true;
+            }
+        }
+        assert!(
+            !saw_owner,
+            "the failed binding write never broadcast a committed owner"
         );
         drop(env);
     }
@@ -17483,8 +17679,14 @@ rl.on('line', (line) => {
     /// V7/A10: record misses are ROUTINE — `resume_for_attach` exists precisely to
     /// serve never-tracked transcripts (every claude-CLI-created and pre-ship session
     /// in the shared `~/.claude/projects` store). They resume silently with nulls
-    /// exactly as today (the preserved fallback), and record NOTHING under the new
-    /// cliSessionId (settings: None ⇒ no laundered blank row — Task 9).
+    /// exactly as today (the preserved fallback).
+    /// b8ke ext r27 F4 reshape: the session-init adoption's binding write is
+    /// UNCONDITIONAL now, so a never-recorded resume records a LINEAGE-ONLY
+    /// row under the new cliSessionId (blank settings verbatim) — the
+    /// Task 3 keying (was_recorded/load_settings) is what actually guards the
+    /// no-laundering contract: the row answers NEITHER, so a later resume
+    /// stays silent and never false-alarms SETTINGS_RESET. The pre-r27
+    /// "record NOTHING" wording was the pre-keying guard.
     #[tokio::test(flavor = "multi_thread")]
     async fn resume_without_record_is_silent_and_sends_nulls() {
         let _guard = CLAUDE_ENV_LOCK.lock().await;
@@ -17523,10 +17725,31 @@ rl.on('line', (line) => {
                 "never-recorded resume must stay silent"
             );
         }
-        // No defaults laundering: no binding row was written under the new cliSessionId.
+        // r27 F4: the lineage-only row IS recorded (blank settings verbatim)
+        // — and it launders NOTHING: the Task 3 keying keeps the row from
+        // counting as a settings-bearing record (no false SETTINGS_RESET on
+        // any later resume) and `load_settings` answers None.
+        {
+            let bindings = fake.bindings.lock().unwrap();
+            let row = bindings
+                .iter()
+                .rev()
+                .find(|b| b.provider == "claude" && b.session_id == DURABLE)
+                .expect("the never-recorded resume's lineage-only row (r27 F4)");
+            assert_eq!(
+                row.settings,
+                crate::identity_sink::FreshAgentSettings::default(),
+                "blank settings recorded verbatim — no invented values"
+            );
+        }
         assert!(
-            fake.bindings.lock().unwrap().is_empty(),
-            "a load_settings miss must not write a blank row"
+            !fake.was_recorded("claude", DURABLE),
+            "a lineage-only row must not count as recorded (no laundered \
+             settings-bearing record)"
+        );
+        assert!(
+            fake.load_settings("claude", DURABLE).is_none(),
+            "a lineage-only row answers no settings snapshot"
         );
         drop(env);
     }

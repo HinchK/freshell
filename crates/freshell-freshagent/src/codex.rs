@@ -2210,10 +2210,9 @@ impl FreshCodexState {
         // session down exactly like the lease-revoke arm — a stale
         // post-spawn commit must reap its uncommitted child.
         //
-        // b8ke ext r22 F2: the binding row's fence pair — captured at the
-        // moment THIS operation's commit runs (the pre-commit ticket's
-        // generation; the delayed-write fence baseline the durable row
-        // carries below).
+        // b8ke ext r22 F2: the binding row's fence pair — the pre-commit
+        // ticket's generation (the delayed-write fence baseline the durable
+        // row carries below).
         let (binding_epoch, binding_generation) =
             match (self.ownership.as_ref(), own_ticket.as_ref()) {
                 (Some(registry), Some(ticket)) => {
@@ -2221,6 +2220,62 @@ impl FreshCodexState {
                 }
                 _ => (None, None),
             };
+
+        // P1.13 identity event (Task 4): the ledger binding row for this create,
+        // AWAITED before the `freshAgent.created` reply below goes out
+        // (durable-before-answer). Covers both the healthy create and the
+        // `handle_create_resume` (R1) path -- both funnel through this shared tail.
+        // b8ke ext r22 F2: the binding failure PROPAGATES — the create is
+        // torn down and the claim settles typed (the ticket's RAII drop;
+        // the watcher's confirmed death releases the record), never a
+        // bare LEDGER_WRITE_FAILED notification under a committed Live.
+        // b8ke ext r27 F4: the write runs BEFORE the commit-Live, inside
+        // the SAME coordinator operation — pre-r27 the commit released the
+        // operation first, so a handoff or stop could begin while the
+        // binding was blocked and a later failure tore the runtime down
+        // only after the owner was already authoritative.
+        if let Err(e) = self
+            .record_codex_binding(
+                &thread_id,
+                Some(&request_id),
+                &model,
+                sandbox.as_deref(),
+                permission_mode.as_deref(),
+                effort.as_deref(),
+                cwd.as_deref(),
+                None,
+                provenance.as_ref(),
+                // b8ke ext r22 F2: the pre-commit pair (the fence).
+                binding_epoch,
+                binding_generation,
+            )
+            .await
+        {
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %thread_id, request_id = %request_id,
+                error = %e,
+                "freshagent.codex.create_binding_failed: the durable binding row could \
+                 not be persisted — the registered session is torn down and the create \
+                 fails typed, never a committed Live (kata b8ke ext r27 F4)"
+            );
+            if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
+                session.consumer.abort();
+                session.client.close().await;
+                if let Some(kill_tx) = session.kill_tx {
+                    let _ = kill_tx.send(());
+                }
+                let _ = session.watcher.await;
+            }
+            if let Some(mut g) = lease_guard.take() {
+                g.fail();
+            }
+            self.fail_create(
+                &request_id,
+                "FRESH_AGENT_CREATE_FAILED",
+                "the session's resume record could not be persisted; torn down",
+            );
+            return;
+        }
         if let Err(outcome) =
             self.commit_lane_claim_at(&mut own_ticket, &thread_id, &thread_id, sidecar_pid)
         {
@@ -2245,57 +2300,6 @@ impl FreshCodexState {
                 &request_id,
                 "FRESH_AGENT_CREATE_FAILED",
                 "session ownership changed during create; torn down",
-            );
-            return;
-        }
-
-        // P1.13 identity event (Task 4): the ledger binding row for this create,
-        // AWAITED before the `freshAgent.created` reply below goes out
-        // (durable-before-answer). Covers both the healthy create and the
-        // `handle_create_resume` (R1) path -- both funnel through this shared tail.
-        // b8ke ext r22 F2: the binding failure PROPAGATES — the create is
-        // torn down and the claim settles typed (the watcher's confirmed
-        // death releases the record), never a bare LEDGER_WRITE_FAILED
-        // notification under a committed Live.
-        if let Err(e) = self
-            .record_codex_binding(
-                &thread_id,
-                Some(&request_id),
-                &model,
-                sandbox.as_deref(),
-                permission_mode.as_deref(),
-                effort.as_deref(),
-                cwd.as_deref(),
-                None,
-                provenance.as_ref(),
-                // b8ke ext r22 F2: the commit-time pair (the fence).
-                binding_epoch,
-                binding_generation,
-            )
-            .await
-        {
-            tracing::error!(target: "invariant",
-                provider = PROVIDER, session_id = %thread_id, request_id = %request_id,
-                error = %e,
-                "freshagent.codex.create_binding_failed: the durable binding row could \
-                 not be persisted — the registered session is torn down and the create \
-                 fails typed (kata b8ke ext r22 F2)"
-            );
-            if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
-                session.consumer.abort();
-                session.client.close().await;
-                if let Some(kill_tx) = session.kill_tx {
-                    let _ = kill_tx.send(());
-                }
-                let _ = session.watcher.await;
-            }
-            if let Some(mut g) = lease_guard.take() {
-                g.fail();
-            }
-            self.fail_create(
-                &request_id,
-                "FRESH_AGENT_CREATE_FAILED",
-                "the session's resume record could not be persisted; torn down",
             );
             return;
         }
@@ -6711,6 +6715,74 @@ impl FreshCodexState {
             }
         }
 
+        // P1.13 identity event (Task 5, R3): refresh write re-persisting the RECOVERED
+        // live values, `supersedes: None` -- GATED on an actual recovery. On a miss it
+        // must NOT run: writing would launder blank defaults into the ledger and
+        // permanently mask the miss (V7 §2's laundering finding). AWAITED before this
+        // fn returns (durable-before-answer).
+        // b8ke ext r27 F2: the UNDER-TICKET continuation holds NO own ticket
+        // by design — the SUPPLIED handoff (epoch, generation) stamps the
+        // row instead, so the target's durable row carries the handoff's
+        // generation (pre-r27 the write carried (None, None), the row
+        // preserved the PRIOR generation, and a delayed prior-generation
+        // write could pass the ledger's comparison and replace the new
+        // owner's recovery metadata).
+        // b8ke ext r27 F4: the write runs BEFORE the commit-Live, inside
+        // the SAME coordinator operation — pre-r27 the commit released the
+        // operation first, so a handoff or stop could begin while the
+        // binding was blocked. The failure PROPAGATES (the registered
+        // session is torn down, the lease failed open, no commit — the
+        // ticket's RAII drop settles the claim typed), in BOTH modes: the
+        // under-ticket failure surfaces to the runner as the typed
+        // recoverable handoff failure.
+        let (binding_epoch, binding_generation) = match (self.ownership.as_ref(), handoff) {
+            (Some(registry), Some((_, handoff_generation))) => {
+                (Some(registry.boot_epoch()), Some(handoff_generation))
+            }
+            _ => (None, None),
+        };
+        if recovered.is_some() {
+            if let Err(e) = self
+                .record_codex_binding(
+                    thread_id,
+                    None,
+                    rec.model.as_deref().unwrap_or(""),
+                    rec.sandbox.as_deref(),
+                    rec.permission_mode.as_deref(),
+                    rec.effort.as_deref(),
+                    cwd.or(rec.cwd.as_deref()),
+                    None,
+                    // D8: conn-less attach-resume refresh — provenance `None`
+                    // keeps the row's existing stamps.
+                    None,
+                    binding_epoch,
+                    binding_generation,
+                )
+                .await
+            {
+                tracing::error!(target: "invariant",
+                    provider = PROVIDER, session_id = %thread_id, error = %e,
+                    "freshagent.codex.resume_binding_failed: the durable row write \
+                     failed — the registered session is torn down, no commit (kata \
+                     b8ke ext r27 F4)"
+                );
+                if let Some(session) = self.sessions.lock().await.remove(thread_id) {
+                    session.consumer.abort();
+                    session.client.close().await;
+                    if let Some(kill_tx) = session.kill_tx {
+                        let _ = kill_tx.send(());
+                    }
+                    let _ = session.watcher.await;
+                }
+                if let Some(mut g) = lease_guard.take() {
+                    g.fail();
+                }
+                return Err(ResumeSessionError::Transient(
+                    "the session's resume record could not be persisted; torn down".to_string(),
+                ));
+            }
+        }
+
         // kata b8ke Task 3: the resume's registration survived every teardown
         // gate — commit `Live{FreshAgent}` and retain the stamp. Under-ticket
         // mode (handoff continuation): SKIP the commit — return the
@@ -6752,44 +6824,6 @@ impl FreshCodexState {
                 None
             }
         };
-
-        // P1.13 identity event (Task 5, R3): refresh write re-persisting the RECOVERED
-        // live values, `supersedes: None` -- GATED on an actual recovery. On a miss it
-        // must NOT run: writing would launder blank defaults into the ledger and
-        // permanently mask the miss (V7 §2's laundering finding). AWAITED before this
-        // fn returns (durable-before-answer).
-        // b8ke ext r27 F2: the UNDER-TICKET continuation holds NO own ticket
-        // by design — the SUPPLIED handoff (epoch, generation) stamps the
-        // row instead, so the target's durable row carries the handoff's
-        // generation (pre-r27 the write carried (None, None), the row
-        // preserved the PRIOR generation, and a delayed prior-generation
-        // write could pass the ledger's comparison and replace the new
-        // owner's recovery metadata).
-        let (binding_epoch, binding_generation) = match (self.ownership.as_ref(), handoff) {
-            (Some(registry), Some((_, handoff_generation))) => {
-                (Some(registry.boot_epoch()), Some(handoff_generation))
-            }
-            _ => (None, None),
-        };
-        if recovered.is_some() {
-            let _ = self
-                .record_codex_binding(
-                    thread_id,
-                    None,
-                    rec.model.as_deref().unwrap_or(""),
-                    rec.sandbox.as_deref(),
-                    rec.permission_mode.as_deref(),
-                    rec.effort.as_deref(),
-                    cwd.or(rec.cwd.as_deref()),
-                    None,
-                    // D8: conn-less attach-resume refresh — provenance `None`
-                    // keeps the row's existing stamps.
-                    None,
-                    binding_epoch,
-                    binding_generation,
-                )
-                .await;
-        }
 
         Ok(ResumedCodexSession {
             client,
@@ -10948,6 +10982,106 @@ pub(crate) mod tests {
             );
         }
         // Drain the bus so the shutdown's frames do not leak into other tests.
+        while rx.try_recv().is_ok() {}
+        st.shutdown().await;
+    }
+
+    /// b8ke ext r27 F4: the create's durable binding write runs BEFORE the
+    /// commit-Live — while the write is parked (the sink's binding stall),
+    /// the coordinator operation still COVERS the session: the key holds
+    /// the create's `Starting` claim, so a competing handoff BEGIN is
+    /// refused typed (Blocked). Pre-r27 the commit had already released
+    /// the operation at this point — the key read Live and a handoff or
+    /// stop could begin while the binding was blocked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_create_binding_write_precedes_the_commit_and_holds_the_operation() {
+        let _guard = ENV_LOCK.lock().await;
+        let (mut st, mut rx, fake) = state_with_sink();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        // The fake app server's fresh-create thread id (its default).
+        const THREAD: &str = "thread-new-1";
+        configure_fake_codex_cmd("{}");
+        // Park the create's binding write.
+        let stall = fake.arm_binding_stall("codex", THREAD);
+        let st2 = st.clone();
+        let create_task = tokio::spawn(async move {
+            st2.handle_create(
+                FreshAgentCreate {
+                    observed_epoch: None,
+                    observed_generation: None,
+                    request_id: "req-r27-f4-codex".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    provider: Some(freshell_protocol::AgentProvider::Codex),
+                    cwd: None,
+                    legacy_restore_context: None,
+                    resume_session_id: None,
+                    session_ref: None,
+                    model: Some("gpt-5.3-codex-spark".to_string()),
+                    model_selection: None,
+                    permission_mode: None,
+                    sandbox: None,
+                    effort: None,
+                    plugins: None,
+                    tab_id: None,
+                },
+                None,
+            )
+            .await;
+        });
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the create reached its binding write");
+
+        // THE r27 F4 CONTRACT: the write is parked BEFORE the commit — the
+        // create's Starting claim still covers the key. Pre-r27 the commit
+        // preceded the write and the key read Live here.
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, THREAD).state,
+                freshell_ownership::OwnershipState::Starting { .. }
+            ),
+            "the create's binding write runs INSIDE the coordinator operation \
+             (the pre-commit Starting claim) — got {:?}",
+            registry.observe(PROVIDER, THREAD).state
+        );
+        assert!(
+            matches!(
+                registry.begin_handoff(
+                    PROVIDER,
+                    THREAD,
+                    freshell_ownership::RuntimeOwnerKind::Terminal,
+                    "competing-mid-write",
+                    None,
+                    "test",
+                    crate::session_lease::now_epoch_ms(),
+                ),
+                freshell_ownership::BeginOutcome::Blocked { .. }
+            ),
+            "a competing handoff cannot begin while the binding write is \
+             still inside the coordinator operation"
+        );
+        // Restore the key for the release (the probe handoff never entered).
+        let _ = registry.fail(PROVIDER, THREAD, "competing-mid-write", u64::MAX, false);
+
+        // Release: the commit completes and the create answers created.
+        let _ = stall.release.send(());
+        let created: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.created"
+                    || frame["type"] == "freshAgent.create.failed"
+                {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the create resolves within budget");
+        assert_eq!(created["type"], "freshAgent.created", "{created}");
+        assert_eq!(created["sessionId"], json!(THREAD));
+        let _ = create_task.await;
         while rx.try_recv().is_ok() {}
         st.shutdown().await;
     }
