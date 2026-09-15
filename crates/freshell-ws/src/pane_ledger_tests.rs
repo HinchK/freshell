@@ -88,6 +88,8 @@ fn write_with_policy(
         create_request_id: Some("req-1"),
         origin_create_request_id: None,
         provenance,
+        observed_epoch: None,
+        observed_generation: None,
         now_ms,
     }
 }
@@ -159,6 +161,8 @@ fn fa_write<'a>(provider: &'a str, session_id: &'a str, now_ms: i64) -> FreshAge
         effort: None,
         supersedes: None,
         provenance: ProvenancePolicy::Inherit,
+        observed_epoch: None,
+        observed_generation: None,
         now_ms,
     }
 }
@@ -2018,6 +2022,8 @@ fn disabled_ledger_refuses_the_rollback_row_write_with_a_loud_error() {
             effort: None,
             supersedes: None,
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: 1,
         })
         .expect("binding writes keep their silent-no-op policy on a disabled ledger");
@@ -3671,6 +3677,8 @@ fn crash_mid_supersession_two_bound_rows_repaired_by_updated_at_tiebreak() {
             retired_reason: None,
             superseded_by: None,
             pane_kind: None,
+            owner_epoch: None,
+            owner_generation: None,
             model: None,
             sandbox: None,
             permission_mode: None,
@@ -3793,6 +3801,8 @@ fn fresh_agent_binding_roundtrips_settings_and_pane_kind() {
             effort: Some("high"),
             supersedes: None,
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: 1_000,
         })
         .unwrap();
@@ -3823,6 +3833,8 @@ fn fresh_agent_binding_upsert_preserves_created_at_and_refreshes_settings() {
         effort: Some("low"),
         supersedes: None,
         provenance: ProvenancePolicy::Inherit,
+        observed_epoch: None,
+        observed_generation: None,
         now_ms: 1_000,
     };
     ledger.record_fresh_agent_binding(&base).unwrap();
@@ -3831,6 +3843,8 @@ fn fresh_agent_binding_upsert_preserves_created_at_and_refreshes_settings() {
             model: Some("m2"),
             effort: None,
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: 2_000,
             ..base
         })
@@ -3864,6 +3878,8 @@ fn supersedes_retires_the_old_row_and_links_the_chain() {
         effort: None,
         supersedes: None,
         provenance: ProvenancePolicy::Inherit,
+        observed_epoch: None,
+        observed_generation: None,
         now_ms: 1_000,
     };
     ledger.record_fresh_agent_binding(&base).unwrap();
@@ -3872,6 +3888,8 @@ fn supersedes_retires_the_old_row_and_links_the_chain() {
             session_id: "new-thread",
             supersedes: Some("old-thread"),
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: 2_000,
             ..base
         })
@@ -3921,6 +3939,8 @@ fn fresh_agent_upsert_preserves_advisory_create_request_id_when_absent() {
         effort: None,
         supersedes: None,
         provenance: ProvenancePolicy::Inherit,
+        observed_epoch: None,
+        observed_generation: None,
         now_ms: 1_000,
     };
     ledger.record_fresh_agent_binding(&base).unwrap();
@@ -3928,6 +3948,8 @@ fn fresh_agent_upsert_preserves_advisory_create_request_id_when_absent() {
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             create_request_id: None,
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: 2_000,
             ..base
         })
@@ -3961,6 +3983,8 @@ fn fresh_agent_settings_recorded_keys_off_settings_bearing_rows() {
         effort: None,
         supersedes: None,
         provenance: ProvenancePolicy::Inherit,
+        observed_epoch: None,
+        observed_generation: None,
         now_ms: 1_000,
     };
     // A cwd-only snapshot counts as settings-bearing (real creates always
@@ -4003,6 +4027,8 @@ fn supersedes_of_a_missing_old_row_is_a_silent_noop() {
             effort: None,
             supersedes: Some("never-existed"),
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: 1_000,
         })
         .expect("missing old row is a silent no-op, not an error");
@@ -6608,6 +6634,8 @@ fn a_detach_close_records_the_pane_close_without_retiring_or_fencing_anything() 
             create_request_id: Some("req-det"),
             origin_create_request_id: None,
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: 1_000,
         })
         .unwrap();
@@ -6730,6 +6758,8 @@ fn a_fully_aged_detach_close_survives_while_a_row_carries_its_create_request_id(
             create_request_id: Some("req-kept"),
             origin_create_request_id: None,
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: 1_000,
         })
         .unwrap();
@@ -6805,6 +6835,8 @@ fn a_tab_close_journals_one_batch_envelope_covering_the_whole_pane_set() {
                 create_request_id: Some(crid),
                 origin_create_request_id: None,
                 provenance: ProvenancePolicy::Inherit,
+                observed_epoch: None,
+                observed_generation: None,
                 now_ms: 1_000,
             })
             .unwrap();
@@ -7135,6 +7167,8 @@ fn a_fully_aged_detach_close_survives_while_a_row_carries_only_its_origin_lineag
             create_request_id: None, // the deliberate conn-less lane shape
             origin_create_request_id: Some("req-origin"),
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: 1_000,
         })
         .unwrap();
@@ -7182,6 +7216,8 @@ fn a_fully_aged_detach_close_survives_while_a_lineage_less_row_names_its_termina
             create_request_id: None,
             origin_create_request_id: None,
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: 1_000,
         })
         .unwrap();
@@ -7197,6 +7233,8 @@ fn a_fully_aged_detach_close_survives_while_a_lineage_less_row_names_its_termina
             create_request_id: Some("req-survivor"),
             origin_create_request_id: None,
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: 1_000,
         })
         .unwrap();
@@ -7260,6 +7298,8 @@ fn close_record_covers_row_is_the_shared_recovery_predicate() {
             retired_reason: None,
             superseded_by: None,
             pane_kind: None,
+            owner_epoch: None,
+            owner_generation: None,
             model: None,
             sandbox: None,
             permission_mode: None,

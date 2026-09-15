@@ -251,6 +251,8 @@ impl PaneIdentitySink for TestLedgerSink {
                     effort: upsert.settings.effort.as_deref(),
                     supersedes: upsert.supersedes.as_deref(),
                     provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+                    observed_epoch: None,
+                    observed_generation: None,
                     now_ms: now,
                 };
                 ledger.record_fresh_agent_binding(&w)?;

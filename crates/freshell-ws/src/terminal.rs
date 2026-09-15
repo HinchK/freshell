@@ -4775,6 +4775,10 @@ pub(crate) async fn handle_create(
                             asserted_at: write_asserted_at,
                         },
                     ),
+                    // b8ke ext r22 F2: legacy-unfenced (the pre-spawn
+                    // prespawn row predates the ownership claim's pair).
+                    observed_epoch: None,
+                    observed_generation: None,
                     now_ms: now,
                 })
             })
@@ -5138,6 +5142,11 @@ pub(crate) async fn handle_create(
                             asserted_at: write_asserted_at,
                         },
                     ),
+                    // b8ke ext r22 F2: legacy-unfenced (this write's lane
+                    // predates the ownership pair threading; the row's prior
+                    // stamp is preserved by the write path).
+                    observed_epoch: None,
+                    observed_generation: None,
                     now_ms: now,
                 })
             })
@@ -5996,6 +6005,11 @@ pub async fn respawn_agent_terminal(
                     // carries (focused-ep4-r2 Findings 1+2: maintenance writes
                     // touch neither).
                     provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
+                    // b8ke ext r22 F2: legacy-unfenced (this write's lane
+                    // predates the ownership pair threading; the row's prior
+                    // stamp is preserved by the write path).
+                    observed_epoch: None,
+                    observed_generation: None,
                     now_ms: now,
                 })
             })

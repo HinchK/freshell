@@ -724,6 +724,8 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
             effort: None,
             supersedes: None,
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: now,
         })
         .unwrap();
@@ -741,6 +743,8 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
             effort: None,
             supersedes: Some("old-t"),
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: now + 1,
         })
         .unwrap();

@@ -778,6 +778,17 @@ pub struct BindingRow {
     /// "fresh-agent" for fresh-agent rows (P1.13); absent on terminal rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_kind: Option<String>,
+    /// b8ke ext r22 F2: the ownership (epoch, generation) pair this row was
+    /// last written under — the DELAYED-WRITE FENCE's baseline. A binding
+    /// write carrying an OLDER pair (a pre-teardown in-flight write racing
+    /// a completed handoff that advanced the generation) refuses typed, so
+    /// the newer owner's recovery row survives untouched. `None` on
+    /// pre-r22 rows and legacy-unfenced writes (the fence fires only when
+    /// both the row's stamp and the write's pair exist).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_generation: Option<u64>,
     /// Resume-invocation record (campaign plan §4.2): exactly what the
     /// provider-native resume command needs. Updated when the user changes
     /// them. All optional under LEDGER_VERSION 1 — no version bump.
@@ -1166,6 +1177,14 @@ pub struct BindingWrite<'a> {
     /// ep4-r2 Findings 1+2): the value captured at message receipt flows to
     /// the row unchanged — there is no write-side time override to get wrong.
     pub provenance: ProvenancePolicy<'a>,
+    /// b8ke ext r22 F2: the operation's observed (epoch, generation) pair —
+    /// the DELAYED-WRITE FENCE. The write path refuses typed when the
+    /// existing row's stamp is NEWER (a stale pre-teardown write can never
+    /// overwrite a newer owner's recovery row), and the written row carries
+    /// this pair as its stamp. `None` = legacy-unfenced (accepted; the row's
+    /// prior stamp is preserved).
+    pub observed_epoch: Option<u64>,
+    pub observed_generation: Option<u64>,
     pub now_ms: i64,
 }
 
@@ -1212,6 +1231,14 @@ pub struct FreshAgentBindingWrite<'a> {
     /// per-lane contract (Replace / Inherit / Clear; the Inherit merge falls
     /// back to the superseded parent's stamps on a fork-chain write).
     pub provenance: ProvenancePolicy<'a>,
+    /// b8ke ext r22 F2: the operation's observed (epoch, generation) pair —
+    /// the DELAYED-WRITE FENCE (the fresh-agent binding rows' recovery data
+    /// is generation-fenced: a delayed pre-teardown write carrying an older
+    /// pair refuses typed, so the newer owner's recovery row survives).
+    /// `None` = legacy-unfenced (accepted; the row's prior stamp is
+    /// preserved).
+    pub observed_epoch: Option<u64>,
+    pub observed_generation: Option<u64>,
     pub now_ms: i64,
 }
 
@@ -1939,6 +1966,41 @@ impl PaneLedger {
             })
             .cloned();
 
+        // b8ke ext r22 F2: the DELAYED-WRITE FENCE (the terminal rows'
+        // twin of the fresh-agent path's gate) — the row's current
+        // ownership stamp vs this write's observed pair. A write carrying
+        // an OLDER pair refuses typed: the newer owner's recovery row
+        // survives. Fires only when both stamps exist.
+        if let (Some((row_epoch, row_gen)), Some((in_epoch, in_gen))) = (
+            index
+                .bindings
+                .get(&(w.provider.to_string(), w.session_id.to_string()))
+                .and_then(|r| match (r.owner_epoch, r.owner_generation) {
+                    (Some(e), Some(g)) => Some((e, g)),
+                    _ => None,
+                }),
+            match (w.observed_epoch, w.observed_generation) {
+                (Some(e), Some(g)) => Some((e, g)),
+                _ => None,
+            },
+        ) {
+            if (in_epoch, in_gen) < (row_epoch, row_gen) {
+                tracing::warn!(target: "freshell_ws::pane_ledger",
+                    provider = %w.provider,
+                    session_id = %w.session_id,
+                    row_epoch, row_generation = row_gen,
+                    observed_epoch = in_epoch, observed_generation = in_gen,
+                    "pane_ledger_binding_refused_stale_pair: the write's observed \
+                     ownership pair predates the row's current owner — the newer \
+                     owner's recovery row survives (kata b8ke ext r22 F2)"
+                );
+                return Err(std::io::Error::other(
+                    "STALE_BINDING_PAIR: the write's observed ownership pair \
+                     predates the row's current owner",
+                ));
+            }
+        }
+
         let key = (w.provider.to_string(), w.session_id.to_string());
         let existing = index.bindings.get(&key);
         let created_at = existing.map(|r| r.created_at).unwrap_or(w.now_ms);
@@ -1997,6 +2059,10 @@ impl PaneLedger {
             retired_reason: None,
             superseded_by: None,
             pane_kind: None,
+            // b8ke ext r22 F2: the write's observed pair becomes the row's
+            // ownership stamp (the delayed-write fence baseline).
+            owner_epoch: w.observed_epoch,
+            owner_generation: w.observed_generation,
             model: None,
             sandbox: None,
             permission_mode: None,
@@ -2232,6 +2298,37 @@ impl PaneLedger {
             }
         }
         let existing = index.bindings.get(&key);
+        // b8ke ext r22 F2: the DELAYED-WRITE FENCE — the row's current
+        // ownership stamp vs this write's carried pair. A write carrying an
+        // OLDER pair (a pre-teardown in-flight write racing a completed
+        // handoff that advanced the generation — the handoff's terminal-side
+        // row write stamped the newer pair) REFUSES typed: the newer
+        // owner's recovery row survives untouched. The refusal is a typed
+        // error the binding lane maps onto its typed failure path — never a
+        // silent overwrite. Fires only when BOTH stamps exist (the row's
+        // and the write's); a legacy-unfenced write or an unstamped row
+        // proceeds (the pre-r22 behavior).
+        if let (Some((row_e, row_g)), Some((w_e, w_g))) = (
+            existing.and_then(|r| r.owner_epoch.zip(r.owner_generation)),
+            w.observed_epoch.zip(w.observed_generation),
+        ) {
+            if (w_e, w_g) < (row_e, row_g) {
+                tracing::warn!(target: "freshell_ws::pane_ledger",
+                    provider = %w.provider,
+                    session_id = %w.session_id,
+                    row_epoch = row_e, row_generation = row_g,
+                    write_epoch = w_e, write_generation = w_g,
+                    "pane_ledger_binding_refused_stale_pair: a delayed \
+                     pre-teardown binding write carries an older ownership \
+                     pair — the newer owner's recovery row survives (kata \
+                     b8ke ext r22 F2)"
+                );
+                return Err(std::io::Error::other(
+                    "STALE_BINDING_PAIR: the row was rebound under a newer ownership \
+                     generation; the delayed write is refused",
+                ));
+            }
+        }
         let created_at = existing.map(|r| r.created_at).unwrap_or(w.now_ms);
         // Advisory field: keep the existing row's value when the new write
         // has none (latest-observed semantics, D4).
@@ -2357,6 +2454,13 @@ impl PaneLedger {
             retired_reason: None,
             superseded_by: None,
             pane_kind: Some("fresh-agent".into()),
+            // b8ke ext r22 F2: the row's ownership stamp — this write's
+            // carried pair (preserved from the prior row when the write is
+            // legacy-unfenced).
+            owner_epoch: w.observed_epoch.or(existing.and_then(|r| r.owner_epoch)),
+            owner_generation: w
+                .observed_generation
+                .or(existing.and_then(|r| r.owner_generation)),
             model: w.model.map(str::to_string),
             sandbox: w.sandbox.map(str::to_string),
             permission_mode: w.permission_mode.map(str::to_string),
@@ -4604,6 +4708,11 @@ pub(crate) async fn ledger_resolve_identity(
             // `asserted_at` when (and only when) the stamps come FROM the
             // marker (focused-ep4 Finding).
             provenance: ProvenancePolicy::Inherit,
+            // b8ke ext r22 F2: legacy-unfenced (this write's lane
+            // predates the ownership pair threading; the row's prior
+            // stamp is preserved by the write path).
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: now,
         })
     })

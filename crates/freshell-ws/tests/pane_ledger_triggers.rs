@@ -149,6 +149,8 @@ async fn failed_claude_resume_create_leaves_prior_binding_row_untouched() {
             create_request_id: Some("req-prior-epoch"),
             origin_create_request_id: None,
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: seeded_at,
         })
         .expect("seed prior-epoch binding row");
@@ -741,6 +743,8 @@ async fn a_kill_before_identity_resolution_records_a_pane_close_the_late_resolut
             create_request_id: None,
             origin_create_request_id: None,
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: 9_000,
         })
     })
