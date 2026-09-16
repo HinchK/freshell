@@ -1,9 +1,9 @@
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { LOCAL_ONLY_SPECS } from '../playwright.config.js'
-import { CLOUD_SKIP_SPECS } from '../playwright.cloud.config.js'
+import { CLOUD_SKIP_SPECS, CLOUD_SKIP_TITLES } from '../playwright.cloud.config.js'
 import { createE2eServerHandle } from './external-target.js'
 import { assertRustServerInfo, RustServer } from './rust-server.js'
 
@@ -72,7 +72,7 @@ function listedProjects(
     env,
     encoding: 'utf8',
   })
-  const total = output.match(/Total: (\d+) tests in (\d+) files/)
+  const total = output.match(/Total: (\d+) tests? in (\d+) files?/)
   if (!total) throw new Error(`Playwright list output did not include a total:\n${output}`)
   return {
     output,
@@ -108,6 +108,21 @@ describe('browser selection non-vacuity', () => {
     expect(chromium.output).toContain('[chromium]')
     expect(chromium.tests).toBeGreaterThanOrEqual(308)
     expect(chromium.files).toBeGreaterThanOrEqual(86)
+    // Local coverage pin (kata 67jt): every CLOUD_SKIP_SPECS entry must
+    // remain listed on the base/local lane — cloud-skip never means "not
+    // covered"; it means "covered locally". A renamed or deleted spec that
+    // forgets the list fails here.
+    for (const spec of CLOUD_SKIP_SPECS) {
+      expect(chromium.output, `base lane must still list ${spec}`).toContain(spec)
+    }
+    // CLOUD_SKIP_TITLES non-vacuity: each grepInvert title must actually
+    // select a test in the base lane — else the cloud exclusion would be
+    // vacuously green after an edit (today's known hit: editor-pane.spec.ts
+    // "loads the editor lazily and requests a new JS asset after the click").
+    expect(CLOUD_SKIP_TITLES.length).toBeGreaterThan(0)
+    for (const title of CLOUD_SKIP_TITLES) {
+      expect(chromium.output, `grepInvert source must exist in the base lane: ${title.source}`).toMatch(title)
+    }
 
     const ci = listedProjects(cleanEnvironment({ CI: '1' }))
     expect(ci.labels).toEqual(['chromium', 'firefox', 'webkit'])
@@ -145,6 +160,44 @@ describe('browser selection non-vacuity', () => {
     expect(cloud.output).toContain('[chromium]')
     expect(cloud.tests).toBeGreaterThan(0)
     expect(cloud.files).toBeGreaterThan(0)
+    // Cloud exclusion pin (kata 67jt): no skip-listed spec may appear in
+    // the cloud selection at all — a pattern typo, a minimatch-semantics
+    // change, or a config refactor that drops the testIgnore mapping all
+    // fail here.
+    for (const spec of CLOUD_SKIP_SPECS) {
+      expect(cloud.output, `cloud lane must not list ${spec}`).not.toContain(spec)
+    }
+    // grepInvert honored at selection level: excluded titles absent from
+    // the cloud list while their spec files still run there.
+    for (const title of CLOUD_SKIP_TITLES) {
+      expect(cloud.output, `cloud lane must not list excluded title: ${title.source}`).not.toMatch(title)
+    }
+
+    // Explicit positional file args are an INTERSECTION with testIgnore,
+    // never a bypass (Playwright 1.58.2 cliFileMatcher semantics): a mixed
+    // focused invocation must keep its cloud-legal member and silently drop
+    // the skip-listed one — so even a contaminated manifest or filter could
+    // not execute skip-listed specs under the cloud config.
+    const mixed = listedProjects(cleanEnvironment(), cloudConfig, [
+      'test/e2e-browser/specs/truly-idle-alerting.spec.ts',
+      'test/e2e-browser/specs/host-stats-pane.spec.ts',
+    ])
+    expect(mixed.output).toContain('host-stats-pane.spec.ts')
+    expect(mixed.output).not.toContain('truly-idle-alerting')
+    expect(mixed.files).toBe(1)
+
+    // An ALL-skip focused invocation fails LOUDLY (exit 1, "No tests
+    // found") instead of silently reading as a green zero-test run — a
+    // vacuous focused cloud proof can never masquerade as coverage.
+    const allSkip = spawnSync(process.execPath, [
+      playwrightCli,
+      'test',
+      '--config', cloudConfig,
+      '--list',
+      'test/e2e-browser/specs/truly-idle-alerting.spec.ts',
+    ], { cwd: projectRoot, env: cleanEnvironment(), encoding: 'utf8' })
+    expect(allSkip.status).toBe(1)
+    expect(`${allSkip.stdout}\n${allSkip.stderr}`).toContain('No tests found')
 
     const migrated = listedProjects(cleanEnvironment(), cloudConfig, [
       'test/e2e-browser/specs/server-build-mismatch-rust.spec.ts',
