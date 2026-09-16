@@ -737,6 +737,14 @@ export const SessionHandoffErrorCodeSchema = z.enum([
    *  clear is not permission to start a writer; the acknowledged-risk
    *  arm is the only start). */
   'CLEARED_UNVERIFIED_FENCED',
+  /** b8ke ext r34 F3: the typed 400 for a half-supplied observed (epoch,
+   *  generation) fence pair (session_handoff.rs's wire_fence refusal).
+   *  Current browser callers always send both fields together, but the
+   *  typed REST/client contract must parse the server's documented
+   *  response instead of converting it to a generic
+   *  HANDOFF_REQUEST_FAILED ("could not reach the server") for malformed
+   *  callers. */
+  'INVALID_FENCE',
 ])
 export type SessionHandoffErrorCode = z.infer<typeof SessionHandoffErrorCodeSchema>
 

@@ -1246,6 +1246,11 @@ describe('requestSessionHandoff()', () => {
       // CLEARED-UNVERIFIED key (the r16-F4 clear's typed refusal after an
       // ordinary retry on the cleared fence).
       'CLEARED_UNVERIFIED_FENCED',
+      // b8ke ext r34 F3: the typed 400 for a half-supplied observed
+      // (epoch, generation) fence pair — the server's documented
+      // wire_fence refusal (session_handoff.rs), parsed as the typed
+      // error instead of the generic HANDOFF_REQUEST_FAILED.
+      'INVALID_FENCE',
     ] as const
     for (const code of SERVER_EMITTED_FAILURE_CODES) {
       expect(SessionHandoffErrorCodeSchema.safeParse(code).success, code).toBe(true)
@@ -1286,6 +1291,38 @@ describe('requestSessionHandoff()', () => {
       })
       expect(parsed.success, cleared).toBe(true)
     }
+  })
+
+  // b8ke ext r34 F3: the typed 400 for a HALF-SUPPLIED observed fence
+  // pair parses as the typed INVALID_FENCE error — never the generic
+  // HANDOFF_REQUEST_FAILED ("could not reach the server") diagnostic
+  // the malformed-caller conversion produced pre-r34.
+  it('parses the server-emitted INVALID_FENCE 400 as the typed error', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(400, {
+      ok: false,
+      error: {
+        code: 'INVALID_FENCE',
+        message: 'observedEpoch and observedGeneration must be sent together — a half-fence is invalid',
+        retryable: false,
+      },
+    }))
+
+    const result = await requestSessionHandoff({
+      provider: 'codex',
+      sessionId: 'sid-half-fence',
+      targetKind: 'terminal',
+      mode: 'codex',
+      observedEpoch: 3,
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'INVALID_FENCE',
+        message: 'observedEpoch and observedGeneration must be sent together — a half-fence is invalid',
+        retryable: false,
+      },
+    })
   })
 
   it('parses the server-emitted STALE_START_FENCED refusal frame', async () => {
