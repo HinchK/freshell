@@ -248,60 +248,163 @@ pub mod ownership_lane {
         }
     }
 
-    /// The typed STALE-ON-ARRIVAL verdict for a wire-parsed observed fence
-    /// against the coordinator's CURRENT pair for the key (b8ke ext r29 F2):
-    /// the reclaim-less lifecycle lanes (opencode compact/fork/rollback —
-    /// operations that never claim, so nothing re-validates the pair for
-    /// them) consult this at their decision point, BEFORE any provider
-    /// mutation. `Ok(())` when the fence is current, the registry is
-    /// unwired, or the request is legacy-unfenced (`None` — the
-    /// coordinator's cross-kind checks still govern those). The refusal
-    /// mirrors [`RuntimeOwnershipRegistry::begin_start`]'s fence gate: an
-    /// epoch from a DIFFERENT (pre-restart) boot or an OLDER generation is
-    /// stale — a queued old-generation request can never mutate newer
-    /// history or mint a child past the fence.
-    pub fn check_observed_fence(
+    /// b8ke focused ep5 r1 F1: the reclaim-less lanes' coordinator-backed
+    /// OP GUARD — the opencode compact/fork/rollback lanes' fence, backing
+    /// the ext-r29 snapshot consult with the REAL coordinator machinery
+    /// (the attach guard, the same discipline the claude rollback's Adopt
+    /// arm uses). Pre-ep5-r1 the consult was a bare unlocked snapshot
+    /// comparison: it verified neither the record's state nor the owner
+    /// kind, held NOTHING through the provider mutation, and let
+    /// legacy-unfenced requests pass unconditionally — a handoff could
+    /// begin the instant the check passed, then advance the generation
+    /// while the old-kind operation mutated history or minted and
+    /// committed a child. The guard closes the check-then-act window
+    /// structurally: [`LaneOpGuard::Armed`] HOLDS the coordinator's
+    /// attach guard (a concurrent `begin_handoff`/`begin_stop` answers
+    /// the typed `Blocked` outcome until the guard drops), the record
+    /// under it is verified `Live{FreshAgent}`, a supplied pair is
+    /// validated atomically at arm time, and a legacy-unfenced request
+    /// routes through the SAME guard with the coordinator's current pair
+    /// — never an unconditional pass into mutation.
+    pub enum LaneOpGuard {
+        /// Armed and HELD: concurrent lifecycle begins answer Blocked
+        /// until the guard drops. The caller MUST hold it across its
+        /// provider mutation (and commit), releasing only after.
+        Armed(freshell_ownership::AttachGuard),
+        /// No coordinator wired (the legacy no-coordinator lane proceeds
+        /// unguarded — there is nothing to serialize).
+        Unwired,
+        /// The typed refusal (the wire message names the reason): a
+        /// lifecycle transition owns the key, the record is not
+        /// `Live{FreshAgent}` (a terminal owner or a vacated/crashed
+        /// shape), or the supplied observed pair is stale. Every arm
+        /// answers the lanes' typed `SESSION_RESERVED` surface.
+        Refused { message: String },
+    }
+
+    /// Arm the reclaim-less op guard (see [`LaneOpGuard`]). The
+    /// `operation_id` names the guard on the coordinator's arm/blocked
+    /// events (diagnosability); `observed` is the request's wire-parsed
+    /// pair (`None` = legacy-unfenced — routed through the guard with the
+    /// coordinator's CURRENT pair, captured atomically at arm time).
+    pub fn arm_reclaimless_op_guard(
         registry: &Option<Arc<RuntimeOwnershipRegistry>>,
         provider: &str,
         session_id: &str,
+        operation_id: &str,
         observed: Option<ObservedFence>,
-    ) -> Result<(), ObservedFenceStale> {
+        initiator: &str,
+    ) -> LaneOpGuard {
         let Some(registry) = registry.as_ref() else {
-            return Ok(());
-        };
-        let Some(fence) = observed else {
-            return Ok(());
+            return LaneOpGuard::Unwired;
         };
         let snap = registry.observe(provider, session_id);
-        if fence.epoch != snap.epoch || fence.generation < snap.generation {
-            return Err(ObservedFenceStale {
-                observed_epoch: fence.epoch,
-                observed_generation: fence.generation,
-                current_epoch: snap.epoch,
-                current_generation: snap.generation,
-            });
+        // The supplied pair's epoch must be THIS boot's — the boot epoch is
+        // constant per process, so this pre-check is exact (never a
+        // check-then-act): a cross-epoch pair is a pre-restart observation,
+        // stale on its face.
+        if let Some(fence) = observed {
+            if fence.epoch != snap.epoch {
+                tracing::warn!(target: "freshell_ownership",
+                    operation_id = %operation_id, provider = %provider,
+                    session_id = %session_id, initiator,
+                    observed_epoch = fence.epoch, observed_generation = fence.generation,
+                    current_epoch = snap.epoch, current_generation = snap.generation,
+                    event = "ownership.op_guard.refused",
+                    outcome = "refused", failure_reason = "STALE_GENERATION",
+                    "the op guard refused to arm (the observed pair is from a \
+                     pre-restart epoch) — the operation aborts typed");
+                return LaneOpGuard::Refused {
+                    message: STALE_OP_GUARD_MESSAGE.to_string(),
+                };
+            }
         }
-        Ok(())
+        // A legacy-unfenced request routes through the SAME guard with the
+        // coordinator's current pair — captured here, validated atomically
+        // at arm time (the guard then blocks any handoff that arrives
+        // after, so the pair can never go stale under the mutation).
+        let observed_generation = observed
+            .map(|fence| fence.generation)
+            .unwrap_or(snap.generation);
+        match registry.begin_attach_guard(
+            provider,
+            session_id,
+            operation_id,
+            Some(observed_generation),
+            initiator,
+        ) {
+            freshell_ownership::AttachGuardOutcome::Armed(guard) => {
+                let guard = *guard;
+                // Verify `Live{FreshAgent}` UNDER the guard — stable now
+                // (lifecycle begins answer Blocked while it is held): a
+                // current-generation request over a TERMINAL-owned key (a
+                // completed handoff) refuses typed here, never mutating
+                // another kind's session.
+                let under = registry.observe(provider, session_id);
+                match under.state {
+                    freshell_ownership::OwnershipState::Live { owner, .. }
+                        if owner.kind == RuntimeOwnerKind::FreshAgent =>
+                    {
+                        LaneOpGuard::Armed(guard)
+                    }
+                    other => {
+                        tracing::warn!(target: "freshell_ownership",
+                            operation_id = %operation_id, provider = %provider,
+                            session_id = %session_id, initiator,
+                            state = ?other, epoch = under.epoch, generation = under.generation,
+                            event = "ownership.op_guard.refused",
+                            outcome = "refused", failure_reason = "NOT_FRESH_AGENT_LIVE",
+                            "the op guard armed over a non-fresh-agent owner — the \
+                             operation aborts typed and the guard releases");
+                        drop(guard);
+                        LaneOpGuard::Refused {
+                            message: KIND_OP_GUARD_MESSAGE.to_string(),
+                        }
+                    }
+                }
+            }
+            freshell_ownership::AttachGuardOutcome::Refused { state, generation } => {
+                tracing::warn!(target: "freshell_ownership",
+                    operation_id = %operation_id, provider = %provider,
+                    session_id = %session_id, initiator,
+                    state = ?state, generation,
+                    event = "ownership.op_guard.refused",
+                    outcome = "refused", failure_reason = "LIFECYCLE_IN_FLIGHT",
+                    "the op guard refused to arm (a lifecycle transition owns the \
+                     key, or the record is not Live) — the operation aborts typed, \
+                     nothing is mutated");
+                LaneOpGuard::Refused {
+                    message: LIFECYCLE_OP_GUARD_MESSAGE.to_string(),
+                }
+            }
+            freshell_ownership::AttachGuardOutcome::StaleGeneration {
+                current_epoch: _,
+                current_generation,
+            } => {
+                tracing::warn!(target: "freshell_ownership",
+                    operation_id = %operation_id, provider = %provider,
+                    session_id = %session_id, initiator,
+                    observed_generation, current_generation,
+                    event = "ownership.op_guard.refused",
+                    outcome = "refused", failure_reason = "STALE_GENERATION",
+                    "the op guard refused to arm (the observed generation is \
+                     stale) — the operation aborts typed, nothing is mutated");
+                LaneOpGuard::Refused {
+                    message: STALE_OP_GUARD_MESSAGE.to_string(),
+                }
+            }
+        }
     }
 
-    /// The typed stale verdict [`check_observed_fence`] refuses with: the
-    /// request's observed pair vs the coordinator's current pair (b8ke ext
-    /// r29 F2).
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub struct ObservedFenceStale {
-        pub observed_epoch: u64,
-        pub observed_generation: u64,
-        pub current_epoch: u64,
-        pub current_generation: u64,
-    }
-
-    impl ObservedFenceStale {
-        /// The wire-facing refusal message (the typed-stale contract the
-        /// lifecycle operations answer with).
-        pub fn message(&self) -> String {
-            "the session moved to a newer ownership generation; refresh and retry".to_string()
-        }
-    }
+    /// The typed-stale wire message ([`LaneOpGuard::Refused`]'s stale arms).
+    pub const STALE_OP_GUARD_MESSAGE: &str =
+        "the session moved to a newer ownership generation; refresh and retry";
+    /// The lifecycle-in-flight / non-Live wire message.
+    pub const LIFECYCLE_OP_GUARD_MESSAGE: &str =
+        "A lifecycle operation owns this session; retry after it settles";
+    /// The terminal-owner / non-fresh-agent wire message.
+    pub const KIND_OP_GUARD_MESSAGE: &str =
+        "The session is owned by another runtime kind; reopen it as that kind instead";
 
     /// Claim; on Granted the caller wraps the result in an `OperationTicket`
     /// (Task 1's RAII guard — drop = typed fail) so a panicked spawn cannot
