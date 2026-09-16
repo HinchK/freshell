@@ -419,9 +419,28 @@ function serverProjectDirectory() {
   }
 }
 
+// Mode-scoped launch-seeding directory (kata mv9m). The two launch shapes that
+// reach seedServerDatabase differ in BOTH argv and cwd:
+//   - a serve launch is `opencode serve [--pure] --hostname H --port P`
+//     spawned with cwd: None (crates/freshell-opencode/src/serve.rs:742), so
+//     the fake's own cwd is the server root — it keeps the 504b5122a
+//     serve-lane contract (serverProjectDirectory()).
+//   - a terminal-PTY launch is `opencode [--model M] --hostname H --port N
+//     [--session <id>]` (crates/freshell-platform/src/cli_launch.rs
+//     settings_args/resume_args; base_args is empty) spawned IN the pane cwd,
+//     so process.cwd() IS the pane cwd — the pre-504b5122a contract the
+//     exact-cwd OpencodeLocator bind requires (row_is_candidate refuses any
+//     row whose normalized cwd differs from the pane cwd,
+//     crates/freshell-sessions/src/opencode_locator.rs).
+// FAKE_OPENCODE_PROJECT_CWD explicitly overrides both modes.
+function launchProjectDirectory() {
+  if (process.env.FAKE_OPENCODE_PROJECT_CWD) return process.env.FAKE_OPENCODE_PROJECT_CWD
+  return argv[0] === 'serve' ? serverProjectDirectory() : process.cwd()
+}
+
 function seedServerDatabase(rootSessionId, childSessionId) {
   const now = Date.now()
-  const directory = serverProjectDirectory()
+  const directory = launchProjectDirectory()
   const db = openDatabase()
   try {
     ensureSchema(db)

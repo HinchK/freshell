@@ -592,10 +592,21 @@ async function runRestartScenario(input: {
     expect(restoreCreates.every((message) => message.recoveryIntent === undefined)).toBe(true)
 
     if (input.includeShellPane) {
-      expect(sentMessages.some((message: any) =>
+      // The stateless shell pane must recover FRESH after the restart (never
+      // session-resumed). The pane.reconcile protocol (server capability
+      // paneReconcileV1) owns post-restart adoption and folds a shell pane to
+      // a Fresh verdict ("Row 8: shells are stateless by design",
+      // crates/freshell-ws/src/reconcile.rs) whose terminal.create is a plain
+      // fresh create — the legacy census `recoveryIntent:
+      // 'fresh_after_restore_unavailable'` latch is deliberately not-armed
+      // while reconcile is active (src/lib/terminal-restore.ts), so the
+      // truthful wire shape is a shell create that resumes nothing.
+      const shellCreates = sentMessages.filter((message: any) =>
         message?.type === 'terminal.create'
-        && message.mode === 'shell'
-        && message.recoveryIntent === 'fresh_after_restore_unavailable'
+        && message.mode === 'shell')
+      expect(shellCreates.length).toBeGreaterThan(0)
+      expect(shellCreates.every((message: any) =>
+        message.restore !== true && message.sessionRef === undefined && message.recoveryIntent === undefined
       )).toBe(true)
     }
 
@@ -871,23 +882,37 @@ test.describe('OpenCode restart recovery', () => {
       }, { timeout: TAB_REGISTRY_SYNC_INTERVAL_MS + 10_000 }).toBe(true)
 
       await restorePage.locator(`[data-context="tab"][data-tab-id="${opencodeTab.tabId}"]`).click()
-      const [afterRefresh] = await waitForRunningTerminals(restorePage, [opencodeTab.tabId], {
-        [opencodeTab.tabId]: beforeAssociation.terminalId,
-      })
+      // The pane's PTY stayed live server-side while the browser was closed
+      // (the background-session model), so pane.reconcile folds Attach for
+      // the still-live terminal ("any LIVE terminal wins",
+      // crates/freshell-ws/src/reconcile.rs) and the recovered pane
+      // reattaches to the SAME terminalId — never a second process for one
+      // session (src/lib/terminal-restore.ts's D8 single-writer invariant).
+      // The pre-pane.reconcile respawn expectation (a NEW terminalId plus a
+      // `--session` restore launch) was unreachable from 504b5122a until the
+      // fake-opencode PTY-mode directory fix restored this test's association.
+      await waitForRunningTerminals(restorePage, [opencodeTab.tabId])
+      const [afterRefresh] = await getPaneSnapshots(restorePage, [opencodeTab.tabId])
       expect(afterRefresh.sessionRef).toEqual({
         provider: 'opencode',
         sessionId: expectedSessionId,
       })
-      expect(afterRefresh.terminalId).toBeTruthy()
-      expect(afterRefresh.terminalId).not.toBe(beforeAssociation.terminalId)
-      await waitForRestoreLaunches(auditLogPath, [expectedSessionId])
+      expect(afterRefresh.terminalId).toBe(beforeAssociation.terminalId)
+      // Attach never respawns: no resume launch is minted for the recovered
+      // pane — the audit's only launch remains the original root launch.
+      const reopenAuditEvents = await readAuditEvents(auditLogPath)
+      expect(reopenAuditEvents.filter((event) => event.event === 'launch' && event.sessionArg)).toEqual([])
+      // The attach replays the live terminal's ring: the last marker sent
+      // while the browser was closed must be visible. (The launch-time ready
+      // line and the pre-close turns sit outside the 64KB replay ring after
+      // the ~216KB of deliberate overflow input above.)
       await expect.poll(async () => {
         const buffer = await restoreHarness.getTerminalBuffer(afterRefresh.terminalId!)
         return buffer ?? ''
       }, {
         timeout: 30_000,
-        message: 'expected restored hidden OpenCode pane to render terminal content after replay-window repair',
-      }).toContain(`fake opencode ready root=${expectedSessionId}`)
+        message: 'expected the reattached hidden OpenCode pane to replay the live terminal output',
+      }).toContain(hiddenAfterCloseMarker)
       await sendInputToTerminals(restorePage, [afterRefresh], 'hidden-after-refresh')
       await waitForStdinAudit(auditLogPath, [{
         tabId: opencodeTab.tabId,
