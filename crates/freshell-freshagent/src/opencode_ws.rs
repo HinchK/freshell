@@ -12598,6 +12598,127 @@ mod tests {
         );
     }
 
+    /// b8ke focused ep5 r5 F3: the unfenced-absence decision is ATOMIC
+    /// with the arm — the deterministic observe→arm race the round-5
+    /// reviewer named. The compact's pre-arm snapshot sees `Handoff`; the
+    /// handoff then COMMITS `Live{FreshAgent}` at the SAME generation
+    /// while the guard is parked in its (r4) snapshot→arm window; the
+    /// released arm succeeds over the newly established owner. Pre-r5 the
+    /// laundered pair armed and the under-guard kind check ACCEPTED the
+    /// unfenced op — the stale compact mutated the newly established
+    /// owner's session. Post-r5 the absence check runs UNDER the guard
+    /// (the arm itself proves the record was Live{FreshAgent} at arm
+    /// time): the typed FENCE_REQUIRED refusal, no mutation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unfenced_compact_racing_a_handoff_commit_into_the_arm_window_is_refused_typed() {
+        let (mut st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        insert_compact_session(&st, "ses_ep5_r5_race", Some("prov-a/mdl-x")).await;
+        let sink = seed_redoable_record(&st, "ses_ep5_r5_race").await;
+        seed_live_fresh_owner(&registry, "ses_ep5_r5_race");
+
+        // The handoff ENTERS and stays open: the record → Handoff at
+        // generation N.
+        let race_generation = match registry.begin_handoff(
+            PROVIDER,
+            "ses_ep5_r5_race",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-r5-race",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) {
+            freshell_ownership::BeginOutcome::Granted { generation } => generation,
+            other => panic!("the race handoff must grant: {other:?}"),
+        };
+
+        // Arm the interlock: the compact's guard call parks after its
+        // snapshot (which sees Handoff{N}), between the observe and the
+        // arm.
+        crate::ownership_lane::OP_GUARD_INTERLOCK.arm(PROVIDER, "ses_ep5_r5_race");
+        let driven = st.clone();
+        let task = tokio::spawn(async move {
+            driven.handle_compact(compact_msg("ses_ep5_r5_race")).await;
+        });
+        {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !crate::ownership_lane::OP_GUARD_INTERLOCK.reached() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the compact's guard never reached the interlock"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+
+        // THE RACE WINDOW: the handoff COMMITS Live{FreshAgent} at the
+        // SAME generation the snapshot saw, while the guard is parked.
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                "ses_ep5_r5_race",
+                "op-r5-race",
+                race_generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("r5-race-newer".into()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+
+        // Release the parked arm: the record is Live{FreshAgent}@N now —
+        // the laundered pair arms, and the UNFENCED decision fires UNDER
+        // the guard: the typed FENCE_REQUIRED refusal.
+        crate::ownership_lane::OP_GUARD_INTERLOCK.release();
+        let _ = task.await;
+        let mut saw_refusal = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).expect("broadcast json");
+            if frame["event"]["type"] == json!("freshAgent.error") {
+                assert_eq!(frame["event"]["code"], json!("SESSION_RESERVED"), "{frame}");
+                assert!(
+                    frame["event"]["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("re-observe"),
+                    "the refusal names the FENCE_REQUIRED contract: {frame}"
+                );
+                saw_refusal = true;
+            }
+        }
+        assert!(
+            saw_refusal,
+            "the unfenced compact racing the handoff commit into the arm \
+             window must refuse typed (FENCE_REQUIRED), never arm over the \
+             newly established owner"
+        );
+        assert!(
+            http.summarize_requests().is_empty(),
+            "the refused compact never drove the summarize POST — the newer \
+             owner's history was never mutated"
+        );
+        assert!(
+            sink.load_rollback(PROVIDER, "ses_ep5_r5_race")
+                .expect("the record survives")
+                .can_redo,
+            "the refused compact never destroyed redo"
+        );
+        // The newly established owner stands untouched.
+        let settled = registry.observe(PROVIDER, "ses_ep5_r5_race");
+        assert_eq!(settled.generation, race_generation);
+        assert!(matches!(
+            settled.state,
+            freshell_ownership::OwnershipState::Live { ref owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ));
+    }
+
     /// b8ke focused ep5 r4 F2: an UNFENCED history mutation arriving
     /// after a COMPLETED OWNERSHIP CYCLE is refused typed — never
     /// laundered into the current generation. The request was queued

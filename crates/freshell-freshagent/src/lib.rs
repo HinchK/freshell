@@ -323,48 +323,34 @@ pub mod ownership_lane {
                 };
             }
         }
-        // b8ke focused ep5 r4 F2: an UNFENCED history mutation (compact/
-        // rollback/fork — `observed == None`, the legacy client shape)
-        // against a Live{FreshAgent} key REFUSES typed — never laundered
-        // to the coordinator's CURRENT generation. The round-4 reviewer's
-        // hazard: a request queued under generation N, received after the
-        // session moved away and returned to Fresh Agent at N+2, was made
-        // indistinguishable from a current request (the laundered pair
-        // armed the guard, the stale operation mutated newer history or
-        // minted a child from it) — the later claim can detect an
-        // ownership change occurring AFTER an observation, but nothing can
-        // detect that an unfenced request was already stale ON ARRIVAL.
-        // The refusal is the actionable contract: the client re-observes
-        // the owner record and retries WITH the pair. Every OTHER state
-        // keeps the routing below (ariming at the current generation only
-        // ever feeds arms that REFUSE — the kind/lifecycle checks own
-        // them, and their typed answers stay accurate for in-flight
-        // handoffs and foreign kinds).
-        if observed.is_none() {
-            if let freshell_ownership::OwnershipState::Live { ref owner, .. } = snap.state {
-                if owner.kind == RuntimeOwnerKind::FreshAgent {
-                    tracing::warn!(target: "freshell_ownership",
-                        operation_id = %operation_id, provider = %provider,
-                        session_id = %session_id, initiator,
-                        current_epoch = snap.epoch, current_generation = snap.generation,
-                        event = "ownership.op_guard.refused",
-                        outcome = "refused", failure_reason = "FENCE_REQUIRED",
-                        "the op guard refused to arm (the history mutation carried no \
-                         observed pair against a live fresh-agent owner) — the operation \
-                         aborts typed; the client re-observes and retries with the pair"
-                    );
-                    return LaneOpGuard::Refused {
-                        message: FENCE_REQUIRED_OP_GUARD_MESSAGE.to_string(),
-                    };
-                }
-            }
-        }
-        // A legacy-unfenced request against every OTHER state routes
-        // through the SAME guard with the coordinator's current pair —
-        // captured here, validated atomically at arm time (the guard then
-        // blocks any handoff that arrives after, so the pair can never go
-        // stale under the mutation; and the under-guard kind/lifecycle
-        // verification below refuses these states typed anyway).
+        // b8ke focused ep5 r4 F2 + ep5 r5 F3: an UNFENCED history mutation
+        // (compact/rollback/fork — `observed == None`, the legacy client
+        // shape) REFUSES typed — never laundered to the coordinator's
+        // CURRENT generation. The round-4 reviewer's hazard: a request
+        // queued under generation N, received after the session moved away
+        // and returned to Fresh Agent at N+2, was made indistinguishable
+        // from a current request (the laundered pair armed the guard, the
+        // stale operation mutated newer history or minted a child from
+        // it) — the later claim can detect an ownership change occurring
+        // AFTER an observation, but nothing can detect that an unfenced
+        // request was already stale ON ARRIVAL. The refusal is the
+        // actionable contract: the client re-observes the owner record and
+        // retries WITH the pair.
+        //
+        // ep5 r5 F3: the absence decision moved OUT of this pre-arm
+        // snapshot INTO the ARMED branch below — the snapshot was a
+        // TOCTOU: it could see `Handoff`, the handoff then commit or
+        // restore `Live{FreshAgent}` at the SAME generation before the
+        // arm call, and the laundered pair armed successfully over the
+        // newly established owner. An ARMED attach guard proves the record
+        // was `Live{FreshAgent}` AT ARM TIME (the coordinator's own
+        // atomic decision), so deciding the absence UNDER the guard is
+        // race-free: whichever way the pre-arm snapshot went, an unfenced
+        // op that arms is refused, and an op over any non-Live state is
+        // refused by the arm itself (the accurate LIFECYCLE/STALE answers
+        // for in-flight handoffs and moved-on keys).
+        #[cfg(test)]
+        OP_GUARD_INTERLOCK.wait_if_targeted(provider, session_id);
         let observed_generation = observed
             .map(|fence| fence.generation)
             .unwrap_or(snap.generation);
@@ -377,6 +363,35 @@ pub mod ownership_lane {
         ) {
             freshell_ownership::AttachGuardOutcome::Armed(guard) => {
                 let guard = *guard;
+                // b8ke focused ep5 r5 F3: THE UNFENCED DECISION, UNDER THE
+                // GUARD. An armed attach guard proves the record was
+                // `Live{FreshAgent}` AT ARM TIME (the coordinator's atomic
+                // decision) — so an unfenced history mutation that armed is
+                // refused HERE regardless of what the pre-arm snapshot
+                // saw: the r4 snapshot-based refusal missed the window
+                // where the snapshot saw `Handoff` and the handoff
+                // committed `Live{FreshAgent}` at the same generation
+                // before the arm — the laundered pair armed over the
+                // newly established owner and the stale op mutated it.
+                if observed.is_none() {
+                    let under = registry.observe(provider, session_id);
+                    tracing::warn!(target: "freshell_ownership",
+                        operation_id = %operation_id, provider = %provider,
+                        session_id = %session_id, initiator,
+                        epoch = under.epoch, generation = under.generation,
+                        state = ?under.state,
+                        event = "ownership.op_guard.refused",
+                        outcome = "refused", failure_reason = "FENCE_REQUIRED",
+                        "the op guard refused the unfenced history mutation under the \
+                         armed guard (the record was Live{{FreshAgent}} at arm time) — \
+                         the operation aborts typed; the client re-observes and \
+                         retries with the pair"
+                    );
+                    drop(guard);
+                    return LaneOpGuard::Refused {
+                        message: FENCE_REQUIRED_OP_GUARD_MESSAGE.to_string(),
+                    };
+                }
                 // Verify `Live{FreshAgent}` UNDER the guard — stable now
                 // (lifecycle begins answer Blocked while it is held): a
                 // current-generation request over a TERMINAL-owned key (a
@@ -453,6 +468,71 @@ pub mod ownership_lane {
     pub const FENCE_REQUIRED_OP_GUARD_MESSAGE: &str =
         "the request carried no observed ownership pair; re-observe the session's \
          owner record and retry";
+
+    /// b8ke focused ep5 r5 F3 (test-only): the op guard's deterministic
+    /// INTERLOCK — parks the guard's pre-arm sequence for ONE targeted
+    /// (provider, session_id) so a test can drive the observe→arm race
+    /// window deterministically (the snapshot sees one state; the test moves
+    /// the coordinator; the released arm sees another). Targeted by key so
+    /// concurrent tests' guard calls pass through untouched.
+    #[cfg(test)]
+    pub(crate) static OP_GUARD_INTERLOCK: OpGuardInterlock = OpGuardInterlock {
+        target: std::sync::Mutex::new(None),
+        reached: std::sync::atomic::AtomicBool::new(false),
+        gate: std::sync::Mutex::new(false),
+        cv: std::sync::Condvar::new(),
+    };
+
+    #[cfg(test)]
+    pub(crate) struct OpGuardInterlock {
+        target: std::sync::Mutex<Option<(String, String)>>,
+        reached: std::sync::atomic::AtomicBool,
+        gate: std::sync::Mutex<bool>,
+        cv: std::sync::Condvar,
+    }
+
+    #[cfg(test)]
+    impl OpGuardInterlock {
+        /// Arm the park for one (provider, session_id) — only that key parks.
+        /// Re-arming resets the arrival flag (a fresh park window).
+        pub(crate) fn arm(&self, provider: &str, session_id: &str) {
+            *self.target.lock().expect("interlock target") =
+                Some((provider.to_string(), session_id.to_string()));
+            self.reached
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        /// Has the targeted guard call reached the park?
+        pub(crate) fn reached(&self) -> bool {
+            self.reached.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Release the parked call and disarm the interlock (idempotent).
+        pub(crate) fn release(&self) {
+            *self.target.lock().expect("interlock target") = None;
+            let mut gate = self.gate.lock().expect("interlock gate");
+            *gate = true;
+            self.cv.notify_all();
+        }
+
+        fn wait_if_targeted(&self, provider: &str, session_id: &str) {
+            let targeted = self
+                .target
+                .lock()
+                .expect("interlock target")
+                .as_ref()
+                .is_some_and(|(p, s)| p == provider && s == session_id);
+            if !targeted {
+                return;
+            }
+            self.reached
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut gate = self.gate.lock().expect("interlock gate");
+            while !*gate {
+                gate = self.cv.wait(gate).expect("interlock condvar");
+            }
+        }
+    }
 
     /// Claim; on Granted the caller wraps the result in an `OperationTicket`
     /// (Task 1's RAII guard — drop = typed fail) so a panicked spawn cannot
