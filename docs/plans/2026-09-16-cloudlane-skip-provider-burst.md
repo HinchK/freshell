@@ -933,22 +933,31 @@ Expected: PASS. Known pre-existing exception: the kata-hsrh rust budget flake (`
 
 - [ ] **Step 3: Run the LOCAL full lane twice at HEAD (the lane where the burst reproduced)**
 
-Run (twice, sequentially; each ~25-30 min on the 96-core host):
+Run (twice, sequentially; each ~25-30 min on the 96-core host). Logs go to the run's durable reports directory under run-scoped names — never shared fixed `/tmp` names (plan review round 2, Finding 1):
 
 ```bash
-npm run test:e2e:local > /tmp/e2e-gate-local-1.log 2>&1; echo "exit=$?"
-npm run test:e2e:local > /tmp/e2e-gate-local-2.log 2>&1; echo "exit=$?"
+LOGS=/home/dan/code/freshell/.worktrees/.the-usual-logs/cloudlane-skip-provider-burst/reports
+npm run test:e2e:local > "$LOGS/gate-e2e-local-1.log" 2>&1; echo "exit=$?"
 ```
 
-Expected: exit=0 on both runs, or exit=1 with every terminal failure OUTSIDE the named burst families and dispositioned per Step 6. Specifically: ZERO terminal failures in opencode-restart-recovery, freshopencode-db-history, freshopencode-first-send-reload-repro, fresh-agent.spec.ts, fresh-agent-centralization-smoke. Each receipt quotes the log's own banner line (post-Task-1: `[e2e-cloud] Running locally... (config: test/e2e-browser/playwright.config.ts; CLOUD_SKIP_SPECS does not apply on this lane; ...)`) as lane provenance. Two consecutive clean-of-burst runs match the campaign's repeat standard for load-correlated flakes.
+**Durability rule (binding):** immediately after EACH lane exits — before any other gate command runs — write that lane's own receipt to `$LOGS/gate-e2e-local-1.md` (and `-2.md` for the second run), recording the command, the exit code, the lane banner line quoted from the log itself (post-Task-1: `[e2e-cloud] Running locally... (config: test/e2e-browser/playwright.config.ts; CLOUD_SKIP_SPECS does not apply on this lane; ...)`), and the pass/fail counts. Step 6 later EXTENDS these receipts with outcome classifications; it never back-fills evidence that did not already land durably.
+
+Then the second run, same procedure:
+
+```bash
+npm run test:e2e:local > "$LOGS/gate-e2e-local-2.log" 2>&1; echo "exit=$?"
+```
+
+Expected: exit=0 on both runs, or exit=1 with every terminal failure OUTSIDE the named burst families and dispositioned per Step 6. Specifically: ZERO terminal failures in opencode-restart-recovery, freshopencode-db-history, freshopencode-first-send-reload-repro, fresh-agent.spec.ts, fresh-agent-centralization-smoke. Two consecutive clean-of-burst runs match the campaign's repeat standard for load-correlated flakes.
 
 - [ ] **Step 4: Run one real CLOUD full lane at HEAD (backend pinned explicitly)**
 
-Run:
+Run (same durability rule — log to the run-scoped durable path, write `gate-e2e-cloud-1.md` immediately after exit, before any further gate command):
 
 ```bash
+LOGS=/home/dan/code/freshell/.worktrees/.the-usual-logs/cloudlane-skip-provider-burst/reports
 FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com \
-  npm run test:e2e:cloud > /tmp/e2e-gate-cloud-1.log 2>&1; echo "exit=$?"
+  npm run test:e2e:cloud > "$LOGS/gate-e2e-cloud-1.log" 2>&1; echo "exit=$?"
 ```
 
 (The wrapper's default shards=1 is the campaign's practiced cloud gate shape — baseline B. The image is content-addressed to the HEAD commit and builds once.)
@@ -957,23 +966,27 @@ Expected: exit=0 with a zero-flake receipt — the wrapper fails the run on ANY 
 
 - [ ] **Step 5: Focused reruns of the affected specs on both lanes**
 
-Local (all five deflaked files):
+Local (all five deflaked files; same durability rule as Steps 3-4 — run-scoped durable log, receipt written immediately after exit):
 
 ```bash
+LOGS=/home/dan/code/freshell/.worktrees/.the-usual-logs/cloudlane-skip-provider-burst/reports
 npm run test:e2e:local -- test/e2e-browser/specs/freshopencode-db-history.spec.ts \
   test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts \
   test/e2e-browser/specs/opencode-restart-recovery.spec.ts \
   test/e2e-browser/specs/fresh-agent.spec.ts \
-  test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts
+  test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts \
+  > "$LOGS/gate-focused-local.log" 2>&1; echo "exit=$?"
 ```
 
 Expected: PASS (all five files; note the first local invocation pays the globalSetup client+Rust build).
 
-Cloud (the cloud-legal member only):
+Cloud (the cloud-legal member only; same durability rule):
 
 ```bash
+LOGS=/home/dan/code/freshell/.worktrees/.the-usual-logs/cloudlane-skip-provider-burst/reports
 FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com \
-  npm run test:e2e:cloud -- test/e2e-browser/specs/fresh-agent.spec.ts
+  npm run test:e2e:cloud -- test/e2e-browser/specs/fresh-agent.spec.ts \
+  > "$LOGS/gate-focused-cloud.log" 2>&1; echo "exit=$?"
 ```
 
 Expected: PASS (the ~25 fresh-agent tests).
@@ -999,7 +1012,7 @@ Then apply the disposition mechanics to everything that is not class (a):
 
 Ledger katas available for pre-existing disposition: hsrh (rust session-init budget under full-suite load), d4qm, nxf6, m8pd (standing cloud-evidenced e2e retry flakes), j96j-class receipts, 38hj/5kyg/ebp6 (campaign baseline). The four singleton flickers (freshclaude-identity-persistence:528, pane-ledger-restart:265, fresh-agent-control-rust:1193, truly-idle:73) are pre-recorded as within-family variance / ledger residuals — a Form A reproduction or a within-family disposition covers a recurrence; a SECOND consecutive recurrence of any singleton escalates it to a new kata filing in the recap (not a fix in this run).
 
-Write the gate receipts to `<logs_dir>/reports/` (e.g. `gate-e2e-local-1.md`, `gate-e2e-local-2.md`, `gate-e2e-cloud-1.md`, `gate-focused.md`): each receipt records the command, the exit code, the lane banner line quoted from the log itself, the pass/fail counts, and — for every failure or recovered retry — its classification class plus the Form A/B evidence or burst-family absence proof; focused cloud lines touching skip-listed families record `0 tests selected (expected)` per Step 5, never as coverage.
+Write the focused-rerun receipts the same way (durable, run-scoped, immediately after each exits): `gate-focused-local.md`, `gate-focused-cloud.md`. Then, with ALL lane receipts already durably written per-step, this step EXTENDS each receipt with its classification content: for every failure or recovered retry, its classification class plus the Form A/B evidence or burst-family absence proof; focused cloud lines touching skip-listed families record `0 tests selected (expected)` per Step 5, never as coverage.
 
 - [ ] **Step 7: Confirm the worktree is clean and push the branch**
 
@@ -1011,3 +1024,5 @@ git push -u origin the-usual/cloudlane-skip-provider-burst
 (The push runs the pre-push gate's cheap checks — cargo fmt/typecheck/clippy filtered by what the push changes; a test-file-only push should be a no-op there. Bypassing with `--no-verify` is NOT authorized for this run.)
 
 Landing: PR creation and merge happen ONLY under the campaign pre-approval — after this run's delta review finishes PASSED, open the PR targeting `main`, wait for required checks, merge, fast-forward local `main` from `origin/main`, and clean up the worktree. If the delta review does not finish PASSED, stop and ask the user before merging. Do not create the PR before that verdict.
+
+**Definitive-gate ordering rule (plan review round 2, Finding 2):** this task's gate evidence is the EXECUTION gate — it proves the plan's implementation, not the final review state. The DEFINITIVE full-HEAD gate is the delta-review stage's own full-suite gate, per the-usual Stage 5: after the delta review loop ends, if ANY review-fix commit landed after this task's Step 7 push, the full-suite gate (standard suite + the full e2e lanes of this task, same commands, fresh run-scoped receipts) reruns ONCE at the final HEAD before the PR is created; if NO review-fix commit landed (HEAD unchanged from this task's gate), this task's receipts remain the final-HEAD evidence and no rerun is needed. The User Request's constraint ("full e2e-lane gate at the run HEAD") is satisfied by the LATER of the two — the PR may never carry lane receipts attached to a HEAD older than the PR's own branch tip.
