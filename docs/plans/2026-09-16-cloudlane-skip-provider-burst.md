@@ -406,94 +406,94 @@ git add test/e2e-browser/playwright.cloud.config.ts test/e2e-browser/helpers/sel
 git commit -m "test(e2e): pin cloud-lane selection integrity; truthful skip-reason comments (kata 67jt)"
 ```
 
-### Task 3: freshopencode-db-history deflake — strict-mode-safe locators + load-tolerant budgets (kata 5prk)
+### Task 3: freshopencode-db-history deflake (kata 5prk) — AMENDED after the first implementation attempt's evidence
+
+**Amendment provenance (2026-09-16):** the first implementer (report: `<git-dir>/usual-sdd/task-003-report.md`, no commit — worktree reverted clean at a1cd9f437) live-proved the locator treatment AND discovered that two of the spec's three tests have been DETERMINISTICALLY red since 2026-06-15: their audit assertions await the fake's CLI `opencode run` audit event, a delivery path retired by 56c55ac97 ("rewrite adapter create+send over opencode serve HTTP/SSE") — the product is serve-only (Rust: `opencode_ws.rs` `create_session` → `prompt_async`, serve.rs; no `Command::new(... run ...)` anywhere in crates/). The spec is CLOUD_SKIP_SPECS-listed, so the cloud gate never runs it and no focused measurement ever surfaced the break (the Sept-16 lane failures fired at earlier assertions first: the strict-mode violation at :284 and the run-audit poll timeout at :356-362 ARE the stale layer under load, not starvation). Test :379's placeholder-repair pipeline additionally does not complete even unloaded at 60s (pane never adopts the seeded session; sidebar discovery works) — cause un-diagnosed (test-setup drift vs product regression). The lane evidence therefore conflated TWO layers: the load-dependent strict-mode flake (real, fixed below) and a pre-existing deterministic stale-contract layer (Form A at base_ref by construction — it reproduces anywhere, any load). Spot-verified by the orchestrator: the fake's serve flow writes `prompt_async` audit events carrying the prompt text (fake-opencode.cjs:1244-1254); the fake retains the retired `run` subcommand (fake-opencode.cjs:588-595) which nothing invokes.
 
 **Files:**
-- Modify: `test/e2e-browser/specs/freshopencode-db-history.spec.ts:283-284` (test :245, first leg), `:304-305` (test :245, post-reload leg), `:359` (test :324, run-audit poll budget), `:461-462` (test :379, repair-path render)
-- Test: the spec itself (the e2e run is the behavior-protecting test — no unit harness exists for browser locators, and a static/prose check would not qualify)
+- Modify: `test/e2e-browser/specs/freshopencode-db-history.spec.ts` — `:283-284` (test :245 first leg, scoped locator + forced-ambiguity poll), `:304-305` (test :245 post-reload leg, scoped locator), `:315-316` (test :245 audit pair, re-specified to the serve contract), test :324 (serve-era investigation + rewrite or class-(f) disposition), `:461-462` (test :379, scoped locator + diagnosis with retained logs)
+- Test: the spec itself (the e2e run is the behavior-protecting test)
 
 **Interfaces:**
-- Consumes: the spec's own donor helpers (`getFreshOpencodePaneState`, `sendFreshAgentPrompt`, `installFakeOpencode`, `seedLegacyOpencodeSession`) and the fake-opencode PATH seam; the app's auto-title pipeline (first prompt copied into tab/pane/session titles — the documented behavior that produced the observed strict-mode violation).
-- Produces: nothing cross-task. All changes stay inside this spec file; the describe's declared `test.setTimeout(180_000)` (:243) is untouched.
+- Consumes: the spec's own donor helpers (`getFreshOpencodePaneState`, `sendFreshAgentPrompt`, `installFakeOpencode`, `seedLegacyOpencodeSession`); the fake-opencode PATH seam; the app's auto-title pipeline (first prompt copied into tab/pane/session titles — the documented behavior that produced the observed strict-mode violation); the fake's `prompt_async` audit event (serve-era delivery proof).
+- Produces: nothing cross-task. All changes stay inside this spec file; the describe's declared `test.setTimeout(180_000)` (:243) is untouched. NO production/server change is in this task's scope — if :379's diagnosis shows a product regression, it is kata-filed and class-(f) dispositioned, NOT fixed here.
 
-**Diagnosis being fixed (from `reports/plan-provider-burst.md` §2.2):** test :245 failed at :284 with a strict-mode violation — bare `getByText(prompt)` resolved to 3-4 elements (tab-strip span, pane-header title, sidebar session button, transcript `<p>`) once the auto-title pipeline landed; under load the title sweep wins the race, unloaded it usually loses. Tests :324/:379 failed as 30s pipeline-starvation timeouts (run-audit poll :356-362; DB-render visibility :461).
+- [ ] **Step 1: Restore the validated locator treatment (RED first)**
 
-- [ ] **Step 1: Write the failing behavioral test (deterministic repro of the strict-mode hazard)**
-
-In test :245, insert a forced-ambiguity poll immediately before the current `:284` assertion, leaving the bare locator in place for now:
+Re-apply the first implementer's reverted diff (report §1, byte-for-byte) in two parts. First the forced-ambiguity poll before the current `:284` bare assertion, and run the focused test to observe the strict-mode red OR its documented contingency:
 
 ```ts
       await expect(page.getByText(response)).toBeVisible({ timeout: 30_000 })
-      // Force the auto-title pipeline's propagation before asserting: the
-      // first prompt is copied into the tab/pane/session titles (under
-      // full-lane load this made the bare getByText below resolve to 3-4
-      // elements — the strict-mode violation this spec terminally failed
-      // on). Waiting for the propagation makes the ambiguity deterministic
-      // instead of load-dependent, so the transcript-scoped locator that
-      // replaces this assertion is exercised against the real condition
-      // every run.
       await expect.poll(async () => page.getByText(prompt).count(), { timeout: 30_000 }).toBeGreaterThan(1)
       await expect(page.getByText(prompt)).toBeVisible({ timeout: 30_000 })
 ```
 
-- [ ] **Step 2: Run the test and verify the intended failure**
-
 Run: `npm run test:e2e:local -- test/e2e-browser/specs/freshopencode-db-history.spec.ts --grep "restores Freshopencode turns from DB history"`
 
-Expected: FAIL — once the count-poll observes propagation (`count() > 1`), the bare `getByText(prompt)` assertion throws the exact lane failure: a Playwright strict-mode violation ("resolved to 3 elements" class). This reproduces the terminal lane failure deterministically and focusedly. Contingency: if the count-poll itself times out focusedly (propagation does not land within 30s unloaded), do not chase it — record the observation, revert the poll, and proceed with the locator fix using the lane-log evidence as the red (the scoped locator remains correct under either outcome); note it in the task receipt.
+Expected: FAIL — the count-poll proves propagation live; the bare assertion throws the lane's strict-mode violation when the title sweep wins, OR (documented by the first attempt, unloaded) the durable session title overwrites the prompt title before the bare assertion re-queries and the test proceeds to the stale-audit failure at :326 — in that case the lane-log strict-mode red (quoted in the first attempt's report §2.2) stands as the locator red; record which branch you observed. Do NOT delete the poll: it stays permanently (it makes the ambiguity condition deterministic for every future run).
 
-- [ ] **Step 3: Add the minimal production implementation (scoped locators + budget raises)**
+- [ ] **Step 2: Scoped locators (GREEN for the locator layer)**
 
-1. Replace the bare prompt assertion at :284 with the transcript-scoped locator (the idiom this spec's sibling repro already uses at freshopencode-first-send-reload-repro.spec.ts:171-172):
+Replace the bare prompt assertions with the transcript-scoped locator (the sibling repro's idiom) — both `:284` legs in test :245:
 
 ```ts
       const transcript = page.locator('[data-context="fresh-agent-transcript"]')
       await expect(transcript.getByText(prompt, { exact: true })).toBeVisible({ timeout: 30_000 })
 ```
 
-2. Same test, post-reload leg — replace the bare prompt assertion at :304 (the persisted tab title already holds the prompt after reload, so the ambiguity is inherent there):
+and the post-reload leg at `:304`:
 
 ```ts
       await expect(transcript.getByText(prompt, { exact: true })).toBeVisible({ timeout: 30_000 })
 ```
 
-(the `transcript` locator is lazy and re-queries after the reload; keep the response assertion at :305 unchanged — response text never propagates to titles).
+- [ ] **Step 3: Re-specify test :245's audit pair to the serve contract (the retired `run` event is architecturally impossible)**
 
-3. Test :324 — raise the run-audit poll budget at :359 from `{ timeout: 30_000 }` to `{ timeout: 60_000 }` (the observed failure was `Received: null / Timeout 30000ms exceeded` waiting for the fake's `run` audit event; the 180s envelope has room).
-
-4. Test :379 — replace the bare prompt assertion at :461 with the scoped locator and raise its budget (the observed failure was a pipeline-starvation timeout at 30s):
+At `:315-316` (HEAD numbering), replace the stale pair —
 
 ```ts
-      const transcript = page.locator('[data-context="fresh-agent-transcript"]')
-      await expect(transcript.getByText(prompt, { exact: true })).toBeVisible({ timeout: 60_000 })
+      expect(auditEvents.some((event) => event.event === 'run' && event.prompt === prompt)).toBe(true)
+      expect(auditEvents.some((event) => event.event === 'export')).toBe(false)
 ```
 
-(keep the response assertion at :462 at its current 30s — it never failed).
+— with the serve-era equivalent (delivery proof: the fake writes `prompt_async` carrying the prompt text on the real turn path):
 
-- [ ] **Step 4: Run the focused test**
+```ts
+      expect(auditEvents.some((event) => event.event === 'prompt_async' && event.prompt === prompt)).toBe(true)
+      expect(auditEvents.some((event) => event.event === 'export')).toBe(false)
+      expect(auditEvents.some((event) => event.event === 'run')).toBe(false)
+```
+
+(The added third assertion pins the RETIREMENT itself: a serve-era turn must never write the CLI `run` event — the test now protects the current contract in both directions.) Run the focused test; expected: test :245 now passes end-to-end. If the `prompt_async` event's shape differs (read fake-opencode.cjs:1244-1258 first and match the real field names), adapt the assertion to the actual serve contract and record the adaptation — never loosen to a vacuous check (e.g., do not drop the prompt-equality).
+
+- [ ] **Step 4: Test :324 — investigate the serve-era guarantee, then rewrite or disposition**
+
+Test :324's premise (CLI `run` output omitting the top-level sessionID; the pane must not infer session ids from DB rows) tests the retired CLI path. Investigate whether the underlying GUARANTEE has a serve-era equivalent: read the Rust placeholder/session-id rules (`crates/freshell-opencode/src/opencode_ws.rs` — session materialization, placeholder resolution, DB-row adoption rules) and the test's own seeding to determine what "never materialize from DB rows without a session id" means post-56c55ac97.
+
+- If a serve-era equivalent guarantee exists: rewrite the test around it (keep the test's protective intent: a pane must not adopt a DB session it was never bound to), with the same audit-shape honesty as Step 3 (assert the real events, both directions where meaningful). Run focused; expected PASS.
+- If NO equivalent guarantee exists (the guarantee itself was part of the retired CLI contract): the test protects nothing in the current product — record that finding with code citations, leave the test failing as-is, and disposition it class (f) (Task 8's amended table). Do NOT delete or skip the test in this run (coverage-reduction requires the user's decision — the recap asks).
+
+- [ ] **Step 5: Test :379 — diagnose with retained logs, then fix-or-disposition**
+
+Re-apply the scoped locator at `:461` (the same transcript idiom; keep the `:462` response assertion unchanged). Then diagnose why the placeholder-repair pipeline stalls (first attempt's evidence: sidebar row discovered, pane never adopts the seeded session, no alert, 60s insufficient even unloaded). Retain the Rust server log this run: before the spec's `finally` cleanup removes the tmp root, copy the server's logDir contents into the test-results dir (or run once with `FRESHELL_LOG_DIR` pointing at a retained path) — the first attempt flagged log loss as the gap. Read the logs against `crates/freshell-opencode` placeholder/repair code paths.
+
+- If the diagnosis shows TEST-SIDE drift (the June-era dispatched pane content shape no longer matches today's repair contract — the server expects a different placeholder/sessionRef shape than the test seeds): fix the test's seeding to the current contract; run focused; expected PASS.
+- If the diagnosis shows a PRODUCT regression (the server should repair the placeholder but doesn't): do NOT fix production in this task — file a kata (product bug, new family, with the log evidence), leave the test failing as-is, disposition class (f), and record the kata ID in the task receipt and progress ledger.
+
+- [ ] **Step 6: Run the focused spec and record the honest per-test outcome**
 
 Run: `npm run test:e2e:local -- test/e2e-browser/specs/freshopencode-db-history.spec.ts`
 
-Expected: PASS — all three tests, with the forced-ambiguity poll still in place: the count-poll proves propagation landed, and the scoped locator matches exactly the transcript `<p>` even while the tab/pane/session titles hold the prompt.
-
-- [ ] **Step 5: Refactor while green**
-
-No refactor needed — the forced-ambiguity poll is deliberate test structure (it converts a load-dependent race into a deterministic condition), and the scoped-locator idiom now matches the sibling repro spec.
-
-- [ ] **Step 6: Run impacted-test verification**
-
-The change is file-local: no shared helper, fixture, config, or wiring is touched, so the impacted set is the spec's own full focused run (Step 4 runs all three tests, not just the edited one — `getFreshOpencodePaneState`/`sendFreshAgentPrompt` here are this file's own copies, and no other spec imports from this file). The spec is cloud-skip-listed, so no cloud rerun applies — its coverage lane is local, per the accepted tradeoff.
-
-Run: (Step 4's command is the complete impacted set.)
-
-Expected: PASS
+Expected: test :245 PASS (locator + serve-era audit contract). Tests :324/:379: PASS if Steps 4/5 landed a serve-era rewrite/test-side fix; otherwise FAILED with the class-(f) disposition recorded per Step 4/5 (the task still commits — the locator layer and the audit re-spec are complete, verified work; the receipts must state exactly which legs pass and which are class-(f) with their evidence paths).
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
 git add test/e2e-browser/specs/freshopencode-db-history.spec.ts
-git commit -m "test(e2e): deflake freshopencode-db-history (scoped transcript locators, forced-ambiguity poll, 60s pipeline budgets)"
+git commit -m "test(e2e): deflake freshopencode-db-history flake layer (scoped locators, forced-ambiguity poll) + re-specify the audit pair to the serve contract (kata 5prk)"
 ```
+
+(If Steps 4/5 produced dispositions rather than rewrites, the commit message stays the same — the receipt, not the message, carries the per-leg outcomes.)
 
 ### Task 4: freshopencode-first-send deflake — poll the status broadcast instead of a one-shot read (kata 5prk)
 
@@ -1044,6 +1044,7 @@ Classify FIRST against this table (every observed outcome class, per the LB-7 fi
 | (c) | recovered retry in a standing ledger family (d4qm / nxf6 / m8pd-class) | pre-existing exit-1 item under Form A — it fails the zero-flake receipt but is dispositioned pre-existing, recorded, NOT blocking |
 | (d) | singleton flicker (freshclaude-identity-persistence-rust:528, pane-ledger-restart-rust:265, fresh-agent-control-rust:1193, truly-idle-alerting:73) | ledger residual — Form A reproduction or within-family disposition covers a recurrence; a SECOND consecutive recurrence escalates to a new kata filing in the recap (not a fix in this run) |
 | (e) | any other/new family (terminal or retry, either lane) | investigate + Form A/B disposition BEFORE accepting — a new family is never automatically pre-existing |
+| (f) | deterministic pre-existing failure in a NAMED family's non-flake layer (execution-discovered: e.g. freshopencode-db-history's stale CLI-`run` audit assertions, terminally red since 56c55ac97 retired the CLI path; and :379's placeholder-repair stall if diagnosed as product regression) | pre-existing deterministic break, NOT a load flake — Form A by construction (reproduces at base_ref, any load); the flake layer of the same family IS expected green post-fix; kata-filed for a dedicated modernization/repair run; recorded with its evidence path and PROMINENTLY listed in the recap for the user's follow-up decision. Such a leg does NOT fail this run's gate, and is NEVER silently skipped or deleted |
 
 Then apply the disposition mechanics to everything that is not class (a):
 
