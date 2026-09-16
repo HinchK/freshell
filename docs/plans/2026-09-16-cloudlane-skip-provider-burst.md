@@ -74,14 +74,14 @@ The four singleton flickers — `freshclaude-identity-persistence-rust.spec.ts:5
 1. Cargo-lock noise: 464 "Blocking waiting for file lock" events + 108 release builds during local full-lane runs (per-worker `ensureRustServerBuilt()`). A latent amplifier for every flake family; deserves its own kata (e.g. a local-lane prebuild). Not this run's scope.
 2. `docker/cloud-run/test-durations.txt` carries stale entries for skip-listed specs — harmless (discovery governs); cosmetic hygiene only.
 3. AGENTS.md:188 says cloud e2e runs are "4 shards" while `npm run test:e2e` defaults to shards=1 (the campaign's practiced cloud gate shape). OPTIONAL doc nit; not required by the User Request (the gate pins its lane explicitly regardless). Likewise OPTIONAL: a one-sentence AGENTS.md note that non-interactive agent shells do not inherit `~/.bashrc` exports. The recap may list both as suggestions.
-4. The cloud banner's `Config:` line (Task 1) has no automated test (stubbing the full gcloud path is disproportionate); it is proven by Task 8's real cloud run receipt.
-5. The container entrypoint's bash manifest (docker/cloud-run/entrypoint.sh:181-197) is deliberately NOT unit-tested: it is a pure function of the cloud config's `--list` output, which Task 2's pins prove clean (testIgnore removes skip-listed files before the list prints, so the sed extractor cannot surface them); the Dockerfile's build-time entrypoint smoke (docker/cloud-run/Dockerfile:129-132) covers execution shape. A bash-side skip-list guard (explorer A's Candidate C) was considered and rejected — it would be a second, sync-hazard encoding of the skip list with no new guarantee. `docker/cloud-run/entrypoint.sh` is read-only for this run.
+4. The container entrypoint's bash manifest (docker/cloud-run/entrypoint.sh:181-197) is deliberately NOT unit-tested: it is a pure function of the cloud config's `--list` output, which Task 2's pins prove clean (testIgnore removes skip-listed files before the list prints, so the sed extractor cannot surface them); the Dockerfile's build-time entrypoint smoke (docker/cloud-run/Dockerfile:129-132) covers execution shape. A bash-side skip-list guard (explorer A's Candidate C) was considered and rejected — it would be a second, sync-hazard encoding of the skip list with no new guarantee. `docker/cloud-run/entrypoint.sh` is read-only for this run. (The cloud banner's `Config:` line WAS originally listed here as untested; plan review round 1 Finding 2 corrected that — Task 1 now asserts it in `scripts/test/cloud-run-wrapper.test.sh`'s stubbed cloud path, so it is no longer a residual.)
 
 ## File responsibilities (the complete change map)
 
 | File | Responsibility in this run |
 |---|---|
 | `scripts/e2e-cloud.sh` (modify :460-466, :511-515) | Lane-provenance banners ONLY. No change to backend resolution, arg normalization, receipt logic, or job lifecycle. |
+| `scripts/test/cloud-run-wrapper.test.sh` (modify — add cloud `Config:` provenance check) | Automated assertion of the cloud-path banner line in the suite's existing stubbed-cloud output (plan review round 1, Finding 2). |
 | `test/e2e-browser/helpers/e2e-cloud-lane-banner.test.ts` (create) | Behavior pin of the wrapper's default-local path: self-identifying banner + the base-config exec, via a stubbed `npx` that records its args. |
 | `test/e2e-browser/playwright.cloud.config.ts` (modify :31-33, :45-46, :72) | Export `CLOUD_SKIP_TITLES` (additive; consumed by the selection pins) + truthful skip-reason comments. NO membership changes. |
 | `test/e2e-browser/helpers/selection-nonvacuity.test.ts` (modify) | Selection-integrity pins (kata 67jt's tested contract). |
@@ -100,11 +100,12 @@ No `src/`, `crates/`, `docker/`, or config/vite changes. No user-facing UI chang
 
 **Files:**
 - Modify: `scripts/e2e-cloud.sh:461` (local-path banner) and `scripts/e2e-cloud.sh:511-515` (cloud banner block)
+- Modify: `scripts/test/cloud-run-wrapper.test.sh` (add a cloud-path `Config:` banner assertion to the existing stubbed-cloud checks)
 - Test: `test/e2e-browser/helpers/e2e-cloud-lane-banner.test.ts` (new)
 
 **Interfaces:**
 - Consumes: `scripts/e2e-cloud.sh` `cmd_run` backend resolution (:449-458) and local exec path (:460-466); package.json script entries `test:e2e:local` / `test:e2e:cloud` (package.json:76-77).
-- Produces: the lane-provenance banner contract consumed by every Task 8 receipt — local runs print one stdout line beginning `[e2e-cloud] Running locally... (config: test/e2e-browser/playwright.config.ts; CLOUD_SKIP_SPECS does not apply on this lane; FRESHELL_E2E_BACKEND=<value or <unset>>)`; cloud runs print a `Config:` line naming `playwright.cloud.config.ts`. CONSUMER CONSTRAINT (LB-4, see `reports/load-bearing-finder.md`): `scripts/test/cloud-run-wrapper.test.sh` DOES parse this output — its checks 9 (:127) and 10 (:146) grep the local-path output for the substring `Running locally`, and check 11 (:212) asserts that substring's ABSENCE on the cloud path. The banner design must therefore preserve the exact `Running locally` substring verbatim; additions after it are safe (all the suite's greps are substring matches on the preserved prefix).
+- Produces: the lane-provenance banner contract consumed by every Task 8 receipt — local runs print one stdout line beginning `[e2e-cloud] Running locally... (config: test/e2e-browser/playwright.config.ts; CLOUD_SKIP_SPECS does not apply on this lane; FRESHELL_E2E_BACKEND=<value or <unset>>)`; cloud runs print a `Config:` line naming `playwright.cloud.config.ts`. CONSUMER CONSTRAINT (LB-4, see `reports/load-bearing-finder.md`): `scripts/test/cloud-run-wrapper.test.sh` DOES parse this output — its checks 9 (:127) and 10 (:146) grep the local-path output for the substring `Running locally`, and check 11 (:212) asserts that substring's ABSENCE on the cloud path. The banner design must therefore preserve the exact `Running locally` substring verbatim; additions after it are safe (all the suite's greps are substring matches on the preserved prefix). The cloud-side `Config:` line is ALSO pinned by this task in the wrapper suite itself: the suite already runs a fully stubbed cloud path and captures the cloud-path output (the `CLOUD_STUB_OUTPUT` variable, as consumed by check 11), so an inexpensive additional check there asserts the cloud path prints the `Config:  test/e2e-browser/playwright.cloud.config.ts` line — closing the provenance contract's cloud half with automated coverage (plan review round 1, Finding 2).
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -188,6 +189,21 @@ And in the cloud banner block, add one line after the `Args:` line (currently :5
   echo "[e2e-cloud]   Config:  test/e2e-browser/playwright.cloud.config.ts (CLOUD_SKIP_SPECS testIgnore + CLOUD_SKIP_TITLES grepInvert apply on this lane)"
 ```
 
+Then close the cloud half's automated coverage (plan review round 1, Finding 2): in `scripts/test/cloud-run-wrapper.test.sh`, inside the stubbed-cloud section — immediately after the existing `Running locally`-absence check (the `if echo "$CLOUD_STUB_OUTPUT" | grep -q "Running locally"; then ... fi` block at :212) — add:
+
+```bash
+# cloud-path provenance (kata 67jt, gate-integrity half): the cloud lane
+# must self-identify its CONFIG file and the selection rules in force.
+if ! printf '%s' "$CLOUD_STUB_OUTPUT" | grep -q 'Config:  test/e2e-browser/playwright.cloud.config.ts'; then
+  echo "FAIL: cloud path is missing the Config provenance line"
+  printf '%s' "$CLOUD_STUB_OUTPUT" | tail -20
+  rm -rf "$STUB_DIR"
+  exit 1
+fi
+```
+
+(Mirror the suite's exact failure idiom — `echo "FAIL: ..."`, `tail -20` context, `rm -rf "$STUB_DIR"`, `exit 1`, as the :212 check does; there is no `fail()` helper in this suite. The grep target string must equal the banner line added above, so keep both literals in sync. `$CLOUD_STUB_OUTPUT` is the same captured cloud-path output the :212 check consumes.)
+
 - [ ] **Step 4: Run the focused test**
 
 Run: `npm run test:e2e:helpers -- e2e-cloud-lane-banner`
@@ -196,20 +212,20 @@ Expected: PASS
 
 - [ ] **Step 5: Refactor while green**
 
-No refactor needed — a two-line banner extension and one behavior test; nothing to consolidate.
+No refactor needed — a two-line banner extension, one behavior test, and one wrapper-suite check; nothing to consolidate.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-The banner change touches the wrapper every e2e invocation uses. Two impacted consumer sets: (a) the helpers suite the new file joins; (b) `scripts/test/cloud-run-wrapper.test.sh` — the established wrapper-output suite (its checks 9/10 grep `Running locally` on the local path, check 11 asserts its absence on the cloud path, checks 13-14 pin arg passthrough); the j90s run used exactly this suite as the impacted set for a wrapper change (see `reports/load-bearing-finder.md`, LB-4). It has no package.json script (verified) — run it directly. Caveat: it executes real local Playwright through the base config's globalSetup (a dist rebuild), so it runs from this worktree, never from the main checkout (the prebuild guard fails closed there while production is live). Nothing in `src/` changes, so `npm run typecheck:client` is unaffected (tsconfig.json covers only `src`, `shared`, `config/vite`).
+The banner change touches the wrapper every e2e invocation uses. Two impacted consumer sets: (a) the helpers suite the new file joins; (b) `scripts/test/cloud-run-wrapper.test.sh` — the established wrapper-output suite (its local-path greps at :127/:146 match `Running locally`, the cloud-path check at :212 asserts that substring's absence, the image-tag/arg checks at :218-247 and :293+ pin invocation shape, and this task's new cloud `Config:` provenance check extends the stubbed-cloud section); the j90s run used exactly this suite as the impacted set for a wrapper change (see `reports/load-bearing-finder.md`, LB-4). It has no package.json script (verified) — run it directly. Caveat: it executes real local Playwright through the base config's globalSetup (a dist rebuild), so it runs from this worktree, never from the main checkout (the prebuild guard fails closed there while production is live). Nothing in `src/` changes, so `npm run typecheck:client` is unaffected (tsconfig.json covers only `src`, `shared`, `config/vite`).
 
 Run: `npm run test:e2e:helpers && bash scripts/test/cloud-run-wrapper.test.sh`
 
-Expected: PASS — the full helpers suite including the pre-existing selection/fixture/leak-metrics pins, and the wrapper suite (all its banner greps are substring matches on the preserved `Running locally` prefix; the cloud-path absence assertion is unaffected by a local-path-only extension)
+Expected: PASS — the full helpers suite including the pre-existing selection/fixture/leak-metrics pins, and the wrapper suite (all its banner greps are substring matches on the preserved `Running locally` prefix; the cloud-path absence assertion is unaffected by a local-path-only extension; the new cloud `Config:` check passes with the banner line in place)
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add scripts/e2e-cloud.sh test/e2e-browser/helpers/e2e-cloud-lane-banner.test.ts
+git add scripts/e2e-cloud.sh scripts/test/cloud-run-wrapper.test.sh test/e2e-browser/helpers/e2e-cloud-lane-banner.test.ts
 git commit -m "test(e2e): self-identifying lane banners in the e2e wrapper (kata 67jt gate provenance)"
 ```
 
@@ -689,7 +705,7 @@ to:
 
 (3x the observed-failing budget, matching the file family's established 15s picker/dialog budget idiom; the surrounding pane waits already use 10s. The follow-up `.click()` legs at :1872/:1918/:1947 carry no explicit budget and are bounded by the test deadline — unchanged.)
 
-**Escalation ladder (gate-evidence-driven, stays inside this task if needed):** if Task 8's lane runs show a terminal failure at these waits, raise to `{ timeout: 30_000 }` AND add an unconditional `test.setTimeout(120_000)` to the three expansion tests (the repo's dominant declaration convention — per-spec body deadlines are the spec's own decision and unconditional declarations are precedented). Do not preemptively declare: the minimal raise goes first, evidence decides the rest.
+**Escalation ladder (gate-evidence-driven, stays inside this task if needed):** if Task 8's lane runs show a terminal failure at these waits, raise to `{ timeout: 30_000 }` (per-assertion literal; allowed by the Global Constraints — the modal tab wait's operative chain at 30s remains within the 60s default deadline under the operative-regime criterion, per `reports/load-bearing-validator-LB-6.md`). If a terminal failure persists at 30s, do NOT raise further and do NOT add any `test.setTimeout` declaration — the inviolable constraints (declared envelopes untouched, PR #785 declared-timeout pins byte-identical) leave no budget-only escape at that point. Instead treat it as a falsified budget-race hypothesis for this family: investigate the stall driver under lane load (the gate run's failure output is the evidence; the modal is route-mocked with zero providers, so a >30s stall indicates a harness/store defect or a load-amplification mechanism, not starvation), and bring the finding back through the run's review loop as a plan amendment — the amendment, not the implementer, decides whether a declared-envelope change (and the corresponding PR #785 contract-pin amendment) is ever justified.
 
 - [ ] **Step 4: Run the focused test**
 
