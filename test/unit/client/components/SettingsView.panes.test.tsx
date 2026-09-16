@@ -266,4 +266,41 @@ describe('SettingsView Panes section', () => {
 
     expect(api.patch).not.toHaveBeenCalled()
   })
+
+  it('exposes the floating add-pane button toggle as an accessible switch, unchecked by default', () => {
+    const store = createTestStore()
+    render(
+      <Provider store={store}>
+        <SettingsView />
+      </Provider>
+    )
+    switchSettingsTab('Panes')
+
+    const toggle = screen.getByRole('switch', { name: 'Toggle floating add-pane button' })
+    expect(toggle).not.toBeChecked()
+  })
+
+  it('toggles the floating add-pane button locally without calling /api/settings', async () => {
+    const store = createTestStore()
+    render(
+      <Provider store={store}>
+        <SettingsView />
+      </Provider>
+    )
+    switchSettingsTab('Panes')
+
+    // This row has a description, so the switch must be selected by its
+    // accessible name (the Toggle sets aria-label="Toggle floating add-pane
+    // button"); do not use the iconsOnTabs test's closest('div') pattern.
+    const toggle = screen.getByRole('switch', { name: 'Toggle floating add-pane button' })
+    fireEvent.click(toggle)
+
+    expect(store.getState().settings.settings.panes.floatingActionButton).toBe(true)
+
+    await act(async () => {
+      vi.advanceTimersByTime(600)
+    })
+
+    expect(api.patch).not.toHaveBeenCalled()
+  })
 })

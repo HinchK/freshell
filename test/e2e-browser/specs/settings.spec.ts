@@ -251,4 +251,53 @@ test.describe('Settings', () => {
     const blobOff = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
     expect(JSON.parse(blobOff ?? '{}').settings?.freshAgent).toBeUndefined()
   })
+
+  test('floating add-pane button is hidden by default, can be enabled, and persists locally', async ({ freshellPage, page, harness, serverInfo }) => {
+    // Two reload legs plus two settings sessions; the cloud-gated budget
+    // follows the Expand thinking reload-leg precedent in this file.
+    if (isCloudLaneWindowConfigured()) test.setTimeout(120_000)
+
+    // The FAB is opt-in: a default boot never renders it.
+    await expect(page.getByRole('button', { name: 'Add pane' })).toHaveCount(0)
+
+    await openSettingsSection(page, 'Panes')
+    const fabSwitch = page.getByRole('switch', { name: 'Toggle floating add-pane button' })
+    await expect(fabSwitch).toHaveAttribute('aria-checked', 'false')
+
+    // Opt in; the resolved setting and the persisted blob (diff-vs-defaults)
+    // both carry the key.
+    await fabSwitch.click()
+    await expect(fabSwitch).toHaveAttribute('aria-checked', 'true')
+    await page.waitForTimeout(PERSIST_DEBOUNCE_WAIT_MS)
+    expect((await harness.getSettings()).panes.floatingActionButton).toBe(true)
+    const blob = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
+    expect(JSON.parse(blob ?? '{}').settings?.panes?.floatingActionButton).toBe(true)
+
+    // The opt-in persists across reload and the FAB is visible on the next
+    // boot (tabs/panes restore from localStorage; the 10s timeout rides
+    // out the restore).
+    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    await harness.waitForHarness()
+    await harness.waitForConnection(undefined, {
+      selfHealReload: isCloudLaneWindowConfigured(),
+    })
+    expect((await harness.getSettings()).panes.floatingActionButton).toBe(true)
+    await expect(page.getByRole('button', { name: 'Add pane' })).toBeVisible({ timeout: 10_000 })
+
+    // Resetting to the default drops the key from the blob, and the next
+    // boot renders without the FAB again.
+    await openSettingsSection(page, 'Panes')
+    await fabSwitch.click()
+    await expect(fabSwitch).toHaveAttribute('aria-checked', 'false')
+    await page.waitForTimeout(PERSIST_DEBOUNCE_WAIT_MS)
+    const blobOff = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
+    expect(JSON.parse(blobOff ?? '{}').settings?.panes?.floatingActionButton).toBeUndefined()
+
+    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    await harness.waitForHarness()
+    await harness.waitForConnection(undefined, {
+      selfHealReload: isCloudLaneWindowConfigured(),
+    })
+    await expect(page.getByRole('button', { name: 'Add pane' })).toHaveCount(0)
+  })
 })
