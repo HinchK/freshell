@@ -1492,9 +1492,37 @@ impl FreshOpencodeState {
             return;
         }
 
+        // b8ke ext r31 F1: the request's observed fence is parsed BEFORE
+        // ANY side effect (the turn-flag resets, the redo destroy, the
+        // busy broadcast, the materialization) — the pair is ONE fence
+        // (the r29 F7 discipline): a half-sent pair is an INVALID fence,
+        // never a silently-downgraded legacy request, and refuses typed
+        // with NOTHING mutated. The parsed pair then feeds the
+        // materialization's ownership claim below — pre-r31 the claim
+        // ran with `None` and DISCARDED the pair the protocol and client
+        // explicitly carry because `freshAgent.send` can create a
+        // runtime: a delayed old-generation send could claim a
+        // since-vacated placeholder and mint/rekey a durable session as
+        // if it had observed nothing.
+        let send_fence =
+            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    drop(session);
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %session_id, request_id = ?request_id,
+                        code = err.code(),
+                        "fresh_agent_send_refused: the observed fence is half-sent \
+                         (invalid) — the send mutates nothing"
+                    );
+                    self.send_error(&request_id, err.code(), err.message());
+                    return;
+                }
+            };
+
         // materializeOrSend:334-335 -- a fresh turn starts un-aborted and un-errored;
-        // `handle_interrupt` flips `turn_aborted` while we are parked on idle, and the
-        // serve-stream bridge flips `turn_errored` if the turn reports an error.
+        // `handle_interrupt` flips `turn_aborted` while we are parked on idle, and
+        // the serve-stream bridge flips `turn_errored` if the turn reports an error.
         session.turn_aborted.store(false, Ordering::SeqCst);
         session.turn_errored.store(false, Ordering::SeqCst);
 
@@ -1604,7 +1632,14 @@ impl FreshOpencodeState {
             match self.begin_lane_claim_at(
                 &claim_key,
                 &materialize_op,
-                None,
+                // b8ke ext r31 F1: the request's observed pair — the
+                // coordinator's fence check refuses a stale (or
+                // stale-epoch) pair typed BEFORE any provider mutation,
+                // so delayed old-generation traffic can never claim a
+                // since-vacated placeholder and materialize over it
+                // (the None shape remains ONLY the genuine legacy
+                // client).
+                send_fence,
                 "freshopencode/send-materialize",
             ) {
                 crate::ownership_lane::LaneClaim::Granted(ticket) => {
@@ -1648,11 +1683,20 @@ impl FreshOpencodeState {
                          refused the placeholder's pre-spawn claim; the pane is not \
                          materialized (kata b8ke ext r26 F3)"
                     );
-                    self.emit_fresh_agent_error(
-                        &session_id,
-                        "SESSION_RESERVED",
-                        "Another resume for this session is in flight",
-                    );
+                    // b8ke ext r31 F1: a STALE observed fence is an
+                    // honest stale refusal — the same SESSION_RESERVED
+                    // the client's bounded re-drive understands, with the
+                    // message that says what to do (refresh and retry);
+                    // every other refusal stays the in-flight conflict.
+                    let message = if matches!(
+                        outcome,
+                        freshell_ownership::BeginOutcome::StaleGeneration { .. }
+                    ) {
+                        "The observed ownership fence is stale; refresh and retry"
+                    } else {
+                        "Another resume for this session is in flight"
+                    };
+                    self.emit_fresh_agent_error(&session_id, "SESSION_RESERVED", message);
                     return;
                 }
             }
@@ -6566,7 +6610,27 @@ mod tests {
         }
     }
 
+    /// b8ke ext r31 F1: the RESHAPED helper pair. `send_msg` is now the
+    /// thin LEGACY wrapper (no observed pair — the genuine legacy-client
+    /// shape the dozens of pre-existing tests model); every test that
+    /// models a modern client builds its message with
+    /// [`send_msg_fenced`] so the observed pair is REAL, never
+    /// hardcoded to `None` by the helper (pre-r31 the helper always
+    /// set both fields to `None`, so the materialization tests never
+    /// exercised the fenced shapes the protocol and client carry).
     fn send_msg(session_id: &str, text: &str) -> FreshAgentSend {
+        send_msg_fenced(session_id, text, None, None)
+    }
+
+    /// The fenced-send builder: the caller states the observed pair
+    /// explicitly — `(Some, Some)` the fence, `(None, None)` the legacy
+    /// shape, any half the INVALID shape the handler must refuse.
+    fn send_msg_fenced(
+        session_id: &str,
+        text: &str,
+        observed_epoch: Option<u64>,
+        observed_generation: Option<u64>,
+    ) -> FreshAgentSend {
         FreshAgentSend {
             provider: AgentProvider::Opencode,
             session_id: session_id.to_string(),
@@ -6576,8 +6640,8 @@ mod tests {
             images: None,
             request_id: Some(format!("req-{text}")),
             settings: None,
-            observed_epoch: None,
-            observed_generation: None,
+            observed_epoch,
+            observed_generation,
         }
     }
 
@@ -7364,6 +7428,264 @@ mod tests {
             .await
             .expect("the kill completes after the settle lands")
             .expect("kill task completed");
+    }
+
+    /// b8ke ext r31 F1 (half-fence): a `freshAgent.send` carrying exactly
+    /// ONE of the observed epoch/generation pair refuses typed
+    /// INVALID_FENCE with NOTHING mutated — no turn flags, no busy
+    /// broadcast, no claim (not even a Vacant replay entry), no provider
+    /// create. Pre-r31 the pair was discarded entirely and a half-fence
+    /// was treated as unfenced.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_half_fenced_send_refuses_typed_invalid_fence_and_never_materializes() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        st.handle_create(create_msg("req-r31-f1-half"), None).await;
+        let placeholder = "freshopencode-req-r31-f1-half";
+        // Drain the create-path frames so the next frame is this send's.
+        while rx.try_recv().is_ok() {}
+
+        st.handle_send(send_msg_fenced(
+            placeholder,
+            "materialize",
+            Some(registry.boot_epoch()),
+            None,
+        ))
+        .await;
+
+        // The typed INVALID_FENCE reply — the send's error shape.
+        let mut saw_invalid_fence = false;
+        while let Ok(frame) = rx.try_recv() {
+            if frame.contains("INVALID_FENCE") {
+                saw_invalid_fence = true;
+            }
+        }
+        assert!(
+            saw_invalid_fence,
+            "the half-fenced send answers the typed INVALID_FENCE refusal"
+        );
+        // NOTHING mutated: no materialization (no durable id minted)...
+        {
+            let sessions = st.sessions.lock().await;
+            let guard = sessions
+                .get(placeholder)
+                .expect("the placeholder session remains in the map");
+            assert!(
+                guard.lock().await.real_session_id.is_none(),
+                "the half-fenced send never materializes a durable session"
+            );
+        }
+        // ...and no coordinator record for the placeholder key (not even
+        // a Vacant replay entry — the claim never ran).
+        assert!(
+            !matches!(
+                registry.observe(PROVIDER, placeholder).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ),
+            "the half-fenced send never claims the placeholder key"
+        );
+        assert_eq!(
+            registry.observe(PROVIDER, placeholder).generation,
+            0,
+            "the half-fenced never advances the placeholder's generation"
+        );
+    }
+
+    /// b8ke ext r31 F1 (stale fence — the exact finding): a DELAYED
+    /// old-generation send — the pane's observation predates the
+    /// placeholder key's last ownership cycle (a prior runtime held the
+    /// key at generation 1 and was released, leaving the key Vacant with
+    /// the monotone generation advanced) — refuses typed with NO
+    /// materialization. Pre-r31 the claim ran with `None`: the stale
+    /// send reclaimed the since-vacated placeholder as if it had
+    /// observed nothing and minted/rekeyed a durable session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_observed_fence_on_a_first_send_refuses_typed_and_never_materializes() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        st.handle_create(create_msg("req-r31-f1-stale"), None).await;
+        let placeholder = "freshopencode-req-r31-f1-stale";
+        // Drain the create-path frames.
+        while rx.try_recv().is_ok() {}
+
+        // THE SEED: the placeholder key held a prior owner at generation 1
+        // and was released — the key is Vacant with the monotone
+        // generation advanced to 1.
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, placeholder).state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "fixture: the create leaves the placeholder key Vacant"
+        );
+        let freshell_ownership::BeginOutcome::Granted { generation } =
+            crate::ownership_lane::claim_fresh_agent_ownership(
+                &registry,
+                PROVIDER,
+                placeholder,
+                "op-r31-seed-prior",
+                None,
+                "test",
+                1_000,
+            )
+        else {
+            panic!("fixture: the seed claim must grant")
+        };
+        let seed_owner = freshell_ownership::OwnerIdentity {
+            kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            terminal_id: None,
+            live_session_key: Some("seed".to_string()),
+            pid: None,
+            ownership_id: Some("op-r31-seed-prior".to_string()),
+        };
+        assert!(
+            matches!(
+                crate::ownership_lane::commit_fresh_agent_ownership(
+                    &registry,
+                    PROVIDER,
+                    placeholder,
+                    "op-r31-seed-prior",
+                    generation,
+                    seed_owner.clone(),
+                ),
+                freshell_ownership::CommitOutcome::Committed
+            ),
+            "fixture: the seed owner commits Live"
+        );
+        registry.release(
+            PROVIDER,
+            placeholder,
+            &freshell_ownership::ReleaseClaim {
+                operation_id: "op-r31-seed-prior".to_string(),
+                generation,
+                runtime: Some(seed_owner),
+            },
+            "test",
+        );
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, placeholder).state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "fixture: the seed owner released — the key is Vacant, generation monotone"
+        );
+
+        // THE DELAYED SEND: the pane's observation predates the seed
+        // cycle (generation 0 against the key's monotone 1).
+        st.handle_send(send_msg_fenced(
+            placeholder,
+            "materialize",
+            Some(registry.boot_epoch()),
+            Some(0),
+        ))
+        .await;
+
+        // The typed stale refusal: SESSION_RESERVED (the code the
+        // client's bounded re-drive understands) with the honest stale
+        // message.
+        let mut saw_stale_refusal = false;
+        while let Ok(frame) = rx.try_recv() {
+            if frame.contains("SESSION_RESERVED") && frame.contains("stale") {
+                saw_stale_refusal = true;
+            }
+        }
+        assert!(
+            saw_stale_refusal,
+            "the stale-fenced send answers the typed stale refusal"
+        );
+        // NO materialization: no durable id, no provider create.
+        {
+            let sessions = st.sessions.lock().await;
+            let guard = sessions
+                .get(placeholder)
+                .expect("the placeholder session remains in the map");
+            assert!(
+                guard.lock().await.real_session_id.is_none(),
+                "the stale-fenced send never materializes a durable session"
+            );
+        }
+        // The placeholder key is UNTOUCHED by the refused send: still
+        // Vacant at the seed's monotone generation (the refused claim
+        // never even created a replay entry).
+        let snap = registry.observe(PROVIDER, placeholder);
+        assert!(
+            matches!(snap.state, freshell_ownership::OwnershipState::Vacant),
+            "the placeholder key stays Vacant after the typed refusal"
+        );
+        assert_eq!(snap.generation, generation, "the generation is untouched");
+        // And no durable id ever entered the coordinator.
+        assert!(
+            !matches!(
+                registry.observe(PROVIDER, "ses_1").state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ),
+            "no durable session was ever claimed"
+        );
+    }
+
+    /// b8ke ext r31 F1 (supplied-current — the control): a first send
+    /// whose observed pair is CURRENT (the boot epoch and the
+    /// placeholder key's current generation) proceeds exactly as the
+    /// legacy shape — the fence is the safety net, never a blanket
+    /// refusal. The materialization mints the durable id, rekeys the
+    /// placeholder to it, and commits the durable key Live{FreshAgent}.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_current_observed_fence_on_a_first_send_materializes() {
+        let (mut st, _killed) = state().await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        st.handle_create(create_msg("req-r31-f1-current"), None)
+            .await;
+        let placeholder = "freshopencode-req-r31-f1-current";
+
+        st.handle_send(send_msg_fenced(
+            placeholder,
+            "materialize",
+            Some(registry.boot_epoch()),
+            Some(0),
+        ))
+        .await;
+
+        // The durable id minted and the session bound to it.
+        {
+            let sessions = st.sessions.lock().await;
+            let guard = sessions
+                .get(placeholder)
+                .expect("the placeholder session remains in the map");
+            assert_eq!(
+                guard.lock().await.real_session_id.as_deref(),
+                Some("ses_1"),
+                "the current-fenced send materializes exactly like the legacy shape"
+            );
+        }
+        // The placeholder rekeyed to the durable id...
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, placeholder).state,
+                freshell_ownership::OwnershipState::Aliased { to, .. } if to == "ses_1"
+            ),
+            "the placeholder is aliased to the durable id"
+        );
+        // ...and the durable key Live{FreshAgent}.
+        assert!(matches!(
+            registry.observe(PROVIDER, "ses_1").state,
+            freshell_ownership::OwnershipState::Live {
+                owner, ..
+            } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ));
     }
 
     /// Delta-r6 close-durability finding, re-staged for the round-4 (F6)
