@@ -7084,6 +7084,10 @@ async fn opencode_handoff_during_compaction_aborts_the_daemon_side_summarize() {
 
     // A compact whose summarize POST the fake serve accepts but whose
     // answer is HELD open — the daemon-side summarization is running.
+    // ep5 r4 F2: the honest client shape — the compact carries the pair
+    // observed from the owner record (an unfenced history mutation against
+    // a Live{FreshAgent} key is the typed FENCE_REQUIRED refusal now).
+    let before = rig.ownership.observe("opencode", &sid);
     rig.fresh_opencode
         .handle_compact(FreshAgentCompact {
             provider: AgentProvider::Opencode,
@@ -7091,8 +7095,8 @@ async fn opencode_handoff_during_compaction_aborts_the_daemon_side_summarize() {
             session_type: SessionType::Freshopencode,
             cwd: Some("/tmp".to_string()),
             instructions: None,
-            observed_epoch: None,
-            observed_generation: None,
+            observed_epoch: Some(before.epoch),
+            observed_generation: Some(before.generation),
         })
         .await;
     env.await_audit_row(Duration::from_secs(20), |r| {
