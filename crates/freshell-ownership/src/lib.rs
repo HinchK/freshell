@@ -402,10 +402,12 @@ pub enum FenceReason {
     /// beside a surviving descendant). The state truthfully encodes the
     /// unverified prior writer; a lifecycle start on it refuses typed
     /// unless it carries the acknowledged-risk arm
-    /// ([`RuntimeOwnershipRegistry::acknowledge_cleared_unverified`] —
-    /// the operator's explicit start-again clears it, recording the
-    /// acknowledgment at the START); confirmed death (the existing
-    /// watchers) also clears it.
+    /// ([`RuntimeOwnershipRegistry::begin_handoff_acknowledged_cleared_unverified`]
+    /// — the operator's explicit start-again enters the r33
+    /// FORCED-REAP-THEN-START handoff: the unverified prior and its
+    /// descendant tree are REAP TARGETS, killed and confirmed before the
+    /// new writer commits); confirmed death (the existing watchers) also
+    /// clears it.
     ClearedUnverified,
     /// b8ke delta round-2 F2: the stale-Starting watchdog could not confirm
     /// the start operation's death (a blocked/hung start, an unregistered
@@ -1585,18 +1587,24 @@ impl RuntimeOwnershipRegistry {
     /// b8ke ext r17 F1: the ATOMIC acknowledged start — the ONE-lock-hold
     /// conditional transition `Fenced{ClearedUnverified} → Handoff` with
     /// the acknowledged-risk arm carried INTO the claim. Pre-r17 the
-    /// acknowledged start was two steps (`acknowledge_cleared_unverified`
-    /// to plain Vacant, then `begin_handoff` reacquiring the lock and
-    /// PANICKING on refusal): a concurrent cross-device lifecycle request
-    /// could claim the vacancy between the calls — including an
-    /// UNACKNOWLEDGED request consuming the opening another client's
-    /// acknowledgment created — and the losing original panicked (its
-    /// caller saw the fallback in-progress lie). Here the record either
-    /// enters Handoff under this claim or the caller answers typed;
-    /// the unverified prior is encoded in the transition log (the
-    /// operator's acknowledgment recorded AT THE START), and the entered
-    /// handoff is the no-prior sequence (the unverified descendants are
-    /// the operator's acknowledged risk — never a reap target).
+    /// acknowledged start was two steps (a plain-Vacant vacate, then
+    /// `begin_handoff` reacquiring the lock and PANICKING on refusal): a
+    /// concurrent cross-device lifecycle request could claim the vacancy
+    /// between the calls — including an UNACKNOWLEDGED request consuming
+    /// the opening another client's acknowledgment created — and the
+    /// losing original panicked (its caller saw the fallback in-progress
+    /// lie). Here the record either enters Handoff under this claim or
+    /// the caller answers typed; the unverified prior is encoded in the
+    /// transition log (the operator's acknowledgment recorded AT THE
+    /// START).
+    /// b8ke ext r33 F1: the entered handoff CARRIES THE UNVERIFIED PRIOR
+    /// as its reap target — the FORCED-REAP-THEN-START contract: the
+    /// runner kills and confirms the prior's death (the descendant tree
+    /// included) before the new writer spawns, and an unconfirmable kill
+    /// lands the SAME typed fenced family again. Pre-r33 the enter
+    /// discarded the prior (`prior: None`) and the runner started a
+    /// SECOND writer over a possibly-live first one — the acknowledged
+    /// risk broke the max-one-writer invariant.
     #[allow(clippy::too_many_arguments)] // begin_handoff's field set + the acknowledgment context.
     pub fn begin_handoff_acknowledged_cleared_unverified(
         &self,
@@ -1651,12 +1659,25 @@ impl RuntimeOwnershipRegistry {
                 let unverified_pid = prior.as_ref().and_then(|(o, _)| o.pid);
                 let unverified_live_key =
                     prior.as_ref().and_then(|(o, _)| o.live_session_key.clone());
-                // ONE atomic step: the record enters Handoff (prior NONE —
-                // the no-prior sequence; the unverified descendants are the
-                // operator's acknowledged risk, never a reap target).
+                // b8ke ext r33 F1: FORCED-REAP-THEN-START — the enter
+                // carries the UNVERIFIED PRIOR (and through the runner's
+                // tree-kill, its potentially-surviving descendants) as
+                // the handoff's REAP TARGET: the runner's step 3+4 kills
+                // and confirms the prior's death BEFORE the new writer
+                // spawns, and an UNCONFIRMABLE kill lands the SAME typed
+                // fenced family again (PlatformLimited through the
+                // runner's fence path — the operator's acknowledged
+                // retry can attempt the kill again, so the fence stays
+                // non-permanent) — the acknowledged path can make
+                // progress (it kills) but a provably-alive writer is
+                // never overlapped. Pre-r33 the enter discarded the
+                // prior (`prior: None` — the no-prior sequence) and
+                // started a second writer over a possibly-live first
+                // one: the acknowledgment recorded the risk but broke
+                // the max-one-writer invariant.
                 record.generation += 1;
                 record.state = OwnershipState::Handoff {
-                    prior: None,
+                    prior: prior.clone(),
                     to_kind,
                     operation_id: operation_id.to_string(),
                     generation: record.generation,
@@ -1677,10 +1698,11 @@ impl RuntimeOwnershipRegistry {
                     outcome = "acknowledged_start_entered",
                     failure_reason = "UNVERIFIED_PRIOR_ACKNOWLEDGED",
                     "the operator's acknowledged-risk start entered Handoff \
-                     ATOMICALLY over the cleared-unverified state — the prior \
-                     writer's descendant tree was NEVER confirmed dead; the \
-                     operator accepted the risk of surviving processes, and the \
-                     handoff runs the no-prior sequence");
+                     ATOMICALLY over the cleared-unverified state carrying the \
+                     UNVERIFIED PRIOR as the reap target — the runner kills and \
+                     confirms the prior's death (the descendant tree included) \
+                     BEFORE the new writer spawns; an unconfirmable kill lands \
+                     the typed fenced state again, never a second writer");
                 AcknowledgedStartOutcome::Granted {
                     generation: entered_generation,
                 }
@@ -3571,86 +3593,23 @@ impl RuntimeOwnershipRegistry {
     /// max age) then aborts the operation, awaits its settle, kills the
     /// registered partial runtime if any, and finishes with `commit_stop`
     /// → `Vacant` + the typed `ownership.start.recovered` failure log.
-    /// b8ke ext r16 F4: the acknowledged START on a
-    /// `Fenced{ClearedUnverified}` key — the operator's explicit
-    /// start-again carries the acknowledged-risk arm and THIS call moves
-    /// the record to plain Vacant, recording the acknowledgment in the
-    /// transition log AT THE START (the acknowledgment attaches to the
-    /// dangerous new-writer step, not the harmless clear). The current
-    /// observed pair is required (the operator acknowledges the state
-    /// they are looking at); any other state answers the typed
-    /// `NotPlatformLimited` refusal.
-    pub fn acknowledge_cleared_unverified(
-        &self,
-        provider: &str,
-        session_id: &str,
-        observed: ObservedFence,
-        operation_id: &str,
-        initiator: &str,
-    ) -> ForceReleaseOutcome {
-        let mut inner = self.inner.lock().expect("ownership lock poisoned");
-        let key = SessionKey::new(provider, session_id);
-        let Some(record) = inner.get_mut(&key) else {
-            return ForceReleaseOutcome::NotPlatformLimited {
-                state: OwnershipState::Vacant,
-            };
-        };
-        let current_generation = snapshot_generation(record);
-        if observed.epoch != self.epoch || observed.generation != current_generation {
-            tracing::warn!(target: "freshell_ownership",
-                event = "ownership.fenced.acknowledge_cleared_unverified.stale_observation",
-                operation_id, provider, session_id, initiator,
-                from_kind = ?Option::<RuntimeOwnerKind>::None,
-                to_kind = ?Option::<RuntimeOwnerKind>::None,
-                runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
-                observed_epoch = observed.epoch, observed_generation = observed.generation,
-                epoch = self.epoch, generation = current_generation,
-                duration_ms = 0u64,
-                outcome = "refused", failure_reason = "STALE_OBSERVATION",
-                "the acknowledged start observed a stale fence pair — refresh and retry");
-            return ForceReleaseOutcome::StaleObservation {
-                current_epoch: self.epoch,
-                current_generation,
-            };
-        }
-        match record.state.clone() {
-            OwnershipState::Fenced {
-                reason: reason @ FenceReason::ClearedUnverified,
-                prior,
-                operation_id: fencing_operation_id,
-                since_ms,
-                ..
-            } => {
-                let duration_ms = now_epoch_ms().saturating_sub(since_ms);
-                let unverified_kind = prior.as_ref().map(|(o, _)| o.kind);
-                let unverified_id = prior.as_ref().and_then(|(o, _)| o.terminal_id.clone());
-                let unverified_pid = prior.as_ref().and_then(|(o, _)| o.pid);
-                record.state = OwnershipState::Vacant;
-                // b8ke ext r7 F4: the UNIFORM transition schema — the
-                // acknowledgment STARTS a new writer only after this call,
-                // so to_kind is None-valued here and the acknowledgment
-                // is the recorded failure_reason context.
-                tracing::warn!(target: "freshell_ownership",
-                    event = "ownership.fenced.acknowledged_start_cleared_unverified",
-                    provider, session_id, initiator,
-                    operation_id,
-                    from_kind = ?unverified_kind,
-                    to_kind = ?Option::<RuntimeOwnerKind>::None,
-                    runtime_id = ?unverified_id, pid = ?unverified_pid,
-                    epoch = self.epoch, generation = record.generation, duration_ms,
-                    fence_reason = ?reason,
-                    outcome = "acknowledged_start_vacated",
-                    failure_reason = "UNVERIFIED_PRIOR_ACKNOWLEDGED",
-                    "the operator's acknowledged-risk start vacated the \
-                     cleared-unverified state — the prior writer's descendant tree \
-                     was NEVER confirmed dead; the operator accepted the risk of \
-                     surviving processes");
-                let _ = &fencing_operation_id;
-                ForceReleaseOutcome::Released
-            }
-            state => ForceReleaseOutcome::NotPlatformLimited { state },
-        }
-    }
+    // b8ke ext r16 F4, REMOVED b8ke ext r33 F1: the standalone
+    // acknowledged-start vacate (`acknowledge_cleared_unverified` —
+    // `Fenced{ClearedUnverified} → plain Vacant` with NO kill) is
+    // DELETED: it licensed a second writer over a possibly-live first
+    // one with nothing but the operator's risk-acceptance between
+    // them — the same violation
+    // [`RuntimeOwnershipRegistry::begin_handoff_acknowledged_cleared_unverified`]
+    // carried pre-r33. The ONE acknowledged start is the r33
+    // FORCED-REAP-THEN-START handoff enter: the prior (and its
+    // descendant tree, through the runner's tree-kill) is killed and
+    // confirmed dead BEFORE the new writer spawns, and an unconfirmable
+    // kill lands the SAME typed fenced family again — never a
+    // plain-Vacant bypass.
+    //
+    // (The r16/r17 tests that drove the deleted API's vacate semantics
+    // are reshaped onto the new contract: the acknowledged start now
+    // carries the prior as the reap target.)
 
     pub fn recover_stale_starts(&self, now_ms: u64, max_age_ms: u64) -> Vec<RecoveredStart> {
         let mut inner = self.inner.lock().expect("ownership lock poisoned");
@@ -5570,27 +5529,50 @@ mod tests {
             ),
             BeginOutcome::Blocked { .. }
         ));
-        // THE ACKNOWLEDGED START vacates the state to plain Vacant — the
-        // operator's explicit risk acceptance recorded at the START (the
-        // existing r16-F4 pipeline, unchanged).
+        // b8ke ext r33 F1: THE ACKNOWLEDGED START is the FORCED-REAP-
+        // THEN-START handoff enter — the operator's explicit risk
+        // acceptance recorded at the START, and the unverified prior is
+        // CARRIED as the handoff's reap target (the runner kills and
+        // confirms it before the new writer commits; the pre-r33
+        // plain-Vacant vacate that licensed an immediate second writer
+        // is DELETED). At the coordinator level the enter is observable
+        // as Handoff{prior: Some(the unverified prior)}.
         let snap = r.observe(PROVIDER, "sid-stale-stop");
-        assert_eq!(
-            r.acknowledge_cleared_unverified(
-                PROVIDER,
-                "sid-stale-stop",
-                ObservedFence {
-                    epoch: snap.epoch,
-                    generation: snap.generation,
-                },
-                "op-ack-start",
-                "operator-start-again",
-            ),
-            ForceReleaseOutcome::Released
-        );
-        assert_eq!(
-            r.observe(PROVIDER, "sid-stale-stop").state,
-            OwnershipState::Vacant
-        );
+        let AcknowledgedStartOutcome::Granted {
+            generation: entered,
+        } = r.begin_handoff_acknowledged_cleared_unverified(
+            PROVIDER,
+            "sid-stale-stop",
+            RuntimeOwnerKind::Terminal,
+            "op-ack-start",
+            ObservedFence {
+                epoch: snap.epoch,
+                generation: snap.generation,
+            },
+            "operator-start-again",
+            9,
+        )
+        else {
+            panic!("the acknowledged start must enter")
+        };
+        match r.observe(PROVIDER, "sid-stale-stop").state {
+            OwnershipState::Handoff {
+                prior: Some((owner, _)),
+                generation,
+                ..
+            } => {
+                assert_eq!(generation, entered);
+                assert_eq!(
+                    owner.kind,
+                    RuntimeOwnerKind::FreshAgent,
+                    "the unverified prior is CARRIED as the reap target, never discarded"
+                );
+            }
+            other => panic!("the acknowledged start carries the prior in Handoff: {other:?}"),
+        }
+        // A naive start during the acknowledged handoff's reap window is
+        // STILL blocked — never a second writer beside the unverified
+        // prior.
         assert!(matches!(
             r.begin_start(
                 PROVIDER,
@@ -5599,9 +5581,9 @@ mod tests {
                 "post-ack-start",
                 None,
                 "test",
-                9,
+                10,
             ),
-            BeginOutcome::Granted { .. }
+            BeginOutcome::Blocked { .. }
         ));
     }
 
@@ -6749,22 +6731,32 @@ mod tests {
             ),
             BeginOutcome::Blocked { .. }
         ));
-        // THE ACKNOWLEDGED START vacates the state to plain Vacant — the
-        // operator's explicit risk acceptance recorded at the START.
-        assert!(matches!(
-            r.acknowledge_cleared_unverified(
+        // b8ke ext r33 F1: THE ACKNOWLEDGED START is the FORCED-REAP-
+        // THEN-START handoff enter — the unverified prior is CARRIED as
+        // the reap target (the pre-r33 plain-Vacant vacate is DELETED).
+        let AcknowledgedStartOutcome::Granted { .. } = r
+            .begin_handoff_acknowledged_cleared_unverified(
                 PROVIDER,
                 "sid",
+                RuntimeOwnerKind::Terminal,
+                "op-ack-start",
                 ObservedFence {
                     epoch: r.boot_epoch(),
-                    generation: g
+                    generation: g,
                 },
-                "op-ack-start",
                 "operator-start-again",
-            ),
-            ForceReleaseOutcome::Released
+                9,
+            )
+        else {
+            panic!("the acknowledged start must enter")
+        };
+        assert!(matches!(
+            r.observe(PROVIDER, "sid").state,
+            OwnershipState::Handoff { prior: Some(_), .. }
         ));
-        assert_eq!(r.observe(PROVIDER, "sid").state, OwnershipState::Vacant);
+        // A naive start during the acknowledged handoff's reap window is
+        // STILL blocked — never a second writer beside the unverified
+        // prior.
         assert!(matches!(
             r.begin_start(
                 PROVIDER,
@@ -6773,9 +6765,9 @@ mod tests {
                 "post-ack-start",
                 None,
                 "test",
-                9,
+                10,
             ),
-            BeginOutcome::Granted { .. }
+            BeginOutcome::Blocked { .. }
         ));
 
         // A WatcherFailed fence is NOT force-releasable: its bounded
@@ -8604,9 +8596,13 @@ mod tests {
         );
         // 8. fenced.force_released_unconfirmable (the acknowledged clear —
         // b8ke ext r16 F4: lands in the TYPED cleared-unverified state,
-        // never plain Vacant) + the acknowledged START that vacates it (the
-        // operator's risk acceptance recorded at the START; also covers
-        // fenced.acknowledged_start_cleared_unverified).
+        // never plain Vacant). b8ke ext r33 F1: the acknowledged START is
+        // the FORCED-REAP-THEN-START handoff enter — the unverified
+        // prior CARRIED as the reap target (the pre-r33 standalone vacate
+        // API is DELETED). The entered handoff fails to the typed
+        // Vacant{PriorNotLive} (no runner in this registry-only
+        // enumeration) so the stale-generation drive below begins from
+        // the vacated key exactly as before.
         assert!(matches!(
             r.force_release_platform_limited(
                 PROVIDER,
@@ -8626,18 +8622,33 @@ mod tests {
                 ..
             }
         ));
-        assert!(matches!(
-            r.acknowledge_cleared_unverified(
+        let AcknowledgedStartOutcome::Granted { generation: g_ack } = r
+            .begin_handoff_acknowledged_cleared_unverified(
                 PROVIDER,
                 "sid-enum",
+                RuntimeOwnerKind::Terminal,
+                "op-enum-ack",
                 ObservedFence {
                     epoch: r.boot_epoch(),
                     generation: g_ho2,
                 },
-                "op-enum-ack",
                 "test-operator-start-again",
-            ),
-            ForceReleaseOutcome::Released
+                4_800,
+            )
+        else {
+            panic!("the acknowledged start must enter")
+        };
+        // This key's fence came from a NO-PRIOR handoff (step 5's
+        // vacant-entered handoff), so the enter legitimately carries no
+        // prior — there is NOTHING to reap; the r33 prior-carrying
+        // contract is asserted where a prior EXISTS (the cu key below).
+        assert!(matches!(
+            r.observe(PROVIDER, "sid-enum").state,
+            OwnershipState::Handoff { generation, .. } if generation == g_ack
+        ));
+        assert!(matches!(
+            r.fail(PROVIDER, "sid-enum", "op-enum-ack", g_ack, false),
+            FailOutcome::Vacant { .. }
         ));
         // 9. begin_start.stale_generation + commit_live.stale_generation.
         assert!(matches!(
@@ -9050,25 +9061,15 @@ mod tests {
             ),
             ForceReleaseOutcome::Released
         ));
-        // The stale-observation refusal arm (a stale pair first).
-        assert!(matches!(
-            r_cu.acknowledge_cleared_unverified(
-                PROVIDER,
-                "sid-enum-cleared-unverified",
-                ObservedFence {
-                    epoch: r_cu.boot_epoch(),
-                    generation: cu_fence_generation.saturating_sub(1),
-                },
-                "op-enum-cu-ack",
-                "operator",
-            ),
-            ForceReleaseOutcome::StaleObservation { .. }
-        ));
+        // b8ke ext r33 F1: the legacy standalone acknowledge API is
+        // DELETED (its plain-Vacant vacate licensed a second writer) —
+        // its stale-observation arm's coverage lives on in the NEW
+        // acknowledged-start enter's own stale drive below (op-enum-cu2).
         // THE ACKNOWLEDGED START — b8ke ext r17 F1: the ATOMIC
         // ClearedUnverified→Handoff claim (one lock hold, the risk carried
-        // into the claim) now drives this key's recovery; the standalone
-        // acknowledge API's event keeps its coverage from the step-8 drive
-        // on the `sid-enum` key.
+        // into the claim); b8ke ext r33 F1: the enter CARRIES the
+        // unverified prior as the handoff's reap target (the runner
+        // kills and confirms it before the new writer commits).
         let AcknowledgedStartOutcome::Granted {
             generation: cu_entered,
         } = r_cu.begin_handoff_acknowledged_cleared_unverified(
@@ -9088,7 +9089,10 @@ mod tests {
         };
         assert!(matches!(
             r_cu.observe(PROVIDER, "sid-enum-cleared-unverified").state,
-            OwnershipState::Handoff { generation, .. } if generation == cu_entered
+            OwnershipState::Handoff { prior: Some((owner, _)), generation, .. }
+                if generation == cu_entered
+                    && owner.kind == RuntimeOwnerKind::FreshAgent
+                    && owner.pid == Some(5555)
         ));
         // The stale-observation refusal arm (a fresh cu key, the stale pair).
         let BeginOutcome::Granted { generation: g_cu2 } = r_cu.begin_start(
@@ -9205,8 +9209,9 @@ mod tests {
             "ownership.start.failed",
             "ownership.attach_guard.armed",
             "ownership.attach_guard.released",
-            "ownership.fenced.acknowledged_start_cleared_unverified",
-            "ownership.fenced.acknowledge_cleared_unverified.stale_observation",
+            // b8ke ext r33 F1: the two legacy standalone-acknowledge
+            // events are GONE with the deleted API; the acknowledged
+            // start's coverage is the enter + its stale refusal below.
             "ownership.handoff.acknowledged_start.entered",
             "ownership.handoff.acknowledged_start.stale_observation",
         ];
@@ -9530,7 +9535,27 @@ mod tests {
                         generation: entered_gen,
                         ..
                     } => {
-                        assert!(prior.is_none(), "the no-prior sequence: {prior:?}");
+                        // b8ke ext r33 F1: the enter CARRIES the unverified
+                        // prior as the handoff's REAP TARGET — the
+                        // FORCED-REAP-THEN-START contract (the runner
+                        // kills and confirms it before the new writer
+                        // commits). Pre-r33 this pinned `prior.is_none()`
+                        // — the no-prior sequence that started a second
+                        // writer over the possibly-live prior.
+                        match prior {
+                            Some((owner, prior_gen)) => {
+                                assert_eq!(
+                                    owner.kind,
+                                    RuntimeOwnerKind::FreshAgent,
+                                    "the unverified prior is carried verbatim: {owner:?}"
+                                );
+                                assert_eq!(prior_gen, 1);
+                            }
+                            None => panic!(
+                                "the acknowledged start carries the prior as the \
+                                 reap target — never the discarded no-prior sequence"
+                            ),
+                        }
                         assert_eq!(to_kind, RuntimeOwnerKind::Terminal);
                         assert_eq!(operation_id, "op-ack-start");
                         assert_eq!(entered_gen, cleared_generation + 1);

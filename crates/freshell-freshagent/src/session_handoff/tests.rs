@@ -3956,13 +3956,17 @@ async fn a_platform_limited_fence_recovers_only_through_the_acknowledged_force_c
 }
 
 /// b8ke ext r16 F4: the acknowledged PlatformLimited clear lands in the
-/// TYPED cleared-unverified state (never plain Vacant). The
-/// banner-initiated "Start reopen again" handoff proceeds BECAUSE it
-/// carries the acknowledged-risk arm (the acknowledgment recorded at the
-/// START); a NAIVE unacknowledged handoff on the cleared-unverified key
-/// refuses typed (pre-r16 the clear landed plain-Vacant, so a good-faith
-/// user following the offered recovery could start a second writer
-/// beside a surviving descendant without any acknowledgment).
+/// TYPED cleared-unverified state (never plain Vacant). b8ke ext r33 F1:
+/// the banner-initiated "Start reopen again" handoff is the
+/// FORCED-REAP-THEN-START — the acknowledged arm enters Handoff CARRYING
+/// the unverified prior as the reap target (the kill must confirm before
+/// any new writer); a NAIVE unacknowledged handoff on the
+/// cleared-unverified key refuses typed (pre-r16 the clear landed
+/// plain-Vacant, so a good-faith user following the offered recovery
+/// could start a second writer beside a surviving descendant without any
+/// acknowledgment; pre-r33 the acknowledged arm did the same with a
+/// recorded risk-acceptance). On THIS platform-limited rig the forced
+/// reap cannot confirm — the honest typed PLATFORM_LIMITED fence again.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_cleared_unverified_state_requires_the_acknowledged_start() {
     let _guard = ENV_LOCK.lock().await;
@@ -4015,8 +4019,17 @@ async fn the_cleared_unverified_state_requires_the_acknowledged_start() {
         }
     ));
 
-    // THE BANNER-INITIATED START (acknowledged): the handoff proceeds —
-    // the acknowledgment attaches to the START and vacates the state.
+    // b8ke ext r33 F1: THE BANNER-INITIATED START (acknowledged) on THIS
+    // platform-limited rig is the FORCED-REAP-THEN-START contract's
+    // UNCONFIRMABLE half — the runner now CARRIES the unverified prior
+    // as its reap target, attempts the kill, and this rig's teardown
+    // STILL cannot confirm the descendant tree: the honest outcome is
+    // the typed PLATFORM_LIMITED failure and the SAME fenced family
+    // again (never ok:true over a possibly-live prior — pre-r33 the
+    // enter discarded the prior and started a second writer here). The
+    // operator can retry (the fence stays non-permanent); the confirmed-
+    // kill green half is driven on the STANDARD rig in
+    // `the_acknowledged_start_reaps_the_live_prior_before_the_new_writer`.
     let clear_snap = rig.ownership.observe("claude", &sid);
     let mut ack_req = handoff_req_terminal("claude", &sid, "claude");
     ack_req.acknowledge_platform_limited_risk = true;
@@ -4029,16 +4042,229 @@ async fn the_cleared_unverified_state_requires_the_acknowledged_start() {
         .expect("acknowledged retry completed");
     assert_eq!(
         retried["ok"],
-        json!(true),
-        "the acknowledged start-again handoff proceeds: {retried}"
+        json!(false),
+        "the acknowledged start over an unconfirmable prior answers the honest \
+         typed failure — never a second writer: {retried}"
     );
-    let terminal_id = retried["owner"]["terminalId"].as_str().unwrap().to_string();
+    assert_eq!(
+        retried["error"]["code"],
+        json!("PLATFORM_LIMITED"),
+        "the unconfirmable forced reap lands the typed PLATFORM_LIMITED fence: {retried}"
+    );
+    assert_eq!(retried["error"]["retryable"], json!(true));
+    // The SAME typed fenced family again — never plain Vacant, never a
+    // live second writer.
+    assert!(
+        matches!(
+            rig.ownership.observe("claude", &sid).state,
+            OwnershipState::Fenced { reason, .. }
+                if matches!(
+                    reason,
+                    FenceReason::PlatformLimited | FenceReason::ClearedUnverified
+                )
+        ),
+        "the unconfirmable forced reap re-lands the typed fence: {:?}",
+        rig.ownership.observe("claude", &sid).state
+    );
+}
+
+/// b8ke ext r33 F1 (the GREEN half — the forced-reap-then-start on the
+/// STANDARD rig): the acknowledged start over a cleared-unverified state
+/// whose prior is PROVABLY ALIVE enters the handoff CARRYING the prior
+/// as its reap target — the runner kills the prior sidecar (the
+/// descendant tree included) and CONFIRMS death BEFORE the new writer
+/// commits. Pre-r33 the enter discarded the prior: the sidecar was
+/// never killed, the target spawned beside it — two live writers (the
+/// exact finding).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_acknowledged_start_reaps_the_live_prior_before_the_new_writer() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let mut rig = build_rig(None);
+    establish_fresh_claude_owner(&mut rig, &sid).await;
+
+    // Seed the typed cleared-unverified state DIRECTLY on the registry —
+    // the fence carries the LIVE prior (the standard rig's kill lanes can
+    // confirm death, unlike the platform-limited rig's).
+    let freshell_ownership::BeginOutcome::Granted {
+        generation: g_fence,
+    } = rig.ownership.begin_handoff(
+        "claude",
+        &sid,
+        RuntimeOwnerKind::Terminal,
+        "op-r33-seed-fence",
+        None,
+        "test",
+        1_000,
+    )
+    else {
+        panic!("fixture: the fence handoff must grant")
+    };
+    assert!(matches!(
+        rig.ownership.fence_unconfirmed_handoff(
+            "claude",
+            &sid,
+            "op-r33-seed-fence",
+            g_fence,
+            freshell_ownership::FenceReason::PlatformLimited,
+        ),
+        freshell_ownership::FenceOutcome::Fenced
+    ));
+    let snap = rig.ownership.observe("claude", &sid);
+    assert!(matches!(
+        rig.ownership.force_release_platform_limited(
+            "claude",
+            &sid,
+            freshell_ownership::ObservedFence {
+                epoch: snap.epoch,
+                generation: snap.generation,
+            },
+            "operator",
+        ),
+        freshell_ownership::ForceReleaseOutcome::Released
+    ));
+    assert!(matches!(
+        rig.ownership.observe("claude", &sid).state,
+        OwnershipState::Fenced {
+            reason: FenceReason::ClearedUnverified,
+            ..
+        }
+    ));
+    // Fixture: the prior sidecar is ALIVE at the acknowledged start.
+    let prior_pid = env
+        .sidecar_pid_for(&sid)
+        .expect("fixture: the prior sidecar's pid");
+    assert!(
+        freshell_terminal::registry::pid_alive(prior_pid),
+        "fixture: the unverified prior is provably alive"
+    );
+
+    // THE ACKNOWLEDGED START: enters Handoff carrying the prior as the
+    // reap target — the forced kill + confirm, THEN the target.
+    let ack_snap = rig.ownership.observe("claude", &sid);
+    let mut ack_req = handoff_req_terminal("claude", &sid, "claude");
+    ack_req.acknowledge_platform_limited_risk = true;
+    ack_req.observed_epoch = Some(ack_snap.epoch);
+    ack_req.observed_generation = Some(ack_snap.generation);
+    let handle = rig.runner.spawn_handoff(ack_req);
+    let result = handle
+        .completion
+        .await
+        .expect("acknowledged start completed");
+    assert_eq!(
+        result["ok"],
+        json!(true),
+        "the forced-reap-then-start completes once the prior's death is \
+         confirmed: {result}"
+    );
+
+    // THE PRIOR IS DEAD — the forced reap killed and confirmed it
+    // (pre-r33 the sidecar stayed alive beside the new writer).
+    await_pid_dead(prior_pid).await;
+    assert!(
+        !freshell_terminal::registry::pid_alive(prior_pid),
+        "the unverified prior is killed and confirmed dead BEFORE the new \
+         writer commits — never two live writers"
+    );
+    // The new writer is the session's SOLE owner.
+    let terminal_id = result["owner"]["terminalId"].as_str().unwrap().to_string();
     match rig.ownership.observe("claude", &sid).state {
         OwnershipState::Live { owner, .. } => {
             assert_eq!(owner.kind, RuntimeOwnerKind::Terminal);
             assert_eq!(owner.terminal_id.as_deref(), Some(terminal_id.as_str()));
         }
-        other => panic!("expected the committed terminal owner, got {other:?}"),
+        other => panic!("the new terminal writer holds the key, got {other:?}"),
+    }
+    rig.registry.kill(&terminal_id);
+}
+
+/// b8ke ext r33 F1 (b): the acknowledged start over an ALREADY-DEAD
+/// prior proceeds — the forced reap finds the prior gone (AlreadyGone /
+/// the confirmed-death evidence) and the new writer commits without a
+/// permanent wedge.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_acknowledged_start_over_an_already_dead_prior_proceeds() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let mut rig = build_rig(None);
+    establish_fresh_claude_owner(&mut rig, &sid).await;
+
+    // The same typed-state seeding...
+    let freshell_ownership::BeginOutcome::Granted {
+        generation: g_fence,
+    } = rig.ownership.begin_handoff(
+        "claude",
+        &sid,
+        RuntimeOwnerKind::Terminal,
+        "op-r33-seed-fence-dead",
+        None,
+        "test",
+        1_000,
+    )
+    else {
+        panic!("fixture: the fence handoff must grant")
+    };
+    assert!(matches!(
+        rig.ownership.fence_unconfirmed_handoff(
+            "claude",
+            &sid,
+            "op-r33-seed-fence-dead",
+            g_fence,
+            freshell_ownership::FenceReason::PlatformLimited,
+        ),
+        freshell_ownership::FenceOutcome::Fenced
+    ));
+    let snap = rig.ownership.observe("claude", &sid);
+    assert!(matches!(
+        rig.ownership.force_release_platform_limited(
+            "claude",
+            &sid,
+            freshell_ownership::ObservedFence {
+                epoch: snap.epoch,
+                generation: snap.generation,
+            },
+            "operator",
+        ),
+        freshell_ownership::ForceReleaseOutcome::Released
+    ));
+
+    // ...with the prior ALREADY DEAD (the OS-confirmed death evidence
+    // the reap finds).
+    let prior_pid = env
+        .sidecar_pid_for(&sid)
+        .expect("fixture: the prior sidecar's pid");
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &prior_pid.to_string()])
+        .status();
+    await_pid_dead(prior_pid).await;
+
+    // THE ACKNOWLEDGED START proceeds — no permanent wedge.
+    let ack_snap = rig.ownership.observe("claude", &sid);
+    let mut ack_req = handoff_req_terminal("claude", &sid, "claude");
+    ack_req.acknowledge_platform_limited_risk = true;
+    ack_req.observed_epoch = Some(ack_snap.epoch);
+    ack_req.observed_generation = Some(ack_snap.generation);
+    let handle = rig.runner.spawn_handoff(ack_req);
+    let result = handle
+        .completion
+        .await
+        .expect("acknowledged start completed");
+    assert_eq!(
+        result["ok"],
+        json!(true),
+        "the acknowledged start over an already-dead prior proceeds: {result}"
+    );
+    let terminal_id = result["owner"]["terminalId"].as_str().unwrap().to_string();
+    match rig.ownership.observe("claude", &sid).state {
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(owner.kind, RuntimeOwnerKind::Terminal);
+            assert_eq!(owner.terminal_id.as_deref(), Some(terminal_id.as_str()));
+        }
+        other => panic!("the new terminal writer holds the key, got {other:?}"),
     }
     rig.registry.kill(&terminal_id);
 }
