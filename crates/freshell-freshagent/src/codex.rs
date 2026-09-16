@@ -6835,10 +6835,23 @@ impl FreshCodexState {
                     None,
                     binding_epoch,
                     binding_generation,
-                    // b8ke focused ep5 r2 F1: the handoff runner's OWN
-                    // authoritative target binding — the pair is the
-                    // runner's supplied handoff generation.
-                    true,
+                    // b8ke focused ep5 r2 F1 + focused ep5 r5 F1: the
+                    // authoritative marker is CONDITIONAL on the
+                    // under-ticket handoff shape (`handoff.is_some()` —
+                    // exactly the OpenCode path's discipline): the
+                    // runner-supplied handoff binding is the r27-F2
+                    // authoritative target write; an ORDINARY
+                    // `ensure_session_resumable` cold resume (handoff
+                    // `None`, pair `(None, None)`) is a lane write. Pre-r5
+                    // the unconditional `true` made every ordinary cold
+                    // resume's binding write arrive at the production sink
+                    // marked authoritative with NO pair — the ep5-r3
+                    // consult's typed refusal (an authoritative write must
+                    // carry its observed pair) — so the recovered thread
+                    // registered, its binding write was REFUSED, the
+                    // runtime tore back down, and the resume answered a
+                    // transient error: restart recovery was broken.
+                    handoff.is_some(),
                 )
                 .await
             {

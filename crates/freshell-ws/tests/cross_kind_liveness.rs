@@ -862,8 +862,29 @@ impl PaneIdentitySink for TestLedgerSink {
             .map_err(std::io::Error::other)?
         })
     }
-    fn load_settings(&self, _provider: &str, _session_id: &str) -> Option<FreshAgentSettings> {
-        None
+    fn load_settings(&self, provider: &str, session_id: &str) -> Option<FreshAgentSettings> {
+        // b8ke focused ep5 r5 F1: mirror the PRODUCTION bridge's read
+        // verbatim (the rollback-focused `None` stub this copy inherited
+        // silently disabled the ordinary cold resume's RECOVERED path —
+        // `recovered` never answered Some, so the recovered-session
+        // binding write never ran in this harness). Memory-only against
+        // the real ledger, the same fresh-agent gate + settings-bearing
+        // gate as `LedgerIdentitySink::load_settings`.
+        let row = self.ledger.load_binding(provider, session_id)?;
+        if row.pane_kind.as_deref() != Some("fresh-agent") {
+            return None;
+        }
+        let s = FreshAgentSettings {
+            model: row.model,
+            sandbox: row.sandbox,
+            permission_mode: row.permission_mode,
+            effort: row.effort,
+            cwd: row.cwd,
+        };
+        if s == FreshAgentSettings::default() {
+            return None;
+        }
+        Some(s)
     }
     fn load_provenance(
         &self,
@@ -3793,6 +3814,143 @@ async fn the_failed_transition_repair_fences_and_reverts_end_to_end() {
     let _ = terminal_id;
     std::env::remove_var("CLAUDE_CONFIG_DIR");
     let _ = std::fs::remove_dir_all(store_dir);
+}
+
+/// b8ke focused ep5 r5 F1 (e2e): an ORDINARY codex cold resume with
+/// RECOVERED settings succeeds end-to-end over the PRODUCTION-shaped
+/// consulting sink (the merged harness's TestLedgerSink mirrors the
+/// production bridge's ownership consult verbatim, over the real
+/// ledger). The recovered-session binding write is a LANE write — never
+/// the authoritative marker without its pair — so the thread registers,
+/// the coordinator goes Live{FreshAgent}, and the recovered row
+/// refreshes: no teardown, no transient error. Pre-r5 the codex recovered-session binding was
+/// marked authoritative UNCONDITIONALLY: the ordinary resume's
+/// `(None, None)` pair met the ep5-r3 consult's typed refusal (an
+/// authoritative write must carry its observed pair), the recovered
+/// thread registered, its binding write was refused, the runtime tore
+/// back down, and the resume answered a transient error — breaking
+/// restart recovery.
+#[tokio::test]
+async fn an_ordinary_codex_cold_resume_with_recovered_settings_lands_end_to_end() {
+    let _guard = ENV_LOCK.lock().await;
+    let _sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
+                                              // The isolated codex home + the fake app-server (the lease-suite
+                                              // pattern): the resume spawns a real sidecar subprocess through
+                                              // CODEX_CMD.
+    let codex_home = tempfile::tempdir().expect("isolated codex home");
+    let prev_codex_home = std::env::var_os("CODEX_HOME");
+    let prev_allow = std::env::var_os("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES");
+    let prev_cmd = std::env::var_os("CODEX_CMD");
+    std::env::set_var("CODEX_HOME", codex_home.path());
+    std::env::set_var("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES", "1");
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs")
+        .canonicalize()
+        .expect("fake-app-server fixture exists");
+    std::env::set_var("CODEX_CMD", format!("node {}", fixture.display()));
+
+    let (mut h, pane_ledger) = spawn_merged_server_with_ledger().await;
+
+    // THE RECOVERED ROW: a settings-bearing codex fresh-agent row for the
+    // thread — the resume's `load_settings` must answer Some (the
+    // recovered-session binding write only runs on an actual recovery).
+    let sid = format!(
+        "c0c0c0c0-c0c0-4c0c-8c0c-c0c0c0c0{}",
+        &uuid_like_suffix()[..12]
+    );
+    pane_ledger
+        .record_fresh_agent_binding(&freshell_ws::pane_ledger::FreshAgentBindingWrite {
+            provider: "codex",
+            session_id: &sid,
+            mode: "freshcodex",
+            cwd: Some("/tmp"),
+            create_request_id: None,
+            model: Some("recovered-model"),
+            sandbox: None,
+            permission_mode: None,
+            effort: None,
+            supersedes: None,
+            provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+            authoritative: false,
+            now_ms: 1_000,
+        })
+        .expect("the recovered row seeds");
+    let row_before = pane_ledger
+        .load_binding("codex", &sid)
+        .expect("the recovered row exists");
+
+    // THE ORDINARY COLD ATTACH-RESUME: `freshAgent.attach` naming the
+    // thread — the `ensure_session_resumable(..., handoff: None)` path
+    // (no handoff, no coordinator operation on the write). The handler
+    // is detached; the observable end-to-end truths are the coordinator
+    // going Live{FreshAgent} and the recovered row refreshing. Pre-r5
+    // the recovered-session binding write was refused by the ownership
+    // consult, the recovered thread tore back down, and the resume
+    // answered a transient error — the key never went Live.
+    send_json(
+        &mut h.ws,
+        &json!({
+            "type": "freshAgent.attach",
+            "sessionType": "freshcodex", "provider": "codex",
+            "sessionId": sid,
+            "cwd": "/tmp",
+            "sessionRef": { "provider": "codex", "sessionId": sid },
+        }),
+    )
+    .await;
+    let went_live = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let live = matches!(
+                h.ws_state.fresh_codex.ownership_snapshot("codex", &sid).state,
+                freshell_ownership::OwnershipState::Live { ref owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            );
+            if live {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(
+        went_live.is_ok(),
+        "the ordinary cold resume committed Live{{FreshAgent}} — no teardown, \
+         no transient error (pre-r5 the refused binding write tore the \
+         recovered thread back down)"
+    );
+
+    // The binding write LANDED (a LANE write, never the authoritative
+    // refusal): the recovered row refreshed.
+    let row_after = pane_ledger
+        .load_binding("codex", &sid)
+        .expect("the row survives the resume");
+    assert_eq!(
+        row_after.pane_kind.as_deref(),
+        Some("fresh-agent"),
+        "the row stays the fresh-agent recovery record: {row_after:?}"
+    );
+    assert!(
+        row_after.updated_at > row_before.updated_at,
+        "the recovered-session binding write refreshed the row (the write \
+         is a LANE write — never the authoritative refusal): before \
+         {row_before:?} after {row_after:?}"
+    );
+
+    // Env restore.
+    match prev_codex_home {
+        Some(v) => std::env::set_var("CODEX_HOME", v),
+        None => std::env::remove_var("CODEX_HOME"),
+    }
+    match prev_allow {
+        Some(v) => std::env::set_var("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES", v),
+        None => std::env::remove_var("FAKE_CODEX_APP_SERVER_ALLOW_DURABLE_WRITES"),
+    }
+    match prev_cmd {
+        Some(v) => std::env::set_var("CODEX_CMD", v),
+        None => std::env::remove_var("CODEX_CMD"),
+    }
 }
 
 // ── kata b8ke Task 7: the deterministic pause-hook race suite ───────────────
