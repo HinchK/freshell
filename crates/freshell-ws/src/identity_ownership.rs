@@ -451,11 +451,15 @@ pub(crate) async fn coordinator_commit_identity(
                         snapshot.generation,
                         "handoff-committed",
                     );
-                    // The old key's VACANT release frame (F3): the old
-                    // session's CLI owner is GONE — the client clears the
-                    // divergence card for the old key (the alias chain
-                    // resolves the canonical NEW record for navigation).
-                    broadcast_vacant_frame(
+                    // The old key's frame (b8ke ext r31 F2): the SAME
+                    // aliased truth the reconnect replay resolves —
+                    // `aliasOf` naming the new canonical id and the
+                    // canonical's ownerKind/terminalId/generation — so
+                    // an ONLINE old-key pane converges exactly like a
+                    // reconnecting one (pre-r31 this broadcast the
+                    // VACANT shape with aliasOf None and the two
+                    // channels disagreed).
+                    broadcast_rebind_alias_frame(
                         state,
                         provider,
                         old_locator.session_id.as_str(),
@@ -545,6 +549,68 @@ fn rebind_release_old_key(
             false
         }
     }
+}
+
+/// b8ke ext r31 F2: the rebind's OLD-key frame — the SAME aliased truth
+/// the reconnect replay resolves. The frame is DERIVED from
+/// `snapshot_records()` itself (the one-resolve, one-read fixpoint —
+/// the exact record a reconnecting client's `ready.runtimeOwners`
+/// carries), so an ONLINE old-key pane and a RECONNECTING one converge
+/// identically, BY CONSTRUCTION: both see the old key with `aliasOf`
+/// naming the new canonical id and the CANONICAL record's
+/// ownerKind/terminalId/generation. Pre-r31 the live broadcast said
+/// `ownerKind:"vacant", aliasOf:None` while the replay resolved the
+/// same aliased key to the new canonical owner — identical
+/// old-sessionRef panes converged differently depending on whether
+/// they stayed online (owner/attach UI cleared) or reconnected (the
+/// authoritative owner folded). The `alias_of` field's own contract
+/// ("Set on the rekey transition's OLD-key mirror frame") is what
+/// this frame now honors; the client's fold already follows aliases.
+pub(crate) fn broadcast_rebind_alias_frame(
+    state: &WsState,
+    provider: &str,
+    old_session_id: &str,
+    operation_id: &str,
+) {
+    let Some(ownership) = state.ownership.as_ref() else {
+        return;
+    };
+    // ONE resolve, ONE read — the replay's own fixpoint discipline
+    // (delta round-3 F6): the record carries the canonical's
+    // owner_kind/terminal_id/generation plus aliasOf naming the
+    // canonical id.
+    let Some(rec) = ownership
+        .snapshot_records()
+        .into_iter()
+        .find(|rec| rec.provider == provider && rec.session_id == old_session_id)
+    else {
+        // No coordinator record for the old key (never occurs on a
+        // committed rebind — the rekey wrote Aliased{to: new} in the
+        // same scope): the honest vacant frame.
+        broadcast_vacant_frame(state, provider, old_session_id, operation_id);
+        return;
+    };
+    let frame = serde_json::to_string(&ServerMessage::SessionRuntimeOwner(
+        freshell_protocol::SessionRuntimeOwner {
+            provider: rec.provider,
+            session_id: rec.session_id,
+            epoch: rec.epoch,
+            generation: rec.generation,
+            owner_kind: rec.owner_kind,
+            previous_kind: None,
+            terminal_id: rec.terminal_id,
+            operation_id: operation_id.to_string(),
+            transition: "released".to_string(),
+            reason: rec.reason.clone(),
+            fenced: match rec.state {
+                freshell_ownership::ReplayOwnerState::Fenced => Some(true),
+                _ => None,
+            },
+            alias_of: rec.alias_of.clone(),
+        },
+    ))
+    .unwrap_or_default();
+    let _ = state.broadcast_tx.send(frame);
 }
 
 /// b8ke ext r14 F3: the VACANT owner frame — `ownerKind: "vacant"`, no

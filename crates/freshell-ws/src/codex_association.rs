@@ -1258,14 +1258,20 @@ mod tests {
                 if owner.terminal_id.as_deref() == Some("t1")
         ));
 
-        // (1b) b8ke ext r14 F3: the broadcast pair — the NEW key's
+        // (1b) b8ke ext r31 F2: the broadcast pair — the NEW key's
         // handoff-committed frame (ownerKind terminal + the terminal id)
-        // and the OLD key's released frame in the VACANT shape
-        // (ownerKind "vacant", NO terminal id) — the shape the client's
-        // convergence clears on (pre-r14 the released frame carried
-        // ownerKind "terminal" + the terminal id, so old-key Fresh Agent
-        // panes kept presenting "opened as CLI elsewhere" with a
-        // direct-attach action pointing at a terminal that had moved on).
+        // and the OLD key's frame in the ALIASED shape. The old key's
+        // LIVE broadcast and the RECONNECT REPLAY must agree BY
+        // CONSTRUCTION (the frame is derived from snapshot_records()
+        // itself): both carry `aliasOf` naming the new canonical id and
+        // the CANONICAL record's ownerKind/terminalId/generation, so an
+        // online old-sessionRef pane and a reconnecting one converge
+        // IDENTICALLY (pre-r31 the live broadcast said
+        // ownerKind "vacant", aliasOf None while the replay resolved
+        // the same aliased key to the new canonical owner — the
+        // pre-r14 divergence card is now handled by the alias chain:
+        // the pane folds the authoritative owner and navigates to the
+        // canonical key).
         {
             let mut new_key_frame: Option<serde_json::Value> = None;
             let mut old_key_frame: Option<serde_json::Value> = None;
@@ -1295,15 +1301,61 @@ mod tests {
             let old_key_frame =
                 old_key_frame.expect("the rebind broadcast the old key's release frame");
             assert_eq!(
+                old_key_frame["transition"],
+                json!("released"),
+                "the old key's frame is the release transition: {old_key_frame}"
+            );
+            // THE EQUIVALENCE: the live frame matches the replay record
+            // the reconnecting client receives, field for field.
+            let old_key_replay = ownership
+                .snapshot_records()
+                .into_iter()
+                .find(|rec| rec.session_id == OLD_TID && rec.provider == "codex")
+                .expect("the replay resolves the old key's record");
+            assert_eq!(
+                old_key_replay.alias_of.as_deref(),
+                Some(NEW_TID),
+                "the replay record's aliasOf names the new canonical id"
+            );
+            assert_eq!(
+                old_key_frame["aliasOf"],
+                json!(NEW_TID),
+                "the LIVE broadcast carries the same aliasOf as the replay: {old_key_frame}"
+            );
+            assert_eq!(
                 old_key_frame["ownerKind"],
-                json!("vacant"),
-                "the old key's released frame carries the VACANT owner shape: {old_key_frame}"
+                json!(old_key_replay.owner_kind),
+                "the live frame's ownerKind is the replay record's (the CANONICAL's): \
+                 {old_key_frame}"
             );
-            assert!(
-                old_key_frame.get("terminalId").is_none(),
-                "the VACANT release frame carries NO terminal id: {old_key_frame}"
+            assert_eq!(
+                old_key_frame["ownerKind"],
+                json!("terminal"),
+                "the canonical owner is terminal — the old key folds the authoritative \
+                 owner, never a permanent vacant: {old_key_frame}"
             );
-            assert_eq!(old_key_frame["transition"], json!("released"));
+            assert_eq!(
+                old_key_frame["terminalId"],
+                json!(old_key_replay.terminal_id),
+                "the live frame's terminalId is the replay record's: {old_key_frame}"
+            );
+            assert_eq!(
+                old_key_frame["terminalId"],
+                json!("t1"),
+                "the canonical terminal's id — the old-key pane navigates to it: \
+                 {old_key_frame}"
+            );
+            assert_eq!(
+                old_key_frame["generation"],
+                json!(old_key_replay.generation),
+                "the live frame's generation is the replay record's (the CANONICAL's): \
+                 {old_key_frame}"
+            );
+            assert_eq!(
+                old_key_frame["epoch"],
+                json!(old_key_replay.epoch),
+                "the live frame's epoch is the replay record's: {old_key_frame}"
+            );
         }
 
         // (2) EXACTLY ONE retained claim (the new key's) — the rebind
