@@ -138,7 +138,7 @@ Then insert this describe immediately after the `panes.repoIconsOnTabs (browser-
 
 Run: `npm run test:vitest -- run test/unit/shared/settings.test.ts`
 
-Expected: FAIL — six tests in the new block fail because the key does not exist anywhere yet: `defaults to false` and `applies a boolean patch` resolve to `undefined` (no default, and `resolveLocalSettings` drops the unknown key); `preserves ... legacy local settings seed` and `survives the reload path` return `undefined` (`pickKeys(raw.panes, PANES_LOCAL_KEYS)` drops the unknown key, so the whole panes section normalizes away); `includes ... composed resolved settings` composes `undefined`; `persists ... browser-preferences diff` produces no `patch.panes.floatingActionButton` (no writer line). The other four tests (`merges patches...`, `rejects non-boolean...`, `is rejected by the server patch schema`, `produces no persisted patch entry...`) pass at this point — `mergeLocalSettings` merges generically at runtime, unknown keys are dropped either way, the strict server schema already rejects the key, and a missing writer trivially persists nothing. They are regression guards, not red drivers.
+Expected: FAIL — four tests in the new block fail because the key does not exist anywhere yet: `defaults to false` resolves to `undefined` (no default); `preserves ... legacy local settings seed` and `survives the reload path` return `undefined` (`pickKeys(raw.panes, PANES_LOCAL_KEYS)` drops the unknown key, so the whole panes section normalizes away); `persists ... browser-preferences diff` produces no `patch.panes.floatingActionButton` (no writer line). The other six tests pass at this point — `applies a boolean patch` and `includes ... composed resolved settings` because `resolveLocalSettings` merges panes via generic `mergeDefined` (shared/settings.ts:1325) and `composeResolvedSettings` spreads `local.panes` (1431-1434), so an unknown key flows through at runtime (Vitest does not typecheck); `merges patches...`, `rejects non-boolean...`, `is rejected by the server patch schema`, and `produces no persisted patch entry...` because the generic merge, the drop-either-way normalization, the strict server schema, and the missing writer trivially satisfy them. Those six are regression guards, not red drivers.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -320,11 +320,11 @@ Expected: FAIL — exactly one test, `hides the floating action button by defaul
 - `creates picker pane when FAB is clicked` (:569)
 - `adds pane even when no active pane is set (falls back to first leaf)` (:599)
 - `handles rapid add operations` (:625)
-- In the helper bodies of BOTH `createStoreWithDefaultNewPane` copies (first at :658-668, second at :739-749): change `const store = createStore(panesState)` → `const store = createStoreWithFab(panesState)`. This covers the three `FAB + button respects defaultNewPane setting` tests (:670, :693, :715) and the five `split buttons respect defaultNewPane setting` tests (:751, :774, :797, :820, :842), which click the FAB's hover-revealed split buttons.
+- In the helper bodies of BOTH `createStoreWithDefaultNewPane` copies (first at :658-668, second at :739-749): change `const store = createStore(panesState)` → `const store = createStoreWithFab(panesState)`. These helpers are used inside two DESCRIBES titled `FAB + button respects defaultNewPane setting` (:670, :693, :715 are the per-case tests inside the first, e.g. `creates shell terminal when defaultNewPane is "shell"`) and `split buttons respect defaultNewPane setting` (:751, :774, :797, :820, :842 are the per-case tests inside the second), which click the FAB's hover-revealed split buttons.
 
 No other test in this file queries the FAB (verified by exploration: `hidden prop propagation`, `layout initialization`, `malformed persistence`, and the other `rendering` tests never touch it).
 
-(c) `test/integration/client/editor-pane.test.tsx` — its `createTestStore` (lines 190-201) has no settings preload, so the four tests that click `getByRole('button', { name: /add pane/i })` (the helper `selectEditorFromPicker` at :203-208 used by `can add editor pane via FAB` :260 and `displays editor toolbar with path input` :292; the direct click at :570 used by `maintains editor state when splitting panes` :537 and `integrates with terminal and editor panes in split view` :636) would fail under the new default. Add the enable dispatch inside the helper so every store it builds renders the FAB exactly as before this change:
+(c) `test/integration/client/editor-pane.test.tsx` — its `createTestStore` (lines 190-201) has no settings preload, so the four tests that click `getByRole('button', { name: /add pane/i })` (the helper `selectEditorFromPicker` at :203-208 used by `can add editor pane via FAB` :260 and `displays editor toolbar with path input` :292, and by `integrates with terminal and editor panes in split view` :636 via its call site :665; the direct click at :570 used by `maintains editor state when splitting panes` :537) would fail under the new default. Add the enable dispatch inside the helper so every store it builds renders the FAB exactly as before this change:
 
 ```ts
 const createTestStore = () => {
@@ -557,7 +557,7 @@ git commit -m "feat(settings): floating add-pane button toggle in Panes settings
 - Modify: `test/e2e-browser/specs/mobile-viewport.spec.ts:186` (harness dispatch before the overlap check)
 
 **Interfaces:**
-- Consumes: Tasks 1-3 behavior; the e2e test harness dispatch facility (`window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'settings/updateSettingsLocal', payload: { panes: { floatingActionButton: true } } })` — the same in-page dispatch pattern used at `mobile-viewport.spec.ts:143-162` and `helpers/test-harness.ts:497-503`; the harness is installed on every `?e2e=1` page and its `dispatch` is the real store dispatch, so the FAB appears immediately because `PaneLayout` re-renders on settings changes).
+- Consumes: Tasks 1-3 behavior; the e2e page-global test harness `window.__FRESHELL_TEST_HARNESS__` (installed on every `?e2e=1` page by `src/lib/test-harness.ts`; its `dispatch` is the live store dispatch — `src/lib/test-harness.ts:19,130` — so `window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'settings/updateSettingsLocal', payload: { panes: { floatingActionButton: true } } })` flips the FAB immediately because `PaneLayout` re-renders on settings changes; in-page dispatch precedent: `mobile-viewport.spec.ts:145`).
 - Produces: `openPanePicker`'s no-terminal fallback remains functional under the default-off FAB (it enables the FAB through the harness, then clicks it); the mobile-viewport Send-button/add-pane overlap contract keeps exercising a visible FAB; a new cloud-runnable spec proves the fallback path.
 
 - [ ] **Step 1: Write the failing behavioral test**
@@ -601,7 +601,7 @@ In `test/e2e-browser/specs/pane-picker.spec.ts`, insert before the describe's cl
   })
 ```
 
-(The `panes/updatePaneContent` dispatch and the editor content shape mirror `mobile-viewport.spec.ts:143-167` and `PaneLayout.tsx:36`. The title deliberately contains the unique token `add-pane-button` for the focused cloud run below — no other spec title in `test/e2e-browser` contains it.)
+(The `panes/updatePaneContent` dispatch STYLE mirrors `mobile-viewport.spec.ts:143-167` (which dispatches a fresh-agent payload there); the editor content SHAPE comes from `PaneLayout.tsx:36` / the `EditorPaneContent` defaults at `paneTypes.ts:146-160`. The title deliberately contains the unique token `add-pane-button` for the focused cloud run below — no other spec title in `test/e2e-browser` contains it.)
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
