@@ -9740,6 +9740,11 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
     }))
   })
 
+  // b8ke ext r34 F1: `retryable: true` below is the SERVER's REAL shape —
+  // the handler emits it (pinned server-side in
+  // session_handoff::tests::a_stale_generation_answer_is_retryable_from_the_handler_output);
+  // pre-r34 the server emitted false while client tests fabricated true,
+  // so the banner's Retry action never rendered for a real server answer.
   it('STALE_GENERATION retry refreshes the observed (epoch, generation) pair from the runtime-owner record', async () => {
     const store = createStore()
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent() }))
@@ -9837,6 +9842,9 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
     // Task-009 review Minor 1: the per-code fold matrix lives in the
     // ContextMenu suite; this loop gives EVERY typed code — including
     // REAP_TIMEOUT — the composed banner-render + Retry assertion.
+    // b8ke ext r34 F1: `retryable: true` is the SERVER's REAL shape for
+    // STALE_GENERATION (pinned server-side); the matrix keeps the
+    // banner-render assertion per code honest against it.
     const typedFailures: Array<{ code: string; message: string }> = [
       { code: 'REAP_TIMEOUT', message: 'the prior runtime did not confirm its exit in time' },
       { code: 'TARGET_SPAWN_FAILED', message: 'the target runtime failed to start' },

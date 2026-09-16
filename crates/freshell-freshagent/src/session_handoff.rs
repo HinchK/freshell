@@ -524,9 +524,14 @@ impl SessionHandoffRunner {
                 return typed_failure(
                     "STALE_GENERATION",
                     "observed ownership fence is stale; refresh and retry",
-                    false,
+                    // b8ke ext r34 F1: a stale generation is the CANONICAL
+                    // retryable race outcome — the message says refresh and
+                    // retry, so the banner renders the Retry action (pre-r34
+                    // every real STALE_GENERATION answered retryable: false
+                    // and the recovery was unreachable).
+                    true,
                     current_generation,
-                )
+                );
             }
             // b8ke focused round-4 review R4-4: a PlatformLimited fence is
             // cleared ONLY by the EXPLICIT acknowledged operator
@@ -642,9 +647,12 @@ impl SessionHandoffRunner {
                         return typed_failure(
                             "STALE_GENERATION",
                             "observed ownership fence is stale; refresh and retry",
-                            false,
+                            // b8ke ext r34 F1: retryable (the acknowledged
+                            // start's stale observation is the same
+                            // refresh-and-retry race).
+                            true,
                             current_generation,
-                        )
+                        );
                     }
                     freshell_ownership::AcknowledgedStartOutcome::LostRace { state } => {
                         tracing::warn!(target: "freshell_ownership",
@@ -915,7 +923,10 @@ impl SessionHandoffRunner {
                         return typed_failure(
                             "STALE_GENERATION",
                             "observed ownership fence is stale; refresh and retry",
-                            false,
+                            // b8ke ext r34 F1: retryable (the force-clear's
+                            // stale observation is the same refresh-and-
+                            // retry race).
+                            true,
                             current_generation,
                         );
                     }
@@ -1529,7 +1540,10 @@ impl SessionHandoffRunner {
                         typed_failure(
                             "STALE_GENERATION",
                             "ownership moved during handoff; the uncommitted target was reaped",
-                            false,
+                            // b8ke ext r34 F1: retryable — the target was
+                            // reaped (nothing to clean up); the caller
+                            // refreshes its observed pair and retries.
+                            true,
                             current,
                         )
                     }

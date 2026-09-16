@@ -2584,6 +2584,15 @@ async fn the_stale_commit_unconfirmed_reap_frame_stays_fenced_never_vacant() {
         json!("STALE_GENERATION"),
         "the typed stale-commit failure answers: {result}"
     );
+    // b8ke ext r34 F1: the stale-commit's STALE_GENERATION is RETRYABLE
+    // from the ACTUAL handler output — the message says the caller
+    // refreshes and retries (pre-r34 the flag was false and the banner
+    // rendered no action).
+    assert_eq!(
+        result["error"]["retryable"],
+        json!(true),
+        "STALE_GENERATION carries retryable: true from the handler: {result}"
+    );
 
     // THE FRAME CONTRACT: the LAST handoff-failed frame keeps the typed
     // fenced truth (fenced:true + the fence record's wire reason), never a
@@ -2768,6 +2777,15 @@ async fn a_watcher_release_mid_failure_window_leaves_the_final_frame_resolved() 
         result["error"]["code"],
         json!("STALE_GENERATION"),
         "the typed stale-commit failure answers: {result}"
+    );
+    // b8ke ext r34 F1: the stale-commit's STALE_GENERATION is RETRYABLE
+    // from the ACTUAL handler output — the message says the caller
+    // refreshes and retries (pre-r34 the flag was false and the banner
+    // rendered no action).
+    assert_eq!(
+        result["error"]["retryable"],
+        json!(true),
+        "STALE_GENERATION carries retryable: true from the handler: {result}"
     );
 
     // THE e4r2 F3 CONTRACT: the FINAL frame the client folds reflects the
@@ -4454,6 +4472,78 @@ async fn a_codex_handoff_on_an_old_rebound_reference_resolves_the_permanent_alia
         OwnershipState::Aliased { to, .. } if to == new_tid
     ));
     rig.registry.kill(&terminal_id);
+}
+
+/// b8ke ext r34 F1: the SERVER-side per-code pin — every real
+/// STALE_GENERATION answer carries `retryable: true` from the ACTUAL
+/// handler output. A stale generation is the canonical retryable
+/// cross-device race outcome (the message says refresh and retry); the
+/// client banner renders the Retry action from this flag. Pre-r34 the
+/// server emitted `retryable: false` while the client coverage
+/// fabricated `true` — the recovery existed only in the tests. This pin
+/// drives the MAIN path's emission (the observed-pair stale enter); the
+/// stale-commit arm's emission is pinned by the retryable asserts in the
+/// stale-commit tests, and the acknowledged-start/force-clear race arms
+/// share the same `typed_failure` call shape.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stale_generation_answer_is_retryable_from_the_handler_output() {
+    let _guard = ENV_LOCK.lock().await;
+    let sid = format!("stale-retryable-{}", uuid::Uuid::new_v4());
+    let rig = build_rig(None);
+
+    // A live terminal owner at generation 1 (the observed-pair baseline).
+    let freshell_ownership::BeginOutcome::Granted { generation } = rig.ownership.begin_start(
+        "codex",
+        &sid,
+        RuntimeOwnerKind::Terminal,
+        "op-r34-stale-baseline",
+        None,
+        "test",
+        1_000,
+    ) else {
+        panic!("fixture: the baseline claim must grant")
+    };
+    assert!(matches!(
+        rig.ownership.commit_live(
+            "codex",
+            &sid,
+            "op-r34-stale-baseline",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: RuntimeOwnerKind::Terminal,
+                terminal_id: Some("t-r34-stale-baseline".to_string()),
+                live_session_key: None,
+                pid: None,
+                ownership_id: None,
+            },
+        ),
+        freshell_ownership::CommitOutcome::Committed
+    ));
+
+    // THE HANDOFF with a STALE observed pair (generation 0 against the
+    // key's generation 1): the main path's stale-enter emission.
+    let mut req = handoff_req_terminal("codex", &sid, "codex");
+    req.observed_epoch = Some(rig.ownership.boot_epoch());
+    req.observed_generation = Some(0);
+    let handle = rig.runner.spawn_handoff(req);
+    let result = handle.completion.await.expect("runner completed");
+    assert_eq!(
+        result["error"]["code"],
+        json!("STALE_GENERATION"),
+        "the stale observed pair answers the typed stale generation: {result}"
+    );
+    assert_eq!(
+        result["error"]["retryable"],
+        json!(true),
+        "STALE_GENERATION carries retryable: true from the ACTUAL handler \
+         output — the banner's Retry action renders from this flag: {result}"
+    );
+    assert_eq!(
+        result["error"]["ownerGeneration"],
+        json!(generation),
+        "the refusal names the current generation for the caller's refresh: {result}"
+    );
+    rig.registry.kill("t-r34-stale-baseline");
 }
 
 /// b8ke ext r16 F1: the settle-then-reap confirmation PROPAGATES
