@@ -22,7 +22,7 @@
 
 **Goal:** Eliminate the `host-stats-pane.spec.ts:47` freshellPage setup-timeout flake by fixing the three harness defects that jointly produced it: (1) the self-healing `waitForConnection` lets its phases, reload, and final poll each consume their own full window (a sequential 3-window drift up to 135s at W=90s) instead of enforcing W as a single total deadline; (2) the per-test deadline (60s) is smaller than the fixture chain's evidence-shaped envelope on the cloud lane (only `settings.spec.ts` got a hook-based 120s extension); (3) `selectShellFromPicker` — the piece the retained trace proves was the actual budget burner — conflates a slow terminal render with "wrong shell option", silently escalates through options that do not exist on this platform, swallows every error, and double-creates terminals.
 
-**Architecture:** The retained attempt-1 trace (validator report, LB-C) shows the recorded failure was NOT the j90s zero-CPU wedge: the boot chain completed, WS ready landed at t0+23s (inside phase 1 — no self-heal reload), the fixture clicked "Shell" (terminal created server-side, active with `hasClients:true`), but the `.xterm` render starved >30s under container-wide CPU contention (54% CPU, a sibling worker's normally-200ms test took 74s in the same window). The loop's 30s `.xterm` wait failed, and the loop escalated — WSL (5s click timeout), CMD (mid-click at the 60s deadline) — options absent on the Linux picker, silently burning the remaining budget. The fix makes the harness envelope coherent and covered: `waitForConnection` enforces W as a single total deadline (phase-1 `floor(W/2)`; the reload and phase-2 share the remainder, +1s slack — the documented design intent and the j90s recap's Optional finding #4); the per-test budget derives from the same env that scales the window (`FRESHELL_E2E_WS_READY_TIMEOUT_MS`) and COVERS the chain's permitted composition (connection envelope W+1s + the picker's permitted worst case + start reserve = 231.5s at the cloud default; delta-review r2, probe-inclusive as of r5), applied as the `freshellPage` FIXTURE's OWN setup timeout (Playwright's fixture-timeout mechanism — slow setup gets the allowance while every test body keeps its declared or config-default ceiling; delta review r9); and `selectShellFromPicker` distinguishes a confirmed-absent option (click TimeoutError, then a bounded creation probe confirms nothing was created — advance) from a successful or late-dispatched click (wait generously for the render, fail loudly on timeout — never escalate; delta review r5: a click timeout does not prove the handler never ran). The local lane (env unset) keeps the default budget; the picker's healthy path is unchanged.
+**Architecture:** The retained attempt-1 trace (validator report, LB-C) shows the recorded failure was NOT the j90s zero-CPU wedge: the boot chain completed, WS ready landed at t0+23s (inside phase 1 — no self-heal reload), the fixture clicked "Shell" (terminal created server-side, active with `hasClients:true`), but the `.xterm` render starved >30s under container-wide CPU contention (54% CPU, a sibling worker's normally-200ms test took 74s in the same window). The loop's 30s `.xterm` wait failed, and the loop escalated — WSL (5s click timeout), CMD (mid-click at the 60s deadline) — options absent on the Linux picker, silently burning the remaining budget. The fix makes the harness envelope coherent and covered: `waitForConnection` enforces W as a single total deadline (phase-1 `floor(W/2)`; the reload and phase-2 share the remainder, +1s slack — the documented design intent and the j90s recap's Optional finding #4); the per-test budget derives from the same env that scales the window (`FRESHELL_E2E_WS_READY_TIMEOUT_MS`) and COVERS the chain's permitted composition (connection envelope W+1s + the goto and harness legal maxima + the picker's permitted worst case = 261.5s at the cloud default; delta-reviews r2+r5+r12), applied as the `freshellPage` FIXTURE's OWN setup timeout (Playwright's fixture-timeout mechanism — slow setup gets the allowance while every test body keeps its declared or config-default ceiling; delta review r9); and `selectShellFromPicker` distinguishes a confirmed-absent option (click TimeoutError, then a bounded creation probe confirms nothing was created — advance) from a successful or late-dispatched click (wait generously for the render, fail loudly on timeout — never escalate; delta review r5: a click timeout does not prove the handler never ran). The local lane (env unset) keeps the default budget; the picker's healthy path is unchanged.
 
 **Tech Stack:** Playwright 1.58.2 fixtures and `test.info().setTimeout`, TypeScript (NodeNext/ESM — relative imports in test files carry `.js`; type-only imports stay type-only), Vitest for the e2e-helpers unit lane (fake timers for clock-sensitive coherence tests), the repo's cloud e2e lane (`scripts/e2e-cloud.sh`) for proof.
 
@@ -30,15 +30,15 @@
 
 - Budget changes are cloud-only and env-gated: with `FRESHELL_E2E_WS_READY_TIMEOUT_MS` unset, no timeout changes and no different call shapes on the default path (byte-identical local lane for the budget dimension).
 - `waitForConnection`'s self-heal window W is a SINGLE TOTAL deadline: phase-1 + the reload's navigation + phase-2 share W (+1s slack), so the connection-wait envelope is W+1s (91s at the cloud window) — the budget never needs to cover a multi-W envelope. The pre-fix sequential drift (up to 135s) is fixed at the source (Task 2), not budgeted around.
-- Budget = the fixture chain's PERMITTED COMPOSITION (delta-review r2, probe-inclusive as of r5): connection envelope (W + 1s total-deadline slack) + the picker's permitted worst case (derived from the picker's own exported constants — settle + one click budget + one creation-probe budget per shell name + the render wait = 110.5s) + start/body reserve (30s) = 231.5s at the cloud default W=90s, unit-pinned so the composition cannot drift. A budget merely "evidence-sized" to the recorded episodes was rejected by review: the retained trace shows connection AND render slowness co-occurring in one container-wide disturbance, so the outer deadline must cover the waits the chain is permitted to compose, or the same outer setup-timeout flake recurs before the picker's diagnostic can fire.
+- Budget = the fixture chain's PERMITTED COMPOSITION (delta-reviews r2+r5+r12): connection envelope (W + 1s total-deadline slack) + page.goto's and waitForHarness's LEGAL MAXIMA (30s each — not their healthy ~3s: correlated cloud slowness can stretch both to their deadlines together, delta r12) + the picker's permitted worst case (derived from the picker's own exported constants — settle + one click budget + one creation-probe budget per shell name + the render wait = 110.5s) = 261.5s at the cloud default W=90s, unit-pinned so the composition cannot drift. (The former 30s start/body reserve is deleted: its goto/harness rationale is superseded by the real maxima, and a body-start margin never belonged in a fixture-SETUP slot — the body has its own deadline.) A budget merely "evidence-sized" to the recorded episodes was rejected by review: the retained trace shows connection AND render slowness co-occurring in one container-wide disturbance, so the outer deadline must cover the waits the chain is permitted to compose, or the same outer setup-timeout flake recurs before the picker's diagnostic can fire.
 - The wiring NEVER modifies a test's own deadline (delta review r9 — the r2-r8 whole-test/default-class extension is superseded): the composed budget is the `freshellPage` fixture's OWN timeout (Playwright's fixture-timeout mechanism, playwright.dev/docs/test-fixtures#fixture-timeout), so slow boot SETUP gets its allowance while every body keeps its declared or config-default ceiling on every lane (`DEFAULT_TEST_TIMEOUT_MS` = 60_000, the constant the Playwright configs import). Specs that need a larger BODY budget declare it themselves, cloud-gated to exactly what the pre-run state gave them (settings' two reload tests declare 120_000 under isCloudLaneWindowConfigured() — the removed hook's exact value; locally no declaration and the exact pre-run 60s, delta review r10); a declared 0 (unlimited) or an above-default declaration reaches the wiring unchanged. The former whole-test extension gave unrelated bodies ~171.5s of extra ceiling and could suppress their flakes — the fixture-timeout design removes that interference structurally. The contract spec pins it.
 - The self-heal stays cloud-only (env-presence gated) and fresh-boot-only: never opt a mid-test `waitForConnection` site into `selfHealReload` (a reload would destroy the state under test).
 - Never loosen the ready assertion, never skip or exclude specs, never raise `retries`, never widen `CLOUD_SKIP_SPECS` — those are coverage reductions, not fixes. The picker fix TIGHTENS failure semantics (a thrown diagnostic replaces a silent fall-through past a successful click; non-timeout click errors propagate); it must not touch any passing-path assertion.
 - Malformed env values must never poison the budget (reuse `resolveWsReadyTimeoutMs`'s parsing/fallback — one parsing rule).
 - A budget that covers the evidence-shaped envelope must not silently become a per-test entitlement: assertions and waits inside test bodies keep their own explicit timeouts.
 - The other three baseline flakes (kata 38hj `restore-contract-wall-rust.spec.ts:579`, kata 5kyg `recover-my-panes-rust.spec.ts:733`, kata ebp6 `reconcile-client-adoption-rust.spec.ts:542`) are pre-existing failures at base_ref 39192e8aa and stay out of scope; they are the campaign's next one-test-at-a-time steps.
-- The gVisor wedge and container-slowness episodes are infra-layer and cannot be deterministically forced; acceptance evidence is (a) the budget arithmetic and total-deadline coherence (unit-pinned), (b) the contract spec proving the wiring under the env-present path, (c) the picker loop's new contract (unit-pinned: no escalation after a successful click; the render wait receives `SHELL_RENDER_TIMEOUT_MS`; loud timeout; non-timeout click errors propagate; and — delta r5 — a click timeout followed by a late-dispatched create joins the success path, a click timeout with nothing created advances, and probe hard errors propagate), and (d) zero-flake cloud receipts for the affected spec at the committed HEAD.
-- Accepted residuals, deliberately out of scope (recorded so the reviewer sees conscious scoping): (a) the client's timeout-less boot fetches (App.tsx:1691-1753, api.ts:181) remain unbounded — that product-level hardening is the qq5m flake class, tracked by its own kata and later campaign runs; the fixes here make single infra episodes survivable without it. (b) The budget covers the fixture chain's permitted composition but not unbounded TEST-BODY work (bodies keep their own declared/explicit timeouts) and not the goto/waitForHarness maxima — both fail with their own distinct timeout signatures long before the outer deadline, never the "while setting up freshellPage" signature this run eliminates. (c) `waitForHarness`'s decorative 15s (real 30s) was an LB-1-class two-argument binding bug FIXED by this run (delta reviews r5+r6): the committed call is the three-argument form with the timeout as waitForFunction's options, and the DEFAULT is 30_000 — the historical EFFECTIVE window — so honoring the binding shrinks no caller (the old decorative 15s, honored for real, would have halved every no-arg caller's window). The one explicit-argument call site (perf/run-sample.ts) passes 30_000, equal to its historical effective window. (d) Raw-base specs that import `test` from `@playwright/test` directly and boot the app in-body (terminal-escape-key-rust, cli-rust, silent-input-loss-rust, sidebar-registry-sync-rust, sidebar-remote-status-rings-rust, sidebar-status-tier-sort-rust, diag03-rotation-redaction-rust — load-bearing LB-B2) never resolve `e2eMachineId`; they keep the same 60s deadline they have today. This run does not regress them and does not cover them; they are tracked by kata j96j and addressed by a later campaign step.
+- The gVisor wedge and container-slowness episodes are infra-layer and cannot be deterministically forced; acceptance evidence is (a) the budget arithmetic and total-deadline coherence (unit-pinned), (b) the contract spec proving the wiring under the env-present path, (c) the picker loop's new contract (unit-pinned: no escalation after a successful click; the render wait receives `SHELL_RENDER_TIMEOUT_MS`; loud timeout; non-timeout click errors propagate; and — delta r5 — a click timeout followed by a late-dispatched create joins the success path, a click timeout with nothing created advances, and probe hard errors propagate), (d) the fixture-timeout application pin (the production freshellPage registration carries a deterministically slowed boot past the test's own deadline — delta r12), and (e) zero-flake cloud receipts for the affected spec at the committed HEAD.
+- Accepted residuals, deliberately out of scope (recorded so the reviewer sees conscious scoping): (a) the client's timeout-less boot fetches (App.tsx:1691-1753, api.ts:181) remain unbounded — that product-level hardening is the qq5m flake class, tracked by its own kata and later campaign runs; the fixes here make single infra episodes survivable without it. (b) The budget covers the fixture chain's permitted composition INCLUDING the goto and waitForHarness maxima (delta review r12) but not unbounded TEST-BODY work (bodies keep their own declared/explicit timeouts). (c) `waitForHarness`'s decorative 15s (real 30s) was an LB-1-class two-argument binding bug FIXED by this run (delta reviews r5+r6): the committed call is the three-argument form with the timeout as waitForFunction's options, and the DEFAULT is 30_000 — the historical EFFECTIVE window — so honoring the binding shrinks no caller (the old decorative 15s, honored for real, would have halved every no-arg caller's window). The one explicit-argument call site (perf/run-sample.ts) passes 30_000, equal to its historical effective window. (d) Raw-base specs that import `test` from `@playwright/test` directly and boot the app in-body (terminal-escape-key-rust, cli-rust, silent-input-loss-rust, sidebar-registry-sync-rust, sidebar-remote-status-rings-rust, sidebar-status-tier-sort-rust, diag03-rotation-redaction-rust — load-bearing LB-B2) never resolve `e2eMachineId`; they keep the same 60s deadline they have today. This run does not regress them and does not cover them; they are tracked by kata j96j and addressed by a later campaign step.
 - The full e2e lane at the run HEAD is part of this run's final gate (`npm run test:e2e`, cloud backend); PR checks do not run e2e on this repo, so the lane must be run explicitly.
 
 ---
@@ -51,11 +51,11 @@
 
 **Interfaces:**
 - Consumes: `resolveWsReadyTimeoutMs(explicitMs, env)`, `DEFAULT_WS_READY_TIMEOUT_MS`, env key `FRESHELL_E2E_WS_READY_TIMEOUT_MS` (set to `90000` on the cloud lane by `scripts/e2e-cloud.sh`'s run-env block).
-- Produces (as amended by delta-review rounds 1-5 and 9): `isCloudLaneWindowConfigured(env?): boolean` (ONE presence rule — present AND non-empty), `shellPickerWorstCaseMs(): number` (the picker's permitted worst case derived from its own exported constants — settle + one click budget + one creation-probe budget per shell name + the render wait), `CLOUD_LANE_START_RESERVE_MS: number` (30_000), `DEFAULT_TEST_TIMEOUT_MS: number` (60_000 — the Playwright configs' `timeout` value, imported from here as the single source of truth), `freshellPageFixtureTimeoutMs(env?): number | undefined` (the freshellPage fixture's OWN setup timeout: the composed budget on the cloud lane, undefined locally — unit-pinned below; delta review r9, replacing the superseded extension predicate), and `resolveCloudLaneTestBudgetMs(env?): number | null` — `null` when the window env is not configured (local lane: caller must not extend anything), otherwise the permitted composition: `resolveWsReadyTimeoutMs(undefined, env) + 1000 + shellPickerWorstCaseMs() + CLOUD_LANE_START_RESERVE_MS` (231.5s at the cloud default).
+- Produces (as amended by delta-review rounds 1-5 and 9): `isCloudLaneWindowConfigured(env?): boolean` (ONE presence rule — present AND non-empty), `shellPickerWorstCaseMs(): number` (the picker's permitted worst case derived from its own exported constants — settle + one click budget + one creation-probe budget per shell name + the render wait), `CLOUD_LANE_GOTO_MAX_MS: number` (30_000 — page.goto's legal maximum, Playwright's default navigation timeout) and `CLOUD_LANE_HARNESS_MAX_MS: number` (30_000 — waitForHarness's default window; delta review r12), `DEFAULT_TEST_TIMEOUT_MS: number` (60_000 — the Playwright configs' `timeout` value, imported from here as the single source of truth), `freshellPageFixtureTimeoutMs(env?): number | undefined` (the freshellPage fixture's OWN setup timeout: the composed budget on the cloud lane, undefined locally — unit-pinned below; delta review r9, replacing the superseded extension predicate), and `resolveCloudLaneTestBudgetMs(env?): number | null` — `null` when the window env is not configured (local lane: caller must not extend anything), otherwise the permitted composition: `resolveWsReadyTimeoutMs(undefined, env) + 1000 + CLOUD_LANE_GOTO_MAX_MS + CLOUD_LANE_HARNESS_MAX_MS + shellPickerWorstCaseMs()` (261.5s at the cloud default).
 
 - [ ] **Step 1: Write the failing behavioral test**
 
-Add to `test/e2e-browser/helpers/test-harness.test.ts` (match the file's existing vitest style — imports from `'./test-harness'`, `describe`/`it`; add `CLOUD_LANE_START_RESERVE_MS`, `resolveCloudLaneTestBudgetMs`, `shellPickerWorstCaseMs`, `isCloudLaneWindowConfigured`, `DEFAULT_TEST_TIMEOUT_MS`, and `freshellPageFixtureTimeoutMs` to the existing import from `'./test-harness'`, plus the picker constants `SHELL_PICKER_SETTLE_MS`/`SHELL_CLICK_TIMEOUT_MS`/`SHELL_PROBE_TIMEOUT_MS`/`SHELL_RENDER_TIMEOUT_MS`/`SHELL_NAMES` once Task 4 exports them):
+Add to `test/e2e-browser/helpers/test-harness.test.ts` (match the file's existing vitest style — imports from `'./test-harness'`, `describe`/`it`; add `CLOUD_LANE_GOTO_MAX_MS`, `CLOUD_LANE_HARNESS_MAX_MS`, `resolveCloudLaneTestBudgetMs`, `shellPickerWorstCaseMs`, `isCloudLaneWindowConfigured`, `DEFAULT_TEST_TIMEOUT_MS`, and `freshellPageFixtureTimeoutMs` to the existing import from `'./test-harness'`, plus the picker constants `SHELL_PICKER_SETTLE_MS`/`SHELL_CLICK_TIMEOUT_MS`/`SHELL_PROBE_TIMEOUT_MS`/`SHELL_RENDER_TIMEOUT_MS`/`SHELL_NAMES` once Task 4 exports them):
 
 **Dependency order (delta-review r5 reconciliation):** the listing below is the COMMITTED final state. `shellPickerWorstCaseMs` composes from the `SHELL_*` picker constants, whose values Task 4 owns — a worker executing top-down exports the constants (plain exported consts, no logic) together with this task's resolver so the whole listing compiles, and `selectShellFromPicker` itself is implemented in Task 4. The `freshellPageFixtureTimeoutMs` describe is the delta-r9 remediation's unit pin for the fixture-timeout wiring (it replaced the r5 extension-predicate describe when the whole-test extension was superseded).
 
@@ -71,21 +71,21 @@ describe('resolveCloudLaneTestBudgetMs', () => {
 
   it('covers the permitted composition at the cloud default window (delta reviews r2+r5)', () => {
     // W=90s: connection envelope (W + 1s total-deadline slack) = 91_000;
-    // picker worst case (settle + at most 5 clicks + 5 probes + the render
-    // wait) = 500 + 5 * (5_000 + 5_000) + 60_000 = 110_500; start reserve
-    // 30_000. Total 231_500 (delta r5: the creation probe's per-shell
-    // budget joined the composition).
-    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '90000' })).toBe(231_500)
+    // goto max 30_000 + waitForHarness max 30_000 (delta r12: the initial
+    // operations' LEGAL maxima, not their healthy ~3s); picker worst case
+    // (settle + at most 5 clicks + 5 probes + the render wait) = 500 +
+    // 5 * (5_000 + 5_000) + 60_000 = 110_500. Total 261_500.
+    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '90000' })).toBe(261_500)
   })
 
-  it('scales with the configured window (60s -> 201_500)', () => {
-    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '60000' })).toBe(201_500)
+  it('scales with the configured window (60s -> 231_500)', () => {
+    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '60000' })).toBe(231_500)
   })
 
   it('falls back to the default window composition on malformed values (one parsing rule)', () => {
     for (const malformed of ['not-a-number', '0', '-5']) {
       expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: malformed }))
-        .toBe(30_000 + 1_000 + shellPickerWorstCaseMs() + CLOUD_LANE_START_RESERVE_MS)
+        .toBe(30_000 + 1_000 + CLOUD_LANE_GOTO_MAX_MS + CLOUD_LANE_HARNESS_MAX_MS + shellPickerWorstCaseMs())
     }
   })
 
@@ -94,7 +94,7 @@ describe('resolveCloudLaneTestBudgetMs', () => {
       const budget = resolveCloudLaneTestBudgetMs({ [ENV_VAR]: windowMs })
       expect(budget).not.toBeNull()
       expect(budget!).toBeGreaterThanOrEqual(
-        Number(windowMs) + 1_000 + shellPickerWorstCaseMs() + CLOUD_LANE_START_RESERVE_MS,
+        Number(windowMs) + 1_000 + CLOUD_LANE_GOTO_MAX_MS + CLOUD_LANE_HARNESS_MAX_MS + shellPickerWorstCaseMs(),
       )
     }
   })
@@ -133,8 +133,8 @@ describe('isCloudLaneWindowConfigured (one presence rule for every cloud-lane ga
 
 describe('freshellPageFixtureTimeoutMs (the boot chain owns its own setup allowance, delta review r9)', () => {
   it('is the composed budget on the cloud lane — the fixture SETUP gets the large window, never the test body', () => {
-    expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: '90000' })).toBe(231_500)
-    expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: '60000' })).toBe(201_500)
+    expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: '90000' })).toBe(261_500)
+    expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: '60000' })).toBe(231_500)
   })
 
   it('is undefined on the local lane: fixture time counts toward the test timeout — the exact pre-run behavior', () => {
@@ -145,7 +145,7 @@ describe('freshellPageFixtureTimeoutMs (the boot chain owns its own setup allowa
   it('falls back to the default window composition on malformed values (one parsing rule)', () => {
     for (const malformed of ['not-a-number', '0', '-5']) {
       expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: malformed }))
-        .toBe(30_000 + 1_000 + shellPickerWorstCaseMs() + CLOUD_LANE_START_RESERVE_MS)
+        .toBe(30_000 + 1_000 + CLOUD_LANE_GOTO_MAX_MS + CLOUD_LANE_HARNESS_MAX_MS + shellPickerWorstCaseMs())
     }
   })
 
@@ -162,7 +162,7 @@ describe('freshellPageFixtureTimeoutMs (the boot chain owns its own setup allowa
 
 Run: `npm run test:e2e:helpers -- test-harness`
 
-Expected: FAIL because the new exports (`resolveCloudLaneTestBudgetMs`, `isCloudLaneWindowConfigured`, `shellPickerWorstCaseMs`, the picker constants, `CLOUD_LANE_START_RESERVE_MS`, `DEFAULT_TEST_TIMEOUT_MS`, `freshellPageFixtureTimeoutMs`) are missing from `./test-harness` — the suite reports the missing exports and cannot assert the composed budget derivation or the fixture-timeout value (the behavior is absent).
+Expected: FAIL because the new exports (`resolveCloudLaneTestBudgetMs`, `isCloudLaneWindowConfigured`, `shellPickerWorstCaseMs`, the picker constants, `CLOUD_LANE_GOTO_MAX_MS`, `CLOUD_LANE_HARNESS_MAX_MS`, `DEFAULT_TEST_TIMEOUT_MS`, `freshellPageFixtureTimeoutMs`) are missing from `./test-harness` — the suite reports the missing exports and cannot assert the composed budget derivation or the fixture-timeout value (the behavior is absent).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -170,13 +170,22 @@ In `test/e2e-browser/helpers/test-harness.ts`, directly after `resolveWsReadyTim
 
 ```ts
 /**
- * Start/body reserve added to the connection and picker envelopes when
- * computing the cloud-lane per-test budget: healthy page.goto +
- * waitForHarness (~3s — their maxima are self-limiting: each throws its
- * own distinct navigation/wait timeout well before the test deadline) and
- * a body-start margin for the test's first steps.
+ * page.goto's legal maximum on the cloud lane: Playwright's DEFAULT
+ * navigation timeout (30s — the configs set no navigationTimeout), NOT
+ * the healthy ~3s. Each initial operation can legally succeed just
+ * before its own deadline, so correlated cloud slowness can stretch
+ * goto AND the harness wait to their maxima TOGETHER — the composition
+ * must cover their maxima, not their healthy shapes (delta review r12).
  */
-export const CLOUD_LANE_START_RESERVE_MS = 30_000
+export const CLOUD_LANE_GOTO_MAX_MS = 30_000
+
+/**
+ * waitForHarness's legal maximum: its default window (30_000 — the
+ * historical EFFECTIVE window, delta review r6). Same rationale as
+ * CLOUD_LANE_GOTO_MAX_MS: the composition covers the maxima the chain is
+ * permitted to compose (delta review r12).
+ */
+export const CLOUD_LANE_HARNESS_MAX_MS = 30_000
 
 /**
  * Whether the cloud-lane window env key is configured (present AND
@@ -214,9 +223,10 @@ export function shellPickerWorstCaseMs(): number {
 /**
  * Resolve the cloud-lane per-test deadline budget, or null on the local
  * lane (kata tg4e). The budget COVERS THE PERMITTED COMPOSITION of the
- * fixture chain (delta-review r2): the connection envelope (waitForConnection
- * enforces its window W as a single total deadline, W + 1s slack) plus the
- * picker's permitted worst case plus a start/body reserve. The config's 60s
+ * fixture chain (delta-reviews r2+r12): the connection envelope (waitForConnection
+ * enforces its window W as a single total deadline, W + 1s slack) plus
+ * page.goto's and waitForHarness's legal maxima plus the picker's
+ * permitted worst case. The config's 60s
  * default deadline kills fixture setup mid-composition ("Test timeout of
  * 60000ms exceeded while setting up freshellPage" — the recorded tg4e flake,
  * whose retained trace shows connection AND render slowness co-occurring
@@ -233,7 +243,10 @@ export function resolveCloudLaneTestBudgetMs(
 ): number | null {
   if (!isCloudLaneWindowConfigured(env)) return null
   const connectionEnvelopeMs = resolveWsReadyTimeoutMs(undefined, env) + 1000
-  return connectionEnvelopeMs + shellPickerWorstCaseMs() + CLOUD_LANE_START_RESERVE_MS
+  return connectionEnvelopeMs
+    + CLOUD_LANE_GOTO_MAX_MS
+    + CLOUD_LANE_HARNESS_MAX_MS
+    + shellPickerWorstCaseMs()
 }
 
 /**
@@ -252,8 +265,10 @@ export const DEFAULT_TEST_TIMEOUT_MS = 60_000
  * receive a larger allowance while the test keeps its original deadline
  * (playwright.dev/docs/test-fixtures#fixture-timeout) — the boot chain
  * (goto + waitForHarness + self-healing waitForConnection + the picker
- * leg) is fixture setup, and its permitted composition is exactly what
- * resolveCloudLaneTestBudgetMs derives. undefined means no
+ * leg) is fixture setup, and its permitted composition — INCLUDING the
+ * goto and harness maxima (delta review r12) — is exactly what
+ * resolveCloudLaneTestBudgetMs derives: 261.5s at the default window.
+ * undefined means no
  * fixture-specific timeout: fixture time counts toward the test timeout —
  * the exact pre-run behavior the local lane keeps. The test's own
  * deadline is NEVER modified by the wiring.
@@ -580,53 +595,64 @@ git commit -m "test(e2e): waitForConnection self-heal enforces its window as a s
 
 - [ ] **Step 1: Write the failing behavioral test (the contract spec + the wiring-presence pin)**
 
-Create `test/e2e-browser/specs/e2e-budget-contract.spec.ts`, whose FIRST block is the fixture-timeout MECHANISM pin (the committed form, delta review r11 — the deterministic BEHAVIORAL test that setup may outlive the test's own deadline; it replaced the r10 source-text pin, which the repo's quality rule rejects — a source check runs no behavior):
+Create `test/e2e-browser/specs/e2e-budget-contract.spec.ts`, whose FIRST block is the fixture-timeout APPLICATION pin (the committed form, delta review r12): it exercises THE PRODUCTION freshellPage REGISTRATION — the spec's local test extension overrides the `harness` DEPENDENCY with a TestHarness subclass whose waitForHarness deterministically sleeps 8s before delegating, so the production fixture's own setup legally exceeds the test's own declared deadline:
 
 ```ts
 import { test as base, expect } from '../helpers/fixtures.js'
-import { DEFAULT_TEST_TIMEOUT_MS } from '../helpers/test-harness.js'
+import { DEFAULT_TEST_TIMEOUT_MS, isCloudLaneWindowConfigured, TestHarness } from '../helpers/test-harness.js'
+import type { Page } from '@playwright/test'
 
-// The fixture-timeout mechanism pin (delta review r11): a test-scoped
-// fixture whose setup DETERMINISTICALLY outlives the test's own declared
-// deadline, carrying its own larger fixture timeout. The test below
-// reaches its body only if Playwright runs fixture setup on the fixture's
-// separate timeout slot — the exact property the tg4e fix depends on
-// (slow boot SETUP may outlive the test's own 60s ceiling). If the
-// mechanism breaks, or the tuple wiring loses its timeout, the setup dies
-// at the test's own deadline instead. Constant 30s on both lanes: this
-// pin tests the MECHANISM; the lane-derived composed value is behaviorally
-// unit-pinned by freshellPageFixtureTimeoutMs, and the real tuple wiring
-// runs on every healthy boot of the legs and the full lane. Semantics
-// empirically probed on Playwright 1.58.2 (r11 remediation research): the
-// function form (no fixture timeout) fails with the EXACT tg4e signature
-// — "Test timeout of 3000ms exceeded while setting up \"slowSetupWitness\""
-// — and the tuple form carries the 8s setup to a body that still observes
-// its own 3s slot.
-const test = base.extend<{ slowSetupWitness: void }>({
-  slowSetupWitness: [async ({}, use) => {
-    // 8s of real time vs the test's own 3s deadline: only the fixture's
-    // own slot can carry this setup.
+// The fixture-timeout APPLICATION pin (delta review r12): it exercises
+// THE PRODUCTION freshellPage REGISTRATION — not a synthetic witness.
+// The spec's local test extension overrides the `harness` DEPENDENCY
+// with a TestHarness subclass whose waitForHarness deterministically
+// sleeps 8s before delegating, so the production fixture's own setup
+// legally exceeds the test's own declared deadline: reaching the test
+// body is only possible if the production tuple wiring
+// ({ timeout: freshellPageFixtureTimeoutMs() } in fixtures.ts) carries
+// the boot on freshellPage's separate timeout slot. With the wiring
+// removed, this test dies with "Test timeout of 3000ms exceeded while
+// setting up 'freshellPage'" — the EXACT production tg4e signature —
+// deterministically (the 8s sleep dominates any machine speed).
+// Validated by mutation during the r12 remediation. The lane-derived
+// composed value (261.5s at the default window, including the goto and
+// harness maxima) is behaviorally unit-pinned by freshellPageFixtureTimeoutMs.
+class DeterministicallySlowBootHarness extends TestHarness {
+  constructor(page: Page) {
+    super(page)
+  }
+
+  override async waitForHarness(timeoutMs?: number): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 8_000))
-    await use()
-  }, { timeout: 30_000 }],
+    return super.waitForHarness(timeoutMs)
+  }
+}
+
+const test = base.extend<{ harness: TestHarness }>({
+  harness: async ({ page }, use) => {
+    await use(new DeterministicallySlowBootHarness(page))
+  },
 })
 ```
 
-and whose LAST block pins the mechanism behaviorally:
+and whose LAST block pins the application behaviorally:
 
 ```ts
 // The behavioral pin itself: the describe declares a 3s test deadline;
-// the witness fixture's 8s setup survives ONLY on the fixture's own 30s
-// slot. Reaching the body is the assertion — a mechanism regression fails
-// this test with the test's own 3s timeout (deterministically, on every
-// lane). Validated by mutation during the r11 remediation: the function
-// form (no fixture timeout) fails with "Test timeout of 3000ms exceeded
-// while setting up \"slowSetupWitness\"" — the tg4e signature.
-test.describe('the fixture-timeout mechanism (delta review r11)', () => {
+// the production freshellPage boot (deterministically >= 8s via the slow
+// harness dependency) survives ONLY on the production fixture's own
+// timeout slot. Reaching the body is the assertion — losing the tuple
+// options in fixtures.ts fails this test with the production tg4e
+// signature, deterministically. Cloud-lane-only by the wiring's design:
+// locally freshellPageFixtureTimeoutMs() is undefined (the exact pre-run
+// local behavior), so the pin skips when the window env is not configured
+// (the no-env leg reports it skipped).
+test.describe('the production fixture-timeout application (delta review r12)', () => {
+  test.skip(!isCloudLaneWindowConfigured(), 'the fixture timeout is cloud-lane wiring; the local lane keeps its exact pre-run behavior')
   test.setTimeout(3_000)
-  test('a fixture setup that outlives the test\'s own deadline passes when the fixture carries its own larger timeout', async ({ slowSetupWitness }) => {
-    void slowSetupWitness
-    // The test's own slot is intact after the slow setup: the wiring never
+  test('freshellPage setup outlives the test\'s own deadline on the fixture\'s OWN production timeout slot', async ({ freshellPage }) => {
+    void freshellPage
+    // The test's own slot is intact after the slow boot: the wiring never
     // touched the test's deadline.
     expect(test.info().timeout).toBe(3_000)
   })
@@ -712,7 +738,7 @@ test.describe('declared unlimited (0) deadline', () => {
 // recorded flake exhausts; that spec's budget belongs to its own deflake
 // run. The wiring keeps it exactly as declared on both lanes. Resolves
 // ONLY e2eMachineId (not freshellPage): the boot chain's permitted
-// composition (231.5s at the default window) exceeds 180s, so wrapping
+// composition (261.5s at the default window) exceeds 180s, so wrapping
 // the full boot under a knowingly-insufficient deadline would reintroduce
 // the tg4e setup-flake class inside this contract test itself (delta
 // review r9, Major 2).
@@ -734,7 +760,7 @@ Run (env-set local invocation reproduces the cloud-shaped path; first local run 
 FRESHELL_E2E_WS_READY_TIMEOUT_MS=90000 npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/e2e-budget-contract.spec.ts
 ```
 
-Expected (delta review r11 — the honest protection story; there is NO intermediate Red for the wiring APPLICATION itself): the MECHANISM pin is green pre-wiring BY DESIGN — it tests Playwright's fixture-timeout mechanism with its own local witness fixture (its mutation story proves its teeth: the function form fails with the tg4e signature, validated during the r11 remediation). The deadline-neutrality pins are green pre-wiring BY DESIGN — they pin the ABSENCE of deadline modification, and their RED value is against deadline-MUTATING wiring (demonstrated against the r2-r8 whole-test extension during the r9 remediation: three pins failed until the wiring was removed). The wiring's three failure modes are each covered: a wrong VALUE fails freshellPageFixtureTimeoutMs's unit pins (Task 1); a broken MECHANISM fails the witness pin; a broken APPLICATION (the tuple options lost) is observable only under a wedged boot — the full-lane zero-flake gate (Task 7) is its protection, exactly as it was pre-run. Playwright exposes no runtime API for a fixture's registered timeout, and the repo's quality bar rejects source-text pins — this hierarchy is the qualifying coverage.
+Expected (delta review r11 — the honest protection story; there is NO intermediate Red for the wiring APPLICATION itself): the APPLICATION pin is green pre-wiring only under the env-set path's wiring — its mutation story proves its teeth deterministically: with freshellPage reverted to the function form (no fixture timeout) it fails with the EXACT production signature, Test timeout of 3000ms exceeded while setting up 'freshellPage' (validated by mutation during the r12 remediation, on the env-set leg; on the no-env leg it skips — the wiring it pins is cloud-gated). The deadline-neutrality pins are green pre-wiring BY DESIGN — they pin the ABSENCE of deadline modification, and their RED value is against deadline-MUTATING wiring (demonstrated against the r2-r8 whole-test extension during the r9 remediation: three pins failed until the wiring was removed). The wiring's three failure modes are each covered: a wrong VALUE fails freshellPageFixtureTimeoutMs's unit pins (Task 1); a broken APPLICATION fails the production pin (the slow-harness dependency makes the production boot deterministically exceed the test's own deadline); a wedged-boot budget insufficiency beyond the composition falls to the full-lane zero-flake gate (Task 7), exactly as it was pre-run. Playwright exposes no runtime API for a fixture's registered timeout, and the repo's quality bar rejects source-text pins — this hierarchy is the qualifying coverage.
 
 ```bash
 env -u FRESHELL_E2E_WS_READY_TIMEOUT_MS npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/e2e-budget-contract.spec.ts
@@ -750,7 +776,7 @@ In `test/e2e-browser/helpers/fixtures.ts`: extend the existing import from `'./t
   // the picker leg) is fixture SETUP, and Playwright allows a fixture a
   // separate larger timeout so slow setup gets its allowance while the
   // TEST keeps its original deadline. On the cloud lane the timeout is the
-  // composed budget (freshellPageFixtureTimeoutMs -> 231.5s at the default
+  // composed budget (freshellPageFixtureTimeoutMs -> 261.5s at the default
   // window); locally it is undefined — fixture time counts toward the test
   // timeout, the exact pre-run behavior. The wiring NEVER modifies the
   // test's own deadline.
@@ -1251,7 +1277,7 @@ git commit -m "test(e2e): picker loop distinguishes absent options from slow ren
 - Modify: `test/e2e-browser/specs/settings.spec.ts` (delete the `test.beforeEach` block, lines 8-21 in the current file: the cloud-only `test.setTimeout(120_000)` hook; its probe-verified mechanism documentation has moved into the `e2eMachineId` fixture comment in Task 3)
 
 **Interfaces:**
-- Consumes: Task 3's fixture-level composed budget (settings.spec.ts uses `freshellPage`, so its boot chain runs under the freshellPage fixture's OWN timeout — at the cloud default window the composed budget (231.5s) strictly exceeds the removed hook's flat 120s). The hook was an under-budget artifact of the pre-composition design (delta review r2); with the fixture-timeout design (delta review r9) the fixture setup gets MORE headroom than the hook ever gave, while the test BODIES keep the config's 60s default. The two tests that reload mid-body restore the hook's exact coverage, cloud-gated and scoped to themselves (delta review r10): `if (isCloudLaneWindowConfigured()) test.setTimeout(120_000)` as the first statement of each body — the removed hook's exact value, under the same env gate; their mid-body connection wait's legal envelope (W+1s = 91s at W=90s) fits inside it exactly as it did for years. Locally: no declaration, the exact pre-run 60s behavior.
+- Consumes: Task 3's fixture-level composed budget (settings.spec.ts uses `freshellPage`, so its boot chain runs under the freshellPage fixture's OWN timeout — at the cloud default window the composed budget (261.5s) strictly exceeds the removed hook's flat 120s). The hook was an under-budget artifact of the pre-composition design (delta review r2); with the fixture-timeout design (delta review r9) the fixture setup gets MORE headroom than the hook ever gave, while the test BODIES keep the config's 60s default. The two tests that reload mid-body restore the hook's exact coverage, cloud-gated and scoped to themselves (delta review r10): `if (isCloudLaneWindowConfigured()) test.setTimeout(120_000)` as the first statement of each body — the removed hook's exact value, under the same env gate; their mid-body connection wait's legal envelope (W+1s = 91s at W=90s) fits inside it exactly as it did for years. Locally: no declaration, the exact pre-run 60s behavior.
 - Produces: one source of truth for the cloud wedge budget (the freshellPage fixture's own timeout), no per-spec opt-in — and per-test body declarations where a test's own body envelope genuinely exceeds the default (the two reload tests).
 
 - [ ] **Step 1: Write the failing behavioral test**

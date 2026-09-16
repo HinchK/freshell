@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Page } from '@playwright/test'
 import {
-  CLOUD_LANE_START_RESERVE_MS,
+  CLOUD_LANE_GOTO_MAX_MS,
+  CLOUD_LANE_HARNESS_MAX_MS,
   DEFAULT_TEST_TIMEOUT_MS,
   DEFAULT_WS_READY_TIMEOUT_MS,
   freshellPageFixtureTimeoutMs,
@@ -112,23 +113,25 @@ describe('resolveCloudLaneTestBudgetMs', () => {
     expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '' })).toBeNull()
   })
 
-  it('covers the permitted composition at the cloud default window (delta reviews r2+r5)', () => {
+  it('covers the permitted composition at the cloud default window (delta reviews r2+r5+r12)', () => {
     // W=90s: connection envelope (W + 1s total-deadline slack) = 91_000;
+    // goto max 30_000 + waitForHarness max 30_000 (delta r12: the initial
+    // operations' LEGAL maxima, not their healthy ~3s — correlated cloud
+    // slowness can stretch both to their deadlines together);
     // picker worst case (settle + at most 5 clicks + 5 probes + the render
-    // wait) = 500 + 5 * (5_000 + 5_000) + 60_000 = 110_500; start reserve
-    // 30_000. Total 231_500 (delta r5: the creation probe's per-shell
-    // budget joined the composition).
-    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '90000' })).toBe(231_500)
+    // wait) = 500 + 5 * (5_000 + 5_000) + 60_000 = 110_500.
+    // Total 261_500.
+    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '90000' })).toBe(261_500)
   })
 
-  it('scales with the configured window (60s -> 201_500)', () => {
-    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '60000' })).toBe(201_500)
+  it('scales with the configured window (60s -> 231_500)', () => {
+    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '60000' })).toBe(231_500)
   })
 
   it('falls back to the default window composition on malformed values (one parsing rule)', () => {
     for (const malformed of ['not-a-number', '0', '-5']) {
       expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: malformed }))
-        .toBe(30_000 + 1_000 + shellPickerWorstCaseMs() + CLOUD_LANE_START_RESERVE_MS)
+        .toBe(30_000 + 1_000 + CLOUD_LANE_GOTO_MAX_MS + CLOUD_LANE_HARNESS_MAX_MS + shellPickerWorstCaseMs())
     }
   })
 
@@ -137,7 +140,7 @@ describe('resolveCloudLaneTestBudgetMs', () => {
       const budget = resolveCloudLaneTestBudgetMs({ [ENV_VAR]: windowMs })
       expect(budget).not.toBeNull()
       expect(budget!).toBeGreaterThanOrEqual(
-        Number(windowMs) + 1_000 + shellPickerWorstCaseMs() + CLOUD_LANE_START_RESERVE_MS,
+        Number(windowMs) + 1_000 + CLOUD_LANE_GOTO_MAX_MS + CLOUD_LANE_HARNESS_MAX_MS + shellPickerWorstCaseMs(),
       )
     }
   })
@@ -176,8 +179,8 @@ describe('isCloudLaneWindowConfigured (one presence rule for every cloud-lane ga
 
 describe('freshellPageFixtureTimeoutMs (the boot chain owns its own setup allowance, delta review r9)', () => {
   it('is the composed budget on the cloud lane — the fixture SETUP gets the large window, never the test body', () => {
-    expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: '90000' })).toBe(231_500)
-    expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: '60000' })).toBe(201_500)
+    expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: '90000' })).toBe(261_500)
+    expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: '60000' })).toBe(231_500)
   })
 
   it('is undefined on the local lane: fixture time counts toward the test timeout — the exact pre-run behavior', () => {
@@ -188,7 +191,7 @@ describe('freshellPageFixtureTimeoutMs (the boot chain owns its own setup allowa
   it('falls back to the default window composition on malformed values (one parsing rule)', () => {
     for (const malformed of ['not-a-number', '0', '-5']) {
       expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: malformed }))
-        .toBe(30_000 + 1_000 + shellPickerWorstCaseMs() + CLOUD_LANE_START_RESERVE_MS)
+        .toBe(30_000 + 1_000 + CLOUD_LANE_GOTO_MAX_MS + CLOUD_LANE_HARNESS_MAX_MS + shellPickerWorstCaseMs())
     }
   })
 

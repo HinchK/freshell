@@ -36,13 +36,22 @@ export function resolveWsReadyTimeoutMs(
 }
 
 /**
- * Start/body reserve added to the connection and picker envelopes when
- * computing the cloud-lane per-test budget: healthy page.goto +
- * waitForHarness (~3s — their maxima are self-limiting: each throws its
- * own distinct navigation/wait timeout well before the test deadline) and
- * a body-start margin for the test's first steps.
+ * page.goto's legal maximum on the cloud lane: Playwright's DEFAULT
+ * navigation timeout (30s — the configs set no navigationTimeout), NOT
+ * the healthy ~3s. Each initial operation can legally succeed just
+ * before its own deadline, so correlated cloud slowness can stretch
+ * goto AND the harness wait to their maxima TOGETHER — the composition
+ * must cover their maxima, not their healthy shapes (delta review r12).
  */
-export const CLOUD_LANE_START_RESERVE_MS = 30_000
+export const CLOUD_LANE_GOTO_MAX_MS = 30_000
+
+/**
+ * waitForHarness's legal maximum: its default window (30_000 — the
+ * historical EFFECTIVE window, delta review r6). Same rationale as
+ * CLOUD_LANE_GOTO_MAX_MS: the composition covers the maxima the chain is
+ * permitted to compose (delta review r12).
+ */
+export const CLOUD_LANE_HARNESS_MAX_MS = 30_000
 
 /**
  * Whether the cloud-lane window env key is configured (present AND
@@ -95,8 +104,9 @@ export const DEFAULT_TEST_TIMEOUT_MS = 60_000
  * receive a larger allowance while the test keeps its original deadline
  * (playwright.dev/docs/test-fixtures#fixture-timeout) — the boot chain
  * (goto + waitForHarness + self-healing waitForConnection + the picker
- * leg) is fixture setup, and its permitted composition is exactly what
- * resolveCloudLaneTestBudgetMs derives. undefined means no
+ * leg) is fixture setup, and its permitted composition — INCLUDING the
+ * goto and harness maxima (delta review r12) — is exactly what
+ * resolveCloudLaneTestBudgetMs derives: 261.5s at the default window. undefined means no
  * fixture-specific timeout: fixture time counts toward the test timeout —
  * the exact pre-run behavior the local lane keeps. The test's own
  * deadline is NEVER modified by the wiring: bodies keep their declared or
@@ -113,9 +123,10 @@ export function freshellPageFixtureTimeoutMs(
 /**
  * Resolve the cloud-lane per-test deadline budget, or null on the local
  * lane (kata tg4e). The budget COVERS THE PERMITTED COMPOSITION of the
- * fixture chain (delta-review r2): the connection envelope (waitForConnection
- * enforces its window W as a single total deadline, W + 1s slack) plus the
- * picker's permitted worst case plus a start/body reserve. The config's 60s
+ * fixture chain (delta-reviews r2+r12): the connection envelope
+ * (waitForConnection enforces its window W as a single total deadline,
+ * W + 1s slack) plus page.goto's and waitForHarness's legal maxima plus
+ * the picker's permitted worst case. The config's 60s
  * default deadline kills fixture setup mid-composition ("Test timeout of
  * 60000ms exceeded while setting up freshellPage" — the recorded tg4e flake,
  * whose retained trace shows connection AND render slowness co-occurring
@@ -132,7 +143,10 @@ export function resolveCloudLaneTestBudgetMs(
 ): number | null {
   if (!isCloudLaneWindowConfigured(env)) return null
   const connectionEnvelopeMs = resolveWsReadyTimeoutMs(undefined, env) + 1000
-  return connectionEnvelopeMs + shellPickerWorstCaseMs() + CLOUD_LANE_START_RESERVE_MS
+  return connectionEnvelopeMs
+    + CLOUD_LANE_GOTO_MAX_MS
+    + CLOUD_LANE_HARNESS_MAX_MS
+    + shellPickerWorstCaseMs()
 }
 
 /**
