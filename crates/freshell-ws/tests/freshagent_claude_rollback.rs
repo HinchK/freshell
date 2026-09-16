@@ -320,6 +320,24 @@ impl PaneIdentitySink for TestLedgerSink {
             .map_err(std::io::Error::other)?
         })
     }
+    fn repair_failed_transition(
+        &self,
+        provider: &str,
+        session_id: &str,
+        epoch: u64,
+        generation: u64,
+    ) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        let now = Self::now_ms();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                ledger.repair_failed_transition_binding(&p, &s, epoch, generation, now)
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
+    }
     fn load_rollback(&self, provider: &str, session_id: &str) -> Option<RollbackRecord> {
         // Mirror of freshell-server's LedgerIdentitySink: the shared migrating
         // reader owns the version gate + the legacy epochless-union migration

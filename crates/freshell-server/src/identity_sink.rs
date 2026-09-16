@@ -80,9 +80,18 @@ pub struct LedgerIdentitySink {
     /// awaiting task's cancellation faces.
     ownership: Option<std::sync::Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
     /// b8ke focused ep5 r3 F1: the deterministic park (test-only — never
-    /// armed in production).
+    /// armed in production). Parks the AUTHORITATIVE closure BEFORE the
+    /// ownership consult — the canceled-ARRIVAL cells.
     #[cfg(test)]
     authoritative_park: Option<std::sync::Arc<AuthoritativeWritePark>>,
+    /// b8ke focused ep5 r4 F1: the deterministic POST-VALIDATION park
+    /// (test-only): parks the authoritative closure AFTER the ownership
+    /// consult passed and BEFORE the ledger mutation — the
+    /// VALIDATED-THEN-CANCELED ordering the round-4 reviewer demanded the
+    /// tests exercise (the consult passed; the cancel lands; the repair
+    /// fences; only then does the mutation run).
+    #[cfg(test)]
+    authoritative_park_after_validation: Option<std::sync::Arc<AuthoritativeWritePark>>,
 }
 
 impl LedgerIdentitySink {
@@ -95,6 +104,8 @@ impl LedgerIdentitySink {
             ownership,
             #[cfg(test)]
             authoritative_park: None,
+            #[cfg(test)]
+            authoritative_park_after_validation: None,
         }
     }
 
@@ -109,6 +120,18 @@ impl LedgerIdentitySink {
         park: std::sync::Arc<AuthoritativeWritePark>,
     ) -> Self {
         self.authoritative_park = Some(park);
+        self
+    }
+
+    /// b8ke focused ep5 r4 F1 (test-only): arm the POST-VALIDATION park —
+    /// the closure parks between the ownership consult and the ledger
+    /// mutation.
+    #[cfg(test)]
+    pub(crate) fn with_authoritative_park_after_validation(
+        mut self,
+        park: std::sync::Arc<AuthoritativeWritePark>,
+    ) -> Self {
+        self.authoritative_park_after_validation = Some(park);
         self
     }
 }
@@ -163,55 +186,54 @@ impl PaneIdentitySink for LedgerIdentitySink {
         let ownership = self.ownership.clone();
         #[cfg(test)]
         let authoritative_park = self.authoritative_park.clone();
+        #[cfg(test)]
+        let authoritative_park_after_validation = self.authoritative_park_after_validation.clone();
         let now = now_ms();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
-                // b8ke focused ep5 r3 F1: the authoritative write's
-                // OWNERSHIP RE-VALIDATION. The ep5-r2 exception (the handoff
-                // runner's own target binding over the NORMAL unstamped
-                // terminal row) is valid ONLY while the write's handoff
-                // operation still owns the key's transition — this closure
-                // can OUTLIVE cancellation of the awaiting task (task abort
-                // never cancels a started spawn_blocking closure), and the
-                // abort cleanup reaps the uncommitted target and
-                // restores/vacates ownership WITHOUT a kill tombstone (the
-                // handoff's deliberate no-tombstone choice: the key survives
-                // the transition, so the kill lanes' identity close would
-                // wrongly retire the SHARED row and its tombstone would
-                // suppress the legitimate target's own write). An orphaned
-                // closure would therefore land its fresh-agent metadata
-                // AFTER the cleanup — over the restored prior terminal's or
-                // a newly attached terminal's ordinary unstamped row —
-                // corrupting the authoritative recovery registry.
+                // b8ke focused ep5 r3 F1 + ep5 r4 F1 (the round-4
+                // reviewer rejected the r3 "accepted residual" — the
+                // consult ALONE left a time-of-check/time-of-use window,
+                // and the abort cleanup had no ledger visibility): the
+                // authoritative write's ownership re-validation is now the
+                // FIRST of TWO serialized layers, and neither layer leaves
+                // an unaccepted window.
                 //
-                // The consult runs HERE, inside the closure, at EXECUTION
-                // time: the coordinator's CURRENT state is the exact truth
-                // the surviving closure faces. The (epoch, generation) pair
-                // uniquely identifies the write's own transition (generations
-                // advance per operation on the key), so a state-shape +
-                // generation match proves the write's handoff still owns it:
+                // LAYER 1 — THIS consult (execution-time truth): refuses
+                // every authoritative write whose handoff transition is
+                // already gone when the closure executes (canceled,
+                // superseded, restored, vacated, foreign epoch). Handles
+                // every post-cancel ARRIVAL, including the `spawn_blocking`
+                // closure that outlived its awaiting task's cancellation.
+                //
+                // LAYER 2 — the failed-transition repair (the runner's
+                // abort/failure cleanup, `repair_failed_transition` on this
+                // same sink): when the transition fails, its cleanup lands
+                // the durable tombstone fence + the conditional retire of
+                // the transition's own orphaned row. The fence closes THIS
+                // consult's remaining interleaving — a write whose consult
+                // passed BEFORE the cancel is suppressed wholesale at the
+                // ledger's tombstone consult, whichever arrival order its
+                // late mutation takes; the revert closes the
+                // completed-then-canceled ordering — a write that fully
+                // landed while the handoff was live is retired typed, and
+                // the coordinator and the recovery registry re-converge.
+                // A later legitimate claim clears the tombstone through
+                // its `commit_claim`, so the fence never wedges the
+                // session.
+                //
+                // The (epoch, generation) pair uniquely identifies the
+                // write's own transition (generations advance per
+                // operation on the key), so a state-shape + generation
+                // match proves the write's handoff still owns it:
                 // * `Handoff{generation == w}` — the runner's window (the
                 //   codex/opencode under-ticket writes execute inside it,
                 //   and the claude adoption can race the runner's commit).
                 // * `Live{FreshAgent, generation == w}` — the committed
-                //   target (the claude under-ticket write, post-commit).
-                // Everything else — a restored prior terminal, a newly
-                // attached terminal, Vacant, a superseding transition at a
-                // newer generation, or a different boot epoch — refuses
-                // typed and the recovery row keeps its rightful owner.
-                // Non-authoritative writes never consult (the r2 ledger
-                // matrix governs them unchanged).
-                //
-                // Known residual (accepted, documented): the consult is a
-                // snapshot — the abort cleanup's coordinator transition can
-                // land in the microscopic window between the consult and
-                // the ledger write below (the abort path takes no ledger
-                // lock, so no guard here can serialize against it), and a
-                // write that fully COMPLETED while the handoff was
-                // genuinely live is legitimate even if the abort lands
-                // right after it. Both orderings need the abort path to
-                // become ledger-visible (a coordinator-held write guard or
-                // an abort-side row repair) — out of this finding's scope.
+                //   target (the claude under-ticket shape, post-commit).
+                // Everything else refuses typed and the recovery row keeps
+                // its rightful owner. Non-authoritative writes never
+                // consult (the r2 ledger matrix governs them unchanged).
                 if upsert.authoritative {
                     #[cfg(test)]
                     if let Some(park) = authoritative_park.as_ref() {
@@ -276,6 +298,10 @@ impl PaneIdentitySink for LedgerIdentitySink {
                              focused ep5 r3 F1)"
                         );
                         return Err(stale_transition());
+                    }
+                    #[cfg(test)]
+                    if let Some(park) = authoritative_park_after_validation.as_ref() {
+                        park.wait_for_release();
                     }
                 }
                 // Delta-r2 Finding 2: the upsert's tri-state provenance policy
@@ -666,6 +692,29 @@ impl PaneIdentitySink for LedgerIdentitySink {
             tokio::task::spawn_blocking(move || {
                 let payload = serde_json::to_value(&record).map_err(std::io::Error::other)?;
                 ledger.record_rollback_row(&p, &s, &payload, now)
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
+    }
+
+    /// b8ke focused ep5 r4 F1: the failed-transition repair — same
+    /// awaited-spawn_blocking discipline as every write lane. A failure
+    /// maps to the caller's warn path (the cleanup never blocks its
+    /// coordinator fail on a ledger hiccup, but it logs LOUD).
+    fn repair_failed_transition(
+        &self,
+        provider: &str,
+        session_id: &str,
+        epoch: u64,
+        generation: u64,
+    ) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        let now = now_ms();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                ledger.repair_failed_transition_binding(&p, &s, epoch, generation, now)
             })
             .await
             .map_err(std::io::Error::other)?
@@ -1626,6 +1675,133 @@ mod tests {
             assert!(
                 err.to_string().contains("NOT_NEWER_BINDING_OVER_TERMINAL"),
                 "the refusal is the LEDGER's r2 typed error, not the consult's: {err}"
+            );
+        }
+
+        /// b8ke focused ep5 r4 F1 — the VALIDATED-THEN-CANCELED ordering
+        /// (the round-4 reviewer's first named ordering): the write's
+        /// ownership consult PASSES (the handoff owns the transition),
+        /// the closure parks BETWEEN the consult and the ledger mutation,
+        /// the handoff then fails (the abort cleanup's settled effect:
+        /// repair-then-fail, the runner's exact order), and only then is
+        /// the closure released. The repair's durable tombstone fence
+        /// suppresses the late mutation — the row NEVER becomes the
+        /// reaped target's fresh-agent row.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_validated_then_canceled_write_is_fenced_and_the_row_stays_consistent() {
+            let tmp = tempfile::tempdir().unwrap();
+            let ledger = Arc::new(PaneLedger::new(Some(tmp.path().to_path_buf())));
+            let registry = Arc::new(RuntimeOwnershipRegistry::new());
+            drive_terminal_live(&registry);
+            let generation = drive_handoff_window(&registry, "op-handoff-vc");
+            seed_terminal_row(&ledger, "t-old");
+
+            // The write consults (Handoff owns the transition at gen 2) and
+            // parks AFTER validation — before the ledger mutation.
+            let park = AuthoritativeWritePark::new();
+            let sink = LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .with_authoritative_park_after_validation(park.clone());
+            let write_epoch = registry.boot_epoch();
+            let write = tokio::spawn(async move {
+                sink.record_binding(authoritative_upsert(write_epoch, generation, true))
+                    .await
+            });
+            while !park.reached() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+
+            // THE CANCEL (the abort cleanup's exact order): the repair
+            // lands (the reap's ledger act), then the coordinator entry
+            // fails with the restore.
+            let repair_sink = LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()));
+            repair_sink
+                .repair_failed_transition("claude", SID, write_epoch, generation)
+                .await
+                .expect("the cleanup's repair lands");
+            assert_eq!(
+                registry.fail("claude", SID, "op-handoff-vc", generation, true),
+                FailOutcome::RestoredPriorOwner
+            );
+
+            // RELEASE the validated closure: the ledger's tombstone consult
+            // suppresses the mutation wholesale (Ok — never an error, never
+            // a row).
+            park.release();
+            let outcome = write.await.expect("the write task joins");
+            assert!(
+                outcome.is_ok(),
+                "the suppressed write answers Ok (suppression, not error): {:?}",
+                outcome.err()
+            );
+            let row = ledger.load_binding("claude", SID).expect("the row");
+            assert_eq!(
+                row.pane_kind, None,
+                "the reaped target's fresh-agent metadata never landed: {row:?}"
+            );
+            assert_eq!(
+                row.live_terminal_id.as_deref(),
+                Some("t-old"),
+                "the restored terminal's identity survives: {row:?}"
+            );
+            // The durable fence is fed (a still-in-flight sibling closure
+            // from the same transition would face it too).
+            assert!(ledger.kill_tombstone_at("claude", SID).is_some());
+        }
+
+        /// b8ke focused ep5 r4 F1 — the COMPLETED-THEN-CANCELED ordering
+        /// (the round-4 reviewer's second named ordering): the write
+        /// fully COMPLETES while the handoff is genuinely live (the row
+        /// legitimately becomes the target's fresh-agent row), the
+        /// handoff then fails and its cleanup reaps the uncommitted
+        /// target — the repair's conditional revert retires the
+        /// transition's own orphaned row, and the coordinator and the
+        /// recovery registry re-converge.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_completed_then_canceled_write_is_reverted_and_the_row_stays_consistent() {
+            let tmp = tempfile::tempdir().unwrap();
+            let ledger = Arc::new(PaneLedger::new(Some(tmp.path().to_path_buf())));
+            let registry = Arc::new(RuntimeOwnershipRegistry::new());
+            drive_terminal_live(&registry);
+            let generation = drive_handoff_window(&registry, "op-handoff-cc");
+            seed_terminal_row(&ledger, "t-old");
+            let epoch = registry.boot_epoch();
+
+            // The write completes, live handoff — the row becomes the
+            // target's (legitimate AT THIS MOMENT).
+            LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .record_binding(authoritative_upsert(epoch, generation, true))
+                .await
+                .expect("the in-window write completes");
+            let row = ledger.load_binding("claude", SID).expect("the row");
+            assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+
+            // THE CANCEL (the abort cleanup's order): the repair, then the
+            // restore-fail.
+            LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .repair_failed_transition("claude", SID, epoch, generation)
+                .await
+                .expect("the cleanup's repair lands");
+            assert_eq!(
+                registry.fail("claude", SID, "op-handoff-cc", generation, true),
+                FailOutcome::RestoredPriorOwner
+            );
+
+            // The orphaned row is REVERTED: retired typed FailedTransition,
+            // never an authoritative Bound fresh-agent claim beside a
+            // Terminal-owned coordinator record.
+            let row = ledger.load_binding("claude", SID).expect("the row");
+            assert_eq!(
+                row.state,
+                freshell_ws::pane_ledger::RowState::Retired,
+                "the row: {row:?}"
+            );
+            assert_eq!(
+                row.retired_reason,
+                Some(freshell_ws::pane_ledger::RetiredReason::FailedTransition)
+            );
+            assert!(
+                ledger.kill_tombstone_at("claude", SID).is_some(),
+                "the fence still guards any other in-flight sibling write"
             );
         }
 

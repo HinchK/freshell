@@ -611,6 +611,190 @@ fn an_authoritative_write_over_a_stamped_row_still_proves_strictly_newer() {
     assert_eq!(row.owner_generation, Some(10));
 }
 
+// ── kata b8ke focused ep5 r4 F1: the FAILED-TRANSITION REPAIR — the
+// abort/typed-failure cleanup's ledger act. Two halves under one guard:
+// the durable tombstone fence (suppressing the failed transition's late
+// orphaned writes, whichever arrival order) and the conditional retire
+// of the transition's OWN orphaned row (Bound fresh-agent stamped at
+// exactly the transition's pair). ─────────────────────────────────────
+
+/// The repair's REVERT half: the orphaned product (the failed
+/// transition's own authoritative write, landed) retires typed
+/// `FailedTransition`, and the durable fence is fed.
+#[test]
+fn the_failed_transition_repair_retires_the_transitions_own_orphaned_row() {
+    let root = temp_root("ep5-r4-repair-retires-orphan");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    const EPOCH: u64 = 3;
+    // The orphaned write landed: a Bound fresh-agent row stamped at the
+    // failed transition's (epoch, generation) pair.
+    ledger
+        .record_fresh_agent_binding(&fa_write_target("codex", "ses-ep5-r4-a", 1_000, EPOCH, 8))
+        .expect("the orphaned authoritative write landed");
+    assert_eq!(
+        ledger
+            .load_binding("codex", "ses-ep5-r4-a")
+            .expect("the row")
+            .state,
+        RowState::Bound
+    );
+
+    ledger
+        .repair_failed_transition_binding("codex", "ses-ep5-r4-a", EPOCH, 8, 1_100)
+        .expect("the repair lands");
+
+    let row = ledger
+        .load_binding("codex", "ses-ep5-r4-a")
+        .expect("the row survives, retired");
+    assert_eq!(row.state, RowState::Retired);
+    assert_eq!(row.retired_reason, Some(RetiredReason::FailedTransition));
+    assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+    // The durable fence is fed: the tombstone index answers.
+    assert!(
+        ledger.kill_tombstone_at("codex", "ses-ep5-r4-a").is_some(),
+        "the repair fed the kill-tombstone fence"
+    );
+    // Idempotent: a retried repair re-derives the same state.
+    ledger
+        .repair_failed_transition_binding("codex", "ses-ep5-r4-a", EPOCH, 8, 1_200)
+        .expect("the retried repair is idempotent");
+    let row = ledger.load_binding("codex", "ses-ep5-r4-a").expect("row");
+    assert_eq!(row.state, RowState::Retired);
+}
+
+/// The repair never demotes a row the failed transition did not own: the
+/// restored terminal's ordinary recovery row, and a LATER transition's
+/// fresh-agent row (a newer pair), both stand exactly as they were.
+#[test]
+fn the_failed_transition_repair_leaves_innocent_rows_untouched() {
+    let root = temp_root("ep5-r4-repair-innocent-rows");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    const EPOCH: u64 = 3;
+    // The ordinary terminal recovery row (unstamped).
+    ledger
+        .record_binding(&write("codex", "ses-ep5-r4-b", "t-ep5-r4-b", 1_000))
+        .expect("the terminal row");
+    // A LATER transition's fresh-agent row (a NEWER pair).
+    ledger
+        .record_fresh_agent_binding(&fa_write_target("codex", "ses-ep5-r4-c", 1_000, EPOCH, 11))
+        .expect("the later transition's row");
+
+    // The FAILED transition's repair names (EPOCH, 8) — neither row
+    // matches the orphan profile.
+    ledger
+        .repair_failed_transition_binding("codex", "ses-ep5-r4-b", EPOCH, 8, 1_100)
+        .expect("the repair lands (fence only)");
+    ledger
+        .repair_failed_transition_binding("codex", "ses-ep5-r4-c", EPOCH, 8, 1_100)
+        .expect("the repair lands (fence only)");
+
+    let term = ledger
+        .load_binding("codex", "ses-ep5-r4-b")
+        .expect("the terminal row");
+    assert_eq!(term.state, RowState::Bound, "the terminal row stands");
+    assert_eq!(term.live_terminal_id.as_deref(), Some("t-ep5-r4-b"));
+    assert_eq!(term.retired_reason, None);
+    let later = ledger
+        .load_binding("codex", "ses-ep5-r4-c")
+        .expect("the later transition's row");
+    assert_eq!(
+        later.state,
+        RowState::Bound,
+        "the later transition's row stands"
+    );
+    assert_eq!(later.owner_generation, Some(11));
+    assert_eq!(later.retired_reason, None);
+    // The fences for both identities are still fed (the fence half is
+    // NOT conditional — it must suppress the failed transition's late
+    // writes regardless of what the row held).
+    assert!(ledger.kill_tombstone_at("codex", "ses-ep5-r4-b").is_some());
+    assert!(ledger.kill_tombstone_at("codex", "ses-ep5-r4-c").is_some());
+}
+
+/// The repair's FENCE half, in the validated-then-canceled ordering: a
+/// late authoritative write whose bridge consult passed BEFORE the
+/// cancel (its pair is the failed transition's own) is suppressed
+/// wholesale at the ledger's tombstone consult — no Bound row is
+/// created, whichever arrival order the late mutation takes.
+#[test]
+fn the_failed_transition_repair_fence_suppresses_the_late_orphaned_write() {
+    let root = temp_root("ep5-r4-repair-fence-late-write");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    const EPOCH: u64 = 3;
+    // The ordinary terminal recovery row — the row the late mutation
+    // would corrupt.
+    ledger
+        .record_binding(&write("codex", "ses-ep5-r4-d", "t-ep5-r4-d", 1_000))
+        .expect("the terminal row");
+
+    // The cleanup lands the repair (the transition at (EPOCH, 8) failed)
+    // BEFORE the orphaned closure's mutation arrives.
+    ledger
+        .repair_failed_transition_binding("codex", "ses-ep5-r4-d", EPOCH, 8, 1_100)
+        .expect("the repair lands");
+
+    // THE LATE MUTATION: the failed transition's own authoritative write
+    // (its consult passed pre-cancel — at the ledger it faces only the
+    // tombstone). Suppressed wholesale — Ok, and NEVER a fresh-agent row.
+    // The still-Bound terminal row the fence dominates converges Retired
+    // by the EXISTING remnant discipline (the envelope's close evidence
+    // outranks a Bound row predating it — the same self-heal a kill-lane
+    // crash remnant gets), with the terminal's IDENTITY preserved in the
+    // row and a later ordinary attach re-minting it Bound.
+    ledger
+        .record_fresh_agent_binding(&fa_write_target("codex", "ses-ep5-r4-d", 1_200, EPOCH, 8))
+        .expect("the suppressed write answers Ok (suppression, not error)");
+    let row = ledger
+        .load_binding("codex", "ses-ep5-r4-d")
+        .expect("the row");
+    assert_eq!(
+        row.pane_kind, None,
+        "the suppressed write never landed — never fresh-agent: {row:?}"
+    );
+    assert_eq!(
+        row.live_terminal_id.as_deref(),
+        Some("t-ep5-r4-d"),
+        "the terminal's identity survives the remnant convergence: {row:?}"
+    );
+    assert_eq!(row.state, RowState::Retired);
+    assert_eq!(row.retired_reason, Some(RetiredReason::Closed));
+}
+
+/// The fence never wedges the session: a LATER legitimate claim clears
+/// the tombstone (the `commit_claim` machinery the resume lanes run),
+/// and the new transition's strictly-newer authoritative write lands.
+#[test]
+fn a_later_claim_clears_the_repair_fence_and_the_newer_authoritative_write_lands() {
+    let root = temp_root("ep5-r4-repair-fence-claim-clears");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    const EPOCH: u64 = 3;
+    ledger
+        .record_binding(&write("codex", "ses-ep5-r4-e", "t-ep5-r4-e", 1_000))
+        .expect("the terminal row");
+    ledger
+        .repair_failed_transition_binding("codex", "ses-ep5-r4-e", EPOCH, 8, 1_100)
+        .expect("the failed transition's repair");
+    assert!(ledger.kill_tombstone_at("codex", "ses-ep5-r4-e").is_some());
+
+    // The later legitimate claim's commit clears the tombstone (the same
+    // clear the killed-session re-attach machinery performs).
+    ledger
+        .clear_kill_tombstone("codex", "ses-ep5-r4-e")
+        .expect("the claim's commit clears the fence");
+    assert!(ledger.kill_tombstone_at("codex", "ses-ep5-r4-e").is_none());
+
+    // The new transition's authoritative write (a NEWER generation)
+    // lands — the r2 exception's success arm, unfenced by the repair.
+    ledger
+        .record_fresh_agent_binding(&fa_write_target("codex", "ses-ep5-r4-e", 1_300, EPOCH, 9))
+        .expect("the later handoff's authoritative write lands");
+    let row = ledger
+        .load_binding("codex", "ses-ep5-r4-e")
+        .expect("the row");
+    assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+    assert_eq!(row.owner_generation, Some(9));
+}
+
 /// b8ke ext r29 F3: the UNFENCED-CLOBBER backstop — a fully-unfenced
 /// fresh-agent binding write (no observed pair, the legacy shape every
 /// not-yet-fenced lane sends) can never clobber a live terminal's

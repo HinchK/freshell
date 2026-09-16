@@ -728,6 +728,13 @@ pub enum RetiredReason {
     Closed,
     GcExpired,
     SessionMissing,
+    /// b8ke focused ep5 r4 F1: the failed handoff transition's cleanup
+    /// retired this row — the row is the ORPHANED product of the
+    /// transition's own authoritative binding write (stamped at the
+    /// transition's (epoch, generation) pair), and the transition failed
+    /// (canceled, panicked, or failed typed) with the target reaped, so
+    /// the fresh-agent recovery claim is not authoritative.
+    FailedTransition,
 }
 
 /// A durable identity fact — see the module doc for the schema contract.
@@ -3267,6 +3274,7 @@ impl PaneLedger {
         create_request_id: Option<&str>,
         panes: &[PaneCloseLinkage],
         now_ms: i64,
+        orphan_filter: Option<(u64, u64)>,
     ) -> Result<(), CloseEnvelopeError> {
         let prior = index.close_envelopes.get(key).cloned();
         let mut record = prior.clone().unwrap_or(CloseEnvelopeRecord {
@@ -3319,7 +3327,7 @@ impl PaneLedger {
             // never the close: a failed projection leaves a fence-dominated
             // Bound row (reads closed at every boundary) until the sweep
             // converges it durably. Loud, never silent.
-            self.project_row_flips_locked(root, index, identities, now_ms);
+            self.project_row_flips_locked(root, index, identities, now_ms, orphan_filter);
         }
         outcome
     }
@@ -3461,11 +3469,57 @@ impl PaneLedger {
         index: &mut LedgerIndex,
         identities: &[(String, String)],
         now_ms: i64,
+        // b8ke focused ep5 r4 F1: the failed-transition repair's ORPHAN
+        // filter. `None` is every prior caller's discipline: flip every
+        // Bound row for the identities to Retired/Closed. `Some((epoch,
+        // generation))` flips ONLY the failed transition's own orphaned
+        // product — a Bound FRESH-AGENT row stamped at exactly the
+        // transition's (epoch, generation) pair (the authoritative
+        // binding write's stamp; every legitimate later transition carries
+        // a newer pair) — retiring it typed `FailedTransition`. Any other
+        // row (the restored terminal's ordinary recovery row, a later
+        // owner's row, an already-Retired row) is left exactly as it is:
+        // the repair must not demote rows the failed transition never
+        // owned.
+        orphan_filter: Option<(u64, u64)>,
     ) {
         for (provider, session_id) in identities {
             let key = (provider.clone(), session_id.clone());
             if let Some(mut row) = index.bindings.get(&key).cloned() {
                 if row.state != RowState::Bound {
+                    continue;
+                }
+                if let Some((epoch, generation)) = orphan_filter {
+                    let is_orphaned_product = row.pane_kind.as_deref() == Some("fresh-agent")
+                        && row.owner_epoch == Some(epoch)
+                        && row.owner_generation == Some(generation);
+                    if !is_orphaned_product {
+                        continue;
+                    }
+                    row.state = RowState::Retired;
+                    row.retired_reason = Some(RetiredReason::FailedTransition);
+                    row.updated_at = now_ms;
+                    tracing::info!(
+                        target: "freshell_ws::pane_ledger",
+                        provider = %provider,
+                        session_id = %session_id,
+                        epoch, generation,
+                        "pane_ledger_failed_transition_row_repaired: the orphaned \
+                         authoritative fresh-agent row (the failed transition's own \
+                         binding write) is retired — the coordinator and the recovery \
+                         registry re-converge (kata b8ke focused ep5 r4 F1)"
+                    );
+                    if let Err(err) = self.write_binding(root, index, &row) {
+                        tracing::error!(
+                            target: "freshell_ws::pane_ledger",
+                            provider = %provider,
+                            session_id = %session_id,
+                            error = %err,
+                            "pane_ledger_failed_transition_row_repair_write_failed: the \
+                             close IS durable (its journal record stands and its fence \
+                             dominates the row); the next sweep converges the row"
+                        );
+                    }
                     continue;
                 }
                 row.state = RowState::Retired;
@@ -3629,6 +3683,9 @@ impl PaneLedger {
                 None,
                 &[],
                 now_ms,
+                // b8ke focused ep5 r4 F1: no orphan filter — the
+                // close projection is the ordinary retire discipline.
+                None,
             )?;
         }
         for pending_id in pending_ids {
@@ -3643,6 +3700,70 @@ impl PaneLedger {
             }
         }
         Ok(())
+    }
+
+    /// b8ke focused ep5 r4 F1: the FAILED-TRANSITION REPAIR — the abort /
+    /// typed-failure cleanup's ONE ledger act when it reaps an uncommitted
+    /// fresh-agent handoff target and the coordinator entry fails (restores
+    /// the prior or vacates). Under ONE index-guard hold it lands BOTH
+    /// halves of the re-convergence, in this order:
+    ///
+    /// 1. THE FENCE (durable): the close-envelope journal record for the
+    ///    identity — the same carrier the kill lanes' closes write — feeds
+    ///    the kill-tombstone index, so ANY late binding write from the
+    ///    failed transition (an orphaned `spawn_blocking` closure whose
+    ///    ownership consult passed BEFORE the cancel, still in flight) is
+    ///    suppressed wholesale by [`PaneLedger::record_fresh_agent_binding`]'s
+    ///    tombstone consult — no Bound row is created, whichever arrival
+    ///    order the late write takes. A LATER legitimate claim clears the
+    ///    tombstone through its `commit_claim` (the killed-session
+    ///    re-attach machinery), so the fence never wedges the session.
+    /// 2. THE REVERT (conditional): the projection flips ONLY the failed
+    ///    transition's own ORPHANED product — a Bound fresh-agent row
+    ///    stamped at exactly the transition's (epoch, generation) pair —
+    ///    to `Retired/FailedTransition`. The restored prior terminal's
+    ///    ordinary recovery row, a later owner's row, and every
+    ///    already-Retired row are left exactly as they are.
+    ///
+    /// Both halves are idempotent: a retried repair re-derives the same
+    /// envelope merge and re-matches the same orphan filter. Together they
+    /// close the round-3 consult's time-of-check/time-of-use window for
+    /// BOTH real orderings — the write validated then canceled (the fence
+    /// suppresses its late mutation) and the write completed then canceled
+    /// (the revert retires it) — so the recovery registry and the
+    /// coordinator re-converge in every interleaving.
+    pub fn repair_failed_transition_binding(
+        &self,
+        provider: &str,
+        session_id: &str,
+        epoch: u64,
+        generation: u64,
+        now_ms: i64,
+    ) -> std::io::Result<()> {
+        let Some(root) = self.root.clone() else {
+            return Ok(());
+        };
+        let mut index = self.guard();
+        let identities = [(provider.to_string(), session_id.to_string())];
+        self.close_envelope_locked(
+            &root,
+            &mut index,
+            &Self::agent_envelope_key(provider, session_id),
+            &identities,
+            None,
+            None,
+            &[],
+            now_ms,
+            Some((epoch, generation)),
+        )
+        .map_err(|err| {
+            std::io::Error::other(match err {
+                CloseEnvelopeError::Clean(e) => format!("FAILED_TRANSITION_REPAIR_CLEAN: {e}"),
+                CloseEnvelopeError::Persisted(e) => {
+                    format!("FAILED_TRANSITION_REPAIR_PERSISTED: {e}")
+                }
+            })
+        })
     }
 
     /// Delta-r6-r2 (focused-episode-6 round 1, Findings 1+2+6) — the terminal
@@ -3712,6 +3833,9 @@ impl PaneLedger {
             w.create_request_id.as_deref(),
             &[],
             w.now_ms,
+            // b8ke focused ep5 r4 F1: no orphan filter — the
+            // close projection is the ordinary retire discipline.
+            None,
         )?;
         // Step 4 — the marker (LAST; warn-only hygiene — the close is
         // durable by now).
@@ -3772,6 +3896,9 @@ impl PaneLedger {
             Some(create_request_id),
             &[],
             now_ms,
+            // b8ke focused ep5 r4 F1: no orphan filter — the
+            // close projection is the ordinary retire discipline.
+            None,
         )
     }
 
@@ -3806,6 +3933,9 @@ impl PaneLedger {
             None,
             panes,
             now_ms,
+            // b8ke focused ep5 r4 F1: no orphan filter — the
+            // close projection is the ordinary retire discipline.
+            None,
         )
     }
 

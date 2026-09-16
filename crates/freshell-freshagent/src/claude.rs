@@ -1593,7 +1593,7 @@ impl FreshClaudeState {
     }
 
     /// The wired identity sink, if any.
-    fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
+    pub(crate) fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
         self.identity_sink.get().cloned()
     }
 

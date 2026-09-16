@@ -5074,6 +5074,115 @@ async fn handoff_abort_during_target_spawn_reaps_the_uncommitted_terminal() {
     await_pid_dead(prior_pid).await;
 }
 
+/// b8ke focused ep5 r4 F1: an aborted handoff whose target is a FRESH
+/// AGENT fires the FAILED-TRANSITION REPAIR through the reaped target's
+/// identity sink — the cleanup's ledger act (the durable tombstone fence
+/// + the conditional revert of the transition's own orphaned row) — with
+/// the transition's OWN (boot epoch, handoff generation). The abort
+/// lands in the staged-flavor window: the target was spawned and
+/// registered (its under-ticket binding write may be in flight or
+/// landed), the runner parks at the flavor stage, and the abort's guard
+/// cleanup reaps the uncommitted target and fails the entry.
+#[tokio::test]
+async fn handoff_abort_of_a_fresh_target_fires_the_failed_transition_repair() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    // The claude-lane resume gates on transcript presence (the 6b pattern):
+    // the target's resume of `sid` needs the transcript under
+    // CLAUDE_CONFIG_DIR.
+    let store_dir =
+        std::env::temp_dir().join(format!("freshell-handoff-ep5-r4-{}", uuid_like_suffix()));
+    let project_dir = store_dir.join("projects").join("slug");
+    std::fs::create_dir_all(&project_dir).expect("create transcript project dir");
+    std::fs::write(
+        project_dir.join(format!("{sid}.jsonl")),
+        "{\"cwd\": \"/tmp\"}\n",
+    )
+    .expect("write fake transcript");
+    std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
+
+    // A pausing flavor writer: `stage` parks inside the Handoff window
+    // (post target-spawn, pre-commit) — the abort's deterministic window.
+    let stage_reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    struct PausingFlavorWriter {
+        reached: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl crate::session_handoff::FlavorWrite for PausingFlavorWriter {
+        fn stage(
+            &self,
+            _provider: &str,
+            _session_id: &str,
+            _flavor: &str,
+        ) -> crate::session_handoff::StagedFlavorFuture {
+            self.reached
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            // Park until the test aborts the runner (the await is
+            // CANCELED by the abort — the stage never commits).
+            Box::pin(std::future::pending::<
+                Result<Option<Box<dyn crate::session_handoff::StagedFlavor>>, String>,
+            >())
+        }
+    }
+    let mut rig = build_rig_with_flavor_writer(Arc::new(PausingFlavorWriter {
+        reached: Arc::clone(&stage_reached),
+    }));
+    // The reaped target's lane sink: the fake RECORDS the repair call.
+    let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+    rig.fresh_claude.set_identity_sink(fake.clone());
+
+    establish_fresh_claude_owner(&mut rig, &sid).await;
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_fresh("claude", &sid, "freshclaude"));
+
+    // Park proof: the runner reached the flavor stage INSIDE the Handoff
+    // window (the target is spawned + registered) — capture the window's
+    // generation.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !stage_reached.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the runner never reached the flavor stage"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let generation = match rig.ownership.observe("claude", &sid).state {
+        OwnershipState::Handoff { generation, .. } => generation,
+        other => panic!("expected the Handoff window, got {other:?}"),
+    };
+
+    // ABORT inside the flavor-stage window: the guard's cleanup reaps the
+    // uncommitted fresh-agent target (firing the repair), then fails the
+    // entry (the prior was reaped by the runner's stop — the key goes
+    // Vacant).
+    handle.abort();
+    let _ = handle.task.await;
+    await_cond("the aborted handoff must settle the key Vacant", || {
+        rig.ownership.observe("claude", &sid).state == OwnershipState::Vacant
+    })
+    .await;
+
+    // THE REPAIR FIRED with the transition's own pair: (provider, sid,
+    // boot epoch, handoff generation).
+    let repairs = fake.repairs.lock().expect("repairs lock").clone();
+    assert!(
+        repairs.contains(&(
+            "claude".to_string(),
+            sid.clone(),
+            rig.ownership.boot_epoch(),
+            generation
+        )),
+        "the failed transition's repair fired with its own (epoch, generation): \
+         {repairs:?} (boot epoch {}, handoff generation {generation})",
+        rig.ownership.boot_epoch()
+    );
+    // The prior's sidecar tree is dead (the runner's stop + the cleanup's
+    // reap both settled).
+    let _ = env;
+}
+
 /// 5e'. b8ke ext r10 F3: an abort landing while the detached terminal
 /// spawn is parked in PRE-PUBLICATION work (the reviewer's exact window —
 /// nothing published, the cleanup's bounded settle-wait times out) FAILS

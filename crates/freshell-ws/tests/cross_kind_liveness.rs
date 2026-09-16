@@ -895,6 +895,24 @@ impl PaneIdentitySink for TestLedgerSink {
             .map_err(std::io::Error::other)?
         })
     }
+    fn repair_failed_transition(
+        &self,
+        provider: &str,
+        session_id: &str,
+        epoch: u64,
+        generation: u64,
+    ) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        let now = Self::now_ms();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                ledger.repair_failed_transition_binding(&p, &s, epoch, generation, now)
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
+    }
     fn load_rollback(&self, provider: &str, session_id: &str) -> Option<RollbackRecord> {
         // Mirror of freshell-server's LedgerIdentitySink: the shared migrating
         // reader owns the version gate + the legacy epochless-union migration
@@ -3601,6 +3619,178 @@ async fn a_superseded_handoffs_stale_authoritative_write_is_refused_end_to_end()
     // the second terminal's PTY is reaped through the registry.
     h.ws_state.registry.kill(&second_terminal_id);
     let _ = first_terminal_id;
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    let _ = std::fs::remove_dir_all(store_dir);
+}
+
+/// b8ke focused ep5 r4 F1 (e2e): the FAILED-TRANSITION REPAIR, end to end
+/// through the merged harness's real ledger and the lane sink. The
+/// cleanup's ledger act (fired here exactly as the abort/typed-failure
+/// cleanup would fire it, with the transition's own pair): (1) REVERTS
+/// the transition's own orphaned authoritative row (the completed-write
+/// ordering — the row the handoff's target wrote retires typed
+/// `FailedTransition`); (2) its durable tombstone fence SUPPRESSES a late
+/// authoritative write whose ownership consult STILL PASSES (the
+/// validated-then-canceled ordering — the consult passed pre-cancel, the
+/// tombstone closes the interleaving), leaving the row untouched; (3) a
+/// later legitimate claim's `clear_kill_tombstone` (the claim commit's
+/// act) re-opens the identity.
+#[tokio::test]
+async fn the_failed_transition_repair_fences_and_reverts_end_to_end() {
+    let _guard = ENV_LOCK.lock().await;
+    let _sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
+                                              // The claude-lane resume gates on transcript presence (the 6b
+                                              // pattern): the target's resume of `sid` needs the transcript under
+                                              // CLAUDE_CONFIG_DIR.
+    let store_dir = std::env::temp_dir().join(format!(
+        "freshell-handoff-ep5-r4-repair-{}",
+        uuid_like_suffix()
+    ));
+    let project_dir = store_dir.join("projects").join("slug");
+    std::fs::create_dir_all(&project_dir).expect("create transcript project dir");
+    let sid = format!("ho-rep-{}", uuid::Uuid::new_v4());
+    std::fs::write(
+        project_dir.join(format!("{sid}.jsonl")),
+        "{\"cwd\": \"/tmp\"}\n",
+    )
+    .expect("write fake transcript");
+    std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
+
+    let (mut h, pane_ledger) = spawn_merged_server_with_ledger().await;
+
+    // 1. The TERMINAL owner + 2. the FIRST handoff to the FRESH target —
+    //    the r2 success flow: the target's authoritative binding lands
+    //    over the ordinary unstamped terminal row.
+    send_json(
+        &mut h.ws,
+        &json!({
+            "type": "terminal.create", "requestId": "rep-t1",
+            "mode": "claude", "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut h.ws, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("terminal.created")
+            && v.get("requestId").and_then(|r| r.as_str()) == Some("rep-t1")
+    })
+    .await;
+    let terminal_id = created
+        .get("terminalId")
+        .and_then(|t| t.as_str())
+        .expect("terminalId")
+        .to_string();
+    let (status, body) = http_post_json(
+        &h.base_url,
+        "/api/sessions/handoff",
+        &json!({
+            "provider": "claude", "sessionId": sid, "targetKind": "fresh-agent",
+            "sessionType": "freshclaude", "deviceId": "test-device-a",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", body);
+    assert_eq!(body["ok"], serde_json::json!(true), "{}", body);
+    let flipped = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let done = pane_ledger
+                .load_binding("claude", &sid)
+                .is_some_and(|r| r.pane_kind.as_deref() == Some("fresh-agent"));
+            if done {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(
+        flipped.is_ok(),
+        "the handoff's authoritative write landed (the success arm)"
+    );
+    let snap = h.ws_state.fresh_claude.ownership_snapshot("claude", &sid);
+    let (epoch, generation) = (snap.epoch, snap.generation);
+    assert!(matches!(
+        snap.state,
+        freshell_ownership::OwnershipState::Live { ref owner, .. }
+            if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+    ));
+
+    // 3. THE REVERT (the completed-write ordering): the transition at
+    //    (epoch, generation) fails and its cleanup fires the repair —
+    //    the row the target's own write produced retires typed
+    //    FailedTransition, and the durable fence is fed.
+    let sink = TestLedgerSink {
+        ledger: Arc::clone(&pane_ledger),
+        ownership: h.ws_state.ownership.clone(),
+    };
+    sink.repair_failed_transition("claude", &sid, epoch, generation)
+        .await
+        .expect("the cleanup's repair lands");
+    let row = pane_ledger
+        .load_binding("claude", &sid)
+        .expect("the orphaned row survives, retired");
+    assert_eq!(
+        row.state,
+        freshell_ws::pane_ledger::RowState::Retired,
+        "the orphaned row retired: {row:?}"
+    );
+    assert_eq!(
+        row.retired_reason,
+        Some(freshell_ws::pane_ledger::RetiredReason::FailedTransition)
+    );
+    assert!(
+        pane_ledger.kill_tombstone_at("claude", &sid).is_some(),
+        "the durable fence is fed"
+    );
+
+    // 4. THE FENCE (the validated-then-canceled ordering): a late
+    //    authoritative write carrying the SAME transition's pair — its
+    //    ownership consult STILL PASSES (the coordinator holds
+    //    Live{{FreshAgent}} at that generation) — is suppressed at the
+    //    ledger's tombstone consult, changing nothing.
+    let row_before = pane_ledger
+        .load_binding("claude", &sid)
+        .expect("the row before the late write");
+    sink.record_binding(FreshAgentBindingUpsert {
+        provider: "claude".into(),
+        session_id: sid.clone(),
+        mode: "freshclaude".into(),
+        create_request_id: None,
+        resolves_pending: None,
+        supersedes: None,
+        provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+        observed_epoch: Some(epoch),
+        observed_generation: Some(generation),
+        authoritative: true,
+        settings: freshell_freshagent::FreshAgentSettings {
+            model: Some("late-orphaned".into()),
+            ..Default::default()
+        },
+    })
+    .await
+    .expect("the suppressed late write answers Ok (suppression, not error)");
+    let row = pane_ledger
+        .load_binding("claude", &sid)
+        .expect("the row after the late write");
+    assert_eq!(
+        row, row_before,
+        "the suppressed late write changed nothing: {row:?}"
+    );
+
+    // 5. THE FENCE NEVER WEDGES: a later legitimate claim's commit clears
+    //    the tombstone (the killed-session re-attach machinery).
+    sink.clear_kill_tombstone("claude", &sid)
+        .await
+        .expect("the claim commit's clear lands");
+    assert!(
+        pane_ledger.kill_tombstone_at("claude", &sid).is_none(),
+        "the fence is cleared — the identity re-opens for the next claim"
+    );
+
+    // Cleanup: the first terminal's row was reaped by the handoff; the
+    // fresh target's sidecar dies with the harness.
+    let _ = terminal_id;
     std::env::remove_var("CLAUDE_CONFIG_DIR");
     let _ = std::fs::remove_dir_all(store_dir);
 }

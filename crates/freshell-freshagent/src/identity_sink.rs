@@ -371,6 +371,24 @@ pub trait PaneIdentitySink: Send + Sync {
     /// never by writing a fabricated empty record. Idempotent: deleting an
     /// absent row succeeds (the ledger's `delete_rollback_row` discipline).
     fn delete_rollback(&self, provider: &str, session_id: &str) -> SinkWrite;
+    /// b8ke focused ep5 r4 F1: the FAILED-TRANSITION REPAIR — the handoff
+    /// abort / typed-failure cleanup's ONE ledger act after reaping an
+    /// uncommitted fresh-agent target: the durable kill-tombstone carrier
+    /// (fencing any late binding write from the failed transition — an
+    /// orphaned `spawn_blocking` closure whose ownership consult passed
+    /// before the cancel) plus the conditional retire of the transition's
+    /// own orphaned authoritative row (Bound fresh-agent stamped at
+    /// exactly the transition's (epoch, generation) pair). Idempotent.
+    /// Never called on a SUCCESSFUL transition (the committed target's
+    /// row is legitimate); a later legitimate claim clears the tombstone
+    /// through its `commit_claim`, so the fence never wedges the session.
+    fn repair_failed_transition(
+        &self,
+        provider: &str,
+        session_id: &str,
+        epoch: u64,
+        generation: u64,
+    ) -> SinkWrite;
     /// Task 3 lineage lookup: resolve a CREATE requestId to the durable
     /// session id recorded on the newest matching binding row (the pane-ledger
     /// `lookup_by_create_request_id` rule: Bound or GcExpired, newest by
@@ -611,6 +629,11 @@ pub(crate) struct FakeIdentitySink {
     /// close is ONE envelope over the whole identity set (never multi-pass
     /// partials over a session whose later close could fail).
     pub retire_batches: std::sync::Mutex<RetireBatchLog>,
+    /// b8ke focused ep5 r4 F1: every `repair_failed_transition` call, in
+    /// order — `(provider, sessionId, epoch, generation)`. The runner's
+    /// abort/failure-path tests assert the failed transition's cleanup
+    /// fires the repair with the transition's OWN (epoch, generation).
+    pub repairs: std::sync::Mutex<Vec<(String, String, u64, u64)>>,
     /// Focused-ep5-r1 Finding 2 (round-4 amended): the fake mirror of the
     /// ledger's kill tombstones, stamped by `kill_clock` — a deterministic
     /// monotone counter standing in for the real ledger's wall-clock
@@ -1424,6 +1447,19 @@ impl PaneIdentitySink for FakeIdentitySink {
                 .unwrap()
                 .remove(&(provider.into(), session_id.into()));
         }
+        self.write_result()
+    }
+    fn repair_failed_transition(
+        &self,
+        provider: &str,
+        session_id: &str,
+        epoch: u64,
+        generation: u64,
+    ) -> SinkWrite {
+        self.repairs
+            .lock()
+            .unwrap()
+            .push((provider.into(), session_id.into(), epoch, generation));
         self.write_result()
     }
     fn retire_closed(&self, provider: &str, session_id: &str) -> SinkCloseWrite {

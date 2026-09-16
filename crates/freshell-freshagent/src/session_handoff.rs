@@ -1841,6 +1841,52 @@ impl SessionHandoffRunner {
     /// discarded the result and vacated the key while the target was
     /// alive/unconfirmed, and the stale-start watcher could no longer
     /// resolve it: the record was already Vacant).
+    /// b8ke focused ep5 r4 F1: the failed-transition repair's LANE
+    /// DISPATCH — the reaped uncommitted target's provider lane owns the
+    /// identity sink, so the runner routes the repair through it (the
+    /// same provider→lane dispatch the kill path uses). The epoch is the
+    /// coordinator's boot epoch (the same one the under-ticket binding
+    /// write's pair carried, so the orphan filter matches the orphaned
+    /// row's own stamp exactly). Best-effort on failure: the cleanup
+    /// never blocks its coordinator fail on a ledger hiccup, but it logs
+    /// LOUD — the consult still refuses the failed transition's late
+    /// writes, and a landed orphan row converges at the next claim or
+    /// sweep.
+    async fn repair_failed_transition_binding_row(
+        self: &Arc<Self>,
+        provider: &str,
+        session_id: &str,
+        generation: u64,
+    ) {
+        let epoch = self.ownership.boot_epoch();
+        let sink = match provider {
+            "codex" => self.fresh_codex.identity_sink(),
+            "claude" => self.fresh_claude.identity_sink(),
+            "opencode" => self.fresh_opencode.identity_sink(),
+            // An unknown provider never wrote a fresh-agent binding row.
+            _ => return,
+        };
+        let Some(sink) = sink else {
+            // The lane has no ledger wired (unwired tests): nothing to
+            // repair.
+            return;
+        };
+        if let Err(err) = sink
+            .repair_failed_transition(provider, session_id, epoch, generation)
+            .await
+        {
+            tracing::error!(target: "invariant",
+                provider = %provider, session_id = %session_id,
+                epoch, generation, error = %err,
+                event = "ownership.handoff.failed_transition_repair_write_failed",
+                "the failed transition's durable ledger repair could not land — \
+                 the bridge consult still refuses this transition's late \
+                 writes; an already-landed orphan row converges at the next \
+                 claim or sweep (kata b8ke focused ep5 r4 F1)"
+            );
+        }
+    }
+
     async fn reap_uncommitted_target(
         self: &Arc<Self>,
         req: &HandoffRequest,
@@ -1958,14 +2004,38 @@ impl SessionHandoffRunner {
                 }
             }
             RuntimeOwnerKind::FreshAgent => {
-                self.stop_runtime(
-                    req,
-                    owner,
-                    "handoff-runner-stale-commit",
-                    operation_id,
+                let outcome = self
+                    .stop_runtime(
+                        req,
+                        owner,
+                        "handoff-runner-stale-commit",
+                        operation_id,
+                        generation,
+                    )
+                    .await;
+                // b8ke focused ep5 r4 F1: the FAILED-TRANSITION REPAIR —
+                // this runtime is an UNCOMMITTED handoff target being
+                // reaped by its own failing transition (the abort cleanup,
+                // the flavor-write failure, or the stale-commit unwind —
+                // this function is their one shared choke point, and the
+                // PRIOR stop never routes through it). Its authoritative
+                // binding write may have landed, be in flight, or arrive
+                // late (a `spawn_blocking` closure whose bridge consult
+                // passed before the cancel), so the transition's cleanup
+                // lands the ledger repair: the durable tombstone fence
+                // (suppressing any late write from this transition) plus
+                // the conditional retire of the transition's own orphaned
+                // row. Fires for EVERY verdict — Reaped, fenced
+                // ReapTimeout, PlatformLimited — the target is abandoned
+                // in all three, and its identity claim must not outlive
+                // the transition that failed.
+                self.repair_failed_transition_binding_row(
+                    &req.provider,
+                    &req.session_id,
                     generation,
                 )
-                .await
+                .await;
+                outcome
             }
         }
     }
@@ -2784,6 +2854,13 @@ impl SessionHandoffRunner {
                     confirmation.await
                 }
             };
+            // b8ke focused ep5 r4 F1: the SAME failed-transition repair as
+            // `reap_uncommitted_target`'s identified-target arm — this is
+            // the spawned-but-identity-unrecorded target (the abort landed
+            // between the spawn and start_target's return), whose binding
+            // write is equally in flight or landed.
+            self.repair_failed_transition_binding_row(provider, session_id, *generation)
+                .await;
             if reaped {
                 // The aborted resume's lease guard dropped ARMED with its
                 // kill handle set (the child existed), so the lease is held
