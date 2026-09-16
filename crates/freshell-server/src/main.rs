@@ -1552,7 +1552,15 @@ async fn main() -> ExitCode {
     // clones of each state share the `Arc<OnceLock>` field, so this covers
     // every route's clone.
     let fresh_agent_identity_sink: freshell_freshagent::SharedPaneIdentitySink =
-        std::sync::Arc::new(identity_sink::LedgerIdentitySink::new(pane_ledger.clone()));
+        // b8ke focused ep5 r3 F1: the bridge carries the ONE server-wide
+        // ownership coordinator — the authoritative binding write's
+        // execution-time ownership re-validation consults it inside the
+        // spawn_blocking closure (the canceled/superseded handoff's
+        // orphaned write is refused typed).
+        std::sync::Arc::new(identity_sink::LedgerIdentitySink::new(
+            pane_ledger.clone(),
+            Some(std::sync::Arc::clone(&ownership)),
+        ));
     fresh_codex_state.set_identity_sink(fresh_agent_identity_sink.clone());
     fresh_claude_state.set_identity_sink(fresh_agent_identity_sink.clone());
     fresh_opencode_state.set_identity_sink(fresh_agent_identity_sink.clone());

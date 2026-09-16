@@ -716,6 +716,10 @@ async fn spawn_merged_server_with_hooks(
 /// awaited binding batch.
 struct TestLedgerSink {
     ledger: Arc<PaneLedger>,
+    /// b8ke focused ep5 r3 F1: the merged harness's ONE ownership
+    /// coordinator — the authoritative write's ownership re-validation
+    /// consults it (mirrors the production bridge's consult verbatim).
+    ownership: Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
 }
 impl TestLedgerSink {
     fn now_ms() -> i64 {
@@ -751,9 +755,65 @@ impl PaneIdentitySink for TestLedgerSink {
     }
     fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite {
         let ledger = self.ledger.clone();
+        let ownership = self.ownership.clone();
         let now = Self::now_ms();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
+                // b8ke focused ep5 r3 F1: the authoritative write's
+                // ownership re-validation — mirrors the production bridge
+                // (crates/freshell-server/src/identity_sink.rs) verbatim:
+                // the consult runs INSIDE the spawn_blocking closure, at
+                // execution time, and refuses typed when the write's
+                // handoff no longer owns the key's transition at its
+                // (epoch, generation) pair.
+                if upsert.authoritative {
+                    let (Some(w_epoch), Some(w_generation)) =
+                        (upsert.observed_epoch, upsert.observed_generation)
+                    else {
+                        return Err(std::io::Error::other(
+                            "STALE_TRANSITION_BINDING: an authoritative write must \
+                             carry its observed (epoch, generation) pair — the \
+                             ownership re-validation cannot run (kata b8ke focused \
+                             ep5 r3 F1)",
+                        ));
+                    };
+                    let Some(registry) = ownership.as_ref() else {
+                        return Err(std::io::Error::other(
+                            "STALE_TRANSITION_BINDING: an authoritative write \
+                             arrived at a bridge with no ownership coordinator \
+                             wired — authoritative markers are minted only by \
+                             coordinator-driven handoff lanes (kata b8ke focused \
+                             ep5 r3 F1)",
+                        ));
+                    };
+                    let snap = registry.observe(&upsert.provider, &upsert.session_id);
+                    let transition_owned = snap.epoch == w_epoch
+                        && match &snap.state {
+                            freshell_ownership::OwnershipState::Handoff {
+                                generation,
+                                ..
+                            } => *generation == w_generation,
+                            freshell_ownership::OwnershipState::Live {
+                                owner,
+                                generation,
+                                ..
+                            } => {
+                                *generation == w_generation
+                                    && owner.kind
+                                        == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                            }
+                            _ => false,
+                        };
+                    if !transition_owned {
+                        return Err(std::io::Error::other(
+                            "STALE_TRANSITION_BINDING: the authoritative write's \
+                             handoff operation no longer owns the key's transition \
+                             at its generation (canceled, superseded, restored, \
+                             vacated, or a new boot epoch) — the write is refused \
+                             (kata b8ke focused ep5 r3 F1)",
+                        ));
+                    }
+                }
                 let w = FreshAgentBindingWrite {
                     provider: &upsert.provider,
                     session_id: &upsert.session_id,
@@ -1059,6 +1119,10 @@ async fn spawn_merged_server_with_ledger() -> (MergedHarness, Arc<PaneLedger>) {
     )));
     let sink: std::sync::Arc<dyn PaneIdentitySink> = Arc::new(TestLedgerSink {
         ledger: Arc::clone(&pane_ledger),
+        // b8ke focused ep5 r3 F1: the same ONE coordinator the merged
+        // harness wired into the lanes — the sink's authoritative-write
+        // consult reads the same transitions the runner drives.
+        ownership: state.ownership.clone(),
     });
     state.fresh_claude.set_identity_sink(sink.clone());
     state.fresh_codex.set_identity_sink(sink.clone());
@@ -3330,6 +3394,213 @@ async fn terminal_to_fresh_agent_handoff_lands_over_the_unstamped_terminal_row()
     // sidecar is a short-lived script under the dropped env), and the
     // terminal row's PTY is reaped through the registry.
     h.ws_state.registry.kill(&terminal_id);
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    let _ = std::fs::remove_dir_all(store_dir);
+}
+
+/// b8ke focused ep5 r3 F1 (e2e): a SUPERSEDED handoff's stale
+/// authoritative write is refused at the sink's ownership consult, END TO
+/// END. The first handoff commits Live{FreshAgent} and its target's
+/// binding lands (the r2 exception's flow); a SECOND handoff moves the
+/// key on (a terminal target, a newer generation); the FIRST handoff's
+/// delayed/orphaned target write — still marked authoritative, still
+/// carrying the first handoff's (epoch, generation) pair — is refused
+/// with the CONSULT's typed error (STALE_TRANSITION, not the ledger's
+/// NOT_NEWER arithmetic: the consult runs first, and this asserts the
+/// right layer refused it), and the refused write mutates nothing on the
+/// recovery row.
+#[tokio::test]
+async fn a_superseded_handoffs_stale_authoritative_write_is_refused_end_to_end() {
+    let _guard = ENV_LOCK.lock().await;
+    let _sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
+                                              // The claude-lane resume gates on transcript presence (the 6b
+                                              // pattern): the target's resume of `sid` needs the transcript under
+                                              // CLAUDE_CONFIG_DIR.
+    let store_dir =
+        std::env::temp_dir().join(format!("freshell-handoff-ep5-r3-{}", uuid_like_suffix()));
+    let project_dir = store_dir.join("projects").join("slug");
+    std::fs::create_dir_all(&project_dir).expect("create transcript project dir");
+    let sid = format!("ho-sup-{}", uuid::Uuid::new_v4());
+    std::fs::write(
+        project_dir.join(format!("{sid}.jsonl")),
+        "{\"cwd\": \"/tmp\"}\n",
+    )
+    .expect("write fake transcript");
+    std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
+
+    let (mut h, pane_ledger) = spawn_merged_server_with_ledger().await;
+
+    // 1. The TERMINAL owner: an ordinary WS terminal binding (claude mode)
+    //    over the durable id — the coordinator's Live{Terminal} and the
+    //    ledger row Bound with live_terminal_id and NO ownership stamp.
+    send_json(
+        &mut h.ws,
+        &json!({
+            "type": "terminal.create", "requestId": "sup-t1",
+            "mode": "claude", "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut h.ws, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("terminal.created")
+            && v.get("requestId").and_then(|r| r.as_str()) == Some("sup-t1")
+    })
+    .await;
+    let first_terminal_id = created
+        .get("terminalId")
+        .and_then(|t| t.as_str())
+        .expect("terminalId")
+        .to_string();
+
+    // 2. The FIRST handoff to the FRESH target — commits
+    //    Live{FreshAgent} at its generation and the target's
+    //    authoritative binding lands over the unstamped terminal row
+    //    (the r2 exception's flow, re-proven under the r3 consult).
+    let (status, body) = http_post_json(
+        &h.base_url,
+        "/api/sessions/handoff",
+        &json!({
+            "provider": "claude", "sessionId": sid, "targetKind": "fresh-agent",
+            "sessionType": "freshclaude", "deviceId": "test-device-a",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", body);
+    assert_eq!(body["ok"], serde_json::json!(true), "{}", body);
+    let flipped = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let done = pane_ledger
+                .load_binding("claude", &sid)
+                .is_some_and(|r| r.pane_kind.as_deref() == Some("fresh-agent"));
+            if done {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(
+        flipped.is_ok(),
+        "the first handoff's authoritative write landed (the success arm)"
+    );
+    let snap = h.ws_state.fresh_claude.ownership_snapshot("claude", &sid);
+    let (epoch, first_generation) = (snap.epoch, snap.generation);
+    assert!(
+        matches!(
+            snap.state,
+            freshell_ownership::OwnershipState::Live { ref owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ),
+        "the first handoff committed Live{{FreshAgent}} at generation {first_generation}: {:?}",
+        snap.state
+    );
+
+    // 3. The SECOND handoff moves the key on: fresh-agent → terminal —
+    //    the runner stops the fresh target and commits the terminal owner
+    //    at a NEWER generation.
+    let (status, body) = http_post_json(
+        &h.base_url,
+        "/api/sessions/handoff",
+        &json!({
+            "provider": "claude", "sessionId": sid, "targetKind": "terminal",
+            "mode": "claude", "deviceId": "test-device-a",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", body);
+    assert_eq!(body["ok"], serde_json::json!(true), "{}", body);
+    let second_terminal_id = body["owner"]["terminalId"]
+        .as_str()
+        .expect("the terminal target's terminalId")
+        .to_string();
+    let snap = h.ws_state.fresh_claude.ownership_snapshot("claude", &sid);
+    assert!(
+        matches!(
+            snap.state,
+            freshell_ownership::OwnershipState::Live { ref owner, .. }
+                if owner.terminal_id.as_deref() == Some(second_terminal_id.as_str())
+        ),
+        "the second handoff committed the terminal owner: {:?}",
+        snap.state
+    );
+    assert!(
+        snap.generation > first_generation,
+        "the second handoff advanced the generation ({} > {})",
+        snap.generation,
+        first_generation
+    );
+
+    // 4. THE STALE WRITE: the FIRST handoff's delayed target write — the
+    //    exact shape an orphaned spawn_blocking closure from a
+    //    canceled/superseded handoff carries (authoritative, the first
+    //    handoff's pair) — through the same sink the lanes write
+    //    through. The consult reads the key's CURRENT truth (a terminal
+    //    owner at a newer generation) and refuses with ITS typed error.
+    //    Note the row the stale write targets: the fresh→terminal
+    //    handoff does not itself rewrite the recovery row (the terminal
+    //    lane's row writes ride the ordinary attach path, not the
+    //    runner's target spawn), so the row still carries the FIRST
+    //    handoff's fresh-agent metadata — the refused write must leave
+    //    it byte-identical.
+    let row_before = pane_ledger
+        .load_binding("claude", &sid)
+        .expect("the row exists before the stale write");
+    let sink = TestLedgerSink {
+        ledger: Arc::clone(&pane_ledger),
+        ownership: h.ws_state.ownership.clone(),
+    };
+    let err = sink
+        .record_binding(FreshAgentBindingUpsert {
+            provider: "claude".into(),
+            session_id: sid.clone(),
+            mode: "freshclaude".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: Some(epoch),
+            observed_generation: Some(first_generation),
+            authoritative: true,
+            settings: freshell_freshagent::FreshAgentSettings {
+                model: Some("stale-superseded".into()),
+                ..Default::default()
+            },
+        })
+        .await
+        .expect_err("the superseded handoff's stale authoritative write is refused");
+    assert!(
+        err.to_string().contains("STALE_TRANSITION_BINDING"),
+        "the refusal is the ownership CONSULT's typed error (not the ledger's \
+         arithmetic): {err}"
+    );
+
+    // The refused write mutated NOTHING: the row is byte-identical to its
+    // pre-write shape (still the first handoff's fresh-agent metadata at
+    // generation {first_generation}, never the stale write's model).
+    let row = pane_ledger
+        .load_binding("claude", &sid)
+        .expect("the row survives");
+    assert_eq!(
+        row, row_before,
+        "the refused stale write changed nothing: before {row_before:?} after {row:?}"
+    );
+    assert_eq!(
+        row.model.as_deref(),
+        None,
+        "the stale write's distinguishing settings never landed: {row:?}"
+    );
+    assert_eq!(
+        row.owner_generation,
+        Some(first_generation),
+        "the row still carries the first (committed) handoff's generation: {row:?}"
+    );
+
+    // Cleanup: the first terminal's row was reaped by the first handoff;
+    // the second terminal's PTY is reaped through the registry.
+    h.ws_state.registry.kill(&second_terminal_id);
+    let _ = first_terminal_id;
     std::env::remove_var("CLAUDE_CONFIG_DIR");
     let _ = std::fs::remove_dir_all(store_dir);
 }
