@@ -9603,6 +9603,86 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
     expect(within(alert).queryByRole('button')).toBeNull()
   })
 
+  // b8ke ext r34 F2: the attach-here path CANONICALIZES at the write — a
+  // cross-device pane holding a PRE-REKEY provisional id discovers the
+  // terminal owner through the alias chain, and the pane write must anchor
+  // to the CANONICAL session ref (the reverse terminal→fresh-agent action
+  // has the same discipline at TerminalView). Pre-r34 the write kept the
+  // pane's raw superseded sessionRef: the attach worked for the current
+  // process but the pane stayed durably anchored to the retired id, which
+  // later restoration/lifecycle recovery could no longer identify once
+  // the alias records reset on reconnect and the registry reconstitutes
+  // in memory at server start.
+  it('the attach-here action writes the CANONICAL session ref for an aliased provisional id', async () => {
+    const OLD_ID = 'old-thread-r34'
+    const CANONICAL_ID = 'ses-canonical-r34'
+    const store = createStore()
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent({
+      sessionRef: { provider: 'codex', sessionId: OLD_ID },
+      sessionId: OLD_ID,
+    }) }))
+    // Prop-rendered (the wedged-sidecar harness shape): the attach action
+    // swaps the pane to a TERMINAL pane in the store — a store-backed
+    // wrapper would throw on the kind change mid-assertion.
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={divergencePaneContent({
+            sessionRef: { provider: 'codex', sessionId: OLD_ID },
+            sessionId: OLD_ID,
+          })}
+        />
+      </Provider>,
+    )
+
+    const dispatchSpy = vi.spyOn(store, 'dispatch')
+
+    // The alias chain: the OLD (pre-rebind) id's runtime-owner record
+    // carries aliasOf naming the canonical thread id (the r31-F2 rebind
+    // old-key frame shape), and the CANONICAL record names the committed
+    // terminal owner.
+    act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame({
+      sessionId: OLD_ID,
+      aliasOf: CANONICAL_ID,
+      transition: 'released',
+      generation: 4,
+      terminalId: 't-r34-alias',
+    }))))
+    act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame({
+      sessionId: CANONICAL_ID,
+      transition: 'handoff-committed',
+      generation: 5,
+      terminalId: 't-r34-alias',
+    }))))
+
+    // The divergence card renders through the alias chain (the pane's
+    // canonical session resolves OLD → CANONICAL → the terminal owner).
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(/open as a terminal on another device/i)
+    const attach = within(alert).getByRole('button', { name: /attach the terminal here/i })
+    fireEvent.click(attach)
+
+    // THE PANE WRITE IS CANONICAL: the swap's sessionRef is the canonical
+    // thread id, never the pane's retired provisional one (pre-r34 this
+    // payload kept OLD_ID).
+    const swap = dispatchSpy.mock.calls
+      .map(([action]) => action as { type?: string; payload?: { tabId?: string; paneId?: string; content?: { kind?: string; sessionRef?: { sessionId?: string } } } })
+      .find((action) => action?.type === 'panes/updatePaneContent' && action.payload?.content?.kind === 'terminal')
+    expect(swap?.payload).toMatchObject({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'terminal',
+        mode: 'codex',
+        terminalId: 't-r34-alias',
+        sessionRef: { provider: 'codex', sessionId: CANONICAL_ID },
+      },
+    })
+    expect(swap?.payload?.content?.sessionRef?.sessionId).not.toBe(OLD_ID)
+  })
+
   // b8ke focused round-5 R5-3: a SAME-KIND in-progress lifecycle transition
   // (the ready-replay fold of starting/handoff/stopping naming THIS pane's
   // kind) is transition-blocked: the pane shows the transition card (never

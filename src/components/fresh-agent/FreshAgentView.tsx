@@ -1124,6 +1124,17 @@ export function FreshAgentView({
       content.sessionId !== undefined ? { provider: content.provider, sessionId: content.sessionId } : undefined
     )
     if (!sessionRef) return
+    // b8ke ext r34 F2: canonicalize at the WRITE (mirroring the reverse
+    // action's discipline at TerminalView's openAsFreshAgentHere) — the
+    // divergence was discovered through the alias chain, so the pane
+    // write must anchor to the CANONICAL session ref, never the pane's
+    // raw superseded one: runtime-owner aliases reset on reconnect and
+    // the ownership registry is reconstructed in memory at server start,
+    // so a pane durably written with the retired pre-rekey provisional id
+    // could no longer be identified with the canonical conversation by
+    // later restoration or lifecycle recovery.
+    const canonical = resolveCanonicalPaneSession(appStore.getState(), content)
+    const sessionId = canonical?.sessionId ?? sessionRef.sessionId
     dispatch(updatePaneContent({
       tabId,
       paneId,
@@ -1131,12 +1142,12 @@ export function FreshAgentView({
         createRequestId: content.createRequestId,
         mode: content.provider,
         provider: sessionRef.provider,
-        sessionId: sessionRef.sessionId,
+        sessionId,
         terminalId: divergence.terminalId,
         cwd: content.initialCwd,
       }),
     }))
-  }, [dispatch, paneId, tabId])
+  }, [appStore, dispatch, paneId, tabId])
 
   useEffect(() => () => {
     if (rateLimitRetryTimerRef.current !== null) {
