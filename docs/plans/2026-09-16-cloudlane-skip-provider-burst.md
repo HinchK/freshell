@@ -92,7 +92,7 @@ The four singleton flickers — `freshclaude-identity-persistence-rust.spec.ts:5
 | `test/e2e-browser/specs/fresh-agent.spec.ts` (modify) | Three settings-modal wait budgets (kata vpfr). |
 | `test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts` (modify) | Eviction-proof capture-path polls (re-send the crafted legacy sync on evicted observations; `reports/load-bearing-validator-LB-2.md`) + explicit 30s bounds (kata vpfr). |
 
-No `src/`, `crates/`, `docker/`, or config/vite changes. No user-facing UI change → `docs/index.html` and `README.md` untouched.
+EXCEPT the amended Task 4: one production change in `src/components/fresh-agent/FreshAgentView.tsx` (the applySnapshot pane-content status gate — evidence-driven amendment, see Task 4). Otherwise no `crates/`, `docker/`, or config/vite changes. No user-facing UI change → `docs/index.html` and `README.md` untouched.
 
 ---
 
@@ -495,86 +495,52 @@ git commit -m "test(e2e): deflake freshopencode-db-history flake layer (scoped l
 
 (If Steps 4/5 produced dispositions rather than rewrites, the commit message stays the same — the receipt, not the message, carries the per-leg outcomes.)
 
-### Task 4: freshopencode-first-send deflake — poll the status broadcast instead of a one-shot read (kata 5prk)
+### Task 4: freshopencode-first-send deflake (kata 5prk) — AMENDED after the first attempt's evidence: poll conversion + close the ungated pane-content status clobber (production invariant fix)
+
+**Amendment provenance (2026-09-16):** the first implementer (report: `<git-dir>/usual-sdd/task-004-report.md`, no commit — worktree reverted clean at c4da9bb7f) live-proved the task's premise false at this base: the one-shot read fails DETERMINISTICALLY unloaded (control probe: `Expected: "running" Received: "idle"`), and a mid-run log capture shows the pane-content `running` window closes ~48ms BEFORE the audit event gates the read. Verified causal chain: (1) `sendUserText` writes optimistic pane-content `status: 'running'` (FreshAgentView.tsx:2597-2604); (2) the server's running broadcast (placeholder-keyed, opencode_ws.rs:1015-1024) is snapshot-invalidating (FreshAgentView.tsx:114-123); (3) the placeholder short-circuit replies `status: "idle"` (freshell-freshagent lib.rs:826-856, build_opencode_snapshot_json ~:2111); (4) in `applySnapshot` the SESSION-RECORD status write is gated by `canAdoptSnapshotStatus` (FreshAgentView.tsx:2196-2211 — the repo's own invariant: an idle snapshot "would clear a genuinely running turn") but the pane-content `updatePaneContent({..., status})` write directly below (~:2216-2243) is UNGATED — an idle snapshot clobbers the optimistic running on EVERY freshopencode first send. The UI stays busy (session record), but the pane-content echo the spec asserts flips idle. This is a production invariant violation, and closing it (mirroring the session-record gate onto the pane-content write) is the SYSTEM fix that makes the spec's original assertion valid again — the deterministic e2e failure IS its red test. The poll conversion remains part of the fix (it makes the loaded read race-tolerant once the window no longer closes by construction; the attempt-1 mutation red already proved the poll's bound live). This amendment ADDS a production change to this task — recorded prominently for the delta review and the recap.
 
 **Files:**
-- Modify: `test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts:178-181`
-- Test: the spec itself
+- Modify: `test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts:178-181` (poll conversion)
+- Modify: `src/components/fresh-agent/FreshAgentView.tsx` (applySnapshot: gate the pane-content status write with the same `canAdoptSnapshotStatus` discipline as the session-record write)
+- Test: the e2e spec itself (the deterministic red) + the client unit suite for the touched logic if a harness exists (locate with `rg -l canAdoptSnapshotStatus test/ src/`; if the gate is only exercised via integration, extend the nearest FreshAgentView/applySnapshot unit test if present, and record honestly if no unit seam exists — the e2e spec is the behavior-protecting test)
 
 **Interfaces:**
-- Consumes: the spec's `getFreshOpencodePaneState(page)` (:109-123), the `FAKE_OPENCODE_HANG_SESSION_CREATE=1` server env (:66 — pins the turn in flight so `running` is a stable steady state), and the audit-file poll at :173-176.
-- Produces: nothing cross-task. The describe's declared `test.setTimeout(90_000)` (:134) is untouched; the 30s poll bound is an explicit per-assertion literal inside that envelope. Sizing rationale (corrected per `reports/load-bearing-validator-LB-6.md`): the full-chain all-max worst case (~239.5s pre-change, ~269.5s post) ALREADY exceeded the 90s envelope with passing history, so all-max arithmetic was never this envelope's property — the operative regime is the criterion (the 15s one-shot position is where the old bound demonstrably fired under load in all three runs; the whole body passes unloaded in seconds; the envelope is PR-#785-frozen). No `test.setTimeout` declaration is added; the new bound's loaded reachability is gate-measured by Task 8's local lane runs.
+- Consumes: the spec's `getFreshOpencodePaneState(page)` (:109-123), the `FAKE_OPENCODE_HANG_SESSION_CREATE=1` server env (:66 — pins the turn in flight so `running` is a stable steady state), the audit-file poll at :173-176, and `canAdoptSnapshotStatus` (FreshAgentView.tsx:2196).
+- Produces: the gated pane-content status adoption (invariant: an idle/busy-less snapshot must not clear a genuinely running pane-content status — mirrors the shipped session-record gate). The describe's declared `test.setTimeout(90_000)` (:134) is untouched; the 30s poll bound is an explicit per-assertion literal inside that envelope. Sizing rationale (LB-6): the operative regime is the criterion; no `test.setTimeout` declaration is added.
 
-**Diagnosis:** after the 15s audit-event poll succeeds, the test did ONE synchronous `getFreshOpencodePaneState(page)` read and asserted `status === 'running'`. The audit-file write (fake CLI process) and the client's status broadcast (WS → Redux) are different pipelines; under 48-worker load the broadcast lags the audit event, so the one-shot read observed pre-turn `idle` (lane failure: `Expected: "running" Received: "idle"` at :180, in both HEAD runs). Unloaded the broadcast always wins — a focused red is not feasible without fabricating app-side delays, so the red evidence is the lane log plus a bound-liveness mutation below.
+**Diagnosis being fixed (two layers, evidence-corrected):** (a) the load layer — the one-shot read raced the broadcast under load (fixed by the poll); (b) the deterministic layer — the ungated pane-content clobber closes the `running` window ~48ms before the audit gate (fixed by the production gate extension). Attempt-1 evidence: the control probe + the mid-run log table (report §4.6).
 
-- [ ] **Step 1: Reproduce the failing condition as far as it is focusedly reproducible (bound-liveness mutation)**
+- [ ] **Step 1: Restore the poll conversion and verify the deterministic RED (the production defect's red test)**
 
-Apply the fix-shaped poll but with a dead bound, temporarily, to prove the assertion shape fails loudly at its bound rather than hanging (the repo's decorative-timeout lesson class). Temporarily replace :178-181 with:
-
-```ts
-      await expect.poll(async () => getFreshOpencodePaneState(page), { timeout: 1 }).toMatchObject({
-        sessionId: expect.stringMatching(/^freshopencode-/),
-        status: 'running',
-        sessionRef: {
-          sessionId: expect.stringMatching(/^freshopencode-/),
-        },
-      })
-```
-
-- [ ] **Step 2: Run the test and verify the intended failure**
+Re-apply the poll conversion exactly as the original Step 3 drafted it (30s bound + rationale comment, `duringSend` binding and its three asserts deleted — attempt 1 verified nothing else references it). Then run the focused spec and observe the deterministic red (the production defect):
 
 Run: `npm run test:e2e:local -- test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts`
 
-Expected: FAIL with `Timeout: 1ms exceeded` while polling `getFreshOpencodePaneState` (the received value shows the pre-turn state) — proving the poll is bounded and the bound is live. The REAL red is the lane evidence (both HEAD full-lane runs failed at :180 with `Expected: "running" Received: "idle"`); the race window (audit write → WS status broadcast) only opens under load.
+Expected: FAIL — `toMatchObject` with `status: "idle"` at the 30s bound (attempt 1's run 2, same shape). This red is now the PRODUCTION fix's red test: it fails because the ungated pane-content write clobbers the optimistic running before the read. (Attempt 1's mutation red — `{ timeout: 1 }` failing loudly at its bound — already proved the poll mechanism live; no need to repeat it.)
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [ ] **Step 2: Close the ungated pane-content status clobber (minimal production change)**
 
-Set the real bound (same block, `{ timeout: 1 }` → `{ timeout: 30_000 }`) and add the rationale comment:
+In `src/components/fresh-agent/FreshAgentView.tsx` `applySnapshot`, extend the `canAdoptSnapshotStatus` discipline to the pane-content status write: the `updatePaneContent({..., status: nextStatus})` call (~:2216-2243) must not write a NON-running status over a pane-content status that is currently `'running'` unless the snapshot adoption is legal by the same gate the session-record write uses (:2196-2211). Read both writes and the gate carefully first; mirror the gate's exact semantics (do not invent a new policy — reuse `canAdoptSnapshotStatus` so the two writes can never disagree); keep every other field of the `updatePaneContent` write unchanged (the gate applies to the `status` field only). Add a code comment stating the invariant in the repo's own terms (an idle snapshot must not clear a genuinely running turn — the pane-content echo is user-visible state and deserves the same protection the session record has).
 
-```ts
-      // The audit write (fake CLI process) and the client's status broadcast
-      // (WS -> Redux) are different pipelines: under full-lane load the
-      // broadcast lags the audit event, so a one-shot read raced and could
-      // observe the pre-turn 'idle' (the lane failure: Expected "running",
-      // Received "idle"). Poll instead: FAKE_OPENCODE_HANG_SESSION_CREATE=1
-      // pins the turn in flight, so 'running' is a stable steady state —
-      // polling to it does not weaken the pinned contract (the submitted
-      // prompt must stay visible across reload while materialization is
-      // pending).
-      await expect.poll(async () => getFreshOpencodePaneState(page), { timeout: 30_000 }).toMatchObject({
-        sessionId: expect.stringMatching(/^freshopencode-/),
-        status: 'running',
-        sessionRef: {
-          sessionId: expect.stringMatching(/^freshopencode-/),
-        },
-      })
-```
-
-The poll replaces the `const duringSend = ...` one-shot read entirely — delete the `duringSend` binding and its three `expect(...)` lines (nothing else references `duringSend`). The negative leg is inherent: the poll fails loudly at 30s if the turn never starts, and the subsequent reload leg still pins "materialization pending" via `FAKE_OPENCODE_HANG_SESSION_CREATE`.
-
-- [ ] **Step 4: Run the focused test**
+- [ ] **Step 3: Run the focused test (GREEN for both layers)**
 
 Run: `npm run test:e2e:local -- test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts`
 
-Expected: PASS
+Expected: PASS — with the gate extended, the optimistic `running` survives the hanging create (a genuine steady state until the 30s `request_timeout`), and the poll observes it.
 
-- [ ] **Step 5: Refactor while green**
+- [ ] **Step 4: Refactor while green**
 
-The `duringSend` removal in Step 3 IS the cleanup (the one-shot binding existed only for the removed asserts); nothing further.
+If `canAdoptSnapshotStatus`'s expression is now consumed twice in ways that invite drift, extract nothing preemptively — the two call sites SHOULD share the single binding already computed in `applySnapshot`'s scope; verify they do (one binding, two uses). No other refactor.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [ ] **Step 5: Run impacted-test verification (a src change — the impacted set is broader now)**
 
-File-local change; no shared surface touched (the spec owns its helpers). The impacted set is the spec's focused run (Step 4, the file's single test). Cloud-skip-listed spec — the local lane is its coverage lane.
+The production change touches `src/components/fresh-agent/FreshAgentView.tsx`. Impacted sets: (a) `npm run typecheck:client` (now applies — tsconfig covers `src`); (b) the client vitest suite for the touched module and its neighbors (`npm run test:vitest -- src/components/fresh-agent` if a matching suite exists — locate with `rg -l "FreshAgentView|applySnapshot" test/ | head`; run whatever focused vitest files cover FreshAgentView/pane-status logic; record the exact set you ran); (c) the e2e specs that exercise pane-status/snapshot adoption for fresh-agent panes: this spec (Step 3, green) + `npm run test:e2e:local -- test/e2e-browser/specs/freshopencode-db-history.spec.ts` (the family sibling — its transcript/status legs must stay green) + the fresh-agent cloud-legal member `npm run test:e2e:local -- test/e2e-browser/specs/fresh-agent.spec.ts --grep "session"` is NOT required (different surface); instead run the whole-branch standard gate later — here, run (a), (b), (c). Record every result.
 
-Run: (Step 4's command is the complete impacted set.)
-
-Expected: PASS
-
-- [ ] **Step 7: Commit the task**
+- [ ] **Step 6: Commit the task**
 
 ```bash
-git add test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts
-git commit -m "test(e2e): deflake freshopencode-first-send (poll the status broadcast, 30s bound)"
+git add test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts src/components/fresh-agent/FreshAgentView.tsx
+git commit -m "fix(fresh-agent): gate pane-content status adoption in applySnapshot like the session record (idle snapshots must not clear a genuinely running turn); deflake first-send repro with a bounded poll (kata 5prk)"
 ```
 
 ### Task 5: opencode-restart-recovery deflake — load-tolerant budgets + the RustServer kill seam (kata mv9m)
