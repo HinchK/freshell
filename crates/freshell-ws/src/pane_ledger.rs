@@ -284,6 +284,34 @@ pub struct PaneCloseKill {
     pub provider: String,
     pub session_id: String,
     pub at_ms: i64,
+    /// b8ke focused ep5 r5 F2: the kill's TRANSITION SCOPE — `Some((epoch,
+    /// generation))` ONLY on a failed handoff transition's repair kill
+    /// (the cleanup's fence): the tombstone suppresses/dominates only
+    /// writes and rows at or before that pair; a strictly NEWER binding
+    /// (a later committed owner's write or refresh) is invisible to it.
+    /// `None` on every ordinary kill-lane close (the identity-wide fence).
+    /// Serde-optional under the existing records: pre-r5 records parse to
+    /// `None` (the identity-wide semantics) and old readers ignore the
+    /// field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<(u64, u64)>,
+}
+
+/// b8ke focused ep5 r5 F2: does the tombstone's transition scope LEAVE the
+/// candidate alone? `true` only when the tombstone is SCOPED (a failed
+/// transition's repair fence) and the candidate proves STRICTLY NEWER
+/// than the scope — a later committed owner's binding write or row. The
+/// ordinary kill lanes' tombstones (scope `None`) and every candidate
+/// that cannot prove newer (an unstamped row, an unfenced write) stay
+/// under the fence — fail closed, exactly as before.
+fn tombstone_scope_spares_newer(
+    scope: Option<(u64, u64)>,
+    candidate_pair: Option<(u64, u64)>,
+) -> bool {
+    match (scope, candidate_pair) {
+        (Some(scope), Some(pair)) => pair > scope,
+        _ => false,
+    }
 }
 
 /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3) — the close envelope's
@@ -688,6 +716,36 @@ fn classify_kill_tombstone(
 /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3): feed ONE close-envelope
 /// journal record into the write-through index — the SAME discipline at
 /// persist time and at load. The record's `kills` ARE the close fences: each
+/// b8ke focused ep5 r5 F2: the tombstone index's value — the close's
+/// stamp plus the kill's TRANSITION SCOPE. The merge (max at_ms, and the
+/// STRONGER scope wins: an identity-wide kill — scope `None` — outranks a
+/// scoped one, and the newer stamp carries its own scope) keeps the
+/// feed/recompute/boot-scan folds consistent.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct KillTombstoneEntry {
+    at_ms: i64,
+    scope: Option<(u64, u64)>,
+}
+
+impl KillTombstoneEntry {
+    /// Fold one kill into the entry: the max stamp wins; on a stamp tie
+    /// the IDENTITY-WIDE (unscoped) fence is the stronger claim.
+    fn fold(&mut self, kill: &PaneCloseKill) {
+        match self.at_ms.cmp(&kill.at_ms) {
+            std::cmp::Ordering::Less => {
+                self.at_ms = kill.at_ms;
+                self.scope = kill.scope;
+            }
+            std::cmp::Ordering::Equal => {
+                if kill.scope.is_none() {
+                    self.scope = None;
+                }
+            }
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+}
+
 /// folds into the `kill_tombstones` index, max stamp winning across records
 /// and legacy files (a re-kill re-stamps forward).
 fn feed_close_envelope(index: &mut LedgerIndex, key: String, record: CloseEnvelopeRecord) {
@@ -695,8 +753,11 @@ fn feed_close_envelope(index: &mut LedgerIndex, key: String, record: CloseEnvelo
         index
             .kill_tombstones
             .entry((kill.provider.clone(), kill.session_id.clone()))
-            .and_modify(|stamp| *stamp = (*stamp).max(kill.at_ms))
-            .or_insert(kill.at_ms);
+            .and_modify(|entry| entry.fold(kill))
+            .or_insert(KillTombstoneEntry {
+                at_ms: kill.at_ms,
+                scope: kill.scope,
+            });
     }
     index.close_envelopes.insert(key, record);
 }
@@ -1305,7 +1366,7 @@ struct LedgerIndex {
     /// (the suppress arm), the dominance sweep, the claim commit's
     /// conditional, and the recovery inventory's verdict joins — never a
     /// liveness signal.
-    kill_tombstones: std::collections::HashMap<(String, String), i64>,
+    kill_tombstones: std::collections::HashMap<(String, String), KillTombstoneEntry>,
     /// The fence keys backed by a LEGACY `kill-tombstones/` file (the
     /// pre-journal shape). Tracked so the record sweep's un-feed only ever
     /// drops fences no other durable source carries, and the fence sweep's
@@ -1843,11 +1904,22 @@ impl PaneLedger {
                         if tombstone.ledger_version == LEDGER_VERSION {
                             let key = (tombstone.provider.clone(), tombstone.session_id.clone());
                             index.legacy_tombstone_keys.insert(key.clone());
+                            // Legacy files are identity-wide fences (scope None).
                             index
                                 .kill_tombstones
                                 .entry(key)
-                                .and_modify(|stamp| *stamp = (*stamp).max(tombstone.killed_at_ms))
-                                .or_insert(tombstone.killed_at_ms);
+                                .and_modify(|entry| {
+                                    entry.fold(&PaneCloseKill {
+                                        provider: tombstone.provider.clone(),
+                                        session_id: tombstone.session_id.clone(),
+                                        at_ms: tombstone.killed_at_ms,
+                                        scope: None,
+                                    })
+                                })
+                                .or_insert(KillTombstoneEntry {
+                                    at_ms: tombstone.killed_at_ms,
+                                    scope: None,
+                                });
                         }
                     }
                 }
@@ -2293,57 +2365,88 @@ impl PaneLedger {
         // A CLAIM-RESIDUE tombstone (a committed claim's revive visibly
         // outranks its own crashed clear) is inert: the write proceeds and
         // the residue is pruned.
-        if let Some(killed_at) = index.kill_tombstones.get(&key).copied() {
-            let row_view = index.bindings.get(&key).map(|r| (r.state, r.updated_at));
-            match classify_kill_tombstone(killed_at, row_view, w.now_ms) {
-                KillTombstoneVerdict::Dominant | KillTombstoneVerdict::Fresh => {
-                    tracing::info!(
-                        target: "freshell_ws::pane_ledger",
-                        provider = %w.provider,
-                        session_id = %w.session_id,
-                        killed_at_ms = killed_at,
-                        "pane_ledger_binding_suppressed_by_kill_tombstone: a late write \
-                         for an explicitly-closed identity writes nothing (never Bound)"
-                    );
-                    if let Some(mut remnant) = index.bindings.get(&key).cloned() {
-                        if remnant.state == RowState::Bound {
-                            remnant.state = RowState::Retired;
-                            remnant.retired_reason = Some(RetiredReason::Closed);
-                            remnant.updated_at = w.now_ms;
-                            tracing::info!(
-                                target: "freshell_ws::pane_ledger",
-                                provider = %w.provider,
-                                session_id = %w.session_id,
-                                "pane_ledger_tombstoned_remnant_retired: force-retiring the \
-                                 crash-window Bound remnant alongside the suppressed write"
-                            );
-                            self.write_binding(root, &mut index, &remnant)?;
-                        }
-                    }
-                    return Ok(());
-                }
-                // Finding 4: an expired tombstone over a missing/Retired row is
-                // pruned noise — the write proceeds and the consult sweeps it
-                // lazily. Finding 3: a ClaimResidue tombstone (the committed
-                // claim's own clear crashed/failed) is inert by construction
-                // (the Bound row outranks it) — never suppress the claim's own
-                // write; prune the residue instead so it cannot linger.
-                KillTombstoneVerdict::Expired | KillTombstoneVerdict::ClaimResidue => {
-                    if let Err(err) =
-                        Self::clear_kill_fence_locked(root, &mut index, w.provider, w.session_id)
-                    {
-                        // Fail loud, never silent: the sweep prunes at the
-                        // next GC pass regardless (a ClaimResidue fence left
-                        // behind is inert either way — the row outranks it;
-                        // a record-fed fence simply re-derives at the next
-                        // load and dies with its record).
-                        tracing::warn!(
+        if let Some(tombstone) = index.kill_tombstones.get(&key).copied() {
+            let killed_at = tombstone.at_ms;
+            // b8ke focused ep5 r5 F2: the tombstone's TRANSITION SCOPE. A
+            // SCOPED tombstone (a failed handoff transition's repair
+            // fence) suppresses only writes AT OR BEFORE its (epoch,
+            // generation) pair: a binding write carrying a STRICTLY NEWER
+            // pair — a later committed owner's legitimate write or
+            // refresh — is INVISIBLE to it and proceeds untouched
+            // (never suppressed, never the remnant force-retire). The
+            // r4 repair wrote an identity-wide kill timestamp, so a LATE
+            // cleanup of an already-superseded transition stamped its
+            // kill AFTER the newer owner's Bound row — the newer owner's
+            // next refresh classified Dominant, was suppressed, and the
+            // force-retire corrupted its recovery row as Closed.
+            if tombstone_scope_spares_newer(
+                tombstone.scope,
+                w.observed_epoch.zip(w.observed_generation),
+            ) {
+                tracing::info!(
+                    target: "freshell_ws::pane_ledger",
+                    provider = %w.provider,
+                    session_id = %w.session_id,
+                    killed_at_ms = killed_at,
+                    tombstone_scope = ?tombstone.scope,
+                    "pane_ledger_scoped_tombstone_spares_newer_binding: the failed \
+                     transition's fence is INVISIBLE to this strictly-newer write"
+                );
+            } else {
+                let row_view = index.bindings.get(&key).map(|r| (r.state, r.updated_at));
+                match classify_kill_tombstone(killed_at, row_view, w.now_ms) {
+                    KillTombstoneVerdict::Dominant | KillTombstoneVerdict::Fresh => {
+                        tracing::info!(
                             target: "freshell_ws::pane_ledger",
                             provider = %w.provider,
                             session_id = %w.session_id,
-                            error = %err,
-                            "pane_ledger_stale_tombstone_sweep_failed: fence left behind; GC retries"
+                            killed_at_ms = killed_at,
+                            "pane_ledger_binding_suppressed_by_kill_tombstone: a late write \
+                             for an explicitly-closed identity writes nothing (never Bound)"
                         );
+                        if let Some(mut remnant) = index.bindings.get(&key).cloned() {
+                            if remnant.state == RowState::Bound {
+                                remnant.state = RowState::Retired;
+                                remnant.retired_reason = Some(RetiredReason::Closed);
+                                remnant.updated_at = w.now_ms;
+                                tracing::info!(
+                                    target: "freshell_ws::pane_ledger",
+                                    provider = %w.provider,
+                                    session_id = %w.session_id,
+                                    "pane_ledger_tombstoned_remnant_retired: force-retiring the \
+                                     crash-window Bound remnant alongside the suppressed write"
+                                );
+                                self.write_binding(root, &mut index, &remnant)?;
+                            }
+                        }
+                        return Ok(());
+                    }
+                    // Finding 4: an expired tombstone over a missing/Retired row is
+                    // pruned noise — the write proceeds and the consult sweeps it
+                    // lazily. Finding 3: a ClaimResidue tombstone (the committed
+                    // claim's own clear crashed/failed) is inert by construction
+                    // (the Bound row outranks it) — never suppress the claim's own
+                    // write; prune the residue instead so it cannot linger.
+                    KillTombstoneVerdict::Expired | KillTombstoneVerdict::ClaimResidue => {
+                        if let Err(err) = Self::clear_kill_fence_locked(
+                            root,
+                            &mut index,
+                            w.provider,
+                            w.session_id,
+                        ) {
+                            // Fail loud, never silent: the sweep prunes at the
+                            // next GC pass regardless (a ClaimResidue fence left
+                            // behind is inert either way — the row outranks it;
+                            // a record-fed fence simply re-derives at the next
+                            // load and dies with its record).
+                            tracing::warn!(
+                                target: "freshell_ws::pane_ledger",
+                                provider = %w.provider,
+                                session_id = %w.session_id,
+                                error = %err,
+                                "pane_ledger_stale_tombstone_sweep_failed: fence left behind; GC retries"
+                            );
+                        }
                     }
                 }
             }
@@ -2790,21 +2893,27 @@ impl PaneLedger {
             }
         }
         // The index fence entry mirrors the durable truth exactly: only the
-        // SURVIVING carriers feed it (re-stamped forward to their max).
-        let recomputed: Option<i64> = index
-            .close_envelopes
-            .values()
-            .flat_map(|record| record.kills.iter())
-            .filter(|k| k.provider == provider && k.session_id == session_id)
-            .map(|k| k.at_ms)
-            .max();
+        // SURVIVING carriers feed it (folded through the entry merge — max
+        // stamp, the stronger scope winning).
+        let mut recomputed: Option<KillTombstoneEntry> = None;
+        for record in index.close_envelopes.values() {
+            for kill in record
+                .kills
+                .iter()
+                .filter(|k| k.provider == provider && k.session_id == session_id)
+            {
+                recomputed
+                    .get_or_insert(KillTombstoneEntry::default())
+                    .fold(kill);
+            }
+        }
         match (legacy_survives, recomputed) {
             (false, None) => {
                 index.kill_tombstones.remove(&key);
             }
             (true, None) => { /* the legacy file outlived its delete: keep its stamp */ }
-            (_, Some(stamp)) => {
-                index.kill_tombstones.insert(key, stamp);
+            (_, Some(entry)) => {
+                index.kill_tombstones.insert(key, entry);
             }
         }
         match first_err {
@@ -2979,7 +3088,7 @@ impl PaneLedger {
         self.guard()
             .kill_tombstones
             .get(&(provider.to_string(), session_id.to_string()))
-            .copied()
+            .map(|entry| entry.at_ms)
     }
 
     /// The identities whose kill tombstone currently DOMINATES a Bound row
@@ -3002,11 +3111,22 @@ impl PaneLedger {
         index
             .kill_tombstones
             .iter()
-            .filter(|(key, killed_at)| {
-                let row_view = index.bindings.get(*key).map(|r| (r.state, r.updated_at));
+            .filter(|(key, tombstone)| {
+                let row = index.bindings.get(*key);
+                // b8ke focused ep5 r5 F2: a SCOPED tombstone does not
+                // dominate a row that proves STRICTLY NEWER than its
+                // transition pair (a later committed owner's row) — the
+                // same scope predicate the write consult applies.
+                if tombstone_scope_spares_newer(
+                    tombstone.scope,
+                    row.and_then(|r| r.owner_epoch.zip(r.owner_generation)),
+                ) {
+                    return false;
+                }
+                let row_view = row.map(|r| (r.state, r.updated_at));
                 // Dominance is TTL-free; `now` only disambiguates the
                 // non-Bound arms, which this filter never selects anyway.
-                classify_kill_tombstone(**killed_at, row_view, i64::MAX)
+                classify_kill_tombstone(tombstone.at_ms, row_view, i64::MAX)
                     == KillTombstoneVerdict::Dominant
             })
             .map(|(key, _)| key.clone())
@@ -3113,7 +3233,11 @@ impl PaneLedger {
         let mut index = self.guard();
         for alias in fence_checked_aliases {
             let alias_key = (provider.to_string(), alias.clone());
-            if let Some(killed_at) = index.kill_tombstones.get(&alias_key).copied() {
+            if let Some(killed_at) = index
+                .kill_tombstones
+                .get(&alias_key)
+                .map(|entry| entry.at_ms)
+            {
                 tracing::info!(
                     target: "freshell_ws::pane_ledger",
                     provider = %provider,
@@ -3127,7 +3251,7 @@ impl PaneLedger {
             }
         }
         let key = (provider.to_string(), session_id.to_string());
-        let current = index.kill_tombstones.get(&key).copied();
+        let current = index.kill_tombstones.get(&key).map(|entry| entry.at_ms);
         let dead_state_advanced = match (current, expect_killed_at_ms) {
             (Some(cur), Some(exp)) => cur > exp,
             (Some(_), None) => true,
@@ -3275,6 +3399,10 @@ impl PaneLedger {
         panes: &[PaneCloseLinkage],
         now_ms: i64,
         orphan_filter: Option<(u64, u64)>,
+        // b8ke focused ep5 r5 F2: the kills' TRANSITION SCOPE — `None` on
+        // every ordinary close (the identity-wide fence); `Some((epoch,
+        // generation))` ONLY on the failed-transition repair's fence.
+        kill_scope: Option<(u64, u64)>,
     ) -> Result<(), CloseEnvelopeError> {
         let prior = index.close_envelopes.get(key).cloned();
         let mut record = prior.clone().unwrap_or(CloseEnvelopeRecord {
@@ -3294,11 +3422,15 @@ impl PaneLedger {
                 .iter_mut()
                 .find(|k| &k.provider == provider && &k.session_id == session_id)
             {
-                Some(existing) => existing.at_ms = now_ms,
+                Some(existing) => {
+                    existing.at_ms = now_ms;
+                    existing.scope = kill_scope;
+                }
                 None => record.kills.push(PaneCloseKill {
                     provider: provider.clone(),
                     session_id: session_id.clone(),
                     at_ms: now_ms,
+                    scope: kill_scope,
                 }),
             }
         }
@@ -3686,6 +3818,9 @@ impl PaneLedger {
                 // b8ke focused ep5 r4 F1: no orphan filter — the
                 // close projection is the ordinary retire discipline.
                 None,
+                // b8ke focused ep5 r5 F2: no kill scope — the
+                // identity-wide fence every ordinary close writes.
+                None,
             )?;
         }
         for pending_id in pending_ids {
@@ -3708,16 +3843,25 @@ impl PaneLedger {
     /// the prior or vacates). Under ONE index-guard hold it lands BOTH
     /// halves of the re-convergence, in this order:
     ///
-    /// 1. THE FENCE (durable): the close-envelope journal record for the
-    ///    identity — the same carrier the kill lanes' closes write — feeds
-    ///    the kill-tombstone index, so ANY late binding write from the
-    ///    failed transition (an orphaned `spawn_blocking` closure whose
-    ///    ownership consult passed BEFORE the cancel, still in flight) is
-    ///    suppressed wholesale by [`PaneLedger::record_fresh_agent_binding`]'s
-    ///    tombstone consult — no Bound row is created, whichever arrival
-    ///    order the late write takes. A LATER legitimate claim clears the
-    ///    tombstone through its `commit_claim` (the killed-session
-    ///    re-attach machinery), so the fence never wedges the session.
+    /// 1. THE FENCE (durable, SCOPED): the close-envelope journal record
+    ///    for the identity — the same carrier the kill lanes' closes
+    ///    write — feeds the kill-tombstone index carrying the failed
+    ///    transition's (epoch, generation) SCOPE, so any late binding
+    ///    write from the failed transition (an orphaned `spawn_blocking`
+    ///    closure whose ownership consult passed BEFORE the cancel, still
+    ///    in flight) is suppressed wholesale by
+    ///    [`PaneLedger::record_fresh_agent_binding`]'s tombstone consult —
+    ///    no Bound row is created, whichever arrival order the late write
+    ///    takes. The scope (ep5 r5 F2) bounds the fence to writes AT OR
+    ///    BEFORE the failed transition's pair: a LATER committed owner's
+    ///    strictly-newer binding or refresh is invisible to it (the r4
+    ///    identity-wide timestamp stamped a kill after a newer owner's
+    ///    Bound row, so the newer owner's next refresh classified
+    ///    Dominant, was suppressed, and the remnant force-retire corrupted
+    ///    its recovery row as Closed). A LATER legitimate claim still
+    ///    clears the tombstone through its `commit_claim` (the
+    ///    killed-session re-attach machinery), so the fence never wedges
+    ///    the session.
     /// 2. THE REVERT (conditional): the projection flips ONLY the failed
     ///    transition's own ORPHANED product — a Bound fresh-agent row
     ///    stamped at exactly the transition's (epoch, generation) pair —
@@ -3754,6 +3898,11 @@ impl PaneLedger {
             None,
             &[],
             now_ms,
+            Some((epoch, generation)),
+            // b8ke focused ep5 r5 F2: the repair's fence is SCOPED to the
+            // failed transition's (epoch, generation) — it suppresses only
+            // writes/rows at or before that pair; a strictly newer binding
+            // (a later committed owner's) is invisible to it.
             Some((epoch, generation)),
         )
         .map_err(|err| {
@@ -3836,6 +3985,9 @@ impl PaneLedger {
             // b8ke focused ep5 r4 F1: no orphan filter — the
             // close projection is the ordinary retire discipline.
             None,
+            // b8ke focused ep5 r5 F2: no kill scope — the
+            // identity-wide fence every ordinary close writes.
+            None,
         )?;
         // Step 4 — the marker (LAST; warn-only hygiene — the close is
         // durable by now).
@@ -3899,6 +4051,9 @@ impl PaneLedger {
             // b8ke focused ep5 r4 F1: no orphan filter — the
             // close projection is the ordinary retire discipline.
             None,
+            // b8ke focused ep5 r5 F2: no kill scope — the
+            // identity-wide fence every ordinary close writes.
+            None,
         )
     }
 
@@ -3935,6 +4090,9 @@ impl PaneLedger {
             now_ms,
             // b8ke focused ep5 r4 F1: no orphan filter — the
             // close projection is the ordinary retire discipline.
+            None,
+            // b8ke focused ep5 r5 F2: no kill scope — the
+            // identity-wide fence every ordinary close writes.
             None,
         )
     }
@@ -4685,6 +4843,7 @@ impl PaneLedger {
                     provider: w.provider.to_string(),
                     session_id: w.session_id.to_string(),
                     at_ms: w.now_ms,
+                    scope: None,
                 });
             }
             match self.persist_close_envelope_locked(

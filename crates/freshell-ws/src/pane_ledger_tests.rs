@@ -709,6 +709,56 @@ fn the_failed_transition_repair_leaves_innocent_rows_untouched() {
     // writes regardless of what the row held).
     assert!(ledger.kill_tombstone_at("codex", "ses-ep5-r4-b").is_some());
     assert!(ledger.kill_tombstone_at("codex", "ses-ep5-r4-c").is_some());
+
+    // b8ke focused ep5 r5 F2 — EXTENDED PAST THE REPAIR (the reviewer's
+    // next-write demand): the failed transition was ALREADY SUPERSEDED —
+    // ses-ep5-r4-c is a LATER committed owner's row (generation 11), and
+    // the repair (the stale cleanup of the (EPOCH, 8) transition) fired
+    // AFTER that row existed. The NEWER OWNER'S NEXT LEGITIMATE REFRESH —
+    // a binding write carrying its own strictly-newer pair — must STILL
+    // LAND (pre-r5 the identity-wide tombstone timestamped its kill after
+    // the newer row: the refresh classified Dominant, was suppressed, and
+    // the remnant force-retire corrupted the row as Closed).
+    ledger
+        .record_fresh_agent_binding(&fa_write_target("codex", "ses-ep5-r4-c", 1_200, EPOCH, 11))
+        .expect(
+            "the newer owner's next refresh lands — the scoped fence \
+                 is invisible to its strictly-newer pair",
+        );
+    let later = ledger
+        .load_binding("codex", "ses-ep5-r4-c")
+        .expect("the newer owner's row");
+    assert_eq!(
+        later.state,
+        RowState::Bound,
+        "the newer owner's refresh was never suppressed/force-retired: {later:?}"
+    );
+    assert_eq!(
+        later.retired_reason, None,
+        "never Retired/Closed: {later:?}"
+    );
+
+    // ...while the FAILED TRANSITION'S OWN LATE WRITE still refuses —
+    // over the NEWER-STAMPED row the r22 stale-pair fence is the first
+    // line (its (EPOCH, 8) pair is strictly older than the row's 11),
+    // and over every less-stamped shape the scoped tombstone suppresses
+    // it (the r4 fence test). Either way: never a landing.
+    let err = ledger
+        .record_fresh_agent_binding(&fa_write_target("codex", "ses-ep5-r4-c", 1_300, EPOCH, 8))
+        .expect_err("the failed transition's own late write never lands");
+    assert!(
+        err.to_string().contains("STALE_BINDING_PAIR"),
+        "the typed refusal over the newer row: {err}"
+    );
+    let later = ledger
+        .load_binding("codex", "ses-ep5-r4-c")
+        .expect("the row");
+    assert_eq!(
+        later.state,
+        RowState::Bound,
+        "the refused late write changed nothing: {later:?}"
+    );
+    assert_eq!(later.owner_generation, Some(11));
 }
 
 /// The repair's FENCE half, in the validated-then-canceled ordering: a
