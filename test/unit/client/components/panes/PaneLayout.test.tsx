@@ -178,6 +178,15 @@ function renderWithStore(
   return render(<Provider store={store}>{ui}</Provider>)
 }
 
+function createStoreWithFab(initialPanesState: Partial<PanesState> = {}) {
+  const store = createStore(initialPanesState)
+  store.dispatch({
+    type: 'settings/updateSettingsLocal',
+    payload: { panes: { floatingActionButton: true } },
+  })
+  return store
+}
+
 describe('PaneLayout', () => {
   beforeEach(() => {
     mockSend.mockClear()
@@ -369,7 +378,7 @@ describe('PaneLayout', () => {
       expect(await screen.findByTestId(`editor-${existingPaneId}`)).toBeInTheDocument()
     })
 
-    it('renders FloatingActionButton', async () => {
+    it('hides the floating action button by default', async () => {
       const existingPaneId = 'pane-1'
       const store = createStore({
         layouts: {
@@ -387,7 +396,28 @@ describe('PaneLayout', () => {
         store
       )
 
-      // FAB should be present
+      // The FAB is opt-in via the panes.floatingActionButton local setting.
+      expect(screen.queryByTitle('Add pane')).not.toBeInTheDocument()
+    })
+
+    it('renders the floating action button when the setting is enabled', async () => {
+      const existingPaneId = 'pane-1'
+      const store = createStoreWithFab({
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: existingPaneId,
+            content: createTerminalContent(),
+          },
+        },
+        activePane: { 'tab-1': existingPaneId },
+      })
+
+      renderWithStore(
+        <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} />,
+        store
+      )
+
       expect(screen.getByTitle('Add pane')).toBeInTheDocument()
     })
   })
@@ -395,7 +425,7 @@ describe('PaneLayout', () => {
   describe('adding terminal pane', () => {
     it('splits active pane when adding terminal', async () => {
       const paneId = 'pane-1'
-      const store = createStore({
+      const store = createStoreWithFab({
         layouts: {
           'tab-1': {
             type: 'leaf',
@@ -440,7 +470,7 @@ describe('PaneLayout', () => {
       }))
 
       const paneId = 'pane-1'
-      const store = createStore({
+      const store = createStoreWithFab({
         layouts: {
           'tab-1': {
             type: 'leaf',
@@ -479,7 +509,7 @@ describe('PaneLayout', () => {
       }))
 
       const paneId = 'pane-1'
-      const store = createStore({
+      const store = createStoreWithFab({
         layouts: {
           'tab-1': {
             type: 'leaf',
@@ -506,7 +536,7 @@ describe('PaneLayout', () => {
 
     it('sets new pane as active after adding', async () => {
       const paneId = 'pane-1'
-      const store = createStore({
+      const store = createStoreWithFab({
         layouts: {
           'tab-1': {
             type: 'leaf',
@@ -536,7 +566,7 @@ describe('PaneLayout', () => {
   describe('adding browser pane', () => {
     it('splits active pane when adding browser', async () => {
       const paneId = 'pane-1'
-      const store = createStore({
+      const store = createStoreWithFab({
         layouts: {
           'tab-1': {
             type: 'leaf',
@@ -566,7 +596,7 @@ describe('PaneLayout', () => {
 
     it('creates picker pane when FAB is clicked', async () => {
       const paneId = 'pane-1'
-      const store = createStore({
+      const store = createStoreWithFab({
         layouts: {
           'tab-1': {
             type: 'leaf',
@@ -596,7 +626,7 @@ describe('PaneLayout', () => {
   describe('edge cases', () => {
     it('adds pane even when no active pane is set (falls back to first leaf)', async () => {
       const paneId = 'pane-1'
-      const store = createStore({
+      const store = createStoreWithFab({
         layouts: {
           'tab-1': {
             type: 'leaf',
@@ -622,7 +652,7 @@ describe('PaneLayout', () => {
 
     it('handles rapid add operations', async () => {
       const paneId = 'pane-1'
-      const store = createStore({
+      const store = createStoreWithFab({
         layouts: {
           'tab-1': {
             type: 'leaf',
@@ -659,7 +689,7 @@ describe('PaneLayout', () => {
       defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor',
       panesState: Partial<PanesState> = {},
     ) {
-      const store = createStore(panesState)
+      const store = createStoreWithFab(panesState)
       store.dispatch({
         type: 'settings/previewServerSettingsPatch',
         payload: { panes: { defaultNewPane } },
@@ -740,7 +770,7 @@ describe('PaneLayout', () => {
       defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor',
       panesState: Partial<PanesState> = {},
     ) {
-      const store = createStore(panesState)
+      const store = createStoreWithFab(panesState)
       store.dispatch({
         type: 'settings/previewServerSettingsPatch',
         payload: { panes: { defaultNewPane } },
