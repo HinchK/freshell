@@ -544,8 +544,10 @@ cmd_run() {
   # spend at most W+1s together) survives the observed wedge class with
   # margin. The freshellPage fixture's boot chain derives its OWN setup
   # timeout from this window COMPOSED with the chain's other permitted
-  # waits (window + 1s connection slack + the goto and harness maxima
-  # (30s each, delta r12) + the picker's permitted worst case (~110.5s,
+  # waits (window + 1s connection slack + the allowances for the
+  # UNBOUNDED initial operations (goto + harness install, 30s each —
+  # explicit budget lines, no Playwright maxima exist in this runner;
+  # delta r13) + the picker's permitted worst case (~110.5s,
   # incl. the post-click-timeout creation probe), ~261.5s at this default
   # window) — Playwright's
   # fixture-timeout mechanism, so slow SETUP gets the allowance while

@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Page } from '@playwright/test'
 import {
-  CLOUD_LANE_GOTO_MAX_MS,
-  CLOUD_LANE_HARNESS_MAX_MS,
+  CLOUD_LANE_GOTO_ALLOWANCE_MS,
+  CLOUD_LANE_HARNESS_ALLOWANCE_MS,
   DEFAULT_TEST_TIMEOUT_MS,
   DEFAULT_WS_READY_TIMEOUT_MS,
   freshellPageFixtureTimeoutMs,
@@ -131,7 +131,7 @@ describe('resolveCloudLaneTestBudgetMs', () => {
   it('falls back to the default window composition on malformed values (one parsing rule)', () => {
     for (const malformed of ['not-a-number', '0', '-5']) {
       expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: malformed }))
-        .toBe(30_000 + 1_000 + CLOUD_LANE_GOTO_MAX_MS + CLOUD_LANE_HARNESS_MAX_MS + shellPickerWorstCaseMs())
+        .toBe(30_000 + 1_000 + CLOUD_LANE_GOTO_ALLOWANCE_MS + CLOUD_LANE_HARNESS_ALLOWANCE_MS + shellPickerWorstCaseMs())
     }
   })
 
@@ -140,7 +140,7 @@ describe('resolveCloudLaneTestBudgetMs', () => {
       const budget = resolveCloudLaneTestBudgetMs({ [ENV_VAR]: windowMs })
       expect(budget).not.toBeNull()
       expect(budget!).toBeGreaterThanOrEqual(
-        Number(windowMs) + 1_000 + CLOUD_LANE_GOTO_MAX_MS + CLOUD_LANE_HARNESS_MAX_MS + shellPickerWorstCaseMs(),
+        Number(windowMs) + 1_000 + CLOUD_LANE_GOTO_ALLOWANCE_MS + CLOUD_LANE_HARNESS_ALLOWANCE_MS + shellPickerWorstCaseMs(),
       )
     }
   })
@@ -191,7 +191,7 @@ describe('freshellPageFixtureTimeoutMs (the boot chain owns its own setup allowa
   it('falls back to the default window composition on malformed values (one parsing rule)', () => {
     for (const malformed of ['not-a-number', '0', '-5']) {
       expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: malformed }))
-        .toBe(30_000 + 1_000 + CLOUD_LANE_GOTO_MAX_MS + CLOUD_LANE_HARNESS_MAX_MS + shellPickerWorstCaseMs())
+        .toBe(30_000 + 1_000 + CLOUD_LANE_GOTO_ALLOWANCE_MS + CLOUD_LANE_HARNESS_ALLOWANCE_MS + shellPickerWorstCaseMs())
     }
   })
 
@@ -239,14 +239,17 @@ describe('TestHarness.waitForConnection timeout wiring', () => {
     expect(calls[0][2]).toEqual({ timeout: 15_000 })
   })
 
-  it('waitForHarness default keeps the HISTORICAL EFFECTIVE window: 30s, not the decorative 15s (delta review r6)', async () => {
-    // Honoring the old decorative 15s default for real would HALVE every
-    // no-arg caller's effective window vs. the pre-run state — the bug made
-    // the real window Playwright's 30s default. Fixing the binding must not
-    // shrink anyone: the default IS the historical effective window.
+  it('waitForHarness default is 0 (unlimited, outer-bound-governed) — the exact pre-run effective semantics (delta review r13)', async () => {
+    // The historical decorative 15s never applied: unconfigured
+    // Playwright-Test waits inherit the context's 0 default (= disabled),
+    // so the pre-run wait was bounded ONLY by the outer deadline. The r6
+    // attempt to pin a 30s "historical effective window" rested on a false
+    // default and NARROWED the wait; the committed default restores the
+    // pre-run semantics: 0 = no inner limit, the test deadline (locally)
+    // or the freshellPage fixture slot (cloud lane) governs.
     const { page, calls } = fakePage()
     await new TestHarness(page).waitForHarness()
-    expect(calls[0][2]).toEqual({ timeout: 30_000 })
+    expect(calls[0][2]).toEqual({ timeout: 0 })
   })
 })
 

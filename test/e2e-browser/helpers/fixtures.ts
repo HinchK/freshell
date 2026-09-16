@@ -264,8 +264,10 @@ export const test = base.extend<{
   // TEST keeps its original deadline (playwright.dev/docs/test-fixtures#
   // fixture-timeout). On the cloud lane the timeout is the composed
   // budget (freshellPageFixtureTimeoutMs -> 261.5s at the default window:
-  // connection W+1s + the goto and harness maxima + the picker worst
-  // case, delta review r12); locally it is undefined — fixture time
+  // connection W+1s + the allowances for the UNBOUNDED initial
+  // operations (goto, harness install — no Playwright maxima exist in
+  // this runner; explicit budget lines, delta reviews r12+r13) + the
+  // picker worst case); locally it is undefined — fixture time
   // counts toward the test timeout, the exact pre-run behavior. The wiring NEVER modifies the
   // test's own deadline: bodies keep their declared or config-default
   // ceiling on every lane (the former whole-test extension gave

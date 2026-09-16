@@ -15,8 +15,10 @@ import type { Page } from '@playwright/test'
 // setting up \"freshellPage\"" — the EXACT production tg4e signature —
 // deterministically (the 8s sleep dominates any machine speed).
 // Validated by mutation during the r12 remediation. The lane-derived
-// composed value (261.5s at the default window, including the goto and
-// harness maxima) is behaviorally unit-pinned by freshellPageFixtureTimeoutMs.
+// composed value (261.5s at the default window, including the
+// allowances for the UNBOUNDED initial operations — goto and harness
+// install have NO Playwright maxima in this runner; delta r13) is
+// behaviorally unit-pinned by freshellPageFixtureTimeoutMs.
 class DeterministicallySlowBootHarness extends TestHarness {
   constructor(page: Page) {
     super(page)
