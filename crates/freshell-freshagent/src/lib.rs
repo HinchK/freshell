@@ -1406,19 +1406,32 @@ pub mod ownership_lane {
     /// the new vacant generation (retries repeated the stale request
     /// until reconnection; other devices kept displaying the former
     /// owner). `None` when the coordinator is unwired (nothing to fold).
+    /// b8ke ext r32 F2: the frame carries ITS OWN transition's pair —
+    /// the (epoch, generation) captured AT `commit_stop`'s commit —
+    /// NEVER a re-observed current generation. If a lifecycle operation
+    /// on another device starts or completes between the commit and
+    /// this broadcast, a re-observed frame would carry the NEWER
+    /// operation's generation, and the client (which accepts all
+    /// same-generation frames) would fold the vacant frame OVER the
+    /// newer `handoff-started`/live-owner state until another event or
+    /// a reconnect. The committed pair keeps the frame honestly
+    /// labeled: the client's fence discipline orders it as the older
+    /// transition it is.
     pub fn released_owner_frame(
         registry: &Option<Arc<RuntimeOwnershipRegistry>>,
         provider: &str,
         session_id: &str,
         operation_id: &str,
+        committed_epoch: u64,
+        committed_generation: u64,
     ) -> Option<freshell_protocol::ServerMessage> {
         let registry = registry.as_ref()?;
         Some(freshell_protocol::ServerMessage::SessionRuntimeOwner(
             freshell_protocol::SessionRuntimeOwner {
                 provider: provider.to_string(),
                 session_id: session_id.to_string(),
-                epoch: registry.boot_epoch(),
-                generation: registry.observe(provider, session_id).generation,
+                epoch: committed_epoch,
+                generation: committed_generation,
                 owner_kind: "vacant".into(),
                 previous_kind: None,
                 terminal_id: None,
@@ -5918,6 +5931,106 @@ mod tests {
             .expect("stamps lock")
             .get(session_id)
             .is_some());
+    }
+
+    /// b8ke ext r32 F2: the released frame carries ITS OWN transition's
+    /// pair — the (epoch, generation) captured at the commit — never a
+    /// re-observed current generation. A lifecycle operation landing
+    /// between the commit_stop and this broadcast (modeled by advancing
+    /// the key with a competing start BEFORE the frame is built) must
+    /// not leak its newer generation into the vacant frame: the client
+    /// accepts all same-generation frames, so a re-observed frame
+    /// folds OVER the newer operation's state. Pre-r32 the builder
+    /// re-observed and the frame carried the newer generation.
+    #[test]
+    fn released_owner_frame_carries_the_committed_pair_not_the_current_generation() {
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let sid = "ses-r32-f2-released-frame";
+        let owner = freshell_ownership::OwnerIdentity {
+            kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            terminal_id: None,
+            live_session_key: Some("live-key-r32-f2".into()),
+            pid: Some(111_222),
+            ownership_id: Some("op-live-r32-f2".into()),
+        };
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            "codex",
+            sid,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-live-r32-f2",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("fixture granted")
+        };
+        assert_eq!(
+            registry.commit_live("codex", sid, "op-live-r32-f2", generation, owner.clone()),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        // The stop commits Vacant — THIS transition's pair is
+        // (boot_epoch, stop_gen).
+        let freshell_ownership::StopOutcome::Granted {
+            generation: stop_gen,
+        } = registry.begin_stop(
+            "codex",
+            sid,
+            "op-stop-r32-f2",
+            &freshell_ownership::StopClaim {
+                expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                expected_runtime: Some(owner.clone()),
+                observed: freshell_ownership::ObservedFence {
+                    epoch: registry.boot_epoch(),
+                    generation,
+                },
+            },
+            "test",
+            2_000,
+        )
+        else {
+            panic!("fixture stop granted")
+        };
+        assert_eq!(
+            registry.commit_stop("codex", sid, "op-stop-r32-f2", stop_gen),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        // A lifecycle op lands BETWEEN the commit and the broadcast: a
+        // competing start grants and advances the key's generation.
+        let freshell_ownership::BeginOutcome::Granted { generation: newer } = registry.begin_start(
+            "codex",
+            sid,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-competitor-r32-f2",
+            None,
+            "competitor",
+            3_000,
+        ) else {
+            panic!("fixture competitor granted")
+        };
+        assert!(newer > stop_gen, "the competitor advanced the generation");
+
+        // THE FRAME, built with the COMMITTED pair: it must carry the
+        // stop's own (epoch, stop_gen) — pre-r32 the builder re-observed
+        // and carried the competitor's `newer` generation.
+        let frame = ownership_lane::released_owner_frame(
+            &Some(Arc::clone(&registry)),
+            "codex",
+            sid,
+            "op-stop-r32-f2",
+            registry.boot_epoch(),
+            stop_gen,
+        )
+        .expect("the wired registry builds the frame");
+        let freshell_protocol::ServerMessage::SessionRuntimeOwner(o) = frame else {
+            panic!("the released frame is a SessionRuntimeOwner")
+        };
+        assert_eq!(
+            o.generation, stop_gen,
+            "the released frame carries ITS OWN committed pair, never the \
+             re-observed current generation ({newer})"
+        );
+        assert_eq!(o.epoch, registry.boot_epoch());
+        assert_eq!(o.owner_kind, "vacant");
     }
 
     #[test]

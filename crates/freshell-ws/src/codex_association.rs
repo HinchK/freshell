@@ -1068,6 +1068,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// b8ke ext r32 F2 (the WS-side builder): `broadcast_vacant_frame`
+    /// carries the CALLER's committed pair — the (epoch, generation)
+    /// captured at the release/commit_stop commit — never a re-observed
+    /// current generation. The deterministic probe: a key with NO
+    /// record observes generation 0, while the committed pair says 7 —
+    /// pre-r32 the builder re-observed and the frame carried the
+    /// current 0 instead of the transition's own 7 (the same defect
+    /// that, on an ADVANCED key, folds the vacant frame over a newer
+    /// `handoff-started`/live-owner state because the client accepts
+    /// all same-generation frames).
+    #[tokio::test]
+    async fn broadcast_vacant_frame_carries_the_committed_pair_not_the_current_generation() {
+        let home = unique_temp_dir("r32-f2-ws-frame");
+        let (mut state, mut rx) = state_with_locator(home.clone());
+        let ownership = wire_ownership(&mut state);
+        while rx.try_recv().is_ok() {}
+
+        let sid = "ses-r32-f2-ws-missing";
+        assert_eq!(
+            ownership.observe("codex", sid).generation,
+            0,
+            "fixture: the missing key's observed generation is 0"
+        );
+        crate::identity_ownership::broadcast_vacant_frame(
+            &state,
+            "codex",
+            sid,
+            "op-r32-f2-ws",
+            ownership.boot_epoch(),
+            7,
+        );
+        let mut frame: Option<serde_json::Value> = None;
+        while let Ok(raw) = rx.try_recv() {
+            let parsed: serde_json::Value = serde_json::from_str(&raw).expect("json frame");
+            if parsed["type"] == "session.runtimeOwner" && parsed["sessionId"] == json!(sid) {
+                frame = Some(parsed);
+            }
+        }
+        let frame = frame.expect("the vacant frame was broadcast");
+        assert_eq!(
+            frame["generation"],
+            json!(7),
+            "the vacant frame carries the COMMITTED pair's generation, never \
+             the re-observed current generation: {frame}"
+        );
+        assert_eq!(frame["epoch"], json!(ownership.boot_epoch()));
+        assert_eq!(frame["ownerKind"], json!("vacant"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     /// b8ke ext r14 F1: a durable-binding FAILURE unwinds the held
     /// authority — NO committed owner. The adoption's ledger write fails
     /// (a ledger root that is a FILE: every write errors) — the adoption

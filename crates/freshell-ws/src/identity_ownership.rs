@@ -535,8 +535,18 @@ fn rebind_release_old_key(
                     provider: provider.to_string(),
                     session_id: old_session_id.to_string(),
                 });
-            // b8ke ext r14 F3: the VACANT release frame under the old key.
-            broadcast_vacant_frame(state, provider, old_session_id, operation_id);
+            // b8ke ext r14 F3: the VACANT release frame under the old key
+            // (b8ke ext r32 F2: stamped with THIS release's own pair —
+            // the old key's pre-release generation, never a re-observed
+            // current generation).
+            broadcast_vacant_frame(
+                state,
+                provider,
+                old_session_id,
+                operation_id,
+                ownership.boot_epoch(),
+                *generation,
+            );
             true
         }
         other => {
@@ -586,8 +596,17 @@ pub(crate) fn broadcast_rebind_alias_frame(
     else {
         // No coordinator record for the old key (never occurs on a
         // committed rebind — the rekey wrote Aliased{to: new} in the
-        // same scope): the honest vacant frame.
-        broadcast_vacant_frame(state, provider, old_session_id, operation_id);
+        // same scope): the honest vacant frame. A MISSING record has no
+        // transition pair to mislabel (its observed generation is 0
+        // and nothing can race a key that does not exist).
+        broadcast_vacant_frame(
+            state,
+            provider,
+            old_session_id,
+            operation_id,
+            ownership.boot_epoch(),
+            ownership.observe(provider, old_session_id).generation,
+        );
         return;
     };
     let frame = serde_json::to_string(&ServerMessage::SessionRuntimeOwner(
@@ -619,11 +638,24 @@ pub(crate) fn broadcast_rebind_alias_frame(
 /// terminal-owner frame on a released key left old-key Fresh Agent panes
 /// presenting the divergence card with a direct-attach action long after
 /// the writer moved).
+///
+/// b8ke ext r32 F2: the frame carries ITS OWN transition's pair — the
+/// (epoch, generation) captured at the release/commit_stop commit —
+/// NEVER a re-observed current generation. If a lifecycle operation on
+/// another device starts or completes between the commit and this
+/// broadcast, a re-observed frame would carry the NEWER operation's
+/// generation and the client (which accepts all same-generation
+/// frames) would fold the vacant frame OVER the newer
+/// `handoff-started`/live-owner state until another event or a
+/// reconnect. The committed pair keeps the frame honestly labeled: the
+/// client's fence discipline orders it as the older transition it is.
 pub(crate) fn broadcast_vacant_frame(
     state: &WsState,
     provider: &str,
     session_id: &str,
     operation_id: &str,
+    committed_epoch: u64,
+    committed_generation: u64,
 ) {
     let Some(ownership) = state.ownership.as_ref() else {
         return;
@@ -632,8 +664,8 @@ pub(crate) fn broadcast_vacant_frame(
         freshell_protocol::SessionRuntimeOwner {
             provider: provider.to_string(),
             session_id: session_id.to_string(),
-            epoch: ownership.boot_epoch(),
-            generation: ownership.observe(provider, session_id).generation,
+            epoch: committed_epoch,
+            generation: committed_generation,
             owner_kind: "vacant".into(),
             previous_kind: None,
             terminal_id: None,

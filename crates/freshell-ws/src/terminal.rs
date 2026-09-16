@@ -7884,8 +7884,19 @@ fn commit_terminal_stop(state: &WsState, stop_commit: &mut Option<(String, Strin
     // sequence converge on the vacant owner and the NEW generation
     // (pre-r18 the commit changed the coordinator with no broadcast, so
     // a recreate carrying the stale observed generation was fenced and
-    // the client kept retrying the stale pair).
-    crate::identity_ownership::broadcast_vacant_frame(state, &provider, &session_id, &operation_id);
+    // the client kept retrying the stale pair). b8ke ext r32 F2: the
+    // frame carries THIS stop's committed pair — never a re-observed
+    // current generation (a lifecycle op landing between the commit and
+    // the broadcast must not have its state overwritten by the vacant
+    // frame).
+    crate::identity_ownership::broadcast_vacant_frame(
+        state,
+        &provider,
+        &session_id,
+        &operation_id,
+        ownership.boot_epoch(),
+        generation,
+    );
 }
 
 /// kata b8ke Task 4 review F1: the granted stop's CLEAN-failure rollback —

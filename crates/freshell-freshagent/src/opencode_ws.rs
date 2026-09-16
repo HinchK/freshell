@@ -3041,6 +3041,12 @@ impl FreshOpencodeState {
                                                 PROVIDER,
                                                 &key,
                                                 &op_id,
+                                                // b8ke ext r32 F2: the
+                                                // COMMITTED transition's
+                                                // own pair — never a
+                                                // re-observed generation.
+                                                registry.boot_epoch(),
+                                                generation,
                                             )
                                         {
                                             self.broadcast(&frame);
@@ -3253,6 +3259,10 @@ impl FreshOpencodeState {
                     PROVIDER,
                     key,
                     op_id,
+                    // b8ke ext r32 F2: the COMMITTED transition's own
+                    // pair — never a re-observed generation.
+                    registry.boot_epoch(),
+                    generation,
                 ) {
                     self.broadcast(&frame);
                 }

@@ -3221,6 +3221,11 @@ impl FreshClaudeState {
                                 PROVIDER,
                                 &key,
                                 &op_id,
+                                // b8ke ext r32 F2: the COMMITTED
+                                // transition's own pair — never a
+                                // re-observed generation.
+                                registry.boot_epoch(),
+                                generation,
                             ) {
                                 self.broadcast(&frame);
                             }
@@ -3360,6 +3365,10 @@ impl FreshClaudeState {
                             PROVIDER,
                             key,
                             op_id,
+                            // b8ke ext r32 F2: the COMMITTED transition's
+                            // own pair — never a re-observed generation.
+                            registry.boot_epoch(),
+                            generation,
                         ) {
                             self.broadcast(&frame);
                         }
@@ -3396,6 +3405,11 @@ impl FreshClaudeState {
                                     PROVIDER,
                                     &key,
                                     &op_id,
+                                    // b8ke ext r32 F2: the COMMITTED
+                                    // transition's own pair — never a
+                                    // re-observed generation.
+                                    registry.boot_epoch(),
+                                    generation,
                                 ) {
                                     if let Ok(frame) = serde_json::to_string(&frame) {
                                         let _ = deferred_broadcast_tx.send(frame);
