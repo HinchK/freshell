@@ -2823,6 +2823,27 @@ impl TerminalRegistry {
         let Some(ownership) = self.ownership.as_ref() else {
             return (freshell_ownership::CommitOutcome::Committed, None);
         };
+        // b8ke ext r30 F2: the retained-claim lock is the ordering point
+        // for the WHOLE rekey — held across the liveness check, the
+        // old→new coordinator move, AND the claim-map move, exactly the
+        // normal commit's discipline (the template at
+        // [`Self::commit_session_ref_ownership`]). Pre-r30 the rekey
+        // checked liveness and moved the coordinator record BEFORE taking
+        // this lock: a PTY exiting between the coordinator move and the
+        // claim move was consumed by `finish_pty_exit` against the OLD
+        // claim — releasing the now-Aliased old key (a no-op) — and the
+        // rekey then installed a NEW claim for the already-dead terminal,
+        // leaving the new canonical key falsely Live{Terminal} with no
+        // release evidence. Under this lock an exit in the window BLOCKS
+        // and consumes the NEW claim once the rekey completes (releasing
+        // the new key correctly), and an exit that already happened is
+        // seen by the liveness check (a dead PTY never rebinds). The
+        // nesting is the template's own: no code path takes the registry's
+        // inner lock and then this lock, so claims→inner can never invert.
+        let mut claims = self
+            .session_ref_ownership
+            .lock()
+            .expect("session-ref ownership lock");
         // The ext-r9 F2 commit-time liveness check: a dead/gone PTY never
         // records Live (the association lanes gate on a Running row, so
         // this passes).
@@ -2858,27 +2879,26 @@ impl TerminalRegistry {
         if !matches!(outcome, freshell_ownership::CommitOutcome::Committed) {
             return (outcome, None);
         }
+        // b8ke ext r30 F1's test seam: the deterministic park INSIDE the
+        // critical section — between the coordinator move and the
+        // claim-map move. Never armed in production.
+        #[cfg(test)]
+        REKEY_INTERLOCK.wait_if_targeted(terminal_id);
         // The retained-claim rekey: remove the old claim + insert the new
         // — ONE registry lock scope (the map never holds both after the
-        // step).
-        let removed_old = {
-            let mut claims = self
-                .session_ref_ownership
-                .lock()
-                .expect("session-ref ownership lock");
-            let removed_old = claims.remove(&session_ref_key(old_locator));
-            claims.insert(
-                session_ref_key(new_locator),
-                RetainedSessionRefOwnership {
-                    locator: new_locator.clone(),
-                    terminal_id: terminal_id.to_string(),
-                    operation_id: operation_id.to_string(),
-                    generation,
-                    pid,
-                },
-            );
-            removed_old
-        };
+        // step) — and now ATOMIC with the coordinator move above (the
+        // same lock scope covers both).
+        let removed_old = claims.remove(&session_ref_key(old_locator));
+        claims.insert(
+            session_ref_key(new_locator),
+            RetainedSessionRefOwnership {
+                locator: new_locator.clone(),
+                terminal_id: terminal_id.to_string(),
+                operation_id: operation_id.to_string(),
+                generation,
+                pid,
+            },
+        );
         (outcome, removed_old)
     }
 
@@ -3375,6 +3395,69 @@ fn deliver_batches(
     }
 }
 
+/// b8ke ext r30 F2 (test-only): the rekey's deterministic INTERLOCK —
+/// parks the rekey's critical section between the old→new coordinator
+/// move and the retained-claim move for ONE targeted terminal id, so a
+/// test can drive the PTY-exit race in that exact window. Targeted by
+/// terminal id so concurrent tests pass through untouched.
+#[cfg(test)]
+pub(crate) static REKEY_INTERLOCK: RekeyInterlock = RekeyInterlock {
+    target: std::sync::Mutex::new(None),
+    reached: std::sync::atomic::AtomicBool::new(false),
+    gate: std::sync::Mutex::new(false),
+    cv: std::sync::Condvar::new(),
+};
+
+#[cfg(test)]
+pub(crate) struct RekeyInterlock {
+    target: std::sync::Mutex<Option<String>>,
+    reached: std::sync::atomic::AtomicBool,
+    gate: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl RekeyInterlock {
+    /// Arm the park for one terminal id — only that id parks. Re-arming
+    /// resets the arrival flag.
+    pub(crate) fn arm(&self, terminal_id: &str) {
+        *self.target.lock().expect("interlock target") = Some(terminal_id.to_string());
+        self.reached
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Has the targeted rekey reached the park?
+    pub(crate) fn reached(&self) -> bool {
+        self.reached.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Release the parked rekey and disarm (idempotent).
+    pub(crate) fn release(&self) {
+        *self.target.lock().expect("interlock target") = None;
+        let mut gate = self.gate.lock().expect("interlock gate");
+        *gate = true;
+        self.cv.notify_all();
+    }
+
+    fn wait_if_targeted(&self, terminal_id: &str) {
+        let targeted = self
+            .target
+            .lock()
+            .expect("interlock target")
+            .as_ref()
+            .is_some_and(|t| t == terminal_id);
+        if !targeted {
+            return;
+        }
+        self.reached
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut gate = self.gate.lock().expect("interlock gate");
+        while !*gate {
+            gate = self.cv.wait(gate).expect("interlock condvar");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3607,6 +3690,131 @@ mod tests {
     /// **RED before implementation**: `TerminalRegistry::finish_pty_exit`
     /// (the NATURAL-exit path) must emit a `terminal.exited` event (fields:
     /// `terminal_id`, `exit_code`).
+    /// b8ke ext r30 F2: the rekey's exit race, driven deterministically
+    /// through the interlock. The rekey parks INSIDE its critical section
+    /// — between the old→new coordinator move and the retained-claim
+    /// move — and the PTY's natural exit (`finish_pty_exit`) fires in
+    /// that exact window. With the claims lock held across the whole
+    /// rekey (the normal commit's template), the exit BLOCKS until the
+    /// rekey completes, then consumes the NEW claim and releases the NEW
+    /// canonical key: the new key is never falsely Live and no claim
+    /// survives for the dead terminal. Pre-r30 the exit consumed the OLD
+    /// claim mid-window (releasing the now-Aliased old key — a no-op),
+    /// and the rekey then installed a NEW claim for the already-dead
+    /// terminal, leaving the new canonical key falsely Live{Terminal}.
+    #[test]
+    fn rekey_exit_racing_the_claim_move_consumes_the_new_claim_and_releases_the_new_key() {
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let reg = TerminalRegistry::new().with_ownership(ownership.clone());
+        reg.insert_headless("T-r30-rekey", "S-r30-rekey");
+
+        let old_locator = SessionLocator {
+            provider: "codex".to_string(),
+            session_id: "ses-r30-old".to_string(),
+        };
+        let new_locator = SessionLocator {
+            provider: "codex".to_string(),
+            session_id: "ses-r30-new".to_string(),
+        };
+
+        // The old key's Live{Terminal} era: a begin + the normal commit
+        // (the template) installs the old retained claim.
+        let freshell_ownership::BeginOutcome::Granted { generation: g1 } = ownership.begin_start(
+            &old_locator.provider,
+            &old_locator.session_id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-r30-old",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("the old-key start must grant")
+        };
+        assert_eq!(
+            reg.commit_session_ref_ownership(&old_locator, "op-r30-old", g1, "T-r30-rekey"),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        assert!(reg
+            .retained_ownership_claim_by_locator(&old_locator)
+            .is_some());
+
+        // The new key's rekey entry: its Starting claim.
+        let freshell_ownership::BeginOutcome::Granted { generation: g2 } = ownership.begin_start(
+            &new_locator.provider,
+            &new_locator.session_id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-r30-new",
+            None,
+            "test",
+            2_000,
+        ) else {
+            panic!("the new-key start must grant")
+        };
+
+        // Arm the interlock and run the rekey to its park — inside the
+        // window, after the coordinator move, before the claim move.
+        REKEY_INTERLOCK.arm("T-r30-rekey");
+        let rekey_reg = reg.clone();
+        let rekey_old = old_locator.clone();
+        let rekey_new = new_locator.clone();
+        let rekey = std::thread::spawn(move || {
+            rekey_reg.commit_session_ref_ownership_rekey(
+                &rekey_old,
+                &rekey_new,
+                "op-r30-new",
+                g2,
+                "T-r30-rekey",
+            )
+        });
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !REKEY_INTERLOCK.reached() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the rekey never reached the interlock park"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        // THE EXIT fires in the parked window. With the claims lock held
+        // (the fix) it blocks mid-consumption; without it (pre-r30) it
+        // consumed the OLD claim and no-op-released the aliased old key.
+        let exit_reg = reg.clone();
+        let exit = std::thread::spawn(move || exit_reg.finish_pty_exit("T-r30-rekey", 0));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Release the rekey: it completes the claim move under the lock,
+        // and the (blocked) exit then consumes the NEW claim.
+        REKEY_INTERLOCK.release();
+        let (outcome, _removed_old) = rekey.join().expect("the rekey joins");
+        assert_eq!(outcome, freshell_ownership::CommitOutcome::Committed);
+        assert!(exit.join().expect("the exit joins"));
+
+        // THE CONVERGENCE: the exit consumed the NEW claim and released
+        // the NEW canonical key — never falsely Live — and no retained
+        // claim survives for the dead terminal.
+        let settled = ownership.observe(&new_locator.provider, &new_locator.session_id);
+        assert!(
+            !matches!(
+                settled.state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ),
+            "the new canonical key is never falsely Live for the dead \
+             terminal: {settled:?}"
+        );
+        assert!(
+            reg.retained_ownership_claim_by_locator(&new_locator)
+                .is_none(),
+            "no retained claim survives the exit (the NEW claim was consumed)"
+        );
+        assert!(
+            reg.retained_ownership_claim_by_locator(&old_locator)
+                .is_none(),
+            "the old claim never survived the rekey either"
+        );
+    }
+
     #[test]
     fn finish_pty_exit_emits_terminal_exited_event_with_exit_code() {
         let (events, _guard) = tracing_capture::capture();
