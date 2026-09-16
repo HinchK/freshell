@@ -1184,6 +1184,40 @@ impl RuntimeOwnershipRegistry {
                 }
             }
             OwnershipState::Vacant => {
+                // b8ke ext r32 F1: an in-flight ATTACH guard owns the
+                // key's window EVEN AFTER the incumbent's exit — the
+                // exit-during-guard race. Pre-r32 the incumbent's
+                // release flipped Live→Vacant unconditionally and this
+                // branch ignored `in_flight_attaches`, so a competing
+                // cross-kind begin acquired the coordinator and started
+                // its writer while the guarded create was still in its
+                // spawn; the create's late claim only detected and
+                // killed the writer AFTER the overlap. The deferred
+                // acquisition lands when the LAST guard resolves (the
+                // count hits zero — `AttachGuard::release_window`); the
+                // record's Vacant state itself stays honest (the
+                // runtime IS dead), the DEFERRAL is the acquisition
+                // policy, so no fence can become permanent and the
+                // guarded create's own `commit_live` (at the armed
+                // generation) is never refused.
+                if record.in_flight_attaches > 0 {
+                    tracing::warn!(target: "freshell_ownership",
+                        event = "ownership.start.blocked_by_attach_guard",
+                        operation_id, provider, session_id, initiator,
+                        from_kind = ?Option::<RuntimeOwnerKind>::None,
+                        to_kind = ?Some(kind),
+                        runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
+                        epoch = self.epoch, generation = record.generation,
+                        duration_ms = 0u64,
+                        outcome = "refused", failure_reason = "ATTACH_IN_FLIGHT",
+                        "the incumbent exited but an in-flight attach still holds \
+                         the key's coordinator window — the start retries after the \
+                         attach completes");
+                    return BeginOutcome::Blocked {
+                        state: record.state.clone(),
+                        retry_after_ms: OWNERSHIP_RETRY_AFTER_MS,
+                    };
+                }
                 // Every entry into `Starting` goes through this arm, so
                 // resetting the registration fields here is the single
                 // choke point guaranteeing a later Starting operation can
@@ -1621,6 +1655,34 @@ impl RuntimeOwnershipRegistry {
                 }
             }
             OwnershipState::Vacant => {
+                // b8ke ext r32 F1: the same exit-during-guard race as
+                // begin_start's Vacant arm — an incumbent that exited
+                // while an attach/create guard is in flight left the
+                // record Vacant with the guard count still riding it;
+                // the handoff answers the SAME typed Blocked outcome
+                // the Live branch (r12 F2) gives, so a competing
+                // cross-kind operation never acquires the coordinator
+                // through the vacated key while the guarded create
+                // holds continuous authority. The deferral lands when
+                // the last guard resolves.
+                if record.in_flight_attaches > 0 {
+                    tracing::warn!(target: "freshell_ownership",
+                        event = "ownership.handoff.blocked_by_attach_guard",
+                        operation_id, provider, session_id, initiator,
+                        from_kind = ?Option::<RuntimeOwnerKind>::None,
+                        to_kind = ?Some(to_kind),
+                        runtime_id = ?Option::<String>::None, pid = ?Option::<u32>::None,
+                        epoch = self.epoch, generation = record.generation,
+                        duration_ms = 0u64,
+                        outcome = "refused", failure_reason = "ATTACH_IN_FLIGHT",
+                        "the incumbent exited but an in-flight attach still holds \
+                         the key's coordinator window — the handoff retries after \
+                         the attach completes");
+                    return BeginOutcome::Blocked {
+                        state: record.state.clone(),
+                        retry_after_ms: OWNERSHIP_RETRY_AFTER_MS,
+                    };
+                }
                 record.generation += 1;
                 record.state = OwnershipState::Handoff {
                     prior: None,
@@ -3075,6 +3137,16 @@ impl RuntimeOwnershipRegistry {
             {
                 if runtime_matches(&owner, claim) && generation == claim.generation {
                     let duration_ms = now_epoch_ms().saturating_sub(since_ms);
+                    // b8ke ext r32 F1: the release itself lands Vacant
+                    // (the honest state — the runtime IS dead), but when
+                    // an in-flight attach/create guard rides the record
+                    // the key's ACQUISITION stays deferred: the
+                    // begin_start/begin_handoff Vacant arms answer the
+                    // typed Blocked outcome while the count is nonzero,
+                    // so the exit cannot invalidate the guarded
+                    // operation's authority. The deferral resolves by
+                    // itself when the last guard releases — no fence can
+                    // become permanent.
                     record.state = OwnershipState::Vacant;
                     // Round-2 review: the released event reports the
                     // transition to Vacant CORRECTLY — `from_kind` is the
@@ -9860,6 +9932,162 @@ mod tests {
         ) {
             BeginOutcome::Granted { .. } => {}
             other => panic!("the handoff must proceed after the window closed: {other:?}"),
+        }
+    }
+
+    /// b8ke ext r32 F1: the EXIT-DURING-GUARD race — the attach-window
+    /// tests above keep the incumbent Live; this variant kills it
+    /// mid-window. The incumbent's release lands the record Vacant with
+    /// the guard count still riding it; a competing cross-kind
+    /// begin_start/begin_handoff must answer the SAME typed Blocked
+    /// outcome (never acquire the coordinator and start a writer while
+    /// the guarded create is still in its spawn), the guarded create's
+    /// own commit completes with continuous authority (at the armed
+    /// generation), and the deferred acquisition lands when the last
+    /// guard resolves. Pre-r32 both Vacant arms ignored
+    /// `in_flight_attaches`: the competitor acquired, started its
+    /// writer, and the create's late claim killed it only AFTER the
+    /// overlap — and the create's own commit went StaleGeneration.
+    #[test]
+    fn an_incumbent_exit_during_an_attach_guard_defers_acquisition_until_the_guard_resolves() {
+        let registry = Arc::new(RuntimeOwnershipRegistry::new());
+        let owner = OwnerIdentity {
+            kind: RuntimeOwnerKind::FreshAgent,
+            terminal_id: None,
+            live_session_key: Some("live-key-1".into()),
+            pid: Some(424_242),
+            ownership_id: Some("op-live-r32".into()),
+        };
+        let BeginOutcome::Granted { generation } = registry.begin_start(
+            "codex",
+            "sid-r32-exit-guard",
+            RuntimeOwnerKind::FreshAgent,
+            "op-live-r32",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("fixture granted")
+        };
+        assert_eq!(
+            registry.commit_live(
+                "codex",
+                "sid-r32-exit-guard",
+                "op-live-r32",
+                generation,
+                owner.clone(),
+            ),
+            CommitOutcome::Committed
+        );
+
+        // The existing-runtime attach/create guard arms on the LIVE
+        // incumbent (the window the r12 F2 pins keep Live).
+        let AttachGuardOutcome::Armed(guard) = registry.begin_attach_guard(
+            "codex",
+            "sid-r32-exit-guard",
+            "attach-r32",
+            Some(generation),
+            "test",
+        ) else {
+            panic!("the guard must arm on the Live incumbent")
+        };
+
+        // THE INCUMBENT EXITS while the guard is in flight: the release
+        // lands the record Vacant (the honest state) with the count
+        // still riding it.
+        registry.release(
+            "codex",
+            "sid-r32-exit-guard",
+            &ReleaseClaim {
+                operation_id: "op-live-r32".into(),
+                generation,
+                runtime: Some(owner.clone()),
+            },
+            "watcher",
+        );
+        assert!(
+            matches!(
+                registry.observe("codex", "sid-r32-exit-guard").state,
+                OwnershipState::Vacant
+            ),
+            "fixture: the incumbent's exit landed the record Vacant"
+        );
+
+        // THE COMPETING CROSS-KIND BEGIN — pre-r32 this ACQUIRED the
+        // coordinator through the unguarded Vacant arm; it must answer
+        // the typed Blocked outcome (the deferred acquisition).
+        match registry.begin_start(
+            "codex",
+            "sid-r32-exit-guard",
+            RuntimeOwnerKind::Terminal,
+            "op-competitor-start",
+            None,
+            "competitor",
+            2_000,
+        ) {
+            BeginOutcome::Blocked {
+                state,
+                retry_after_ms,
+            } => {
+                assert!(matches!(state, OwnershipState::Vacant));
+                assert!(retry_after_ms > 0);
+            }
+            other => {
+                panic!("the cross-kind start over a guarded-Vacant key must be Blocked: {other:?}")
+            }
+        }
+        match registry.begin_handoff(
+            "codex",
+            "sid-r32-exit-guard",
+            RuntimeOwnerKind::Terminal,
+            "op-competitor-handoff",
+            None,
+            "competitor",
+            2_000,
+        ) {
+            BeginOutcome::Blocked {
+                state,
+                retry_after_ms,
+            } => {
+                assert!(matches!(state, OwnershipState::Vacant));
+                assert!(retry_after_ms > 0);
+            }
+            other => panic!(
+                "the cross-kind handoff over a guarded-Vacant key must be Blocked: {other:?}"
+            ),
+        }
+
+        // The guarded create completes with CONTINUOUS AUTHORITY: through
+        // the whole window no competitor acquired the key — the record's
+        // generation is STILL the armed one (pre-r32 the competitor's
+        // grant bumped it into Starting, and the guarded flow's late
+        // claim found a foreign owner and killed its own writer only
+        // AFTER the overlap). The guard-held flows claim NOTHING on the
+        // guarded key — the guard IS the authority (the adopt/attach
+        // windows) — so the completion is the disarm below.
+        assert_eq!(
+            registry.observe("codex", "sid-r32-exit-guard").generation,
+            generation,
+            "no competitor acquired the guarded key during the window"
+        );
+
+        // THE DEFERRED ACQUISITION LANDS when the last guard resolves
+        // (the count hits zero — the deferred release lands after guard
+        // resolution, never a permanent fence).
+        guard.disarm();
+        match registry.begin_start(
+            "codex",
+            "sid-r32-exit-guard",
+            RuntimeOwnerKind::Terminal,
+            "op-competitor-after",
+            None,
+            "competitor",
+            3_000,
+        ) {
+            BeginOutcome::Granted { .. } => {}
+            other => {
+                panic!("the deferred acquisition must land after the guard resolves: {other:?}")
+            }
         }
     }
 
