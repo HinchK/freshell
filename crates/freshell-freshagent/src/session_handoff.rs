@@ -436,35 +436,29 @@ impl SessionHandoffRunner {
         // Every downstream surface — the coordinator enter, the lane stop,
         // the broadcast frames — then uses the one canonical id, so the
         // panes holding EITHER id converge. b8ke ext r23 F1: OpenCode has
-        // the SAME two-identity shape — the pane's persisted
+        // the SAME two-identity shape (the pane's persisted
         // `freshopencode-*` placeholder is an `Aliased{to: ses_*}`
-        // coordinator alias (created at the materialization), so a
-        // placeholder-holding restored pane or a REST caller resolves
-        // through the SAME chain to the durable key that actually holds
-        // the owner.
+        // coordinator alias). b8ke ext r33 F2: the resolution is the
+        // coordinator's OWN alias-chain fixpoint for EVERY provider —
+        // codex included: a codex terminal identity rebind leaves the old
+        // thread id permanently `Aliased{to: new}`, and a REST handoff
+        // addressing that old reference previously fell to the aliased
+        // key's typed retryable `HANDOFF_IN_PROGRESS` — a retry that
+        // could never succeed (the alias is permanent). The one fixpoint
+        // resolves all three providers' aliases (and any future one) to
+        // the canonical key before the coordinator enter.
         let mut req = req;
-        if req.provider == "claude" {
-            let resolved = self.fresh_claude.resolve_ownership_key(&req.session_id);
-            if resolved != req.session_id {
-                tracing::info!(target: "freshell_ownership",
-                    event = "ownership.handoff.rekey_alias_resolved",
-                    provider = %req.provider,
-                    wire_session_id = %req.session_id, canonical_session_id = %resolved,
-                    "the handoff's wire id is a superseded re-key alias — the runner \
-                     operates on the canonical coordinator key");
-                req.session_id = resolved;
-            }
-        } else if req.provider == "opencode" {
-            let resolved = self.fresh_opencode.resolve_ownership_key(&req.session_id);
-            if resolved != req.session_id {
-                tracing::info!(target: "freshell_ownership",
-                    event = "ownership.handoff.placeholder_alias_resolved",
-                    provider = %req.provider,
-                    wire_session_id = %req.session_id, canonical_session_id = %resolved,
-                    "the handoff's wire id is a freshopencode placeholder — the runner \
-                     operates on the durable ses_* canonical coordinator key");
-                req.session_id = resolved;
-            }
+        let resolved = self
+            .ownership
+            .resolve_canonical(&req.provider, &req.session_id);
+        if resolved != req.session_id {
+            tracing::info!(target: "freshell_ownership",
+                event = "ownership.handoff.rekey_alias_resolved",
+                provider = %req.provider,
+                wire_session_id = %req.session_id, canonical_session_id = %resolved,
+                "the handoff's wire id is a superseded re-key alias — the runner \
+                 operates on the canonical coordinator key");
+            req.session_id = resolved;
         }
         // b8ke delta review F5: the provider↔target validation — BEFORE the
         // coordinator enter, so a mismatched target never stops the prior

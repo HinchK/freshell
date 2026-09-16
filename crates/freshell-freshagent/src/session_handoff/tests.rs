@@ -589,6 +589,10 @@ fn build_rig_inner(
     let cli_commands = Arc::new(vec![
         sleeper_cli_spec("claude"),
         sleeper_cli_spec("opencode"),
+        // b8ke ext r33 F2: the codex terminal-target handoff (the
+        // old-rebound-reference resolution test) — a registered codex
+        // sleeper CLI (additive: no test asserted codex was absent).
+        sleeper_cli_spec("codex"),
     ]);
     let mut fresh_agent =
         crate::FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx))
@@ -4325,6 +4329,131 @@ async fn an_abort_with_a_published_target_pid_outliving_the_reap_budget_fences()
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// b8ke ext r33 F2: a codex terminal identity rebind moves the live
+/// record to the new thread id and leaves the old key PERMANENTLY
+/// `Aliased{to: new}`. A REST handoff addressing that old valid codex
+/// reference must resolve through the coordinator's alias-chain fixpoint
+/// to the canonical key and proceed against the real owner (typed owner
+/// responses as usual) — pre-r33 the runner resolved aliases only for
+/// claude and opencode, so the codex old reference fell to `begin_handoff`
+/// on the ALIASED key and was mapped to retryable `HANDOFF_IN_PROGRESS`:
+/// a retry that could NEVER succeed (the alias is permanent).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_codex_handoff_on_an_old_rebound_reference_resolves_the_permanent_alias() {
+    let _guard = ENV_LOCK.lock().await;
+    let old_tid = format!("old-thread-{}", uuid::Uuid::new_v4());
+    let new_tid = format!("new-thread-{}", uuid::Uuid::new_v4());
+    let rig = build_rig(None);
+
+    // The pre-rebind terminal owner under the OLD thread id.
+    let owner = freshell_ownership::OwnerIdentity {
+        kind: RuntimeOwnerKind::Terminal,
+        terminal_id: Some("t-r33-codex-rebind".to_string()),
+        live_session_key: None,
+        pid: None,
+        ownership_id: Some("op-r33-codex-live".to_string()),
+    };
+    let freshell_ownership::BeginOutcome::Granted { generation } = rig.ownership.begin_start(
+        "codex",
+        &old_tid,
+        RuntimeOwnerKind::Terminal,
+        "op-r33-codex-live",
+        None,
+        "test",
+        1_000,
+    ) else {
+        panic!("fixture: the pre-rebind claim must grant")
+    };
+    assert!(matches!(
+        rig.ownership.commit_live(
+            "codex",
+            &old_tid,
+            "op-r33-codex-live",
+            generation,
+            owner.clone()
+        ),
+        freshell_ownership::CommitOutcome::Committed
+    ));
+    // The running headless terminal the rebind's owner names.
+    rig.registry
+        .register_headless(freshell_terminal::registry::HeadlessTerminal {
+            terminal_id: "t-r33-codex-rebind".to_string(),
+            stream_id: "t-r33-codex-rebind".to_string(),
+            mode: "codex".to_string(),
+            resume_session_id: Some(new_tid.clone()),
+            create_request_id: None,
+            created_at: None,
+        });
+
+    // THE REBIND: the new key's Starting claim first (the rebind
+    // commit's own contract), then the live record moves old→new; the
+    // old key is PERMANENTLY Aliased{to: new}.
+    let freshell_ownership::BeginOutcome::Granted { generation: g_new } =
+        rig.ownership.begin_start(
+            "codex",
+            &new_tid,
+            RuntimeOwnerKind::Terminal,
+            "op-r33-codex-rebind",
+            None,
+            "test",
+            1_100,
+        )
+    else {
+        panic!("fixture: the rebind's new-key claim must grant")
+    };
+    assert!(matches!(
+        rig.ownership.commit_live_rekey_from_terminal(
+            "codex",
+            &new_tid,
+            "op-r33-codex-rebind",
+            g_new,
+            &old_tid,
+            "t-r33-codex-rebind",
+            owner,
+            "test",
+        ),
+        freshell_ownership::CommitOutcome::Committed
+    ));
+    assert!(matches!(
+        rig.ownership.observe("codex", &old_tid).state,
+        OwnershipState::Aliased { to, .. } if to == new_tid
+    ));
+    assert!(matches!(
+        rig.ownership.observe("codex", &new_tid).state,
+        OwnershipState::Live { owner, .. }
+            if owner.terminal_id.as_deref() == Some("t-r33-codex-rebind")
+    ));
+
+    // THE HANDOFF on the OLD reference: resolves to the canonical key and
+    // proceeds against the real owner (pre-r33 this answered the
+    // retryable HANDOFF_IN_PROGRESS forever).
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("codex", &old_tid, "codex"));
+    let result = handle.completion.await.expect("handoff completed");
+    assert_eq!(
+        result["ok"],
+        json!(true),
+        "the old reference resolves to the canonical owner and the handoff \
+         proceeds: {result}"
+    );
+    // The commit landed under the CANONICAL key; the old key stays the
+    // resolution alias throughout.
+    let terminal_id = result["owner"]["terminalId"].as_str().unwrap().to_string();
+    match rig.ownership.observe("codex", &new_tid).state {
+        OwnershipState::Live { owner, .. } => {
+            assert_eq!(owner.kind, RuntimeOwnerKind::Terminal);
+            assert_eq!(owner.terminal_id.as_deref(), Some(terminal_id.as_str()));
+        }
+        other => panic!("the new writer holds the CANONICAL key, got {other:?}"),
+    }
+    assert!(matches!(
+        rig.ownership.observe("codex", &old_tid).state,
+        OwnershipState::Aliased { to, .. } if to == new_tid
+    ));
+    rig.registry.kill(&terminal_id);
 }
 
 /// b8ke ext r16 F1: the settle-then-reap confirmation PROPAGATES
