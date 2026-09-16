@@ -1130,6 +1130,8 @@ async fn rest_resume_resolves_placeholder_sessionref_through_the_ledger() {
         provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
         observed_epoch: None,
         observed_generation: None,
+
+        authoritative: false,
         settings: FreshAgentSettings::default(),
     })
     .await

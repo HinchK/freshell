@@ -1060,6 +1060,11 @@ impl FreshCodexState {
         // legacy-unfenced lanes (no commit under way).
         observed_epoch: Option<u64>,
         observed_generation: Option<u64>,
+        // b8ke focused ep5 r2 F1: the handoff runner's OWN authoritative
+        // target binding (the under-ticket continuation's write — the pair
+        // is the runner's supplied handoff generation). Every other
+        // caller passes false (a lane write).
+        authoritative: bool,
     ) -> Result<(), std::io::Error> {
         let Some(sink) = self.identity_sink() else {
             return Ok(());
@@ -1105,6 +1110,7 @@ impl FreshCodexState {
                 provenance: provenance.cloned().into(),
                 observed_epoch,
                 observed_generation,
+                authoritative,
                 settings,
             })
             .await
@@ -2253,6 +2259,8 @@ impl FreshCodexState {
                 // b8ke ext r22 F2: the pre-commit pair (the fence).
                 binding_epoch,
                 binding_generation,
+                // b8ke focused ep5 r2 F1: an ordinary create's lane write.
+                false,
             )
             .await
         {
@@ -2445,6 +2453,8 @@ impl FreshCodexState {
                         Some(&p),
                         None, // observed_epoch (b8ke ext r22 F2)
                         None, // observed_generation
+                        // b8ke focused ep5 r2 F1: a lane write.
+                        false,
                     )
                     .await;
             }
@@ -2714,6 +2724,9 @@ impl FreshCodexState {
                 // delayed-write fence (see above).
                 refresh_epoch,
                 refresh_generation,
+                // b8ke focused ep5 r2 F1: a lane refresh, never the
+                // runner's authoritative target binding.
+                false,
             )
             .await
         {
@@ -3887,6 +3900,8 @@ impl FreshCodexState {
                 fork_provenance.as_ref(),
                 None, // observed_epoch (b8ke ext r22 F2)
                 None, // observed_generation
+                // b8ke focused ep5 r2 F1: a lane write.
+                false,
             )
             .await;
 
@@ -5269,6 +5284,8 @@ impl FreshCodexState {
                 None,
                 None, // observed_epoch (b8ke ext r22 F2)
                 None, // observed_generation
+                // b8ke focused ep5 r2 F1: a lane write.
+                false,
             )
             .await;
 
@@ -5577,6 +5594,8 @@ impl FreshCodexState {
                 None,
                 None, // observed_epoch (b8ke ext r22 F2)
                 None, // observed_generation
+                // b8ke focused ep5 r2 F1: a lane write.
+                false,
             )
             .await;
 
@@ -6816,6 +6835,10 @@ impl FreshCodexState {
                     None,
                     binding_epoch,
                     binding_generation,
+                    // b8ke focused ep5 r2 F1: the handoff runner's OWN
+                    // authoritative target binding — the pair is the
+                    // runner's supplied handoff generation.
+                    true,
                 )
                 .await
             {
@@ -11294,6 +11317,13 @@ pub(crate) mod tests {
                 "the handoff continuation stamps the SUPPLIED handoff generation — \
                  pre-r27 it carried None (the under-ticket lane has no own ticket)"
             );
+            // b8ke focused ep5 r2 F1: the under-ticket target binding is
+            // the runner's AUTHORITATIVE write (the terminal-row guard's
+            // accepting arm over the prior terminal's unstamped row).
+            assert!(
+                last.authoritative,
+                "the handoff continuation's binding is authoritative: {last:?}"
+            );
         }
         // Drain the bus so the shutdown's frames do not leak into other tests.
         while rx.try_recv().is_ok() {}
@@ -14146,6 +14176,8 @@ pub(crate) mod tests {
             }),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -14337,6 +14369,8 @@ pub(crate) mod tests {
             }),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -14426,6 +14460,8 @@ pub(crate) mod tests {
             }),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings {
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: None,
@@ -14526,6 +14562,8 @@ pub(crate) mod tests {
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings {
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: None,
@@ -16111,6 +16149,8 @@ pub(crate) mod tests {
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await

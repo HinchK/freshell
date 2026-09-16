@@ -7292,6 +7292,12 @@ impl FreshClaudeState {
                     provenance: provenance.cloned().into(),
                     observed_epoch: binding_epoch,
                     observed_generation: binding_generation,
+                    // b8ke focused ep5 r2 F1: the UNDER-TICKET shape (no own
+                    // adoption ticket; the session's recorded HANDOFF
+                    // generation supplied the pair) is the handoff runner's
+                    // OWN authoritative target binding — the ordinary
+                    // create's own-ticket write stays a lane write.
+                    authoritative: adoption_ticket.is_none() && owning_generation.is_some(),
                     settings: settings.cloned().unwrap_or_default(),
                 })
                 .await
@@ -15284,6 +15290,8 @@ rl.on('line', (line) => {
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await

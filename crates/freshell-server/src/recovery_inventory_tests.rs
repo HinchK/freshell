@@ -3128,6 +3128,8 @@ fn fresh_agent_create_completed_after_the_pane_closed_is_never_offered() {
             now_ms: 930_000,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
         })
         .expect("late landing binding write");
     let row = ledger.load_binding("opencode", "S1").expect("row written");
@@ -3189,6 +3191,8 @@ fn fresh_agent_create_asserted_inside_the_kill_window_stays_offered_despite_a_la
             now_ms: 1_500_000,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
         })
         .expect("late landing binding write");
     let row = ledger.load_binding("opencode", "S1").expect("row written");
@@ -3318,6 +3322,8 @@ fn supersession_after_the_freeze_judges_on_the_parents_assertion_time() {
             now_ms: 1_500_000,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
         })
         .expect("fork child binding write");
     let child = ledger.load_binding("codex", "child-id").expect("child row");

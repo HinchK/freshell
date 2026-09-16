@@ -34,6 +34,11 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
+use freshell_freshagent::{
+    ClaimCommit, FreshAgentBindingUpsert, FreshAgentSettings, PaneIdentitySink, RollbackRecord,
+    SinkAliasClearWrite, SinkCloseWrite, SinkCommitWrite, SinkWrite,
+};
+use freshell_ws::pane_ledger::{FreshAgentBindingWrite, PaneLedger};
 use freshell_ws::WsState;
 
 const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
@@ -698,6 +703,424 @@ async fn spawn_merged_server_with_hooks(
         ws_state: state,
         handoff_runner,
     }
+}
+
+// ── b8ke focused ep5 r2 F1: the ledger-backed identity sink for the real-ledger
+//    merged harness (copied from freshagent_claude_rollback.rs — the ws-test
+//    crate cannot depend on freshell-server: the dep edge runs the other way) ──
+
+/// The rollback-record-provisioning identity sink, backed by the REAL pane
+/// ledger — mirrors `freshell-server/src/identity_sink.rs`'s LedgerIdentitySink
+/// (the ws-test crate cannot depend on freshell-server: the dep edge runs the
+/// other way), INCLUDING the claude-adoption rollback-row re-key that rides the
+/// awaited binding batch.
+struct TestLedgerSink {
+    ledger: Arc<PaneLedger>,
+}
+impl TestLedgerSink {
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+}
+impl PaneIdentitySink for TestLedgerSink {
+    fn record_pending(&self, placeholder_id: &str, mode: &str, cwd: Option<&str>) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, m, c) = (
+            placeholder_id.to_string(),
+            mode.to_string(),
+            cwd.map(str::to_string),
+        );
+        let now = Self::now_ms();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                ledger.record_pending(
+                    &p,
+                    &m,
+                    c.as_deref(),
+                    None,
+                    freshell_ws::pane_ledger::ProvenanceStamps::default(),
+                    now,
+                )
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
+    }
+    fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let now = Self::now_ms();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let w = FreshAgentBindingWrite {
+                    provider: &upsert.provider,
+                    session_id: &upsert.session_id,
+                    mode: &upsert.mode,
+                    cwd: upsert.settings.cwd.as_deref(),
+                    create_request_id: upsert.create_request_id.as_deref(),
+                    model: upsert.settings.model.as_deref(),
+                    sandbox: upsert.settings.sandbox.as_deref(),
+                    permission_mode: upsert.settings.permission_mode.as_deref(),
+                    effort: upsert.settings.effort.as_deref(),
+                    supersedes: upsert.supersedes.as_deref(),
+                    provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+                    observed_epoch: upsert.observed_epoch,
+                    observed_generation: upsert.observed_generation,
+                    authoritative: upsert.authoritative,
+                    now_ms: now,
+                };
+                ledger.record_fresh_agent_binding(&w)?;
+                // kata 1wxv Task 4 (claude adoption): the rollback row re-keys
+                // old→new in the SAME awaited batch as the binding write.
+                if upsert.provider == "claude" {
+                    if let Some(old_id) = upsert.supersedes.as_deref() {
+                        if old_id != upsert.session_id {
+                            if let Some(payload) =
+                                ledger.load_rollback_row(&upsert.provider, old_id)
+                            {
+                                ledger.record_rollback_row(
+                                    &upsert.provider,
+                                    &upsert.session_id,
+                                    &payload,
+                                    now,
+                                )?;
+                                if let Err(e) = ledger.delete_rollback_row(&upsert.provider, old_id) {
+                                    tracing::warn!(error = %e, session = %old_id, "rollback row re-key: old row delete failed (cosmetic)");
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(p) = upsert.resolves_pending.as_deref() {
+                    let _ = ledger.delete_pending(p);
+                }
+                Ok(())
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
+    }
+    fn load_settings(&self, _provider: &str, _session_id: &str) -> Option<FreshAgentSettings> {
+        None
+    }
+    fn load_provenance(
+        &self,
+        _provider: &str,
+        _session_id: &str,
+    ) -> Option<freshell_freshagent::BindProvenance> {
+        // Rollback-focused double (like `load_settings` above): these
+        // rollback tests never cold-attach a codex/opencode session, so the
+        // provenance read-back is out of their contract.
+        None
+    }
+    fn was_recorded(&self, provider: &str, session_id: &str) -> bool {
+        self.ledger.load_binding(provider, session_id).is_some()
+    }
+    fn record_rollback(
+        &self,
+        provider: &str,
+        session_id: &str,
+        record: RollbackRecord,
+    ) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                let payload = serde_json::to_value(&record).map_err(std::io::Error::other)?;
+                ledger.record_rollback_row(&p, &s, &payload, TestLedgerSink::now_ms())
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
+    }
+    fn load_rollback(&self, provider: &str, session_id: &str) -> Option<RollbackRecord> {
+        // Mirror of freshell-server's LedgerIdentitySink: the shared migrating
+        // reader owns the version gate + the legacy epochless-union migration
+        // (focused ep1-r1 F3, absence-keyed per ep1-r2 F1).
+        let payload = self.ledger.load_rollback_row(provider, session_id)?;
+        RollbackRecord::from_stored_payload(payload)
+    }
+    fn delete_rollback(&self, provider: &str, session_id: &str) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.delete_rollback_row(&p, &s))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
+
+    fn lookup_by_create_request_id(
+        &self,
+        provider: &str,
+        create_request_id: &str,
+    ) -> Option<String> {
+        self.ledger
+            .lookup_by_create_request_id(provider, create_request_id)
+            .map(|row| row.session_id)
+    }
+
+    // Retire-on-kill (delta-review round 5): the same real-ledger pass-through
+    // the LedgerIdentitySink this double mirrors now implements.
+    fn retire_closed(&self, provider: &str, session_id: &str) -> SinkCloseWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        Box::pin(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                ledger.retire_closed(&p, &s, TestLedgerSink::now_ms())
+            })
+            .await
+            .map_err(|join| {
+                freshell_freshagent::identity_sink::SinkCloseError::Clean(std::io::Error::other(
+                    join,
+                ))
+            })?;
+            result.map_err(|err| match err {
+                freshell_ws::pane_ledger::CloseEnvelopeError::Clean(e) => {
+                    freshell_freshagent::identity_sink::SinkCloseError::Clean(e)
+                }
+                freshell_ws::pane_ledger::CloseEnvelopeError::Persisted(e) => {
+                    freshell_freshagent::identity_sink::SinkCloseError::Persisted(e)
+                }
+            })
+        })
+    }
+
+    /// Delta-r6-r3: the real-ledger delegation mirrors
+    /// `freshell-server/src/identity_sink.rs`'s `retire_closed_batch`
+    /// (the ledger envelope is the atomicity point; one spawn_blocking hop).
+    fn retire_closed_batch(
+        &self,
+        provider: &str,
+        session_ids: &[String],
+        pending_ids: &[String],
+    ) -> SinkCloseWrite {
+        let ledger = self.ledger.clone();
+        let p = provider.to_string();
+        let ids = session_ids.to_vec();
+        let pendings = pending_ids.to_vec();
+        Box::pin(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                ledger.close_identities(&p, &ids, &pendings, TestLedgerSink::now_ms())
+            })
+            .await
+            .map_err(|join| {
+                freshell_freshagent::identity_sink::SinkCloseError::Clean(std::io::Error::other(
+                    join,
+                ))
+            })?;
+            result.map_err(|err| match err {
+                freshell_ws::pane_ledger::CloseEnvelopeError::Clean(e) => {
+                    freshell_freshagent::identity_sink::SinkCloseError::Clean(e)
+                }
+                freshell_ws::pane_ledger::CloseEnvelopeError::Persisted(e) => {
+                    freshell_freshagent::identity_sink::SinkCloseError::Persisted(e)
+                }
+            })
+        })
+    }
+    fn delete_pending(&self, placeholder_id: &str) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let p = placeholder_id.to_string();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.delete_pending(&p))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
+
+    // Focused-ep5-r1 Finding 2: same real-ledger pass-through as `retire_closed`.
+    fn clear_kill_tombstone(&self, provider: &str, session_id: &str) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.clear_kill_tombstone(&p, &s))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
+
+    // Focused-ep5-r3 Finding 1 (retire-on-kill round 4): the snapshot read is
+    // a memory-only inline pass-through (the LedgerIdentitySink discipline).
+    fn kill_tombstone_at_ms(&self, provider: &str, session_id: &str) -> Option<i64> {
+        self.ledger.kill_tombstone_at(provider, session_id)
+    }
+
+    // Retire-on-kill round 5 (focused-ep5-r4 Finding 2): the alias-tombstone
+    // retention probe — memory-only inline pass-through like the snapshot read.
+    fn row_is_bound(&self, provider: &str, session_id: &str) -> bool {
+        self.ledger.row_is_bound(provider, session_id)
+    }
+
+    // Focused-ep5-r3 Findings 1+3: the conditional single-transition claim
+    // commit — a faithful pass-through to the real ledger op.
+    fn commit_claim(
+        &self,
+        provider: &str,
+        session_id: &str,
+        expect_killed_at_ms: Option<i64>,
+    ) -> SinkCommitWrite {
+        self.commit_claim_aliased(provider, session_id, expect_killed_at_ms, &[])
+    }
+    // Focused-ep5-r5 Finding 2 (retire-on-kill round 6): the aliased commit's
+    // faithful pass-through (the alias gate lives inside the ledger's
+    // guarded transition).
+    fn commit_claim_aliased(
+        &self,
+        provider: &str,
+        session_id: &str,
+        expect_killed_at_ms: Option<i64>,
+        fence_checked_aliases: &[String],
+    ) -> SinkCommitWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        let aliases: Vec<String> = fence_checked_aliases.to_vec();
+        Box::pin(async move {
+            let outcome = tokio::task::spawn_blocking(move || {
+                ledger.commit_claim_aliased(
+                    &p,
+                    &s,
+                    expect_killed_at_ms,
+                    &aliases,
+                    TestLedgerSink::now_ms(),
+                )
+            })
+            .await
+            .map_err(std::io::Error::other)??;
+            Ok(match outcome {
+                freshell_ws::pane_ledger::ClaimCommitOutcome::Committed => ClaimCommit::Committed,
+                freshell_ws::pane_ledger::ClaimCommitOutcome::RefusedStale => {
+                    ClaimCommit::RefusedStale
+                }
+            })
+        })
+    }
+    // Finding 2's alias-record pass-throughs (same disciplines as the rest of
+    // the test double).
+    fn record_alias_tombstone(
+        &self,
+        provider: &str,
+        placeholder: &str,
+        durable: &str,
+        at_ms: i64,
+    ) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, ph, d) = (
+            provider.to_string(),
+            placeholder.to_string(),
+            durable.to_string(),
+        );
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.record_alias_tombstone(&p, &ph, &d, at_ms))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
+    fn alias_tombstone_records(&self, provider: &str, placeholder: &str) -> Vec<(String, i64)> {
+        self.ledger.alias_tombstone_records(provider, placeholder)
+    }
+    fn clear_alias_tombstones_for_durable(
+        &self,
+        provider: &str,
+        durable: &str,
+    ) -> SinkAliasClearWrite {
+        let ledger = self.ledger.clone();
+        let (p, d) = (provider.to_string(), durable.to_string());
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || ledger.clear_alias_tombstones_for_durable(&p, &d))
+                .await
+                .map_err(std::io::Error::other)?
+        })
+    }
+}
+
+/// b8ke focused ep5 r2 F1: [`spawn_merged_server`] over a REAL pane ledger
+/// (a tempdir root) with the ledger-backed identity sink wired into the
+/// fresh states — the fresh-agent lanes' binding rows actually LAND (the
+/// default harness runs a DISABLED ledger and no sink, so no row ever
+/// exists to guard). The terminal lane shares the same real ledger
+/// through the WsState.
+async fn spawn_merged_server_with_ledger() -> (MergedHarness, Arc<PaneLedger>) {
+    let hooks = Arc::new(freshell_freshagent::HandoffTestHooks::default());
+    let cli_commands = Arc::new(vec![sleeper_cli_spec("claude"), sleeper_cli_spec("codex")]);
+    let (state, registry, fresh_agent_state) =
+        build_ws_state(cli_commands.iter().cloned().collect()).await;
+
+    // The REAL ledger (tempdir-rooted) replaces the disabled one BEFORE any
+    // write can flow; the fresh states write through the same ledger via the
+    // TestLedgerSink.
+    let ledger_root =
+        std::env::temp_dir().join(format!("freshell-cross-kind-ledger-{}", uuid_like_suffix()));
+    std::fs::create_dir_all(&ledger_root).expect("create the ledger root");
+    let pane_ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+        ledger_root.clone(),
+    )));
+    let sink: std::sync::Arc<dyn PaneIdentitySink> = Arc::new(TestLedgerSink {
+        ledger: Arc::clone(&pane_ledger),
+    });
+    state.fresh_claude.set_identity_sink(sink.clone());
+    state.fresh_codex.set_identity_sink(sink.clone());
+    state.fresh_opencode.set_identity_sink(sink.clone());
+    let state = WsState {
+        pane_ledger: Arc::clone(&pane_ledger),
+        ..state
+    };
+
+    let snapshot_state = freshell_freshagent::SnapshotState::new(
+        Arc::new(AUTH_TOKEN.to_string()),
+        state.fresh_codex.clone(),
+        fresh_agent_state
+            .clone()
+            .with_ownership(state.ownership.clone().expect("coordinator wired")),
+        state.fresh_claude.clone(),
+    );
+    let ownership = state.ownership.clone().expect("coordinator wired");
+    let handoff_runner = Arc::new(
+        freshell_freshagent::SessionHandoffRunner::new(
+            Arc::new(AUTH_TOKEN.to_string()),
+            state.broadcast_tx.clone(),
+            ownership,
+            registry.clone(),
+            state.fresh_codex.clone(),
+            state.fresh_claude.clone(),
+            state.fresh_opencode.clone(),
+            fresh_agent_state
+                .clone()
+                .with_ownership(state.ownership.clone().expect("coordinator wired"))
+                .with_terminal_registry(registry.clone())
+                .with_cli_commands(Arc::clone(&cli_commands)),
+            Arc::clone(&cli_commands),
+        )
+        .with_test_hooks(Arc::clone(&hooks)),
+    );
+    let app = freshell_ws::router(state.clone())
+        .merge(freshell_freshagent::snapshot::router(snapshot_state))
+        .merge(freshell_freshagent::session_handoff::handoff_router(
+            Arc::clone(&handoff_runner),
+        ));
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let ws_url = format!("ws://{addr}/ws");
+    let ws = connect(&ws_url).await;
+    (
+        MergedHarness {
+            base_url: format!("http://{addr}"),
+            ws_url,
+            ws,
+            ws_state: state,
+            handoff_runner,
+        },
+        pane_ledger,
+    )
 }
 
 /// A parsed minimal HTTP GET response: `(status, JSON body)` — the
@@ -2755,6 +3178,160 @@ async fn fresh_agent_to_terminal_handoff_is_atomic_and_broadcast() {
         "the refusal names the terminal owner: {refused}"
     );
     let _ = sidecar;
+}
+
+/// b8ke focused ep5 r2 F1: END-TO-END terminal→fresh-agent handoff over
+/// the real REST endpoint against the in-process server with the REAL
+/// pane ledger — the ep5-r2 finding's exact scenario. The terminal row
+/// is the NORMAL UNSTAMPED production shape (the ordinary WS terminal
+/// binding writes stamp nothing; the handoff kills the terminal directly
+/// and the exit hook leaves its row Bound with live_terminal_id), so the
+/// target's AUTHORITATIVE binding write (the runner's r27-F2 under-ticket
+/// shape, carrying the handoff generation) is the only write that may
+/// land over it. Pre-ep5-r2 the strictly-newer guard refused it
+/// (write_pair = Some, row_pair = None) and the requested handoff tore
+/// the target down; post-fix the handoff commits Live{FreshAgent} and
+/// the recovery row becomes the fresh-agent target's.
+#[tokio::test]
+async fn terminal_to_fresh_agent_handoff_lands_over_the_unstamped_terminal_row() {
+    let _guard = ENV_LOCK.lock().await;
+    let _sidecar = FakeSidecarEnv::install(); // SYNC at base — no .await
+                                              // The claude-lane resume gates on transcript presence (the 6b
+                                              // pattern): the target's resume of `sid` needs the transcript under
+                                              // CLAUDE_CONFIG_DIR.
+    let store_dir =
+        std::env::temp_dir().join(format!("freshell-handoff-ep5-r2-{}", uuid_like_suffix()));
+    let project_dir = store_dir.join("projects").join("slug");
+    std::fs::create_dir_all(&project_dir).expect("create transcript project dir");
+    let sid = format!("ho-rev-{}", uuid::Uuid::new_v4());
+    std::fs::write(
+        project_dir.join(format!("{sid}.jsonl")),
+        "{\"cwd\": \"/tmp\"}\n",
+    )
+    .expect("write fake transcript");
+    std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
+
+    let (mut h, pane_ledger) = spawn_merged_server_with_ledger().await;
+
+    // 1. The TERMINAL owner: an ordinary WS terminal binding (claude mode)
+    //    over the durable id — the coordinator's Live{Terminal} and the
+    //    ledger row Bound with live_terminal_id and NO ownership stamp
+    //    (the normal production shape).
+    send_json(
+        &mut h.ws,
+        &json!({
+            "type": "terminal.create", "requestId": "rev-t1",
+            "mode": "claude", "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut h.ws, Duration::from_secs(20), |v| {
+        v.get("type").and_then(|t| t.as_str()) == Some("terminal.created")
+            && v.get("requestId").and_then(|r| r.as_str()) == Some("rev-t1")
+    })
+    .await;
+    let terminal_id = created
+        .get("terminalId")
+        .and_then(|t| t.as_str())
+        .expect("terminalId")
+        .to_string();
+    assert!(
+        matches!(
+            h.ws_state
+                .fresh_claude
+                .ownership_snapshot("claude", &sid)
+                .state,
+            freshell_ownership::OwnershipState::Live { ref owner, .. }
+                if owner.terminal_id.as_deref() == Some(terminal_id.as_str())
+        ),
+        "the terminal owner must be Live before the handoff"
+    );
+    let row = pane_ledger
+        .load_binding("claude", &sid)
+        .expect("the terminal binding row exists");
+    assert_eq!(
+        row.live_terminal_id.as_deref(),
+        Some(terminal_id.as_str()),
+        "the terminal's recovery row: {row:?}"
+    );
+    assert_eq!(
+        (row.owner_epoch, row.owner_generation),
+        (None, None),
+        "the ordinary WS terminal binding row is UNSTAMPED (the normal \
+         production shape the ep5-r2 finding names): {row:?}"
+    );
+
+    // 2. The handoff to the FRESH target over the real REST endpoint.
+    //    Pre-ep5-r2 this answered ok:false — the target's authoritative
+    //    binding write was refused by the strictly-newer guard and the
+    //    freshly spawned target was torn down.
+    let (status, body) = http_post_json(
+        &h.base_url,
+        "/api/sessions/handoff",
+        &json!({
+            "provider": "claude", "sessionId": sid, "targetKind": "fresh-agent",
+            "sessionType": "freshclaude", "deviceId": "test-device-a",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "{}", body);
+    assert_eq!(body["ok"], serde_json::json!(true), "{}", body);
+
+    // 3. The coordinator is Live{FreshAgent}.
+    let snap = h.ws_state.fresh_claude.ownership_snapshot("claude", &sid);
+    assert!(
+        matches!(
+            snap.state,
+            freshell_ownership::OwnershipState::Live { ref owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ),
+        "expected Live fresh-agent owner, got {:?}",
+        snap.state
+    );
+
+    // 4. THE REAL LEDGER: the recovery row became the fresh-agent
+    //    target's — pane_kind fresh-agent, the terminal's binding
+    //    superseded (pre-ep5-r2 the row stayed the dead terminal's).
+    //    The target's session-init adoption write is ASYNC to the
+    //    runner's commit (the sidecar's sdk.session.init lands after the
+    //    handoff answered) — bounded-poll for the flip.
+    let flipped = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let done = pane_ledger
+                .load_binding("claude", &sid)
+                .is_some_and(|r| r.pane_kind.as_deref() == Some("fresh-agent"));
+            if done {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(
+        flipped.is_ok(),
+        "the target's authoritative binding write never landed over the terminal's unstamped row"
+    );
+    let row = pane_ledger
+        .load_binding("claude", &sid)
+        .expect("the row after the handoff");
+    assert_eq!(
+        row.pane_kind.as_deref(),
+        Some("fresh-agent"),
+        "the recovery row is the fresh-agent target's: {row:?}"
+    );
+    assert_eq!(
+        row.live_terminal_id, None,
+        "the terminal's binding is superseded: {row:?}"
+    );
+
+    // Cleanup: the sidecar target dies with the harness (the fake
+    // sidecar is a short-lived script under the dropped env), and the
+    // terminal row's PTY is reaped through the registry.
+    h.ws_state.registry.kill(&terminal_id);
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    let _ = std::fs::remove_dir_all(store_dir);
 }
 
 // ── kata b8ke Task 7: the deterministic pause-hook race suite ───────────────

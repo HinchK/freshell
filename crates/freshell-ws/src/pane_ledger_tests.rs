@@ -163,6 +163,8 @@ fn fa_write<'a>(provider: &'a str, session_id: &'a str, now_ms: i64) -> FreshAge
         provenance: ProvenancePolicy::Inherit,
         observed_epoch: None,
         observed_generation: None,
+
+        authoritative: false,
         now_ms,
     }
 }
@@ -189,6 +191,38 @@ fn fa_write_fenced<'a>(
         provenance: ProvenancePolicy::Inherit,
         observed_epoch: Some(epoch),
         observed_generation: Some(generation),
+
+        authoritative: false,
+        now_ms,
+    }
+}
+
+/// b8ke focused ep5 r2 F1: the HANDOFF RUNNER'S OWN authoritative target
+/// binding — the r27-F2 under-ticket write shape (the pair is the
+/// runner's supplied handoff generation; the marker is set at exactly
+/// the three under-ticket write sites, never on a lane write).
+fn fa_write_target<'a>(
+    provider: &'a str,
+    session_id: &'a str,
+    now_ms: i64,
+    epoch: u64,
+    generation: u64,
+) -> FreshAgentBindingWrite<'a> {
+    FreshAgentBindingWrite {
+        provider,
+        session_id,
+        mode: provider,
+        cwd: Some("/tmp/proj"),
+        create_request_id: None,
+        model: Some("test-model"),
+        sandbox: None,
+        permission_mode: None,
+        effort: None,
+        supersedes: None,
+        provenance: ProvenancePolicy::Inherit,
+        observed_epoch: Some(epoch),
+        observed_generation: Some(generation),
+        authoritative: true,
         now_ms,
     }
 }
@@ -419,8 +453,12 @@ fn a_paired_fresh_agent_write_at_the_terminal_rows_own_generation_never_passes_a
     assert_eq!(row.owner_epoch, Some(3));
     assert_eq!(row.owner_generation, Some(9));
 
-    // A paired write over an UNSTAMPED terminal row (a pre-r22 legacy
-    // row) also refuses — no comparable proof of newer.
+    // A NON-AUTHORITATIVE paired write over an UNSTAMPED terminal row (a
+    // pre-r22 legacy row — the normal production shape for ordinary
+    // WS/REST/MCP terminal bindings) still refuses — the stale lane
+    // refresh cannot prove newer against a row with no baseline. (The
+    // runner's own authoritative target binding over this shape is the
+    // ep5-r2 landing test below.)
     ledger
         .record_binding(&BindingWrite {
             provider: "codex",
@@ -457,6 +495,118 @@ fn a_paired_fresh_agent_write_at_the_terminal_rows_own_generation_never_passes_a
     let row = ledger
         .load_binding("codex", "ses-ep5-trap")
         .expect("the reclaimed row");
+    assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+    assert_eq!(row.owner_generation, Some(10));
+}
+
+/// b8ke focused ep5 r2 F1: the REAL terminal→fresh-agent handoff over
+/// the NORMAL UNSTAMPED terminal row — the ep5-r1 guard refused the
+/// runner's own target binding here (write_pair = Some, row_pair = None
+/// → NOT_NEWER), tearing the requested handoff's target down for
+/// commonly created browser, REST, and MCP sessions (ordinary terminal
+/// binding writes stamp nothing; the handoff kills the terminal directly
+/// and the exit hook leaves its row Bound with live_terminal_id). The
+/// target's AUTHORITATIVE-marked paired write (the r27-F2 under-ticket
+/// shape: the runner-supplied handoff generation) now LANDS — the
+/// recovery row becomes the fresh-agent target's.
+#[test]
+fn a_handoff_targets_authoritative_binding_lands_over_the_normal_unstamped_terminal_row() {
+    let root = temp_root("ep5-r2-handoff-over-unstamped");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // The normal production terminal row: Bound, live_terminal_id set,
+    // NO ownership stamp (an ordinary WS/REST/MCP terminal binding).
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "claude",
+            session_id: "ses-ep5-r2-target",
+            terminal_id: "t-ep5-r2",
+            mode: "claude",
+            cwd: Some("/w"),
+            create_request_id: Some("req-t-ep5-r2"),
+            origin_create_request_id: None,
+            provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+            now_ms: 1_000,
+        })
+        .expect("the unstamped terminal row");
+
+    // THE HANDOFF: the runner reaped the terminal, committed Live{FreshAgent}
+    // at the handoff generation, and the target's authoritative binding
+    // write carries that generation — it LANDS over the unstamped row.
+    ledger
+        .record_fresh_agent_binding(&fa_write_target("claude", "ses-ep5-r2-target", 1_200, 7, 4))
+        .expect("the authoritative target binding lands over the unstamped row");
+
+    // The recovery row is now the fresh-agent target's.
+    let row = ledger
+        .load_binding("claude", "ses-ep5-r2-target")
+        .expect("the row");
+    assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+    assert_eq!(
+        row.live_terminal_id, None,
+        "the terminal's binding is superseded: {row:?}"
+    );
+    assert_eq!(row.owner_epoch, Some(7));
+    assert_eq!(row.owner_generation, Some(4));
+    assert_eq!(row.state, RowState::Bound);
+}
+
+/// b8ke focused ep5 r2 F1: the authoritative marker relaxes ONLY the
+/// unstamped shape — over a STAMPED terminal row the arithmetic binds
+/// marked writes too (an equal-pair authoritative write refuses), so a
+/// DELAYED authoritative target write can never clobber a LATER
+/// handoff's stamped row, and the ep5-r1 equal-pair trap stays closed
+/// for every write.
+#[test]
+fn an_authoritative_write_over_a_stamped_row_still_proves_strictly_newer() {
+    let root = temp_root("ep5-r2-authoritative-over-stamped");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // A STAMPED terminal row (a prior handoff's terminal-side commit).
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "codex",
+            session_id: "ses-ep5-r2-stamped",
+            terminal_id: "t-ep5-r2-stamped",
+            mode: "freshcodex",
+            cwd: Some("/w"),
+            create_request_id: Some("req-t-ep5-r2-s"),
+            origin_create_request_id: None,
+            provenance: ProvenancePolicy::Inherit,
+            observed_epoch: Some(3),
+            observed_generation: Some(9),
+            now_ms: 1_000,
+        })
+        .expect("the stamped terminal row");
+
+    // The EQUAL-pair authoritative write — refused typed (strictly-newer
+    // arithmetic binds marked writes over stamped rows).
+    let result = ledger.record_fresh_agent_binding(&fa_write_target(
+        "codex",
+        "ses-ep5-r2-stamped",
+        1_100,
+        3,
+        9,
+    ));
+    let err = result.expect_err("the equal-pair authoritative write refuses");
+    assert!(
+        err.to_string().contains("NOT_NEWER_BINDING_OVER_TERMINAL"),
+        "the refusal is typed: {err}"
+    );
+
+    // The strictly-newer authoritative write lands.
+    ledger
+        .record_fresh_agent_binding(&fa_write_target(
+            "codex",
+            "ses-ep5-r2-stamped",
+            1_200,
+            3,
+            10,
+        ))
+        .expect("the strictly-newer authoritative write lands");
+    let row = ledger
+        .load_binding("codex", "ses-ep5-r2-stamped")
+        .expect("the row");
     assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
     assert_eq!(row.owner_generation, Some(10));
 }
@@ -593,6 +743,8 @@ fn fa_write_provenance_at<'a>(
         }),
         observed_epoch: None,
         observed_generation: None,
+
+        authoritative: false,
         ..fa_write(provider, session_id, now_ms)
     }
 }
@@ -790,6 +942,8 @@ fn fresh_agent_clear_rebind_erases_stamps_and_never_inherits_the_parent() {
             provenance: ProvenancePolicy::Clear,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             ..fa_write("claude", "sess-1", 2_000)
         })
         .unwrap();
@@ -816,6 +970,8 @@ fn fresh_agent_clear_rebind_erases_stamps_and_never_inherits_the_parent() {
             provenance: ProvenancePolicy::Clear,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             ..fa_write("claude", "sess-2", 3_000)
         })
         .unwrap();
@@ -849,6 +1005,8 @@ fn fresh_agent_clear_rebind_erases_stamps_and_never_inherits_the_parent() {
             provenance: ProvenancePolicy::Clear,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             ..fa_write("claude", "sess-4", 5_000)
         })
         .unwrap();
@@ -934,6 +1092,8 @@ fn fresh_agent_supersession_inherits_provenance_from_the_retired_parent() {
             supersedes: Some("parent-id"),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             ..fa_write("claude", "child-id", 2_000)
         })
         .unwrap();
@@ -1550,6 +1710,8 @@ fn fresh_agent_supersession_inherits_the_parents_assertion_time() {
             supersedes: Some("parent-id"),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             ..fa_write("claude", "child-id", 5_000)
         })
         .unwrap();
@@ -1750,6 +1912,8 @@ fn fresh_agent_out_of_order_replace_keeps_the_newer_attribution() {
             model: Some("m-late"),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             ..fa_write_provenance_at(
                 "opencode",
                 "ses_1",
@@ -1882,6 +2046,8 @@ fn fresh_agent_legacy_reassert_missing_tab_never_touches_the_attribution() {
             model: Some("m-legacy"),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             ..fa_write_provenance_at(
                 "codex",
                 "ses_1",
@@ -2016,6 +2182,8 @@ fn fresh_agent_legacy_create_and_fork_attach_their_provenance_without_a_tab() {
             supersedes: Some("ses_parent"),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             ..fa_write_provenance_at(
                 "claude",
                 "ses_child",
@@ -2213,6 +2381,8 @@ fn fresh_agent_clear_raises_the_attribution_floor_against_delayed_pre_clear_asse
             provenance: ProvenancePolicy::Clear,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             ..fa_write("opencode", "ses_1", 5_000)
         })
         .unwrap();
@@ -2230,6 +2400,8 @@ fn fresh_agent_clear_raises_the_attribution_floor_against_delayed_pre_clear_asse
             model: Some("m-stale"),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             ..fa_write_provenance_at(
                 "opencode",
                 "ses_1",
@@ -2428,6 +2600,8 @@ fn disabled_ledger_refuses_the_rollback_row_write_with_a_loud_error() {
             provenance: ProvenancePolicy::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             now_ms: 1,
         })
         .expect("binding writes keep their silent-no-op policy on a disabled ledger");
@@ -4215,6 +4389,8 @@ fn fresh_agent_binding_roundtrips_settings_and_pane_kind() {
             provenance: ProvenancePolicy::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             now_ms: 1_000,
         })
         .unwrap();
@@ -4247,6 +4423,8 @@ fn fresh_agent_binding_upsert_preserves_created_at_and_refreshes_settings() {
         provenance: ProvenancePolicy::Inherit,
         observed_epoch: None,
         observed_generation: None,
+
+        authoritative: false,
         now_ms: 1_000,
     };
     ledger.record_fresh_agent_binding(&base).unwrap();
@@ -4257,6 +4435,8 @@ fn fresh_agent_binding_upsert_preserves_created_at_and_refreshes_settings() {
             provenance: ProvenancePolicy::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             now_ms: 2_000,
             ..base
         })
@@ -4292,6 +4472,8 @@ fn supersedes_retires_the_old_row_and_links_the_chain() {
         provenance: ProvenancePolicy::Inherit,
         observed_epoch: None,
         observed_generation: None,
+
+        authoritative: false,
         now_ms: 1_000,
     };
     ledger.record_fresh_agent_binding(&base).unwrap();
@@ -4302,6 +4484,8 @@ fn supersedes_retires_the_old_row_and_links_the_chain() {
             provenance: ProvenancePolicy::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             now_ms: 2_000,
             ..base
         })
@@ -4353,6 +4537,8 @@ fn fresh_agent_upsert_preserves_advisory_create_request_id_when_absent() {
         provenance: ProvenancePolicy::Inherit,
         observed_epoch: None,
         observed_generation: None,
+
+        authoritative: false,
         now_ms: 1_000,
     };
     ledger.record_fresh_agent_binding(&base).unwrap();
@@ -4362,6 +4548,8 @@ fn fresh_agent_upsert_preserves_advisory_create_request_id_when_absent() {
             provenance: ProvenancePolicy::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             now_ms: 2_000,
             ..base
         })
@@ -4397,6 +4585,8 @@ fn fresh_agent_settings_recorded_keys_off_settings_bearing_rows() {
         provenance: ProvenancePolicy::Inherit,
         observed_epoch: None,
         observed_generation: None,
+
+        authoritative: false,
         now_ms: 1_000,
     };
     // A cwd-only snapshot counts as settings-bearing (real creates always
@@ -4410,6 +4600,8 @@ fn fresh_agent_settings_recorded_keys_off_settings_bearing_rows() {
             cwd: None,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             ..base
         })
         .unwrap();
@@ -4443,6 +4635,8 @@ fn supersedes_of_a_missing_old_row_is_a_silent_noop() {
             provenance: ProvenancePolicy::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             now_ms: 1_000,
         })
         .expect("missing old row is a silent no-op, not an error");

@@ -1328,6 +1328,8 @@ mod tests {
                 provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
                 observed_epoch: None,
                 observed_generation: None,
+
+                authoritative: false,
             })
             .expect("seed fresh-agent ledger row");
 

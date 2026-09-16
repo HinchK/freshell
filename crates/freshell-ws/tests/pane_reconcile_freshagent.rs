@@ -726,6 +726,8 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             now_ms: now,
         })
         .unwrap();
@@ -745,6 +747,8 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             now_ms: now + 1,
         })
         .unwrap();

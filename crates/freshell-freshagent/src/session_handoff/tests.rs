@@ -5541,6 +5541,15 @@ async fn the_claude_handoff_target_binding_carries_the_handoff_generation() {
             "the under-ticket adoption stamps the SUPPLIED handoff generation — \
              pre-r27 it carried None (the adoption holds no own ticket)"
         );
+        // b8ke focused ep5 r2 F1: the under-ticket target binding carries
+        // the AUTHORITATIVE marker (the handoff runner's own target
+        // binding — the ledger's terminal-row guard accepts it over the
+        // prior terminal's normal UNSTAMPED row).
+        assert!(
+            target_binding.authoritative,
+            "the under-ticket target binding is the runner's authoritative write: \
+             {target_binding:?}"
+        );
     }
 
     // Cleanup: the runner retained the stamp — the lane kill works.

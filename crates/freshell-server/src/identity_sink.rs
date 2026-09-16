@@ -125,6 +125,10 @@ impl PaneIdentitySink for LedgerIdentitySink {
                     // typed on a stale pair).
                     observed_epoch: upsert.observed_epoch,
                     observed_generation: upsert.observed_generation,
+                    // b8ke focused ep5 r2 F1: the runner-supplied target
+                    // binding marker threads through (the terminal-row
+                    // guard's authoritative arm).
+                    authoritative: upsert.authoritative,
                     now_ms: now,
                 };
                 ledger.record_fresh_agent_binding(&w)?; // binding-write failure propagates
@@ -520,6 +524,8 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: Some("workspace-write".into()),
@@ -617,6 +623,8 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -663,6 +671,8 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: settings.clone(),
         })
         .await
@@ -688,6 +698,8 @@ mod tests {
             settings,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
         })
         .await
         .expect("codex crash-respawn binding write");
@@ -729,6 +741,8 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: Some(EPOCH),
             observed_generation: Some(3),
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 model: Some("old-model".into()),
                 ..Default::default()
@@ -749,6 +763,8 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: Some(EPOCH),
             observed_generation: Some(4),
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 model: Some("new-owner-model".into()),
                 ..Default::default()
@@ -770,6 +786,8 @@ mod tests {
                 provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
                 observed_epoch: Some(EPOCH),
                 observed_generation: Some(3),
+
+                authoritative: false,
                 settings: FreshAgentSettings {
                     model: Some("stale-writer-model".into()),
                     ..Default::default()
@@ -823,6 +841,8 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: Some(EPOCH),
             observed_generation: Some(3),
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -862,6 +882,8 @@ mod tests {
                 provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
                 observed_epoch: Some(EPOCH),
                 observed_generation: Some(3),
+
+                authoritative: false,
                 settings: FreshAgentSettings::default(),
             })
             .await
@@ -1023,6 +1045,8 @@ mod tests {
             ),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1067,6 +1091,8 @@ mod tests {
             ),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1124,6 +1150,8 @@ mod tests {
             ),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -1147,6 +1175,8 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -1167,6 +1197,8 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1230,6 +1262,8 @@ mod tests {
             provenance,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1288,6 +1322,8 @@ mod tests {
             // lineage-only rows (settings-bearing-ness is unrelated).
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -1329,6 +1365,8 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1416,6 +1454,8 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1539,6 +1579,8 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1586,6 +1628,8 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1650,6 +1694,8 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1745,6 +1791,8 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1838,6 +1886,8 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1960,6 +2010,8 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await

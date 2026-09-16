@@ -1239,6 +1239,13 @@ pub struct FreshAgentBindingWrite<'a> {
     /// preserved).
     pub observed_epoch: Option<u64>,
     pub observed_generation: Option<u64>,
+    /// b8ke focused ep5 r2 F1: the write is the HANDOFF RUNNER'S OWN
+    /// authoritative target binding (the r27-F2 under-ticket shape — the
+    /// pair is the runner's supplied handoff generation). The
+    /// terminal-row guard accepts an authoritative PAIRED write over an
+    /// UNSTAMPED terminal row (the normal production shape); every
+    /// non-authoritative write keeps the strictly-newer rule.
+    pub authoritative: bool,
     pub now_ms: i64,
 }
 
@@ -2366,40 +2373,49 @@ impl PaneLedger {
                 ));
             }
         }
-
-        // b8ke ext r29 F3 + focused ep5 r1 F2: the TERMINAL-ROW guard — a
-        // fresh-agent binding write over a Bound row whose recovery
-        // binding belongs to a LIVE TERMINAL must carry a STRICTLY NEWER
-        // ownership pair. The ext-r29 arm covered only the fully-unfenced
-        // shape; the ep5-r1 review named the same-generation trap — a
-        // terminal binding written at the handoff/target generation while
-        // a delayed fresh-agent refresh carries that SAME generation is
-        // "not older" and passed both fences, rewriting the terminal's
-        // authoritative recovery row as pane_kind fresh-agent with no
-        // live_terminal_id. A fresh-agent lane with legitimate authority
-        // reclaims a terminal-bound row under a CLAIMED, STAMPED write,
-        // and every legitimate reclaim advances the generation (each
-        // handoff/stop/commit mints the next one), so a strictly-newer
-        // requirement refuses nothing legitimate — while unfenced,
-        // equal-pair, older-pair (already refused by the stale-pair
-        // fence above when comparable), and paired-over-unstamped-row
-        // writes all refuse typed.
+        // b8ke ext r29 F3 + focused ep5 r1 F2 + focused ep5 r2 F1: the
+        // TERMINAL-ROW guard. A fresh-agent binding write over a Bound row
+        // whose recovery binding belongs to a LIVE TERMINAL:
+        //
+        // * over a STAMPED row (the handoff's terminal-side commit stamped
+        //   it), a paired write must be STRICTLY NEWER — for everyone,
+        //   authoritative or not: every legitimate reclaim advances the
+        //   generation, the ep5-r1 equal-pair trap stays closed, and a
+        //   DELAYED authoritative target write can never clobber a LATER
+        //   handoff's stamped row.
+        // * over an UNSTAMPED row — the NORMAL production shape (ordinary
+        //   WS/REST/MCP terminal binding writes stamp nothing; the
+        //   terminal→fresh-agent handoff kills the terminal directly and
+        //   the exit hook leaves the row Bound) — only the handoff
+        //   runner's OWN authoritative target binding (the r27-F2
+        //   under-ticket shape: the pair is the runner's supplied handoff
+        //   generation, marked `authoritative` at exactly the three
+        //   under-ticket write sites) lands; every non-authoritative
+        //   lane write (a stale refresh carrying a pre-handoff pair, an
+        //   unfenced refresh) refuses typed — the pairs alone cannot
+        //   prove newer against a row with no baseline.
         if existing.is_some_and(|r| r.state == RowState::Bound && r.live_terminal_id.is_some()) {
             let write_pair = w.observed_epoch.zip(w.observed_generation);
             let row_pair = existing.and_then(|r| r.owner_epoch.zip(r.owner_generation));
-            let strictly_newer = matches!((write_pair, row_pair), (Some(wp), Some(rp)) if wp > rp);
-            if !strictly_newer {
+            let accepted = match (write_pair, row_pair) {
+                (Some(_), None) if w.authoritative => true,
+                (Some(write_pair), Some(row_pair)) => write_pair > row_pair,
+                _ => false,
+            };
+            if !accepted {
                 let unfenced = write_pair.is_none();
                 tracing::warn!(target: "freshell_ws::pane_ledger",
                     provider = %w.provider,
                     session_id = %w.session_id,
                     live_terminal_id = ?existing.and_then(|r| r.live_terminal_id.clone()),
                     write_pair = ?write_pair, row_pair = ?row_pair,
+                    authoritative = w.authoritative,
                     "pane_ledger_binding_refused_over_terminal: a fresh-agent \
                      binding write would clobber a live terminal's recovery row \
-                     without a strictly newer ownership pair (unfenced, the \
-                     terminal's own generation, or an unstamped row) — the write \
-                     is refused typed (kata b8ke focused ep5 r1 F2)"
+                     without a strictly newer ownership pair (or, over the row's \
+                     unstamped shape, without the handoff runner's authoritative \
+                     target marker) — the write is refused typed (kata b8ke \
+                     focused ep5 r2 F1)"
                 );
                 return Err(std::io::Error::other(if unfenced {
                     "UNFENCED_BINDING_OVER_TERMINAL: the row's recovery binding \
@@ -2408,7 +2424,8 @@ impl PaneLedger {
                 } else {
                     "NOT_NEWER_BINDING_OVER_TERMINAL: the row's recovery binding \
                      belongs to a live terminal; the fresh-agent write must carry \
-                     a strictly newer ownership pair"
+                     a strictly newer ownership pair (or, over an unstamped row, \
+                     be the handoff runner's authoritative target binding)"
                 }));
             }
         }

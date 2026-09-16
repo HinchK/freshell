@@ -1308,6 +1308,8 @@ impl FreshOpencodeState {
                 // the new terminal owner's recovery row.
                 observed_epoch: observed_binding_pair.map(|(epoch, _)| epoch),
                 observed_generation: observed_binding_pair.map(|(_, generation)| generation),
+                // b8ke focused ep5 r2 F1: a lane write.
+                authoritative: false,
                 settings: pre_park_settings.clone(),
             });
             let _ = self
@@ -1325,6 +1327,8 @@ impl FreshOpencodeState {
                     // instead of letting it corrupt the new owner's row).
                     observed_epoch: observed_binding_pair.map(|(epoch, _)| epoch),
                     observed_generation: observed_binding_pair.map(|(_, generation)| generation),
+                    // b8ke focused ep5 r2 F1: a lane write.
+                    authoritative: false,
                     settings: crate::identity_sink::FreshAgentSettings {
                         model,
                         sandbox: None,
@@ -1764,6 +1768,8 @@ impl FreshOpencodeState {
                     provenance: session.provenance.clone().into(),
                     observed_epoch: None,
                     observed_generation: None,
+                    // b8ke focused ep5 r2 F1: a lane write.
+                    authoritative: false,
                     settings: crate::identity_sink::FreshAgentSettings {
                         model: session.model.clone(),
                         sandbox: None,
@@ -1870,6 +1876,8 @@ impl FreshOpencodeState {
                     provenance: session.provenance.clone().into(),
                     observed_epoch: None,
                     observed_generation: None,
+                    // b8ke focused ep5 r2 F1: a lane write.
+                    authoritative: false,
                     settings: crate::identity_sink::FreshAgentSettings {
                         model: session.model.clone(),
                         sandbox: None,
@@ -4178,6 +4186,8 @@ impl FreshOpencodeState {
                 provenance: fork_provenance.into(),
                 observed_epoch: None,
                 observed_generation: None,
+                // b8ke focused ep5 r2 F1: a lane write.
+                authoritative: false,
                 settings: crate::identity_sink::FreshAgentSettings {
                     model,
                     sandbox: None,
@@ -5620,6 +5630,12 @@ impl FreshOpencodeState {
                     provenance,
                     observed_epoch: binding_epoch,
                     observed_generation: binding_generation,
+                    // b8ke focused ep5 r2 F1: the UNDER-TICKET shape (no own
+                    // ticket; the runner-supplied handoff generation stamped
+                    // the pair) is the handoff runner's OWN authoritative
+                    // target binding — the normal resume's own-ticket write
+                    // stays a lane write.
+                    authoritative: own_ticket.is_none() && handoff.is_some(),
                     settings,
                 })
                 .await
@@ -9588,6 +9604,13 @@ mod tests {
             "the handoff continuation stamps the SUPPLIED handoff generation — \
              pre-r27 it carried None (derived from its own absent ticket)"
         );
+        // b8ke focused ep5 r2 F1: the under-ticket target binding is the
+        // runner's AUTHORITATIVE write (the terminal-row guard's
+        // accepting arm over the prior terminal's unstamped row).
+        assert!(
+            last.authoritative,
+            "the handoff continuation's binding is authoritative: {last:?}"
+        );
     }
 
     /// b8ke ext r26 F4: a first-send materialization whose durable
@@ -9933,6 +9956,8 @@ mod tests {
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -9990,6 +10015,8 @@ mod tests {
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -10811,6 +10838,8 @@ mod tests {
             }),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -11077,6 +11106,8 @@ mod tests {
             }),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings {
                 model: Some("big-model".into()),
                 sandbox: None,
@@ -11174,6 +11205,8 @@ mod tests {
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings {
                 model: Some("big-model".into()),
                 sandbox: None,
@@ -11330,6 +11363,8 @@ mod tests {
             }),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -11415,6 +11450,8 @@ mod tests {
             }),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await

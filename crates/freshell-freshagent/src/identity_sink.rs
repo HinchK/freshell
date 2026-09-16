@@ -168,6 +168,18 @@ pub struct FreshAgentBindingUpsert {
     /// newer owner's recovery row. `None` = legacy-unfenced (accepted).
     pub observed_epoch: Option<u64>,
     pub observed_generation: Option<u64>,
+    /// b8ke focused ep5 r2 F1: the HANDOFF RUNNER'S OWN authoritative
+    /// target binding — set ONLY where the pair is runner-supplied (the
+    /// r27-F2 under-ticket continuation shapes: the handoff's commit
+    /// context threads its own generation into the target's row write).
+    /// Over a terminal-bound row the ledger accepts an authoritative
+    /// PAIRED write over the row's UNSTAMPED shape (the normal
+    /// production terminal row — ordinary WS/REST/MCP terminal binding
+    /// writes stamp nothing), while every non-authoritative lane write
+    /// (the post-send refresh, the settings refresh, crash respawns)
+    /// still proves strictly-newer or refuses. NEVER set this on a lane
+    /// refresh.
+    pub authoritative: bool,
     pub settings: FreshAgentSettings,
 }
 
@@ -900,6 +912,8 @@ impl FakeIdentitySink {
             provenance: ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: s,
         });
     }
@@ -1861,6 +1875,8 @@ mod tests {
             provenance: ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 model: Some("m".into()),
                 sandbox: None,
@@ -1901,6 +1917,8 @@ mod tests {
             provenance: ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -1945,6 +1963,8 @@ mod tests {
             provenance: ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2086,6 +2106,8 @@ mod tests {
             }),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2113,6 +2135,8 @@ mod tests {
             provenance: ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2130,6 +2154,8 @@ mod tests {
             }),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2167,6 +2193,8 @@ mod tests {
             }),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2189,6 +2217,8 @@ mod tests {
             }),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2208,6 +2238,8 @@ mod tests {
             provenance: ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2238,6 +2270,8 @@ mod tests {
             }),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2254,6 +2288,8 @@ mod tests {
             provenance: ProvenanceUpdate::Clear,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2274,6 +2310,8 @@ mod tests {
             provenance: ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2299,6 +2337,8 @@ mod tests {
             provenance: ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         };
         fake.retire_closed("claude", "durable-m")
@@ -2409,6 +2449,8 @@ mod tests {
             provenance: ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2442,6 +2484,8 @@ mod tests {
             provenance: ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         };
         // Arm + invoke + KILL + release: suppressed.
@@ -2477,6 +2521,8 @@ mod tests {
             session_id: "durable-h".into(),
             observed_epoch: None,
             observed_generation: None,
+
+            authoritative: false,
             ..upsert()
         })
         .await

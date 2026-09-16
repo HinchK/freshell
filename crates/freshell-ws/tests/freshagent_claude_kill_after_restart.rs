@@ -173,6 +173,7 @@ impl PaneIdentitySink for TestLedgerSink {
                     provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
                     observed_epoch: None,
                     observed_generation: None,
+                    authoritative: upsert.authoritative,
                     now_ms: now,
                 };
                 ledger.record_fresh_agent_binding(&w)?;

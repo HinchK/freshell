@@ -4029,6 +4029,10 @@ async fn resume_session_ref_tab(
                 provenance: identity_sink::ProvenanceUpdate::Clear,
                 observed_epoch: binding_epoch,
                 observed_generation: binding_generation,
+                // b8ke focused ep5 r2 F1: a REST-lane write (never the
+                // runner's authoritative target binding — the REST surface
+                // carries no handoff continuation context).
+                authoritative: false,
                 settings: identity_sink::FreshAgentSettings {
                     model: model.clone(),
                     sandbox: None,
@@ -4494,6 +4498,8 @@ async fn send_keys(
                     // b8ke ext r22 F2: the mint-time pair (the fence).
                     observed_epoch: binding_epoch,
                     observed_generation: binding_generation,
+                    // b8ke focused ep5 r2 F1: a REST-lane write.
+                    authoritative: false,
                     settings: identity_sink::FreshAgentSettings {
                         model: pane.model.clone(),
                         sandbox: None,
