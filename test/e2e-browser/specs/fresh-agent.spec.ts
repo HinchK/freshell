@@ -1667,7 +1667,7 @@ test.describe('Fresh Agent', () => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
     })
     const persistedFreshcodex = await page.evaluate(({ currentTabId, currentPaneId }) => {
-      const raw = localStorage.getItem('freshell.layout.v3')
+      const raw = localStorage.getItem(`freshell.layout.v3.${sessionStorage.getItem('freshell.layout-window-id.v1')}`)
       if (!raw) throw new Error('Missing persisted layout after freshcodex flush')
       const layout = JSON.parse(raw)
       const findPane = (node: any): any => {

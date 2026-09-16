@@ -1531,7 +1531,7 @@ test.describe('fresh-agent control surfaces — codex lane (rust)', () => {
 
       await flushPersistence(page)
       const persisted = await page.evaluate(({ tabId, paneId }) => {
-        const raw = localStorage.getItem('freshell.layout.v3')
+        const raw = localStorage.getItem(`freshell.layout.v3.${sessionStorage.getItem('freshell.layout-window-id.v1')}`)
         if (!raw) throw new Error('Missing persisted layout after Freshcodex flush')
         const layout = JSON.parse(raw)
         const findPane = (node: any): any => {
