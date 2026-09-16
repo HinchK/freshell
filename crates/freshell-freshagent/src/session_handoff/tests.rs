@@ -5157,11 +5157,11 @@ async fn a_handoff_target_exiting_before_the_commit_never_publishes_live() {
     // THE TARGET EXITS: kill the resumed sidecar (the LATEST create
     // row for this sid — the target's spawn), and wait for the OS to
     // confirm it gone (the publication's liveness evidence).
-    let target_pid = env
-        .create_rows()
-        .into_iter()
-        .filter(|r| r["msg"]["resumeSessionId"] == sid)
-        .last()
+    let rows = env.create_rows();
+    let target_pid = rows
+        .iter()
+        .rev()
+        .find(|r| r["msg"]["resumeSessionId"] == sid)
         .and_then(|r| r["pid"].as_u64())
         .expect("the target sidecar's create row") as u32;
     let _ = std::process::Command::new("kill")

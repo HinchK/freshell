@@ -5791,7 +5791,6 @@ mod tests {
     /// epoch/generation pair is a typed invalid fence — never a silent
     /// downgrade to the unfenced legacy path. Only BOTH-present (a fence)
     /// and BOTH-absent (legacy) are accepted shapes.
-    #[test]
     /// b8ke ext r30 F1 (the SHARED create/attach/resume site): a runtime
     /// whose sidecar pid already exited NEVER publishes —
     /// `commit_lane_claim`'s liveness check runs under the stamps lock
@@ -5921,6 +5920,7 @@ mod tests {
             .is_some());
     }
 
+    #[test]
     fn wire_fence_rejects_each_half_fenced_combination_typed() {
         use freshell_ownership::ObservedFence;
 
