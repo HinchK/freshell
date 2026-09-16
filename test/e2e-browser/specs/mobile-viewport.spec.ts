@@ -183,6 +183,17 @@ test.describe('Mobile Viewport', () => {
     await expect.poll(async () => paneRoot.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1)
     await expect.poll(async () => transcript.evaluate((el) => el.scrollWidth - el.clientWidth)).toBeLessThanOrEqual(1)
 
+    // The floating add-pane button is opt-in (panes.floatingActionButton,
+    // default off). Enable it through the test harness so this mobile
+    // layout contract keeps checking the Send button against a VISIBLE
+    // add-pane button.
+    await page.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'settings/updateSettingsLocal',
+        payload: { panes: { floatingActionButton: true } },
+      })
+    })
+
     const addPaneButton = page.getByRole('button', { name: /^add pane$/i })
     await expect(addPaneButton).toBeVisible()
     const sendBox = await sendBtn.boundingBox()

@@ -35,4 +35,39 @@ test.describe('Pane picker', () => {
       return nextLayout?.type
     }).toBe('leaf')
   })
+
+  test('openPanePicker uses the add-pane-button fallback when no terminal is visible', async ({ freshellPage, page, harness, terminal }) => {
+    await terminal.waitForTerminal()
+
+    // Swap the terminal pane for an editor pane so no .xterm is visible and
+    // openPanePicker must take its add-pane-button fallback branch (the FAB
+    // is opt-in; the adapted helper enables it through the test harness).
+    const tabId = await harness.getActiveTabId()
+    expect(tabId).toBeTruthy()
+    const layout = await harness.getPaneLayout(tabId!)
+    expect(layout?.type).toBe('leaf')
+    const paneId = layout.id as string
+    await page.evaluate(({ currentTabId, currentPaneId }) => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'panes/updatePaneContent',
+        payload: {
+          tabId: currentTabId,
+          paneId: currentPaneId,
+          content: {
+            kind: 'editor',
+            filePath: null,
+            language: null,
+            readOnly: false,
+            content: '',
+            viewMode: 'source',
+            wordWrap: true,
+          },
+        },
+      })
+    }, { currentTabId: tabId!, currentPaneId: paneId })
+    await expect(page.locator('.xterm')).toHaveCount(0, { timeout: 10_000 })
+
+    const picker = await openPanePicker(page)
+    await expect(picker.getByRole('button', { name: /^Editor$/i })).toBeVisible()
+  })
 })
