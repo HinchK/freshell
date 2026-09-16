@@ -3439,9 +3439,12 @@ impl FreshOpencodeState {
         // a terminal-owned key refuses typed, and a handoff arriving
         // AFTER the arm answers the coordinator's typed Blocked until
         // the guard releases — the check-then-act window does not
-        // exist. Legacy-unfenced requests route through the same guard
-        // with the coordinator's current pair. The guard moves into the
-        // detached drive below and releases once the summarize POST is
+        // exist. An unfenced request against a Live{FreshAgent} key is
+        // the typed FENCE_REQUIRED refusal (ep5 r4 F2 — an unfenced
+        // history mutation can never be told apart from a current one, so
+        // it never arms); every other state still routes through the same
+        // guard with the coordinator's current pair. The guard moves into
+        // the detached drive below and releases once the summarize POST is
         // answered (the provider mutation is done; the await-idle tail
         // is read-only and stays quiesceable through the existing
         // abort machinery).
@@ -3887,8 +3890,11 @@ impl FreshOpencodeState {
         // parent handoff arriving AFTER the arm answers the
         // coordinator's typed Blocked until the guard releases at
         // handler end (RAII) — the check-then-act window does not
-        // exist. Legacy-unfenced requests route through the same guard
-        // with the coordinator's current pair.
+        // exist. An unfenced request against a Live{FreshAgent} key is
+        // the typed FENCE_REQUIRED refusal (ep5 r4 F2 — an unfenced
+        // history mutation can never be told apart from a current one,
+        // so it never arms); every other state still routes through the
+        // same guard with the coordinator's current pair.
         let _op_guard = match crate::ownership_lane::arm_reclaimless_op_guard(
             &self.fresh_agent.ownership,
             PROVIDER,
@@ -4426,9 +4432,12 @@ impl FreshOpencodeState {
         // refuses typed, a terminal-owned key refuses typed, and a
         // handoff arriving AFTER the arm answers the coordinator's typed
         // Blocked until the guard releases at handler end (RAII) — the
-        // check-then-act window does not exist. Legacy-unfenced requests
-        // route through the same guard with the coordinator's current
-        // pair.
+        // check-then-act window does not exist. An unfenced request
+        // against a Live{FreshAgent} key is the typed FENCE_REQUIRED
+        // refusal (ep5 r4 F2 — an unfenced history mutation can never be
+        // told apart from a current one, so it never arms); every other
+        // state still routes through the same guard with the
+        // coordinator's current pair.
         let _op_guard = match crate::ownership_lane::arm_reclaimless_op_guard(
             &self.fresh_agent.ownership,
             PROVIDER,
@@ -10588,6 +10597,19 @@ mod tests {
     /// since-vacated shape a stale reconnect request must never reclaim.
     /// b8ke focused ep5 r1 F1: seed a LIVE `Live{FreshAgent}` owner record
     /// for the id (the op guard's verification target) WITHOUT vacating it.
+    /// b8ke focused ep5 r4 F2: the FENCED client shape — observe the
+    /// coordinator's owner record, then send the op WITH the pair (the
+    /// post-F2 contract: an unfenced history mutation against a
+    /// Live{FreshAgent} key is the typed FENCE_REQUIRED refusal, so the
+    /// client re-observes and retries carrying the pair).
+    fn fenced_observed(
+        registry: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        sid: &str,
+    ) -> (Option<u64>, Option<u64>) {
+        let snap = registry.observe(PROVIDER, sid);
+        (Some(snap.epoch), Some(snap.generation))
+    }
+
     fn seed_live_fresh_owner(
         registry: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
         durable_id: &str,
@@ -12456,8 +12478,11 @@ mod tests {
         seed_live_fresh_owner(&registry, "ses_ep5_compact");
 
         let driven = st.clone();
+        let mut msg = compact_msg("ses_ep5_compact");
+        (msg.observed_epoch, msg.observed_generation) =
+            fenced_observed(&registry, "ses_ep5_compact");
         let task = tokio::spawn(async move {
-            driven.handle_compact(compact_msg("ses_ep5_compact")).await;
+            driven.handle_compact(msg).await;
         });
         // Park proof: the model-resolution GET /config is parked at the
         // gate (the guard armed, no mutation yet).
@@ -12573,6 +12598,145 @@ mod tests {
         );
     }
 
+    /// b8ke focused ep5 r4 F2: an UNFENCED history mutation arriving
+    /// after a COMPLETED OWNERSHIP CYCLE is refused typed — never
+    /// laundered into the current generation. The request was queued
+    /// when the session held generation N; the session then moved away
+    /// (a terminal handoff) and returned to Fresh Agent ownership at
+    /// N+2. Pre-F2 the absent pair was assigned the coordinator's
+    /// CURRENT generation (indistinguishable from a current request:
+    /// the guard armed and the stale operation mutated the newer
+    /// history). Post-F2 the typed FENCE_REQUIRED refusal answers it —
+    /// the client re-observes the owner record and retries WITH the
+    /// pair — and nothing is mutated.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unfenced_compact_after_a_completed_ownership_cycle_is_refused_typed() {
+        let (mut st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        insert_compact_session(&st, "ses_ep5_cycle", Some("prov-a/mdl-x")).await;
+        let sink = seed_redoable_record(&st, "ses_ep5_cycle").await;
+        seed_live_fresh_owner(&registry, "ses_ep5_cycle");
+
+        // THE CYCLE: away — the terminal handoff commits at generation
+        // N+1 — then back — the fresh-agent handoff commits at N+2.
+        let away_generation = match registry.begin_handoff(
+            PROVIDER,
+            "ses_ep5_cycle",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-ep5-cycle-away",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) {
+            freshell_ownership::BeginOutcome::Granted { generation } => generation,
+            other => panic!("the away handoff must grant: {other:?}"),
+        };
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                "ses_ep5_cycle",
+                "op-ep5-cycle-away",
+                away_generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-cycle".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        let back_generation = match registry.begin_handoff(
+            PROVIDER,
+            "ses_ep5_cycle",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-ep5-cycle-back",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) {
+            freshell_ownership::BeginOutcome::Granted { generation } => generation,
+            other => panic!("the back handoff must grant: {other:?}"),
+        };
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                "ses_ep5_cycle",
+                "op-ep5-cycle-back",
+                back_generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("cycle-fresh".into()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        assert!(
+            back_generation > away_generation,
+            "the cycle advanced the generation"
+        );
+        assert!(matches!(
+            registry.observe(PROVIDER, "ses_ep5_cycle").state,
+            freshell_ownership::OwnershipState::Live { ref owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ));
+
+        // THE UNFENCED COMPACT — queued at generation N (the seed), its
+        // wire pair absent, arriving after the completed cycle. Refused
+        // typed with the FENCE_REQUIRED message; nothing mutated.
+        st.handle_compact(compact_msg("ses_ep5_cycle")).await;
+        let mut saw_refusal = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).expect("broadcast json");
+            if frame["event"]["type"] == json!("freshAgent.error") {
+                assert_eq!(frame["event"]["code"], json!("SESSION_RESERVED"), "{frame}");
+                assert!(
+                    frame["event"]["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("re-observe"),
+                    "the refusal names the FENCE_REQUIRED contract: {frame}"
+                );
+                saw_refusal = true;
+            }
+        }
+        assert!(
+            saw_refusal,
+            "the unfenced compact after a completed cycle must refuse typed"
+        );
+        assert!(
+            http.summarize_requests().is_empty(),
+            "the refused compact never drove the summarize POST — the newer \
+             history was never mutated"
+        );
+        assert!(
+            sink.load_rollback(PROVIDER, "ses_ep5_cycle")
+                .expect("the record survives")
+                .can_redo,
+            "the refused compact never destroyed redo"
+        );
+
+        // The actionable contract: the SAME request WITH the re-observed
+        // pair arms and completes (the compact drives its summarize POST).
+        let mut msg = compact_msg("ses_ep5_cycle");
+        (msg.observed_epoch, msg.observed_generation) = fenced_observed(&registry, "ses_ep5_cycle");
+        st.handle_compact(msg).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while http.summarize_requests().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fenced retry never drove the summarize POST"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// b8ke focused ep5 r1 F1: the fork's op guard is HELD across the fork
     /// window — a parent handoff arriving while the fork POST is parked
     /// mid-flight answers the coordinator's typed `Blocked` (pre-ep5-r1
@@ -12593,14 +12757,13 @@ mod tests {
         let driven = st.clone();
         let (sink, captured) = capturing_sink();
         let reply_sink = sink.clone();
+        let mut fork_request = fork_msg("ses_ep5_fork", "req-ep5-fork", None);
+        (
+            fork_request.observed_epoch,
+            fork_request.observed_generation,
+        ) = fenced_observed(&registry, "ses_ep5_fork");
         let task = tokio::spawn(async move {
-            driven
-                .handle_fork(
-                    fork_msg("ses_ep5_fork", "req-ep5-fork", None),
-                    None,
-                    reply_sink,
-                )
-                .await;
+            driven.handle_fork(fork_request, None, reply_sink).await;
         });
         {
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -12719,10 +12882,13 @@ mod tests {
 
         let driven = st.clone();
         let (sink, captured) = capturing_sink();
+        let mut rollback_request = undo_op("ses_real", "rb-ep5-race");
+        (
+            rollback_request.observed_epoch,
+            rollback_request.observed_generation,
+        ) = fenced_observed(&registry, "ses_real");
         let task = tokio::spawn(async move {
-            driven
-                .handle_rollback(undo_op("ses_real", "rb-ep5-race"), sink)
-                .await;
+            driven.handle_rollback(rollback_request, sink).await;
         });
         {
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -14441,10 +14607,12 @@ mod tests {
         let (sink, captured) = capturing_sink();
 
         let st2 = st.clone();
-        let fork = tokio::spawn(async move {
-            st2.handle_fork(fork_msg("ses_parent", "fork-r26", None), None, sink)
-                .await
-        });
+        let mut fork_request = fork_msg("ses_parent", "fork-r26", None);
+        (
+            fork_request.observed_epoch,
+            fork_request.observed_generation,
+        ) = fenced_observed(&registry, "ses_parent");
+        let fork = tokio::spawn(async move { st2.handle_fork(fork_request, None, sink).await });
 
         // THE PRE-MUTATION CLAIM: the request-scoped provisional key holds
         // the in-flight start while the fork POST is still open (pre-r26
@@ -14530,8 +14698,12 @@ mod tests {
         fake.set_fail_writes(true);
 
         let (sink, captured) = capturing_sink();
-        st.handle_fork(fork_msg("ses_parent", "fork-req-f4", None), None, sink)
-            .await;
+        let mut fork_request = fork_msg("ses_parent", "fork-req-f4", None);
+        (
+            fork_request.observed_epoch,
+            fork_request.observed_generation,
+        ) = fenced_observed(&registry, "ses_parent");
+        st.handle_fork(fork_request, None, sink).await;
 
         // The reply is the TYPED error, never the forked success.
         let frames = captured.lock().expect("captured mutex").clone();
@@ -14736,8 +14908,12 @@ mod tests {
             (child_arc, bridge_was_live, fail_outcome)
         });
 
-        st.handle_fork(fork_msg("ses_parent", "fork-req-stale", None), None, sink)
-            .await;
+        let mut fork_request = fork_msg("ses_parent", "fork-req-stale", None);
+        (
+            fork_request.observed_epoch,
+            fork_request.observed_generation,
+        ) = fenced_observed(&registry, "ses_parent");
+        st.handle_fork(fork_request, None, sink).await;
 
         let (child_arc, bridge_was_live, fail_outcome) = mover.await.expect("mover task completed");
         assert!(

@@ -285,8 +285,12 @@ pub mod ownership_lane {
     /// Arm the reclaim-less op guard (see [`LaneOpGuard`]). The
     /// `operation_id` names the guard on the coordinator's arm/blocked
     /// events (diagnosability); `observed` is the request's wire-parsed
-    /// pair (`None` = legacy-unfenced — routed through the guard with the
-    /// coordinator's CURRENT pair, captured atomically at arm time).
+    /// pair (`None` = legacy-unfenced — against a Live{FreshAgent} key
+    /// that is the typed FENCE_REQUIRED refusal (ep5 r4 F2: an unfenced
+    /// history mutation can never be told apart from a current one, so it
+    /// never arms); every other state still routes through the guard with
+    /// the coordinator's CURRENT pair, captured atomically at arm time —
+    /// the under-guard verification refuses those states typed anyway).
     pub fn arm_reclaimless_op_guard(
         registry: &Option<Arc<RuntimeOwnershipRegistry>>,
         provider: &str,
@@ -319,10 +323,48 @@ pub mod ownership_lane {
                 };
             }
         }
-        // A legacy-unfenced request routes through the SAME guard with the
-        // coordinator's current pair — captured here, validated atomically
-        // at arm time (the guard then blocks any handoff that arrives
-        // after, so the pair can never go stale under the mutation).
+        // b8ke focused ep5 r4 F2: an UNFENCED history mutation (compact/
+        // rollback/fork — `observed == None`, the legacy client shape)
+        // against a Live{FreshAgent} key REFUSES typed — never laundered
+        // to the coordinator's CURRENT generation. The round-4 reviewer's
+        // hazard: a request queued under generation N, received after the
+        // session moved away and returned to Fresh Agent at N+2, was made
+        // indistinguishable from a current request (the laundered pair
+        // armed the guard, the stale operation mutated newer history or
+        // minted a child from it) — the later claim can detect an
+        // ownership change occurring AFTER an observation, but nothing can
+        // detect that an unfenced request was already stale ON ARRIVAL.
+        // The refusal is the actionable contract: the client re-observes
+        // the owner record and retries WITH the pair. Every OTHER state
+        // keeps the routing below (ariming at the current generation only
+        // ever feeds arms that REFUSE — the kind/lifecycle checks own
+        // them, and their typed answers stay accurate for in-flight
+        // handoffs and foreign kinds).
+        if observed.is_none() {
+            if let freshell_ownership::OwnershipState::Live { ref owner, .. } = snap.state {
+                if owner.kind == RuntimeOwnerKind::FreshAgent {
+                    tracing::warn!(target: "freshell_ownership",
+                        operation_id = %operation_id, provider = %provider,
+                        session_id = %session_id, initiator,
+                        current_epoch = snap.epoch, current_generation = snap.generation,
+                        event = "ownership.op_guard.refused",
+                        outcome = "refused", failure_reason = "FENCE_REQUIRED",
+                        "the op guard refused to arm (the history mutation carried no \
+                         observed pair against a live fresh-agent owner) — the operation \
+                         aborts typed; the client re-observes and retries with the pair"
+                    );
+                    return LaneOpGuard::Refused {
+                        message: FENCE_REQUIRED_OP_GUARD_MESSAGE.to_string(),
+                    };
+                }
+            }
+        }
+        // A legacy-unfenced request against every OTHER state routes
+        // through the SAME guard with the coordinator's current pair —
+        // captured here, validated atomically at arm time (the guard then
+        // blocks any handoff that arrives after, so the pair can never go
+        // stale under the mutation; and the under-guard kind/lifecycle
+        // verification below refuses these states typed anyway).
         let observed_generation = observed
             .map(|fence| fence.generation)
             .unwrap_or(snap.generation);
@@ -405,6 +447,12 @@ pub mod ownership_lane {
     /// The terminal-owner / non-fresh-agent wire message.
     pub const KIND_OP_GUARD_MESSAGE: &str =
         "The session is owned by another runtime kind; reopen it as that kind instead";
+    /// b8ke focused ep5 r4 F2: the unfenced-history-mutation wire message —
+    /// the typed fence-required refusal the client can act on (re-observe
+    /// the session's owner record, then retry WITH the observed pair).
+    pub const FENCE_REQUIRED_OP_GUARD_MESSAGE: &str =
+        "the request carried no observed ownership pair; re-observe the session's \
+         owner record and retry";
 
     /// Claim; on Granted the caller wraps the result in an `OperationTicket`
     /// (Task 1's RAII guard — drop = typed fail) so a panicked spawn cannot
