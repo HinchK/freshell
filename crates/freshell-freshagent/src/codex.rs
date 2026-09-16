@@ -2528,6 +2528,31 @@ impl FreshCodexState {
             }
         }
 
+        // b8ke ext r29 F3: the operation's CLAIM pair — the (epoch,
+        // generation) of the coordinator record for the (possibly
+        // respawned) session at the moment ensure-alive established this
+        // send's live authority. Captured HERE — not at the refresh site —
+        // so every await from this point to the binding write's landing
+        // (the sessions lookup, the turn-lock park, the destroy-redo, the
+        // turn/start, the awaited ledger write) is INSIDE the delayed-write
+        // fence: a handoff that reaps this runtime and binds a terminal
+        // under a NEWER generation anywhere in that span leaves the late
+        // refresh carrying the PRE-handoff pair, and the ledger's
+        // stale-write check refuses it typed. (Observing at the refresh
+        // site instead would hand a mid-send handoff the POST-handoff pair
+        // and let the clobber through.) When the registry is unwired the
+        // legacy-unfenced (None, None) shape keeps the pre-r29 behavior.
+        let (refresh_epoch, refresh_generation) = self
+            .ownership
+            .as_ref()
+            .map(|registry| {
+                (
+                    Some(registry.boot_epoch()),
+                    Some(registry.observe(PROVIDER, &session_id).generation),
+                )
+            })
+            .unwrap_or((None, None));
+
         // Look up the session; extract the client + settings under the lock (Child isn't Clone).
         let looked_up = {
             let guard = self.sessions.lock().await;
@@ -2654,7 +2679,22 @@ impl FreshCodexState {
             session.sandbox = sandbox.clone();
             session.permission_mode = permission_mode.clone();
         }
-        let _ = self
+        // b8ke ext r29 F3: the post-send binding refresh carries the
+        // operation's CLAIM pair (captured above, right after ensure-alive)
+        // — the delayed-write fence. Pre-r29 the refresh passed NO pair
+        // and ignored the write result: a delayed refresh landing after a
+        // handoff reaped this codex runtime and bound a terminal under a
+        // NEWER generation was ACCEPTED unfenced by the ledger (its
+        // stale-write check only fires on a carried pair) and rewrote the
+        // terminal's authoritative recovery row as pane_kind fresh-agent
+        // with no live_terminal_id — corrupting the recovery binding after
+        // an otherwise successful atomic handoff. Fenced, the ledger's
+        // check refuses the late write typed; the result is HANDLED — a
+        // refused or failed refresh is logged loud (typed), never
+        // silently dropped and never force-applied. It never fails the
+        // accepted turn: the settings snapshot is recoverable by the next
+        // write.
+        if let Err(err) = self
             .record_codex_binding(
                 &session_id,
                 None,
@@ -2667,10 +2707,21 @@ impl FreshCodexState {
                 // Send/settings mutation is not a new browser assertion — conn-less
                 // (merge keeps prior stamps, ep4 writer rules).
                 None,
-                None, // observed_epoch (b8ke ext r22 F2)
-                None, // observed_generation
+                // b8ke ext r29 F3: the operation's observed pair — the
+                // delayed-write fence (see above).
+                refresh_epoch,
+                refresh_generation,
             )
-            .await;
+            .await
+        {
+            tracing::warn!(target: "freshell_freshagent::codex",
+                session_id = %session_id, turn = %submitted_turn_id, error = %err,
+                "freshagent.codex.send_binding_refresh_refused: the post-send \
+                 settings refresh was refused (a stale ownership pair — the row \
+                 belongs to a newer owner — or a ledger failure); the turn \
+                 proceeds and the row is never force-applied (kata b8ke ext r29 F3)"
+            );
+        }
 
         // DIAG-01: the turn was accepted by the sidecar -- session_id + turn
         // id only, never the submitted text/prompt.
@@ -9873,6 +9924,292 @@ pub(crate) mod tests {
         assert_eq!(
             params["input"][1],
             json!({"type":"image","url":"data:image/png;base64,aGVsbG8="})
+        );
+    }
+
+    /// b8ke ext r29 F3: the post-send binding refresh carries the
+    /// operation's observed ownership pair — the coordinator's CURRENT
+    /// (epoch, generation) for the session — so the ledger's
+    /// delayed-write fence can refuse a refresh that lands after a
+    /// handoff reaped the runtime and bound a terminal under a NEWER
+    /// generation. Pre-r29 the refresh passed NO pair (the pre-r22
+    /// unfenced shape), so the late write was accepted and rewrote the
+    /// terminal's authoritative recovery row.
+    #[tokio::test]
+    async fn the_post_send_binding_refresh_carries_the_observed_ownership_pair() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let (mut st, _) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        // Seed the LIVE owner record the send's authority derives from.
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            PROVIDER,
+            "thread-r29-f3",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-r29-f3-seed",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the seed claim must grant")
+        };
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                "thread-r29-f3",
+                "op-r29-f3-seed",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("thread-r29-f3".to_string()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-r29-f3",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            "codex-r29-f3-refresh",
+        )
+        .await;
+        let task = tokio::spawn({
+            let st = st.clone();
+            async move {
+                st.handle_send(send_msg("thread-r29-f3", "hello")).await;
+            }
+        });
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "initialize");
+        peer.respond(&id, json!({}));
+        peer.expect_notification().await;
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&id, json!({"turn":{"id":"turn-r29-f3"}}));
+        task.await.unwrap();
+        peer.disconnect();
+        st.shutdown().await;
+
+        // THE CONTRACT: the post-send refresh carried the observed pair —
+        // (None, None) pre-r29.
+        let pair = fake
+            .binding_pairs
+            .lock()
+            .unwrap()
+            .get(&("codex".to_string(), "thread-r29-f3".to_string()))
+            .cloned()
+            .expect("the post-send refresh wrote the binding row");
+        assert_eq!(
+            pair,
+            (Some(registry.boot_epoch()), Some(generation)),
+            "the refresh carries the session's CURRENT ownership pair: {pair:?}"
+        );
+    }
+
+    /// b8ke ext r29 F3: the fence pair is captured at the operation's
+    /// CLAIM — right after ensure-alive establishes the send's live
+    /// authority — never re-observed at the write site. A handoff that
+    /// advances the generation while the send is mid-flight (parked past
+    /// the claim at the turn-lock or the awaited turn/start) leaves the
+    /// late refresh carrying the PRE-handoff pair, so the ledger's
+    /// stale-write check refuses it. (Observing at the write site would
+    /// hand the mid-send handoff the POST-handoff pair and let the
+    /// clobber through — the exact race the capture point exists to
+    /// close.)
+    #[tokio::test]
+    async fn the_refresh_fence_is_captured_at_the_operations_claim_not_at_the_write_site() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let (mut st, _) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            PROVIDER,
+            "thread-r29-claim",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-r29-claim-seed",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the seed claim must grant")
+        };
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                "thread-r29-claim",
+                "op-r29-claim-seed",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("thread-r29-claim".to_string()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-r29-claim",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            "codex-r29-claim",
+        )
+        .await;
+        let task = tokio::spawn({
+            let st = st.clone();
+            async move {
+                st.handle_send(send_msg("thread-r29-claim", "hello")).await;
+            }
+        });
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "initialize");
+        peer.respond(&id, json!({}));
+        peer.expect_notification().await;
+        // The send is now parked PAST its claim, awaiting turn/start —
+        // hold the answer.
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+
+        // The generation ADVANCES while the send is parked mid-flight: a
+        // handoff begin + fail-restore bumps the record (the mid-send
+        // handoff shape).
+        let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = registry
+            .begin_handoff(
+                PROVIDER,
+                "thread-r29-claim",
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "op-r29-claim-bump",
+                None,
+                "test",
+                freshell_ownership::now_epoch_ms(),
+            )
+        else {
+            panic!("the bump handoff must grant")
+        };
+        let _ = registry.fail(
+            PROVIDER,
+            "thread-r29-claim",
+            "op-r29-claim-bump",
+            ho_gen,
+            true,
+        );
+        assert!(
+            registry.observe(PROVIDER, "thread-r29-claim").generation > generation,
+            "the record's generation advanced past the send's claim"
+        );
+
+        // Release the send: the refresh must carry the PRE-advance CLAIM
+        // pair — the late write is fenced against the advanced record.
+        peer.respond(&id, json!({"turn":{"id":"turn-r29-claim"}}));
+        task.await.unwrap();
+        peer.disconnect();
+        st.shutdown().await;
+
+        let pair = fake
+            .binding_pairs
+            .lock()
+            .unwrap()
+            .get(&("codex".to_string(), "thread-r29-claim".to_string()))
+            .cloned()
+            .expect("the post-send refresh wrote the binding row");
+        assert_eq!(
+            pair,
+            (Some(registry.boot_epoch()), Some(generation)),
+            "the refresh carries the operation's CLAIM pair (pre-advance), never a fresh observe at the write site: {pair:?}"
+        );
+    }
+
+    /// b8ke ext r29 F3: a REFUSED post-send binding refresh is logged
+    /// typed and NEVER fails the accepted turn — pre-r29 the write result
+    /// was silently dropped (`let _ =`), so a refused/failed refresh was
+    /// invisible. The refused write is never force-applied: the turn the
+    /// sidecar already accepted completes, `freshAgent.send.accepted`
+    /// still reaches the bus, and the typed warn names the refusal.
+    #[tokio::test] // current-thread: the thread-local tracing capture
+    async fn a_refused_post_send_binding_refresh_is_logged_typed_and_never_fails_the_accepted_turn()
+    {
+        let (events, _guard) = tracing_capture::capture();
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        fake.set_fail_writes(true);
+        st.set_identity_sink(fake.clone());
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-r29-f3-refused",
+            Arc::new(client),
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            spawn_sleeper(),
+            "codex-r29-f3-refused",
+        )
+        .await;
+
+        let task = tokio::spawn({
+            let st = st.clone();
+            async move {
+                st.handle_send(send_msg("thread-r29-f3-refused", "hello"))
+                    .await;
+            }
+        });
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "initialize");
+        peer.respond(&id, json!({}));
+        peer.expect_notification().await;
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "turn/start");
+        peer.respond(&id, json!({"turn":{"id":"turn-r29-f3-refused"}}));
+        task.await
+            .expect("the send completes — a refused refresh never fails the accepted turn");
+        peer.disconnect();
+        st.shutdown().await;
+
+        // The turn's acceptance still reached the bus.
+        let mut saw_accepted = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).expect("bus json");
+            if frame["type"] == "freshAgent.send.accepted"
+                && frame["sessionId"] == json!("thread-r29-f3-refused")
+            {
+                saw_accepted = true;
+            }
+        }
+        assert!(saw_accepted, "the refused refresh never fails the turn");
+
+        // The typed warn fired — never a silent drop.
+        let events = events.lock().expect("capture lock");
+        let refused = events.iter().any(|e| {
+            e.message.contains("send_binding_refresh_refused")
+                && e.fields
+                    .values()
+                    .any(|v| v.contains("the row") || !v.is_empty())
+        });
+        assert!(
+            refused,
+            "the refused refresh is logged typed, never silently dropped: {events:?}"
         );
     }
 

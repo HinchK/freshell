@@ -692,7 +692,20 @@ pub(crate) struct FakeIdentitySink {
     /// the fake after the caller's await was cancelled (set by
     /// [`Self::arm_orphan_binding_gate`]).
     self_weak: std::sync::Mutex<std::sync::Weak<FakeIdentitySink>>,
+    /// b8ke ext r29 F3: the last binding write's observed (epoch,
+    /// generation) pair per identity — the positive assertion surface for
+    /// "the lane carries the delayed-write fence" (pre-r29 every lane
+    /// wrote (None, None) here on its refreshes).
+    pub binding_pairs: std::sync::Mutex<ObservedBindingPairMap>,
 }
+
+/// b8ke ext r29 F3: the observed (epoch, generation) pair a binding write
+/// carried, keyed by (provider, session id) — the delayed-write fence's
+/// lane-level assertion surface (the factored value type keeps the fake's
+/// field off clippy's type_complexity lint).
+#[cfg(test)]
+pub(crate) type ObservedBindingPairMap =
+    std::collections::HashMap<(String, String), (Option<u64>, Option<u64>)>;
 
 /// Retire-on-kill round 3: the fake's ROW-STATE model (the in-memory twin
 /// of the real ledger's `state`/`retired_reason` columns), so kill/claim
@@ -1164,6 +1177,12 @@ impl FakeIdentitySink {
     #[cfg(test)]
     fn apply_binding_mutations(&self, upsert: FreshAgentBindingUpsert) {
         let key = (upsert.provider.clone(), upsert.session_id.clone());
+        // b8ke ext r29 F3: the write's observed pair — recorded for the
+        // lane-level fence assertions (see [`Self::binding_pairs`]).
+        self.binding_pairs.lock().unwrap().insert(
+            key.clone(),
+            (upsert.observed_epoch, upsert.observed_generation),
+        );
         // Retire-on-kill round 3 row-state mirror: the ledger's fresh-agent
         // upsert is unconditionally Bound — a landed write resurrects the row.
         self.states

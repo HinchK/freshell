@@ -311,6 +311,124 @@ fn the_terminal_write_path_shares_the_stale_pair_fence() {
         .expect("the legacy-unfenced write proceeds");
 }
 
+/// b8ke ext r29 F3: the composed DELAYED-REFRESH shape — after a handoff
+/// reaps the codex runtime and binds a terminal under a NEWER generation,
+/// the row is the terminal's authoritative recovery binding (a REAL
+/// terminal row: live_terminal_id set, pane_kind terminal/None, the
+/// post-handoff pair stamped). The post-send settings refresh — now
+/// carrying the operation's PRE-handoff observed pair — lands late and is
+/// REFUSED typed by the delayed-write fence; the terminal's recovery row
+/// survives byte-for-byte.
+#[test]
+fn a_fenced_late_refresh_after_a_terminal_handoff_is_refused_and_the_terminal_recovery_row_survives(
+) {
+    let root = temp_root("r29-f3-fenced-late-refresh");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // The fresh create's row (the pre-handoff pair: epoch 9, generation 4).
+    ledger
+        .record_fresh_agent_binding(&fa_write_fenced("codex", "ses-r29-f3", 1_000, 9, 4))
+        .expect("the fresh create's binding writes");
+
+    // The handoff completes: the terminal identity commit REBINDS the row
+    // as the terminal's recovery binding, stamped with the post-handoff
+    // pair (epoch 9, generation 5) — the exact shape
+    // `record_binding`'s terminal lane leaves.
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "codex",
+            session_id: "ses-r29-f3",
+            terminal_id: "t-r29-f3",
+            mode: "freshcodex",
+            cwd: Some("/w"),
+            create_request_id: Some("req-t-r29"),
+            origin_create_request_id: None,
+            provenance: ProvenancePolicy::Inherit,
+            observed_epoch: Some(9),
+            observed_generation: Some(5),
+            now_ms: 1_100,
+        })
+        .expect("the handoff's terminal row writes");
+
+    // THE DELAYED REFRESH: the post-send settings refresh carrying the
+    // PRE-handoff pair — refused typed.
+    let result =
+        ledger.record_fresh_agent_binding(&fa_write_fenced("codex", "ses-r29-f3", 1_200, 9, 4));
+    let err = result.expect_err("the late fenced refresh is refused typed");
+    assert!(
+        err.to_string().contains("STALE_BINDING_PAIR"),
+        "the refusal is typed: {err}"
+    );
+
+    // The terminal's authoritative recovery row survives untouched.
+    let row = ledger
+        .load_binding("codex", "ses-r29-f3")
+        .expect("the row survives the refused refresh");
+    assert_eq!(row.live_terminal_id.as_deref(), Some("t-r29-f3"));
+    assert_eq!(row.pane_kind, None, "the row stays the terminal's: {row:?}");
+    assert_eq!(row.owner_epoch, Some(9));
+    assert_eq!(row.owner_generation, Some(5));
+    assert_eq!(row.create_request_id.as_deref(), Some("req-t-r29"));
+}
+
+/// b8ke ext r29 F3: the UNFENCED-CLOBBER backstop — a fully-unfenced
+/// fresh-agent binding write (no observed pair, the legacy shape every
+/// not-yet-fenced lane sends) can never clobber a live terminal's
+/// recovery row. Pre-r29 the stale-pair fence only fired on a CARRIED
+/// pair, so the unfenced delayed refresh was ACCEPTED and rewrote the
+/// terminal's row as pane_kind fresh-agent with no live_terminal_id while
+/// preserving the newer stamp — the corruption was invisible to the
+/// fence.
+#[test]
+fn an_unfenced_fresh_agent_binding_write_never_clobbers_a_terminal_bound_row() {
+    let root = temp_root("r29-f3-unfenced-clobber");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // Seed the terminal-bound row exactly as a committed handoff leaves it.
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "codex",
+            session_id: "ses-r29-unfenced",
+            terminal_id: "t-r29-unfenced",
+            mode: "freshcodex",
+            cwd: Some("/w"),
+            create_request_id: Some("req-t-unfenced"),
+            origin_create_request_id: None,
+            provenance: ProvenancePolicy::Inherit,
+            observed_epoch: Some(3),
+            observed_generation: Some(7),
+            now_ms: 1_000,
+        })
+        .expect("the seeded terminal row");
+
+    // THE UNFENCED DELAYED WRITE — refused typed by the backstop.
+    let result = ledger.record_fresh_agent_binding(&fa_write("codex", "ses-r29-unfenced", 1_200));
+    let err = result.expect_err("the unfenced clobber is refused typed");
+    assert!(
+        err.to_string().contains("UNFENCED_BINDING_OVER_TERMINAL"),
+        "the refusal is typed: {err}"
+    );
+
+    // The terminal's recovery row survives untouched.
+    let row = ledger
+        .load_binding("codex", "ses-r29-unfenced")
+        .expect("the row survives the refused write");
+    assert_eq!(row.live_terminal_id.as_deref(), Some("t-r29-unfenced"));
+    assert_eq!(row.pane_kind, None, "the row stays the terminal's: {row:?}");
+    assert_eq!(row.owner_epoch, Some(3));
+    assert_eq!(row.owner_generation, Some(7));
+
+    // The backstop never over-blocks: an unfenced write onto a row with NO
+    // terminal binding (the ordinary fresh-agent row) still proceeds (the
+    // pre-r29 behavior for every legitimate unfenced lane).
+    ledger
+        .record_fresh_agent_binding(&fa_write("codex", "ses-r29-plain", 1_300))
+        .expect("an unfenced write over a non-terminal row proceeds");
+    let row = ledger
+        .load_binding("codex", "ses-r29-plain")
+        .expect("the fresh row");
+    assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+    assert_eq!(row.live_terminal_id, None);
+}
+
 /// b8ke ext r22 F2: stamp_owner_pair is MONOTONIC — an older pair never
 /// regresses the row's baseline; a missing row is a no-op.
 #[test]
