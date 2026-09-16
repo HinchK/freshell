@@ -447,18 +447,27 @@ cmd_run() {
   done
 
   # Resolve backend: explicit flags override env var; env var defaults to local.
+  # backend_source records HOW the lane was chosen (flag / env / default) —
+  # the banner prints the RESOLVED lane and its selection source, never the
+  # raw env value, which misleads when a flag overrides it.
+  local backend_source="default"
   if $cloud_mode; then
     local_mode=false
+    backend_source="flag --cloud"
   elif $local_mode; then
-    : # local_mode already true
+    backend_source="flag --local"
   elif [ "${FRESHELL_E2E_BACKEND:-local}" = "cloud" ]; then
     cloud_mode=true
+    backend_source="env FRESHELL_E2E_BACKEND=cloud"
   else
     local_mode=true
+    if [ -n "${FRESHELL_E2E_BACKEND:-}" ]; then
+      backend_source="env FRESHELL_E2E_BACKEND=$FRESHELL_E2E_BACKEND"
+    fi
   fi
 
   if $local_mode; then
-    echo "[e2e-cloud] Running locally..."
+    echo "[e2e-cloud] Running locally... (config: test/e2e-browser/playwright.config.ts; CLOUD_SKIP_SPECS does not apply on this lane; backend=local; source: ${backend_source})"
     cd "$ROOT"
     exec npx playwright test \
       --config test/e2e-browser/playwright.config.ts \
@@ -513,6 +522,7 @@ cmd_run() {
   echo "[e2e-cloud]   Shards:  $shards"
   echo "[e2e-cloud]   Timeout: $timeout"
   echo "[e2e-cloud]   Args:    ${pw_args[*]}"
+  echo "[e2e-cloud]   Config:  test/e2e-browser/playwright.cloud.config.ts (CLOUD_SKIP_SPECS testIgnore + CLOUD_SKIP_TITLES grepInvert apply on this lane)"
 
   # Build a YAML env-vars file for this run's Cloud Run Job.
   # We use --env-vars-file (YAML) instead of --set-env-vars because
