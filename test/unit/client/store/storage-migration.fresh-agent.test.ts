@@ -281,6 +281,140 @@ describe('storage-migration fresh-agent', () => {
     expect(localStorage.getItem(SIDECAR_KEY)).toBe(oldestEvidence)
   })
 
+  // e5r1: the migration's recoverable read must distinguish parse-level
+  // failure classes. A metadata-malformed primary (present-but-mistyped
+  // machineId/persistedAt — structurally valid) must NOT select the
+  // surviving backup: the malformed PRIMARY flows through, so the rewrite
+  // keeps its tabs durable and the pre-migration evidence sidecar holds
+  // the corrupt stamp for the health classifier.
+  it('does not swap the backup in for a metadata-malformed primary: the migrated primary stays durable and the evidence sidecar preserves it (e5r1)', async () => {
+    const primaryRaw = JSON.stringify({
+      version: 3,
+      persistedAt: 1234,
+      machineId: 123,
+      tabs: { tabs: [{ id: 'tab-primary', title: 'Primary' }], activeTabId: 'tab-primary' },
+      panes: {
+        version: 6,
+        layouts: { 'tab-primary': { type: 'leaf', id: 'pane-primary', content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-primary', status: 'running' } } },
+        activePane: { 'tab-primary': 'pane-primary' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    })
+    const backupRaw = JSON.stringify({
+      version: 3,
+      persistedAt: 123,
+      machineId: 'machine-backup',
+      tabs: { tabs: [{ id: 'tab-backup', title: 'Backup' }], activeTabId: 'tab-backup' },
+      panes: {
+        version: 6,
+        layouts: { 'tab-backup': { type: 'leaf', id: 'pane-backup', content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-backup', status: 'running' } } },
+        activePane: { 'tab-backup': 'pane-backup' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    })
+    const storage = createStorage()
+    Object.defineProperty(globalThis, 'localStorage', { value: storage, writable: true })
+    storage.seed(VERSION_KEY, '5')
+    storage.seed(LAYOUT_KEY, primaryRaw)
+    storage.seed(BACKUP_KEY, backupRaw)
+
+    await import('@/store/storage-migration')
+
+    // No backup swap: the durable layout holds the PRIMARY's tab.
+    const durable = JSON.parse(localStorage.getItem(LAYOUT_KEY)!) as { tabs: { tabs: Array<{ id: string }> } }
+    expect(durable.tabs.tabs.map((t) => t.id)).toEqual(['tab-primary'])
+    // The evidence sidecar preserves the malformed PRIMARY (not the
+    // backup) so classifyPersistedLayoutHealth sees the corrupt stamp.
+    expect(localStorage.getItem(SIDECAR_KEY)).toBe(primaryRaw)
+    // The rewrite's standard pre-rewrite mirror: the backup channel now
+    // holds THIS rewrite's pre-rewrite raw (the malformed primary).
+    expect(localStorage.getItem(BACKUP_KEY)).toBe(primaryRaw)
+  })
+
+  // e5r2: the empty-string machineId variant — the migration's falsy
+  // machineId guard drops "" from the migrated raw exactly like a
+  // mistyped value, and the recoverable read must not swap the backup
+  // in: the primary stays durable and the evidence sidecar preserves
+  // the corrupt stamp for the health classifier.
+  it('does not swap the backup in for an empty-string machineId primary: the migrated primary stays durable and the evidence sidecar preserves it (e5r2)', async () => {
+    const primaryRaw = JSON.stringify({
+      version: 3,
+      persistedAt: 1234,
+      machineId: '',
+      tabs: { tabs: [{ id: 'tab-primary', title: 'Primary' }], activeTabId: 'tab-primary' },
+      panes: {
+        version: 6,
+        layouts: { 'tab-primary': { type: 'leaf', id: 'pane-primary', content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-primary', status: 'running' } } },
+        activePane: { 'tab-primary': 'pane-primary' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    })
+    const backupRaw = JSON.stringify({
+      version: 3,
+      persistedAt: 123,
+      machineId: 'machine-backup',
+      tabs: { tabs: [{ id: 'tab-backup', title: 'Backup' }], activeTabId: 'tab-backup' },
+      panes: {
+        version: 6,
+        layouts: { 'tab-backup': { type: 'leaf', id: 'pane-backup', content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-backup', status: 'running' } } },
+        activePane: { 'tab-backup': 'pane-backup' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    })
+    const storage = createStorage()
+    Object.defineProperty(globalThis, 'localStorage', { value: storage, writable: true })
+    storage.seed(VERSION_KEY, '5')
+    storage.seed(LAYOUT_KEY, primaryRaw)
+    storage.seed(BACKUP_KEY, backupRaw)
+
+    await import('@/store/storage-migration')
+
+    // No backup swap: the durable layout holds the PRIMARY's tab.
+    const durable = JSON.parse(localStorage.getItem(LAYOUT_KEY)!) as { tabs: { tabs: Array<{ id: string }> } }
+    expect(durable.tabs.tabs.map((t) => t.id)).toEqual(['tab-primary'])
+    // The migrated raw dropped the empty stamp (JSON.stringify omits
+    // undefined) — the sanitized current raw looks unstamped, so only the
+    // sidecar evidence can keep this class corrupt.
+    expect(durable.machineId).toBeUndefined()
+    expect(localStorage.getItem(SIDECAR_KEY)).toBe(primaryRaw)
+    expect(localStorage.getItem(BACKUP_KEY)).toBe(primaryRaw)
+  })
+
+  it('still recovers a structurally destroyed primary from the surviving backup (the legitimate fallback path)', async () => {
+    const backupRaw = JSON.stringify({
+      version: 3,
+      persistedAt: 123,
+      machineId: 'machine-backup',
+      tabs: { tabs: [{ id: 'tab-backup', title: 'Backup' }], activeTabId: 'tab-backup' },
+      panes: {
+        version: 6,
+        layouts: { 'tab-backup': { type: 'leaf', id: 'pane-backup', content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-backup', status: 'running' } } },
+        activePane: { 'tab-backup': 'pane-backup' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    })
+    const storage = createStorage()
+    Object.defineProperty(globalThis, 'localStorage', { value: storage, writable: true })
+    storage.seed(VERSION_KEY, '5')
+    storage.seed(LAYOUT_KEY, '{ structurally destroyed')
+    storage.seed(BACKUP_KEY, backupRaw)
+
+    await import('@/store/storage-migration')
+
+    const recovered = JSON.parse(localStorage.getItem(LAYOUT_KEY)!) as { tabs: { tabs: Array<{ id: string }> } }
+    expect(recovered.tabs.tabs.map((t) => t.id)).toEqual(['tab-backup'])
+  })
+
   it('aborts before touching the original layout when the backup write fails', async () => {
     const originalRaw = makeLegacyLayoutRaw()
     const storage = createStorage({

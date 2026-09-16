@@ -18,6 +18,7 @@ const VALID_CLAUDE_SESSION_ID = '11111111-2222-4333-8444-555555555555'
 const WINDOW_ID = 'client-health-tests'
 const LAYOUT_STORAGE_KEY = `freshell.layout.v3.${WINDOW_ID}`
 const LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY = `freshell.layout.pre-migration-raw.v1.${WINDOW_ID}`
+const LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY = `${LAYOUT_STORAGE_KEY}.backup-before-fresh-agent-centralization`
 
 function seedWindow(): void {
   sessionStorage.setItem('freshell.layout-window-id.v1', WINDOW_ID)
@@ -145,9 +146,9 @@ describe('classifyPersistedLayoutHealth', () => {
     // pre-merge comment framed it as the same-machine chooser re-pick, but
     // #774's pick handler now ARMS the one-shot active-selection marker on
     // every chooser pick, so the re-pick boot peeks it and classifies with
-    // activeSelection:true (the foreign pin below); the unarmed unstamped
-    // case is the ordinary reload of a remembered selection, whose layout
-    // is this machine's newest truth and must be KEPT.
+    // activeSelection:true (the armed-unstamped keep pin below); the unarmed
+    // unstamped case is the ordinary reload of a remembered selection, whose
+    // layout is this machine's newest truth and must be KEPT.
     localStorage.setItem(MACHINE_ID_STORAGE_KEY, 'machine-1')
     const envelope = healthyEnvelope('machine-1')
     delete envelope.machineId
@@ -155,20 +156,27 @@ describe('classifyPersistedLayoutHealth', () => {
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
   })
 
-  it('classifies an otherwise-healthy UNSTAMPED envelope as foreign under an armed active-selection marker (#774 merged into Choice B)', () => {
-    // MERGED SEMANTICS (red-first pin): the chooser's one-shot marker proves
-    // the machine was ACTIVELY chosen this boot, so an unstamped legacy
-    // envelope cannot be assumed local — it may be the PREVIOUS machine's
-    // cache, and the chosen machine's durable truth must replace it. This
-    // is the one classification the machine-id stamp cannot make on its own
-    // (unstamped data has no origin proof). #774's active-choice intent,
-    // preserved at the classifier layer instead of its superseded
-    // restoreMachineWorkspace({ activeSelection }) option.
+  it('keeps an otherwise-healthy UNSTAMPED envelope under an armed active-selection marker — a same-machine chooser re-pick keeps the legacy layout (delta r4)', () => {
+    // DELTA r4 (review finding 1): this pin previously codified 'foreign'
+    // for the armed + unstamped + healthy-content lane — the merged-rule
+    // resolution of the #774 conflict — which contradicted the ACCEPTED
+    // REQUIREMENT that a chooser re-pick of the SAME machine keep a
+    // healthy local layout (no forced server resync; the rebuild discards
+    // the exact split arrangement and pane labels). An unstamped envelope
+    // cannot PROVE machine ownership either way, so the armed marker alone
+    // must not demote a healthy layout: it keeps, and the boot's healthy
+    // backfill stamps it, so the next boot classifies unambiguously.
+    // Accepted residual: because ownership is unprovable, a DIFFERENT
+    // machine's pick during the legacy-to-stamped transition also keeps
+    // the local layout — pre-upgrade-consistent (unstamped was never
+    // foreign before stamps existed) and bounded to the transition: the
+    // keep's backfill stamp ends the window and full foreign detection
+    // resumes on the next boot.
     localStorage.setItem(MACHINE_ID_STORAGE_KEY, 'machine-1')
     const envelope = healthyEnvelope('machine-1')
     delete envelope.machineId
     seedEnvelope(envelope)
-    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW, activeSelection: true })).toBe('foreign')
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW, activeSelection: true })).toBe('healthy')
   })
 
   it('keeps a STAMPED same-machine healthy layout under an armed active-selection marker — Choice B wins the #774 boot-gate conflict', () => {
@@ -176,9 +184,11 @@ describe('classifyPersistedLayoutHealth', () => {
     // demote a provably-own healthy layout — the stamp is the stronger,
     // durable origin proof. The pick handler arms the marker on EVERY
     // chooser pick (#774), including a same-machine re-pick whose layout
-    // is stamped-healthy; Choice B window sovereignty keeps it. #774's
-    // clear-on-active-choice is thereby narrowed to the unstamped case,
-    // where foreignness is actually plausible.
+    // is stamped-healthy; Choice B window sovereignty keeps it. Delta r4
+    // extends the same keep to the UNSTAMPED legacy case (the pin above):
+    // the armed marker never demotes a healthy layout — foreignness
+    // requires the stamp's positive proof (a stamp naming another
+    // machine).
     localStorage.setItem(MACHINE_ID_STORAGE_KEY, 'machine-1')
     seedEnvelope(healthyEnvelope('machine-1'))
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW, activeSelection: true })).toBe('healthy')
@@ -404,6 +414,131 @@ describe('classifyPersistedLayoutHealth', () => {
     expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
   })
 
+  // e3r4 finding 2: the lifecycle invariants must also cover FRESH-AGENT
+  // panes and the terminal shell. isWellFormedPaneTree only checks
+  // strings, so a fresh-agent pane with an EMPTY or envelope-wide
+  // DUPLICATE createRequestId or a status outside the client
+  // SdkSessionStatus union passed string-only tree validation and
+  // classified healthy — an empty id violates FreshAgentCreateSchema
+  // (requestId z.string().min(1), shared/ws-protocol.ts:757), a
+  // duplicate aliases the request-keyed pending-create routing, and a
+  // bogus status without a session identity prevents FreshAgentView
+  // from ever sending a create. A terminal shell outside ShellSchema
+  // (shared/ws-protocol.ts:45) likewise survived loading verbatim
+  // (normalizePaneContent keeps any string shell, panesSlice.ts:78) and
+  // was sent in a rejected terminal.create. The fresh-agent pane's
+  // "mode" fields (sessionType + provider) are already pinned by the
+  // tree-level isPaneContentShape check the classifier runs first, so
+  // the lifecycle layer adds the id and status invariants.
+  it('returns corrupt when a fresh-agent pane content carries an EMPTY createRequestId (violates FreshAgentCreateSchema; the loader would mint a fresh identity)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', createRequestId: '', status: 'idle' },
+      },
+    }
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when two fresh-agent panes share one createRequestId (request-keyed pending-create routing would alias both panes)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'split',
+        id: 'split-fa',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          { type: 'leaf', id: 'pane-a', content: { kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', createRequestId: 'cr-fa-dup', status: 'idle' } },
+          { type: 'leaf', id: 'pane-b', content: { kind: 'fresh-agent', sessionType: 'freshcodex', provider: 'codex', createRequestId: 'cr-fa-dup', status: 'running' } },
+        ],
+      },
+    }
+    ;(envelope.panes as { activePane: Record<string, string> }).activePane['tab-a'] = 'pane-a'
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when a terminal pane and a fresh-agent pane share one createRequestId (both kinds mint from the same nanoid space — legit flushes never alias)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'split',
+        id: 'split-mixed',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          { type: 'leaf', id: 'pane-a', content: { kind: 'terminal', mode: 'shell', createRequestId: 'cr-shared', status: 'running' } },
+          { type: 'leaf', id: 'pane-b', content: { kind: 'fresh-agent', sessionType: 'freshopencode', provider: 'opencode', createRequestId: 'cr-shared', status: 'idle' } },
+        ],
+      },
+    }
+    ;(envelope.panes as { activePane: Record<string, string> }).activePane['tab-a'] = 'pane-a'
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when a fresh-agent pane status is outside the SdkSessionStatus union (a bogus status without a session identity never sends a create)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', createRequestId: 'cr-fa', status: 'zombie-status' },
+      },
+    }
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when a terminal pane shell is a nonempty value outside ShellSchema (survives loading verbatim and is sent in a rejected terminal.create)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'terminal', mode: 'shell', createRequestId: 'cr-a', status: 'running', shell: 'fish' },
+      },
+    }
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('stays healthy when a terminal pane OMITS shell (absent = the loader\u2019s system default = healthy)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'leaf',
+        id: 'pane-a',
+        content: { kind: 'terminal', mode: 'shell', createRequestId: 'cr-a', status: 'running' },
+      },
+    }
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
+  it('stays healthy for a valid fresh-agent pane (non-empty id, union-member status) alongside a terminal pane with a valid shell', () => {
+    const envelope = healthyEnvelope('machine-1')
+    ;(envelope.panes as Record<string, unknown>).layouts = {
+      'tab-a': {
+        type: 'split',
+        id: 'split-ok',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          { type: 'leaf', id: 'pane-a', content: { kind: 'terminal', mode: 'shell', shell: 'wsl', createRequestId: 'cr-term', status: 'running' } },
+          { type: 'leaf', id: 'pane-b', content: { kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude', createRequestId: 'cr-fa', status: 'idle' } },
+        ],
+      },
+    }
+    ;(envelope.panes as { activePane: Record<string, string> }).activePane['tab-a'] = 'pane-a'
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
   // Content-salvage classification (delta review round 2, finding 3):
   // parsePersistedLayoutRaw silently strips malformed DURABLE pane-content
   // fields BEFORE tree validation (normalizeTerminalContent destructures
@@ -528,6 +663,128 @@ describe('classifyPersistedLayoutHealth', () => {
   })
 })
 
+// Delta r5 finding 1: present-but-malformed top-level envelope metadata
+// (a machineId that is not a string, or a persistedAt that is not a
+// number) is CORRUPTION, distinct from legitimate ABSENCE. The parse used
+// to coerce both to undefined (persistedState.ts), so a corrupt envelope
+// classified as unstamped legacy — healthy — and the healthy boot's stamp
+// backfill then relabeled a corrupted layout from machine A as machine B,
+// published onward by tab sync. The boot migration compounds it: its
+// rewrite DROPS a malformed machineId and REPLACES a malformed persistedAt
+// with a fresh Date.now() (storage-migration.ts migratePersistedLayout),
+// so post-rewrite the sanitized current raw looks healthy and only the
+// pre-migration evidence sidecar still shows the malformed value.
+describe('malformed envelope metadata classifies corrupt — never silently coerced to legacy absence (delta r5 finding 1)', () => {
+  beforeEach(() => { localStorage.clear(); seedWindow() })
+
+  it('returns corrupt when machineId is present but not a string (direct parse path)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    envelope.machineId = 123
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  // e5r2: an empty-string machineId is the same malformed class — the
+  // validity rule follows machine-identity.ts's nonEmptyString
+  // normalization (which trims, so whitespace-only is empty too). The
+  // gate used to accept "" as a string, the classifier treated the
+  // envelope as unstamped legacy — healthy — and the stamp backfill
+  // relabeled a possibly wrong-machine workspace as the current machine.
+  it('returns corrupt when machineId is present but empty (empty stamp is malformed metadata, not legacy absence — direct parse path)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    envelope.machineId = ''
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+    const whitespace = healthyEnvelope('machine-1')
+    whitespace.machineId = '   '
+    seedEnvelope(whitespace)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('returns corrupt when persistedAt is present but not a number (direct parse path)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    envelope.persistedAt = 'recently'
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('stays healthy when machineId is absent while persistedAt is valid (legacy machine-id absence — direct parse path)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    delete envelope.machineId
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
+  it('never classifies ABSENCE corrupt: an absent persistedAt keeps the pre-existing epoch fallback (stale, not corrupt — direct parse path)', () => {
+    const envelope = healthyEnvelope('machine-1')
+    delete envelope.machineId
+    delete envelope.persistedAt
+    seedEnvelope(envelope)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('stale')
+  })
+
+  it('classifies corrupt through the pre-migration evidence when the migration dropped a malformed machineId (the sanitized current raw must not slide through as healthy legacy)', () => {
+    // The realistic post-rewrite shape: the migration's JSON.stringify
+    // omits the undefined machineId, so the current raw is unstamped and
+    // otherwise healthy — only the evidence sidecar still carries the
+    // malformed stamp.
+    const current = healthyEnvelope('machine-1')
+    delete current.machineId
+    seedEnvelope(current)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+    const original = healthyEnvelope('machine-1')
+    original.machineId = 123
+    localStorage.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, JSON.stringify(original))
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+    localStorage.removeItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
+  // e5r2: the migration's falsy machineId guard drops "" exactly like a
+  // mistyped one, and hasMalformedEnvelopeMetadata must flag it in the
+  // evidence the same way — an empty stamp is malformed metadata, never
+  // legacy absence.
+  it('classifies corrupt through the pre-migration evidence when the migration dropped an empty-string machineId (e5r2)', () => {
+    const current = healthyEnvelope('machine-1')
+    delete current.machineId
+    seedEnvelope(current)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+    const original = healthyEnvelope('machine-1')
+    original.machineId = ''
+    localStorage.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, JSON.stringify(original))
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+    localStorage.removeItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
+  it('classifies corrupt through the pre-migration evidence when the migration replaced a malformed persistedAt with a fresh stamp', () => {
+    const current = healthyEnvelope('machine-1')
+    seedEnvelope(current)
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+    const original = healthyEnvelope('machine-1')
+    original.persistedAt = 'recently'
+    localStorage.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, JSON.stringify(original))
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('corrupt')
+  })
+
+  it('stays healthy when the evidence envelope legitimately lacks both metadata keys (legacy absence in evidence is not corruption)', () => {
+    const current = healthyEnvelope('machine-1')
+    seedEnvelope(current)
+    const original = healthyEnvelope('machine-1')
+    delete original.machineId
+    delete original.persistedAt
+    localStorage.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, JSON.stringify(original))
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+
+  it('stays healthy when the evidence envelope carries valid metadata values (a string machineId and a number persistedAt)', () => {
+    const current = healthyEnvelope('machine-1')
+    seedEnvelope(current)
+    localStorage.setItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY, JSON.stringify(healthyEnvelope('machine-1')))
+    expect(classifyPersistedLayoutHealth('machine-1', { now: NOW })).toBe('healthy')
+  })
+})
+
 // e2r1 review finding 1: the content-salvage check could never fire in the
 // REAL boot order. main.tsx imports the self-executing storage-migration
 // BEFORE the store and App (main.tsx:8 vs :9-10), and on essentially every
@@ -611,6 +868,116 @@ describe('classifyPersistedLayoutHealth in the real boot order (migration rewrit
     }))
     const { classify } = await classifyAfterRealBoot()
     expect(classify('machine-1')).toBe('corrupt')
+  })
+
+  // Delta r5 finding 1 through the REAL boot order: the migration rewrite
+  // drops a malformed machineId (JSON.stringify omits undefined) and
+  // replaces a malformed persistedAt with Date.now(), so the sanitized
+  // current raw alone looks like healthy legacy data — only the evidence
+  // sidecar the rewrite mirrors can keep the malformed class corrupt.
+  it('classifies corrupt when the boot migration dropped a malformed machineId stamp (the sanitized envelope must not slide through as healthy legacy)', async () => {
+    const envelope = healthyEnvelope('machine-1')
+    envelope.machineId = 123
+    seedEnvelope(envelope)
+    const { classify } = await classifyAfterRealBoot()
+    expect(classify('machine-1')).toBe('corrupt')
+  })
+
+  it('classifies corrupt when the boot migration replaced a malformed persistedAt with a fresh stamp', async () => {
+    const envelope = healthyEnvelope('machine-1')
+    envelope.persistedAt = 'recently'
+    seedEnvelope(envelope)
+    const { classify } = await classifyAfterRealBoot()
+    expect(classify('machine-1')).toBe('corrupt')
+  })
+
+  // e5r1 (review of the delta r5 fix): the r5 real-boot lanes above seeded
+  // no backup, but readRecoverablePersistedLayoutRaw's fallback treated ANY
+  // parse failure — including the r5 metadata refusal — as a reason to
+  // select the surviving .backup-before-fresh-agent-centralization value.
+  // With a backup present, the migration rewrote the layout key with the
+  // OLDER BACKUP's content and mirrored the backup — not the malformed
+  // primary — as pre-migration evidence, so the classifier saw a healthy
+  // layout and silently rolled back newer tabs and panes instead of
+  // rebuilding.
+  function backupTabEnvelope(): Record<string, unknown> {
+    return {
+      persistedAt: NOW,
+      version: 4,
+      machineId: 'machine-1',
+      tabs: { activeTabId: 'tab-backup', tabs: [{ id: 'tab-backup', title: 'Backup', createdAt: NOW, updatedAt: NOW }] },
+      panes: {
+        layouts: { 'tab-backup': { type: 'leaf', id: 'pane-backup', content: { kind: 'editor', filePath: '/tmp/b.md', language: null, readOnly: false, content: '', viewMode: 'source', wordWrap: true } } },
+        activePane: { 'tab-backup': 'pane-backup' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }
+  }
+
+  it('classifies corrupt when a metadata-malformed primary coexists with a surviving migration backup: no backup swap, the evidence preserves the malformed primary (e5r1)', async () => {
+    const malformedPrimary = healthyEnvelope('machine-1')
+    malformedPrimary.machineId = 123
+    const primaryRaw = JSON.stringify(malformedPrimary)
+    seedEnvelope(primaryRaw)
+    localStorage.setItem(LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY, JSON.stringify(backupTabEnvelope()))
+
+    const { classify } = await classifyAfterRealBoot()
+
+    // No backup swap: the durable layout still holds the PRIMARY's tab —
+    // the migration delivered the malformed primary, not the older backup.
+    const durable = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY)!) as { tabs: { tabs: Array<{ id: string }> } }
+    expect(durable.tabs.tabs.map((t) => t.id)).toEqual(['tab-a'])
+    // The evidence sidecar preserves the malformed PRIMARY so the
+    // metadata comparison below can still see the corrupt stamp.
+    expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBe(primaryRaw)
+    expect(classify('machine-1')).toBe('corrupt')
+  })
+
+  it('classifies corrupt when a malformed persistedAt coexists with a surviving migration backup (e5r1)', async () => {
+    const malformedPrimary = healthyEnvelope('machine-1')
+    malformedPrimary.persistedAt = 'recently'
+    seedEnvelope(malformedPrimary)
+    localStorage.setItem(LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY, JSON.stringify(backupTabEnvelope()))
+    const { classify } = await classifyAfterRealBoot()
+    expect(classify('machine-1')).toBe('corrupt')
+  })
+
+  // e5r2: the empty-string machineId variant of the lane above. The
+  // migration's falsy guard drops "" from the sanitized current raw (so
+  // the direct parse path can no longer catch it), the recoverable read
+  // must NOT swap the older backup in (parseLayoutStructure is
+  // structural-only), and the evidence sidecar must preserve the
+  // malformed PRIMARY so the metadata comparison classifies corrupt →
+  // rebuild, instead of the healthy-legacy keep that relabeled a
+  // possibly wrong-machine workspace via the stamp backfill.
+  it('classifies corrupt when an empty-string machineId primary coexists with a surviving migration backup: no backup swap, the evidence preserves the malformed primary (e5r2)', async () => {
+    const malformedPrimary = healthyEnvelope('machine-1')
+    malformedPrimary.machineId = ''
+    const primaryRaw = JSON.stringify(malformedPrimary)
+    seedEnvelope(primaryRaw)
+    localStorage.setItem(LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY, JSON.stringify(backupTabEnvelope()))
+
+    const { classify } = await classifyAfterRealBoot()
+
+    // No backup swap: the durable layout still holds the PRIMARY's tab —
+    // the migration delivered the malformed primary, not the older backup.
+    const durable = JSON.parse(localStorage.getItem(LAYOUT_STORAGE_KEY)!) as { tabs: { tabs: Array<{ id: string }> } }
+    expect(durable.tabs.tabs.map((t) => t.id)).toEqual(['tab-a'])
+    // The evidence sidecar preserves the malformed PRIMARY so the
+    // metadata comparison below can still see the corrupt stamp.
+    expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBe(primaryRaw)
+    expect(classify('machine-1')).toBe('corrupt')
+  })
+
+  it('boots an unstamped, persistedAt-less legacy envelope healthy through the real order (the migration supplies the stamp; absence is never corruption)', async () => {
+    const envelope = healthyEnvelope('machine-1')
+    delete envelope.machineId
+    delete envelope.persistedAt
+    seedEnvelope(envelope)
+    const { classify } = await classifyAfterRealBoot()
+    expect(classify('machine-1')).toBe('healthy')
   })
 
   // Verified migration drops that must NOT classify corrupt once the
@@ -769,6 +1136,62 @@ describe('classifyPersistedLayoutHealth in the real boot order (migration rewrit
     const boot2 = await classifyAfterRealBoot()
     expect(localStorage.getItem(LAYOUT_PRE_MIGRATION_RAW_STORAGE_KEY)).toBeNull()
     expect(boot2.classify('machine-1')).toBe('healthy')
+  })
+
+  // e3 post-cap finding 2: the migration-boot prune sweep deleted THIS
+  // window's beyond-threshold envelope BEFORE the App classifier ran, so
+  // a real stale boot was classified (and logged) 'absent' — the five-state
+  // classification and the stale reason propagation were never exercised.
+  // The sweep now spares the own key (still pruning OTHER windows'
+  // abandoned keys), the classifier sees the stale envelope and the gate
+  // rebuilds with reason 'stale', and only the COMPLETED decision runs the
+  // deferred own-key prune.
+  it('a stale own envelope SURVIVES the migration-boot sweep, classifies STALE (not absent), and is retired by the gate-time prune afterward (e3 post-cap finding 2)', async () => {
+    const STALE_PERSISTED_AT = NOW - STALE_LAYOUT_MS - 1
+    seedEnvelope(healthyEnvelope('machine-1', STALE_PERSISTED_AT))
+    const OTHER_WINDOW_KEY = 'freshell.layout.v3.client-other-window'
+    localStorage.setItem(OTHER_WINDOW_KEY, JSON.stringify(healthyEnvelope('machine-1', STALE_PERSISTED_AT)))
+
+    const { classify } = await classifyAfterRealBoot()
+
+    // The sweep's abandoned-key hygiene is intact: the OTHER window's
+    // stale envelope was pruned at migration boot.
+    expect(localStorage.getItem(OTHER_WINDOW_KEY)).toBeNull()
+    // THIS window's stale envelope survived for the classifier (the
+    // migration's rewrite preserves persistedAt).
+    const ownRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(ownRaw).not.toBeNull()
+    expect(JSON.parse(ownRaw!).persistedAt).toBe(STALE_PERSISTED_AT)
+    // The classifier-then-prune ordering: the boot classifies STALE, not
+    // absent — the reason the gate propagates to the rebuild.
+    expect(classify('machine-1')).toBe('stale')
+
+    // The decision completed: the gate's deferred own-key prune removes
+    // the stale envelope (and its channels) afterward.
+    const { pruneOwnStaleLayoutEnvelope } = await import('@/store/storage-migration')
+    vi.useFakeTimers()
+    vi.setSystemTime(NOW)
+    try {
+      pruneOwnStaleLayoutEnvelope()
+    } finally {
+      vi.useRealTimers()
+    }
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).toBeNull()
+  })
+
+  it('the gate-time own-key prune removes only a beyond-threshold envelope — a fresh own envelope survives it', async () => {
+    seedEnvelope(healthyEnvelope('machine-1', NOW))
+    await classifyAfterRealBoot()
+
+    const { pruneOwnStaleLayoutEnvelope } = await import('@/store/storage-migration')
+    vi.useFakeTimers()
+    vi.setSystemTime(NOW)
+    try {
+      pruneOwnStaleLayoutEnvelope()
+    } finally {
+      vi.useRealTimers()
+    }
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).not.toBeNull()
   })
 })
 

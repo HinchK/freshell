@@ -397,6 +397,168 @@ describe('per-window layout keys', () => {
     expect(localStorage.getItem(LEGACY_LAYOUT_KEY), 'the legacy key is still never deleted').not.toBeNull()
   })
 
+  // ── e3r4 finding 1: claim → copy → confirm-commit ──
+  //
+  // The claim/read-back protocol was not exclusive: the
+  // A-write → A-read → B-write → B-read interleave let both windows read
+  // back their own id and both adopt. And the marker was committed BEFORE
+  // the layout copy, so a quota/write failure at the copy permanently
+  // consumed the one-shot and blocked every later window from adopting.
+  // The protocol is now: claim (tentative marker) → read-back → copy →
+  // post-copy re-verify (confirm-commit). A failed copy rolls the claim
+  // back; a lost post-copy re-verify discards the copied key (absent →
+  // own-snapshot rebuild). HTML webstorage has no atomic test-and-set
+  // (webstorage.html §12.1: "authors are encouraged to assume that there
+  // is no locking mechanism"), so a residual double-adopt window remains
+  // — pinned and documented in the third test below. The complete future
+  // mechanism is navigator.locks (Web Locks API).
+
+  function forwardingProxy(storage: Storage, hook: (prop: string, fn: (...args: any[]) => unknown) => (...args: any[]) => unknown): Storage {
+    return new Proxy(storage, {
+      get(target, prop) {
+        const value = Reflect.get(target, prop, target)
+        if (typeof value === 'function') {
+          const bound = (value as (...args: unknown[]) => unknown).bind(target)
+          return hook(String(prop), bound as (...args: any[]) => unknown)
+        }
+        return value
+      },
+    }) as unknown as Storage
+  }
+
+  it('e3r4 finding 1 (copy-failure rollback): a failed legacy copy does NOT consume the one-shot marker — the claim rolls back and a later window can adopt', async () => {
+    seedWindow(WINDOW_B_ID)
+    localStorage.setItem(LEGACY_LAYOUT_KEY, envelopeFor('tab-legacy'))
+
+    // setItem for THIS window's derived key throws (quota): the copy
+    // fails AFTER the claim was written.
+    const rejecting = forwardingProxy(localStorage, (prop, fn) => {
+      if (prop !== 'setItem') return fn
+      return (key: string, value: string) => {
+        if (key === KEY_B) throw new Error('QuotaExceededError (test)')
+        return fn(key, value)
+      }
+    })
+    vi.stubGlobal('localStorage', rejecting)
+    try {
+      await bootFreshModules()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+
+    expect(localStorage.getItem(KEY_B), 'the failed copy left no envelope').toBeNull()
+    expect(localStorage.getItem(LEGACY_ADOPTION_MARKER_KEY), 'the claim rolled back — the one-shot is NOT consumed').toBeNull()
+
+    // The one-shot survives for a later fresh window.
+    seedWindow('layout-window-later')
+    await bootFreshModules()
+    expect(localStorage.getItem('freshell.layout.v3.layout-window-later'), 'a later window adopts after the rolled-back claim').not.toBeNull()
+    expect(localStorage.getItem(LEGACY_LAYOUT_KEY), 'the legacy key is still never deleted').not.toBeNull()
+  })
+
+  it('e3r4 finding 1 (post-copy re-verify): the A/A/B/B interleave converges to exactly ONE adopter — B keeps, A discards and takes the absent path', async () => {
+    // The reviewer's exact named interleave: A-write → A-read → B-write →
+    // B-read — both windows read back their own id and both copy. Window
+    // A boots with B's claim landing right after A's copy (inside the
+    // interleave window), so A's post-copy re-verify must see B's claim.
+    seedWindow(WINDOW_A_ID)
+    localStorage.setItem(LEGACY_LAYOUT_KEY, envelopeFor('tab-legacy'))
+    const claimB = JSON.stringify({ version: 1, ownerId: WINDOW_B_ID, adoptedAt: NOW })
+    const foreignClaimLandsAfterOurCopy = forwardingProxy(localStorage, (prop, fn) => {
+      if (prop !== 'setItem') return fn
+      return (key: string, value: string) => {
+        const result = fn(key, value)
+        if (key === KEY_A) fn(LEGACY_ADOPTION_MARKER_KEY, claimB)
+        return result
+      }
+    })
+    vi.stubGlobal('localStorage', foreignClaimLandsAfterOurCopy)
+    try {
+      await bootFreshModules()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+
+    expect(localStorage.getItem(KEY_A), 'window A discarded its copied envelope after losing the claim').toBeNull()
+    expect(JSON.parse(localStorage.getItem(LEGACY_ADOPTION_MARKER_KEY)!).ownerId).toBe(WINDOW_B_ID)
+
+    // Window B's side of the same interleave: B passed the marker-absent
+    // check BEFORE A claimed (that is what A/A/B/B means), so B's boot
+    // replays that check against a null marker, then claims/copies.
+    seedWindow(WINDOW_B_ID)
+    let markerAbsentCheckReplayed = false
+    const bSideSeesPreClaimMarker = forwardingProxy(localStorage, (prop, fn) => {
+      if (prop !== 'getItem') return fn
+      return (key: string, ...rest: unknown[]) => {
+        const value = fn(key, ...rest) as string | null
+        if (key === LEGACY_ADOPTION_MARKER_KEY && !markerAbsentCheckReplayed && value !== null) {
+          markerAbsentCheckReplayed = true
+          return null
+        }
+        return value
+      }
+    })
+    vi.stubGlobal('localStorage', bSideSeesPreClaimMarker)
+    try {
+      await bootFreshModules()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+
+    expect(localStorage.getItem(KEY_B), 'window B — the surviving claimant — keeps the adopted envelope').not.toBeNull()
+    expect(localStorage.getItem(KEY_A), 'exactly one adopter: window A stays absent (own-snapshot rebuild)').toBeNull()
+    expect(JSON.parse(localStorage.getItem(LEGACY_ADOPTION_MARKER_KEY)!).ownerId).toBe(WINDOW_B_ID)
+  })
+
+  it('e3r4 finding 1 (documented residual): when the claim survives our re-verify BEFORE a foreign claimant\u2019s write lands, both windows adopt the SAME shared legacy envelope — the irreducible bound without an atomic test-and-set', async () => {
+    // The residual, documented rather than silently ignored: A completes
+    // claim → read → copy → re-verify with NO foreign write in between
+    // (the claim legitimately survived); B — which had already passed the
+    // absent checks — then claims, reads back its own id, copies, and
+    // re-verifies its own id. Both keep identical copies of the SAME
+    // shared legacy envelope: the worst case equals the pre-upgrade
+    // shared-envelope behavior for exactly those two simultaneously
+    // booting windows; every later window is still gated by the
+    // marker-present check. HTML webstorage has no atomic test-and-set —
+    // each single getItem/setItem is atomic against the shared map, but
+    // the spec promises no locking across agent clusters
+    // (webstorage.html §12.1). navigator.locks (Web Locks API) is the
+    // complete future mechanism; this path deliberately stays
+    // dependency-free.
+    seedWindow(WINDOW_A_ID)
+    localStorage.setItem(LEGACY_LAYOUT_KEY, envelopeFor('tab-legacy'))
+    await bootFreshModules()
+    expect(localStorage.getItem(KEY_A), 'window A adopted cleanly (no interleaving)').not.toBeNull()
+    expect(JSON.parse(localStorage.getItem(LEGACY_ADOPTION_MARKER_KEY)!).ownerId).toBe(WINDOW_A_ID)
+
+    seedWindow(WINDOW_B_ID)
+    let markerAbsentCheckReplayed = false
+    const bSideSeesPreClaimMarker = forwardingProxy(localStorage, (prop, fn) => {
+      if (prop !== 'getItem') return fn
+      return (key: string, ...rest: unknown[]) => {
+        const value = fn(key, ...rest) as string | null
+        if (key === LEGACY_ADOPTION_MARKER_KEY && !markerAbsentCheckReplayed && value !== null) {
+          markerAbsentCheckReplayed = true
+          return null
+        }
+        return value
+      }
+    })
+    vi.stubGlobal('localStorage', bSideSeesPreClaimMarker)
+    try {
+      await bootFreshModules()
+    } finally {
+      vi.unstubAllGlobals()
+    }
+
+    expect(localStorage.getItem(KEY_B), 'the residual: B also adopts — both hold the SAME shared legacy envelope').not.toBeNull()
+    expect(
+      JSON.parse(localStorage.getItem(KEY_A)!).tabs.tabs.map((t: { id: string }) => t.id),
+      'window A\u2019s earlier adoption is untouched (its flow had already completed)',
+    ).toEqual(['tab-legacy'])
+    expect(JSON.parse(localStorage.getItem(LEGACY_ADOPTION_MARKER_KEY)!).ownerId, 'the last claimant wins the marker').toBe(WINDOW_B_ID)
+  })
+
   it('the single-window upgrade path adopts exactly once: a second boot neither re-adopts nor rewrites the legacy envelope', async () => {
     seedWindow(WINDOW_B_ID)
     const legacyRaw = envelopeFor('tab-adopted')

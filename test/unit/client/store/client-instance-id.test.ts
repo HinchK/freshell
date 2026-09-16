@@ -45,6 +45,47 @@ describe('client-instance-id (stable id under sessionStorage write failure)', ()
     expect(sessionStorage.getItem('freshell.tabs.client-instance-id.v1')).toBeNull()
   })
 
+  it('a rotation whose setItem is rejected stays authoritative in memory — repeated getters keep the rotated id over the stale stored id', async () => {
+    // e3 post-cap finding 3, mirroring perWindowLayoutKeys' remint-rejection
+    // pin: a duplicated tab COPIES the registry client id in sessionStorage,
+    // and the lease-collision rotation rewrites it. When that setItem FAILS
+    // (quota edge), storage keeps the STALE copied id — the getter must
+    // never re-read it over the established rotation, or hello/bootstrap
+    // consumers identify the duplicate as the ORIGINAL while
+    // tabRegistrySync keeps its closure-local rotated id.
+    const COPIED_ID = 'client-copied-original'
+    sessionStorage.setItem('freshell.tabs.client-instance-id.v1', COPIED_ID)
+
+    vi.resetModules()
+    const { getCurrentTabRegistryClientInstanceId, setTabRegistryClientInstanceId } = await import('@/store/client-instance-id')
+
+    // The context first adopts the stored (copied) id, as at real boot —
+    // the initial-boot read-storage semantics are unchanged.
+    expect(getCurrentTabRegistryClientInstanceId()).toBe(COPIED_ID)
+
+    // setItem rejects from here on (jsdom's Storage is a Proxy that
+    // defeats vi.spyOn — stub the global with a forwarding stub).
+    const realSessionStorage = sessionStorage
+    const rejecting = new Proxy(realSessionStorage, {
+      get(target, prop) {
+        if (prop === 'setItem') {
+          return () => { throw new Error('QuotaExceededError (test)') }
+        }
+        const value = Reflect.get(target, prop, target)
+        return typeof value === 'function' ? (value as (...args: unknown[]) => unknown).bind(target) : value
+      },
+    })
+    vi.stubGlobal('sessionStorage', rejecting)
+    try {
+      setTabRegistryClientInstanceId('client-rotated-duplicate')
+      expect(getCurrentTabRegistryClientInstanceId(), 'the rotated id is authoritative, not the stale stored id').toBe('client-rotated-duplicate')
+      expect(getCurrentTabRegistryClientInstanceId(), 'repeated getter calls keep the rotated id').toBe('client-rotated-duplicate')
+      expect(realSessionStorage.getItem('freshell.tabs.client-instance-id.v1'), 'the storage write genuinely failed — the stale copied id is still stored').toBe(COPIED_ID)
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
   it('a full persistence flush under the same quota condition writes and broadcasts under ONE layout key', async () => {
     simulateQuotaExhaustedSessionStorage()
 

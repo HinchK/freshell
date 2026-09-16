@@ -516,4 +516,87 @@ describe('storage-migration', () => {
     expect(parsed).not.toBeNull()
     expect(parsed?.machineId).toBe('machine-stamp-1')
   })
+
+  // e3 post-cap finding 2: the migration-boot prune sweep deleted THIS
+  // window's beyond-threshold envelope BEFORE the App classifier ran, so a
+  // real stale boot classified (and logged) 'absent' — never 'stale'. The
+  // sweep now spares the own key; the App gate's deferred own-key prune
+  // (pruneOwnStaleLayoutEnvelope) retires it after the keep-vs-rebuild
+  // decision, while the sweep keeps pruning OTHER windows' abandoned keys.
+  function layoutEnvelopeFixture(persistedAt: number): Record<string, unknown> {
+    return {
+      persistedAt,
+      version: 4,
+      machineId: 'machine-sweep-1',
+      tabs: {
+        activeTabId: 'tab-1',
+        tabs: [{ id: 'tab-1', title: 'Work', createdAt: 1, updatedAt: 1 }],
+      },
+      panes: {
+        version: 7,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'editor',
+              filePath: '/tmp/a.md',
+              language: null,
+              readOnly: false,
+              content: '',
+              viewMode: 'source',
+              wordWrap: true,
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }
+  }
+
+  it('the boot sweep spares THIS window’s stale envelope for the classifier but still prunes other windows’ stale keys (e3 post-cap finding 2)', async () => {
+    localStorage.setItem('freshell_version', '5')
+    const stalePersistedAt = Date.now() - 8 * 24 * 60 * 60 * 1000
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(layoutEnvelopeFixture(stalePersistedAt)))
+    const otherStaleKey = 'freshell.layout.v3.client-other-window'
+    localStorage.setItem(otherStaleKey, JSON.stringify(layoutEnvelopeFixture(stalePersistedAt)))
+    const otherFreshKey = 'freshell.layout.v3.client-fresh-window'
+    localStorage.setItem(otherFreshKey, JSON.stringify(layoutEnvelopeFixture(Date.now())))
+
+    const module = await importFreshStorageMigration()
+
+    // Hygiene intact: OTHER windows' abandoned keys are pruned by the
+    // boot sweep, fresh ones kept.
+    expect(localStorage.getItem(otherStaleKey)).toBeNull()
+    expect(localStorage.getItem(otherFreshKey)).not.toBeNull()
+    // The classifier's input survived: the own stale envelope is still
+    // there for classifyPersistedLayoutHealth (the migration rewrite
+    // preserves persistedAt).
+    const ownRaw = localStorage.getItem(LAYOUT_STORAGE_KEY)
+    expect(ownRaw).not.toBeNull()
+    expect(JSON.parse(ownRaw!).persistedAt).toBe(stalePersistedAt)
+
+    // The gate-time prune (called by App after the decision) removes the
+    // own stale envelope together with its channels.
+    localStorage.setItem(`${LAYOUT_STORAGE_KEY}.bak`, 'stale-backup')
+    ;(module.pruneOwnStaleLayoutEnvelope as () => void)()
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).toBeNull()
+    expect(localStorage.getItem(`${LAYOUT_STORAGE_KEY}.bak`)).toBeNull()
+  })
+
+  it('the gate-time own-key prune keeps a fresh envelope and no-ops an absent one', async () => {
+    localStorage.setItem('freshell_version', '5')
+    localStorage.setItem(LAYOUT_STORAGE_KEY, JSON.stringify(layoutEnvelopeFixture(Date.now())))
+
+    const module = await importFreshStorageMigration()
+    ;(module.pruneOwnStaleLayoutEnvelope as () => void)()
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).not.toBeNull()
+
+    localStorage.removeItem(LAYOUT_STORAGE_KEY)
+    ;(module.pruneOwnStaleLayoutEnvelope as () => void)()
+    expect(localStorage.getItem(LAYOUT_STORAGE_KEY)).toBeNull()
+  })
 })

@@ -108,6 +108,16 @@ function nonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined
 }
 
+/** The validity rule for a persisted machine id STAMP (layout envelope
+ * machineId fields): valid only when nonEmptyString accepts it — non-empty
+ * after trimming, so whitespace-only is empty. An invalid PRESENT value is
+ * malformed metadata, never a legacy absence (legacy absence is the key
+ * being ABSENT from the envelope); the Rust recovery API rejects an empty
+ * machineId the same way. */
+export function isValidMachineIdStamp(value: unknown): boolean {
+  return nonEmptyString(value) !== undefined
+}
+
 function readSelections(storage: Pick<Storage, 'getItem'> | undefined): MachineSelectionMap {
   if (!storage) return {}
   try {

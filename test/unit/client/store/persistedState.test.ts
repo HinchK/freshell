@@ -351,6 +351,59 @@ describe('persistedState parsers', () => {
       })
       expect(parsePersistedLayoutRaw(raw)).toBeNull()
     })
+
+    // Delta r5 finding 1: present-but-malformed top-level metadata is
+    // corruption, not a legacy absence. The parse used to coerce a
+    // non-string machineId (or a non-number persistedAt) to undefined, so
+    // a corrupt envelope parsed as unstamped legacy — the boot classifier
+    // kept it and the healthy path's stamp backfill relabeled it as the
+    // currently selected machine. Only genuinely ABSENT keys keep the
+    // legacy meaning.
+    function metadataEnvelope(metadata: Record<string, unknown>): string {
+      return JSON.stringify({
+        version: 4,
+        ...metadata,
+        tabs: { activeTabId: 'tab-a', tabs: [{ id: 'tab-a', title: 'A', createdAt: 1 }] },
+        panes: { version: PANES_SCHEMA_VERSION, layouts: {}, activePane: {}, paneTitles: {}, paneTitleSetByUser: {} },
+        tombstones: [],
+      })
+    }
+
+    it('returns null when machineId is present but not a string (malformed stamp — corruption, not legacy absence)', () => {
+      expect(parsePersistedLayoutRaw(metadataEnvelope({ machineId: 123 }))).toBeNull()
+      expect(parsePersistedLayoutRaw(metadataEnvelope({ machineId: null }))).toBeNull()
+    })
+
+    // e5r2: an empty-string machineId is the same malformed class — the
+    // validity rule follows machine-identity.ts's nonEmptyString
+    // normalization, which TRIMS, so whitespace-only values are empty too.
+    // Legacy absence is the key being ABSENT from the envelope, never a
+    // present-but-empty value (the Rust recovery API rejects "" the same
+    // way); letting it parse kept a possibly wrong-machine workspace as
+    // healthy legacy and the stamp backfill relabeled it.
+    it('returns null when machineId is present but empty or whitespace-only (malformed stamp — corruption, not legacy absence)', () => {
+      expect(parsePersistedLayoutRaw(metadataEnvelope({ machineId: '' }))).toBeNull()
+      expect(parsePersistedLayoutRaw(metadataEnvelope({ machineId: '   ' }))).toBeNull()
+    })
+
+    it('returns null when persistedAt is present but not a number (malformed stamp)', () => {
+      expect(parsePersistedLayoutRaw(metadataEnvelope({ persistedAt: 'recently' }))).toBeNull()
+      expect(parsePersistedLayoutRaw(metadataEnvelope({ persistedAt: null }))).toBeNull()
+    })
+
+    it('still parses an envelope with absent machineId and absent persistedAt (legitimate legacy absence)', () => {
+      const parsed = parsePersistedLayoutRaw(metadataEnvelope({}))
+      expect(parsed).not.toBeNull()
+      expect(parsed!.machineId).toBeUndefined()
+      expect(parsed!.persistedAt).toBeUndefined()
+    })
+
+    it('still parses an unstamped envelope with a valid persistedAt (legacy machine-id absence)', () => {
+      const parsed = parsePersistedLayoutRaw(metadataEnvelope({ persistedAt: 1234 }))
+      expect(parsed).not.toBeNull()
+      expect(parsed!.machineId).toBeUndefined()
+      expect(parsed!.persistedAt).toBe(1234)
+    })
   })
 
   describe('parsePersistedPanesRaw', () => {

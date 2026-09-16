@@ -327,6 +327,90 @@ describe('persistedState fresh-agent migration', () => {
     }) as Storage)).toBe(currentRaw)
   })
 
+  // e5r1: the recoverable-read fallback must distinguish parse-level
+  // failure classes. It historically treated ANY parse failure as a
+  // reason to select the surviving backup, but the r5 metadata refusal
+  // made present-but-malformed machineId/persistedAt a parse failure too
+  // — so a corrupt CURRENT layout selected the older backup and the boot
+  // never saw the corruption. The backup fallback is for STRUCTURALLY
+  // destroyed primaries only; a metadata-malformed primary must flow
+  // through as the corrupt evidence the boot classifier needs.
+  it('keeps a metadata-malformed primary (machineId present but not a string) when a backup exists — no backup swap', () => {
+    const backupRaw = layoutRaw({
+      'tab-1': leaf('pane-backup', { kind: 'terminal', mode: 'shell' }),
+    })
+    const malformedRaw = JSON.stringify({
+      ...JSON.parse(layoutRaw({ 'tab-1': leaf('pane-current', { kind: 'terminal', mode: 'codex' }) })),
+      machineId: 123,
+    })
+
+    expect(readRecoverablePersistedLayoutRaw(storageWith({
+      [LAYOUT_STORAGE_KEY]: malformedRaw,
+      [LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY]: backupRaw,
+    }) as Storage)).toBe(malformedRaw)
+  })
+
+  it('keeps a metadata-malformed primary (persistedAt present but not a number) when a backup exists — no backup swap', () => {
+    const backupRaw = layoutRaw({
+      'tab-1': leaf('pane-backup', { kind: 'terminal', mode: 'shell' }),
+    })
+    const malformedRaw = JSON.stringify({
+      ...JSON.parse(layoutRaw({ 'tab-1': leaf('pane-current', { kind: 'terminal', mode: 'codex' }) })),
+      persistedAt: 'recently',
+    })
+
+    expect(readRecoverablePersistedLayoutRaw(storageWith({
+      [LAYOUT_STORAGE_KEY]: malformedRaw,
+      [LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY]: backupRaw,
+    }) as Storage)).toBe(malformedRaw)
+  })
+
+  // e5r2: the empty-string machineId is the same metadata-malformed
+  // class. parseLayoutStructure stays structural-only — an empty stamp
+  // must NOT select the backup; the malformed PRIMARY is the corrupt
+  // evidence the boot classifier needs.
+  it('keeps an empty-string machineId primary when a backup exists — no backup swap (e5r2)', () => {
+    const backupRaw = layoutRaw({
+      'tab-1': leaf('pane-backup', { kind: 'terminal', mode: 'shell' }),
+    })
+    const malformedRaw = JSON.stringify({
+      ...JSON.parse(layoutRaw({ 'tab-1': leaf('pane-current', { kind: 'terminal', mode: 'codex' }) })),
+      machineId: '',
+    })
+
+    expect(readRecoverablePersistedLayoutRaw(storageWith({
+      [LAYOUT_STORAGE_KEY]: malformedRaw,
+      [LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY]: backupRaw,
+    }) as Storage)).toBe(malformedRaw)
+  })
+
+  it('still selects the backup when the primary is structurally destroyed (JSON garbage, wrong shape, or a newer schema version)', () => {
+    const backupRaw = layoutRaw({
+      'tab-1': leaf('pane-backup', { kind: 'terminal', mode: 'shell' }),
+    })
+
+    expect(readRecoverablePersistedLayoutRaw(storageWith({
+      [LAYOUT_STORAGE_KEY]: '{ not json',
+      [LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY]: backupRaw,
+    }) as Storage)).toBe(backupRaw)
+
+    expect(readRecoverablePersistedLayoutRaw(storageWith({
+      [LAYOUT_STORAGE_KEY]: '{"version":3,"unexpected":"shape"}',
+      [LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY]: backupRaw,
+    }) as Storage)).toBe(backupRaw)
+
+    const tooNewRaw = JSON.stringify({
+      version: 999,
+      tabs: { activeTabId: null, tabs: [] },
+      panes: { version: 6, layouts: {}, activePane: {}, paneTitles: {}, paneTitleSetByUser: {} },
+      tombstones: [],
+    })
+    expect(readRecoverablePersistedLayoutRaw(storageWith({
+      [LAYOUT_STORAGE_KEY]: tooNewRaw,
+      [LAYOUT_FRESH_AGENT_BACKUP_STORAGE_KEY]: backupRaw,
+    }) as Storage)).toBe(backupRaw)
+  })
+
   it('ignores a stale marker and keeps the current valid layout', () => {
     const backupRaw = layoutRaw({
       'tab-1': leaf('pane-backup', { kind: 'terminal', mode: 'shell' }),

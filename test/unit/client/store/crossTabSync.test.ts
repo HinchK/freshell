@@ -2258,6 +2258,171 @@ describe('crossTabSync', () => {
     expect(store.getState().panes.paneTitles['t1']?.['pane-a'], 'an older remote title never overwrites').toBe('Local title')
   })
 
+  it('e3r4 finding 3: a foreign no-op flush never raises the recency floor — a different window\u2019s strictly-newer title still applies (the reviewer\u2019s exact ordering)', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+    seedLocalWorkspace(store)
+
+    // The receiver's own durable envelope: persistedAt 100 is what install
+    // seeds the recency floor from.
+    localStorage.setItem(OWN_LAYOUT_KEY, JSON.stringify({
+      version: 3,
+      persistedAt: 100,
+      tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'T1', createdAt: 1 }] },
+      panes: {
+        version: 6,
+        layouts: {
+          't1': {
+            type: 'leaf',
+            id: 'pane-a',
+            content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-a', status: 'running' },
+          },
+        },
+        activePane: { 't1': 'pane-a' },
+        paneTitles: { 't1': { 'pane-a': 'Local title' } },
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    // Window W1 (another window) flushes a NO-OP envelope at 300: it
+    // shares no panes with the receiver and delivers no titles — but its
+    // parse used to advance the recency floor to 300 anyway.
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: 'freshell.layout.v3.layout-window-w1',
+      newValue: JSON.stringify({
+        version: 3,
+        persistedAt: 300,
+        tabs: { activeTabId: 't9', tabs: [{ id: 't9', title: 'T9', createdAt: 9 }] },
+        panes: { version: 6, layouts: {}, activePane: {}, paneTitles: {}, paneTitleSetByUser: {} },
+        tombstones: [],
+      }),
+    }))
+
+    // Window W2 (a different window) delivers a title at 200 — not newer
+    // than W1's 300, but strictly newer than the receiver's OWN envelope
+    // (100), so it must apply. Deliveries from independent windows have no
+    // cross-source total ordering, so only the receiver's own envelope may
+    // set the floor.
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: 'freshell.layout.v3.layout-window-w2',
+      newValue: JSON.stringify({
+        version: 3,
+        persistedAt: 200,
+        tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'T1', createdAt: 1 }] },
+        panes: {
+          version: 6,
+          layouts: {
+            't1': {
+              type: 'leaf',
+              id: 'pane-a',
+              content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-a', status: 'running' },
+            },
+          },
+          activePane: { 't1': 'pane-a' },
+          paneTitles: { 't1': { 'pane-a': 'Title from window two' } },
+          paneTitleSetByUser: {},
+        },
+        tombstones: [],
+      }),
+    }))
+
+    expect(store.getState().panes.paneTitles['t1']?.['pane-a'], 'the strictly-newer-than-local title applies — the foreign no-op never moved the floor').toBe('Title from window two')
+  })
+
+  it('delta r4 finding 2: an APPLIED foreign title-only event advances the recency floor immediately — another window\u2019s older pre-flush title is rejected (the reviewer\u2019s exact ordering)', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+    })
+    seedLocalWorkspace(store)
+
+    // The receiver's own durable envelope: persistedAt 100 is what install
+    // seeds the recency floor from.
+    localStorage.setItem(OWN_LAYOUT_KEY, JSON.stringify({
+      version: 3,
+      persistedAt: 100,
+      tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'T1', createdAt: 1 }] },
+      panes: {
+        version: 6,
+        layouts: {
+          't1': {
+            type: 'leaf',
+            id: 'pane-a',
+            content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-a', status: 'running' },
+          },
+        },
+        activePane: { 't1': 'pane-a' },
+        paneTitles: { 't1': { 'pane-a': 'Local title' } },
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    cleanups.push(installCrossTabSync(store as any))
+
+    // Window W1 delivers a title at 300 — strictly newer than the floor
+    // (100) — and it APPLIES (the shared pane adopts W1's title). The
+    // floor must advance to 300 IMMEDIATELY: the receiver's debounced
+    // (~500ms) persistence flush is too late to guard the window where a
+    // second window's OLDER title is still newer than the stale floor.
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: 'freshell.layout.v3.layout-window-w1',
+      newValue: JSON.stringify({
+        version: 3,
+        persistedAt: 300,
+        tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'T1', createdAt: 1 }] },
+        panes: {
+          version: 6,
+          layouts: {
+            't1': {
+              type: 'leaf',
+              id: 'pane-a',
+              content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-a', status: 'running' },
+            },
+          },
+          activePane: { 't1': 'pane-a' },
+          paneTitles: { 't1': { 'pane-a': 'Title from window one' } },
+          paneTitleSetByUser: {},
+        },
+        tombstones: [],
+      }),
+    }))
+
+    expect(store.getState().panes.paneTitles['t1']?.['pane-a'], 'the strictly-newer title applies').toBe('Title from window one')
+
+    // Window W2's OLDER title (200) arrives PRE-FLUSH: against the
+    // unchanged floor (100) it would apply and overwrite W1's newer
+    // title — the regression the reviewer found, which the flush then
+    // makes durable. Against the advanced floor (300) it is rejected.
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: 'freshell.layout.v3.layout-window-w2',
+      newValue: JSON.stringify({
+        version: 3,
+        persistedAt: 200,
+        tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'T1', createdAt: 1 }] },
+        panes: {
+          version: 6,
+          layouts: {
+            't1': {
+              type: 'leaf',
+              id: 'pane-a',
+              content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-a', status: 'running' },
+            },
+          },
+          activePane: { 't1': 'pane-a' },
+          paneTitles: { 't1': { 'pane-a': 'Title from window two' } },
+          paneTitleSetByUser: {},
+        },
+        tombstones: [],
+      }),
+    }))
+
+    expect(store.getState().panes.paneTitles['t1']?.['pane-a'], 'the older pre-flush title is rejected against the floor the APPLIED event advanced').toBe('Title from window one')
+  })
+
   it('keeps user-set pane titles against another window\u2019s NEWER flush (title-only path)', () => {
     const store = configureStore({
       reducer: { tabs: tabsReducer, panes: panesReducer },
@@ -2517,5 +2682,144 @@ describe('crossTabSync', () => {
     })
 
     expect(store.getState().panes).toBe(before)
+  })
+
+  // ── delta r5 finding 2: post-remint own-key staleness ──
+  //
+  // installCrossTabSync captures its ownLayoutKey once at install, but the
+  // tab-registry lease-collision rotation can remint the layout-window id
+  // mid-session (tabRegistrySync.rotateClientInstanceIdAfterCollision →
+  // window-layout-keys remintLayoutWindowId — a duplicated tab keeps the
+  // OLD id, the duplicate remints to a fresh one). handleIncomingRaw
+  // already resolves the key dynamically, so an OLD-key event after a
+  // remint is title-only there — but the floor-advance/classification
+  // lines used the captured key: a post-remint OLD-key event was still
+  // classified as the receiver's own key, advancing the recency floor even
+  // on a no-op and letting it reject another window's strictly-newer
+  // title delivery. These tests use a fresh module realm because the
+  // remint's in-memory id is sticky for the realm's lifetime and must not
+  // leak into the shared module instances the other tests use.
+  async function installRemintedSyncFixture(): Promise<{ store: any; oldKey: string }> {
+    const OLD_WINDOW_ID = 'client-remint-routing'
+    const OLD_KEY = `freshell.layout.v3.${OLD_WINDOW_ID}`
+    sessionStorage.setItem(LAYOUT_WINDOW_ID_STORAGE_KEY, OLD_WINDOW_ID)
+    localStorage.setItem(OLD_KEY, JSON.stringify({
+      version: 3,
+      persistedAt: 100,
+      tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'T1', createdAt: 1 }] },
+      panes: {
+        version: 6,
+        layouts: {
+          't1': { type: 'leaf', id: 'pane-a', content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-a', status: 'running' } },
+        },
+        activePane: { 't1': 'pane-a' },
+        paneTitles: { 't1': { 'pane-a': 'Local title' } },
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    }))
+
+    vi.resetModules()
+    const { configureStore: freshConfigureStore } = await import('@reduxjs/toolkit')
+    const { default: freshTabsReducer } = await import('@/store/tabsSlice')
+    const { default: freshPanesReducer } = await import('@/store/panesSlice')
+    const { installCrossTabSync: freshInstallCrossTabSync } = await import('@/store/crossTabSync')
+    const { remintLayoutWindowId } = await import('@/store/window-layout-keys')
+
+    const store = freshConfigureStore({
+      reducer: { tabs: freshTabsReducer, panes: freshPanesReducer },
+    })
+    expect(store.getState().tabs.tabs.map((t: any) => t.id), 'the module-init loaders read the OLD-key envelope').toEqual(['t1'])
+    cleanups.push(freshInstallCrossTabSync(store as any))
+    remintLayoutWindowId()
+    return { store, oldKey: OLD_KEY }
+  }
+
+  function oldKeyEventRaw(persistedAt: number, options: { sharedPaneTitle?: string } = {}): string {
+    const layouts = options.sharedPaneTitle === undefined
+      ? {}
+      : {
+        't1': { type: 'leaf', id: 'pane-a', content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-a', status: 'running' } },
+      }
+    return JSON.stringify({
+      version: 3,
+      persistedAt,
+      tabs: { activeTabId: 't9', tabs: [{ id: 't9', title: 'T9', createdAt: 9 }] },
+      panes: {
+        version: 6,
+        layouts,
+        activePane: {},
+        paneTitles: options.sharedPaneTitle === undefined ? {} : { 't1': { 'pane-a': options.sharedPaneTitle } },
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    })
+  }
+
+  function windowTwoTitleRaw(persistedAt: number, title: string): string {
+    return JSON.stringify({
+      version: 3,
+      persistedAt,
+      tabs: { activeTabId: 't1', tabs: [{ id: 't1', title: 'T1', createdAt: 1 }] },
+      panes: {
+        version: 6,
+        layouts: {
+          't1': { type: 'leaf', id: 'pane-a', content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-a', status: 'running' } },
+        },
+        activePane: { 't1': 'pane-a' },
+        paneTitles: { 't1': { 'pane-a': title } },
+        paneTitleSetByUser: {},
+      },
+      tombstones: [],
+    })
+  }
+
+  it('delta r5 finding 2: after a remint, an OLD-key NO-OP event never advances the recency floor — a strictly-newer other-window title still applies', async () => {
+    const { store, oldKey } = await installRemintedSyncFixture()
+
+    // The OLD shared key's event shares no panes and delivers no titles —
+    // a no-op at a HIGHER stamp (300). Post-remint it is a FOREIGN
+    // window's event and must not move the floor.
+    window.dispatchEvent(new StorageEvent('storage', { key: oldKey, newValue: oldKeyEventRaw(300) }))
+
+    // Window W2's title at 200 is not newer than the no-op's 300, but it
+    // IS strictly newer than the receiver's own envelope (100) — with the
+    // floor unmoved it must apply.
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: 'freshell.layout.v3.layout-window-w2',
+      newValue: windowTwoTitleRaw(200, 'Title from window two'),
+    }))
+
+    expect(store.getState().panes.paneTitles['t1']?.['pane-a'], 'the old-key no-op never moved the floor').toBe('Title from window two')
+  })
+
+  it('delta r5 finding 2: after a remint, an APPLIED old-key title event advances the floor immediately — another window\u2019s older pre-flush title is rejected (the delta r4 rule travels with the foreign classification)', async () => {
+    const { store, oldKey } = await installRemintedSyncFixture()
+
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: oldKey,
+      newValue: oldKeyEventRaw(300, { sharedPaneTitle: 'Title from old shared key' }),
+    }))
+    expect(store.getState().panes.paneTitles['t1']?.['pane-a'], 'the strictly-newer old-key title applies title-only').toBe('Title from old shared key')
+
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: 'freshell.layout.v3.layout-window-w2',
+      newValue: windowTwoTitleRaw(200, 'Title from window two'),
+    }))
+
+    expect(store.getState().panes.paneTitles['t1']?.['pane-a'], 'the older pre-flush title is rejected against the floor the APPLIED event advanced').toBe('Title from old shared key')
+  })
+
+  it('delta r5 finding 2: after a remint, an OLD-key event never full-hydrates — no tabs or pane trees are adopted from the pre-rotation shared key', async () => {
+    const { store, oldKey } = await installRemintedSyncFixture()
+
+    window.dispatchEvent(new StorageEvent('storage', {
+      key: oldKey,
+      newValue: oldKeyEventRaw(300, { sharedPaneTitle: 'Title from old shared key' }),
+    }))
+
+    expect(store.getState().tabs.tabs.map((t: any) => t.id), 'the old key no longer adopts the other window\u2019s tabs').toEqual(['t1'])
+    expect((store.getState().panes.layouts['t1'] as any)?.id, 'the local pane tree is not replaced').toBe('pane-a')
+    expect(store.getState().panes.paneTitles['t1']?.['pane-a']).toBe('Title from old shared key')
   })
 })

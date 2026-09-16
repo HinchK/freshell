@@ -2,8 +2,10 @@ import { parsePersistedLayoutRaw, type ParsedPersistedLayout } from '@/store/per
 import { isWellFormedPaneTree } from '@/store/paneTreeValidation'
 import type { TerminalStatus } from '@/store/types'
 import { getPreMigrationLayoutRaw } from '@/store/storage-migration'
-import { LEGACY_FRESHOPENCODE_DEFAULT_MODEL } from '@/store/paneTypes'
+import { LEGACY_FRESHOPENCODE_DEFAULT_MODEL, type SdkSessionStatus } from '@/store/paneTypes'
 import { getWindowLayoutKey, getWindowLayoutPreMigrationRawKey } from '@/store/window-layout-keys'
+import { isValidMachineIdStamp } from '@/lib/machine-identity'
+import { ShellSchema } from '@shared/ws-protocol'
 import { sanitizeRestoreError, sanitizeSessionRef } from '@shared/session-contract'
 import { STALE_LAYOUT_MS } from './stale-layout-threshold'
 
@@ -15,6 +17,25 @@ const TERMINAL_STATUS_SET = new Set<TerminalStatus>([
   'recovering',
   'exited',
   'error',
+])
+
+/** The real client SdkSessionStatus union (src/store/paneTypes.ts:179 —
+ * the persisted FreshAgentPaneContent status field), as a runtime set.
+ * The typed Set constructor pins the members to the union at compile
+ * time. The shared/ws-protocol SdkSessionStatus is the server→client
+ * MESSAGE union (8 members); pane content additionally carries the
+ * client-local 'create-failed' edge, so paneTypes' union is the one
+ * persisted pane content can legitimately hold. */
+const SDK_SESSION_STATUS_SET = new Set<SdkSessionStatus>([
+  'creating',
+  'starting',
+  'connected',
+  'running',
+  'idle',
+  'compacting',
+  'exited',
+  'stuck',
+  'create-failed',
 ])
 
 /** A local layout older than this rebuilds from the server instead of being
@@ -342,6 +363,30 @@ function hasSalvagedLeafContent(
   return false
 }
 
+/** Envelope-metadata discrimination (delta r5 finding 1): a PRESENT but
+ * invalid machineId/persistedAt is corruption, not a legacy absence. The
+ * parse refuses this class outright (parsePersistedLayoutRaw returns
+ * null, persistedState.ts), but the boot migration's rewrite silently
+ * DROPS a malformed machineId and REPLACES a malformed persistedAt with
+ * a fresh stamp (storage-migration.ts migratePersistedLayout), so
+ * post-rewrite the sanitized current raw parses clean and only the
+ * salvage raw — the evidence sidecar outranking this boot's capture —
+ * still shows the malformed value. The same present-but-malformed rule,
+ * applied to the comparison's envelope metadata key coverage: without
+ * it, a corrupted layout from machine A that the migration sanitized
+ * classifies healthy legacy and the boot's stamp backfill relabels it
+ * as machine B. The machineId validity rule follows machine-identity's
+ * nonEmptyString normalization (e5r2): an empty or whitespace-only
+ * string is malformed too, never a legacy absence — legacy absence is
+ * the key being ABSENT from the envelope. */
+function hasMalformedEnvelopeMetadata(
+  rawEnvelope: { machineId?: unknown; persistedAt?: unknown } | undefined,
+): boolean {
+  if (!rawEnvelope) return false
+  if (rawEnvelope.machineId !== undefined && !isValidMachineIdStamp(rawEnvelope.machineId)) return true
+  return rawEnvelope.persistedAt !== undefined && typeof rawEnvelope.persistedAt !== 'number'
+}
+
 /** Aliased-identity check over a (already well-formedness-checked) tree:
  * EVERY node id — split ids AND leaf ids — must be non-empty and unique
  * across the envelope (pane and split ids are minted from the same
@@ -367,65 +412,112 @@ function hasAliasedNodeIds(node: unknown, seenIds: Set<string>): boolean {
 }
 
 /** Content lifecycle invariants over the PARSED pane trees (delta review
- * round 3, finding 3): isWellFormedPaneTree only checks
- * createRequestId/status/mode are STRINGS, so empty createRequestIds,
- * duplicate createRequestIds across terminal panes, non-union statuses,
- * and empty modes all passed while the loader silently heals or the server
- * rejects/dedupes the creates —
- * - an EMPTY createRequestId: the loader mints a fresh nanoid identity
- *   (persistMiddleware migratePaneContent `createRequestId || nanoid()`,
- *   panesSlice normalizePaneContent :79-81), silently losing the pane's
- *   durable terminal binding; the wire schema would reject it outright
- *   (TerminalCreateSchema requestId z.string().min(1),
- *   shared/ws-protocol.ts:468) and the reconcile path answers
- *   missing_create_request_id invalid (crates/freshell-ws/src/reconcile.rs:245).
- * - a DUPLICATE createRequestId across terminal panes: the server's
- *   single-flight create-dedupe ADOPTS the existing live terminal for a
- *   repeated key (crates/freshell-ws/src/terminal.rs:2884-2933 — "a create
- *   whose createRequestId already has a live terminal ADOPTS it"), so both
- *   panes would alias onto ONE PTY, and the reconcile derivation flags
- *   duplicate_create_request_id within one request (reconcile.rs:56-59).
- * - a status outside the TerminalStatus union: no loader normalizes pane
- *   content status (migratePaneContent only heals falsy → 'creating';
- *   panesSlice normalizePaneContent keeps any string), so an unsupported
- *   status installs verbatim.
- * - an EMPTY mode: the load path silently substitutes 'shell'
+ * round 3, finding 3; e3r4 finding 2 extends them beyond terminals):
+ * isWellFormedPaneTree only checks createRequestId/status/mode are
+ * STRINGS, so empty createRequestIds, duplicate createRequestIds across
+ * panes, non-union statuses, and empty modes all passed while the loader
+ * silently heals or the server rejects/dedupes the creates —
+ * - an EMPTY createRequestId (terminal OR fresh-agent): the loader mints
+ *   a fresh nanoid identity (persistMiddleware migratePaneContent
+ *   `createRequestId || nanoid()`, panesSlice normalizePaneContent
+ *   :79-81), silently losing the pane's durable binding; the terminal
+ *   wire schema rejects it outright (TerminalCreateSchema requestId
+ *   z.string().min(1), shared/ws-protocol.ts:468) and the fresh-agent
+ *   one too (FreshAgentCreateSchema requestId z.string().min(1),
+ *   shared/ws-protocol.ts:757), while the reconcile path answers
+ *   missing_create_request_id invalid (crates/freshell-ws/src/
+ *   reconcile.rs:245).
+ * - a DUPLICATE createRequestId across panes (terminal OR fresh-agent —
+ *   one shared envelope-wide set: both kinds mint from the same nanoid
+ *   space, so legit flushes can never alias across kinds either): the
+ *   server's single-flight terminal create-dedupe ADOPTS the existing
+ *   live terminal for a repeated key (crates/freshell-ws/src/terminal.rs:
+ *   2884-2933), so both panes would alias onto ONE PTY; on the
+ *   fresh-agent side the duplicate aliases the request-keyed
+ *   pending-create routing (freshAgent.create is keyed by requestId, so
+ *   both panes would bind one session's created event). The reconcile
+ *   derivation flags duplicate_create_request_id within one request
+ *   (reconcile.rs:56-59).
+ * - a TERMINAL status outside the TerminalStatus union: no loader
+ *   normalizes pane content status (migratePaneContent only heals falsy
+ *   → 'creating'; panesSlice normalizePaneContent keeps any string), so
+ *   an unsupported status installs verbatim.
+ * - a FRESH-AGENT status outside the SdkSessionStatus union: a bogus
+ *   status without a session identity prevents FreshAgentView from ever
+ *   sending a create — the pane reopens dead. The fresh-agent pane's
+ *   "mode" fields (sessionType + provider) need no lifecycle check
+ *   here: the tree-level isPaneContentShape pass the classifier already
+ *   ran pins them against the real FreshAgentSessionType union and the
+ *   resolved runtime provider (paneTreeValidation.ts:65-73).
+ * - an EMPTY terminal mode: the load path silently substitutes 'shell'
  *   (migratePaneContent `mode || 'shell'`), so a mode-wiped CLI pane
  *   reopens as a shell — identity loss. The valid mode set per the
  *   protocol is 'shell' | a non-empty provider string (TabMode,
  *   src/store/types.ts:29; CodingCliProviderSchema z.string().min(1),
  *   shared/ws-protocol.ts:47) — the wire accepts any string, so the
- *   enforceable invariant is exactly non-empty. */
-function hasLifecycleInvalidTerminalContent(node: unknown, seenCreateRequestIds: Set<string>): boolean {
+ *   enforceable invariant is exactly non-empty.
+ * - a TERMINAL shell outside ShellSchema: absent/undefined is the
+ *   loader's 'system' default = healthy, but any other value the wire
+ *   schema rejects survives loading verbatim
+ *   (panesSlice normalizePaneContent keeps any string shell :78) and is
+ *   sent in a rejected terminal.create (ShellSchema,
+ *   shared/ws-protocol.ts:45). */
+function hasLifecycleInvalidPaneContent(node: unknown, seenCreateRequestIds: Set<string>): boolean {
   const n = node as {
     type?: string
-    content?: { kind?: unknown; createRequestId?: unknown; status?: unknown; mode?: unknown }
+    content?: { kind?: unknown; createRequestId?: unknown; status?: unknown; mode?: unknown; shell?: unknown }
     children?: unknown[]
   } | null
   if (!n || typeof n !== 'object') return false
   if (n.type === 'leaf') {
     const content = n.content
-    if (!content || typeof content !== 'object' || content.kind !== 'terminal') return false
-    const createRequestId = content.createRequestId
-    if (typeof createRequestId !== 'string' || createRequestId.length === 0) return true
-    if (seenCreateRequestIds.has(createRequestId)) return true
-    seenCreateRequestIds.add(createRequestId)
-    if (typeof content.status !== 'string' || !TERMINAL_STATUS_SET.has(content.status as TerminalStatus)) return true
-    if (typeof content.mode !== 'string' || content.mode.length === 0) return true
+    if (!content || typeof content !== 'object') return false
+    if (content.kind === 'terminal') {
+      const createRequestId = content.createRequestId
+      if (typeof createRequestId !== 'string' || createRequestId.length === 0) return true
+      if (seenCreateRequestIds.has(createRequestId)) return true
+      seenCreateRequestIds.add(createRequestId)
+      if (typeof content.status !== 'string' || !TERMINAL_STATUS_SET.has(content.status as TerminalStatus)) return true
+      if (typeof content.mode !== 'string' || content.mode.length === 0) return true
+      if (content.shell !== undefined && !ShellSchema.safeParse(content.shell).success) return true
+      return false
+    }
+    if (content.kind === 'fresh-agent') {
+      const createRequestId = content.createRequestId
+      if (typeof createRequestId !== 'string' || createRequestId.length === 0) return true
+      if (seenCreateRequestIds.has(createRequestId)) return true
+      seenCreateRequestIds.add(createRequestId)
+      if (typeof content.status !== 'string' || !SDK_SESSION_STATUS_SET.has(content.status as SdkSessionStatus)) return true
+      return false
+    }
     return false
   }
   for (const child of n.children ?? []) {
-    if (hasLifecycleInvalidTerminalContent(child, seenCreateRequestIds)) return true
+    if (hasLifecycleInvalidPaneContent(child, seenCreateRequestIds)) return true
   }
   return false
 }
+
+/** The App boot gate's deferred own-key prune — implemented in
+ * storage-migration.ts (which owns the envelope-removal machinery) and
+ * re-exported here so the gate keeps a single recovery import boundary
+ * (e3 post-cap finding 2: the migration-boot sweep spares this window's
+ * envelope for the classifier; the gate retires it after its decision). */
+export { pruneOwnStaleLayoutEnvelope } from '@/store/storage-migration'
 
 /** Classify the persisted layout envelope for the machine this boot
  * resolved. Reads only localStorage; no network.
  *
  * - absent:   nothing usable is persisted.
  * - corrupt:  the envelope exists but does not parse, parse-level salvage
- *             dropped invalid tab rows, content-level salvage silently
+ *             dropped invalid tab rows, the envelope carries
+ *             present-but-malformed top-level metadata (a machineId that
+ *             is not a non-empty string — empty and whitespace-only are
+ *             malformed, per machine-identity's normalization, e5r2 — or
+ *             a persistedAt that is not a number; corruption, not a
+ *             legacy absence; refused by the parse, and caught through
+ *             the pre-migration evidence below when the boot migration's
+ *             rewrite dropped or replaced the malformed value), content-level salvage silently
  *             stripped a durable pane-content field (a raw leaf content
  *             key the parsed result dropped, outside the verified
  *             migration set — see hasSalvagedLeafContent), a layout tree
@@ -435,34 +527,36 @@ function hasLifecycleInvalidTerminalContent(node: unknown, seenCreateRequestIds:
  *             non-empty ids, so aliases are corruption by definition),
  *             terminal pane content violates the lifecycle invariants
  *             (an empty or envelope-wide duplicate createRequestId, a
- *             status outside the TerminalStatus union, or an empty mode —
- *             see hasLifecycleInvalidTerminalContent),
+ *             status outside the TerminalStatus union, an empty mode, or
+ *             a shell outside ShellSchema — see
+ *             hasLifecycleInvalidPaneContent),
+ *             fresh-agent pane content violates its lifecycle invariants
+ *             (an empty or envelope-wide duplicate createRequestId —
+ *             shared with terminals, both kinds mint from the same
+ *             nanoid space — or a status outside the SdkSessionStatus
+ *             union; its sessionType/provider "mode" fields are already
+ *             pinned by the tree-level isPaneContentShape check),
  *             referential integrity is broken (a layout entry without its
  *             tab, or a tab without its layout entry), or an active
  *             reference is missing/dangling (activeTabId not a parsed tab
  *             while tabs are non-empty; activePane[tabId] absent or not a
  *             leaf of that tab's layout).
  * - foreign: IFF the envelope is STAMPED and the stamp names a different
- *            machine, OR (#774 merged) the boot peeked an ARMED
- *            active-selection marker (the chooser pick's one-shot
- *            sessionStorage mark) and the envelope is UNSTAMPED — the
- *            marker proves the machine was actively chosen, so an
- *            unstamped legacy envelope cannot be assumed local (it may
- *            be the previous machine's cache). A STAMPED same-machine
- *            healthy layout still keeps under an armed marker: the stamp
- *            is the stronger origin proof, and Choice B window
- *            sovereignty wins over #774's clear-on-active-choice. An
- *            UNARMED unstamped envelope is legacy (pre-stamp) data
- *            assumed local — it can never classify foreign, so a natural
- *            reload of a remembered selection keeps a healthy unstamped
- *            layout; Task 2's stamp backfill makes unstamped a one-boot
- *            transitional state.
- *            Accepted migration residual: an unarmed unstamped envelope
- *            that actually belonged to a different machine (an origin
- *            remap before the first boot of this code) is mis-kept for
- *            one boot under this rule; the backfill then stamps it with
- *            the resolved machine id, so every later boot classifies
- *            correctly.
+ *            machine — the stamp's positive proof. An UNSTAMPED (legacy,
+ *            pre-stamp) envelope is assumed local and never classifies
+ *            foreign, armed marker or not (delta r4): unstamped data
+ *            cannot prove machine ownership either way, so the chooser's
+ *            armed marker alone must not demote a healthy layout — a
+ *            same-machine re-pick KEEPS it (the accepted requirement; a
+ *            forced rebuild would discard the exact split arrangement
+ *            and pane labels), and the healthy boot's stamp backfill
+ *            makes unstamped a one-boot transitional state.
+ *            Accepted migration residual: a different-machine pick during
+ *            that transition (armed or unarmed) also keeps the local
+ *            layout — pre-upgrade-consistent (unstamped was never
+ *            foreign before stamps existed) and bounded to the transition;
+ *            the backfill stamp ends the window and every later boot
+ *            classifies correctly.
  * - stale:   older than STALE_LAYOUT_MS.
  * - healthy: everything else — the window keeps its local layout. */
 export function classifyPersistedLayoutHealth(
@@ -471,8 +565,11 @@ export function classifyPersistedLayoutHealth(
     now?: number
     storage?: Storage
     /** True when the boot peeked the chooser's armed active-selection
-     * marker (#774): an otherwise-healthy UNSTAMPED envelope then
-     * classifies foreign (see the foreign case above). */
+     * marker (#774). Delta r4: the marker no longer demotes an otherwise
+     * healthy UNSTAMPED envelope (a same-machine re-pick keeps it — see
+     * the foreign case above), so it has no classification effect here;
+     * foreignness requires the stamp's positive proof. The boot gate still
+     * passes it as part of its peek→classify→consume protocol. */
     activeSelection?: boolean
   } = {},
 ): PersistedLayoutHealth {
@@ -508,11 +605,11 @@ export function classifyPersistedLayoutHealth(
   // z.unknown while paneTreeValidation only checks typeof id === 'string'
   // — so without this check a corrupt-cache state classifies healthy.
   const seenNodeIds = new Set<string>()
-  const seenTerminalCreateRequestIds = new Set<string>()
+  const seenCreateRequestIds = new Set<string>()
   for (const layout of Object.values(parsed.panes?.layouts ?? {})) {
     if (!isWellFormedPaneTree(layout)) return 'corrupt'
     if (hasAliasedNodeIds(layout, seenNodeIds)) return 'corrupt'
-    if (hasLifecycleInvalidTerminalContent(layout, seenTerminalCreateRequestIds)) return 'corrupt'
+    if (hasLifecycleInvalidPaneContent(layout, seenCreateRequestIds)) return 'corrupt'
   }
   // Parse-level salvage drops rows SILENTLY (persistedState.ts salvageTabs
   // :88-102 — one structurally-invalid tab is dropped while the rest parse),
@@ -561,13 +658,22 @@ export function classifyPersistedLayoutHealth(
   const salvageRaw = readPreMigrationEvidenceRaw(storage)
     ?? getPreMigrationLayoutRaw()
     ?? raw
-  let salvageEnvelope: { panes?: { layouts?: unknown } } | undefined
+  let salvageEnvelope: { panes?: { layouts?: unknown }; machineId?: unknown; persistedAt?: unknown } | undefined
   try {
     salvageEnvelope = JSON.parse(salvageRaw)
   } catch {
     salvageEnvelope = undefined
   }
   if (hasSalvagedLeafContent(salvageEnvelope, parsed)) return 'corrupt'
+  // The comparison's envelope METADATA key coverage (delta r5 finding 1):
+  // a salvage raw whose machineId is present but not a non-empty string
+  // (empty/whitespace-only included, e5r2), or whose persistedAt is
+  // present but not a number, is the malformed class the migration's
+  // rewrite dropped or replaced — the sanitized current raw must not
+  // slide through as healthy legacy. (When the salvage raw IS the
+  // current raw, the parse-level refusal already classified it corrupt
+  // before this point, so this check is a no-op there.)
+  if (hasMalformedEnvelopeMetadata(salvageEnvelope)) return 'corrupt'
   // Referential integrity, BOTH directions — verified against the actual
   // loaders: a layout entry whose tabId is not among the parsed tabs is
   // DROPPED at load (cleanOrphanedLayouts, panesSlice.ts:328-371, called
@@ -634,19 +740,22 @@ export function classifyPersistedLayoutHealth(
       if (!layout || !collectLeafIdsOf(layout).has(activePaneId)) return 'corrupt'
     }
   }
-  // Foreign IFF stamped AND the stamp names a different machine. Unstamped
-  // = legacy (pre-stamp) data assumed local — never foreign on its own (a
-  // natural reload of a remembered selection keeps a healthy unstamped
-  // layout; Task 2's backfill then stamps it so the next boot is
-  // unambiguous) — EXCEPT under an ARMED active-selection marker (#774
-  // merged): the chooser pick proved the machine was actively chosen this
-  // boot, so an unstamped envelope may be the PREVIOUS machine's cache and
-  // the chosen machine's durable truth must replace it. A stamped
-  // same-machine layout keeps even under an armed marker (Choice B wins).
+  // Foreign IFF stamped AND the stamp names a different machine. An
+  // UNSTAMPED (legacy, pre-stamp) envelope is assumed local — never
+  // foreign, ARMED marker or not (delta r4): unstamped data cannot prove
+  // machine ownership either way, so the chooser's armed marker alone must
+  // not demote a healthy layout — a same-machine re-pick KEEPS it (the
+  // accepted requirement; a forced rebuild would discard the exact split
+  // arrangement and pane labels), and the healthy boot's backfill then
+  // stamps it, so the next boot is unambiguous. Accepted residual: a
+  // different-machine pick during the legacy-to-stamped transition also
+  // keeps the local layout — pre-upgrade-consistent (unstamped was never
+  // foreign before stamps existed) and bounded to the transition. A
+  // stamped same-machine layout keeps under an armed marker (Choice B
+  // wins); a stamped other-machine layout is foreign, armed or not.
   const stamp = parsed.machineId
   const stamped = typeof stamp === 'string' && !!stamp
   if (stamped && stamp !== resolvedMachineId) return 'foreign'
-  if (opts.activeSelection === true && !stamped) return 'foreign'
   const persistedAt = typeof parsed.persistedAt === 'number' ? parsed.persistedAt : 0
   if (now - persistedAt > STALE_LAYOUT_MS) return 'stale'
   return 'healthy'

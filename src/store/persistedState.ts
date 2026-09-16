@@ -16,6 +16,7 @@ import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState } from '@shared/fresh-agent'
 import { normalizeFreshAgentPaneModelSelection } from './paneTypes'
 import { createLogger } from '@/lib/client-logger'
+import { isValidMachineIdStamp } from '@/lib/machine-identity'
 
 export { TABS_STORAGE_KEY, PANES_STORAGE_KEY }
 
@@ -531,10 +532,26 @@ export function readRecoverablePersistedLayoutRaw(storage: Pick<Storage, 'getIte
     return backup
   }
 
-  return parsePersistedLayoutRaw(raw) ? raw : backup
+  // e5r1: the fallback exists for STRUCTURALLY destroyed primaries — the
+  // class parseLayoutStructure refuses (JSON-level, wrong-shape, or
+  // newer-schema-version failure). A present-but-malformed machineId or
+  // persistedAt is NOT that class: the malformed PRIMARY must flow through
+  // to the boot migration and health classifier as corrupt evidence.
+  // Selecting the older backup here would make the migration rewrite the
+  // layout key with the backup's tabs and mirror the backup — not the
+  // malformed primary — as pre-migration evidence, so the classifier would
+  // keep a healthy-looking layout and silently roll back newer tabs and
+  // panes instead of rebuilding.
+  return parseLayoutStructure(raw) ? raw : backup
 }
 
-export function parsePersistedLayoutRaw(raw: string): ParsedPersistedLayout | null {
+/** The structural parse gate shared by the loader-grade parse and the
+ * recoverable-read fallback (e5r1): JSON-level, envelope-shape (zod), and
+ * schema-version checks ONLY. Present-but-malformed envelope METADATA
+ * (a machineId that is not a non-empty string, or a persistedAt that is
+ * not a number) is deliberately outside this gate — it is a corruption
+ * class the boot classifier must see, not structural destruction. */
+function parseLayoutStructure(raw: string): z.infer<typeof zPersistedLayoutPayload> | null {
   let parsed: unknown
   try {
     parsed = JSON.parse(raw)
@@ -545,17 +562,36 @@ export function parsePersistedLayoutRaw(raw: string): ParsedPersistedLayout | nu
   const res = zPersistedLayoutPayload.safeParse(parsed)
   if (!res.success) return null
   if (res.data.version > LAYOUT_SCHEMA_VERSION) return null
+  return res.data
+}
 
-  const panes = res.data.panes
+export function parsePersistedLayoutRaw(raw: string): ParsedPersistedLayout | null {
+  const structural = parseLayoutStructure(raw)
+  if (!structural) return null
+
+  // Present-but-malformed top-level metadata is corruption, not a legacy
+  // absence (delta r5 finding 1, empty values added e5r2): the schema
+  // passes both keys through, and silently coercing a non-string machineId
+  // (or, per machine-identity's nonEmptyString normalization, an empty or
+  // whitespace-only one) or a non-number persistedAt to undefined let a
+  // corrupt envelope parse as unstamped legacy — the boot classifier kept
+  // it and the healthy path's stamp backfill relabeled it as the currently
+  // selected machine. Only genuinely ABSENT keys keep the legacy meaning,
+  // so refuse the parse instead of coercing.
+  const rawMetadata = structural as { machineId?: unknown; persistedAt?: unknown }
+  if (rawMetadata.machineId !== undefined && !isValidMachineIdStamp(rawMetadata.machineId)) return null
+  if (rawMetadata.persistedAt !== undefined && typeof rawMetadata.persistedAt !== 'number') return null
+
+  const panes = structural.panes
   let panesVersion = typeof panes.version === 'number' ? panes.version : 1
   if (panesVersion < 1) panesVersion = 1
 
   return {
-    version: Math.max(res.data.version, LAYOUT_SCHEMA_VERSION),
+    version: Math.max(structural.version, LAYOUT_SCHEMA_VERSION),
     tabs: {
-      ...res.data.tabs,
-      activeTabId: res.data.tabs.activeTabId ?? null,
-      tabs: salvageTabs(res.data.tabs.tabs),
+      ...structural.tabs,
+      activeTabId: structural.tabs.activeTabId ?? null,
+      tabs: salvageTabs(structural.tabs.tabs),
     },
     panes: {
       version: Math.max(panesVersion, PANES_SCHEMA_VERSION),
@@ -564,9 +600,9 @@ export function parsePersistedLayoutRaw(raw: string): ParsedPersistedLayout | nu
       paneTitles: (panes.paneTitles || {}) as Record<string, Record<string, string>>,
       paneTitleSetByUser: (panes.paneTitleSetByUser || {}) as Record<string, Record<string, boolean>>,
     },
-    tombstones: res.data.tombstones || [],
-    persistedAt: typeof (res.data as any).persistedAt === 'number' ? (res.data as any).persistedAt : undefined,
-    machineId: typeof (res.data as any).machineId === 'string' ? (res.data as any).machineId : undefined,
+    tombstones: structural.tombstones || [],
+    persistedAt: typeof (structural as any).persistedAt === 'number' ? (structural as any).persistedAt : undefined,
+    machineId: typeof (structural as any).machineId === 'string' ? (structural as any).machineId : undefined,
   }
 }
 

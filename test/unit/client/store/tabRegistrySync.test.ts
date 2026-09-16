@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { RootState } from '../../../../src/store/store'
+import { resetClientInstanceIdRotationForTests } from '../../../../src/store/client-instance-id'
 import {
   CLIENT_LEASE_GRACE_MS,
   getCurrentTabRegistryClientInstanceId,
@@ -109,6 +110,12 @@ describe('tabRegistrySync', () => {
     wsMessageHandlers = []
     wsReconnectHandlers = []
     broadcastChannels = []
+    // Each test simulates an independent window context, but the module
+    // instances (and their in-memory state) live for the whole file: the
+    // registry id's rotation-authority latch (e3 post-cap finding 3) must
+    // reset alongside sessionStorage.clear(), or a rotation in an earlier
+    // test makes this context's id reads skip the freshly seeded storage.
+    resetClientInstanceIdRotationForTests()
     sessionStorage.clear()
     localStorage.clear()
     state = createState()

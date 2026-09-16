@@ -124,9 +124,12 @@ export type RestoreMachineWorkspaceOptions = {
  * stale one. #774's activeSelection option (the clear-if-non-recoverable
  * gate that used to live here) is therefore superseded: its keep-on-natural-
  * reload intent is subsumed by the gate's healthy-keep, and its
- * clear-on-active-choice intent moved into the classifier (the chooser's
- * one-shot active-selection marker makes an otherwise-healthy UNSTAMPED
- * envelope classify foreign — a stamped same-machine layout still keeps).
+ * clear-on-active-choice intent moved into the classifier, where delta r4
+ * removed its demotion power — the chooser's one-shot active-selection
+ * marker has no classification effect anymore, an otherwise-healthy
+ * UNSTAMPED envelope keeps as healthy legacy (same-machine re-pick
+ * preservation), and only a stamp naming a different machine classifies
+ * foreign.
  * Because the gate has already decided to rebuild, the local clear below is
  * unconditional.
  */

@@ -532,26 +532,43 @@ function preservePersistedLayout(): PersistedLayoutMigrationResult {
  * pre-change windows may still read it. A window that already has its
  * own envelope ignores later legacy-key writes from pre-change windows.
  *
- * e3r2 finding 2 (claim-then-verify): two simultaneous upgrade boots can
- * both pass the absent checks above before either sets the marker, each
- * copying the shared legacy envelope into its own key and the loser
- * classifying the copied last-writer layout as healthy. The claim is
- * therefore written FIRST — the marker carrying THIS window's
+ * e3r2 finding 2 (claim-then-verify) + e3r4 finding 1
+ * (claim → copy → confirm-commit): two simultaneous upgrade boots can
+ * both pass the absent checks before either sets the marker, so the
+ * claim is written FIRST — the marker carrying THIS window's
  * layout-window-id — and read back immediately; the copy proceeds ONLY
- * if the read still returns the claimer's own id. A window that reads a
- * foreign id skips adoption entirely (its key stays absent → boot
- * rebuilds — the safe outcome). Serialization guarantee relied on: each
- * single localStorage getItem/setItem is atomic against the shared
+ * if the read still returns the claimer's own id. The one-shot is
+ * committed as spent only AFTER the legacy copy succeeds: a failed copy
+ * (quota/write error) rolls the claim back — best-effort remove, and
+ * only while the marker still carries OUR id (removing a foreign
+ * claimant's marker would un-spend THEIR one-shot) — so a later window
+ * can still adopt. A POST-COPY re-verify round then re-reads the claim:
+ * if a foreign claimant won the marker while we copied, we discard our
+ * copied key (best-effort remove) and take the absent path (own-snapshot
+ * rebuild), so the previously unrecoverable interleave
+ * A-write → A-read → B-write → B-read (both read back their own id,
+ * both copy) converges to exactly ONE adopter: B keeps, A discards and
+ * rebuilds. Residual, irreducible without an atomic test-and-set: when
+ * the claim legitimately survives our re-verify BEFORE a foreign
+ * claimant's write lands (A completes fully, then B claims), BOTH
+ * windows adopt — but they copy the SAME shared legacy envelope, so the
+ * worst case equals the pre-upgrade shared-envelope behavior for exactly
+ * those two simultaneously-booting windows; every later window is still
+ * gated by the marker-present check. Serialization guarantee relied on:
+ * each single localStorage getItem/setItem is atomic against the shared
  * per-origin map, but HTML explicitly promises NO locking across agent
  * clusters — "authors are encouraged to assume that there is no locking
- * mechanism" (webstorage.html §12.1) — so the other renderer process's
- * claim CAN land between our setItem and our getItem; the read-back
- * detects it. Residual, bounded: if the interleave is exactly
- * A-write → A-read → B-write → B-read, both windows read back their own
- * id and both adopt — but they copy the SAME shared legacy envelope, so
- * the worst case equals the pre-upgrade shared-envelope behavior for
- * exactly those two simultaneously-booting windows; every later window
- * is still gated by the marker-present check. */
+ * mechanism" (webstorage.html §12.1). The COMPLETE future mechanism is
+ * navigator.locks (Web Locks API); this path deliberately stays
+ * dependency-free. */
+function readLegacyAdoptionClaimOwnerId(): unknown {
+  try {
+    return (JSON.parse(localStorage.getItem(LEGACY_LAYOUT_ADOPTION_MARKER_STORAGE_KEY) ?? '') as { ownerId?: unknown })?.ownerId
+  } catch {
+    return undefined
+  }
+}
+
 function adoptLegacyLayoutIntoWindowKey(): void {
   const ownKey = getWindowLayoutKey()
   try {
@@ -565,14 +582,39 @@ function adoptLegacyLayoutIntoWindowKey(): void {
       ownerId,
       adoptedAt: Date.now(),
     }))
-    let claimedOwnerId: unknown
+    if (readLegacyAdoptionClaimOwnerId() !== ownerId) return
     try {
-      claimedOwnerId = (JSON.parse(localStorage.getItem(LEGACY_LAYOUT_ADOPTION_MARKER_STORAGE_KEY) ?? '') as { ownerId?: unknown })?.ownerId
-    } catch {
-      claimedOwnerId = undefined
+      localStorage.setItem(ownKey, legacyRaw)
+    } catch (error) {
+      if (readLegacyAdoptionClaimOwnerId() === ownerId) {
+        try {
+          localStorage.removeItem(LEGACY_LAYOUT_ADOPTION_MARKER_STORAGE_KEY)
+        } catch {
+          // best-effort rollback: a retained marker only costs later
+          // windows the rebuild path
+        }
+      }
+      warnStructured('layout_legacy_adoption_copy_failed', {
+        key: ownKey,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return
     }
-    if (claimedOwnerId !== ownerId) return
-    localStorage.setItem(ownKey, legacyRaw)
+    if (readLegacyAdoptionClaimOwnerId() !== ownerId) {
+      let discarded = false
+      try {
+        localStorage.removeItem(ownKey)
+        discarded = true
+      } catch {
+        // best-effort discard: a surviving copy degrades to the bounded
+        // double-adopt residual, never data loss
+      }
+      warnStructured('layout_legacy_adoption_claim_lost', {
+        key: ownKey,
+        discarded,
+      })
+      return
+    }
     log.info('Adopted the legacy layout envelope into this window\u2019s per-window key (one-shot).')
   } catch (error) {
     warnStructured('layout_legacy_adoption_write_failed', {
@@ -599,36 +641,50 @@ function removeLayoutEnvelopeAndChannels(envelopeKey: string, layoutWindowId?: s
   )
 }
 
+/** The prune paths' shared aging rule: returns the envelope's numeric
+ * persistedAt ONLY when it is older than STALE_LAYOUT_MS — the same
+ * threshold the health gate uses — else null (including unparseable raw
+ * or a non-numeric persistedAt: an envelope whose age cannot be
+ * determined is kept, because the health gate owns corrupt
+ * classification and the prune never destroys evidence it cannot age). */
+function staleEnvelopePersistedAt(raw: string | null, now: number): number | null {
+  if (raw === null) return null
+  let persistedAt: unknown
+  try {
+    persistedAt = (JSON.parse(raw) as { persistedAt?: unknown })?.persistedAt
+  } catch {
+    return null
+  }
+  return typeof persistedAt === 'number' && now - persistedAt > STALE_LAYOUT_MS
+    ? persistedAt
+    : null
+}
+
 /** Stale-threshold prune sweep at migration boot (e3r1 finding 5): fresh
  * contexts mint new layout-window ids with no close/expiry path, so
  * closed-window envelopes (and their side channels) would accumulate
  * unboundedly until quota exhaustion breaks persistence. Enumerate the
  * layout-prefix keys, parse ONLY envelope-shaped keys (the derived
- * per-window envelopes and the bare legacy key), and remove those whose
- * persistedAt is older than STALE_LAYOUT_MS — the same threshold the
- * health gate uses, which would classify them stale → rebuild anyway. An
- * envelope whose age cannot be determined (unparseable, or no numeric
- * persistedAt) is kept: the health gate owns corrupt classification, and
- * the sweep never destroys evidence it cannot age. Runs BEFORE legacy
- * adoption so a beyond-threshold legacy envelope is pruned rather than
- * adopted. */
+ * per-window envelopes and the bare legacy key), and remove those beyond
+ * the shared stale age. Runs BEFORE legacy adoption so a beyond-threshold
+ * legacy envelope is pruned rather than adopted. THIS window's own
+ * derived key is SPARED (e3 post-cap finding 2): the boot classifier must
+ * see a stale own envelope to classify it STALE and rebuild with the
+ * stale reason propagated — sweeping it here relabeled every real stale
+ * boot 'absent'. The App gate retires the own envelope after its
+ * keep-vs-rebuild decision via pruneOwnStaleLayoutEnvelope(); every other
+ * window's key keeps the abandoned-key hygiene below. */
 function pruneStaleLayoutEnvelopes(): void {
   try {
     const now = Date.now()
+    const ownKey = getWindowLayoutKey()
     for (const key of Object.keys(localStorage)) {
       if (!key.startsWith(LAYOUT_STORAGE_KEY_PREFIX)) continue
       const isLegacyEnvelope = key === LEGACY_LAYOUT_STORAGE_KEY
       if (!isLegacyEnvelope && !isDerivedLayoutKey(key)) continue
-      const raw = localStorage.getItem(key)
-      if (raw === null) continue
-      let persistedAt: unknown
-      try {
-        persistedAt = (JSON.parse(raw) as { persistedAt?: unknown })?.persistedAt
-      } catch {
-        continue
-      }
-      if (typeof persistedAt !== 'number') continue
-      if (!(now - persistedAt > STALE_LAYOUT_MS)) continue
+      if (key === ownKey) continue
+      const persistedAt = staleEnvelopePersistedAt(localStorage.getItem(key), now)
+      if (persistedAt === null) continue
       if (isLegacyEnvelope) {
         removeLayoutEnvelopeAndChannels(key)
         continue
@@ -640,6 +696,33 @@ function pruneStaleLayoutEnvelopes(): void {
         persistedAt,
       })
     }
+  } catch (error) {
+    warnStructured('layout_stale_prune_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }
+}
+
+/** The App boot gate's DEFERRED own-key prune (e3 post-cap finding 2):
+ * the migration-boot sweep above spares this window's envelope so
+ * classifyPersistedLayoutHealth can see a stale layout; once the gate's
+ * keep-vs-rebuild decision completes, it calls this to retire the
+ * beyond-threshold envelope (and its channels) with the shared aging
+ * rule. A fresh or absent envelope is a no-op, and the gate never
+ * reaches the call on a failed rebuild — the envelope survives as the
+ * retry boot's stale-classification evidence. Re-exported through
+ * layout-health (the gate's recovery boundary) so App's import graph
+ * keeps a single recovery module. */
+export function pruneOwnStaleLayoutEnvelope(): void {
+  try {
+    const key = getWindowLayoutKey()
+    const persistedAt = staleEnvelopePersistedAt(localStorage.getItem(key), Date.now())
+    if (persistedAt === null) return
+    removeLayoutEnvelopeAndChannels(key, getLayoutWindowId())
+    warnStructured('layout_stale_envelope_pruned', {
+      key,
+      persistedAt,
+    })
   } catch (error) {
     warnStructured('layout_stale_prune_failed', {
       error: error instanceof Error ? error.message : String(error),

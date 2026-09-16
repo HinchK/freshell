@@ -75,7 +75,7 @@ import {
   resolveMachineIdentity,
 } from '@/lib/machine-identity'
 import { restoreMachineWorkspace } from '@/lib/machine-workspace'
-import { armPreMigrationEvidenceClear, backfillPersistedLayoutMachineId, classifyPersistedLayoutHealth, clearPreMigrationLayoutEvidence } from '@/lib/recovery/layout-health'
+import { armPreMigrationEvidenceClear, backfillPersistedLayoutMachineId, classifyPersistedLayoutHealth, clearPreMigrationLayoutEvidence, pruneOwnStaleLayoutEnvelope } from '@/lib/recovery/layout-health'
 import { buildLocalSettingsPatch } from '@/store/browserPreferencesPersistence'
 import Sidebar, { AppView } from '@/components/Sidebar'
 import TabBar from '@/components/TabBar'
@@ -843,25 +843,17 @@ export default function App() {
           // CONSUME only after the boot's adjudication completes — a restore
           // failure, cancellation, or in-flight manual reload leaves the
           // marker armed, so the retry always knows the machine was actively
-          // chosen. The peeked marker feeds the classifier: an armed marker
-          // makes an otherwise-healthy UNSTAMPED legacy envelope classify
-          // foreign (the one case the machine-id stamp cannot prove), while
-          // a STAMPED same-machine healthy layout still keeps — Choice B
-          // window sovereignty wins over #774's clear-on-active-choice.
+          // chosen. The peeked marker feeds the classifier, where it is
+          // classification-inert (delta r4: a healthy UNSTAMPED legacy
+          // envelope keeps too — a same-machine re-pick never forces a
+          // resync; foreignness requires the stamp's positive proof), while
+          // a STAMPED other-machine layout still rebuilds — Choice B window
+          // sovereignty wins over #774's clear-on-active-choice.
           const activeSelection = peekActiveMachineSelectionMark()
           // Local-first (Choice B): a healthy local layout IS this window's newest
           // truth — keep it and skip the inventory entirely. Only an absent,
           // corrupt, stale, or foreign layout rebuilds from the server.
           const layoutHealth = classifyPersistedLayoutHealth(resolution.machine.id, { activeSelection })
-          // Stamp backfill — classify FIRST, then backfill (AFTER the health gate
-          // reads the envelope). Unstamped is a one-boot transitional state: this
-          // is the only deterministic restamp for a terminal-free healthy layout.
-          // One call site covers both resolution paths — the bootstrap success
-          // path AND a chooser selection (a pick persists the selection and
-          // reloads; the next boot's resolution lands here). Safe on every
-          // classification outcome: absent/corrupt envelopes no-op inside the
-          // helper, and a rebuilt envelope is restamped by its own flush.
-          backfillPersistedLayoutMachineId(resolution.machine.id)
           if (layoutHealth !== 'healthy') {
             await restoreMachineWorkspace(appStore, resolution.machine.id, { reason: layoutHealth })
             if (cancelled) return false
@@ -879,11 +871,39 @@ export default function App() {
             // local-first-reload-rust.spec.ts scenario 3.
             armPreMigrationEvidenceClear()
           } else {
+            // Stamp backfill — classify FIRST, then backfill (AFTER the
+            // health gate read the envelope). Unstamped is a one-boot
+            // transitional state: this is the only deterministic restamp
+            // for a terminal-free healthy layout. One call site covers
+            // both resolution paths — the bootstrap success path AND a
+            // chooser selection (a pick persists the selection and
+            // reloads; the next boot's resolution lands here).
+            // HEALTHY-ONLY (e3 post-cap finding 1): an unhealthy envelope
+            // is about to be rebuilt, and stamping it with the newly
+            // selected machine id before the awaited recovery succeeds
+            // would poison an interrupted or failed rebuild into the next
+            // boot's 'healthy' — permanently keeping the PREVIOUS
+            // machine's layout. The successful rebuild's own persisted
+            // layout carries the stamp instead (the persist middleware's
+            // selectStampMachineId), so an old-stamped envelope stays
+            // foreign and the rebuild is retried.
+            backfillPersistedLayoutMachineId(resolution.machine.id)
             // Healthy-keep: the durable envelope already classifies
             // healthy — no pending write can strand the evidence, so the
             // gate retires it directly.
             clearPreMigrationLayoutEvidence()
           }
+          // Post-decision own-key prune (e3 post-cap finding 2): the
+          // migration-boot sweep spares THIS window's envelope so the
+          // classifier above can see a stale layout and rebuild with the
+          // stale reason propagated — sweeping at migration time relabeled
+          // every real stale boot 'absent'. With the keep-vs-rebuild
+          // decision complete, retire the beyond-threshold envelope here;
+          // a fresh one (or a healthy keep) is a no-op, and a THROWN
+          // restore returns above without reaching this line, so a failed
+          // rebuild leaves the stale envelope for the retry boot's
+          // classification.
+          pruneOwnStaleLayoutEnvelope()
           // Adjudication complete (healthy-keep or successful rebuild): the
           // one-shot marker is spent. Any earlier return (cancellation) or a
           // thrown restore leaves it armed for the retry boot.
