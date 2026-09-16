@@ -4861,21 +4861,42 @@ impl FreshClaudeState {
             ));
             return;
         };
-        // b8ke ext r13 F3: the rollback's observed generation fence —
-        // the wire carries no pair, so the server threads what it
-        // deterministically knows: the session's CURRENT owner generation,
-        // observed at ENTRY and re-validated by the claim under the
-        // coordinator lock. Any generation advance across the handler's
-        // awaits (the turn lock, the parked/retried spawn work) is the
-        // typed stale refusal — a DELAYED rollback can never replace a
-        // writer that moved on.
-        let rollback_fence = self.ownership.as_ref().map(|ownership| {
-            let snap = ownership.observe(PROVIDER, &durable_id);
-            freshell_ownership::ObservedFence {
-                epoch: ownership.boot_epoch(),
-                generation: snap.generation,
-            }
-        });
+        // b8ke ext r29 F2: the rollback's observed generation fence —
+        // the wire's observedEpoch/observedGeneration pair (additive
+        // since ext r21 F2) is HONORED verbatim: a request already stale
+        // on ARRIVAL (its pair predates a completed handoff/crash
+        // advance) can never be made current — the claim under the
+        // coordinator lock typed-refuses it, so a queued old-generation
+        // rollback can never tear down or roll back a newer runtime. A
+        // half-sent pair is the typed INVALID_FENCE refusal (the F7
+        // discipline). Only the LEGACY-unfenced shape (`None`/`None` — an
+        // older client that never sends the pair) keeps the ext-r13-F3
+        // discipline: the server threads what it deterministically knows —
+        // the session's CURRENT owner generation observed at ENTRY and
+        // re-validated by the claim — so a generation advance across the
+        // handler's awaits (the turn lock, the parked/retried spawn work)
+        // is still the typed stale refusal for those senders too.
+        let rollback_fence =
+            match crate::ownership_lane::wire_fence(op.observed_epoch, op.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    tracing::warn!(target: "freshell_freshagent::claude",
+                        session_id = %durable_id, request_id = %op.request_id, code = err.code(),
+                        "fresh_agent_rollback_refused: the observed fence is half-sent (invalid)");
+                    reply_sink(rollback_error_frame(&op, err.code(), err.message()));
+                    return;
+                }
+            };
+        let rollback_fence = match rollback_fence {
+            Some(fence) => Some(fence),
+            None => self.ownership.as_ref().map(|ownership| {
+                let snap = ownership.observe(PROVIDER, &durable_id);
+                freshell_ownership::ObservedFence {
+                    epoch: ownership.boot_epoch(),
+                    generation: snap.generation,
+                }
+            }),
+        };
         // Held for the REST of this handler. in_turn is set by handle_send UNDER
         // this same lock BEFORE the sidecar write (the check-then-set window is
         // closed): observed false here means no op is in flight. Focused ep1-r1
@@ -13236,6 +13257,167 @@ rl.on('line', (line) => {
             "the stale-generation rollback must answer the typed refusal: {frames:?}"
         );
         std::env::remove_var("CLAUDE_CONFIG_DIR");
+    }
+
+    /// b8ke ext r29 F2: the TRULY stale-on-arrival rollback — the
+    /// generation advances BEFORE the handler runs and the op carries the
+    /// PRE-advance observed pair on the wire (ext r21 F2's additive
+    /// fields). Pre-r29 the handler DISCARDED the supplied pair and
+    /// substituted the coordinator's CURRENT pair at entry, so a request
+    /// already stale when received was made current — it entered the
+    /// same-kind Adopt path and tore down / rolled back the NEWER
+    /// runtime. The supplied pair is now HONORED: the claim
+    /// typed-refuses it (the r13 fenced window never even opens).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_on_arrival_rollback_is_refused_typed() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+
+        st.handle_create(dedup_create_msg("req-r29-f2-stale-arrival"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-r29-f2-stale-arrival").await;
+        let map_key = created["sessionId"].as_str().unwrap().to_string();
+        let old_dur = FRESH_CREATE_DURABLE_ID;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if matches!(
+                registry.observe("claude", old_dur).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "never committed Live"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // The generation ADVANCES BEFORE the rollback is sent: a handoff
+        // begin + fail-restore bumps the record's generation (the
+        // client's pane still holds the PRE-advance observed pair).
+        let before = registry.observe("claude", old_dur);
+        let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = registry
+            .begin_handoff(
+                "claude",
+                old_dur,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "op-r29-f2-bump",
+                None,
+                "test",
+                freshell_ownership::now_epoch_ms(),
+            )
+        else {
+            panic!("the generation-bump handoff must grant")
+        };
+        let _ = registry.fail("claude", old_dur, "op-r29-f2-bump", ho_gen, true);
+        let after = registry.observe("claude", old_dur);
+        assert!(
+            after.generation > before.generation,
+            "the record's generation advanced: {} -> {}",
+            before.generation,
+            after.generation
+        );
+
+        // THE STALE-ON-ARRIVAL ROLLBACK: the wire pair is the pre-advance
+        // observation — the handler must refuse it typed, never
+        // substitute the current pair.
+        let mut op = rollback_op(
+            &map_key,
+            "req-r29-f2-stale-arrival",
+            RollbackDirection::Undo,
+        );
+        op.observed_epoch = Some(before.epoch);
+        op.observed_generation = Some(before.generation);
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(op, sink).await;
+
+        let frames = captured_json(&captured);
+        assert!(
+            frames.iter().any(|f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == json!("freshAgent.error")
+                    && f["event"]["code"] == json!("SESSION_RESERVED")
+                    && f["event"]["requestId"] == json!("req-r29-f2-stale-arrival")
+            }),
+            "the stale-on-arrival rollback must answer the typed refusal: {frames:?}"
+        );
+        // And the record is UNTOUCHED at the advanced generation — the
+        // newer runtime was never torn down or re-keyed.
+        let settled = registry.observe("claude", old_dur);
+        assert_eq!(
+            settled.generation, after.generation,
+            "the refused rollback never moved the record"
+        );
+        assert!(
+            matches!(
+                settled.state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ),
+            "the restored live owner stands: {settled:?}"
+        );
+    }
+
+    /// b8ke ext r29 F2: a half-sent observed pair (exactly one of
+    /// epoch/generation) on a rollback is the typed INVALID_FENCE
+    /// refusal — the F7 discipline, which the rollback lane never had
+    /// (pre-r29 it discarded the pair entirely, so a half-fence silently
+    /// degraded to the unfenced legacy path).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_half_sent_rollback_fence_is_refused_typed() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install();
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+
+        st.handle_create(dedup_create_msg("req-r29-f2-half-fence"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-r29-f2-half-fence").await;
+        let map_key = created["sessionId"].as_str().unwrap().to_string();
+        let old_dur = FRESH_CREATE_DURABLE_ID;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if matches!(
+                registry.observe("claude", old_dur).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "never committed Live"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // HALF-SENT: the epoch without the generation.
+        let mut op = rollback_op(&map_key, "req-r29-f2-half-fence", RollbackDirection::Undo);
+        op.observed_epoch = Some(registry.boot_epoch());
+        op.observed_generation = None;
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(op, sink).await;
+
+        let frames = captured_json(&captured);
+        assert!(
+            frames.iter().any(|f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == json!("freshAgent.error")
+                    && f["event"]["code"] == json!("INVALID_FENCE")
+            }),
+            "the half-sent fence must answer the typed INVALID_FENCE refusal: {frames:?}"
+        );
+        // The live owner stands untouched.
+        assert!(
+            matches!(
+                registry.observe("claude", old_dur).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ),
+            "the half-fenced rollback never touched the live owner"
+        );
     }
 
     /// b8ke focused episode-2 round-3 F1: the NORMAL live-rollback path —

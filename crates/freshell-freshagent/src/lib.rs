@@ -248,6 +248,61 @@ pub mod ownership_lane {
         }
     }
 
+    /// The typed STALE-ON-ARRIVAL verdict for a wire-parsed observed fence
+    /// against the coordinator's CURRENT pair for the key (b8ke ext r29 F2):
+    /// the reclaim-less lifecycle lanes (opencode compact/fork/rollback —
+    /// operations that never claim, so nothing re-validates the pair for
+    /// them) consult this at their decision point, BEFORE any provider
+    /// mutation. `Ok(())` when the fence is current, the registry is
+    /// unwired, or the request is legacy-unfenced (`None` — the
+    /// coordinator's cross-kind checks still govern those). The refusal
+    /// mirrors [`RuntimeOwnershipRegistry::begin_start`]'s fence gate: an
+    /// epoch from a DIFFERENT (pre-restart) boot or an OLDER generation is
+    /// stale — a queued old-generation request can never mutate newer
+    /// history or mint a child past the fence.
+    pub fn check_observed_fence(
+        registry: &Option<Arc<RuntimeOwnershipRegistry>>,
+        provider: &str,
+        session_id: &str,
+        observed: Option<ObservedFence>,
+    ) -> Result<(), ObservedFenceStale> {
+        let Some(registry) = registry.as_ref() else {
+            return Ok(());
+        };
+        let Some(fence) = observed else {
+            return Ok(());
+        };
+        let snap = registry.observe(provider, session_id);
+        if fence.epoch != snap.epoch || fence.generation < snap.generation {
+            return Err(ObservedFenceStale {
+                observed_epoch: fence.epoch,
+                observed_generation: fence.generation,
+                current_epoch: snap.epoch,
+                current_generation: snap.generation,
+            });
+        }
+        Ok(())
+    }
+
+    /// The typed stale verdict [`check_observed_fence`] refuses with: the
+    /// request's observed pair vs the coordinator's current pair (b8ke ext
+    /// r29 F2).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ObservedFenceStale {
+        pub observed_epoch: u64,
+        pub observed_generation: u64,
+        pub current_epoch: u64,
+        pub current_generation: u64,
+    }
+
+    impl ObservedFenceStale {
+        /// The wire-facing refusal message (the typed-stale contract the
+        /// lifecycle operations answer with).
+        pub fn message(&self) -> String {
+            "the session moved to a newer ownership generation; refresh and retry".to_string()
+        }
+    }
+
     /// Claim; on Granted the caller wraps the result in an `OperationTicket`
     /// (Task 1's RAII guard — drop = typed fail) so a panicked spawn cannot
     /// wedge the session.

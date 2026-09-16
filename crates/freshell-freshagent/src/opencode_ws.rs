@@ -3352,6 +3352,21 @@ impl FreshOpencodeState {
     /// Markers survive regardless (decision 6).
     pub async fn handle_compact(&self, msg: FreshAgentCompact) {
         let session_id = msg.session_id.clone();
+        // b8ke ext r29 F2: the compact's delayed-request fence (the wire's
+        // additive observedEpoch/observedGeneration pair — parity with
+        // send/attach/kill): a half-sent pair is the typed INVALID_FENCE
+        // refusal BEFORE any state interaction (the F7 discipline).
+        let compact_fence =
+            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %session_id, code = err.code(),
+                        "fresh_agent_compact_refused: the observed fence is half-sent (invalid)");
+                    self.emit_fresh_agent_error(&session_id, err.code(), err.message());
+                    return;
+                }
+            };
         let session_arc = {
             let guard = self.sessions.lock().await;
             guard.get(&session_id).cloned()
@@ -3395,6 +3410,31 @@ impl FreshOpencodeState {
                     "compact while a turn is in progress is not supported (opencode session {session_id})"
                 ),
             );
+            return;
+        }
+
+        // b8ke ext r29 F2: the STALE-ON-ARRIVAL fence consult — the
+        // reclaim-less lane's decision point (BEFORE the redo destroy, the
+        // running-status broadcast, or the summarize POST): a compact
+        // whose observed pair predates the CURRENT record (a completed
+        // handoff / crash advance) answers the typed stale refusal — a
+        // queued old-generation compact can never mutate newer history.
+        // The real (durable) id is the canonical coordinator key.
+        if let Err(stale) = crate::ownership_lane::check_observed_fence(
+            &self.fresh_agent.ownership,
+            PROVIDER,
+            &real_id,
+            compact_fence,
+        ) {
+            tracing::warn!(target: "freshell_freshagent::opencode",
+                session_id = %session_id, real_id = %real_id,
+                observed_epoch = stale.observed_epoch,
+                observed_generation = stale.observed_generation,
+                current_epoch = stale.current_epoch,
+                current_generation = stale.current_generation,
+                "fresh_agent_compact_refused: the observed fence is stale on arrival");
+            drop(session);
+            self.emit_fresh_agent_error(&session_id, "SESSION_RESERVED", &stale.message());
             return;
         }
 
@@ -3683,6 +3723,34 @@ impl FreshOpencodeState {
             return;
         };
 
+        // b8ke ext r29 F2: the fork's delayed-request fence (the wire's
+        // additive observedEpoch/observedGeneration pair — parity with
+        // send/attach/kill): a half-sent pair is the typed INVALID_FENCE
+        // refusal BEFORE any state interaction (the F7 discipline); a
+        // whole pair is consulted against the PARENT's current record at
+        // the decision point below AND threads into the provisional
+        // child's claim (never `None` — a pre-restart-epoch fork can never
+        // mint a child past the fence).
+        let fork_fence =
+            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %msg.session_id, code = err.code(),
+                        "fresh_agent_fork_refused: the observed fence is half-sent (invalid)");
+                    reply_sink(event_frame(
+                        &msg.session_id,
+                        json!({
+                            "type": "freshAgent.error",
+                            "sessionId": msg.session_id,
+                            "code": err.code(),
+                            "message": err.message(),
+                        }),
+                    ));
+                    return;
+                }
+            };
+
         let session_arc = {
             let guard = self.sessions.lock().await;
             guard.get(&msg.session_id).cloned()
@@ -3733,6 +3801,39 @@ impl FreshOpencodeState {
                 session.provenance.clone(),
             )
         };
+
+        // b8ke ext r29 F2: the STALE-ON-ARRIVAL fence consult — the
+        // reclaim-less lane's decision point (BEFORE the provisional
+        // child's claim, the fork POST, or any provider mutation): a fork
+        // whose observed pair predates the PARENT's current record (a
+        // completed handoff / crash advance) answers the typed stale
+        // refusal — a queued old-generation fork can never mint a child
+        // from newer history. The real (durable) id is the canonical
+        // coordinator key.
+        if let Err(stale) = crate::ownership_lane::check_observed_fence(
+            &self.fresh_agent.ownership,
+            PROVIDER,
+            &real_id,
+            fork_fence,
+        ) {
+            tracing::warn!(target: "freshell_freshagent::opencode",
+                session_id = %msg.session_id, real_id = %real_id,
+                observed_epoch = stale.observed_epoch,
+                observed_generation = stale.observed_generation,
+                current_epoch = stale.current_epoch,
+                current_generation = stale.current_generation,
+                "fresh_agent_fork_refused: the observed fence is stale on arrival");
+            reply_sink(event_frame(
+                &msg.session_id,
+                json!({
+                    "type": "freshAgent.error",
+                    "sessionId": msg.session_id,
+                    "code": "SESSION_RESERVED",
+                    "message": stale.message(),
+                }),
+            ));
+            return;
+        }
 
         // D8 (focused-ep1-r5 Findings 1+2): fork provenance by precedence —
         // (1) the FORKING connection's provenance (fork is always
@@ -3800,7 +3901,12 @@ impl FreshOpencodeState {
         match self.begin_lane_claim_at(
             &claim_key,
             &fork_op_id,
-            None,
+            // b8ke ext r29 F2: the operation's fence — the fork's observed
+            // pair threads into the provisional child's claim (never
+            // `None`: a pre-restart-epoch observation can never mint a
+            // child; the parent consult above already refused the
+            // stale-generation shape).
+            fork_fence,
             &Self::initiator_for(fork_provenance.as_ref(), "freshopencode/fork"),
         ) {
             crate::ownership_lane::LaneClaim::Granted(ticket) => {
@@ -4161,6 +4267,24 @@ impl FreshOpencodeState {
             ));
             return;
         };
+        // b8ke ext r29 F2: the undo/redo frame's delayed-request fence (the
+        // wire's additive observedEpoch/observedGeneration pair — parity
+        // with the codex rollback since ext r21 F2): a half-sent pair is
+        // the typed INVALID_FENCE refusal; a whole pair is consulted
+        // against the record at the decision point below — a queued
+        // old-generation rollback can never mutate newer history.
+        let rollback_fence =
+            match crate::ownership_lane::wire_fence(op.observed_epoch, op.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %op.session_id, request_id = %op.request_id,
+                        code = err.code(),
+                        "fresh_agent_rollback_refused: the observed fence is half-sent (invalid)");
+                    reply_sink(rollback_error_frame(&op, err.code(), err.message()));
+                    return;
+                }
+            };
         let session_arc = { self.sessions.lock().await.get(&op.session_id).cloned() };
         let Some(session_arc) = session_arc else {
             reply_sink(rollback_error_frame(
@@ -4203,6 +4327,34 @@ impl FreshOpencodeState {
                 &op,
                 "INVALID_ROLLBACK_TARGET",
                 "rollback toTurn requires a turnId",
+            ));
+            return;
+        }
+        // b8ke ext r29 F2: the STALE-ON-ARRIVAL fence consult — the
+        // reclaim-less lane's decision point (BEFORE the manager reads,
+        // the ledger write, or the revert POST): a rollback whose observed
+        // pair predates the CURRENT record (a completed handoff / crash
+        // advance) answers the typed stale refusal — a queued
+        // old-generation undo/redo can never mutate newer history. The
+        // real (durable) id is the canonical coordinator key.
+        if let Err(stale) = crate::ownership_lane::check_observed_fence(
+            &self.fresh_agent.ownership,
+            PROVIDER,
+            &real_id,
+            rollback_fence,
+        ) {
+            tracing::warn!(target: "freshell_freshagent::opencode",
+                session_id = %op.session_id, real_id = %real_id,
+                request_id = %op.request_id,
+                observed_epoch = stale.observed_epoch,
+                observed_generation = stale.observed_generation,
+                current_epoch = stale.current_epoch,
+                current_generation = stale.current_generation,
+                "fresh_agent_rollback_refused: the observed fence is stale on arrival");
+            reply_sink(rollback_error_frame(
+                &op,
+                "SESSION_RESERVED",
+                &stale.message(),
             ));
             return;
         }
@@ -11881,6 +12033,178 @@ mod tests {
         assert!(
             frames[complete_idx]["event"]["at"].as_i64().unwrap_or(0) > 0,
             "the chime carries a positive monotonic at: {frames:?}"
+        );
+    }
+
+    /// b8ke ext r29 F2: the STALE-ON-ARRIVAL compact — the observed pair on
+    /// the wire (additive since ext r15) predates the CURRENT record (a
+    /// completed handoff / crash advance). Pre-r29 the compact IGNORED the
+    /// supplied pair entirely, so a queued old-generation compact could
+    /// mutate newer history (destroy redo, drive the summarize POST). The
+    /// consult at the decision point answers the typed stale refusal and
+    /// NOTHING reaches the provider.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_on_arrival_compact_is_refused_typed() {
+        let (mut st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        insert_compact_session(&st, "ses_r29_compact", Some("test-model")).await;
+        let sink = seed_redoable_record(&st, "ses_r29_compact").await;
+
+        // The record advances PAST the client's observation: seed Live then
+        // stop to Vacant (the crash-shaped advanced generation).
+        let stale_generation = seed_live_then_stop_to_vacant(&registry, "ses_r29_compact").await;
+
+        // THE STALE COMPACT: the pre-advance observed pair rides the wire.
+        let mut msg = compact_msg("ses_r29_compact");
+        msg.observed_epoch = Some(registry.boot_epoch());
+        msg.observed_generation = Some(stale_generation);
+        st.handle_compact(msg).await;
+
+        // The typed stale refusal — the nested SESSION_RESERVED error frame.
+        let mut saw_refusal = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).expect("broadcast json");
+            if frame["event"]["type"] == json!("freshAgent.error") {
+                assert_eq!(
+                    frame["event"]["code"],
+                    json!("SESSION_RESERVED"),
+                    "the stale compact answers the typed stale code: {frame}"
+                );
+                saw_refusal = true;
+            }
+        }
+        assert!(
+            saw_refusal,
+            "the stale compact must answer the typed refusal"
+        );
+        // NOTHING reached the provider — no summarize POST.
+        assert!(
+            http.summarize_requests().is_empty(),
+            "the refused compact never drove the summarize POST"
+        );
+        // The redo record SURVIVES (the destroy-redo drive never ran).
+        let record = sink.load_rollback(PROVIDER, "ses_r29_compact");
+        assert!(
+            record.expect("the record survives").can_redo,
+            "the refused compact never destroyed redo"
+        );
+    }
+
+    /// b8ke ext r29 F2: a half-sent observed pair (exactly one of
+    /// epoch/generation) on a compact is the typed INVALID_FENCE refusal
+    /// (the F7 discipline, which this lane never had).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_half_sent_compact_fence_is_refused_typed() {
+        let (mut st, _http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        insert_compact_session(&st, "ses_r29_half", Some("test-model")).await;
+        seed_live_then_stop_to_vacant(&registry, "ses_r29_half").await;
+
+        // HALF-SENT: the epoch without the generation.
+        let mut msg = compact_msg("ses_r29_half");
+        msg.observed_epoch = Some(registry.boot_epoch());
+        msg.observed_generation = None;
+        st.handle_compact(msg).await;
+
+        let mut saw_refusal = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).expect("broadcast json");
+            if frame["event"]["type"] == json!("freshAgent.error")
+                && frame["event"]["code"] == json!("INVALID_FENCE")
+            {
+                saw_refusal = true;
+            }
+        }
+        assert!(
+            saw_refusal,
+            "the half-sent fence must answer the typed INVALID_FENCE refusal"
+        );
+    }
+
+    /// b8ke ext r29 F2: the STALE-ON-ARRIVAL fork — the observed pair
+    /// predates the CURRENT record. Pre-r29 the fork ignored the supplied
+    /// pair (and claimed its provisional child with `None`), so a queued
+    /// old-generation fork could mint a child from newer history. The
+    /// consult answers the typed stale refusal on the requesting sink and
+    /// no fork POST ever leaves.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_on_arrival_fork_is_refused_typed() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let mut st = fork_state(http.clone()).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        insert_fork_parent(&st, "ses_r29_fork", Some("/w"), None, None).await;
+        let stale_generation = seed_live_then_stop_to_vacant(&registry, "ses_r29_fork").await;
+
+        // THE STALE FORK: the pre-advance observed pair rides the wire.
+        let mut msg = fork_msg("ses_r29_fork", "req-r29-f2-fork", None);
+        msg.observed_epoch = Some(registry.boot_epoch());
+        msg.observed_generation = Some(stale_generation);
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(msg, None, sink).await;
+
+        let frames = captured.lock().expect("captured mutex").clone();
+        let refused = frames.iter().any(|f| {
+            let v = serde_json::to_value(f).unwrap_or_default();
+            v["type"] == "freshAgent.event"
+                && v["event"]["type"] == json!("freshAgent.error")
+                && v["event"]["code"] == json!("SESSION_RESERVED")
+        });
+        assert!(
+            refused,
+            "the stale fork must answer the typed refusal: {frames:?}"
+        );
+        assert!(
+            http.fork_requests().is_empty(),
+            "the refused fork never issued the provider POST"
+        );
+        // No child was minted anywhere.
+        assert!(
+            !st.sessions.lock().await.contains_key("ses_child"),
+            "the refused fork never registered a child"
+        );
+    }
+
+    /// b8ke ext r29 F2: the STALE-ON-ARRIVAL undo — the observed pair
+    /// predates the CURRENT record. Pre-r29 the rollback ignored the
+    /// supplied pair, so a queued old-generation undo could mutate newer
+    /// history (the revert POST + the record rewrite). The consult answers
+    /// the typed stale refusal on the reply sink and NOTHING reaches the
+    /// provider.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_on_arrival_undo_is_refused_typed() {
+        let (mut st, _rx, _sink, http) = state_with_rollback_fake(None).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        let stale_generation = seed_live_then_stop_to_vacant(&registry, "ses_real").await;
+
+        // THE STALE UNDO: the pre-advance observed pair rides the op.
+        let mut op = undo_op("ses_real", "rb-r29-stale");
+        op.observed_epoch = Some(registry.boot_epoch());
+        op.observed_generation = Some(stale_generation);
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(op, sink).await;
+
+        let frames = captured.lock().expect("captured mutex").clone();
+        let refused = frames.iter().any(|f| {
+            let v = serde_json::to_value(f).unwrap_or_default();
+            v["type"] == "freshAgent.event"
+                && v["event"]["type"] == json!("freshAgent.error")
+                && v["event"]["code"] == json!("SESSION_RESERVED")
+                && v["event"]["requestId"] == json!("rb-r29-stale")
+                && v["event"]["rollback"] == json!(true)
+        });
+        assert!(
+            refused,
+            "the stale undo must answer the typed rollback-stamped refusal: {frames:?}"
+        );
+        assert!(
+            http.revert_posts().is_empty(),
+            "the refused undo never posted the revert"
         );
     }
 
