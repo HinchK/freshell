@@ -1307,6 +1307,7 @@ pub mod ownership_lane {
     /// deferred-acquisition block exempts it (the create completes
     /// with continuous authority) while every competitor answers the
     /// typed Blocked outcome.
+    #[allow(clippy::too_many_arguments)] // the claim field set + the window id (b8ke ext r32 F1)
     pub fn begin_terminal_lane_claim_under_attach_window(
         registry: &Option<Arc<RuntimeOwnershipRegistry>>,
         provider: &str,
@@ -1329,6 +1330,7 @@ pub mod ownership_lane {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // the claim field set + the window id (b8ke ext r32 F1)
     fn begin_terminal_lane_claim_inner(
         registry: &Option<Arc<RuntimeOwnershipRegistry>>,
         provider: &str,
@@ -1490,7 +1492,9 @@ pub mod ownership_lane {
         committed_epoch: u64,
         committed_generation: u64,
     ) -> Option<freshell_protocol::ServerMessage> {
-        let registry = registry.as_ref()?;
+        // The unwired check only — the frame's pair comes from the CALLER
+        // (the committed transition's own), never an observation.
+        registry.as_ref()?;
         Some(freshell_protocol::ServerMessage::SessionRuntimeOwner(
             freshell_protocol::SessionRuntimeOwner {
                 provider: provider.to_string(),

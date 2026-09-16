@@ -1178,6 +1178,7 @@ impl RuntimeOwnershipRegistry {
     /// grants with continuous authority while every competitor still
     /// answers the typed Blocked outcome. A window op that matches
     /// nothing is refused exactly like a competitor's.
+    #[allow(clippy::too_many_arguments)] // the begin field set + the window id (b8ke ext r32 F1)
     pub fn begin_start_under_attach_window(
         &self,
         provider: &str,
@@ -1201,6 +1202,7 @@ impl RuntimeOwnershipRegistry {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // the begin field set + the window id (b8ke ext r32 F1)
     fn begin_start_inner(
         &self,
         provider: &str,

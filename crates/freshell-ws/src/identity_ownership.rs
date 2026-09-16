@@ -657,9 +657,11 @@ pub(crate) fn broadcast_vacant_frame(
     committed_epoch: u64,
     committed_generation: u64,
 ) {
-    let Some(ownership) = state.ownership.as_ref() else {
+    // The unwired check only — the frame's pair comes from the CALLER
+    // (the committed transition's own), never an observation.
+    if state.ownership.is_none() {
         return;
-    };
+    }
     let frame = serde_json::to_string(&ServerMessage::SessionRuntimeOwner(
         freshell_protocol::SessionRuntimeOwner {
             provider: provider.to_string(),
