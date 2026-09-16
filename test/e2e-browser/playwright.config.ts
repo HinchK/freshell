@@ -1,4 +1,5 @@
 import { defineConfig, devices } from '@playwright/test'
+import { DEFAULT_TEST_TIMEOUT_MS } from './helpers/test-harness.js'
 
 /** Match-all browser projects exclude only the separately selected live-CLI smoke. */
 export const CONTINUITY_SMOKE_SPEC = /continuity-smoke\.spec\.ts$/
@@ -28,7 +29,13 @@ export default defineConfig({
   reporter: process.env.CI
     ? [['html', { open: 'never' }], ['github']]
     : [['html', { open: 'never' }]],
-  timeout: 60_000,
+  // The per-test deadline default, imported from the helpers as the single
+  // source of truth (delta review r9): this is the TEST BODY ceiling on
+  // every lane — the cloud wiring never modifies it (the boot chain's
+  // larger allowance is the freshellPage fixture's OWN timeout, see
+  // helpers/fixtures.ts); a spec may declare its own larger body deadline
+  // wherever its body envelope genuinely needs one.
+  timeout: DEFAULT_TEST_TIMEOUT_MS,
   expect: { timeout: 10_000 },
   use: {
     trace: 'on-first-retry',

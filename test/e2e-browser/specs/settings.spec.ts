@@ -1,25 +1,11 @@
 import { test, expect } from '../helpers/fixtures.js'
+import { isCloudLaneWindowConfigured } from '../helpers/test-harness.js'
 
 // The browser-preferences persist path debounces localStorage writes by
 // 500ms; wait past it before reading the blob.
 const PERSIST_DEBOUNCE_WAIT_MS = 600
 
 test.describe('Settings', () => {
-  test.beforeEach(async ({}) => {
-    // Cloud-only wedge budget (kata j90s): Playwright 1.58.2 silently
-    // discards a `timeout` in the test-details position (probe-verified),
-    // so the budget is set here — hooks run BEFORE the freshellPage
-    // fixture resolves, and a setTimeout from a hook extends the deadline
-    // to cover fixture time (probe-verified: a fixture outliving the
-    // config timeout completes under a hook-granted budget). On the cloud
-    // lane (env var present) the 90s window + one-shot self-heal reload
-    // can need well past the default 60s before a test body starts
-    // (observed ~40-60s zero-CPU gVisor I/O wedges + ~6s fresh-boot
-    // recovery + body); 120s covers the observed wedge class. Locally the
-    // env var is unset and the default budget applies.
-    if (process.env.FRESHELL_E2E_WS_READY_TIMEOUT_MS) test.setTimeout(120_000)
-  })
-
   // Helper: navigate to the settings view.
   // Sidebar nav buttons have title="Settings (Ctrl+B ,)" which Playwright
   // matches via getByRole with name /settings/i (title is used as accessible name).
@@ -97,6 +83,15 @@ test.describe('Settings', () => {
   })
 
   test('settings persist after reload', async ({ freshellPage, page, harness, serverInfo }) => {
+    // This test reloads mid-body and re-waits for the connection. The
+    // cloud-gated declaration is EXACTLY the removed settings hook's
+    // coverage restored, scoped to the one test that needs it (delta
+    // reviews r9+r10): under the cloud window the wait's legal envelope
+    // (W+1s = 91s at W=90s) exceeds the config's 60s body default, and the
+    // hook this file used to carry (kata tg4e Task 5 removed it) gave this
+    // body 120s. Locally the env is unset: no declaration, and the 60s
+    // default is the exact pre-run local behavior.
+    if (isCloudLaneWindowConfigured()) test.setTimeout(120_000)
     await openSettings(page)
 
     // Change a setting: toggle cursor blink
@@ -197,8 +192,14 @@ test.describe('Settings', () => {
     ).toBeVisible()
   })
 
-  test('Expand thinking and Expand tools switches persist locally and reset to defaults',
-    async ({ freshellPage, page, harness, serverInfo }) => {
+  test('Expand thinking and Expand tools switches persist locally and reset to defaults', async ({ freshellPage, page, harness, serverInfo }) => {
+    // Reloads mid-body with the self-healing connection wait (opted in on
+    // the cloud lane). The cloud-gated declaration is EXACTLY the removed
+    // settings hook's coverage restored, scoped to the one test that needs
+    // it (delta reviews r9+r10): the wait's legal envelope (W+1s = 91s at
+    // W=90s) exceeds the config's 60s body default, and the hook gave this
+    // body 120s. Locally: no declaration, the exact pre-run 60s behavior.
+    if (isCloudLaneWindowConfigured()) test.setTimeout(120_000)
     await openSettingsSection(page, 'Coding Agents')
 
     // Accessible-name switch locators (each Toggle carries an exact aria-label
@@ -223,13 +224,14 @@ test.describe('Settings', () => {
     expect(parsed.settings?.freshAgent?.expandTools).toBe(true)
 
     // The opt-in persists across reload. Self-heal is safe (and opted in,
-    // cloud lane only) on this fresh-boot leg: the state under test lives in
+    // cloud lane only — one presence rule shared with the budget resolver,
+    // kata tg4e) on this fresh-boot leg: the state under test lives in
     // localStorage, which survives a reload by design. Locally the wait
     // keeps its exact historical single-shot semantics.
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await harness.waitForHarness()
     await harness.waitForConnection(undefined, {
-      selfHealReload: process.env.FRESHELL_E2E_WS_READY_TIMEOUT_MS !== undefined,
+      selfHealReload: isCloudLaneWindowConfigured(),
     })
     const afterReload = (await harness.getSettings()).freshAgent
     expect(afterReload.expandThinking).toBe(true)

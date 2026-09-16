@@ -6,7 +6,14 @@ import {
   type Page,
 } from '@playwright/test'
 import { type E2eServerInfo } from './server-fixture-support.js'
-import { TestHarness } from './test-harness.js'
+import {
+  CLOUD_LANE_GOTO_BOUND_MS,
+  CLOUD_LANE_HARNESS_WAIT_BOUND_MS,
+  TestHarness,
+  freshellPageFixtureTimeoutMs,
+  isCloudLaneWindowConfigured,
+  selectShellFromPicker,
+} from './test-harness.js'
 import { TerminalHelper } from './terminal-helpers.js'
 import { createE2eServerHandle, type E2eServerHandle } from './external-target.js'
 import {
@@ -26,16 +33,29 @@ export interface E2eMachine {
   label: string
 }
 
-/** Register a machine the Rust server will accept before an isolated context boots. */
+/** Register a machine the Rust server will accept before an isolated context
+ * boots. The registration fetch is unbounded by default (delta reviews
+ * r5+r6): a finite test deadline already bounds it — Playwright aborts
+ * fixture resolution at the deadline — and an unconditional private bound
+ * would be a NEW setup-flake vector inside the first fixture every
+ * freshellPage test resolves (the documented container/loopback stall
+ * class outlives any tight bound with no retry to save it). The one
+ * caller that must bound it is the unlimited-deadline contract pin: it
+ * passes opts.fetchTimeoutMs so a wedged registration fails loudly in
+ * bounded time instead of hanging the cloud task to its own kill timer. */
 export async function registerE2eMachine(
   serverInfo: E2eServerInfo,
   label = `Playwright test machine ${Date.now()}`,
+  opts: { fetchTimeoutMs?: number } = {},
 ): Promise<E2eMachine> {
   const headers = { 'x-auth-token': serverInfo.token }
   const created = await fetch(`${serverInfo.baseUrl}/api/machines`, {
     method: 'POST',
     headers: { ...headers, 'content-type': 'application/json' },
     body: JSON.stringify({ label }),
+    ...(opts.fetchTimeoutMs !== undefined
+      ? { signal: AbortSignal.timeout(opts.fetchTimeoutMs) }
+      : {}),
   })
   if (!created.ok) {
     throw new Error(`Could not create E2E machine: HTTP ${created.status}`)
@@ -118,49 +138,6 @@ export async function createFreshE2ePage(
 }
 
 /**
- * Select a shell from the PanePicker, handling the race condition where
- * buttons can be detached during the platform-info Redux update.
- *
- * Strategy: Use Playwright's built-in auto-retry by clicking with a
- * reasonable timeout. If the first candidate detaches, move to the next.
- * After clicking, wait for .xterm to confirm the terminal was created.
- */
-async function selectShellFromPicker(page: Page): Promise<void> {
-  // First check if a terminal is already visible (no picker needed)
-  const xtermAlreadyVisible = await page.locator('.xterm').first().isVisible().catch(() => false)
-  if (xtermAlreadyVisible) return
-
-  // Wait a moment for the PanePicker to stabilize after WS connection
-  // (platform info arrives and may change the option set)
-  await page.waitForTimeout(500)
-
-  // Check again - maybe the terminal appeared during the wait
-  const xtermNow = await page.locator('.xterm').first().isVisible().catch(() => false)
-  if (xtermNow) return
-
-  // Try each shell option. Use a short timeout per attempt since we want
-  // to fall through to the next option quickly if one isn't present.
-  const shellNames = ['Shell', 'WSL', 'CMD', 'PowerShell', 'Bash']
-  for (const name of shellNames) {
-    try {
-      const button = page.getByRole('button', { name: new RegExp(`^${name}$`, 'i') })
-      // click({ timeout: 5000 }) uses Playwright's auto-retry, which handles
-      // transient detachments by re-querying the locator
-      await button.click({ timeout: 5000 })
-      // Wait for .xterm to appear, confirming terminal was created
-      await page.locator('.xterm').first().waitFor({ state: 'visible', timeout: 30_000 })
-      return
-    } catch {
-      // This shell option wasn't available or click failed; try next
-      continue
-    }
-  }
-
-  // If none of the named buttons worked, the picker might not be showing
-  // (or uses different labels). Fall through and let the test handle it.
-}
-
-/**
  * Extended Playwright test fixtures for Freshell E2E tests.
  *
  * Provides:
@@ -238,8 +215,36 @@ export const test = base.extend<{
   // Each test gets a distinct machine so the worker-scoped server cannot
   // restore the preceding test's workspace into a fresh browser context.
   // The id remains stable for every context that one test intentionally uses.
+  //
+  // Cloud-lane wedge budget (kata tg4e, delta review r9): the freshellPage
+  // boot chain — self-healing waitForConnection (at most W+1s, a single
+  // total deadline) plus the picker/render tail (kata tg4e's retained
+  // trace: a container-wide CPU-contention episode starved the post-click
+  // .xterm render and the old picker loop silently burned the remaining
+  // budget escalating through options absent on this platform) — has a
+  // permitted-composed envelope (connection W+1s + picker worst + start
+  // reserve) larger than the config's 60s default, which killed fixture
+  // setup mid-envelope: the recorded "Test timeout of 60000ms exceeded
+  // while setting up freshellPage" flake. That envelope now lives on the
+  // freshellPage fixture's OWN timeout (the tuple form above), so slow
+  // SETUP gets the allowance while every test body keeps its declared or
+  // config-default ceiling. This fixture never touches the test deadline;
+  // a declared 0 (Playwright's UNLIMITED) reaches it unchanged — hence
+  // the conditional registration-fetch bound below.
   e2eMachineId: async ({ testServer }, use) => {
-    await use((await registerE2eMachine(testServer.info)).id)
+    // Bound the registration fetch ONLY under an unlimited (0) test
+    // deadline (delta reviews r5+r6): finite-deadline tests keep their
+    // exact pre-run behavior (the deadline itself bounds resolution —
+    // a private unconditional bound would be a new setup-flake vector
+    // inside this, the FIRST fixture every freshellPage test resolves);
+    // under unlimited there is no deadline to bound anything, so the
+    // generous 60s bound (beyond every documented stall episode in this
+    // run's receipts) makes a wedge fail loudly instead of hanging the
+    // cloud task to its own kill timer.
+    const machine = await registerE2eMachine(testServer.info, undefined, {
+      fetchTimeoutMs: test.info().timeout === 0 ? 60_000 : undefined,
+    })
+    await use(machine.id)
   },
 
   serverInfo: async ({ testServer }, use) => {
@@ -254,34 +259,70 @@ export const test = base.extend<{
     await use(new TerminalHelper(page))
   },
 
-  freshellPage: async ({ page, serverInfo, harness }, use) => {
-    // Navigate to Freshell with auth token and test harness enabled
-    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+  // Tuple form with the fixture's OWN timeout (delta review r9): the boot
+  // chain below (goto + waitForHarness + self-healing waitForConnection +
+  // the picker leg) is fixture SETUP, and Playwright allows a fixture a
+  // separate larger timeout so slow setup gets its allowance while the
+  // TEST keeps its original deadline (playwright.dev/docs/test-fixtures#
+  // fixture-timeout). On the cloud lane the timeout is the composed
+  // budget (freshellPageFixtureTimeoutMs -> 321.5s at the default window:
+  // connection W+1s + the ENFORCED bounds on the initial operations
+  // (goto 60s explicit, harness install 60s default — unconfigured
+  // Playwright-Test waits/navigations are UNLIMITED, so the bounds are
+  // enforced, not assumed; delta reviews r12+r13+r14) + the picker worst
+  // case); locally it is undefined — fixture time
+  // counts toward the test timeout, the exact pre-run behavior. The wiring NEVER modifies the
+  // test's own deadline: bodies keep their declared or config-default
+  // ceiling on every lane (the former whole-test extension gave
+  // unrelated bodies ~171.5s of extra ceiling and could suppress their
+  // flakes — one flake at a time, kata tg4e).
+  freshellPage: [
+    async ({ page, serverInfo, harness }, use) => {
+    // Navigate to Freshell with auth token and test harness enabled.
+    // The goto carries an EXPLICIT bound (delta review r14): unconfigured
+    // Playwright-Test navigation is UNLIMITED (navigationTimeout defaults
+    // to 0 = disabled), so without this a pathological navigation would
+    // pass silently under the fixture slot where the pre-run 60s test
+    // deadline caught it. The bound IS the pre-run whole-test deadline —
+    // no loosening for pathological boots, no narrowing for recovering
+    // ones.
+    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`, {
+      timeout: CLOUD_LANE_GOTO_BOUND_MS,
+    })
 
-    // Wait for the test harness to be installed
-    await harness.waitForHarness()
+    // Wait for the test harness to be installed. The boot chain's wait
+    // carries its OWN ENFORCED bound (delta reviews r14+r15): unconfigured
+    // Playwright-Test waits are UNLIMITED, so under the fixture slot an
+    // unbounded install wait would let a pathological stall pass silently
+    // where the pre-run 60s test deadline caught it. The bound is passed
+    // EXPLICITLY here — the shared helper's no-arg default stays 0 (the
+    // pre-run effective semantics for every other caller, whose own
+    // declared deadlines — 60s or 600s — keep governing them).
+    await harness.waitForHarness(CLOUD_LANE_HARNESS_WAIT_BOUND_MS)
 
     // Wait for WebSocket to connect. Self-heal is opted IN on the cloud
-    // lane only (env var present): this is a fresh-boot wait, and the j90s
+    // lane only (window env configured — one presence rule shared with the
+    // budget resolver, kata tg4e): this is a fresh-boot wait, and the j90s
     // wedge class (a gVisor I/O stall hanging a timeout-less boot fetch so
     // the WS never starts) recovers via a fresh boot chain —
     // waitForConnection performs at most ONE mid-wait reload when ready
     // has not landed by half the window (kata j90s). The local lane keeps
-    // its exact historical single-shot wait semantics.
+    // its exact historical single-shot wait semantics, and a stray EMPTY
+    // export means "unset" everywhere (self-heal and budget agree).
     await harness.waitForConnection(undefined, {
-      selfHealReload: process.env.FRESHELL_E2E_WS_READY_TIMEOUT_MS !== undefined,
+      selfHealReload: isCloudLaneWindowConfigured(),
     })
 
     // If a PanePicker is showing (new tab without auto-created terminal),
     // select a shell to create a terminal. On WSL/Windows the picker shows
     // CMD/PowerShell/WSL instead of a generic "Shell".
     //
-    // Race condition: The PanePicker options depend on `connection.platform`
-    // from Redux. When the WS handshake completes, platform info arrives and
-    // the options list may change (e.g., "Shell" → "CMD/PowerShell/WSL"),
-    // detaching the old buttons mid-click. We handle this by:
-    // 1. Waiting briefly for the PanePicker to stabilize after connection
-    // 2. Using a retry loop with force-click to handle transient detachments
+    // The picker options depend on `connection.platform` from Redux and may
+    // change as the handshake settles (detaching buttons mid-click). The
+    // shared helper (kata tg4e) handles that: a not-clickable option
+    // advances to the next candidate, and a successful click waits out the
+    // render envelope without escalating — see selectShellFromPicker in
+    // test-harness.ts for the full contract.
     await selectShellFromPicker(page)
 
     await use(page)
@@ -290,7 +331,9 @@ export const test = base.extend<{
     // The server is worker-scoped (shared across tests in a spec file),
     // so terminals from previous tests would otherwise pile up.
     await harness.killAllTerminals(serverInfo)
-  },
+    },
+    { timeout: freshellPageFixtureTimeoutMs() },
+  ],
 })
 
 export { expect } from '@playwright/test'
