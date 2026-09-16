@@ -2398,6 +2398,7 @@ impl RuntimeOwnershipRegistry {
         provider: &str,
         from_session_id: &str,
         to_session_id: &str,
+        operation_id: &str,
         initiator: &str,
     ) -> CommitOutcome {
         let mut inner = self.inner.lock().expect("ownership lock poisoned");
@@ -2430,6 +2431,21 @@ impl RuntimeOwnershipRegistry {
             return CommitOutcome::ForeignOperation;
         };
         let target_generation = to_record.generation;
+        // b8ke ext r33 F3: the ALIAS mutation joins the UNIFORM
+        // coordinator log schema — the full required field set
+        // (operation_id, the target's runtime kind/id/pid where known —
+        // the placeholder's own side is None-valued, no runtime ever
+        // existed under it), so the OpenCode placeholder→durable identity
+        // transition is correlatable like every other coordinator
+        // mutation. Pre-r33 the event omitted all of them.
+        let (target_kind, target_terminal_id, target_pid) = match &to_record.state {
+            OwnershipState::Live { owner, .. } => {
+                (Some(owner.kind), owner.terminal_id.clone(), owner.pid)
+            }
+            OwnershipState::Starting { kind, .. } => (Some(*kind), None, None),
+            OwnershipState::Handoff { to_kind, .. } => (Some(*to_kind), None, None),
+            _ => (None, None, None),
+        };
         inner.insert(
             from_key,
             SessionRecord {
@@ -2443,7 +2459,10 @@ impl RuntimeOwnershipRegistry {
         );
         tracing::info!(target: "freshell_ownership",
             event = "ownership.key.alias_vacant", provider,
-            from_session_id, to_session_id, initiator,
+            from_session_id, to_session_id, initiator, operation_id,
+            from_kind = ?Option::<RuntimeOwnerKind>::None,
+            to_kind = ?target_kind,
+            runtime_id = ?target_terminal_id, pid = ?target_pid,
             epoch = self.epoch, generation = target_generation,
             duration_ms = 0u64,
             outcome = "aliased", failure_reason = "",
@@ -5965,7 +5984,13 @@ mod tests {
         // THE ALIAS: the placeholder key (no prior record) becomes an
         // Aliased{to: ses_durable} carrying the durable's generation.
         assert!(matches!(
-            r.alias_vacant_key(PROVIDER, "freshopencode-req-1", "ses_durable", "test"),
+            r.alias_vacant_key(
+                PROVIDER,
+                "freshopencode-req-1",
+                "ses_durable",
+                "op-r33-alias-1",
+                "test"
+            ),
             CommitOutcome::Committed
         ));
         // resolve_canonical walks the chain.
@@ -5983,13 +6008,25 @@ mod tests {
 
         // An already-aliased key refuses typed (never clobber).
         assert!(matches!(
-            r.alias_vacant_key(PROVIDER, "freshopencode-req-1", "ses_durable", "test"),
+            r.alias_vacant_key(
+                PROVIDER,
+                "freshopencode-req-1",
+                "ses_durable",
+                "op-r33-alias-1",
+                "test"
+            ),
             CommitOutcome::ForeignOperation
         ));
         // A missing target key refuses typed (the alias must resolve to a
         // real owner).
         assert!(matches!(
-            r.alias_vacant_key(PROVIDER, "freshopencode-req-2", "ses_absent", "test"),
+            r.alias_vacant_key(
+                PROVIDER,
+                "freshopencode-req-2",
+                "ses_absent",
+                "op-r33-alias-2",
+                "test"
+            ),
             CommitOutcome::ForeignOperation
         ));
     }
@@ -8936,6 +8973,188 @@ mod tests {
             FailOutcome::Released
         ));
 
+        // 19. b8ke ext r33 F3: the previously-UNENUMERATED coordinator
+        // mutations — the sibling-omission audit's fixes. Every one of
+        // these is a state mutation whose event must carry the same
+        // stable schema, and pre-r33 the "exhaustive" test never looked
+        // at any of them.
+        // 19a. ownership.released (the plain release's mutation — already
+        // driven by the noop-cleanup release above, but never checked).
+        // 19b. ownership.start.rekey (rekey_starting's move).
+        let BeginOutcome::Granted {
+            generation: g_rekey_start,
+        } = r.begin_start(
+            PROVIDER,
+            "sid-enum-rekey-start-old",
+            RuntimeOwnerKind::FreshAgent,
+            "op-enum-rekey-start",
+            None,
+            "test",
+            14_100,
+        )
+        else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.rekey_starting(
+                PROVIDER,
+                "sid-enum-rekey-start-old",
+                "sid-enum-rekey-start-new",
+                "op-enum-rekey-start",
+                g_rekey_start,
+            ),
+            CommitOutcome::Committed
+        ));
+        // 19c. ownership.live.rekey_from_terminal (the identity rebind's
+        // old→new move — the same shape the r33 F2 codex test drives).
+        let BeginOutcome::Granted { generation: g_rft } = r.begin_start(
+            PROVIDER,
+            "sid-enum-rft-old",
+            RuntimeOwnerKind::Terminal,
+            "op-enum-rft-live",
+            None,
+            "test",
+            14_200,
+        ) else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "sid-enum-rft-old",
+                "op-enum-rft-live",
+                g_rft,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-enum-rft".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            CommitOutcome::Committed
+        ));
+        let BeginOutcome::Granted {
+            generation: g_rft_new,
+        } = r.begin_start(
+            PROVIDER,
+            "sid-enum-rft-new",
+            RuntimeOwnerKind::Terminal,
+            "op-enum-rft-rebind",
+            None,
+            "test",
+            14_300,
+        )
+        else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.commit_live_rekey_from_terminal(
+                PROVIDER,
+                "sid-enum-rft-new",
+                "op-enum-rft-rebind",
+                g_rft_new,
+                "sid-enum-rft-old",
+                "t-enum-rft",
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-enum-rft".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                },
+                "test",
+            ),
+            CommitOutcome::Committed
+        ));
+        // 19d. ownership.force_released (the confirmed-kill raw force
+        // release's mutation).
+        let BeginOutcome::Granted {
+            generation: g_force,
+        } = r.begin_start(
+            PROVIDER,
+            "sid-enum-force",
+            RuntimeOwnerKind::FreshAgent,
+            "op-enum-force",
+            None,
+            "test",
+            14_400,
+        )
+        else {
+            panic!("expected Granted")
+        };
+        let force_owner = OwnerIdentity {
+            kind: RuntimeOwnerKind::FreshAgent,
+            terminal_id: None,
+            live_session_key: Some("sid-enum-force".into()),
+            pid: None,
+            ownership_id: None,
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "sid-enum-force",
+                "op-enum-force",
+                g_force,
+                force_owner.clone(),
+            ),
+            CommitOutcome::Committed
+        ));
+        r.force_release_for_confirmed_kill(
+            PROVIDER,
+            "sid-enum-force",
+            &ReleaseClaim {
+                operation_id: "op-enum-force".to_string(),
+                generation: g_force,
+                runtime: Some(force_owner),
+            },
+            "test-force",
+        );
+        // 19e. ownership.key.alias_vacant (the OpenCode placeholder→
+        // durable identity alias — b8ke ext r33 F3's finding: the event
+        // previously omitted operation_id/from-kind/to-kind/runtime_id/
+        // pid entirely). The durable target key holds a live owner first
+        // (the alias's to-side truth).
+        let BeginOutcome::Granted {
+            generation: g_alias_to,
+        } = r.begin_start(
+            PROVIDER,
+            "sid-enum-alias-to",
+            RuntimeOwnerKind::FreshAgent,
+            "op-enum-alias-to",
+            None,
+            "test",
+            14_500,
+        )
+        else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            r.commit_live(
+                PROVIDER,
+                "sid-enum-alias-to",
+                "op-enum-alias-to",
+                g_alias_to,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("sid-enum-alias-to".into()),
+                    pid: Some(6464),
+                    ownership_id: None,
+                },
+            ),
+            CommitOutcome::Committed
+        ));
+        assert!(matches!(
+            r.alias_vacant_key(
+                PROVIDER,
+                "freshopencode-enum-placeholder",
+                "sid-enum-alias-to",
+                "op-enum-alias",
+                "test",
+            ),
+            CommitOutcome::Committed
+        ));
         // 17. b8ke ext r15 F3: the attach-guard pair (an armed guard over
         // a live key, then released) — the claims BLOCK handoff/stop
         // operations, so their transition records must carry the same
@@ -9214,6 +9433,16 @@ mod tests {
             // start's coverage is the enter + its stale refusal below.
             "ownership.handoff.acknowledged_start.entered",
             "ownership.handoff.acknowledged_start.stale_observation",
+            // b8ke ext r33 F3: the sibling-omission audit — the
+            // previously-UNENUMERATED coordinator mutations now checked
+            // for the same stable schema (the alias_vacant event itself
+            // was the finding: it omitted the required fields AND the
+            // enumeration entirely, so no test could catch it).
+            "ownership.released",
+            "ownership.start.rekey",
+            "ownership.live.rekey_from_terminal",
+            "ownership.force_released",
+            "ownership.key.alias_vacant",
         ];
         let mut covered: Vec<&str> = Vec::new();
         for event in &events {

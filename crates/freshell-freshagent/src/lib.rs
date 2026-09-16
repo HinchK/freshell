@@ -4856,6 +4856,9 @@ async fn send_keys(
                 PROVIDER,
                 &pane.placeholder_id,
                 &durable_id,
+                // b8ke ext r33 F3: the materialization's own operation id
+                // (the alias mutation's uniform-schema operation_id).
+                &materialize_op,
                 "freshopencode/rest-materialize",
             ) {
                 freshell_ownership::CommitOutcome::Committed => {}
@@ -7498,6 +7501,7 @@ mod tests {
                 PROVIDER,
                 "pending-create-pane-r26-adopt",
                 "ses_r26_adopt",
+                "op-r33-alias-adopt",
                 "test"
             ),
             freshell_ownership::CommitOutcome::Committed

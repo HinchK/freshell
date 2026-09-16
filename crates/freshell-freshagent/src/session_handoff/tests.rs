@@ -7190,6 +7190,7 @@ async fn an_opencode_placeholder_handoff_resolves_the_durable_owner_and_complete
             "opencode",
             &placeholder_id,
             &durable_id,
+            "op-r33-alias",
             "freshopencode/send-materialize",
         ),
         freshell_ownership::CommitOutcome::Committed
