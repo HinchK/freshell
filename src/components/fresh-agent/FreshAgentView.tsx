@@ -2218,8 +2218,34 @@ export function FreshAgentView({
           status: sessionStatus,
         }))
       }
+      // An idle/busy-less snapshot must not clear a genuinely running turn.
+      // The pane-content status echo is user-visible state and deserves the
+      // same protection the session record has — the two writes must never
+      // disagree. "Genuinely running" is the session record's positive busy
+      // assertion (the server's running broadcast / status events): while
+      // the record asserts busy, a busy-less snapshot status may not
+      // overwrite the pane's 'running' unless the session-record gate's own
+      // adoption legality (canAdoptSnapshotStatus and its companion
+      // conditions; the busy disjunct is already excluded by the trigger
+      // below) would allow the same adoption; once the record no longer
+      // asserts busy (authoritative events already ended the turn), the
+      // pane's 'running' is stale and adopting the snapshot's status
+      // restores the agreement.
+      const sessionRecordAssertsBusy = agentSessionStatusRef.current !== undefined
+        && BUSY_STATES.has(agentSessionStatusRef.current)
+      const snapshotClearsGenuineRunning = !snapshotIsBusy
+        && fresh.status === 'running'
+        && sessionRecordAssertsBusy
+        && !(
+          sessionStatus
+          && nextSessionId
+          && canAdoptSnapshotStatus
+          && !wouldRegressStatus
+          && (!hasBlockingLocalEchoForSession && !statusChangedSinceRequest)
+        )
+      const nextPaneStatus = snapshotClearsGenuineRunning ? fresh.status : nextStatus
       if (
-        nextStatus === fresh.status
+        nextPaneStatus === fresh.status
         && nextSessionId === fresh.sessionId
         && nextResumeSessionId === fresh.resumeSessionId
         && nextSessionRef?.provider === fresh.sessionRef?.provider
@@ -2234,7 +2260,7 @@ export function FreshAgentView({
           ...fresh,
           sessionId: nextSessionId,
           sessionRef: nextSessionRef,
-          status: nextStatus,
+          status: nextPaneStatus,
           resumeSessionId: nextResumeSessionId,
           pendingLocalEcho: landedEcho || staleEcho ? undefined : fresh.pendingLocalEcho,
         },

@@ -175,10 +175,22 @@ test.describe('Freshopencode first-send reload regression', () => {
         return events.some((event) => event.event === 'session_create_requested')
       }, { timeout: 15_000 }).toBe(true)
 
-      const duringSend = await getFreshOpencodePaneState(page)
-      expect(duringSend.sessionId).toMatch(/^freshopencode-/)
-      expect(duringSend.status).toBe('running')
-      expect(duringSend.sessionRef?.sessionId).toMatch(/^freshopencode-/)
+      // The audit write (fake CLI process) and the client's status broadcast
+      // (WS -> Redux) are different pipelines: under full-lane load the
+      // broadcast lags the audit event, so a one-shot read raced and could
+      // observe the pre-turn 'idle' (the lane failure: Expected "running",
+      // Received "idle"). Poll instead: FAKE_OPENCODE_HANG_SESSION_CREATE=1
+      // pins the turn in flight, so 'running' is a stable steady state —
+      // polling to it does not weaken the pinned contract (the submitted
+      // prompt must stay visible across reload while materialization is
+      // pending).
+      await expect.poll(async () => getFreshOpencodePaneState(page), { timeout: 30_000 }).toMatchObject({
+        sessionId: expect.stringMatching(/^freshopencode-/),
+        status: 'running',
+        sessionRef: {
+          sessionId: expect.stringMatching(/^freshopencode-/),
+        },
+      })
 
       await page.reload()
       await harness.waitForHarness()
