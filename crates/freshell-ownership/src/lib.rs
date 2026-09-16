@@ -3612,24 +3612,21 @@ impl RuntimeOwnershipRegistry {
     /// max age) then aborts the operation, awaits its settle, kills the
     /// registered partial runtime if any, and finishes with `commit_stop`
     /// → `Vacant` + the typed `ownership.start.recovered` failure log.
-    // b8ke ext r16 F4, REMOVED b8ke ext r33 F1: the standalone
-    // acknowledged-start vacate (`acknowledge_cleared_unverified` —
-    // `Fenced{ClearedUnverified} → plain Vacant` with NO kill) is
-    // DELETED: it licensed a second writer over a possibly-live first
-    // one with nothing but the operator's risk-acceptance between
-    // them — the same violation
-    // [`RuntimeOwnershipRegistry::begin_handoff_acknowledged_cleared_unverified`]
-    // carried pre-r33. The ONE acknowledged start is the r33
-    // FORCED-REAP-THEN-START handoff enter: the prior (and its
-    // descendant tree, through the runner's tree-kill) is killed and
-    // confirmed dead BEFORE the new writer spawns, and an unconfirmable
-    // kill lands the SAME typed fenced family again — never a
-    // plain-Vacant bypass.
-    //
-    // (The r16/r17 tests that drove the deleted API's vacate semantics
-    // are reshaped onto the new contract: the acknowledged start now
-    // carries the prior as the reap target.)
-
+    /// b8ke ext r16 F4, REMOVED b8ke ext r33 F1: the standalone
+    /// acknowledged-start vacate (`acknowledge_cleared_unverified` —
+    /// `Fenced{ClearedUnverified} → plain Vacant` with NO kill) is
+    /// DELETED: it licensed a second writer over a possibly-live first
+    /// one with nothing but the operator's risk-acceptance between
+    /// them — the same violation
+    /// [`RuntimeOwnershipRegistry::begin_handoff_acknowledged_cleared_unverified`]
+    /// carried pre-r33. The ONE acknowledged start is the r33
+    /// FORCED-REAP-THEN-START handoff enter: the prior (and its
+    /// descendant tree, through the runner's tree-kill) is killed and
+    /// confirmed dead BEFORE the new writer spawns, and an unconfirmable
+    /// kill lands the SAME typed fenced family again — never a
+    /// plain-Vacant bypass. (The r16/r17 tests that drove the deleted
+    /// API's vacate semantics are reshaped onto the new contract: the
+    /// acknowledged start now carries the prior as the reap target.)
     pub fn recover_stale_starts(&self, now_ms: u64, max_age_ms: u64) -> Vec<RecoveredStart> {
         let mut inner = self.inner.lock().expect("ownership lock poisoned");
         let mut recovered = Vec::new();
