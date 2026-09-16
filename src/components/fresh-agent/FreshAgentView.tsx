@@ -2693,8 +2693,13 @@ export function FreshAgentView({
   // Providers report capabilities.send=false WHILE BUSY — that must not
   // disable the composer, or queueing becomes unreachable for codex and
   // opencode (live-test finding). Disabled = no session, ended, or truly
-  // read-only when idle.
-  const composerDisabled = !paneContent.sessionId || sessionEnded || (!canSend && !isBusy)
+  // read-only when idle. b8ke ext r32 F3: a DIVERGED/transition pane is a
+  // pure observer (the runtime-owner state owns it — "open as a terminal
+  // on another device" or transition-in-progress): the composer stays
+  // disabled so a user cannot submit text, get a local echo, and issue an
+  // old-kind send the server's generation fence would refuse with a
+  // misleading failure instead of the pane's recoverable attach action.
+  const composerDisabled = !paneContent.sessionId || sessionEnded || (!canSend && !isBusy) || Boolean(ownerDivergence)
 
   useEffect(() => {
     const outgoing = outgoingTurnRef.current
@@ -2809,12 +2814,17 @@ export function FreshAgentView({
 
   // Providers accept one active turn. Keep follow-ups until the session can
   // actually accept them, including across disconnects and provider failures.
+  // b8ke ext r32 F3: a DIVERGED/transition pane never flushes its queue —
+  // the pane is a pure observer with the attach action; a queued message
+  // held from before the divergence (or the transition) stays held until
+  // the pane is no longer diverged (the effect re-runs on the flip).
   useEffect(() => {
     if (isBusy || !canSend || connectionStatus !== 'ready' || isRestoring || hasRestoreFailure) return
+    if (ownerDivergenceRef.current) return
     if (outgoingTurnRef.current || queuedMessages.length === 0 || !paneContentRef.current.sessionId) return
     sendUserText(queuedMessages[0])
     setQueuedMessages((queue) => queue.slice(1))
-  }, [agentSession?.statusVersion, canSend, connectionStatus, hasRestoreFailure, isBusy, isRestoring, outgoingTurnVersion, queuedMessages, sendUserText])
+  }, [agentSession?.statusVersion, canSend, connectionStatus, hasRestoreFailure, isBusy, isRestoring, outgoingTurnVersion, ownerDivergence, queuedMessages, sendUserText])
 
   // Session-scoped auto-approval: any pending approval whose tool the user
   // marked "always allow" is answered immediately.
@@ -2906,7 +2916,12 @@ export function FreshAgentView({
       || childThreads.length > 0
       || Boolean(codexReview)
       || Boolean(codexFork)
-    const canInterrupt = isBusy && (snapshot?.capabilities?.interrupt === true || (
+    // b8ke ext r32 F3: a DIVERGED/transition pane has NO interrupt
+    // affordance — the pane is a pure observer (the runtime-owner state
+    // owns the session; an old-kind interrupt would at best fail the
+    // server's generation fence and at worst tear at a writer the
+    // diverged pane no longer owns).
+    const canInterrupt = !ownerDivergence && isBusy && (snapshot?.capabilities?.interrupt === true || (
       paneContent.provider === 'claude'
       && Boolean(paneContent.sessionId)
       && ['connected', 'running', 'compacting'].includes(effectiveStatus)

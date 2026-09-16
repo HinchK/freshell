@@ -9633,6 +9633,68 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
     expect(screen.queryByTestId('session-handoff-error-banner')).toBeNull()
   })
 
+  // b8ke ext r32 F3: a DIVERGED pane is a PURE OBSERVER while it still
+  // renders the fresh-agent view — the composer is disabled (no submit,
+  // no local echo, no old-kind send the server's generation fence would
+  // refuse as a misleading failed interaction), the interrupt affordance
+  // is gone (the runtime-owner state owns the writer), and a message
+  // queued BEFORE the divergence is HELD (never flushed) until the pane
+  // is no longer diverged. Pre-r32 all three affordances stayed live on
+  // the diverged pane.
+  it('a diverged pane is a pure observer: composer disabled, queued text held, no interrupt affordance', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'running',
+      capabilities: { send: true, interrupt: true, fork: false },
+      turns: [],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: divergencePaneContent({ status: 'running' }),
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // PRE-DIVERGENCE: busy + interruptible — the stop affordance renders
+    // and the composer accepts typing.
+    expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+    expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled()
+
+    // Queue a follow-up while busy (one active turn — the queue holds it).
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: 'Held follow-up' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+
+    // THE DIVERGENCE: the session is handed to a terminal runtime while
+    // the pane is busy with a queued message.
+    act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame())))
+    await screen.findByRole('alert')
+
+    // The composer is DISABLED — a pure observer with the attach action.
+    expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
+    // The interrupt affordance is GONE while diverged (pre-r32 the busy
+    // pane kept its Stop button over a writer it no longer owns).
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument()
+
+    // The session goes idle while STILL diverged: the queued message must
+    // NOT flush (pre-r32 the freed composer flushed the queue and issued
+    // an old-kind send the fence refused).
+    act(() => store.dispatch(setSessionStatus({
+      sessionId: DIV_SESSION_ID,
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      status: 'idle',
+    })))
+    await act(async () => { await Promise.resolve() })
+    expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+    expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+  })
+
   it('handoff-failure banner renders the typed code with a Retry that re-invokes the same handoff identity', async () => {
     const store = createStore()
     store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent() }))
