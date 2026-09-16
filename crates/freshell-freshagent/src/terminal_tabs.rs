@@ -2077,6 +2077,9 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
         is_wsl,
         amplifier_stub,
         ownership_start_terminal_id,
+        adopt_attach_window_op: _rest_adopt_guard
+            .as_ref()
+            .map(|guard| guard.operation_id().to_string()),
     };
     let settle = {
         // Round-3 review I-1: the settle marks settlement (success or
@@ -2172,6 +2175,13 @@ struct GatedSettleInputs {
     /// pre-created for this create (Task 11) — consumed here for the
     /// spawn-failure GC and the exit hook's never-used-stub GC.
     amplifier_stub: Option<freshell_sessions::amplifier_stub::EnsuredSession>,
+    /// b8ke ext r32 F1: the Adopt arm's attach-guard op id — `Some`
+    /// while the handler still holds the window (the guard's Drop at
+    /// handler scope end), so the settle's LATE claim (the holder's own
+    /// acquire over the death-vacated key) can name it and the
+    /// coordinator's deferred-acquisition block exempts THIS create
+    /// (continuous authority) while competitors answer Blocked.
+    adopt_attach_window_op: Option<String>,
 }
 
 /// The spawn-to-settled tail of [`spawn_terminal_pane`], run on a detached
@@ -2212,6 +2222,7 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         is_wsl,
         amplifier_stub,
         ownership_start_terminal_id: _,
+        adopt_attach_window_op,
     } = inputs;
 
     // b8ke ext r20 F1: the DOOR claim pre-minted the terminal id when it
@@ -2973,17 +2984,46 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
     if ownership_claim.is_none() && !under_handoff_ticket {
         if let Some(locator) = claim_locator.clone() {
             let operation_id = format!("rest-create-late-{create_request_id}");
-            let refusal = match crate::ownership_lane::begin_terminal_lane_claim(
-                &state.ownership,
-                &locator.provider,
-                &locator.session_id,
-                &operation_id,
-                // No observed fence: the create holds no prior observation
-                // to fence against (the Adopt arm claimed nothing).
-                None,
-                "rest",
-                now_ms().max(0) as u64,
-            ) {
+            // b8ke ext r32 F1: the holder's OWN late claim — when the
+            // Adopt arm's attach guard is still held (the incumbent
+            // exited mid-window — the exit-during-guard race), the
+            // windowed claim names the armed guard's id so the
+            // coordinator's deferred-acquisition block exempts THIS
+            // create (continuous authority) while every competitor
+            // answers the typed Blocked outcome.
+            // b8ke ext r32 F1: the holder's OWN late claim — when the
+            // Adopt arm's attach guard is still held (the incumbent
+            // exited mid-window — the exit-during-guard race), the
+            // windowed claim names the armed guard's id so the
+            // coordinator's deferred-acquisition block exempts THIS
+            // create (continuous authority) while every competitor
+            // answers the typed Blocked outcome.
+            let claim = match adopt_attach_window_op.as_deref() {
+                None => crate::ownership_lane::begin_terminal_lane_claim(
+                    &state.ownership,
+                    &locator.provider,
+                    &locator.session_id,
+                    &operation_id,
+                    // No observed fence: the create holds no prior observation
+                    // to fence against (the Adopt arm claimed nothing).
+                    None,
+                    "rest",
+                    now_ms().max(0) as u64,
+                ),
+                Some(window_op) => {
+                    crate::ownership_lane::begin_terminal_lane_claim_under_attach_window(
+                        &state.ownership,
+                        &locator.provider,
+                        &locator.session_id,
+                        &operation_id,
+                        None,
+                        "rest",
+                        now_ms().max(0) as u64,
+                        window_op,
+                    )
+                }
+            };
+            let refusal = match claim {
                 crate::ownership_lane::TerminalLaneClaim::Granted(ticket) => {
                     ownership_claim = Some(RestOwnershipClaim {
                         ticket,

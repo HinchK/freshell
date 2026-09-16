@@ -808,6 +808,16 @@ struct SessionRecord {
     /// interleave with a state move), and the losing lifecycle operation
     /// retries after the window.
     in_flight_attaches: u32,
+    /// b8ke ext r32 F1: the ARMED attach guards' operation ids — the
+    /// same windows `in_flight_attaches` counts, identified so the
+    /// GUARD HOLDER's own late claim (the create/attach flow that armed
+    /// the window and now acquires the death-vacated key) can EXEMPT
+    /// itself from the deferred-acquisition block: its begin carries
+    /// `Some(window_operation_id)` matching one of these ids, while
+    /// every competitor (no window op, or one that does not match)
+    /// answers the typed Blocked outcome. The ids are server-minted
+    /// UUIDs, never wire-exposed — a competitor cannot name one.
+    armed_attach_ops: Vec<String>,
 }
 
 impl Default for SessionRecord {
@@ -821,6 +831,7 @@ impl Default for SessionRecord {
             stop_settled: None,
             partial_runtime: None,
             in_flight_attaches: 0,
+            armed_attach_ops: Vec::new(),
         }
     }
 }
@@ -906,6 +917,14 @@ impl AttachGuard {
     pub fn generation(&self) -> u64 {
         self.generation
     }
+
+    /// b8ke ext r32 F1: the armed window's operation id — the holder's
+    /// own late claim (the create/attach flow that armed this guard)
+    /// passes this to the windowed begin so the deferred-acquisition
+    /// block exempts it (a competitor cannot name the UUID).
+    pub fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
 }
 
 impl AttachGuard {
@@ -924,6 +943,15 @@ impl AttachGuard {
         let mut released_pid = None;
         if let Some(record) = inner.get_mut(&key) {
             record.in_flight_attaches = record.in_flight_attaches.saturating_sub(1);
+            // b8ke ext r32 F1: the identified window closes with the
+            // count (the holder's exemption list stays in lockstep).
+            if let Some(pos) = record
+                .armed_attach_ops
+                .iter()
+                .position(|op| op == &self.operation_id)
+            {
+                record.armed_attach_ops.remove(pos);
+            }
             if let OwnershipState::Live { owner, .. } = &record.state {
                 released_from_kind = Some(owner.kind);
                 released_runtime_id = owner.terminal_id.clone();
@@ -1129,6 +1157,61 @@ impl RuntimeOwnershipRegistry {
         initiator: &str,
         now_ms: u64,
     ) -> BeginOutcome {
+        self.begin_start_inner(
+            provider,
+            session_id,
+            kind,
+            operation_id,
+            observed,
+            initiator,
+            now_ms,
+            None,
+        )
+    }
+
+    /// b8ke ext r32 F1: the GUARD HOLDER's own begin — the create/attach
+    /// flow that armed an attach window on this key and now acquires the
+    /// death-vacated key inside its own window. `window_operation_id`
+    /// names one of the record's ARMED guard ids (the holder got it from
+    /// its [`AttachGuard::operation_id`]); the deferred-acquisition
+    /// block in the Vacant arm exempts it, so the holder's late claim
+    /// grants with continuous authority while every competitor still
+    /// answers the typed Blocked outcome. A window op that matches
+    /// nothing is refused exactly like a competitor's.
+    pub fn begin_start_under_attach_window(
+        &self,
+        provider: &str,
+        session_id: &str,
+        kind: RuntimeOwnerKind,
+        operation_id: &str,
+        observed: Option<ObservedFence>,
+        initiator: &str,
+        now_ms: u64,
+        window_operation_id: &str,
+    ) -> BeginOutcome {
+        self.begin_start_inner(
+            provider,
+            session_id,
+            kind,
+            operation_id,
+            observed,
+            initiator,
+            now_ms,
+            Some(window_operation_id),
+        )
+    }
+
+    fn begin_start_inner(
+        &self,
+        provider: &str,
+        session_id: &str,
+        kind: RuntimeOwnerKind,
+        operation_id: &str,
+        observed: Option<ObservedFence>,
+        initiator: &str,
+        now_ms: u64,
+        attach_window_operation_id: Option<&str>,
+    ) -> BeginOutcome {
         let mut inner = self.inner.lock().expect("ownership lock poisoned");
         let key = SessionKey::new(provider, session_id);
         // Fence check BEFORE creating the record: a stale request must not
@@ -1198,9 +1281,16 @@ impl RuntimeOwnershipRegistry {
                 // record's Vacant state itself stays honest (the
                 // runtime IS dead), the DEFERRAL is the acquisition
                 // policy, so no fence can become permanent and the
-                // guarded create's own `commit_live` (at the armed
-                // generation) is never refused.
-                if record.in_flight_attaches > 0 {
+                // guarded create's own windowed begin
+                // (`begin_start_under_attach_window`) is never refused.
+                if record.in_flight_attaches > 0
+                    && !attach_window_operation_id.is_some_and(|window_op| {
+                        record
+                            .armed_attach_ops
+                            .iter()
+                            .any(|armed| armed == window_op)
+                    })
+                {
                     tracing::warn!(target: "freshell_ownership",
                         event = "ownership.start.blocked_by_attach_guard",
                         operation_id, provider, session_id, initiator,
@@ -1453,6 +1543,9 @@ impl RuntimeOwnershipRegistry {
             }
         }
         record.in_flight_attaches = record.in_flight_attaches.saturating_add(1);
+        // b8ke ext r32 F1: the armed window is IDENTIFIED — the holder's
+        // own late claim exempts itself by naming this id.
+        record.armed_attach_ops.push(operation_id.to_string());
         // b8ke ext r15 F3: the arm event joins the UNIFORM transition
         // schema — the LIVE OWNER the guard pins (from_kind + the runtime
         // identity) is the owner a blocked handoff/stop would name, so
@@ -10057,24 +10150,96 @@ mod tests {
             ),
         }
 
-        // The guarded create completes with CONTINUOUS AUTHORITY: through
-        // the whole window no competitor acquired the key — the record's
-        // generation is STILL the armed one (pre-r32 the competitor's
-        // grant bumped it into Starting, and the guarded flow's late
-        // claim found a foreign owner and killed its own writer only
-        // AFTER the overlap). The guard-held flows claim NOTHING on the
-        // guarded key — the guard IS the authority (the adopt/attach
-        // windows) — so the completion is the disarm below.
+        // The guarded create completes with CONTINUOUS AUTHORITY: the
+        // holder's OWN late claim (the create/attach flow that armed the
+        // window, now acquiring the death-vacated key inside it) grants
+        // through the windowed begin — naming its armed guard's op id.
+        // Pre-r32 the competitor's grant had already taken the key and
+        // the holder's late claim found a foreign owner (killing its
+        // own writer only AFTER the overlap).
+        //
+        // A window op that names NOTHING armed is refused exactly like
+        // a competitor's — the exemption is the holder's identity, not
+        // a blanket bypass.
+        match registry.begin_start_under_attach_window(
+            "codex",
+            "sid-r32-exit-guard",
+            RuntimeOwnerKind::Terminal,
+            "op-bogus-window",
+            None,
+            "competitor",
+            2_400,
+            "not-an-armed-window",
+        ) {
+            BeginOutcome::Blocked { .. } => {}
+            other => panic!("a bogus window op must be refused like a competitor's: {other:?}"),
+        }
+        let holder_generation = match registry.begin_start_under_attach_window(
+            "codex",
+            "sid-r32-exit-guard",
+            RuntimeOwnerKind::Terminal,
+            "op-holder-late",
+            None,
+            "holder",
+            2_500,
+            "attach-r32",
+        ) {
+            // The windowed grant is a FRESH acquisition over the vacated
+            // key (the monotone bump — generation + 1), NOT the armed
+            // baseline: "continuous authority" means it GRANTED with no
+            // competitor interleaved (every competitor answered Blocked
+            // at every step), never that generations freeze.
+            BeginOutcome::Granted {
+                generation: holder_gen,
+            } => {
+                assert_eq!(
+                    holder_gen,
+                    generation + 1,
+                    "the holder's windowed claim grants the fresh monotone generation"
+                );
+                holder_gen
+            }
+            other => panic!("the holder's own windowed begin must grant: {other:?}"),
+        };
         assert_eq!(
-            registry.observe("codex", "sid-r32-exit-guard").generation,
-            generation,
-            "no competitor acquired the guarded key during the window"
+            registry.commit_live(
+                "codex",
+                "sid-r32-exit-guard",
+                "op-holder-late",
+                holder_generation,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-holder-r32".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: Some("op-holder-late".into()),
+                },
+            ),
+            CommitOutcome::Committed,
+            "the holder's claim commits Live through its own window"
         );
 
         // THE DEFERRED ACQUISITION LANDS when the last guard resolves
         // (the count hits zero — the deferred release lands after guard
-        // resolution, never a permanent fence).
+        // resolution, never a permanent fence): the holder's owner exits
+        // after the window and the key is acquirable by anyone again.
         guard.disarm();
+        registry.release(
+            "codex",
+            "sid-r32-exit-guard",
+            &ReleaseClaim {
+                operation_id: "op-holder-late".into(),
+                generation: holder_generation,
+                runtime: Some(OwnerIdentity {
+                    kind: RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-holder-r32".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: Some("op-holder-late".into()),
+                }),
+            },
+            "watcher",
+        );
         match registry.begin_start(
             "codex",
             "sid-r32-exit-guard",

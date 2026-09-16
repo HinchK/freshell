@@ -1287,18 +1287,83 @@ pub mod ownership_lane {
         initiator: &str,
         now_ms: u64,
     ) -> TerminalLaneClaim {
-        let Some(registry) = registry.as_ref() else {
-            return TerminalLaneClaim::Unwired;
-        };
-        match registry.begin_start(
+        begin_terminal_lane_claim_inner(
+            registry,
             provider,
             session_id,
-            RuntimeOwnerKind::Terminal,
             operation_id,
             observed,
             initiator,
             now_ms,
-        ) {
+            None,
+        )
+    }
+
+    /// b8ke ext r32 F1: the GUARD HOLDER's own terminal-lane claim — the
+    /// create/attach flow that armed an attach window on this key (the
+    /// Adopt arm's guard) and now claims the death-vacated key inside
+    /// its own window at the settle. `window_operation_id` is the armed
+    /// guard's id ([`AttachGuard::operation_id`]); the coordinator's
+    /// deferred-acquisition block exempts it (the create completes
+    /// with continuous authority) while every competitor answers the
+    /// typed Blocked outcome.
+    pub fn begin_terminal_lane_claim_under_attach_window(
+        registry: &Option<Arc<RuntimeOwnershipRegistry>>,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        observed: Option<ObservedFence>,
+        initiator: &str,
+        now_ms: u64,
+        window_operation_id: &str,
+    ) -> TerminalLaneClaim {
+        begin_terminal_lane_claim_inner(
+            registry,
+            provider,
+            session_id,
+            operation_id,
+            observed,
+            initiator,
+            now_ms,
+            Some(window_operation_id),
+        )
+    }
+
+    fn begin_terminal_lane_claim_inner(
+        registry: &Option<Arc<RuntimeOwnershipRegistry>>,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        observed: Option<ObservedFence>,
+        initiator: &str,
+        now_ms: u64,
+        attach_window_operation_id: Option<&str>,
+    ) -> TerminalLaneClaim {
+        let Some(registry) = registry.as_ref() else {
+            return TerminalLaneClaim::Unwired;
+        };
+        let outcome = match attach_window_operation_id {
+            None => registry.begin_start(
+                provider,
+                session_id,
+                RuntimeOwnerKind::Terminal,
+                operation_id,
+                observed,
+                initiator,
+                now_ms,
+            ),
+            Some(window_op) => registry.begin_start_under_attach_window(
+                provider,
+                session_id,
+                RuntimeOwnerKind::Terminal,
+                operation_id,
+                observed,
+                initiator,
+                now_ms,
+                window_op,
+            ),
+        };
+        match outcome {
             BeginOutcome::Granted { generation } => {
                 TerminalLaneClaim::Granted(OperationTicket::new(
                     Arc::clone(registry),

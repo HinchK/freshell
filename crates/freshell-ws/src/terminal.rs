@@ -5419,17 +5419,39 @@ pub(crate) async fn handle_create(
         if let Some(locator) = learned_locator {
             let operation_id = format!("term-create-late-{}", create.request_id);
             let initiator = format!("ws-conn-{conn_id}");
-            let refusal = match freshell_freshagent::ownership_lane::begin_terminal_lane_claim(
-                &state.ownership,
-                &locator.provider,
-                &locator.session_id,
-                &operation_id,
-                // No observed fence: the create holds no prior observation
-                // to fence against (the Adopt arm claimed nothing).
-                None,
-                &initiator,
-                now_ms().max(0) as u64,
-            ) {
+            // b8ke ext r32 F1: the holder's OWN late claim — when the
+            // Adopt arm's attach guard is still held (the incumbent
+            // exited mid-window — the exit-during-guard race), the
+            // windowed claim names the armed guard's id so the
+            // coordinator's deferred-acquisition block exempts THIS
+            // create (continuous authority) while every competitor
+            // answers the typed Blocked outcome.
+            let claim = match _wire_adopt_guard.as_ref().map(|g| g.operation_id().to_string()) {
+                None => freshell_freshagent::ownership_lane::begin_terminal_lane_claim(
+                    &state.ownership,
+                    &locator.provider,
+                    &locator.session_id,
+                    &operation_id,
+                    // No observed fence: the create holds no prior observation
+                    // to fence against (the Adopt arm claimed nothing).
+                    None,
+                    &initiator,
+                    now_ms().max(0) as u64,
+                ),
+                Some(window_op) => {
+                    freshell_freshagent::ownership_lane::begin_terminal_lane_claim_under_attach_window(
+                        &state.ownership,
+                        &locator.provider,
+                        &locator.session_id,
+                        &operation_id,
+                        None,
+                        &initiator,
+                        now_ms().max(0) as u64,
+                        &window_op,
+                    )
+                }
+            };
+            let refusal = match claim {
                 freshell_freshagent::ownership_lane::TerminalLaneClaim::Granted(ticket) => {
                     terminal_ownership = Some(TerminalOwnershipClaim {
                         ticket,
