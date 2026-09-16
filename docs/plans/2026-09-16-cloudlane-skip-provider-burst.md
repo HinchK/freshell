@@ -105,7 +105,7 @@ No `src/`, `crates/`, `docker/`, or config/vite changes. No user-facing UI chang
 
 **Interfaces:**
 - Consumes: `scripts/e2e-cloud.sh` `cmd_run` backend resolution (:449-458) and local exec path (:460-466); package.json script entries `test:e2e:local` / `test:e2e:cloud` (package.json:76-77).
-- Produces: the lane-provenance banner contract consumed by every Task 8 receipt — local runs print one stdout line beginning `[e2e-cloud] Running locally... (config: test/e2e-browser/playwright.config.ts; CLOUD_SKIP_SPECS does not apply on this lane; FRESHELL_E2E_BACKEND=<value or <unset>>)`; cloud runs print a `Config:` line naming `playwright.cloud.config.ts`. CONSUMER CONSTRAINT (LB-4, see `reports/load-bearing-finder.md`): `scripts/test/cloud-run-wrapper.test.sh` DOES parse this output — its checks 9 (:127) and 10 (:146) grep the local-path output for the substring `Running locally`, and check 11 (:212) asserts that substring's ABSENCE on the cloud path. The banner design must therefore preserve the exact `Running locally` substring verbatim; additions after it are safe (all the suite's greps are substring matches on the preserved prefix). The cloud-side `Config:` line is ALSO pinned by this task in the wrapper suite itself: the suite already runs a fully stubbed cloud path and captures the cloud-path output (the `CLOUD_STUB_OUTPUT` variable, as consumed by check 11), so an inexpensive additional check there asserts the cloud path prints the `Config:  test/e2e-browser/playwright.cloud.config.ts` line — closing the provenance contract's cloud half with automated coverage (plan review round 1, Finding 2).
+- Produces: the lane-provenance banner contract consumed by every Task 8 receipt — local runs print one stdout line beginning `[e2e-cloud] Running locally... (config: test/e2e-browser/playwright.config.ts; CLOUD_SKIP_SPECS does not apply on this lane; backend=local; source: <flag --local | env FRESHELL_E2E_BACKEND=<value> | default>)`; cloud runs print a `Config:` line naming `playwright.cloud.config.ts`. The banner prints the RESOLVED lane and its selection source (never the raw env value, which misleads when a flag overrides it — plan review round 3, Finding 3). CONSUMER CONSTRAINT (LB-4, see `reports/load-bearing-finder.md`): `scripts/test/cloud-run-wrapper.test.sh` DOES parse this output — its checks 9 (:127) and 10 (:146) grep the local-path output for the substring `Running locally`, and check 11 (:212) asserts that substring's ABSENCE on the cloud path. The banner design must therefore preserve the exact `Running locally` substring verbatim; additions after it are safe (all the suite's greps are substring matches on the preserved prefix). The cloud-side `Config:` line is ALSO pinned by this task in the wrapper suite itself: the suite already runs a fully stubbed cloud path and captures the cloud-path output (the `CLOUD_STUB_OUTPUT` variable, as consumed by check 11), so an inexpensive additional check there asserts the cloud path prints the `Config:  test/e2e-browser/playwright.cloud.config.ts` line — closing the provenance contract's cloud half with automated coverage (plan review round 1, Finding 2).
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -153,7 +153,7 @@ describe('e2e-cloud wrapper lane provenance', () => {
     expect(result.stdout).toContain('[e2e-cloud] Running locally...')
     expect(result.stdout).toContain('test/e2e-browser/playwright.config.ts')
     expect(result.stdout).toContain('CLOUD_SKIP_SPECS does not apply')
-    expect(result.stdout).toContain('FRESHELL_E2E_BACKEND=<unset>')
+    expect(result.stdout).toContain('backend=local; source: default')
 
     const npxArgs = (await fsp.readFile(argsFile, 'utf8')).split('\n').filter(Boolean)
     expect(npxArgs).toEqual([
@@ -171,17 +171,38 @@ describe('e2e-cloud wrapper lane provenance', () => {
 
 Run: `npm run test:e2e:helpers -- e2e-cloud-lane-banner`
 
-Expected: FAIL — the banner-provenance assertions fail (`toContain('test/e2e-browser/playwright.config.ts')`, `toContain('CLOUD_SKIP_SPECS does not apply')`, `toContain('FRESHELL_E2E_BACKEND=<unset>')`) because the current banner is only `[e2e-cloud] Running locally...`. The stubbed-`npx` assertions PASS pre-change, proving the spawn harness itself works — the failure is the missing provenance content, not a setup accident.
+Expected: FAIL — the banner-provenance assertions fail (`toContain('test/e2e-browser/playwright.config.ts')`, `toContain('CLOUD_SKIP_SPECS does not apply')`, `toContain('backend=local; source: default')`) because the current banner is only `[e2e-cloud] Running locally...`. The stubbed-`npx` assertions PASS pre-change, proving the spawn harness itself works — the failure is the missing provenance content, not a setup accident.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
 In `scripts/e2e-cloud.sh`, replace line 461 with:
 
 ```bash
-    echo "[e2e-cloud] Running locally... (config: test/e2e-browser/playwright.config.ts; CLOUD_SKIP_SPECS does not apply on this lane; FRESHELL_E2E_BACKEND=${FRESHELL_E2E_BACKEND:-<unset>})"
+    echo "[e2e-cloud] Running locally... (config: test/e2e-browser/playwright.config.ts; CLOUD_SKIP_SPECS does not apply on this lane; backend=local; source: ${backend_source})"
 ```
 
-(`${FRESHELL_E2E_BACKEND:-<unset>}` is safe under `set -u`; it renders the resolved default honestly — receipts can distinguish an unset-env default from an explicit `--local` / `FRESHELL_E2E_BACKEND=local` choice by the banner alone.)
+and record the selection source at the resolution site (the backend-resolution block at :449-458) so the banner prints the RESOLVED lane and HOW it was chosen — not the raw env value, which misleads when a `--local` flag overrides `FRESHELL_E2E_BACKEND=cloud` (plan review round 3, Finding 3):
+
+```bash
+  # Resolve backend: explicit flags override env var; env var defaults to local.
+  local backend_source="default"
+  if $cloud_mode; then
+    local_mode=false
+    backend_source="flag --cloud"
+  elif $local_mode; then
+    backend_source="flag --local"
+  elif [ "${FRESHELL_E2E_BACKEND:-local}" = "cloud" ]; then
+    cloud_mode=true
+    backend_source="env FRESHELL_E2E_BACKEND=cloud"
+  else
+    local_mode=true
+    if [ -n "${FRESHELL_E2E_BACKEND:-}" ]; then
+      backend_source="env FRESHELL_E2E_BACKEND=$FRESHELL_E2E_BACKEND"
+    fi
+  fi
+```
+
+(Reconcile with the block's actual initialization just above it — if `$local_mode` is initialized true rather than set only by the `--local` flag, distinguish the flag case by checking the parsed args the same way the block already does for `--cloud`/`--local`; the requirement is that the three sources — flag, env, default — are distinguishable and truthful in the banner. `set -u` safety: the `${FRESHELL_E2E_BACKEND:-}` forms keep the unbound case rendering as `default`.)
 
 And in the cloud banner block, add one line after the `Args:` line (currently :515):
 
@@ -813,7 +834,7 @@ The REAL red for both stall points is the lane evidence (r1's 404 at the one-sho
     ]))
 ```
 
-2. Insert the PERMANENT deterministic eviction exercise right after that poll (RED A's block, kept): the `tabs/addTab` dispatch through the harness plus the `expect.poll(...).toBe(404)` await that the eviction landed. This converts the lane's load-dependent eviction into a condition the test exercises every run, in the exact final-head window (between the panes read and the capture read).
+2. Insert the PERMANENT deterministic eviction exercise right after that poll (RED A's block, kept — with its eviction-landed poll raised to the family's 30s bound: the red-phase temporary copy may keep 5s because it runs focused/unloaded, but the permanent copy runs under full-lane 48-worker load where related layout observations already exceeded 5-10s; a 5s prerequisite here would replace the original flake with its own timeout — plan review round 3, Finding 2): the `tabs/addTab` dispatch through the harness plus the `expect.poll(..., { timeout: 30_000 }).toBe(404)` await that the eviction landed. This converts the lane's load-dependent eviction into a condition the test exercises every run, in the exact final-head window (between the panes read and the capture read).
 
 3. At :425-430, replace the one-shot capture fetch with the eviction-proof poll:
 
@@ -868,8 +889,27 @@ async function fetchNormalizedLayoutProducedByLegacySync(page: Page, serverInfo:
     { id: 'pane-legacy-agent-nested', kind: 'fresh-agent', createRequestId: 'req-legacy-agent-nested' },
     { id: 'pane-shell', kind: 'terminal', createRequestId: 'req-shell' },
   ]))
-  // ... the rest of the function (the follow-up snapshot fetch and its
-  // assertions) is unchanged.
+
+  // The follow-up one-shot snapshot fetch has the SAME adjacent-read
+  // eviction exposure (an eviction can land between the poll's success and
+  // this fetch — plan review round 3, Finding 1): shield it too. The poll
+  // hands the snapshot out via closure once the entry is present.
+  let snapshot: LayoutSnapshot | undefined
+  await expect.poll(async () => {
+    const response = await fetchWithAuth(serverInfo, `/api/layout/snapshot?tabId=${encodeURIComponent(tabId)}`)
+    if (response.status !== 200) return { status: response.status, present: false }
+    const body = await response.json()
+    const candidate = body.data as LayoutSnapshot
+    if (!collectLeaves(candidate.layouts[tabId]).some((leaf) => leaf.id === 'pane-legacy-agent')) {
+      await sendLegacyLayoutSync(page)
+      return { status: response.status, present: false }
+    }
+    snapshot = candidate
+    return { status: response.status, present: true }
+  }, { timeout: 30_000 }).toMatchObject({ status: 200, present: true })
+```
+
+(the remainder of the helper — the `serialized`/leaf assertions and the `return snapshot` — runs unchanged against the now-protected `snapshot` closure value; `snapshot!` is safe because the poll cannot pass without setting it).
 ```
 
 Liveness note for this fourth literal: unloaded, the fast path sees the re-sent entry immediately and passes even at a dead bound, so an isolated mutation red is not feasible without fabricating eviction timing; its bound is the same expect.poll mechanism proven live by RED B, and its re-send is the same machinery exercised deterministically every run by the permanent trigger (item 2). The eviction re-send, not the bound, is the load-bearing change here.
