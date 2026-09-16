@@ -793,7 +793,14 @@ async function executeSampleDefault(
 
     const harness = new TestHarness(page)
     const terminal = new TerminalHelper(page)
-    await harness.waitForHarness()
+    // The harness-install wait bound (delta-focused r1): this standalone
+    // runner creates a LIBRARY-mode context, whose omitted-timeout default
+    // is Playwright's 30s — the no-arg helper default (0 = unlimited,
+    // the Playwright-Test pre-run parity) would turn a wedged harness
+    // install into an indefinite hang here. Pass the file's own sample
+    // timeout explicitly: the exact 30s this call effectively had
+    // pre-change, now real instead of accidental.
+    await harness.waitForHarness(SAMPLE_TIMEOUT_MS)
 
     if (input.scenarioId !== 'auth-required-cold-boot') {
       await harness.waitForConnection()

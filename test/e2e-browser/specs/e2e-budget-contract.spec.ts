@@ -1,5 +1,10 @@
 import { test, expect } from '../helpers/fixtures.js'
-import { DEFAULT_TEST_TIMEOUT_MS, isCloudLaneWindowConfigured, TestHarness } from '../helpers/test-harness.js'
+import {
+  CLOUD_LANE_HARNESS_WAIT_BOUND_MS,
+  DEFAULT_TEST_TIMEOUT_MS,
+  isCloudLaneWindowConfigured,
+  TestHarness,
+} from '../helpers/test-harness.js'
 import type { Page } from '@playwright/test'
 
 // Contract (kata tg4e, main-green campaign, delta review r9): the cloud
@@ -108,12 +113,19 @@ test.describe('declared deadlines above the config default stay as declared', ()
 // explicit, harness install 60s at the boot call site, picker worst) is
 // behaviorally unit-pinned by freshellPageFixtureTimeoutMs. ONLY this pin resolves
 // the slow harness: the spec's other pins keep the real (fast) harness.
+// Records the argument the PRODUCTION freshellPage fixture passes to its
+// harness-install wait — the boot chain's enforced bound. The application
+// pin asserts it (focused review r1): removing or changing the argument
+// at the production call site fails the pin deterministically.
+let harnessWaitArgumentSeen: number | undefined
+
 class DeterministicallySlowBootHarness extends TestHarness {
   constructor(page: Page) {
     super(page)
   }
 
   override async waitForHarness(timeoutMs?: number): Promise<void> {
+    harnessWaitArgumentSeen = timeoutMs
     await new Promise((resolve) => setTimeout(resolve, 70_000))
     return super.waitForHarness(timeoutMs)
   }
@@ -145,5 +157,9 @@ testSlowBoot.describe('the production fixture-timeout application (delta reviews
     // The test's own slot is intact and untouched after the 70s boot
     // rode the fixture's separate slot.
     expect(testSlowBoot.info().timeout).toBe(DEFAULT_TEST_TIMEOUT_MS)
+    // And the boot chain really passes its enforced harness-install
+    // bound (focused review r1): the production call site's argument,
+    // observed through the subclass the production fixture resolved.
+    expect(harnessWaitArgumentSeen).toBe(CLOUD_LANE_HARNESS_WAIT_BOUND_MS)
   })
 })
