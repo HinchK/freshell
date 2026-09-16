@@ -759,6 +759,44 @@ git add test/e2e-browser/specs/fresh-agent.spec.ts
 git commit -m "test(e2e): deflake fresh-agent settings-modal waits (5s -> 15s under full-lane load)"
 ```
 
+### Task 6b (amendment, added after Task 6's evidence): sweep the stale bare-key layout persist family (kata tr89)
+
+**Amendment provenance (2026-09-16):** Task 6's review found the :1579 failure is (a) a stale test pinning a retired product contract: since `e105f736b` (inside the campaign base) the product writes only per-window layout keys (`freshell.layout.v3.<layoutWindowId>` — persistMiddleware.ts:686, window-layout-keys.ts:70-72, storage-keys.ts:2-9); the test still requires the bare `freshell.layout.v3` key, so it fails deterministically by construction (A/B-proven identical at run HEAD 8b2c21ff8 and campaign base 6ee5cf4b2). The family has siblings that a single-test re-spec would leave behind: `fresh-agent-control-rust.spec.ts:1534` (identical bare-key throw; CLOUD-LEGAL — must be swept or Task 8's cloud gate will show a seemingly-new deterministic failure), `freshclaude-identity-persistence-rust.spec.ts:160` (bare-key read degrading to `''` — vacuous-pass risk), `fresh-agent-centralization-smoke.spec.ts:10` (pins the bare-key constant itself; cloud-skip-listed). Kata tr89 filed.
+
+**Files:**
+- Modify (test-side only, each justified in the report): `test/e2e-browser/specs/fresh-agent.spec.ts` (:1579/:1669 re-spec), `test/e2e-browser/specs/fresh-agent-control-rust.spec.ts` (:1534), `test/e2e-browser/specs/freshclaude-identity-persistence-rust.spec.ts` (:160), `test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts` (:10) — the last one ONLY as it interacts with Task 7's redesign; coordinate, do not duplicate Task 7's work.
+- Test: the affected specs themselves.
+
+**Interfaces:**
+- Consumes: the per-window layout key contract (`window-layout-keys.ts` — the layout window id is derivable in-page; the product's own readers show how).
+- Produces: truthful persistence assertions — the persisted value read must be the per-window key the product actually wrote for THIS window, never a loosened existence check.
+
+- [ ] **Step 1: RED (already captured for :1579 — cheap re-verify)**
+
+Run: `npm run test:e2e:local -- test/e2e-browser/specs/fresh-agent.spec.ts --grep "persists its current layout state"`
+
+Expected: FAIL at :1579 (Missing persisted layout after Freshopencode flush — bare-key read finds nothing).
+
+- [ ] **Step 2: Empirical sibling audit BEFORE any edit**
+
+For each of the three sibling readers: run its spec (focused grep on the containing test) and record the CURRENT status (pass/fail/vacuous) with fresh output. Do not assume — the fresh-agent-control-rust:1534 test may currently pass for reasons the code review must state (e.g. its flush helper's path), or fail deterministically like :1579. Record each reader's mechanism with file:line.
+
+- [ ] **Step 3: Re-spec honestly**
+
+Rewrite each stale reader to assert the truthful current contract: read the per-window key the product wrote for the page's layout window (follow the product's own derivation, e.g. window-layout-keys.ts), and assert the persisted layout contains what the test actually created (scope: the specific claim each test made under the bare-key regime — do not broaden or loosen). For the vacuous '' fallback in freshclaude-identity-persistence: the test must now genuinely verify persistence (a hard failure if the per-window key is absent) — never keep a silent fallback. Keep each test's original intent (the pane/layout created before the flush is the one found after).
+
+- [ ] **Step 4: GREEN — all four specs**
+
+Run all four specs (fresh-agent full; fresh-agent-control-rust full; freshclaude-identity-persistence-rust full; centralization-smoke full) — centralization-smoke expected to still fail at its Task 7 targets (the capture/modal families, kata vpfr) which Task 7 owns; everything the bare-key family owns must be green. Record every result.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add test/e2e-browser/specs/fresh-agent.spec.ts test/e2e-browser/specs/fresh-agent-control-rust.spec.ts test/e2e-browser/specs/freshclaude-identity-persistence-rust.spec.ts
+# plus centralization-smoke ONLY if its :10 constant pin interacted
+git commit -m "test(e2e): sweep stale bare-key layout persist readers to the per-window key contract (kata tr89; product migrated in e105f736b)"
+```
+
 ### Task 7: fresh-agent-centralization-smoke deflake — eviction-proof capture path + explicit bounds (kata vpfr)
 
 **Files:**
