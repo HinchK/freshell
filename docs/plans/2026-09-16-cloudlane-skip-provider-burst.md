@@ -654,6 +654,46 @@ git add test/e2e-browser/specs/opencode-restart-recovery.spec.ts test/e2e-browse
 git commit -m "test(e2e): deflake opencode-restart-recovery (60s session/30s REST budgets; public RustServer.kill for the hard-kill branch)"
 ```
 
+### Task 5b (amendment, added after Task 5's evidence): fake-opencode PTY-mode directory seeding fix (kata mv9m's real root cause)
+
+**Amendment provenance (2026-09-16):** Task 5's implementer (report: `<git-dir>/usual-sdd/task-005-report.md`, commit b57467da9) falsified the latency-overrun diagnosis: all six opencode-restart-recovery failures are deterministic. Root cause (code-verified + probe-proven): the fake's PTY-mode seeding writes `directory = serverProjectDirectory()` (fake-opencode.cjs:413-449) = the shared tmp ROOT, while the spec's pane cwd is `<sharedRoot>/project` — and `OpencodeLocator` requires an EXACT cwd match (`row_is_candidate`, crates/freshell-sessions/src/opencode_locator.rs:609-635, refuses any row whose normalized cwd differs) — so the locator silently refuses the bind and no sessionRef ever lands, at ANY budget. The over-application came from 504b5122a (the serve-lane contract; PTY mode previously used the 8cac280c0 contract: the fake's cwd IS the pane cwd). Probe evidence: with `cwd: sharedRoot` tabs (temporarily, reverted), the pre-kill waits pass in ~2-3s and the kill-branch TypeError fires exactly as predicted — the green/red pair proves the mechanism. The six tests are left failing as-is at HEAD of Task 5 (class-(f) pending THIS amendment).
+
+**Files:**
+- Modify: `test/e2e-browser/fixtures/fake-opencode.cjs` (PTY-mode launch/seed path: `directory = process.cwd()` restored; serve-mode keeps `serverProjectDirectory()`; `FAKE_OPENCODE_PROJECT_CWD` override honored in both)
+- Test: the six opencode-restart-recovery tests (the deterministic red, already captured in Task 5's report) + the impacted opencode-family specs below
+
+**Interfaces:**
+- Consumes: the fake's launch-mode distinction (PTY vs serve) and the exact-cwd locator contract (opencode_locator.rs).
+- Produces: mode-scoped seeded directory — PTY rows bind to pane cwds again; serve rows keep the server-root contract (serve.rs:742 sidecar cwd).
+
+- [ ] **Step 1: RED (already captured — re-verify cheaply)**
+
+Run: `npm run test:e2e:local -- test/e2e-browser/specs/opencode-restart-recovery.spec.ts --grep "reattaches a UI-created OpenCode pane"`
+
+Expected: FAIL at `waitForOpenCodeSessions` (the association never lands — Task 5's report §RED-0/§6 evidence).
+
+- [ ] **Step 2: Fix the PTY-mode seeding (minimal)**
+
+In `test/e2e-browser/fixtures/fake-opencode.cjs`, make the seeded `directory` mode-scoped: PTY-mode launches restore `directory = process.cwd()` (the fake's cwd IS the pane cwd — the pre-504b5122a contract); serve-mode launches keep `serverProjectDirectory()`; keep honoring `FAKE_OPENCODE_PROJECT_CWD` as the explicit override in both. Read the fake's launch paths fully first; change ONLY the directory derivation.
+
+- [ ] **Step 3: GREEN — the six mv9m tests**
+
+Run: `npm run test:e2e:local -- test/e2e-browser/specs/opencode-restart-recovery.spec.ts`
+
+Expected: PASS — all six tests (association lands in seconds; the kill-mode test now exercises the new public `kill()` through a real hard-kill + server2 restore).
+
+- [ ] **Step 4: Impacted-family verification (the fake is shared)**
+
+The fake serves several specs. Run each BEFORE-and-after style (the before state is Task 5's report; run them NOW after the change and record): `opencode-rebind-rust.spec.ts`, `opencode-terminal-restore-rust.spec.ts`, `session-directory-matrix*.spec.ts` (locate exact name), `sidebar-opencode-rail*.spec.ts` (locate), `freshopencode-db-history.spec.ts` (2 passed + 1 class-f jwc7 expected to persist), `freshopencode-first-send-reload-repro.spec.ts` (1 passed). Any regression a fix here causes is THIS task's to resolve (the grouping-label change for session-directory-matrix is expected and must be asserted honestly — update that spec's expectation only if the new label is the truthful pane-cwd label). Record every result.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add test/e2e-browser/fixtures/fake-opencode.cjs
+# plus any honestly-updated impacted-spec expectations, each justified in the report
+git commit -m "test(e2e): fake-opencode seeds mode-scoped session directories (PTY=pane cwd, serve=server root) — restores the locator's exact-cwd bind for opencode terminal specs (kata mv9m)"
+```
+
 ### Task 6: fresh-agent settings-modal waits (kata vpfr, cloud-legal member)
 
 **Files:**
