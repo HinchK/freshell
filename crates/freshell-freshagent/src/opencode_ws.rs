@@ -639,6 +639,11 @@ impl FreshOpencodeState {
         crate::ownership_lane::commit_lane_claim(
             &self.fresh_agent.ownership,
             &self.fresh_agent.ownership_stamps,
+            // b8ke ext r29 F1: every commit-to-Live broadcasts the owner
+            // record on the shared bus — the materialization commit
+            // included (the frame names the durable id every device
+            // converges on).
+            Some(&self.fresh_agent.broadcast_tx),
             PROVIDER,
             session_id,
             ticket,
@@ -1059,6 +1064,7 @@ impl FreshOpencodeState {
                             if let Err(outcome) = crate::ownership_lane::commit_lane_claim(
                                 &self.fresh_agent.ownership,
                                 &self.fresh_agent.ownership_stamps,
+                                Some(&self.fresh_agent.broadcast_tx),
                                 PROVIDER,
                                 &durable_id,
                                 &mut ticket_opt,
@@ -4944,6 +4950,7 @@ impl FreshOpencodeState {
                             if let Err(outcome) = crate::ownership_lane::commit_lane_claim(
                                 &self.fresh_agent.ownership,
                                 &self.fresh_agent.ownership_stamps,
+                                Some(&self.fresh_agent.broadcast_tx),
                                 PROVIDER,
                                 &durable,
                                 &mut ticket_opt,
@@ -9071,6 +9078,57 @@ mod tests {
             "materialized must be emitted exactly once"
         );
         assert_eq!(send_accepted_count, 2, "both sends are still accepted");
+    }
+
+    /// b8ke ext r29 F1: the MATERIALIZATION commit broadcasts the
+    /// committed owner record — pre-r29 the mint→durable re-key committed
+    /// Live{FreshAgent} for the durable `ses_*` key and proceeded
+    /// straight to the materialized frame (whose schema carries no epoch
+    /// or generation), so cross-device observers held no observed fence
+    /// for sessions created during the current connection. The
+    /// commit-to-Live now broadcasts the session.runtimeOwner record for
+    /// the durable id — the id every device converges on.
+    #[tokio::test]
+    async fn a_materialization_broadcasts_the_committed_owner_record() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let mut owner_rx = tx.subscribe();
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        st.set_ownership(registry.clone());
+
+        st.handle_create(create_msg("req-r29-f1-mat"), None).await;
+        let _ = rx.try_recv().unwrap(); // drain freshAgent.created
+
+        let placeholder = "freshopencode-req-r29-f1-mat";
+        st.handle_send(send_msg(placeholder, "one")).await;
+        let real_id = {
+            let guard = st.sessions.lock().await;
+            let session_arc = guard.get(placeholder).cloned().expect("session exists");
+            let s = session_arc.lock().await;
+            s.real_session_id.clone().expect("materialized")
+        };
+
+        let mut owner_frame = None;
+        while let Ok(raw) = owner_rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).expect("bus json");
+            if frame["type"] == "session.runtimeOwner" && frame["sessionId"] == json!(real_id) {
+                owner_frame = Some(frame);
+            }
+        }
+        let frame = owner_frame.expect("the materialization's commit broadcast the owner record");
+        assert_eq!(frame["provider"], "opencode");
+        assert_eq!(frame["ownerKind"], "fresh-agent");
+        assert_eq!(frame["transition"], "handoff-committed");
+        assert_eq!(frame["epoch"], registry.boot_epoch());
+        assert_eq!(
+            frame["generation"],
+            registry.observe(PROVIDER, &real_id).generation,
+            "the frame carries the COMMITTED generation: {frame}"
+        );
+        assert!(frame["fenced"].is_null(), "no fenced marker: {frame}");
     }
 
     #[tokio::test]

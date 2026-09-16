@@ -710,9 +710,11 @@ pub mod ownership_lane {
     /// — the caller must tear its just-registered session down (its
     /// uncommitted child with it) exactly like its existing
     /// claim-refusal paths.
+    #[allow(clippy::too_many_arguments)] // the uniform commit field set (b8ke ext r29 F1)
     pub fn commit_lane_claim(
         registry: &Option<Arc<RuntimeOwnershipRegistry>>,
         stamps: &OwnershipStamps,
+        broadcast_tx: Option<&Arc<tokio::sync::broadcast::Sender<String>>>,
         provider: &str,
         session_id: &str,
         ticket: &mut Option<OperationTicket>,
@@ -726,6 +728,9 @@ pub mod ownership_lane {
             return Ok(());
         };
         let (operation_id, generation) = (held.operation_id().to_string(), held.generation());
+        // The broadcast frame's operation id (operation_id above is moved
+        // into the retained stamp).
+        let frame_operation_id = operation_id.clone();
         let owner = OwnerIdentity {
             kind: RuntimeOwnerKind::FreshAgent,
             terminal_id: None,
@@ -754,6 +759,43 @@ pub mod ownership_lane {
                 );
                 if let Some(held) = ticket.as_mut() {
                     held.disarm();
+                }
+                // b8ke ext r29 F1: EVERY commit-to-Live broadcasts the
+                // authoritative owner record (the 'every ownership
+                // transition BROADCAST' invariant). Pre-r29 only the
+                // adopt arms and the handoff/rekey lanes emitted the
+                // session.runtimeOwner frame — an ordinary codex create
+                // or an opencode materialization committed Live with NO
+                // broadcast, so cross-device observers (and the creating
+                // pane itself) held no observed fence: selectPaneOwnerFence
+                // stayed undefined for sessions created during the current
+                // connection and the client sent lifecycle controls without
+                // the required observed pair until a reconnect or an
+                // unrelated owner transition supplied one. The frame is the
+                // same record the adopt paths already emit (transition
+                // handoff-committed, the ticket's committed generation and
+                // operation id) under the COMMIT KEY — the coordinator's
+                // authoritative id every device converges on.
+                if let Some(broadcast_tx) = broadcast_tx {
+                    let frame = freshell_protocol::ServerMessage::SessionRuntimeOwner(
+                        freshell_protocol::SessionRuntimeOwner {
+                            provider: provider.to_string(),
+                            session_id: session_id.to_string(),
+                            epoch: registry.boot_epoch(),
+                            generation,
+                            owner_kind: "fresh-agent".into(),
+                            previous_kind: None,
+                            terminal_id: None,
+                            operation_id: frame_operation_id,
+                            transition: "handoff-committed".into(),
+                            reason: None,
+                            fenced: None,
+                            alias_of: None,
+                        },
+                    );
+                    if let Ok(frame) = serde_json::to_string(&frame) {
+                        let _ = broadcast_tx.send(frame);
+                    }
                 }
                 Ok(())
             }
@@ -3924,6 +3966,7 @@ async fn resume_session_ref_tab(
     if let Err(outcome) = ownership_lane::commit_lane_claim(
         &state.ownership,
         &state.ownership_stamps,
+        Some(&state.broadcast_tx),
         PROVIDER,
         &durable_id,
         &mut resume_ticket,
@@ -4413,6 +4456,7 @@ async fn send_keys(
         if let Err(outcome) = ownership_lane::commit_lane_claim(
             &state.ownership,
             &state.ownership_stamps,
+            Some(&state.broadcast_tx),
             PROVIDER,
             &durable_id,
             &mut own_ticket,
@@ -5340,10 +5384,116 @@ mod spawn_gate_seam_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ownership_lane::OwnershipStamps;
 
     fn state() -> FreshAgentState {
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
         FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
+    }
+
+    /// b8ke ext r29 F1: the structural commit-to-Live broadcast invariant —
+    /// [`ownership_lane::commit_lane_claim`] emits the authoritative
+    /// `session.runtimeOwner` owner record (kind + epoch + generation, the
+    /// ticket's committed operation id, transition `handoff-committed`)
+    /// whenever a bus is supplied, so EVERY lane that commits Live (codex
+    /// create/fork/respawn/resume, opencode mint/materialization/fork/
+    /// attach/resume, claude create-resume/attach) broadcasts it —
+    /// cross-device observers hold the observed fence from creation
+    /// onward and `selectPaneOwnerFence` resolves immediately, never
+    /// undefined-until-a-reconnect. A lane with no bus (`None`) still
+    /// commits (the broadcast is additive, never load-bearing).
+    #[test]
+    fn a_committed_lane_claim_broadcasts_the_owner_record() {
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let registry_opt = Some(Arc::clone(&registry));
+        let stamps: OwnershipStamps =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let tx = Arc::new(tx);
+
+        let mut ticket = match ownership_lane::begin_lane_claim(
+            &registry_opt,
+            "codex",
+            "ses_r29_f1",
+            "op-r29-f1-commit",
+            None,
+            "test",
+            0,
+        ) {
+            ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            _ => panic!("the seed claim must grant"),
+        };
+        assert!(ownership_lane::commit_lane_claim(
+            &registry_opt,
+            &stamps,
+            Some(&tx),
+            "codex",
+            "ses_r29_f1",
+            &mut ticket,
+            "ses_r29_f1",
+            None,
+        )
+        .is_ok());
+
+        let frame: serde_json::Value =
+            serde_json::from_str(&rx.try_recv().expect("the owner record frame")).unwrap();
+        assert_eq!(frame["type"], "session.runtimeOwner", "{frame}");
+        assert_eq!(frame["provider"], "codex");
+        assert_eq!(frame["sessionId"], "ses_r29_f1");
+        assert_eq!(frame["ownerKind"], "fresh-agent");
+        assert_eq!(frame["transition"], "handoff-committed");
+        assert_eq!(frame["epoch"], registry.boot_epoch());
+        assert_eq!(
+            frame["generation"],
+            registry.observe("codex", "ses_r29_f1").generation,
+            "the frame carries the COMMITTED generation"
+        );
+        assert_eq!(frame["operationId"], "op-r29-f1-commit");
+        assert!(frame["fenced"].is_null(), "no fenced marker: {frame}");
+        assert!(frame["aliasOf"].is_null(), "no alias: {frame}");
+        assert!(
+            frame["terminalId"].is_null(),
+            "a fresh-agent owner has no terminal"
+        );
+
+        // The retained stamp and the Live record stand exactly as before —
+        // the broadcast is purely additive.
+        let stamp = stamps.lock().unwrap().get("ses_r29_f1").cloned().unwrap();
+        assert_eq!(
+            stamp.generation,
+            registry.observe("codex", "ses_r29_f1").generation
+        );
+        assert!(matches!(
+            registry.observe("codex", "ses_r29_f1").state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
+
+        // A commit with NO bus still commits (callers without a broadcast
+        // channel are not blocked).
+        let mut ticket2 = match ownership_lane::begin_lane_claim(
+            &registry_opt,
+            "opencode",
+            "ses_r29_f1_nb",
+            "op-r29-f1-nobus",
+            None,
+            "test",
+            0,
+        ) {
+            ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+            _ => panic!("the second claim must grant"),
+        };
+        assert!(ownership_lane::commit_lane_claim(
+            &registry_opt,
+            &stamps,
+            None,
+            "opencode",
+            "ses_r29_f1_nb",
+            &mut ticket2,
+            "ses_r29_f1_nb",
+            None,
+        )
+        .is_ok());
+        assert!(rx.try_recv().is_err(), "no frame without a bus");
     }
 
     #[test]

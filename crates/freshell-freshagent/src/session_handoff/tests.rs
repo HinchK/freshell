@@ -834,14 +834,14 @@ async fn await_live_session(state: &crate::FreshClaudeState, sid: &str, want: bo
 
 /// Establish a live freshclaude owner for `sid` (the fake sidecar path) and
 /// return once the coordinator records it Live.
-async fn establish_fresh_claude_owner(rig: &Rig, sid: &str) {
+async fn establish_fresh_claude_owner(rig: &mut Rig, sid: &str) {
     rig.fresh_claude.handle_create(create_msg(sid), None).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         match rig.ownership.observe("claude", sid).state {
             OwnershipState::Live { owner, .. } => {
                 assert_eq!(owner.kind, RuntimeOwnerKind::FreshAgent);
-                return;
+                break;
             }
             state => {
                 assert!(
@@ -852,6 +852,15 @@ async fn establish_fresh_claude_owner(rig: &Rig, sid: &str) {
             }
         }
     }
+    // b8ke ext r29 F1: the setup's own commit-to-Live now broadcasts the
+    // authoritative owner record (EVERY commit does, per the invariant).
+    // The handoff tests below assert the HANDOFF's frames with
+    // exactly-one counts — drain the setup's frames here so each test's
+    // frame window holds exactly what its own handoff emits (the
+    // pre-r29 shape). The setup frame's existence itself is pinned by
+    // the provider-level create tests (`a_normal_create_broadcasts_...`,
+    // `a_materialization_broadcasts_...`).
+    let _ = drain_runtime_owner_frames(&mut rig.rx);
 }
 
 // ── the capturing tracing layer (the diag01/ownership-crate pattern) ───────
@@ -984,7 +993,7 @@ async fn handoff_to_terminal_reaps_sidecar_before_target_start_and_commits_owner
     // ASSERTED (the plan's event-log ordering requirement), not just implied.
     let hooks = Arc::new(HandoffTestHooks::default());
     let mut rig = build_rig(Some(Arc::clone(&hooks)));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
     let create_watermark = env.create_rows().len();
     let capture_start = events.lock().expect("capture lock").len();
 
@@ -1157,7 +1166,7 @@ async fn handoff_target_spawn_failure_leaves_vacant_with_typed_error() {
     let hooks = Arc::new(HandoffTestHooks::default());
     hooks.fail_target_spawn_once.store(true, Ordering::SeqCst);
     let mut rig = build_rig(Some(Arc::clone(&hooks)));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
     let create_watermark = env.create_rows().len();
 
     let handle = rig
@@ -1250,7 +1259,7 @@ async fn handoff_reap_timeout_reprobes_the_prior_and_restores_only_a_live_one() 
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks::default());
     let mut rig = build_rig(Some(Arc::clone(&hooks)));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
     let create_watermark = env.create_rows().len();
     // The sidecar stays ALIVE: the timeout is forced without any kill.
     hooks.force_reap_timeout.store(true, Ordering::SeqCst);
@@ -1343,7 +1352,7 @@ async fn handoff_reap_timeout_with_unconfirmable_prior_ends_vacant_typed() {
         ..HandoffTestHooks::default()
     });
     let mut rig = build_rig(Some(Arc::clone(&hooks)));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     let handle = rig
         .runner
@@ -1466,7 +1475,7 @@ async fn handoff_reap_timeout_fences_the_key_until_the_detached_reap_confirms_de
         None,
         150,
     );
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
     let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
 
     let handle = rig
@@ -1625,7 +1634,7 @@ async fn a_watcher_join_error_fences_the_key_until_the_replacement_probe_confirm
         150,
         None,
     );
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
     let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
     // The sidecar's ownership tag (our process is its ancestor, so
     // /proc/<pid>/environ is readable) — the replacement probe's
@@ -1779,7 +1788,7 @@ async fn handoff_with_a_platform_limited_prior_stop_fences_the_key_typed() {
     let _env = FakeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let mut rig = build_rig_with_options(None, None, None, 8_000, None, true);
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
     // Consume the establish-time frames so the failure window is isolated.
     let _ = drain_runtime_owner_frames(&mut rig.rx);
 
@@ -2114,11 +2123,11 @@ async fn a_kilroy_to_claude_cli_handoff_preserves_the_kilroy_flavor() {
     let sid = uuid::Uuid::new_v4().to_string();
     let log: FlavorWriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
     // The session's current durable flavor is KILROY (the hidden type).
-    let rig = build_rig_with_flavor_writer(Arc::new(FixedFlavorWriter {
+    let mut rig = build_rig_with_flavor_writer(Arc::new(FixedFlavorWriter {
         log: Arc::clone(&log),
         current: Some("kilroy".to_string()),
     }));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     // The Kilroy→Claude-CLI handoff (the wire mode is "claude").
     let handle = rig
@@ -2158,7 +2167,7 @@ async fn an_unconfirmed_target_reap_on_the_flavor_failure_fences_then_the_watche
     hooks
         .force_reap_timeout_fenced_skip
         .store(1, std::sync::atomic::Ordering::SeqCst);
-    let rig = build_rig_inner(
+    let mut rig = build_rig_inner(
         Some(Arc::clone(&hooks) as Arc<HandoffTestHooks>),
         None,
         None,
@@ -2168,7 +2177,7 @@ async fn an_unconfirmed_target_reap_on_the_flavor_failure_fences_then_the_watche
         Some(Arc::new(FailingFlavorWriter)),
         None,
     );
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     // A handoff to a TERMINAL target (the rig's supported direction; the
     // forced fenced-timeout hook consults at the reap's top).
@@ -2237,7 +2246,7 @@ async fn a_platform_limited_target_reap_on_the_flavor_failure_fences_typed() {
     hooks
         .force_platform_limited_skip
         .store(1, std::sync::atomic::Ordering::SeqCst);
-    let rig = build_rig_inner(
+    let mut rig = build_rig_inner(
         Some(Arc::clone(&hooks) as Arc<HandoffTestHooks>),
         None,
         None,
@@ -2247,7 +2256,7 @@ async fn a_platform_limited_target_reap_on_the_flavor_failure_fences_typed() {
         Some(Arc::new(FailingFlavorWriter)),
         None,
     );
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     let handle = rig
         .runner
@@ -2320,7 +2329,7 @@ async fn the_unconfirmed_reap_flavor_failure_frame_stays_fenced_never_vacant() {
         Some(Arc::new(FailingFlavorWriter)),
         None,
     );
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     let handle = rig
         .runner
@@ -2402,7 +2411,7 @@ async fn the_platform_limited_reap_failure_frame_stays_fenced_never_vacant() {
         Some(Arc::new(FailingFlavorWriter)),
         None,
     );
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     let handle = rig
         .runner
@@ -2520,7 +2529,7 @@ async fn the_stale_commit_unconfirmed_reap_frame_stays_fenced_never_vacant() {
         .force_reap_timeout_fenced_skip
         .store(1, std::sync::atomic::Ordering::SeqCst);
     let mut rig = build_rig(Some(Arc::clone(&hooks)));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     let handle = rig
         .runner
@@ -2669,7 +2678,7 @@ async fn a_watcher_release_mid_failure_window_leaves_the_final_frame_resolved() 
         .force_reap_timeout_fenced_skip
         .store(1, std::sync::atomic::Ordering::SeqCst);
     let mut rig = build_rig(Some(Arc::clone(&hooks)));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     let handle = rig
         .runner
@@ -2804,7 +2813,7 @@ async fn a_foreign_commit_during_the_abort_broadcast_window_is_never_overwritten
         ..HandoffTestHooks::default()
     });
     let mut rig = build_rig(Some(Arc::clone(&hooks)));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     // Handoff 1 parks right after the coordinator enter. The abort lands
     // in the sync-unwind window (nothing spawned, no kill in flight): the
@@ -3010,7 +3019,7 @@ async fn the_confirmed_reap_flavor_failure_broadcasts_the_truthful_vacancy() {
     let (sink, _capture_guard) = tracing_capture::capture();
     let sid = uuid::Uuid::new_v4().to_string();
     let mut rig = build_rig_with_flavor_writer(Arc::new(FailingFlavorWriter));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     let handle = rig
         .runner
@@ -3158,7 +3167,7 @@ async fn an_abort_after_the_staged_flavor_precursor_never_persists_the_target_fl
     let durable: FlavorWriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
     let release = Arc::new(tokio::sync::Notify::new());
     let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let rig = build_rig_inner(
+    let mut rig = build_rig_inner(
         None,
         None,
         None,
@@ -3173,7 +3182,7 @@ async fn an_abort_after_the_staged_flavor_precursor_never_persists_the_target_fl
         })),
         None,
     );
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     // The handoff to a terminal target stages its flavor (the precursor
     // lands) and parks BEFORE the staged handle returns.
@@ -3284,7 +3293,7 @@ async fn an_abort_in_the_flavor_window_with_an_unconfirmed_target_teardown_fence
     let release = Arc::new(tokio::sync::Notify::new());
     let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let log: FlavorWriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let rig = build_rig_inner(
+    let mut rig = build_rig_inner(
         Some(Arc::clone(&hooks) as Arc<HandoffTestHooks>),
         None,
         None,
@@ -3298,7 +3307,7 @@ async fn an_abort_in_the_flavor_window_with_an_unconfirmed_target_teardown_fence
         })),
         None,
     );
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     // A handoff to a FRESH target (the reviewer's scenario) parks inside
     // its awaited flavor write.
@@ -3449,8 +3458,8 @@ async fn a_flavor_write_failure_surfaces_as_the_typed_handoff_failure() {
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let _env = FakeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
-    let rig = build_rig_with_flavor_writer(Arc::new(FailingFlavorWriter));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    let mut rig = build_rig_with_flavor_writer(Arc::new(FailingFlavorWriter));
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     let handle = rig
         .runner
@@ -3482,12 +3491,12 @@ async fn the_flavor_write_serializes_consecutive_handoffs_in_generation_order() 
     let release = Arc::new(tokio::sync::Notify::new());
     let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let log: FlavorWriteLog = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let rig = build_rig_with_flavor_writer(Arc::new(BlockingFlavorWriter {
+    let mut rig = build_rig_with_flavor_writer(Arc::new(BlockingFlavorWriter {
         log: Arc::clone(&log),
         release: Arc::clone(&release),
         reached: Arc::clone(&reached),
     }));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     // Handoff A parks INSIDE its awaited flavor write (the record is
     // still Handoff — the write precedes the owner commit).
@@ -3558,8 +3567,8 @@ async fn the_handoff_commit_writes_the_durable_flavor_server_side() {
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let _env = FakeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
-    let rig = build_rig(None);
-    establish_fresh_claude_owner(&rig, &sid).await;
+    let mut rig = build_rig(None);
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     // The handoff to the CLI terminal commits; the flavor recorded is the
     // TERMINAL target's mode ("claude" — the CLI flavor).
@@ -3803,7 +3812,7 @@ async fn a_platform_limited_fence_recovers_only_through_the_acknowledged_force_c
     let _env = FakeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let mut rig = build_rig_with_options(None, None, None, 8_000, None, true);
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
     // Consume the establish-time frames so the recovery window is isolated.
     let _ = drain_runtime_owner_frames(&mut rig.rx);
 
@@ -3960,8 +3969,8 @@ async fn the_cleared_unverified_state_requires_the_acknowledged_start() {
     let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
     let _env = FakeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
-    let rig = build_rig_with_options(None, None, None, 8_000, None, true);
-    establish_fresh_claude_owner(&rig, &sid).await;
+    let mut rig = build_rig_with_options(None, None, None, 8_000, None, true);
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     // Fence PlatformLimited (the 3i shape) and take the acknowledged clear.
     let handle = rig
@@ -4205,7 +4214,7 @@ async fn a_delayed_platform_limited_reap_fences_the_key_and_never_releases() {
     // then the released park answers PlatformLimited.
     let mut rig =
         build_rig_with_options(None, Some(Arc::clone(&kill_pause)), None, 150, None, true);
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     let handle = rig
         .runner
@@ -4284,7 +4293,7 @@ async fn handoff_with_an_unconfirmable_claude_tree_fences_the_key_until_the_esca
     // The one-round confirmation window: a TERM-immune descendant
     // deterministically outlives it (the SIGKILL escalation is rounds away).
     let mut rig = build_rig_full(None, None, None, 8_000, Some(1));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
     let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
 
     // Discover the sidecar's ownership tag from its environment (the
@@ -4421,8 +4430,8 @@ async fn a_prior_restored_after_reap_timeout_still_releases_when_it_later_exits(
     let _env = FakeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks::default());
-    let rig = build_rig(Some(Arc::clone(&hooks)));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     // Drive test 3's scenario: timeout, re-probe live, restored.
     hooks.force_reap_timeout.store(true, Ordering::SeqCst);
@@ -4472,7 +4481,7 @@ async fn a_wire_fenced_kill_at_the_handoff_generation_converges_after_a_restore(
     let sid = uuid::Uuid::new_v4().to_string();
     let hooks = Arc::new(HandoffTestHooks::default());
     let mut rig = build_rig(Some(Arc::clone(&hooks)));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
     let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
 
     // Drive test 3's scenario: timeout, re-probe live, restored.
@@ -4645,7 +4654,7 @@ async fn handoff_continues_to_consistency_when_client_disconnects() {
         ..HandoffTestHooks::default()
     });
     let mut rig = build_rig(Some(Arc::clone(&hooks)));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     let handle: HandoffHandle = rig
         .runner
@@ -4710,7 +4719,7 @@ async fn handoff_task_abort_leaves_zero_or_one_owner() {
         ..HandoffTestHooks::default()
     });
     let mut rig = build_rig(Some(Arc::clone(&hooks)));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     let handle = rig
         .runner
@@ -4818,8 +4827,8 @@ async fn handoff_abort_during_prior_kill_reprobes_and_repairs_the_stamp() {
     let env = FakeSidecarEnv::install();
     let sid = uuid::Uuid::new_v4().to_string();
     let kill_pause = Arc::new(tokio::sync::Notify::new());
-    let rig = build_rig_with_claude_pauses(None, Some(Arc::clone(&kill_pause)), None);
-    establish_fresh_claude_owner(&rig, &sid).await;
+    let mut rig = build_rig_with_claude_pauses(None, Some(Arc::clone(&kill_pause)), None);
+    establish_fresh_claude_owner(&mut rig, &sid).await;
     let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
 
     let handle = rig
@@ -4979,8 +4988,8 @@ async fn handoff_abort_during_target_spawn_reaps_the_uncommitted_terminal() {
         pause_in_target_spawn: Some(Arc::clone(&pause)),
         ..HandoffTestHooks::default()
     });
-    let rig = build_rig(Some(Arc::clone(&hooks)));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
+    establish_fresh_claude_owner(&mut rig, &sid).await;
     let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
 
     let handle = rig
@@ -5086,8 +5095,8 @@ async fn handoff_abort_during_pre_publication_spawn_fences_until_the_spawn_settl
         pause_in_target_spawn_before_publish: Some(Arc::clone(&pre_publish_park)),
         ..HandoffTestHooks::default()
     });
-    let rig = build_rig(Some(Arc::clone(&hooks)));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
+    establish_fresh_claude_owner(&mut rig, &sid).await;
     let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
 
     let handle = rig
@@ -5214,8 +5223,8 @@ async fn handoff_abort_cleanup_spares_a_same_id_different_provider_terminal() {
         pause_in_target_spawn: Some(Arc::clone(&pause)),
         ..HandoffTestHooks::default()
     });
-    let rig = build_rig(Some(Arc::clone(&hooks)));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     // The collision victim: a RUNNING terminal of a DIFFERENT provider
     // (codex) whose registry row carries the SAME resume session id — the
@@ -5349,8 +5358,8 @@ async fn handoff_abort_during_fresh_target_resume_reaps_the_registered_session_a
     std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
 
     let resume_pause = Arc::new(tokio::sync::Notify::new());
-    let rig = build_rig_with_claude_pauses(None, None, Some(Arc::clone(&resume_pause)));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    let mut rig = build_rig_with_claude_pauses(None, None, Some(Arc::clone(&resume_pause)));
+    establish_fresh_claude_owner(&mut rig, &sid).await;
     let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
 
     let handle = rig
@@ -5455,13 +5464,13 @@ async fn the_claude_handoff_target_binding_carries_the_handoff_generation() {
     .expect("write fake transcript");
     std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
 
-    let rig = build_rig(None);
+    let mut rig = build_rig(None);
     // The sink wired BEFORE the seed below; the establish's own
     // all-blank adoption writes NOTHING (the V7 no-laundering gate), so
     // the ONLY binding row is the handoff target's.
     let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
     rig.fresh_claude.set_identity_sink(fake.clone());
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
     assert!(
         fake.bindings.lock().unwrap().is_empty(),
         "fixture: the all-blank establish wrote no binding row"
@@ -5570,8 +5579,9 @@ async fn a_terminal_target_binding_failure_fails_the_handoff_typed() {
     std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
 
     // The rig whose runner's terminal-target registration ALWAYS fails.
-    let rig = build_rig_with_pane_identity_binder(std::sync::Arc::new(FailingCreateIdentityBinder));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    let mut rig =
+        build_rig_with_pane_identity_binder(std::sync::Arc::new(FailingCreateIdentityBinder));
+    establish_fresh_claude_owner(&mut rig, &sid).await;
 
     let handle = rig
         .runner
@@ -5674,8 +5684,8 @@ async fn handoff_abort_holds_the_fence_until_the_uncommitted_target_continuation
     // The one-round confirmation window: the cleanup's lane kill cannot
     // confirm the target tree while a TERM-immune tagged descendant lives
     // — the NotConfirmed continuation shape.
-    let rig = build_rig_full(None, None, Some(Arc::clone(&resume_pause)), 8_000, Some(1));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    let mut rig = build_rig_full(None, None, Some(Arc::clone(&resume_pause)), 8_000, Some(1));
+    establish_fresh_claude_owner(&mut rig, &sid).await;
     let prior_pid = env.sidecar_pid_for(&sid).expect("the prior sidecar's pid");
 
     let handle = rig
@@ -6093,7 +6103,7 @@ async fn an_abort_cleanup_broadcasts_the_restored_prior_owner() {
         ..HandoffTestHooks::default()
     });
     let mut rig = build_rig(Some(Arc::clone(&hooks)));
-    establish_fresh_claude_owner(&rig, &sid).await;
+    establish_fresh_claude_owner(&mut rig, &sid).await;
     let _ = drain_runtime_owner_frames(&mut rig.rx);
 
     let handle = rig
@@ -6173,11 +6183,11 @@ async fn a_handoff_on_a_superseded_rekeyed_id_resolves_the_canonical_owner() {
     let env = FakeSidecarEnv::install();
     let canonical = uuid::Uuid::new_v4().to_string();
     let superseded = uuid::Uuid::new_v4().to_string();
-    let rig = build_rig(None);
+    let mut rig = build_rig(None);
     // The pre-rekey truth: the live owner sits under the OLD durable id
     // (the superseded name). The kill handle / sidecar pid resolve through
     // the OLD name.
-    establish_fresh_claude_owner(&rig, &superseded).await;
+    establish_fresh_claude_owner(&mut rig, &superseded).await;
     let sidecar_pid = env.sidecar_pid_for(&superseded);
     assert!(sidecar_pid.is_some(), "the live owner's sidecar pid");
 
@@ -7746,11 +7756,11 @@ async fn handoff_route_refuses_provider_mismatched_targets_typed() {
     let _serve_env = FakeOpencodeServeEnv::install();
     let env = FakeSidecarEnv::install();
 
-    let rig = build_rig(None);
+    let mut rig = build_rig(None);
     // A LIVE prior for the wrong-mode case: the refusal must leave this
     // record byte-identical (same owner kind, same generation).
     let live_sid = uuid::Uuid::new_v4().to_string();
-    establish_fresh_claude_owner(&rig, &live_sid).await;
+    establish_fresh_claude_owner(&mut rig, &live_sid).await;
     let before = rig.ownership.observe("claude", &live_sid);
     let before_generation = before.generation;
 

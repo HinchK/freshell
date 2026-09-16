@@ -879,6 +879,11 @@ impl FreshCodexState {
         crate::ownership_lane::commit_lane_claim(
             &self.ownership,
             &self.ownership_stamps,
+            // b8ke ext r29 F1: every commit-to-Live broadcasts the owner
+            // record on the shared bus — the ordinary create's tail (this
+            // lane's commit at the create/fork/respawn/resume tails)
+            // included, never only the adopt arms.
+            Some(&self.broadcast_tx),
             PROVIDER,
             session_id,
             ticket,
@@ -21147,6 +21152,57 @@ pub(crate) mod tests {
             ),
             "the Vacant record is untouched by the refused undo"
         );
+    }
+
+    /// b8ke ext r29 F1: an ORDINARY codex create broadcasts the committed
+    /// owner record — pre-r29 the create's tail committed Live{FreshAgent}
+    /// and proceeded straight to freshAgent.created (whose schema carries
+    /// no epoch or generation), so cross-device observers — and the
+    /// creating pane itself — held no observed fence:
+    /// selectPaneOwnerFence stayed undefined for sessions created during
+    /// the current connection until a reconnect or an unrelated owner
+    /// transition supplied one. The commit-to-Live now broadcasts the
+    /// session.runtimeOwner record (the same authoritative frame the
+    /// adopt arms already emitted).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_normal_create_broadcasts_the_committed_owner_record() {
+        let _guard = ENV_LOCK.lock().await;
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        // A SECOND receiver on the shared bus: the create fixture drains
+        // its own rx for the created frame, so the owner record is
+        // captured on this side channel subscribed BEFORE the create.
+        let mut owner_rx = st.broadcast_tx.subscribe();
+
+        configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
+
+        let mut owner_frame = None;
+        while let Ok(raw) = owner_rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).expect("bus json");
+            if frame["type"] == "session.runtimeOwner" && frame["sessionId"] == json!(thread_id) {
+                owner_frame = Some(frame);
+            }
+        }
+        let frame = owner_frame.expect("the ordinary create's commit broadcast the owner record");
+        assert_eq!(frame["provider"], "codex");
+        assert_eq!(frame["ownerKind"], "fresh-agent");
+        assert_eq!(frame["transition"], "handoff-committed");
+        assert_eq!(frame["epoch"], registry.boot_epoch());
+        assert_eq!(
+            frame["generation"],
+            registry.observe(PROVIDER, &thread_id).generation,
+            "the frame carries the COMMITTED generation: {frame}"
+        );
+        assert!(
+            frame["operationId"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty()),
+            "the frame names the committing coordinator operation"
+        );
+        assert!(frame["fenced"].is_null(), "no fenced marker: {frame}");
+        assert!(frame["aliasOf"].is_null(), "no alias: {frame}");
     }
 
     /// b8ke ext r21 F2: same stale-pair refusal for FORK — the reconnect-

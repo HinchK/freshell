@@ -1391,6 +1391,9 @@ impl FreshClaudeState {
         crate::ownership_lane::commit_lane_claim(
             &self.ownership,
             &self.ownership_stamps,
+            // b8ke ext r29 F1: every commit-to-Live broadcasts the owner
+            // record on the shared bus.
+            Some(&self.broadcast_tx),
             PROVIDER,
             &session_id,
             ticket,
@@ -14267,6 +14270,7 @@ rl.on('line', (line) => {
             crate::ownership_lane::commit_lane_claim(
                 &st.ownership,
                 &st.ownership_stamps,
+                Some(&st.broadcast_tx),
                 PROVIDER,
                 &placeholder,
                 &mut seed_ticket,
@@ -14396,6 +14400,7 @@ rl.on('line', (line) => {
             crate::ownership_lane::commit_lane_claim(
                 &st.ownership,
                 &st.ownership_stamps,
+                Some(&st.broadcast_tx),
                 PROVIDER,
                 &placeholder,
                 &mut seed_ticket,
