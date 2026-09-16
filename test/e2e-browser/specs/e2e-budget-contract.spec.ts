@@ -105,8 +105,8 @@ test.describe('declared deadlines above the config default stay as declared', ()
 // machine speed). Validated by mutation during the r14 remediation. The
 // lane-derived composed value (321.5s at the default window — every
 // piece now carries an ENFORCED bound: connection W+1s, goto 60s
-// explicit, harness install 60s default, picker worst) is behaviorally
-// unit-pinned by freshellPageFixtureTimeoutMs. ONLY this pin resolves
+// explicit, harness install 60s at the boot call site, picker worst) is
+// behaviorally unit-pinned by freshellPageFixtureTimeoutMs. ONLY this pin resolves
 // the slow harness: the spec's other pins keep the real (fast) harness.
 class DeterministicallySlowBootHarness extends TestHarness {
   constructor(page: Page) {

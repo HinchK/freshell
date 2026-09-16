@@ -240,19 +240,19 @@ describe('TestHarness.waitForConnection timeout wiring', () => {
     expect(calls[0][2]).toEqual({ timeout: 15_000 })
   })
 
-  it('waitForHarness default is the ENFORCED 60s bound — the pre-run whole-test deadline as the single wait own bound (delta review r14)', async () => {
+  it('waitForHarness no-arg default is 0 (unlimited, the caller own outer bound governs) — the exact pre-run semantics for every caller (delta review r15)', async () => {
     // Unconfigured Playwright-Test waits are UNLIMITED (the context's
-    // default timeout is 0 = disabled), so pre-run this wait was bounded
-    // only by the whole test's 60s deadline. Under the r9 fixture slot an
-    // unbounded wait would let a pathological install stall pass silently
-    // (the loosening r14 rejected); the default is therefore the pre-run
-    // whole-test deadline: a pathological wait dies at 60s exactly where
-    // pre-run caught it, a slow-but-recovering wait (30-60s) keeps the
-    // pass envelope pre-run gave it. Explicit per-call values are
-    // honored.
+    // default timeout is 0 = disabled), so pre-run every no-arg caller's
+    // wait was bounded only by its OWN test deadline — callers
+    // deliberately declaring 120-600s deadlines keep that allowance. A
+    // shared finite default would narrow them (the r14 60s default did —
+    // the mirror image of the loosening r14 rejected; r15 corrected it).
+    // The ONE call site this run repairs (the freshellPage boot chain)
+    // passes CLOUD_LANE_HARNESS_WAIT_BOUND_MS explicitly.
     const { page, calls } = fakePage()
     await new TestHarness(page).waitForHarness()
-    expect(calls[0][2]).toEqual({ timeout: CLOUD_LANE_HARNESS_WAIT_BOUND_MS })
+    expect(calls[0][2]).toEqual({ timeout: 0 })
+    // And the boot chain's enforced bound exists and is pinned:
     expect(CLOUD_LANE_HARNESS_WAIT_BOUND_MS).toBe(60_000)
   })
 })

@@ -545,7 +545,8 @@ cmd_run() {
   # margin. The freshellPage fixture's boot chain derives its OWN setup
   # timeout from this window COMPOSED with the chain's other permitted
   # waits (window + 1s connection slack + the ENFORCED bounds on the
-  # initial operations (goto 60s explicit + harness install 60s default —
+  # initial operations (goto 60s explicit + harness install 60s explicit
+  # at the freshellPage boot call site —
   # unconfigured Playwright-Test navigations/waits are UNLIMITED, so the
   # bounds are enforced in the fixture chain, not assumed; delta r14) +
   # the picker's permitted worst case (~110.5s,

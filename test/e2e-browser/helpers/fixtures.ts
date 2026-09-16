@@ -8,6 +8,7 @@ import {
 import { type E2eServerInfo } from './server-fixture-support.js'
 import {
   CLOUD_LANE_GOTO_BOUND_MS,
+  CLOUD_LANE_HARNESS_WAIT_BOUND_MS,
   TestHarness,
   freshellPageFixtureTimeoutMs,
   isCloudLaneWindowConfigured,
@@ -289,8 +290,15 @@ export const test = base.extend<{
       timeout: CLOUD_LANE_GOTO_BOUND_MS,
     })
 
-    // Wait for the test harness to be installed
-    await harness.waitForHarness()
+    // Wait for the test harness to be installed. The boot chain's wait
+    // carries its OWN ENFORCED bound (delta reviews r14+r15): unconfigured
+    // Playwright-Test waits are UNLIMITED, so under the fixture slot an
+    // unbounded install wait would let a pathological stall pass silently
+    // where the pre-run 60s test deadline caught it. The bound is passed
+    // EXPLICITLY here — the shared helper's no-arg default stays 0 (the
+    // pre-run effective semantics for every other caller, whose own
+    // declared deadlines — 60s or 600s — keep governing them).
+    await harness.waitForHarness(CLOUD_LANE_HARNESS_WAIT_BOUND_MS)
 
     // Wait for WebSocket to connect. Self-heal is opted IN on the cloud
     // lane only (window env configured — one presence rule shared with the
