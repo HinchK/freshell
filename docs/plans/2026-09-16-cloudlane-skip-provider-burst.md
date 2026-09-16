@@ -23,7 +23,7 @@
 
 **Goal:** Make the e2e cloud lane's skip-list contract a tested, pinned, self-proving guarantee, and make the provider-pane burst specs (katas mv9m, 5prk, vpfr) stop failing terminally under full-lane load — so that a full-lane run at the run HEAD shows zero terminal failures in the named burst families, every full-lane receipt self-identifies its lane, and the branch lands on main via one PR under the campaign pre-approval.
 
-**Architecture:** Two independent halves in one branch. (1) Kata 67jt, premise-corrected: explorer investigation (verified by the orchestrator; see `reports/plan-runner-selection.md`) proved the cloud lane at main ALREADY honors CLOUD_SKIP_SPECS at every hop — single-task, multi-shard manifest, and focused-explicit-path invocations alike. The "skip-listed specs executed in full-lane runs" evidence came from LOCAL runs of the BASE config (`npm run test:e2e` silently defaults `FRESHELL_E2E_BACKEND` to local in non-interactive agent shells; the base config intentionally has no CLOUD_SKIP knowledge), and a prior gate receipt mislabeled those local runs as cloud runs. The deliverable for this half is therefore: a lane-provenance banner in `scripts/e2e-cloud.sh` (the local path states the config in effect and that CLOUD_SKIP_SPECS does not apply, so receipts can quote the lane from the log itself) plus selection-integrity pins in the existing `selection-nonvacuity` suite (per-entry cloud exclusion, per-entry base coverage, grepInvert non-vacuity, explicit-path no-bypass, and a loud all-skip failure pin) — converting a verified-once fact into an automated regression contract. (2) Katas mv9m/5prk/vpfr: per-spec, spec-local deflakes inside each spec's own envelope — a strict-mode-safe scoped-locator fix plus a deterministic forced-ambiguity poll (db-history), an expect.poll conversion of a one-shot state read (first-send), an expect.poll conversion of a one-shot capture fetch plus a visibility budget (centralization-smoke), and evidence-sized sub-budget raises (opencode-restart-recovery session/association waits; fresh-agent settings-modal waits). The failing lane is LOCAL, so these changes are unconditional (an `isCloudLaneWindowConfigured()` gate would never fire on the observed lane); every change stays inside the spec files; no shared wiring, no CLOUD_SKIP_SPECS membership change, no test-deadline change.
+**Architecture:** Two independent halves in one branch. (1) Kata 67jt, premise-corrected: explorer investigation (verified by the orchestrator; see `reports/plan-runner-selection.md`) proved the cloud lane at main ALREADY honors CLOUD_SKIP_SPECS at every hop — single-task, multi-shard manifest, and focused-explicit-path invocations alike. The "skip-listed specs executed in full-lane runs" evidence came from LOCAL runs of the BASE config (`npm run test:e2e` silently defaults `FRESHELL_E2E_BACKEND` to local in non-interactive agent shells; the base config intentionally has no CLOUD_SKIP knowledge), and a prior gate receipt mislabeled those local runs as cloud runs. The deliverable for this half is therefore: a lane-provenance banner in `scripts/e2e-cloud.sh` (the local path states the config in effect and that CLOUD_SKIP_SPECS does not apply, so receipts can quote the lane from the log itself) plus selection-integrity pins in the existing `selection-nonvacuity` suite (per-entry cloud exclusion, per-entry base coverage, grepInvert non-vacuity, explicit-path no-bypass, and a loud all-skip failure pin) — converting a verified-once fact into an automated regression contract. (2) Katas mv9m/5prk/vpfr: per-spec, spec-local deflakes inside each spec's own envelope — a strict-mode-safe scoped-locator fix plus a deterministic forced-ambiguity poll (db-history), an expect.poll conversion of a one-shot state read (first-send), an eviction-proof capture path in centralization-smoke (re-send the crafted legacy layout sync whenever the page's own debounced layout mirror evicts it — a 404/empty observation inside a bounded poll, never a bare poll-until-422; see Task 7 and `reports/load-bearing-validator-LB-2.md`) plus explicit visibility and pane-poll bounds, and load-tolerant sub-budget raises (opencode-restart-recovery session/association waits; fresh-agent settings-modal waits). The failing lane is LOCAL, so these changes are unconditional (an `isCloudLaneWindowConfigured()` gate would never fire on the observed lane); every change stays inside the spec files plus one spec-owned helper seam (`test/e2e-browser/helpers/rust-server.ts` gains a public `kill(signal)` method — kata mv9m's deterministic TypeError fix, see Task 5); no `src/` app wiring, no CLOUD_SKIP_SPECS membership change, no test-deadline change.
 
 **Tech Stack:** Bash (`scripts/e2e-cloud.sh`), TypeScript/NodeNext-ESM test files (relative imports carry `.js`), Playwright 1.58.2 (testIgnore/grepInvert selection semantics — CLI file args are an intersection with testIgnore, never a bypass; `expect.poll`; strict-mode-safe locators), Vitest via the e2e-helpers config (`test/e2e-browser/vitest.config.ts`), the repo e2e lane wrapper (local + Cloud Run Jobs, gcloud-robot identity).
 
@@ -33,7 +33,7 @@
 - **Never push behavior changes directly to main.** All work happens on the run branch `the-usual/cloudlane-skip-provider-burst` in the worktree `.worktrees/cloudlane-skip-provider-burst`; landing is via PR targeting `main` ONLY after this run's delta review finishes PASSED (campaign pre-approval); if the delta review does not finish PASSED, ask the user before merging. Commits use the repo identity already configured (`Dan Shapiro <3732858+danshapiro@users.noreply.github.com>`) — never `dan@danshapiro.com` as git author.
 - **PR #785 contracts are inviolable** (landed at base_ref 6ee5cf4b2; inventory in `reports/plan-constraints-priorart.md` §1):
   - The wiring NEVER modifies any test's own deadline. Budgets apply only via the `freshellPage` fixture's own timeout slot. This run touches no wiring at all; all budget changes are explicit per-assertion/sub-wait literals inside spec files.
-  - Never touch `DEFAULT_TEST_TIMEOUT_MS` (60_000) or any spec's declared `test.setTimeout` envelope. All raises stay inside the existing describe envelopes (opencode-restart-recovery 240s, db-history 180s, first-send 90s; fresh-agent and centralization-smoke keep the 60s default — the raised sub-waits sum below it).
+  - Never touch `DEFAULT_TEST_TIMEOUT_MS` (60_000) or any spec's declared `test.setTimeout` envelope. All raises are per-assertion literals individually well inside the existing describe envelopes (opencode-restart-recovery 240s, db-history 180s, first-send 90s; fresh-agent and centralization-smoke keep the 60s default). All-max chain sums are NOT the sizing criterion: the pre-change chains already exceeded these envelopes as full-chain worst-case sums with passing history (see `reports/load-bearing-validator-LB-6.md` for the per-test table), so no `test.setTimeout` declaration is added anywhere in this run.
   - Keep `waitForHarness`'s no-arg default 0 (UNLIMITED) and the production boot call site's explicit `CLOUD_LANE_HARNESS_WAIT_BOUND_MS` untouched.
   - `isCloudLaneWindowConfigured()` gating is the precedent ONLY for cloud-lane-specific deadlines (settings.spec.ts). The provider burst was observed on the LOCAL lane, so the deflakes here are unconditional — a cloud-gated bump would not fire on the observed lane and must not be used for these fixes.
   - Any CLOUD_SKIP_SPECS edit must keep the selection pins green: no duplicates; `mcp-qa-smoke-rust.spec.ts` stays IN; `server-build-mismatch-rust.spec.ts` and `tabs-client-retire.spec.ts` stay OUT; all LOCAL_ONLY_SPECS included; `e2e-budget-contract.spec.ts` stays cloud-runnable. **This run makes NO CLOUD_SKIP_SPECS membership changes** — no new entries, no removals.
@@ -42,7 +42,7 @@
 - **Cloud identity:** cloud lanes never require interactive `gcloud auth login`. For this run's cloud commands, pin `FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com` (ambient gcloud is expired).
 - **Test coordination:** broad repo-supported runs (`npm test`) wait for the shared coordinator gate — if another agent holds it, wait, never kill a foreign holder; set `FRESHELL_TEST_SUMMARY` for holder visibility. The e2e helpers suite (`npm run test:e2e:helpers`) and focused Playwright runs are not coordinated lanes; run them directly from the worktree (the helpers globalSetup prebuild fails closed on the main checkout while production is live — the worktree is exempt).
 - **TypeScript NodeNext/ESM:** relative imports in test files carry `.js` extensions. Note `npm run typecheck:client` (tsconfig.json) covers only `src`, `shared`, and `config/vite` — test/e2e-browser files are compile-checked by actually running them (Playwright/Vitest esbuild), so the focused run IS the compile proof.
-- **Budget-sizing discipline** (repo precedent): raises are per-assertion, evidence-sized (observed overruns were 1-4x the failing budgets), and fit inside existing describe envelopes. A budget that can be shown decorative (never consulted) fails its red phase — every raised literal must be demonstrated live (mutation red) before it is trusted.
+- **Budget-sizing discipline** (corrected per `reports/load-bearing-validator-LB-1.md` §5): raises are per-assertion, sized at 2-3x the budgets that demonstrably fired under load. The aborting lane timeouts prove only latency ≥ the old bound — no eventual-completion time is measured anywhere in the evidence corpus, so no "observed overrun multiple" can be cited; each raise's sufficiency is a gate-tested hypothesis, not a measured latency. A budget that can be shown decorative (never consulted) fails its red phase — every raised literal must be demonstrated live (mutation red) before it is trusted.
 - Pre-existing flakes outside the named katas stay out of scope, ledger-recorded (see Residuals below).
 
 ## Kata premise reconciliation, per-spec treatment justification, and residuals
@@ -53,21 +53,21 @@ The kata's original framing ("cloud lane executes CLOUD_SKIP_SPECS-listed specs 
 
 ### Per-spec treatment justification against the lane's design intent
 
-The cloud lane's documented design intent (playwright.cloud.config.ts:26-29) is to exclude specs that "require external CLI binaries ... or ... depend on environment-specific rendering/timing that differs in cloud". Every named burst spec installs hermetic FAKE provider CLIs from `test/e2e-browser/fixtures/` (fake-opencode.cjs etc.) onto the spawned server's PATH — none fundamentally requires network-installed binaries. Their failures are budget races of the provider-pane boot/lifecycle pipeline under parallel load (the focused rerun passed 32/32 in 1.6m; the burst reproduced identically at base_ref — load-correlated, pre-existing, not delta-caused). Therefore:
+The cloud lane's documented design intent (playwright.cloud.config.ts:26-29) is to exclude specs that "require external CLI binaries ... or ... depend on environment-specific rendering/timing that differs in cloud". Every named burst spec installs hermetic FAKE provider CLIs from `test/e2e-browser/fixtures/` (fake-opencode.cjs etc.) onto the spawned server's PATH — none fundamentally requires network-installed binaries. Their failures are budget races of the provider-pane boot/lifecycle pipeline under parallel load (the burst reproduced identically at base_ref — load-correlated, pre-existing, not delta-caused). Evidence-class honesty (per `reports/load-bearing-validator-LB-1.md`): the prior run's "focused rerun 32/32" was a CLOUD run — five of the eight handed spec files are CLOUD_SKIP_SPECS-listed and contributed ZERO tests (freshopencode-db-history, freshopencode-first-send-reload-repro, opencode-restart-recovery, fresh-agent-centralization-smoke, truly-idle-alerting); the 32 executed tests came from fresh-agent (25), freshclaude-identity-persistence (4), and pane-ledger-restart (3); fresh-agent-control-rust was never rerun. The skip-listed families were therefore never measured even unloaded. Per-family evidence classes: fresh-agent modal waits = transience-proven (a loaded pass at the old 5s budget exists) + unloaded-bounded (whole bodies fit ≤9s in the rerun); centralization-smoke capture = transience-proven (a full 48-worker loaded pass exists); opencode-restart-recovery, db-history :324/:379, first-send, and centralization-smoke settings visibility = gate-measured (zero passes anywhere in the corpus — their only proof is Task 8's local lane runs, with the escalation ladder armed). Therefore:
 
 | family | cloud membership decision | local full-lane treatment |
 |---|---|---|
-| opencode-restart-recovery (mv9m, 6 failures) | keep skip-listed (provider-boot timing under load is exactly the class the lane excludes) | Task 5: raise the two failing sub-budgets (30s→60s session materialization wait, 15s→30s REST association poll) inside the 240s envelope |
+| opencode-restart-recovery (mv9m, 6 failures) | keep skip-listed (provider-boot timing under load is exactly the class the lane excludes) | Task 5: raise the two failing sub-budgets (30s→60s session materialization wait, 15s→30s REST association poll) inside the 240s envelope, AND add the public `RustServer.kill(signal)` the spec's kill branch calls (a deterministic TypeError no budget raise can fix — see `reports/load-bearing-validator-LB-6.md` §5) |
 | freshopencode-db-history (5prk, 3 failures) | keep skip-listed | Task 3: scoped strict-mode-safe transcript locators (the :245 strict-mode violation) + 30s→60s on the two failing polls/waits |
 | freshopencode-first-send-reload-repro (5prk, 1 failure) | keep skip-listed | Task 4: convert the one-shot status read to a bounded expect.poll |
 | fresh-agent.spec.ts (vpfr, 2-3 failures) | NOT skip-listed — route-mocked, zero-provider, cloud-legal by the lane's own standard (the freshopencode-model-picker precedent) — do not add it | Task 6: raise the three 5s settings-modal tab waits to 15s |
-| fresh-agent-centralization-smoke (vpfr, 2 failures) | keep skip-listed (mocked WS/REST, no binaries; excluded for load/timing sensitivity) | Task 7: poll the capture route until its pinned 422 contract answer + explicit 30s on the settings visibility |
+| fresh-agent-centralization-smoke (vpfr, 2 failures) | keep skip-listed (mocked WS/REST, no binaries; excluded for load/timing sensitivity) | Task 7: eviction-proof the capture path (re-send the crafted legacy sync whenever an evicted observation — capture 404 or empty panes — appears inside bounded polls; see `reports/load-bearing-validator-LB-2.md`) + explicit 30s bounds on the `/api/panes` poll and the settings visibility |
 
 **No new CLOUD_SKIP_SPECS entries and no removals** — skip-listing the cloud-legal specs would remove real cloud coverage of contracts the lane currently holds green; un-skip-listing the others would widen the lane beyond its design intent. Task 2 corrects the stale skip-reason comments in place ("requires opencode binary" → the truthful provider-pipeline-timing rationale) so the lane's recorded design intent matches reality.
 
 ### Singleton flicker decision (explicit, per plan requirements)
 
-The four singleton flickers — `freshclaude-identity-persistence-rust.spec.ts:528` (30s deadSessionAdjudication poll), `pane-ledger-restart-rust.spec.ts:265` (5s durability wall), `fresh-agent-control-rust.spec.ts:1193` (60s post-restart stdin frame), `truly-idle-alerting.spec.ts:73` (10s blue-class window) — are each n≤2 membership flickers, and **none of them live in a file this run otherwise touches**. Per the decision rule (include only same-file, same-class one-liners), **all four are recorded as ledger residuals, not fixed here**. They remain locally covered (three are cloud-legal and cloud-green in the 32/32 focused rerun; truly-idle is skip-listed and environment-sensitive by its own documented reason). Task 8's disposition standard covers any recurrence: Form A (identical base_ref reproduction) or within-family variance, per the prior run's receipt practice.
+The four singleton flickers — `freshclaude-identity-persistence-rust.spec.ts:528` (30s deadSessionAdjudication poll), `pane-ledger-restart-rust.spec.ts:265` (5s durability wall), `fresh-agent-control-rust.spec.ts:1193` (60s post-restart stdin frame), `truly-idle-alerting.spec.ts:73` (10s blue-class window) — are each n≤2 membership flickers, and **none of them live in a file this run otherwise touches**. Per the decision rule (include only same-file, same-class one-liners), **all four are recorded as ledger residuals, not fixed here**. They remain locally covered; unloaded evidence honesty (per `reports/load-bearing-validator-LB-1.md` §4): only two of the four ran in the prior focused cloud rerun and both were green (freshclaude-identity-persistence's 4 tests, pane-ledger-restart's 3 tests); fresh-agent-control-rust was NOT part of the rerun's 8-file handoff and has no unloaded measurement; truly-idle is skip-listed and environment-sensitive by its own documented reason. Task 8's disposition standard covers any recurrence: Form A (identical base_ref reproduction) or within-family variance, per the prior run's receipt practice.
 
 ### Residuals (ledger-recorded, out of scope)
 
@@ -87,9 +87,10 @@ The four singleton flickers — `freshclaude-identity-persistence-rust.spec.ts:5
 | `test/e2e-browser/helpers/selection-nonvacuity.test.ts` (modify) | Selection-integrity pins (kata 67jt's tested contract). |
 | `test/e2e-browser/specs/freshopencode-db-history.spec.ts` (modify) | Strict-mode-safe scoped locators + forced-ambiguity poll + two budget raises (kata 5prk). |
 | `test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts` (modify) | Poll conversion of the one-shot status read (kata 5prk). |
-| `test/e2e-browser/specs/opencode-restart-recovery.spec.ts` (modify) | Two sub-budget raises (kata mv9m). |
+| `test/e2e-browser/specs/opencode-restart-recovery.spec.ts` (modify) | Two sub-budget raises (kata mv9m); the `:525` kill call site itself is unchanged (it becomes valid via the helper seam below). |
+| `test/e2e-browser/helpers/rust-server.ts` (modify) | Add the public `kill(signal)` method — hard process-group kill WITHOUT reboot, the deterministic TypeError fix for the spec's kill branch (kata mv9m; `reports/load-bearing-validator-LB-6.md` §5). Additive only: `restart()`/`restartAbrupt()`/`stop()` are untouched. |
 | `test/e2e-browser/specs/fresh-agent.spec.ts` (modify) | Three settings-modal wait budgets (kata vpfr). |
-| `test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts` (modify) | Capture-route poll conversion + explicit visibility budget (kata vpfr). |
+| `test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts` (modify) | Eviction-proof capture-path polls (re-send the crafted legacy sync on evicted observations; `reports/load-bearing-validator-LB-2.md`) + explicit 30s bounds (kata vpfr). |
 
 No `src/`, `crates/`, `docker/`, or config/vite changes. No user-facing UI change → `docs/index.html` and `README.md` untouched.
 
@@ -103,7 +104,7 @@ No `src/`, `crates/`, `docker/`, or config/vite changes. No user-facing UI chang
 
 **Interfaces:**
 - Consumes: `scripts/e2e-cloud.sh` `cmd_run` backend resolution (:449-458) and local exec path (:460-466); package.json script entries `test:e2e:local` / `test:e2e:cloud` (package.json:76-77).
-- Produces: the lane-provenance banner contract consumed by every Task 8 receipt — local runs print one stdout line beginning `[e2e-cloud] Running locally... (config: test/e2e-browser/playwright.config.ts; CLOUD_SKIP_SPECS does not apply on this lane; FRESHELL_E2E_BACKEND=<value or <unset>>)`; cloud runs print a `Config:` line naming `playwright.cloud.config.ts`. No consumer parses the pre-change banner text (verified: nothing greps for `Running locally...` beyond the script itself), so extending it is safe.
+- Produces: the lane-provenance banner contract consumed by every Task 8 receipt — local runs print one stdout line beginning `[e2e-cloud] Running locally... (config: test/e2e-browser/playwright.config.ts; CLOUD_SKIP_SPECS does not apply on this lane; FRESHELL_E2E_BACKEND=<value or <unset>>)`; cloud runs print a `Config:` line naming `playwright.cloud.config.ts`. CONSUMER CONSTRAINT (LB-4, see `reports/load-bearing-finder.md`): `scripts/test/cloud-run-wrapper.test.sh` DOES parse this output — its checks 9 (:127) and 10 (:146) grep the local-path output for the substring `Running locally`, and check 11 (:212) asserts that substring's ABSENCE on the cloud path. The banner design must therefore preserve the exact `Running locally` substring verbatim; additions after it are safe (all the suite's greps are substring matches on the preserved prefix).
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -199,11 +200,11 @@ No refactor needed — a two-line banner extension and one behavior test; nothin
 
 - [ ] **Step 6: Run impacted-test verification**
 
-The banner change touches the wrapper every e2e invocation uses, but no other test asserts wrapper output; the impacted set is the helpers suite the new file joins. Nothing in `src/` changes, so `npm run typecheck:client` is unaffected (tsconfig.json covers only `src`, `shared`, `config/vite`).
+The banner change touches the wrapper every e2e invocation uses. Two impacted consumer sets: (a) the helpers suite the new file joins; (b) `scripts/test/cloud-run-wrapper.test.sh` — the established wrapper-output suite (its checks 9/10 grep `Running locally` on the local path, check 11 asserts its absence on the cloud path, checks 13-14 pin arg passthrough); the j90s run used exactly this suite as the impacted set for a wrapper change (see `reports/load-bearing-finder.md`, LB-4). It has no package.json script (verified) — run it directly. Caveat: it executes real local Playwright through the base config's globalSetup (a dist rebuild), so it runs from this worktree, never from the main checkout (the prebuild guard fails closed there while production is live). Nothing in `src/` changes, so `npm run typecheck:client` is unaffected (tsconfig.json covers only `src`, `shared`, `config/vite`).
 
-Run: `npm run test:e2e:helpers`
+Run: `npm run test:e2e:helpers && bash scripts/test/cloud-run-wrapper.test.sh`
 
-Expected: PASS (the full helpers suite, including the pre-existing selection/fixture/leak-metrics pins)
+Expected: PASS — the full helpers suite including the pre-existing selection/fixture/leak-metrics pins, and the wrapper suite (all its banner greps are substring matches on the preserved `Running locally` prefix; the cloud-path absence assertion is unaffected by a local-path-only extension)
 
 - [ ] **Step 7: Commit the task**
 
@@ -465,7 +466,7 @@ git commit -m "test(e2e): deflake freshopencode-db-history (scoped transcript lo
 
 **Interfaces:**
 - Consumes: the spec's `getFreshOpencodePaneState(page)` (:109-123), the `FAKE_OPENCODE_HANG_SESSION_CREATE=1` server env (:66 — pins the turn in flight so `running` is a stable steady state), and the audit-file poll at :173-176.
-- Produces: nothing cross-task. The describe's declared `test.setTimeout(90_000)` (:134) is untouched; the new poll's 30s bound keeps the worst-case wait sum (15s pane state + 5s transcript + 15s audit + 30s status) at 65s, inside the envelope.
+- Produces: nothing cross-task. The describe's declared `test.setTimeout(90_000)` (:134) is untouched; the 30s poll bound is an explicit per-assertion literal inside that envelope. Sizing rationale (corrected per `reports/load-bearing-validator-LB-6.md`): the full-chain all-max worst case (~239.5s pre-change, ~269.5s post) ALREADY exceeded the 90s envelope with passing history, so all-max arithmetic was never this envelope's property — the operative regime is the criterion (the 15s one-shot position is where the old bound demonstrably fired under load in all three runs; the whole body passes unloaded in seconds; the envelope is PR-#785-frozen). No `test.setTimeout` declaration is added; the new bound's loaded reachability is gate-measured by Task 8's local lane runs.
 
 **Diagnosis:** after the 15s audit-event poll succeeds, the test did ONE synchronous `getFreshOpencodePaneState(page)` read and asserted `status === 'running'`. The audit-file write (fake CLI process) and the client's status broadcast (WS → Redux) are different pipelines; under 48-worker load the broadcast lags the audit event, so the one-shot read observed pre-turn `idle` (lane failure: `Expected: "running" Received: "idle"` at :180, in both HEAD runs). Unloaded the broadcast always wins — a focused red is not feasible without fabricating app-side delays, so the red evidence is the lane log plus a bound-liveness mutation below.
 
@@ -539,56 +540,115 @@ git add test/e2e-browser/specs/freshopencode-first-send-reload-repro.spec.ts
 git commit -m "test(e2e): deflake freshopencode-first-send (poll the status broadcast, 30s bound)"
 ```
 
-### Task 5: opencode-restart-recovery deflake — load-tolerant session/association budgets (kata mv9m)
+### Task 5: opencode-restart-recovery deflake — load-tolerant budgets + the RustServer kill seam (kata mv9m)
 
 **Files:**
-- Modify: `test/e2e-browser/specs/opencode-restart-recovery.spec.ts:201` (`waitForOpenCodeSessions` budget), `:823` (REST sessionRef poll budget)
-- Test: the spec itself
+- Modify: `test/e2e-browser/specs/opencode-restart-recovery.spec.ts:201` (`waitForOpenCodeSessions` budget), `:823` (REST sessionRef poll budget). The `:525` call site (`await server1.kill('SIGKILL')`) is NOT changed — it becomes valid once the helper seam below exists.
+- Modify: `test/e2e-browser/helpers/rust-server.ts` (add a public `kill(signal)` method after `restartAbrupt()`, which ends at :495)
+- Test: the spec itself (the e2e run is the behavior-protecting test — the deterministic TypeError red below is the strongest possible anchor), plus the helper's own behavior spec in Step 6
 
 **Interfaces:**
-- Consumes: the spec's donor helpers `waitForOpenCodeSessions` (:184-203) and `waitForRunningTerminals` (:205+, unchanged), `runRestartScenario` (:449+), and the fake-opencode PATH seam.
-- Produces: nothing cross-task. The describe's declared `test.setTimeout(240_000)` (:627) is untouched; both raises sit well inside it. Adjacent budgets that did NOT fail (`waitForRunningTerminals` 45s, picker/dialog 15s waits) are deliberately left alone.
+- Consumes: the spec's donor helpers `waitForOpenCodeSessions` (:184-203) and `waitForRunningTerminals` (:205+, unchanged), `runRestartScenario` (:449+), and the fake-opencode PATH seam; `RustServer`'s existing process-group kill machinery — `restartAbrupt`'s group-SIGKILL half (rust-server.ts:466-492), `ownedDescendantPids`, and `reapSurvivingChildren` (:675-698) — under the class's documented process-group ownership contract (:25-35).
+- Produces: `RustServer.prototype.kill(signal: NodeJS.Signals = 'SIGKILL'): Promise<void>` — a hard process-group kill WITHOUT reboot (the caller owns the restart decision), consumed by the spec's kill branch (:525). Nothing cross-task; `restart()`/`restartAbrupt()`/`stop()` are untouched. The describe's declared `test.setTimeout(240_000)` (:627) is untouched; each raised literal is individually well inside it. Adjacent budgets that did NOT fail (`waitForRunningTerminals` 45s, picker/dialog 15s waits) are deliberately left alone.
 
-**Diagnosis:** all six failing tests timed out inside two fixed sub-budgets while each owned-server + fake-CLI-PTY + discovery/association pipeline ran under 48-way parallelism (plus cargo-lock storms): five at `waitForOpenCodeSessions`' 30s `page.waitForFunction` (spawn → session-event → association → broadcast pipeline) and one at the :714 test's 15s `expect.poll` over `GET /api/terminals` (gate-release → session-event → association-scan → REST reflection). Every failure was a latency overrun, never a wrong value — the focused cloud rerun passed 32/32.
+**Diagnosis:** all six failing tests timed out inside two fixed sub-budgets while each owned-server + fake-CLI-PTY + discovery/association pipeline ran under 48-way parallelism (plus cargo-lock storms): five at `waitForOpenCodeSessions`' 30s `page.waitForFunction` (spawn → session-event → association → broadcast pipeline) and one at the :714 test's 15s `expect.poll` over `GET /api/terminals` (gate-release → session-event → association-scan → REST reflection). Every observed failure was a latency overrun, never a wrong value. Evidence class (per `reports/load-bearing-validator-LB-1.md`): gate-measured — this spec is cloud-skip-listed, contributed zero tests to the prior focused cloud rerun, and has zero loaded or unloaded passes anywhere in the corpus; the raises' sufficiency is proven only by Task 8's local lane runs.
 
-- [ ] **Step 1: Reproduce the failing condition as far as it is focusedly reproducible (bound-liveness mutation)**
+**Second, deterministic defect (NEW, per `reports/load-bearing-validator-LB-6.md` §5):** the `kill` restart-mode branch at :525 calls `await server1.kill('SIGKILL')`, but `RustServer` has NO public `kill` method (public API: `restart()` :439, `restartAbrupt()` :461, `stop()` :497; the process-group kill machinery is private — `killCurrentProcess` :629). Reaching :525 therefore throws `TypeError: server1.kill is not a function` — a deterministic terminal failure no budget raise can fix — so the :1053 test ("restores multiple OpenCode panes after hard server kill") can NEVER pass as written. It was masked in all three loaded runs because they died earlier at the :488 wait. The fix decision, made from the source: `restartAbrupt()` is NOT the right substitute — it kills AND reboots on the same port, which would collide with the spec's own `server2` (constructed at :528-536 and started at :536 on `info1.port`). The spec needs a method that kills WITHOUT rebooting: a public `kill(signal)` on `RustServer`, mirroring `restartAbrupt`'s group-kill semantics (group-SIGKILL + ownership-safe descendant sweep) minus the boot.
 
-Temporarily change the `waitForOpenCodeSessions` budget at :201 from `{ timeout: 30_000 }` to `{ timeout: 1 }`.
+- [ ] **Step 1: Reproduce the failing conditions as far as they are focusedly reproducible (deterministic TypeError red + bound-liveness mutation)**
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+1. Deterministic red (the kill seam): run the :1053 test focused locally with NO changes — unloaded, the pre-kill waits (`waitForOpenCodeSessions` at :488/:497) pass in seconds and the test reaches :525.
+2. Bound-liveness mutation (the budget raises): temporarily change the `waitForOpenCodeSessions` budget at :201 from `{ timeout: 30_000 }` to `{ timeout: 1 }`.
+
+- [ ] **Step 2: Run the tests and verify the intended failures**
+
+Run: `npm run test:e2e:local -- test/e2e-browser/specs/opencode-restart-recovery.spec.ts --grep "restores multiple OpenCode panes after hard server kill"`
+
+Expected: FAIL with `TypeError: server1.kill is not a function` raised inside `runRestartScenario` — the deterministic red proving the kill seam is broken (the first deterministic red of this run; no mutation needed, no load needed).
 
 Run: `npm run test:e2e:local -- test/e2e-browser/specs/opencode-restart-recovery.spec.ts --grep "reattaches a UI-created OpenCode pane"`
 
-Expected: FAIL with `TimeoutError: page.waitForFunction: Timeout 1ms exceeded` raised from `waitForOpenCodeSessions` (:185) — the exact stack of the five lane failures (which read `Timeout 30000ms exceeded` at the same frame), proving the budget literal is live, not decorative. The REAL red is the lane evidence: five tests at this frame with 30000ms exceeded plus one `expect.poll` 15000ms overrun at :813. Revert the mutation.
+Expected: FAIL with `TimeoutError: page.waitForFunction: Timeout 1ms exceeded` raised from `waitForOpenCodeSessions` (:185) — the exact stack of the five lane failures (which read `Timeout 30000ms exceeded` at the same frame), proving the budget literal is live, not decorative. The REAL red for the raises is the lane evidence: five tests at this frame with 30000ms exceeded plus one `expect.poll` 15000ms overrun at :813. Revert the mutation.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-1. At :201: `{ timeout: 30_000 }` → `{ timeout: 60_000 }` (2x the observed-failing budget, per the repo's evidence-sizing discipline).
-2. At :823 (the :714 test's REST association poll): `{ timeout: 15_000 }` → `{ timeout: 30_000 }` (2x).
+1. In `test/e2e-browser/helpers/rust-server.ts`, add the public kill method after `restartAbrupt()` (ends :495), before `stop()` (:497):
 
-- [ ] **Step 4: Run the focused test**
+```ts
+  /**
+   * HARD-kill the current server process WITHOUT rebooting and WITHOUT the
+   * graceful shutdown path (no SIGTERM first, no clean WS close frames, so
+   * the server's own PTY-reaping Drop path never ran — see the class doc
+   * comment's process-group boundary). Same kill semantics as
+   * `restartAbrupt`'s first half: signal the server's OWN process group
+   * (negative pid — ownership-safe by construction), then run the
+   * ownership-safe descendant sweep (`reapSurvivingChildren`) as the
+   * PRIMARY reap, since the graceful reap never ran. Unlike
+   * `restartAbrupt`, does NOT boot a replacement: the caller owns the
+   * restart decision (e.g. opencode-restart-recovery boots its own
+   * server2 bound to the same port and token).
+   */
+  async kill(signal: NodeJS.Signals = 'SIGKILL'): Promise<void> {
+    const proc = this.process
+    const pid = proc?.pid
+    this.process = null
 
-Run: `npm run test:e2e:local -- test/e2e-browser/specs/opencode-restart-recovery.spec.ts --grep "reattaches a UI-created OpenCode pane"`
+    if (!proc || !pid) return
 
-Expected: PASS
+    const childPidsBeforeKill = ownedDescendantPids(pid)
+
+    await new Promise<void>((resolve) => {
+      // Signal delivery is effectively immediate, but keep a hard cap so a
+      // pathological wait can never hang the fixture.
+      const timeout = setTimeout(resolve, 5000)
+      proc.once('exit', () => {
+        clearTimeout(timeout)
+        resolve()
+      })
+      try {
+        // Negative pid targets the server's OWN process group only (see the
+        // class doc comment and `killCurrentProcess` for the ownership
+        // rationale). Does NOT reach PTY shell children — the sweep below
+        // backstops those.
+        process.kill(-pid, signal)
+      } catch {
+        clearTimeout(timeout)
+        resolve()
+      }
+    })
+
+    await this.reapSurvivingChildren(childPidsBeforeKill)
+  }
+```
+
+(Additive only — `restartAbrupt`'s body is deliberately NOT refactored to delegate; see Step 5.)
+
+2. At `opencode-restart-recovery.spec.ts:201`: `{ timeout: 30_000 }` → `{ timeout: 60_000 }` (2x the observed-firing budget, per the corrected sizing discipline).
+3. At `:823` (the :714 test's REST association poll): `{ timeout: 15_000 }` → `{ timeout: 30_000 }` (2x).
+
+- [ ] **Step 4: Run the focused tests**
+
+Run: `npm run test:e2e:local -- test/e2e-browser/specs/opencode-restart-recovery.spec.ts --grep "reattaches a UI-created OpenCode pane|restores multiple OpenCode panes after hard server kill"`
+
+Expected: PASS — both the budget-raised reattach test and the kill-mode test (which now survives :525, boots its own server2, and completes the post-kill restore assertions).
 
 - [ ] **Step 5: Refactor while green**
 
-No refactor needed — two literal changes in the spec's own donor helpers; the helpers' structure is unchanged.
+Considered and rejected: extracting `restartAbrupt`'s group-kill half into a shared private helper that both `restartAbrupt` and `kill` call. It would put `restartAbrupt`'s 30+ call sites across ~20 restart-resilience specs into this task's impacted set for zero behavior change — the additive method keeps the blast radius bounded (DRY yields to the bounded-impacted-set rule for a deflake run; the ~25-line parallel is documented against `restartAbrupt`'s doc comment). No refactor.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-`waitForOpenCodeSessions` is called by all six tests in this file (the loop at :486-489, :497, :665, and inside `runRestartScenario` used by the three restart tests), and the REST poll only by the :714 test — all inside this file; no other spec imports these donor helpers (the per-spec-ownership convention keeps them copied). The impacted set is therefore the whole spec's focused run:
+`waitForOpenCodeSessions` is called by all six tests in this file (the loop at :486-489, :497, :665, and inside `runRestartScenario` used by the three restart tests), and the REST poll only by the :714 test — all inside this file; no other spec imports these donor helpers (the per-spec-ownership convention keeps them copied). The helper change is purely additive (no existing method touched), so `restartAbrupt`'s many callers are provably unimpacted; the helper's own behavior contract is additionally pinned by `test/e2e-browser/specs/harness-01-rust-server.spec.ts` ("boots, survives restart, and reaps only its own process group"), which exercises the same class methods and must stay green. The impacted set is the whole spec's focused run plus that helper spec:
 
-Run: `npm run test:e2e:local -- test/e2e-browser/specs/opencode-restart-recovery.spec.ts`
+Run: `npm run test:e2e:local -- test/e2e-browser/specs/opencode-restart-recovery.spec.ts test/e2e-browser/specs/harness-01-rust-server.spec.ts`
 
-Expected: PASS (all six tests; each boots its own Rust server, so allow several minutes)
+Expected: PASS (all six restart-recovery tests plus the helper spec; each boots its own Rust server, so allow several minutes)
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add test/e2e-browser/specs/opencode-restart-recovery.spec.ts
-git commit -m "test(e2e): deflake opencode-restart-recovery (60s session materialization, 30s REST association budgets)"
+git add test/e2e-browser/specs/opencode-restart-recovery.spec.ts test/e2e-browser/helpers/rust-server.ts
+git commit -m "test(e2e): deflake opencode-restart-recovery (60s session/30s REST budgets; public RustServer.kill for the hard-kill branch)"
 ```
 
 ### Task 6: fresh-agent settings-modal waits (kata vpfr, cloud-legal member)
@@ -599,7 +659,7 @@ git commit -m "test(e2e): deflake opencode-restart-recovery (60s session materia
 
 **Interfaces:**
 - Consumes: the shared `freshellPage` fixture chain (fixtures.ts — untouched) and the spec's `seedCollapsePane` helper (:94-137, route-mocked freshcodex pane; zero provider machinery).
-- Produces: nothing cross-task. The file declares NO `test.setTimeout` (config default 60s, untouched). The three 15s waits keep the worst-case body of test :1831 (which does TWO settings round-trips) inside the 60s deadline.
+- Produces: nothing cross-task. The file declares NO `test.setTimeout` (config default 60s, untouched); the raises are per-assertion literals inside that default. Sizing rationale (corrected per `reports/load-bearing-validator-LB-6.md`): the all-max worst-case body of :1831 (~190s pre-change, ~200s post — dominated by unbudgeted asserts counted at their 10s ceiling) ALREADY exceeded the 60s deadline with both loaded and unloaded passing history, so "the body fits 60s" was never true in the all-max reading — the operative regime is the criterion: the 5s bounds demonstrably fired at exactly these three sites under load (six `Timeout: 5000ms` instances), unloaded the whole bodies fit ≤9s (rerun dispatch timing), and the 15s raise exceeds the entire unloaded body duration. No declaration is added; the escalation ladder below stays the armed instrument, and full new-bound reachability is gate-measured.
 
 **Diagnosis:** after clicking the sidebar Settings button (which unmounts and remounts the pane tree — App.tsx:1788-1796), the three expansion tests wait for the `Coding Agents` settings tab with a 5s `toBeVisible` budget; under 48-worker load the modal render exceeded 5s (`element(s) not found` at :1847/:1899/:1946 in the failing runs). The spec is route-mocked and cloud-legal — it runs on BOTH lanes and is the cloud lane's exposed member of the vpfr family.
 
@@ -656,53 +716,109 @@ git add test/e2e-browser/specs/fresh-agent.spec.ts
 git commit -m "test(e2e): deflake fresh-agent settings-modal waits (5s -> 15s under full-lane load)"
 ```
 
-### Task 7: fresh-agent-centralization-smoke deflake — capture poll + settings visibility budget (kata vpfr)
+### Task 7: fresh-agent-centralization-smoke deflake — eviction-proof capture path + explicit bounds (kata vpfr)
 
 **Files:**
-- Modify: `test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts:425-430` (the one-shot capture fetch; its test begins at :408 in the current file — the kata ledger cites it as :401 from the prior commit's numbering) and `:488` (the `Fresh agent` visibility; its test begins at :454 — kata ledger :447)
+- Modify: `test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts` — `:414-423` (the `/api/panes` poll: explicit 30s bound + eviction re-send), `:425-430` (the one-shot capture fetch → eviction-proof poll; its test begins at :408 in the current file — the kata ledger cites it as :401 from the prior commit's numbering), `:259-303` (`fetchNormalizedLayoutProducedByLegacySync` gains a `page` param + explicit 30s bound + eviction re-send; its call site is :432), `:488` (the `Fresh agent` visibility, explicit 30s; its test begins at :454 — kata ledger :447), plus a permanent deterministic eviction trigger inserted after :423
 - Test: the spec itself
 
 **Interfaces:**
-- Consumes: the spec's `fetchWithAuth(serverInfo, path, init?)` (:248-257), `sendLegacyLayoutSync` (:230-246), and the shared `freshellPage` fixture chain (untouched).
-- Produces: nothing cross-task. The file declares NO `test.setTimeout` (60s default, untouched); the two raised waits (30s poll + 30s visibility) sit in different tests, so no single body can sum them past its deadline.
+- Consumes: the spec's `fetchWithAuth(serverInfo, path, init?)` (:248-257) and `sendLegacyLayoutSync(page)` (:230-246 — re-consumed as the eviction re-send), the shared `freshellPage` fixture chain (untouched), the page's own layout mirror (`src/store/layoutMirrorMiddleware.ts:16-54` — change-gated on the serialized layout payload and debounced 1000ms initial / 200ms on change; consumed as the eviction source, NOT modified), and `window.__FRESHELL_TEST_HARNESS__`'s `dispatch` (the eviction trigger — the file's own `tabs/addTab` idiom at :326-342).
+- Produces: nothing cross-task. The file declares NO `test.setTimeout` (60s default, untouched); the raises are per-assertion literals at the observed stall points (the r1 capture 404; the r3 `/api/panes` implicit-10s stall; the :488 implicit-10s visibility). Sizing note (per `reports/load-bearing-validator-LB-6.md`): the capture test's all-max body (~71s pre-change) already exceeded the 60s deadline with a loaded pass in the corpus (transience-proven) — no all-max fit is claimed and no `test.setTimeout` declaration is added; reachability is gate-measured (Task 8), with the vpfr escalation ladder (Task 6) as the family's armed instrument.
 
-**Diagnosis:** the capture test (kata ledger :401; begins at :408 in the current file) failed at :425-426 because the one-shot `GET /api/panes/pane-legacy-agent/capture` raced the server-side layout-sync → pane-registry propagation: the preceding `expect.poll` for the normalized `/api/panes` snapshot had already passed, but the capture route's pane lookup still 404'd (`Received: 404` where the pinned contract answer is 422 "pane kind fresh-agent is unsupported for capture"). The settings test (kata ledger :447; begins at :454 in the current file) failed at :488 waiting for the `Fresh agent` settings text at the 10s default expect timeout — the same settings-modal render starvation as Task 6. The spec is skip-listed from cloud (its failures stop counting there once 67jt's selection contract is pinned); the local lane is where it must hold.
+**Diagnosis (corrected per `reports/load-bearing-validator-LB-2.md` — the original propagation-race framing was FALSIFIED):** the capture test (kata ledger :401; begins at :408 in the current file) failed at :425-426 with `Expected: 422 / Received: 404`, and in the base-ref run the same test failed EARLIER, at the `/api/panes` poll (:414-423), with `Received: []` sustained for a full 10s window. There is NO layout-sync → pane-registry propagation to wait out: the capture route and the `/api/panes` poll read the SAME server-side LayoutStore, whose ingest normalizes `agent-chat` → `fresh-agent` atomically before the pane is visible to either reader (same-key retain-drop at `crates/freshell-freshagent/src/layout_store.rs:292-300`; connection-keyed ingest at `crates/freshell-ws/src/terminal.rs:1588`). By elimination (see the validator's full decision-tree trace), the 404/empty states require the crafted legacy layout entry to have been EVICTED mid-test by the page's own debounced `ui.layout.sync` — the layout mirror sends the REAL Redux layout on the same WsClient and hence the same connection key, so the server's same-key ingest REPLACES the crafted entry — and NO writer re-inserts `pane-legacy-agent` before the test's render step (:433, which is sequenced after the capture). A bare poll-until-422 would therefore re-time the failure (instant 404 → 30s timeout) without fixing it; the fix must be eviction-proof (re-send the crafted sync whenever the evicted state is observed, then keep polling for the pinned 422). The settings test (kata ledger :447; begins at :454 in the current file) failed at :488 waiting for the `Fresh agent` settings text at the 10s default expect timeout — the same settings-modal render starvation as Task 6 (gate-measured class). The spec is cloud-absent BY DESIGN (cloud selection at main is already clean; Task 2 pins it as a tested contract) — the local lane is where it must hold.
 
-- [ ] **Step 1: Reproduce the failing conditions as far as they are focusedly reproducible (bound-liveness mutations)**
+- [ ] **Step 1: Reproduce the failing conditions as far as they are focusedly reproducible (deterministic eviction reds + bound-liveness mutation)**
 
-1. Temporarily set the new capture poll's bound to `{ timeout: 1 }` (write the poll from Step 3 first, with the dead bound).
-2. Temporarily change :488 to `await expect(page.getByText('Fresh agent')).toBeVisible({ timeout: 1 })`.
+Three temporary states, each run then superseded (the Task 2 mutation-red pattern):
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+1. **RED A — the deterministic eviction (the C2 red):** temporarily insert, between the `/api/panes` poll and the CURRENT one-shot capture fetch, the eviction trigger plus an await that the eviction landed:
 
-Run: `npm run test:e2e:local -- test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts --grep "normalizes remote legacy layout sync|keeps fresh-agent settings"`
+```ts
+    // TEMPORARY red-phase trigger (Step 3 keeps a permanent version):
+    // dispatch a layout-visible change through the harness so the page's
+    // own mirror MUST re-sync (change-gated, 200ms debounce) and evict the
+    // crafted entry — the final-head lane window, now under the test's own
+    // control.
+    await page.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'tabs/addTab',
+        payload: { id: 'tab-eviction-trigger', title: 'Eviction trigger', status: 'running' },
+      })
+    })
+    await expect.poll(async () => {
+      const capture = await fetchWithAuth(serverInfo, '/api/panes/pane-legacy-agent/capture')
+      return capture.status
+    }, { timeout: 5_000 }).toBe(404)
+```
 
-Expected: FAIL — both tests fail at their 1ms bounds (the capture poll with the received mid-sync status; the visibility wait with `element(s) not found`), proving both bounds are live, not decorative. The REAL red is the lane evidence (the 404-vs-422 race at the capture assertion, :425-426 in the current file; the 10s element-not-found at :488). Revert both mutations (the capture poll keeps its real bound from Step 3).
+2. **RED B — the bare-poll falsifier (LB-2's mechanism demonstrated live):** temporarily move that same trigger BEFORE the `/api/panes` poll, leave the poll in its CURRENT bare shape but give it the planned explicit 30s bound (`}, { timeout: 30_000 })`), and remove the eviction-await (not needed — the poll itself now observes the evicted state).
+
+3. **RED C — the :488 bound-liveness mutation:** temporarily change :488 to `await expect(page.getByText('Fresh agent')).toBeVisible({ timeout: 1 })`.
+
+- [ ] **Step 2: Run the tests and verify the intended failures**
+
+RED A — Run: `npm run test:e2e:local -- test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts --grep "normalizes remote legacy layout sync"`
+
+Expected: FAIL — the eviction-await PASSES (the capture status deterministically reaches 404: the crafted entry is GONE, proven live — not a mid-sync transient), then the CURRENT one-shot capture assertion fails with `Expected: 422 / Received: 404`, the exact final-head lane shape, now deterministic. Remove RED A's temporary block.
+
+RED B — Run: `npm run test:e2e:local -- test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts --grep "normalizes remote legacy layout sync"`
+
+Expected: FAIL — the `/api/panes` poll returns `Received: []` for its ENTIRE 30s bound and fails at 30s: after the eviction nothing re-inserts the pane, so the bare poll cannot converge (the validator's falsifier, demonstrated live rather than statically). This red is what the re-send machinery in Step 3 exists to close. Remove RED B's temporary block.
+
+RED C — Run: `npm run test:e2e:local -- test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts --grep "keeps fresh-agent settings"`
+
+Expected: FAIL with `Timeout: 1ms exceeded`, `element(s) not found` for `getByText('Fresh agent')` — the exact lane failure shape (which read `Timeout: 10000ms`), proving the visibility bound is live. Revert RED C.
+
+The REAL red for both stall points is the lane evidence (r1's 404 at the one-shot capture; r3's `Received: []` 10s stall at the `/api/panes` poll).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-1. Replace :425-430:
+1. At :414-423, give the `/api/panes` poll its explicit 30s bound and the eviction re-send:
 
 ```ts
-    const capture = await fetchWithAuth(serverInfo, '/api/panes/pane-legacy-agent/capture')
-    expect(capture.status).toBe(422)
-    expect(await capture.json()).toMatchObject({
-      status: 'error',
-      message: expect.stringContaining('pane kind "fresh-agent"'),
-    })
+    await expect.poll(async () => {
+      const response = await fetchWithAuth(serverInfo, '/api/panes?tabId=tab-remote-legacy')
+      const body = await response.json()
+      const panes: Array<{ id?: string }> = body?.data?.panes ?? []
+      if (!panes.some((pane) => pane.id === 'pane-legacy-agent')) {
+        // Evicted by the page's own debounced mirror sync (same WS
+        // connection key): the server's same-key ingest REPLACED the
+        // crafted entry, and no writer re-inserts it before the render
+        // step — re-craft it (per reports/load-bearing-validator-LB-2.md).
+        await sendLegacyLayoutSync(page)
+      }
+      return panes
+    }, { timeout: 30_000 }).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: 'pane-legacy-agent',
+        kind: 'fresh-agent',
+      }),
+    ]))
 ```
 
-with:
+2. Insert the PERMANENT deterministic eviction exercise right after that poll (RED A's block, kept): the `tabs/addTab` dispatch through the harness plus the `expect.poll(...).toBe(404)` await that the eviction landed. This converts the lane's load-dependent eviction into a condition the test exercises every run, in the exact final-head window (between the panes read and the capture read).
+
+3. At :425-430, replace the one-shot capture fetch with the eviction-proof poll:
 
 ```ts
-    // The capture route's pane lookup 404s until the legacy layout-sync has
-    // fully propagated into the server pane registry — a mid-sync transient
-    // under load (observed: Received 404 where the pinned contract answer is
-    // 422). Poll until the pinned contract answer; any other status fails
-    // loudly at the bound, preserving the "fresh-agent is unsupported for
-    // capture" contract.
+    // Capture contract: the pinned answer is 422 "pane kind \"fresh-agent\"
+    // is unsupported for capture-pane". The crafted entry is evictable at
+    // any pre-render moment by the page's own debounced ui.layout.sync (the
+    // mirror sends the REAL Redux layout on the same WsClient; the server
+    // keys layout-store entries by connection id and same-key ingest
+    // replaces the crafted entry). After eviction NO writer re-inserts
+    // pane-legacy-agent before the render step, so a bare poll would re-time
+    // the failure (every iteration 404 until the bound). Re-send the
+    // crafted sync whenever the evicted state (404) is observed and keep
+    // polling for the pinned contract answer; any other non-422 status
+    // fails the contract assertion loudly at the bound.
     await expect.poll(async () => {
       const capture = await fetchWithAuth(serverInfo, '/api/panes/pane-legacy-agent/capture')
+      if (capture.status === 404) {
+        await sendLegacyLayoutSync(page)
+        return { status: 404 }
+      }
       const body = await capture.json().catch(() => undefined)
       return { status: capture.status, bodyStatus: body?.status, message: body?.message }
     }, { timeout: 30_000 }).toMatchObject({
@@ -712,7 +828,37 @@ with:
     })
 ```
 
-2. At :488, make the visibility budget explicit and load-tolerant (the observed failure was the 10s default):
+4. In `fetchNormalizedLayoutProducedByLegacySync` (:259-303), add a leading `page: Page` parameter, give its `expect.poll` the explicit 30s bound, and add the same eviction re-send when the normalized snapshot lacks the pane (the hazard window spans EVERY pre-render read — the validator's writer enumeration shows nothing re-inserts until the render step at :433; its call site at :432 becomes `fetchNormalizedLayoutProducedByLegacySync(page, serverInfo, 'tab-remote-legacy')`):
+
+```ts
+async function fetchNormalizedLayoutProducedByLegacySync(page: Page, serverInfo: E2eServerInfo, tabId: string): Promise<LayoutSnapshot> {
+  await expect.poll(async () => {
+    const response = await fetchWithAuth(serverInfo, `/api/layout/snapshot?tabId=${encodeURIComponent(tabId)}`)
+    const body = await response.json()
+    const layout = body?.data?.layouts?.[tabId] as PaneNode | undefined
+    const leaves = collectLeaves(layout)
+    if (!leaves.some((leaf) => leaf.id === 'pane-legacy-agent')) {
+      // Same eviction exposure as the two reads above (same hazard window):
+      // re-craft — nothing re-inserts the pane before the render step.
+      await sendLegacyLayoutSync(page)
+    }
+    return leaves.map((leaf) => ({
+      id: leaf.id,
+      kind: leaf.content?.kind,
+      createRequestId: leaf.content?.createRequestId,
+    }))
+  }, { timeout: 30_000 }).toEqual(expect.arrayContaining([
+    { id: 'pane-legacy-agent', kind: 'fresh-agent', createRequestId: 'req-legacy-agent' },
+    { id: 'pane-legacy-agent-nested', kind: 'fresh-agent', createRequestId: 'req-legacy-agent-nested' },
+    { id: 'pane-shell', kind: 'terminal', createRequestId: 'req-shell' },
+  ]))
+  // ... the rest of the function (the follow-up snapshot fetch and its
+  // assertions) is unchanged.
+```
+
+Liveness note for this fourth literal: unloaded, the fast path sees the re-sent entry immediately and passes even at a dead bound, so an isolated mutation red is not feasible without fabricating eviction timing; its bound is the same expect.poll mechanism proven live by RED B, and its re-send is the same machinery exercised deterministically every run by the permanent trigger (item 2). The eviction re-send, not the bound, is the load-bearing change here.
+
+5. At :488, make the visibility budget explicit and load-tolerant (the observed failure was the 10s default):
 
 ```ts
     await expect(page.getByText('Fresh agent')).toBeVisible({ timeout: 30_000 })
@@ -722,15 +868,15 @@ with:
 
 Run: `npm run test:e2e:local -- test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts --grep "normalizes remote legacy layout sync|keeps fresh-agent settings"`
 
-Expected: PASS
+Expected: PASS — with the deterministic eviction exercised every run: the trigger evicts, the await proves the 404 state landed, and the eviction-proof capture poll re-sends and converges on the pinned 422 with its full contract-body assertion.
 
 - [ ] **Step 5: Refactor while green**
 
-No refactor needed — the poll preserves the original assertions exactly (status 422, body status 'error', message substring) while adding retry; the visibility change is a literal.
+Considered and rejected: extracting the re-send-on-evicted-observation discipline into a shared helper. The three polls observe different shapes (panes array membership / capture status / layout leaves), so an abstraction would take a callback per read and obscure each read's own contract; the two-line evicted-observation check stays inline at each read, mirroring the file's existing per-helper ownership convention. The trigger uses the file's own `tabs/addTab` dispatch idiom (:326-342). No refactor.
 
 - [ ] **Step 6: Run impacted-test verification**
 
-File-local changes inside two tests; no shared surface touched (the spec owns `fetchWithAuth`/`sendLegacyLayoutSync` copies). The impacted set is the whole spec's focused run:
+File-local changes inside two tests; no shared surface touched (the spec owns `fetchWithAuth`/`sendLegacyLayoutSync` copies; the layout mirror is consumed, not modified). The impacted set is the whole spec's focused run:
 
 Run: `npm run test:e2e:local -- test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts`
 
@@ -740,7 +886,7 @@ Expected: PASS
 
 ```bash
 git add test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts
-git commit -m "test(e2e): deflake fresh-agent-centralization-smoke (capture poll until 422, 30s settings visibility)"
+git commit -m "test(e2e): deflake fresh-agent-centralization-smoke (eviction-proof capture path, 30s explicit bounds)"
 ```
 
 ### Task 8: Final gate — full-lane proof on both lanes + disposition standard (T-last)
@@ -791,7 +937,7 @@ FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com
 
 (The wrapper's default shards=1 is the campaign's practiced cloud gate shape — baseline B. The image is content-addressed to the HEAD commit and builds once.)
 
-Expected: exit=0 with a zero-flake receipt — the wrapper fails the run on ANY recovered Playwright retry (`recoveredRetryCount > 0`), so "passed with retries" is NOT gate-green here. Verify in the log/receipt: (a) the cloud banner + `Config:` line appear (Task 1's cloud-side provenance); (b) NO skip-listed spec appears in the executed roster (the 67jt contract, now also pinned by Task 2); (c) fresh-agent.spec.ts (the burst family's cloud-legal member) is green.
+Expected: exit=0 with a zero-flake receipt — the wrapper fails the run on ANY recovered Playwright retry (`recoveredRetryCount > 0`), so "passed with retries" is NOT gate-green by itself; an exit=1 run is acceptable ONLY when every failure and recovered retry classifies per the Step 6 table as (c) standing-ledger or (d) singleton-residual (recorded, not blocking). A recovered retry INSIDE fresh-agent.spec.ts is class (b): a gate failure for this run unless it reproduces identically at base_ref under Form A. Verify in the log/receipt: (a) the cloud banner + `Config:` line appear (Task 1's cloud-side provenance); (b) NO skip-listed spec appears in the executed roster (the 67jt contract, now also pinned by Task 2); (c) fresh-agent.spec.ts (the burst family's cloud-legal member) is green.
 
 - [ ] **Step 5: Focused reruns of the affected specs on both lanes**
 
@@ -807,7 +953,7 @@ npm run test:e2e:local -- test/e2e-browser/specs/freshopencode-db-history.spec.t
 
 Expected: PASS (all five files; note the first local invocation pays the globalSetup client+Rust build).
 
-Cloud (the cloud-legal member only — a focused cloud invocation of the four skip-listed files yields the Task 2-pinned loud "No tests found" exit 1 BY DESIGN, which is the contract working, not coverage; their coverage lane is local):
+Cloud (the cloud-legal member only):
 
 ```bash
 FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com \
@@ -816,16 +962,28 @@ FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com
 
 Expected: PASS (the ~25 fresh-agent tests).
 
-- [ ] **Step 6: Disposition anything else that appears (Form A/B standard) + write the receipts**
+**Lane-coverage honesty for the skip-listed families (explicit):** for every skip-listed family — the four burst families (opencode-restart-recovery, freshopencode-db-history, freshopencode-first-send-reload-repro, fresh-agent-centralization-smoke) plus truly-idle-alerting — a focused CLOUD rerun selects ZERO tests BY DESIGN (Playwright 1.58.2 treats explicit positional file args as an intersection with testIgnore, so the skip-listed files contribute nothing). The cloud lane's gate role is selection integrity + no regression on the cloud-running specs; the burst families' REAL proof is the LOCAL lane runs (this step's focused local run, then Step 3's full ×2). Any focused cloud invocation that touches a skip-listed family must be reported in the receipt as `0 tests selected (expected)` (all-skip invocations fail loudly with exit 1 "No tests found" — the Task 2-pinned contract working; mixed invocations show the skip-listed member absent from the executed roster) — a vacuous focused-cloud green is NEVER coverage and must never be cited as such.
 
-For every terminal failure or recovered retry OUTSIDE the named burst families:
+- [ ] **Step 6: Classify every observed outcome, disposition anything else, and write the receipts**
+
+Classify FIRST against this table (every observed outcome class, per the LB-7 finding), then apply the Form A/B standard below:
+
+| class | observed outcome | disposition |
+|---|---|---|
+| (a) | terminal failure in a named burst family, post-fix | gate FAIL — never disposition as pre-existing; investigate the fix and iterate within the task's escalation room |
+| (b) | recovered retry in a named burst family, post-fix (e.g. a fresh-agent modal retry) | still a gate failure for this run — the fix should eliminate the retry, not just the terminal failure — UNLESS it reproduces identically at base_ref under Form A (then it is the pre-existing condition the fix narrowed, recorded as such) |
+| (c) | recovered retry in a standing ledger family (d4qm / nxf6 / m8pd-class) | pre-existing exit-1 item under Form A — it fails the zero-flake receipt but is dispositioned pre-existing, recorded, NOT blocking |
+| (d) | singleton flicker (freshclaude-identity-persistence-rust:528, pane-ledger-restart-rust:265, fresh-agent-control-rust:1193, truly-idle-alerting:73) | ledger residual — Form A reproduction or within-family disposition covers a recurrence; a SECOND consecutive recurrence escalates to a new kata filing in the recap (not a fix in this run) |
+| (e) | any other/new family (terminal or retry, either lane) | investigate + Form A/B disposition BEFORE accepting — a new family is never automatically pre-existing |
+
+Then apply the disposition mechanics to everything that is not class (a):
 
 - **Form A (preferred, strongest):** reproduce identically at base_ref 6ee5cf4b2 in a fresh scratch worktree, same-day environment, same lane — identical test, line, and failure shape. Record the reproduction command and log path.
 - **Form B:** code-cited mechanistic impossibility (why this run's delta cannot create the failure) + population receipts (prior runs showing the same failure at base) + kata filing if it is a new recurring flake.
 
 Ledger katas available for pre-existing disposition: hsrh (rust session-init budget under full-suite load), d4qm, nxf6, m8pd (standing cloud-evidenced e2e retry flakes), j96j-class receipts, 38hj/5kyg/ebp6 (campaign baseline). The four singleton flickers (freshclaude-identity-persistence:528, pane-ledger-restart:265, fresh-agent-control-rust:1193, truly-idle:73) are pre-recorded as within-family variance / ledger residuals — a Form A reproduction or a within-family disposition covers a recurrence; a SECOND consecutive recurrence of any singleton escalates it to a new kata filing in the recap (not a fix in this run).
 
-Write the gate receipts to `<logs_dir>/reports/` (e.g. `gate-e2e-local-1.md`, `gate-e2e-local-2.md`, `gate-e2e-cloud-1.md`, `gate-focused.md`): each receipt records the command, the exit code, the lane banner line quoted from the log itself, the pass/fail counts, and the disposition (or burst-family absence proof) for every failure.
+Write the gate receipts to `<logs_dir>/reports/` (e.g. `gate-e2e-local-1.md`, `gate-e2e-local-2.md`, `gate-e2e-cloud-1.md`, `gate-focused.md`): each receipt records the command, the exit code, the lane banner line quoted from the log itself, the pass/fail counts, and — for every failure or recovered retry — its classification class plus the Form A/B evidence or burst-family absence proof; focused cloud lines touching skip-listed families record `0 tests selected (expected)` per Step 5, never as coverage.
 
 - [ ] **Step 7: Confirm the worktree is clean and push the branch**
 
