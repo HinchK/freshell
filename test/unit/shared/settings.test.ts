@@ -14,6 +14,9 @@ import {
   UI_SCALE_PERCENT_OPTIONS,
 } from '@shared/settings'
 
+import { buildLocalSettingsPatch } from '@/store/browserPreferencesPersistence'
+import { parseBrowserPreferencesRaw } from '@/lib/browser-preferences'
+
 describe('shared settings contract', () => {
   it('accepts representative server-backed fields in the server patch schema', () => {
     const parsed = buildServerSettingsPatchSchema().parse({
@@ -635,6 +638,77 @@ describe('shared settings contract', () => {
     it('is rejected by the server patch schema (stays local)', () => {
       const schema = buildServerSettingsPatchSchema()
       expect(schema.safeParse({ panes: { repoIconsOnTabs: true } }).success).toBe(false)
+    })
+  })
+
+  describe('panes.floatingActionButton (browser-local)', () => {
+    it('defaults to false', () => {
+      const local = resolveLocalSettings(undefined)
+      expect(local.panes.floatingActionButton).toBe(false)
+    })
+
+    it('applies a boolean patch', () => {
+      const local = resolveLocalSettings({ panes: { floatingActionButton: true } })
+      expect(local.panes.floatingActionButton).toBe(true)
+    })
+
+    it('merges patches preserving other pane keys', () => {
+      const merged = mergeLocalSettings(
+        { panes: { iconsOnTabs: false } },
+        { panes: { floatingActionButton: true } },
+      )
+      expect(merged.panes?.iconsOnTabs).toBe(false)
+      expect(merged.panes?.floatingActionButton).toBe(true)
+    })
+
+    it('preserves floatingActionButton when extracting the legacy local settings seed', () => {
+      expect(extractLegacyLocalSettingsSeed({
+        panes: {
+          floatingActionButton: true,
+        },
+      } as Record<string, unknown>)).toEqual({
+        panes: {
+          floatingActionButton: true,
+        },
+      })
+    })
+
+    it('rejects non-boolean floatingActionButton in legacy seed extraction', () => {
+      expect(extractLegacyLocalSettingsSeed({
+        panes: {
+          floatingActionButton: 'yes',
+        },
+      } as Record<string, unknown>)).toEqual(undefined)
+    })
+
+    it('is rejected by the server patch schema (stays local)', () => {
+      const schema = buildServerSettingsPatchSchema()
+      expect(schema.safeParse({ panes: { floatingActionButton: true } }).success).toBe(false)
+    })
+
+    it('includes floatingActionButton in composed resolved settings', () => {
+      const resolved = composeResolvedSettings(
+        createDefaultServerSettings({ loggingDebug: false }),
+        resolveLocalSettings({ panes: { floatingActionButton: true } }),
+      )
+      expect(resolved.panes.floatingActionButton).toBe(true)
+    })
+
+    it('persists a non-default value through the browser-preferences diff', () => {
+      const resolved = resolveLocalSettings({ panes: { floatingActionButton: true } })
+      const patch = buildLocalSettingsPatch(resolved)
+      expect(patch.panes?.floatingActionButton).toBe(true)
+    })
+
+    it('produces no persisted patch entry at the default value', () => {
+      const patch = buildLocalSettingsPatch(resolveLocalSettings({}))
+      expect(patch.panes?.floatingActionButton).toBeUndefined()
+    })
+
+    it('survives the reload path: a parsed browser-preferences record preserves floatingActionButton', () => {
+      const raw = JSON.stringify({ settings: { panes: { floatingActionButton: true } } })
+      const record = parseBrowserPreferencesRaw(raw)
+      expect(record?.settings?.panes?.floatingActionButton).toBe(true)
     })
   })
 

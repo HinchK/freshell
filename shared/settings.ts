@@ -82,7 +82,7 @@ const TERMINAL_LOCAL_KEYS = [
   'osc52Clipboard',
   'renderer',
 ] as const
-const PANES_LOCAL_KEYS = ['snapThreshold', 'iconsOnTabs', 'tabAttentionStyle', 'attentionDismiss', 'sessionOpenMode', 'multirowTabs', 'repoIconsOnTabs', 'tabBarRows'] as const
+const PANES_LOCAL_KEYS = ['snapThreshold', 'iconsOnTabs', 'tabAttentionStyle', 'attentionDismiss', 'sessionOpenMode', 'multirowTabs', 'repoIconsOnTabs', 'tabBarRows', 'floatingActionButton'] as const
 const SIDEBAR_LOCAL_KEYS = [
   'sortMode',
   'worktreeGrouping',
@@ -214,6 +214,7 @@ export type LocalSettings = {
     multirowTabs: boolean
     repoIconsOnTabs: boolean
     tabBarRows: number
+    floatingActionButton: boolean
   }
   sidebar: {
     sortMode: SidebarSortMode
@@ -584,6 +585,9 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
     if (normalizedTabBarRows !== undefined) {
       panes.tabBarRows = normalizedTabBarRows
     }
+    if (typeof patch.panes.floatingActionButton === 'boolean') {
+      panes.floatingActionButton = patch.panes.floatingActionButton as boolean
+    }
     if (Object.keys(panes).length > 0) {
       normalized.panes = panes
     }
@@ -905,6 +909,7 @@ export const defaultLocalSettings: LocalSettings = {
     multirowTabs: true,
     repoIconsOnTabs: true,
     tabBarRows: TAB_BAR_ROWS_DEFAULT,
+    floatingActionButton: false,
   },
   sidebar: {
     sortMode: 'activity',

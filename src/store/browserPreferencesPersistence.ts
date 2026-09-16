@@ -112,6 +112,7 @@ export function buildLocalSettingsPatch(localSettings: LocalSettings): LocalSett
   assignChangedScalar(panes, localSettings.panes, defaultLocalSettings.panes, 'multirowTabs')
   assignChangedScalar(panes, localSettings.panes, defaultLocalSettings.panes, 'repoIconsOnTabs')
   assignChangedScalar(panes, localSettings.panes, defaultLocalSettings.panes, 'tabBarRows')
+  assignChangedScalar(panes, localSettings.panes, defaultLocalSettings.panes, 'floatingActionButton')
   if (Object.keys(panes).length > 0) {
     patch.panes = panes
   }
