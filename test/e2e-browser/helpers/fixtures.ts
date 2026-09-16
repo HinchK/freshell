@@ -7,6 +7,7 @@ import {
 } from '@playwright/test'
 import { type E2eServerInfo } from './server-fixture-support.js'
 import {
+  CLOUD_LANE_GOTO_BOUND_MS,
   TestHarness,
   freshellPageFixtureTimeoutMs,
   isCloudLaneWindowConfigured,
@@ -263,11 +264,12 @@ export const test = base.extend<{
   // separate larger timeout so slow setup gets its allowance while the
   // TEST keeps its original deadline (playwright.dev/docs/test-fixtures#
   // fixture-timeout). On the cloud lane the timeout is the composed
-  // budget (freshellPageFixtureTimeoutMs -> 261.5s at the default window:
-  // connection W+1s + the allowances for the UNBOUNDED initial
-  // operations (goto, harness install — no Playwright maxima exist in
-  // this runner; explicit budget lines, delta reviews r12+r13) + the
-  // picker worst case); locally it is undefined — fixture time
+  // budget (freshellPageFixtureTimeoutMs -> 321.5s at the default window:
+  // connection W+1s + the ENFORCED bounds on the initial operations
+  // (goto 60s explicit, harness install 60s default — unconfigured
+  // Playwright-Test waits/navigations are UNLIMITED, so the bounds are
+  // enforced, not assumed; delta reviews r12+r13+r14) + the picker worst
+  // case); locally it is undefined — fixture time
   // counts toward the test timeout, the exact pre-run behavior. The wiring NEVER modifies the
   // test's own deadline: bodies keep their declared or config-default
   // ceiling on every lane (the former whole-test extension gave
@@ -275,8 +277,17 @@ export const test = base.extend<{
   // flakes — one flake at a time, kata tg4e).
   freshellPage: [
     async ({ page, serverInfo, harness }, use) => {
-    // Navigate to Freshell with auth token and test harness enabled
-    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    // Navigate to Freshell with auth token and test harness enabled.
+    // The goto carries an EXPLICIT bound (delta review r14): unconfigured
+    // Playwright-Test navigation is UNLIMITED (navigationTimeout defaults
+    // to 0 = disabled), so without this a pathological navigation would
+    // pass silently under the fixture slot where the pre-run 60s test
+    // deadline caught it. The bound IS the pre-run whole-test deadline —
+    // no loosening for pathological boots, no narrowing for recovering
+    // ones.
+    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`, {
+      timeout: CLOUD_LANE_GOTO_BOUND_MS,
+    })
 
     // Wait for the test harness to be installed
     await harness.waitForHarness()

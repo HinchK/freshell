@@ -1,40 +1,6 @@
-import { test as base, expect } from '../helpers/fixtures.js'
+import { test, expect } from '../helpers/fixtures.js'
 import { DEFAULT_TEST_TIMEOUT_MS, isCloudLaneWindowConfigured, TestHarness } from '../helpers/test-harness.js'
 import type { Page } from '@playwright/test'
-
-// The fixture-timeout APPLICATION pin (delta review r12): it exercises
-// THE PRODUCTION freshellPage REGISTRATION — not a synthetic witness.
-// The spec's local test extension overrides the `harness` DEPENDENCY
-// with a TestHarness subclass whose waitForHarness deterministically
-// sleeps 8s before delegating, so the production fixture's own setup
-// legally exceeds the test's own declared deadline: reaching the test
-// body is only possible if the production tuple wiring
-// ({ timeout: freshellPageFixtureTimeoutMs() } in fixtures.ts) carries
-// the boot on freshellPage's separate timeout slot. With the wiring
-// removed, this test dies with "Test timeout of 3000ms exceeded while
-// setting up \"freshellPage\"" — the EXACT production tg4e signature —
-// deterministically (the 8s sleep dominates any machine speed).
-// Validated by mutation during the r12 remediation. The lane-derived
-// composed value (261.5s at the default window, including the
-// allowances for the UNBOUNDED initial operations — goto and harness
-// install have NO Playwright maxima in this runner; delta r13) is
-// behaviorally unit-pinned by freshellPageFixtureTimeoutMs.
-class DeterministicallySlowBootHarness extends TestHarness {
-  constructor(page: Page) {
-    super(page)
-  }
-
-  override async waitForHarness(timeoutMs?: number): Promise<void> {
-    await new Promise((resolve) => setTimeout(resolve, 8_000))
-    return super.waitForHarness(timeoutMs)
-  }
-}
-
-const test = base.extend<{ harness: TestHarness }>({
-  harness: async ({ page }, use) => {
-    await use(new DeterministicallySlowBootHarness(page))
-  },
-})
 
 // Contract (kata tg4e, main-green campaign, delta review r9): the cloud
 // wedge budget is the freshellPage FIXTURE's own setup timeout — Playwright
@@ -109,7 +75,7 @@ test.describe('declared unlimited (0) deadline', () => {
 // recorded flake exhausts; that spec's budget belongs to its own deflake
 // run. The wiring keeps it exactly as declared on both lanes. Resolves
 // ONLY e2eMachineId (not freshellPage): the boot chain's permitted
-// composition (261.5s at the default window) exceeds 180s, so wrapping
+// composition (321.5s at the default window) exceeds 180s, so wrapping
 // the full boot under a knowingly-insufficient deadline would reintroduce
 // the tg4e setup-flake class inside this contract test itself (delta
 // review r9, Major 2).
@@ -122,24 +88,62 @@ test.describe('declared deadlines above the config default stay as declared', ()
   })
 })
 
+// The fixture-timeout APPLICATION pin (delta reviews r12+r14): it
+// exercises THE PRODUCTION freshellPage REGISTRATION — not a synthetic
+// witness. The pin's own test object overrides the `harness` DEPENDENCY
+// with a TestHarness subclass whose waitForHarness deterministically
+// sleeps 70s before delegating, so the production fixture's own setup
+// legally exceeds the test's own CONFIG-DEFAULT deadline (60s — the same
+// deadline every other spec runs under, so the pin's prerequisite-fixture
+// stall exposure is exactly the lane's status quo, not a new flake
+// vector; delta r14): reaching the test body is only possible if the
+// production tuple wiring ({ timeout: freshellPageFixtureTimeoutMs() } in
+// fixtures.ts) carries the boot on freshellPage's separate timeout slot.
+// With the wiring removed, this test dies with the EXACT production
+// tg4e message — "Test timeout of 60000ms exceeded while setting up
+// 'freshellPage'" — deterministically (the 70s sleep dominates any
+// machine speed). Validated by mutation during the r14 remediation. The
+// lane-derived composed value (321.5s at the default window — every
+// piece now carries an ENFORCED bound: connection W+1s, goto 60s
+// explicit, harness install 60s default, picker worst) is behaviorally
+// unit-pinned by freshellPageFixtureTimeoutMs. ONLY this pin resolves
+// the slow harness: the spec's other pins keep the real (fast) harness.
+class DeterministicallySlowBootHarness extends TestHarness {
+  constructor(page: Page) {
+    super(page)
+  }
 
-// The behavioral pin itself: the describe declares a 3s test deadline;
-// the production freshellPage boot (deterministically >= 8s via the slow
-// harness dependency) survives ONLY on the production fixture's own
-// timeout slot. Reaching the body is the assertion — losing the tuple
-// options in fixtures.ts fails this test with the production tg4e
-// signature on every lane, deterministically.
-test.describe('the production fixture-timeout application (delta review r12)', () => {
-  // Cloud-lane-only wiring under test: locally freshellPageFixtureTimeoutMs()
-  // is undefined — fixture time counts toward the test timeout, the exact
-  // pre-run local behavior — so this pin skips when the window env is not
-  // configured (the env-set leg and the cloud lane run it for real).
-  test.skip(!isCloudLaneWindowConfigured(), 'the fixture timeout is cloud-lane wiring; the local lane keeps its exact pre-run behavior')
-  test.setTimeout(3_000)
-  test('freshellPage setup outlives the test\'s own deadline on the fixture\'s OWN production timeout slot', async ({ freshellPage }) => {
+  override async waitForHarness(timeoutMs?: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 70_000))
+    return super.waitForHarness(timeoutMs)
+  }
+}
+
+const testSlowBoot = test.extend<{ harness: TestHarness }>({
+  harness: async ({ page }, use) => {
+    await use(new DeterministicallySlowBootHarness(page))
+  },
+})
+
+// The behavioral pin itself: the test keeps the CONFIG-DEFAULT 60s
+// deadline — the same deadline every other spec runs under, so the
+// prerequisite fixtures (e2eMachineId's registration, context, page)
+// have exactly the stall exposure the rest of the lane already has
+// (delta r14). The production freshellPage boot (deterministically
+// >= 70s via the slow harness dependency) survives ONLY on the
+// production fixture's own timeout slot. Reaching the body is the
+// assertion — losing the tuple options in fixtures.ts fails this test
+// with the EXACT production tg4e message, deterministically.
+// Cloud-lane-only by the wiring's design: locally
+// freshellPageFixtureTimeoutMs() is undefined (the exact pre-run local
+// behavior), so the pin skips when the window env is not configured
+// (the no-env leg reports it skipped).
+testSlowBoot.describe('the production fixture-timeout application (delta reviews r12+r14)', () => {
+  testSlowBoot.skip(!isCloudLaneWindowConfigured(), 'the fixture timeout is cloud-lane wiring; the local lane keeps its exact pre-run behavior')
+  testSlowBoot('freshellPage setup outlives the test\'s own config-default deadline on the fixture\'s OWN production timeout slot', async ({ freshellPage }) => {
     void freshellPage
-    // The test's own slot is intact after the slow boot: the wiring never
-    // touched the test's deadline.
-    expect(test.info().timeout).toBe(3_000)
+    // The test's own slot is intact and untouched after the 70s boot
+    // rode the fixture's separate slot.
+    expect(testSlowBoot.info().timeout).toBe(DEFAULT_TEST_TIMEOUT_MS)
   })
 })

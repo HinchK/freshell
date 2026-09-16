@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Page } from '@playwright/test'
 import {
-  CLOUD_LANE_GOTO_ALLOWANCE_MS,
-  CLOUD_LANE_HARNESS_ALLOWANCE_MS,
+  CLOUD_LANE_GOTO_BOUND_MS,
+  CLOUD_LANE_HARNESS_WAIT_BOUND_MS,
   DEFAULT_TEST_TIMEOUT_MS,
   DEFAULT_WS_READY_TIMEOUT_MS,
   freshellPageFixtureTimeoutMs,
@@ -113,25 +113,26 @@ describe('resolveCloudLaneTestBudgetMs', () => {
     expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '' })).toBeNull()
   })
 
-  it('covers the permitted composition at the cloud default window (delta reviews r2+r5+r12)', () => {
+  it('covers the permitted composition at the cloud default window (delta reviews r2+r5+r12+r14)', () => {
     // W=90s: connection envelope (W + 1s total-deadline slack) = 91_000;
-    // goto max 30_000 + waitForHarness max 30_000 (delta r12: the initial
-    // operations' LEGAL maxima, not their healthy ~3s — correlated cloud
-    // slowness can stretch both to their deadlines together);
+    // the initial operations' ENFORCED bounds (goto 60_000 explicit +
+    // harness install 60_000 default — unconfigured Playwright-Test
+    // navigations/waits are UNLIMITED, so the bounds are enforced in the
+    // fixture chain, not assumed from Playwright defaults; delta r14);
     // picker worst case (settle + at most 5 clicks + 5 probes + the render
     // wait) = 500 + 5 * (5_000 + 5_000) + 60_000 = 110_500.
-    // Total 261_500.
-    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '90000' })).toBe(261_500)
+    // Total 321_500.
+    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '90000' })).toBe(321_500)
   })
 
-  it('scales with the configured window (60s -> 231_500)', () => {
-    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '60000' })).toBe(231_500)
+  it('scales with the configured window (60s -> 291_500)', () => {
+    expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: '60000' })).toBe(291_500)
   })
 
   it('falls back to the default window composition on malformed values (one parsing rule)', () => {
     for (const malformed of ['not-a-number', '0', '-5']) {
       expect(resolveCloudLaneTestBudgetMs({ [ENV_VAR]: malformed }))
-        .toBe(30_000 + 1_000 + CLOUD_LANE_GOTO_ALLOWANCE_MS + CLOUD_LANE_HARNESS_ALLOWANCE_MS + shellPickerWorstCaseMs())
+        .toBe(30_000 + 1_000 + CLOUD_LANE_GOTO_BOUND_MS + CLOUD_LANE_HARNESS_WAIT_BOUND_MS + shellPickerWorstCaseMs())
     }
   })
 
@@ -140,7 +141,7 @@ describe('resolveCloudLaneTestBudgetMs', () => {
       const budget = resolveCloudLaneTestBudgetMs({ [ENV_VAR]: windowMs })
       expect(budget).not.toBeNull()
       expect(budget!).toBeGreaterThanOrEqual(
-        Number(windowMs) + 1_000 + CLOUD_LANE_GOTO_ALLOWANCE_MS + CLOUD_LANE_HARNESS_ALLOWANCE_MS + shellPickerWorstCaseMs(),
+        Number(windowMs) + 1_000 + CLOUD_LANE_GOTO_BOUND_MS + CLOUD_LANE_HARNESS_WAIT_BOUND_MS + shellPickerWorstCaseMs(),
       )
     }
   })
@@ -179,8 +180,8 @@ describe('isCloudLaneWindowConfigured (one presence rule for every cloud-lane ga
 
 describe('freshellPageFixtureTimeoutMs (the boot chain owns its own setup allowance, delta review r9)', () => {
   it('is the composed budget on the cloud lane — the fixture SETUP gets the large window, never the test body', () => {
-    expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: '90000' })).toBe(261_500)
-    expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: '60000' })).toBe(231_500)
+    expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: '90000' })).toBe(321_500)
+    expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: '60000' })).toBe(291_500)
   })
 
   it('is undefined on the local lane: fixture time counts toward the test timeout — the exact pre-run behavior', () => {
@@ -191,7 +192,7 @@ describe('freshellPageFixtureTimeoutMs (the boot chain owns its own setup allowa
   it('falls back to the default window composition on malformed values (one parsing rule)', () => {
     for (const malformed of ['not-a-number', '0', '-5']) {
       expect(freshellPageFixtureTimeoutMs({ [ENV_VAR]: malformed }))
-        .toBe(30_000 + 1_000 + CLOUD_LANE_GOTO_ALLOWANCE_MS + CLOUD_LANE_HARNESS_ALLOWANCE_MS + shellPickerWorstCaseMs())
+        .toBe(30_000 + 1_000 + CLOUD_LANE_GOTO_BOUND_MS + CLOUD_LANE_HARNESS_WAIT_BOUND_MS + shellPickerWorstCaseMs())
     }
   })
 
@@ -239,17 +240,20 @@ describe('TestHarness.waitForConnection timeout wiring', () => {
     expect(calls[0][2]).toEqual({ timeout: 15_000 })
   })
 
-  it('waitForHarness default is 0 (unlimited, outer-bound-governed) — the exact pre-run effective semantics (delta review r13)', async () => {
-    // The historical decorative 15s never applied: unconfigured
-    // Playwright-Test waits inherit the context's 0 default (= disabled),
-    // so the pre-run wait was bounded ONLY by the outer deadline. The r6
-    // attempt to pin a 30s "historical effective window" rested on a false
-    // default and NARROWED the wait; the committed default restores the
-    // pre-run semantics: 0 = no inner limit, the test deadline (locally)
-    // or the freshellPage fixture slot (cloud lane) governs.
+  it('waitForHarness default is the ENFORCED 60s bound — the pre-run whole-test deadline as the single wait own bound (delta review r14)', async () => {
+    // Unconfigured Playwright-Test waits are UNLIMITED (the context's
+    // default timeout is 0 = disabled), so pre-run this wait was bounded
+    // only by the whole test's 60s deadline. Under the r9 fixture slot an
+    // unbounded wait would let a pathological install stall pass silently
+    // (the loosening r14 rejected); the default is therefore the pre-run
+    // whole-test deadline: a pathological wait dies at 60s exactly where
+    // pre-run caught it, a slow-but-recovering wait (30-60s) keeps the
+    // pass envelope pre-run gave it. Explicit per-call values are
+    // honored.
     const { page, calls } = fakePage()
     await new TestHarness(page).waitForHarness()
-    expect(calls[0][2]).toEqual({ timeout: 0 })
+    expect(calls[0][2]).toEqual({ timeout: CLOUD_LANE_HARNESS_WAIT_BOUND_MS })
+    expect(CLOUD_LANE_HARNESS_WAIT_BOUND_MS).toBe(60_000)
   })
 })
 

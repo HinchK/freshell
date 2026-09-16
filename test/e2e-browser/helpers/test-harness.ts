@@ -36,29 +36,31 @@ export function resolveWsReadyTimeoutMs(
 }
 
 /**
- * page.goto's ALLOWANCE in the composition (delta reviews r12+r13):
- * goto in this repo's tests is UNBOUNDED — Playwright Test defaults
- * navigationTimeout to 0 (= disabled) when the config sets none
- * (playwright/lib/index.js _setupContextOptions sets
- * _defaultContextNavigationTimeout = navigationTimeout || 0, applied to
- * every context; timeoutSettings.navigationTimeout() returns it), so
- * there is NO Playwright maximum to cover. The composition instead
- * carries an explicit budget line: healthy boots take ~3s, and a stall
- * beyond the allowance burns the rest of the freshellPage fixture slot
- * and fails it loudly with the fixture-timeout signature (never the old
- * generic setup-timeout signature). The timeout-less-fetch wedge class
- * stays residual (a) / kata qq5m.
+ * page.goto's ENFORCED bound in the freshellPage boot chain and the
+ * composition (delta reviews r12+r13+r14): goto in this repo's tests is
+ * otherwise UNBOUNDED — Playwright Test defaults navigationTimeout to
+ * 0 (= disabled) when the config sets none (playwright/lib/index.js
+ * _setupContextOptions sets _defaultContextNavigationTimeout =
+ * navigationTimeout || 0, applied to every context), so without an
+ * explicit bound a pathological navigation would pass silently under the
+ * fixture slot (the exact loosening delta review r14 rejected). The
+ * bound is 60_000 — the pre-run WHOLE-TEST deadline as the single
+ * operation's own bound: a pathological goto (90-200s) dies at 60s
+ * exactly where the pre-run deadline caught it, and a slow-but-recovering
+ * goto (30-60s) keeps the pass envelope pre-run gave it. freshellPage
+ * passes this explicitly to page.goto, and the composition carries it as
+ * a first-class term.
  */
-export const CLOUD_LANE_GOTO_ALLOWANCE_MS = 30_000
+export const CLOUD_LANE_GOTO_BOUND_MS = 60_000
 
 /**
- * The harness-install wait's ALLOWANCE in the composition (delta
- * reviews r12+r13): waitForHarness's committed default is 0 (unlimited,
- * outer-bound-governed — see the method), so there is no inner maximum;
- * the allowance is the composition's explicit budget line for the wait,
- * with the same loud-slot-failure semantics as the goto allowance.
+ * The harness-install wait's ENFORCED bound (delta reviews
+ * r12+r13+r14): the default window for waitForHarness — 60_000, the
+ * pre-run WHOLE-TEST deadline as the single wait's own bound, for the
+ * same no-loosening/no-narrowing reasons as CLOUD_LANE_GOTO_BOUND_MS.
+ * The composition carries it as a first-class term.
  */
-export const CLOUD_LANE_HARNESS_ALLOWANCE_MS = 30_000
+export const CLOUD_LANE_HARNESS_WAIT_BOUND_MS = 60_000
 
 /**
  * Whether the cloud-lane window env key is configured (present AND
@@ -111,10 +113,10 @@ export const DEFAULT_TEST_TIMEOUT_MS = 60_000
  * receive a larger allowance while the test keeps its original deadline
  * (playwright.dev/docs/test-fixtures#fixture-timeout) — the boot chain
  * (goto + waitForHarness + self-healing waitForConnection + the picker
- * leg) is fixture setup, and its permitted composition — the bounded
- * pieces plus the unbounded initial operations' ALLOWANCES (delta
- * reviews r12+r13) — is exactly what resolveCloudLaneTestBudgetMs
- * derives: 261.5s at the default window. undefined means no
+ * leg) is fixture setup, and its permitted composition — every piece now
+ * carries an ENFORCED bound (connection W+1s, goto 60s, harness install
+ * 60s, picker worst) — is exactly what resolveCloudLaneTestBudgetMs
+ * derives: 321.5s at the default window. undefined means no
  * fixture-specific timeout: fixture time counts toward the test timeout —
  * the exact pre-run behavior the local lane keeps. The test's own
  * deadline is NEVER modified by the wiring: bodies keep their declared or
@@ -152,8 +154,8 @@ export function resolveCloudLaneTestBudgetMs(
   if (!isCloudLaneWindowConfigured(env)) return null
   const connectionEnvelopeMs = resolveWsReadyTimeoutMs(undefined, env) + 1000
   return connectionEnvelopeMs
-    + CLOUD_LANE_GOTO_ALLOWANCE_MS
-    + CLOUD_LANE_HARNESS_ALLOWANCE_MS
+    + CLOUD_LANE_GOTO_BOUND_MS
+    + CLOUD_LANE_HARNESS_WAIT_BOUND_MS
     + shellPickerWorstCaseMs()
 }
 
@@ -198,17 +200,20 @@ export class TestHarness {
    * passed as waitForFunction's OPTIONS (third argument) — the historical
    * two-arg call bound the timeout object to the predicate's argument,
    * making every explicit window decorative (the LB-1 defect class,
-   * fixed in delta review r5). The default is 0 — UNLIMITED, governed by
-   * the outer bound: the test deadline locally, the freshellPage fixture
-   * slot on the cloud lane. That is the EXACT pre-run effective
-   * semantics — the decorative 15s never applied because unconfigured
-   * Playwright-Test waits inherit the context's 0 default (= disabled;
-   * verified against playwright/lib/index.js _setupContextOptions and
-   * timeoutSettings), so the historical wait was bounded only by the
-   * outer deadline. The r6 attempt to pin a 30s "historical effective
-   * window" rested on a false default and NARROWED the wait; delta
-   * review r13 corrected it. Explicit per-call values are honored. */
-  async waitForHarness(timeoutMs = 0): Promise<void> {
+   * fixed in delta review r5). Unconfigured Playwright-Test waits are
+   * UNLIMITED (the context's default timeout is 0 = disabled; verified
+   * against playwright/lib/index.js _setupContextOptions and
+   * timeoutSettings), so pre-run this wait was bounded only by the
+   * whole test's 60s deadline — under the r9 fixture slot that outer
+   * bound is 321.5s, and an unbounded wait would let a pathological
+   * install stall pass silently (the loosening delta review r14
+   * rejected). The default is therefore CLOUD_LANE_HARNESS_WAIT_BOUND_MS
+   * (60_000) — the pre-run WHOLE-TEST deadline as the single wait's own
+   * bound: a pathological wait dies at 60s exactly where pre-run caught
+   * it, and a slow-but-recovering wait (30-60s) keeps the pass envelope
+   * pre-run gave it. Explicit per-call values are honored (the r6/r13
+   * default history is corrected here). */
+  async waitForHarness(timeoutMs = CLOUD_LANE_HARNESS_WAIT_BOUND_MS): Promise<void> {
     await this.page.waitForFunction(
       () => !!window.__FRESHELL_TEST_HARNESS__,
       undefined,
