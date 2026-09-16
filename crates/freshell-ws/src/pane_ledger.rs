@@ -2367,36 +2367,50 @@ impl PaneLedger {
             }
         }
 
-        // b8ke ext r29 F3: the UNFENCED-CLOBBER backstop — a fully-unfenced
-        // fresh-agent binding write (no observed pair) can never overwrite
-        // a row whose recovery binding belongs to a LIVE TERMINAL. The
-        // stale-pair fence above only fires when the write CARRIES a pair;
-        // pre-r29 the codex post-send refresh (and any other legacy-unfenced
-        // lane) landed unfenced after a handoff bound a terminal under a
-        // newer generation, and the write was accepted — rewriting the
-        // terminal's authoritative recovery row as pane_kind fresh-agent
-        // with no live_terminal_id while preserving the newer stamp, so the
-        // corruption was invisible to the fence. A fresh-agent lane with
-        // legitimate authority over a terminal-bound row reclaims it under
-        // a CLAIMED, STAMPED write (the coordinator's cross-kind checks
-        // gate the session first); the unfenced shape is exactly the
-        // delayed-write hazard and refuses typed.
-        if w.observed_epoch.is_none()
-            && w.observed_generation.is_none()
-            && existing.is_some_and(|r| r.state == RowState::Bound && r.live_terminal_id.is_some())
-        {
-            tracing::warn!(target: "freshell_ws::pane_ledger",
-                provider = %w.provider,
-                session_id = %w.session_id,
-                live_terminal_id = ?existing.and_then(|r| r.live_terminal_id.clone()),
-                "pane_ledger_binding_refused_unfenced_over_terminal: a fully-unfenced \
-                 fresh-agent binding write would clobber a live terminal's recovery \
-                 row — the write is refused typed (kata b8ke ext r29 F3)"
-            );
-            return Err(std::io::Error::other(
-                "UNFENCED_BINDING_OVER_TERMINAL: the row's recovery binding belongs \
-                 to a live terminal; the unfenced fresh-agent write is refused",
-            ));
+        // b8ke ext r29 F3 + focused ep5 r1 F2: the TERMINAL-ROW guard — a
+        // fresh-agent binding write over a Bound row whose recovery
+        // binding belongs to a LIVE TERMINAL must carry a STRICTLY NEWER
+        // ownership pair. The ext-r29 arm covered only the fully-unfenced
+        // shape; the ep5-r1 review named the same-generation trap — a
+        // terminal binding written at the handoff/target generation while
+        // a delayed fresh-agent refresh carries that SAME generation is
+        // "not older" and passed both fences, rewriting the terminal's
+        // authoritative recovery row as pane_kind fresh-agent with no
+        // live_terminal_id. A fresh-agent lane with legitimate authority
+        // reclaims a terminal-bound row under a CLAIMED, STAMPED write,
+        // and every legitimate reclaim advances the generation (each
+        // handoff/stop/commit mints the next one), so a strictly-newer
+        // requirement refuses nothing legitimate — while unfenced,
+        // equal-pair, older-pair (already refused by the stale-pair
+        // fence above when comparable), and paired-over-unstamped-row
+        // writes all refuse typed.
+        if existing.is_some_and(|r| r.state == RowState::Bound && r.live_terminal_id.is_some()) {
+            let write_pair = w.observed_epoch.zip(w.observed_generation);
+            let row_pair = existing.and_then(|r| r.owner_epoch.zip(r.owner_generation));
+            let strictly_newer = matches!((write_pair, row_pair), (Some(wp), Some(rp)) if wp > rp);
+            if !strictly_newer {
+                let unfenced = write_pair.is_none();
+                tracing::warn!(target: "freshell_ws::pane_ledger",
+                    provider = %w.provider,
+                    session_id = %w.session_id,
+                    live_terminal_id = ?existing.and_then(|r| r.live_terminal_id.clone()),
+                    write_pair = ?write_pair, row_pair = ?row_pair,
+                    "pane_ledger_binding_refused_over_terminal: a fresh-agent \
+                     binding write would clobber a live terminal's recovery row \
+                     without a strictly newer ownership pair (unfenced, the \
+                     terminal's own generation, or an unstamped row) — the write \
+                     is refused typed (kata b8ke focused ep5 r1 F2)"
+                );
+                return Err(std::io::Error::other(if unfenced {
+                    "UNFENCED_BINDING_OVER_TERMINAL: the row's recovery binding \
+                     belongs to a live terminal; the unfenced fresh-agent write \
+                     is refused"
+                } else {
+                    "NOT_NEWER_BINDING_OVER_TERMINAL: the row's recovery binding \
+                     belongs to a live terminal; the fresh-agent write must carry \
+                     a strictly newer ownership pair"
+                }));
+            }
         }
         let created_at = existing.map(|r| r.created_at).unwrap_or(w.now_ms);
         // Advisory field: keep the existing row's value when the new write

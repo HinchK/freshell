@@ -2528,30 +2528,33 @@ impl FreshCodexState {
             }
         }
 
-        // b8ke ext r29 F3: the operation's CLAIM pair — the (epoch,
-        // generation) of the coordinator record for the (possibly
-        // respawned) session at the moment ensure-alive established this
-        // send's live authority. Captured HERE — not at the refresh site —
-        // so every await from this point to the binding write's landing
-        // (the sessions lookup, the turn-lock park, the destroy-redo, the
-        // turn/start, the awaited ledger write) is INSIDE the delayed-write
-        // fence: a handoff that reaps this runtime and binds a terminal
-        // under a NEWER generation anywhere in that span leaves the late
-        // refresh carrying the PRE-handoff pair, and the ledger's
-        // stale-write check refuses it typed. (Observing at the refresh
-        // site instead would hand a mid-send handoff the POST-handoff pair
-        // and let the clobber through.) When the registry is unwired the
-        // legacy-unfenced (None, None) shape keeps the pre-r29 behavior.
-        let (refresh_epoch, refresh_generation) = self
-            .ownership
-            .as_ref()
-            .map(|registry| {
-                (
-                    Some(registry.boot_epoch()),
-                    Some(registry.observe(PROVIDER, &session_id).generation),
-                )
-            })
-            .unwrap_or((None, None));
+        // b8ke focused ep5 r1 F2: the operation's OWN claim pair — the
+        // lane's retained OwnershipStamp for the (possibly respawned)
+        // session, read from the lane's STAMP MAP, NEVER a fresh registry
+        // observation. The ep5-r1 review found the ext-r29 capture was a
+        // fresh observe taken right after the UNGUARDED AlreadyRunning
+        // return: a handoff that had already entered Handoff (or entered
+        // between the return and the observe) handed the delayed refresh
+        // the handoff/target generation — a terminal binding written at
+        // that same generation is not older than the refresh, so the late
+        // refresh passed the ledger's fence and rewrote the authoritative
+        // terminal recovery row. The stamp map is written ONLY by this
+        // lane's own claim commits (the create/respawn/resume that made
+        // the runtime live) and is never advanced by a concurrent
+        // handoff, so it is the pre-handoff pair by construction; a
+        // respawn inside ensure-alive commits and re-stamps BEFORE this
+        // read, so a respawned runtime carries its OWN new pair. A session
+        // with NO stamp (no claim context: the registry was wired after
+        // the fact, or the reap already cleared it) is treated UNFENCED —
+        // (None, None) — so the ledger's UNFENCED-CLOBBER backstop
+        // refuses the refresh over terminal-bound rows.
+        let (refresh_epoch, refresh_generation) = {
+            let stamps = self.ownership_stamps.lock().expect("ownership stamps lock");
+            stamps
+                .get(&session_id)
+                .map(|stamp| (Some(stamp.epoch), Some(stamp.generation)))
+                .unwrap_or((None, None))
+        };
 
         // Look up the session; extract the client + settings under the lock (Child isn't Clone).
         let looked_up = {
@@ -9927,14 +9930,17 @@ pub(crate) mod tests {
         );
     }
 
-    /// b8ke ext r29 F3: the post-send binding refresh carries the
-    /// operation's observed ownership pair — the coordinator's CURRENT
-    /// (epoch, generation) for the session — so the ledger's
+    /// b8ke ext r29 F3 + focused ep5 r1 F2: the post-send binding refresh
+    /// carries the operation's OWN claim pair — the lane's retained
+    /// OwnershipStamp for the session (written only by this lane's claim
+    /// commits), never a fresh registry observation — so the ledger's
     /// delayed-write fence can refuse a refresh that lands after a
     /// handoff reaped the runtime and bound a terminal under a NEWER
     /// generation. Pre-r29 the refresh passed NO pair (the pre-r22
     /// unfenced shape), so the late write was accepted and rewrote the
-    /// terminal's authoritative recovery row.
+    /// terminal's authoritative recovery row; the ep5-r1 review found
+    /// the ext-r29 fresh-observe capture handed a mid-flight handoff the
+    /// POST-handoff generation (the same-generation trap).
     #[tokio::test]
     async fn the_post_send_binding_refresh_carries_the_observed_ownership_pair() {
         let (transport, peer) = freshell_codex::new_channel_transport();
@@ -9945,34 +9951,19 @@ pub(crate) mod tests {
         let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(fake.clone());
 
-        // Seed the LIVE owner record the send's authority derives from.
-        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
-            PROVIDER,
-            "thread-r29-f3",
-            freshell_ownership::RuntimeOwnerKind::FreshAgent,
-            "op-r29-f3-seed",
-            None,
-            "test",
-            freshell_ownership::now_epoch_ms(),
-        ) else {
-            panic!("the seed claim must grant")
-        };
-        assert_eq!(
-            registry.commit_live(
-                PROVIDER,
-                "thread-r29-f3",
-                "op-r29-f3-seed",
-                generation,
-                freshell_ownership::OwnerIdentity {
-                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
-                    terminal_id: None,
-                    live_session_key: Some("thread-r29-f3".to_string()),
-                    pid: None,
-                    ownership_id: None,
-                },
-            ),
-            freshell_ownership::CommitOutcome::Committed
-        );
+        // Seed the runtime's ownership the way the LANE does (the claim +
+        // commit that retains the stamp — production-faithful: every live
+        // codex session's stamp exists because its create/respawn/resume
+        // committed through this very path).
+        let mut seed_ticket =
+            match st.begin_lane_claim_at("thread-r29-f3", "op-r29-f3-seed", None, "test") {
+                crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+                _ => panic!("the seed claim must grant"),
+            };
+        let generation = seed_ticket.as_ref().expect("the seed ticket").generation();
+        assert!(st
+            .commit_lane_claim_at(&mut seed_ticket, "thread-r29-f3", "thread-r29-f3", None,)
+            .is_ok());
 
         insert_fake_session_with_real_consumer(
             &st,
@@ -10017,18 +10008,20 @@ pub(crate) mod tests {
         );
     }
 
-    /// b8ke ext r29 F3: the fence pair is captured at the operation's
-    /// CLAIM — right after ensure-alive establishes the send's live
-    /// authority — never re-observed at the write site. A handoff that
-    /// advances the generation while the send is mid-flight (parked past
-    /// the claim at the turn-lock or the awaited turn/start) leaves the
-    /// late refresh carrying the PRE-handoff pair, so the ledger's
-    /// stale-write check refuses it. (Observing at the write site would
-    /// hand the mid-send handoff the POST-handoff pair and let the
-    /// clobber through — the exact race the capture point exists to
-    /// close.)
+    /// b8ke focused ep5 r1 F2: the harmful ordering the ep5-r1 review
+    /// named — a handoff that has ALREADY ENTERED (the record sits in
+    /// Handoff; nothing reaped the in-map session, so the send sees the
+    /// UNGUARDED AlreadyRunning return) must NOT hand the delayed
+    /// refresh the handoff/target generation: a terminal binding written
+    /// at that same generation is not older than the refresh, so the
+    /// late refresh would pass the ledger's fence and rewrite the
+    /// terminal's authoritative recovery row. The refresh now fences
+    /// with the lane's RETAINED STAMP (the pre-handoff pair by
+    /// construction); the pre-ep5-r1 fresh observe captured the Handoff
+    /// generation exactly here (the handoff is entered BEFORE the send
+    /// arrives — the capture's own observe reads the advanced record).
     #[tokio::test]
-    async fn the_refresh_fence_is_captured_at_the_operations_claim_not_at_the_write_site() {
+    async fn a_refresh_after_a_handoff_entered_still_carries_the_pre_handoff_pair() {
         let (transport, peer) = freshell_codex::new_channel_transport();
         let (client, notifs) = CodexAppServerClient::connect(transport);
         let (mut st, _) = state_with_bus();
@@ -10037,90 +10030,68 @@ pub(crate) mod tests {
         let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(fake.clone());
 
-        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
-            PROVIDER,
-            "thread-r29-claim",
-            freshell_ownership::RuntimeOwnerKind::FreshAgent,
-            "op-r29-claim-seed",
-            None,
-            "test",
-            freshell_ownership::now_epoch_ms(),
-        ) else {
-            panic!("the seed claim must grant")
-        };
-        assert_eq!(
-            registry.commit_live(
-                PROVIDER,
-                "thread-r29-claim",
-                "op-r29-claim-seed",
-                generation,
-                freshell_ownership::OwnerIdentity {
-                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
-                    terminal_id: None,
-                    live_session_key: Some("thread-r29-claim".to_string()),
-                    pid: None,
-                    ownership_id: None,
-                },
-            ),
-            freshell_ownership::CommitOutcome::Committed
-        );
+        // The runtime's ownership exists the way the LANE made it (the
+        // claim + commit that retains the stamp at generation G).
+        let mut seed_ticket =
+            match st.begin_lane_claim_at("thread-ep5-r2", "op-ep5-r2-seed", None, "test") {
+                crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+                _ => panic!("the seed claim must grant"),
+            };
+        let generation = seed_ticket.as_ref().expect("the seed ticket").generation();
+        assert!(st
+            .commit_lane_claim_at(&mut seed_ticket, "thread-ep5-r2", "thread-ep5-r2", None)
+            .is_ok());
 
         insert_fake_session_with_real_consumer(
             &st,
-            "thread-r29-claim",
+            "thread-ep5-r2",
             Arc::new(client),
             Arc::new(StdMutex::new(None)),
             notifs,
             spawn_sleeper(),
-            "codex-r29-claim",
+            "codex-ep5-r2",
         )
         .await;
+
+        // The handoff ENTERS BEFORE the send arrives: the record moves to
+        // Handoff at the ADVANCED generation and NOTHING reaps the in-map
+        // session (the runner is not involved — the enter alone is the
+        // race's precondition), so the send's AlreadyRunning return stands
+        // unguarded exactly as the finding describes.
+        let freshell_ownership::BeginOutcome::Granted { generation: _ } = registry.begin_handoff(
+            PROVIDER,
+            "thread-ep5-r2",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-ep5-r2-entered",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the entered handoff must grant")
+        };
+        assert!(
+            registry.observe(PROVIDER, "thread-ep5-r2").generation > generation,
+            "the record advanced past the runtime's stamp before the send arrived"
+        );
+
+        // THE SEND against the entered-handoff record: the refresh must
+        // carry the PRE-handoff STAMP pair — never the Handoff/target
+        // generation a fresh observe captures — so a terminal binding
+        // written at the handoff's generation is strictly NEWER and the
+        // late refresh is fenced.
         let task = tokio::spawn({
             let st = st.clone();
             async move {
-                st.handle_send(send_msg("thread-r29-claim", "hello")).await;
+                st.handle_send(send_msg("thread-ep5-r2", "hello")).await;
             }
         });
         let (id, method, _) = peer.expect_request().await;
         assert_eq!(method, "initialize");
         peer.respond(&id, json!({}));
         peer.expect_notification().await;
-        // The send is now parked PAST its claim, awaiting turn/start —
-        // hold the answer.
         let (id, method, _) = peer.expect_request().await;
         assert_eq!(method, "turn/start");
-
-        // The generation ADVANCES while the send is parked mid-flight: a
-        // handoff begin + fail-restore bumps the record (the mid-send
-        // handoff shape).
-        let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = registry
-            .begin_handoff(
-                PROVIDER,
-                "thread-r29-claim",
-                freshell_ownership::RuntimeOwnerKind::Terminal,
-                "op-r29-claim-bump",
-                None,
-                "test",
-                freshell_ownership::now_epoch_ms(),
-            )
-        else {
-            panic!("the bump handoff must grant")
-        };
-        let _ = registry.fail(
-            PROVIDER,
-            "thread-r29-claim",
-            "op-r29-claim-bump",
-            ho_gen,
-            true,
-        );
-        assert!(
-            registry.observe(PROVIDER, "thread-r29-claim").generation > generation,
-            "the record's generation advanced past the send's claim"
-        );
-
-        // Release the send: the refresh must carry the PRE-advance CLAIM
-        // pair — the late write is fenced against the advanced record.
-        peer.respond(&id, json!({"turn":{"id":"turn-r29-claim"}}));
+        peer.respond(&id, json!({"turn":{"id":"turn-ep5-r2"}}));
         task.await.unwrap();
         peer.disconnect();
         st.shutdown().await;
@@ -10129,13 +10100,14 @@ pub(crate) mod tests {
             .binding_pairs
             .lock()
             .unwrap()
-            .get(&("codex".to_string(), "thread-r29-claim".to_string()))
+            .get(&("codex".to_string(), "thread-ep5-r2".to_string()))
             .cloned()
             .expect("the post-send refresh wrote the binding row");
         assert_eq!(
             pair,
             (Some(registry.boot_epoch()), Some(generation)),
-            "the refresh carries the operation's CLAIM pair (pre-advance), never a fresh observe at the write site: {pair:?}"
+            "the refresh carries the lane's retained PRE-handoff stamp pair, \
+             never the entered handoff's generation: {pair:?}"
         );
     }
 

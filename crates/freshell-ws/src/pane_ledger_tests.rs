@@ -370,6 +370,97 @@ fn a_fenced_late_refresh_after_a_terminal_handoff_is_refused_and_the_terminal_re
     assert_eq!(row.create_request_id.as_deref(), Some("req-t-r29"));
 }
 
+/// b8ke focused ep5 r1 F2: the SAME-GENERATION TRAP the review named — a
+/// terminal binding written at the handoff/target generation while a
+/// delayed fresh-agent refresh carries that SAME generation is "not
+/// older" and passed both ext-r29 fences (the stale-pair check refuses
+/// only older pairs; the backstop refused only fully-unfenced writes),
+/// so the late refresh rewrote the terminal's authoritative recovery
+/// row. The terminal-row guard now requires a STRICTLY NEWER pair —
+/// every legitimate reclaim advances the generation, so the equal-pair
+/// shape refuses typed and the terminal row survives.
+#[test]
+fn a_paired_fresh_agent_write_at_the_terminal_rows_own_generation_never_passes_as_not_older() {
+    let root = temp_root("ep5-r2-same-generation-trap");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // The committed handoff's terminal binding, stamped at (3, 9).
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "codex",
+            session_id: "ses-ep5-trap",
+            terminal_id: "t-ep5-trap",
+            mode: "freshcodex",
+            cwd: Some("/w"),
+            create_request_id: Some("req-t-trap"),
+            origin_create_request_id: None,
+            provenance: ProvenancePolicy::Inherit,
+            observed_epoch: Some(3),
+            observed_generation: Some(9),
+            now_ms: 1_000,
+        })
+        .expect("the terminal row");
+
+    // THE TRAP: the late fresh-agent refresh carrying the terminal row's
+    // OWN generation — refused typed (never "not older").
+    let result =
+        ledger.record_fresh_agent_binding(&fa_write_fenced("codex", "ses-ep5-trap", 1_200, 3, 9));
+    let err = result.expect_err("the equal-pair write over a terminal row is refused");
+    assert!(
+        err.to_string().contains("NOT_NEWER_BINDING_OVER_TERMINAL"),
+        "the refusal is typed: {err}"
+    );
+
+    // The terminal's recovery row survives untouched.
+    let row = ledger
+        .load_binding("codex", "ses-ep5-trap")
+        .expect("the row survives");
+    assert_eq!(row.live_terminal_id.as_deref(), Some("t-ep5-trap"));
+    assert_eq!(row.pane_kind, None, "the row stays the terminal's: {row:?}");
+    assert_eq!(row.owner_epoch, Some(3));
+    assert_eq!(row.owner_generation, Some(9));
+
+    // A paired write over an UNSTAMPED terminal row (a pre-r22 legacy
+    // row) also refuses — no comparable proof of newer.
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "codex",
+            session_id: "ses-ep5-unstamped",
+            terminal_id: "t-ep5-unstamped",
+            mode: "freshcodex",
+            cwd: Some("/w"),
+            create_request_id: Some("req-t-unstamped"),
+            origin_create_request_id: None,
+            provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+            now_ms: 1_100,
+        })
+        .expect("the unstamped terminal row");
+    let result = ledger.record_fresh_agent_binding(&fa_write_fenced(
+        "codex",
+        "ses-ep5-unstamped",
+        1_300,
+        3,
+        12,
+    ));
+    let err = result.expect_err("a paired write over an unstamped terminal row refuses");
+    assert!(
+        err.to_string().contains("NOT_NEWER_BINDING_OVER_TERMINAL"),
+        "the refusal is typed: {err}"
+    );
+
+    // The strictly-NEWER reclaim still proceeds (the legitimate
+    // terminal→fresh-agent handoff's own write, one generation ahead).
+    ledger
+        .record_fresh_agent_binding(&fa_write_fenced("codex", "ses-ep5-trap", 1_400, 3, 10))
+        .expect("the strictly-newer reclaim proceeds");
+    let row = ledger
+        .load_binding("codex", "ses-ep5-trap")
+        .expect("the reclaimed row");
+    assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+    assert_eq!(row.owner_generation, Some(10));
+}
+
 /// b8ke ext r29 F3: the UNFENCED-CLOBBER backstop — a fully-unfenced
 /// fresh-agent binding write (no observed pair, the legacy shape every
 /// not-yet-fenced lane sends) can never clobber a live terminal's
