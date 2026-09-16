@@ -193,6 +193,9 @@ fn closes_with(
                     provider: p.to_string(),
                     session_id: s.to_string(),
                     at_ms: 5_000,
+                    // b8ke focused ep5 r5 F2: every ordinary close keeps the
+                    // identity-wide fence (no transition scope).
+                    scope: None,
                 })
                 .collect(),
         }],
