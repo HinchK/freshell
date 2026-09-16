@@ -2713,15 +2713,21 @@ async fn same_kind_adopt_death_acquire_settle_commits_the_surviving_terminal() {
     );
 }
 
-/// M1 shape 2 (fence coherence): a LATER owner that legitimately claimed
-/// while the key was Vacant (the phantom's release landed mid-spawn, then a
-/// fresh-agent start claimed the freed key) must NEVER be clobbered by the
-/// settle's late claim. The late claim must answer OwnedByOtherKind instead
-/// of Granted, and the just-spawned terminal — now an unowned writer — must
-/// be handled per the stale-teardown path: killed, confirmed, error reply,
-/// the later owner left untouched.
+/// b8ke ext r32 F1 (M1 shape 2, RESHAPED to the exit-during-guard
+/// contract): a competitor that tries to claim the death-vacated key
+/// MID-WINDOW (the phantom's release lands mid-spawn — the exact
+/// exit-during-guard race) is the DEFERRED ACQUISITION. The competing
+/// begin answers the typed Blocked outcome — never Granted: pre-r32 it
+/// claimed the freed key, "won", and the create's late claim tore the
+/// create's OWN spawn down only AFTER the two writers had overlapped
+/// (the M1 post-overlap defense this test used to pin). The guarded
+/// create COMPLETES with continuous authority: its windowed late claim
+/// grants, the key commits Live{Terminal} under the created terminal,
+/// and no second writer ever existed. The stale-teardown discipline
+/// itself remains (the late-claim refusal arms) for the windows-never-
+/// armed and post-window shapes.
 #[tokio::test]
-async fn settle_late_claim_never_clobbers_a_later_owner_and_tears_the_spawn_down() {
+async fn a_mid_window_competitor_is_deferred_and_the_guarded_create_completes() {
     let (url, registry, ws_state) = spawn_server().await;
     let ownership = ws_state.ownership.clone().expect("coordinator wired");
     let sid = format!("later-owner-{}", uuid::Uuid::new_v4());
@@ -2752,12 +2758,16 @@ async fn settle_late_claim_never_clobbers_a_later_owner_and_tears_the_spawn_down
     let mut stored_phantom = phantom.clone();
     stored_phantom.ownership_id = Some(phantom_op.to_string());
 
-    // On Created (mid-spawn): the phantom dies AND a fresh-agent owner
-    // legitimately claims the freed key — the later owner the settle's late
-    // claim must not clobber.
+    // On Created (mid-spawn): the phantom dies (the incumbent's exit lands
+    // INSIDE the create's attach window) and the COMPETITOR tries to claim
+    // the freed key — captured for the assert below (it must answer the
+    // typed Blocked outcome, never Granted).
+    let competitor_outcome: Arc<std::sync::Mutex<Option<freshell_ownership::BeginOutcome>>> =
+        Arc::new(std::sync::Mutex::new(None));
     {
         let ownership = ownership.clone();
         let sid = sid.clone();
+        let capture = Arc::clone(&competitor_outcome);
         registry.set_activity_observer(Arc::new(move |event| {
             if let freshell_terminal::registry::ActivityEvent::Created {
                 mode,
@@ -2776,32 +2786,16 @@ async fn settle_late_claim_never_clobbers_a_later_owner_and_tears_the_spawn_down
                         },
                         "test/later-owner",
                     );
-                    if let freshell_ownership::BeginOutcome::Granted { generation } = ownership
-                        .begin_start(
-                            "claude",
-                            &sid,
-                            freshell_ownership::RuntimeOwnerKind::FreshAgent,
-                            "op-later-fresh",
-                            None,
-                            "test",
-                            2_000,
-                        )
-                    {
-                        let later = freshell_ownership::OwnerIdentity {
-                            kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
-                            terminal_id: None,
-                            live_session_key: Some("freshclaude:sid".into()),
-                            pid: Some(4242),
-                            ownership_id: None,
-                        };
-                        let _ = ownership.commit_live(
-                            "claude",
-                            &sid,
-                            "op-later-fresh",
-                            generation,
-                            later,
-                        );
-                    }
+                    let outcome = ownership.begin_start(
+                        "claude",
+                        &sid,
+                        freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                        "op-later-fresh",
+                        None,
+                        "test",
+                        2_000,
+                    );
+                    *capture.lock().expect("competitor capture") = Some(outcome);
                 }
             }
         }));
@@ -2822,33 +2816,51 @@ async fn settle_late_claim_never_clobbers_a_later_owner_and_tears_the_spawn_down
             && v["requestId"] == "later-owner-1"
     })
     .await;
+    // The guarded create COMPLETES — never the pre-r32 teardown.
     assert_eq!(
-        frame["type"], "error",
-        "the unowned spawn must be torn down and refused, not created: {frame}"
+        frame["type"], "terminal.created",
+        "the guarded create completes with continuous authority: {frame}"
     );
-    assert!(
-        frame["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("killed"),
-        "the refusal must name the teardown: {frame}"
-    );
-    // The spawned terminal is dead — no live PTY for the session.
-    assert_eq!(
-        live_pty_count_for_session(&registry, "claude", &sid),
-        0,
-        "the unowned spawn must be killed and confirmed"
-    );
-    // The later owner survives untouched.
+    let created_id = frame["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    // THE COMPETITOR was deferred: the mid-window begin answered the
+    // typed Blocked outcome over the death-vacated key (pre-r32: Granted
+    // — the two-writer overlap the late claim only detected after).
+    match competitor_outcome
+        .lock()
+        .expect("competitor capture")
+        .take()
+    {
+        Some(freshell_ownership::BeginOutcome::Blocked {
+            state,
+            retry_after_ms,
+        }) => {
+            assert!(
+                matches!(state, freshell_ownership::OwnershipState::Vacant),
+                "the deferred acquisition answers over the vacated key: {state:?}"
+            );
+            assert!(retry_after_ms > 0, "the refusal is typed and retryable");
+        }
+        other => panic!("the mid-window competitor must answer Blocked, got {other:?}"),
+    }
+    // CONTINUOUS AUTHORITY: the key is Live{Terminal} under the CREATED
+    // terminal — the sole owner, no second writer ever existed.
     match ownership.observe("claude", &sid).state {
         freshell_ownership::OwnershipState::Live { owner, .. } => {
             assert_eq!(
                 owner.kind,
-                freshell_ownership::RuntimeOwnerKind::FreshAgent,
-                "the later owner must survive the losing settle"
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "the create's own claim commits the surviving terminal"
+            );
+            assert_eq!(
+                owner.terminal_id.as_deref(),
+                Some(created_id.as_str()),
+                "the created terminal is the session's sole owner"
             );
         }
-        other => panic!("the later owner must survive the losing settle, got {other:?}"),
+        other => panic!("the created terminal must hold the key, got {other:?}"),
     }
 }
 
