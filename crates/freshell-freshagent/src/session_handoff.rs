@@ -1385,23 +1385,20 @@ impl SessionHandoffRunner {
                     }
                 }
                 // 6. THE single commit Live(targetKind) + broadcast owner
-                // identity.
-                match self.ownership.commit_live(
-                    &req.provider,
-                    &req.session_id,
+                // identity. b8ke ext r30 F1: for a FRESH target this is
+                // the ATOMIC publication — the commit and the retained
+                // stamp land in ONE lane-stamps lock scope the exit
+                // watcher's release consult also takes, gated by a
+                // liveness check under that lock (a dead sidecar never
+                // publishes; its watchers never strand a Live record).
+                match self.commit_live_target_with_release_evidence(
+                    &req,
                     &operation_id,
                     generation,
-                    owner.clone(),
+                    &owner,
                 ) {
                     CommitOutcome::Committed => {
                         guard.disarm();
-                        // Retain the lane stamp for a FRESH target so the
-                        // lane's later kill/exit-watcher paths keep working
-                        // (the stamp matches the just-committed Live record
-                        // exactly — same operation id, generation, runtime).
-                        if owner.kind == RuntimeOwnerKind::FreshAgent {
-                            self.retain_fresh_target_stamp(&req, &operation_id, generation, &owner);
-                        }
                         self.broadcast_owner(
                             &req,
                             "handoff-committed",
@@ -3839,32 +3836,95 @@ impl SessionHandoffRunner {
     /// (single commit authority): the stamp the lane's later kill/exit-watcher
     /// paths build their fenced claims from, matching the committed Live
     /// record exactly (same operation id, generation, runtime identity).
-    fn retain_fresh_target_stamp(
+    /// b8ke ext r30 F1: publish the handoff's FRESH target owner WITH its
+    /// release evidence ATOMICALLY — the terminal registry's
+    /// normal-commit template applied to the fresh-agent lane: the
+    /// LANE's stamps lock is held across the liveness check, the
+    /// commit-to-Live, AND the retained-stamp insertion, and the exit
+    /// watcher's release consult (`release_retained_stamp` →
+    /// `take_retained_stamp`) takes the SAME lock. The (commit, stamp)
+    /// pair is therefore atomic to the watcher: a watcher blocked on
+    /// this critical section finds the stamp and releases the owner it
+    /// names; a watcher that consulted before it found nothing — and
+    /// because the liveness check runs UNDER the lock after that
+    /// consult, the publication then REFUSES (`ForeignOperation`, the
+    /// callers' existing stale-commit arm: reap + typed recoverable
+    /// failure + the failed-transition repair): a target whose sidecar
+    /// already exited is NEVER published Live. Pre-r30 the stamp was
+    /// retained only AFTER the commit, so a target exiting between the
+    /// two left a dead runtime advertised globally Live with the stamp
+    /// inserted too late for the completed watcher to consume. TERMINAL
+    /// targets take no stamp (the terminal lane's own registry claims
+    /// own their release evidence) and publish exactly as before.
+    fn commit_live_target_with_release_evidence(
         &self,
         req: &HandoffRequest,
         operation_id: &str,
         generation: u64,
         owner: &OwnerIdentity,
-    ) {
-        let mut stamped = owner.clone();
-        if stamped.ownership_id.is_none() {
-            stamped.ownership_id = Some(operation_id.to_string());
+    ) -> CommitOutcome {
+        // Terminal targets: no fresh-agent stamp, no lane-stamps
+        // critical section — the plain commit (the registry's retained
+        // claims + the PTY exit hook own the release).
+        if owner.kind != RuntimeOwnerKind::FreshAgent {
+            return self.ownership.commit_live(
+                &req.provider,
+                &req.session_id,
+                operation_id,
+                generation,
+                owner.clone(),
+            );
         }
-        let stamp = crate::ownership_lane::OwnershipStamp {
-            epoch: self.ownership.boot_epoch(),
-            generation,
-            operation_id: operation_id.to_string(),
-            owner: stamped,
-        };
         let stamps = match req.provider.as_str() {
             "codex" => &self.fresh_codex.ownership_stamps,
             "claude" => &self.fresh_claude.ownership_stamps,
             _ => &self.fresh_opencode.fresh_agent().ownership_stamps,
         };
-        stamps
-            .lock()
-            .expect("ownership stamps lock")
-            .insert(req.session_id.clone(), stamp);
+        let mut stamps_guard = stamps.lock().expect("ownership stamps lock");
+        // (1) LIVENESS under the lock: a sidecar that already exited
+        // never publishes. Non-Linux never confirms a pid gone (the
+        // documented platform limitation) — fail closed toward the
+        // publish, exactly as before there.
+        if let Some(pid) = owner.pid {
+            if crate::ownership_lane::partial_pid_confirmed_dead(pid) {
+                tracing::error!(target: "invariant",
+                    provider = %req.provider,
+                    session_id = %req.session_id,
+                    operation_id = %operation_id,
+                    pid,
+                    event = "ownership.handoff.publication_refused_dead_target",
+                    "the handoff target's sidecar exited before the commit-to-Live — \
+                     a dead runtime is never published; the stale-commit arm reaps it \
+                     and the handoff answers the typed recoverable failure (kata b8ke \
+                     ext r30 F1)"
+                );
+                return CommitOutcome::ForeignOperation;
+            }
+        }
+        // (2) THE commit, and (3) the stamp insertion — one lock scope.
+        let outcome = self.ownership.commit_live(
+            &req.provider,
+            &req.session_id,
+            operation_id,
+            generation,
+            owner.clone(),
+        );
+        if matches!(outcome, CommitOutcome::Committed) {
+            let mut stamped = owner.clone();
+            if stamped.ownership_id.is_none() {
+                stamped.ownership_id = Some(operation_id.to_string());
+            }
+            stamps_guard.insert(
+                req.session_id.clone(),
+                crate::ownership_lane::OwnershipStamp {
+                    epoch: self.ownership.boot_epoch(),
+                    generation,
+                    operation_id: operation_id.to_string(),
+                    owner: stamped,
+                },
+            );
+        }
+        outcome
     }
 
     /// Every frame carries the boot epoch, `previousKind` (the transition's

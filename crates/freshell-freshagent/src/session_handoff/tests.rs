@@ -5074,6 +5074,142 @@ async fn handoff_abort_during_target_spawn_reaps_the_uncommitted_terminal() {
     await_pid_dead(prior_pid).await;
 }
 
+/// b8ke ext r30 F1: a handoff target whose sidecar EXITS before the
+/// commit-to-Live is NEVER published — the publication's liveness
+/// check runs under the lane-stamps lock (the same lock the exit
+/// watcher's release consult takes), so the dead target refuses the
+/// commit (the stale-commit arm: reap + typed recoverable failure +
+/// the failed-transition repair) and no retained stamp leaks for an
+/// owner that never materialized. Pre-r30 the commit ran first and
+/// the stamp was inserted only after it: the killed target was
+/// committed Live{FreshAgent} globally, the already-completed exit
+/// watcher had no-op'd (no stamp), and the answer was a FALSE ok:true
+/// — every device converged on a nonexistent owner.
+#[tokio::test]
+async fn a_handoff_target_exiting_before_the_commit_never_publishes_live() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    let sid = uuid::Uuid::new_v4().to_string();
+    // The claude-lane resume gates on transcript presence (the 6b
+    // pattern).
+    let store_dir =
+        std::env::temp_dir().join(format!("freshell-handoff-r30-f1-{}", uuid_like_suffix()));
+    let project_dir = store_dir.join("projects").join("slug");
+    std::fs::create_dir_all(&project_dir).expect("create transcript project dir");
+    std::fs::write(
+        project_dir.join(format!("{sid}.jsonl")),
+        "{\"cwd\": \"/tmp\"}\n",
+    )
+    .expect("write fake transcript");
+    std::env::set_var("CLAUDE_CONFIG_DIR", &store_dir);
+
+    // A RELEASABLE pausing flavor writer: stage() parks inside the
+    // Handoff window (post target-spawn, pre-commit) until the test
+    // releases it — the deterministic kill window.
+    let stage_reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stage_release = Arc::new(tokio::sync::Notify::new());
+    struct ReleasablePausingFlavor {
+        reached: Arc<std::sync::atomic::AtomicBool>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl crate::session_handoff::FlavorWrite for ReleasablePausingFlavor {
+        fn stage(
+            &self,
+            _provider: &str,
+            _session_id: &str,
+            _flavor: &str,
+        ) -> crate::session_handoff::StagedFlavorFuture {
+            self.reached
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let release = Arc::clone(&self.release);
+            Box::pin(async move {
+                let _ = release.notified().await;
+                // No durable flavor to commit — the runner proceeds
+                // straight to the commit-to-Live.
+                Ok(None)
+            })
+        }
+    }
+    let mut rig = build_rig_with_flavor_writer(Arc::new(ReleasablePausingFlavor {
+        reached: Arc::clone(&stage_reached),
+        release: Arc::clone(&stage_release),
+    }));
+    let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+    rig.fresh_claude.set_identity_sink(fake.clone());
+
+    establish_fresh_claude_owner(&mut rig, &sid).await;
+    let handle = rig
+        .runner
+        .spawn_handoff(handoff_req_fresh("claude", &sid, "freshclaude"));
+
+    // Park proof: the runner reached the flavor stage INSIDE the
+    // Handoff window — the target is spawned and registered.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !stage_reached.load(std::sync::atomic::Ordering::SeqCst) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the runner never reached the flavor stage"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // THE TARGET EXITS: kill the resumed sidecar (the LATEST create
+    // row for this sid — the target's spawn), and wait for the OS to
+    // confirm it gone (the publication's liveness evidence).
+    let target_pid = env
+        .create_rows()
+        .into_iter()
+        .filter(|r| r["msg"]["resumeSessionId"] == sid)
+        .last()
+        .and_then(|r| r["pid"].as_u64())
+        .expect("the target sidecar's create row") as u32;
+    let _ = std::process::Command::new("kill")
+        .args(["-9", &target_pid.to_string()])
+        .status();
+    await_pid_dead(target_pid).await;
+
+    // RELEASE: the runner proceeds to the commit-to-Live with a dead
+    // target — the publication must refuse it.
+    stage_release.notify_one();
+    let result = handle.completion.await.expect("handoff completed");
+
+    // The typed failure — never a false ok:true over a dead runtime.
+    assert_eq!(
+        result["ok"],
+        json!(false),
+        "the dead target is never published Live — the handoff answers \
+             the typed recoverable failure: {result}"
+    );
+    // The coordinator NEVER holds Live{FreshAgent} for the dead
+    // target: the stale-commit arm reaped it and failed the entry
+    // (the prior was reaped by the runner's stop — the key settles
+    // Vacant).
+    await_cond("the failed handoff must settle the key Vacant", || {
+        rig.ownership.observe("claude", &sid).state == OwnershipState::Vacant
+    })
+    .await;
+    // No retained stamp LEAKED for the never-published owner.
+    assert!(
+        rig.fresh_claude
+            .ownership_stamps
+            .lock()
+            .expect("stamps lock")
+            .get(&sid)
+            .is_none(),
+        "no release evidence leaked for an owner that never materialized"
+    );
+    // And the failed-transition repair fired (the r4 machinery) with
+    // the transition's own generation.
+    let repairs = fake.repairs.lock().expect("repairs lock").clone();
+    assert!(
+        !repairs.is_empty(),
+        "the stale-commit arm's cleanup repaired the failed transition"
+    );
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+    let _ = std::fs::remove_dir_all(store_dir);
+}
+
 /// b8ke focused ep5 r4 F1: an aborted handoff whose target is a FRESH
 /// AGENT fires the FAILED-TRANSITION REPAIR through the reaped target's
 /// identity sink — the cleanup's ledger act (the durable tombstone fence

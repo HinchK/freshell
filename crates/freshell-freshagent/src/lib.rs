@@ -969,6 +969,37 @@ pub mod ownership_lane {
             pid,
             ownership_id: Some(operation_id.clone()),
         };
+        // b8ke ext r30 F1: the stamps lock is the ordering point for the
+        // WHOLE publication — held across the liveness check, the
+        // commit-to-Live, AND the retained-stamp insertion (the terminal
+        // registry's normal-commit template). The exit watcher's release
+        // consult (`take_retained_stamp`) takes the SAME lock, so the
+        // (commit, stamp) pair is ATOMIC to it: a watcher blocked on this
+        // critical section finds the stamp and releases; a watcher that
+        // consulted before it found nothing (the runtime had not
+        // published) and — because the liveness check below runs under
+        // the lock AFTER that consult — the publication then REFUSES: a
+        // sidecar that already exited never publishes. Pre-r30 the stamp
+        // was inserted only AFTER the commit: a target exiting between
+        // the two left a dead runtime advertised Live with the stamp
+        // arriving too late for the completed watcher to consume — every
+        // device converged on a nonexistent owner.
+        let mut stamps_guard = stamps.lock().expect("ownership stamps lock");
+        if let Some(pid) = owner.pid {
+            if crate::ownership_lane::partial_pid_confirmed_dead(pid) {
+                tracing::error!(target: "invariant",
+                    provider = %provider,
+                    session_id = %session_id,
+                    operation_id = %operation_id,
+                    pid,
+                    event = "ownership.publication_refused_dead_runtime",
+                    "the target's sidecar exited before the commit-to-Live — a dead \
+                     runtime is never published; the caller's teardown owns the \
+                     runtime (kata b8ke ext r30 F1)"
+                );
+                return Err(CommitOutcome::ForeignOperation);
+            }
+        }
         let outcome = commit_fresh_agent_ownership(
             registry,
             provider,
@@ -979,7 +1010,7 @@ pub mod ownership_lane {
         );
         match outcome {
             CommitOutcome::Committed => {
-                stamps.lock().expect("ownership stamps lock").insert(
+                stamps_guard.insert(
                     session_id.to_string(),
                     OwnershipStamp {
                         epoch: registry.boot_epoch(),
@@ -991,6 +1022,10 @@ pub mod ownership_lane {
                 if let Some(held) = ticket.as_mut() {
                     held.disarm();
                 }
+                // The publication (commit + stamp) is complete — release
+                // the stamps lock before the broadcast (a channel send
+                // never needs it; held-lock scope stays minimal).
+                drop(stamps_guard);
                 // b8ke ext r29 F1: EVERY commit-to-Live broadcasts the
                 // authoritative owner record (the 'every ownership
                 // transition BROADCAST' invariant). Pre-r29 only the
@@ -5757,6 +5792,135 @@ mod tests {
     /// downgrade to the unfenced legacy path. Only BOTH-present (a fence)
     /// and BOTH-absent (legacy) are accepted shapes.
     #[test]
+    /// b8ke ext r30 F1 (the SHARED create/attach/resume site): a runtime
+    /// whose sidecar pid already exited NEVER publishes —
+    /// `commit_lane_claim`'s liveness check runs under the stamps lock
+    /// (the same lock the exit watcher's release consult takes), so the
+    /// dead runtime refuses typed (ForeignOperation → the caller's
+    /// teardown), no retained stamp leaks, and the coordinator never
+    /// records Live. Pre-r30 the commit ran first and the stamp was
+    /// inserted only after it — a runtime exiting between the two was
+    /// published Live with release evidence arriving too late for the
+    /// completed watcher.
+    #[test]
+    fn commit_lane_claim_refuses_a_runtime_that_already_exited() {
+        use crate::ownership_lane::{claim_fresh_agent_ownership, commit_lane_claim};
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let stamps: crate::ownership_lane::OwnershipStamps =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+        // A pid that is CONFIRMED dead: a spawned process we wait on.
+        let mut gone = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn a short-lived process");
+        let dead_pid = gone.id();
+        let _ = gone.wait();
+
+        // The lane's granted claim (the ticket the create/resume tails
+        // hold at their commit).
+        let session_id = "ses-r30-f1-shared";
+        let freshell_ownership::BeginOutcome::Granted { generation } = claim_fresh_agent_ownership(
+            &registry,
+            "codex",
+            session_id,
+            "op-r30-f1-shared",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("the claim must grant")
+        };
+        let mut ticket = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&registry),
+            "codex",
+            session_id,
+            "op-r30-f1-shared",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            generation,
+            "test",
+        ));
+
+        // THE PUBLICATION with a dead runtime: refused typed, nothing
+        // published, no stamp.
+        let outcome = commit_lane_claim(
+            &Some(Arc::clone(&registry)),
+            &stamps,
+            None,
+            "codex",
+            session_id,
+            &mut ticket,
+            "fake-live-key",
+            Some(dead_pid),
+        );
+        assert!(
+            matches!(
+                outcome,
+                Err(freshell_ownership::CommitOutcome::ForeignOperation)
+            ),
+            "the dead runtime's publication refuses typed: {outcome:?}"
+        );
+        assert!(
+            !matches!(
+                registry.observe("codex", session_id).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ),
+            "the coordinator never recorded Live for the dead runtime"
+        );
+        assert!(
+            stamps
+                .lock()
+                .expect("stamps lock")
+                .get(session_id)
+                .is_none(),
+            "no retained stamp leaked for an owner that never materialized"
+        );
+
+        // The CONTROL: a live pid publishes — the check is the gate, not
+        // a blanket refusal.
+        let session_id = "ses-r30-f1-live";
+        let freshell_ownership::BeginOutcome::Granted { generation } = claim_fresh_agent_ownership(
+            &registry,
+            "codex",
+            session_id,
+            "op-r30-f1-live",
+            None,
+            "test",
+            2_000,
+        ) else {
+            panic!("the control claim must grant")
+        };
+        let mut ticket = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&registry),
+            "codex",
+            session_id,
+            "op-r30-f1-live",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            generation,
+            "test",
+        ));
+        let alive_pid = std::process::id();
+        commit_lane_claim(
+            &Some(Arc::clone(&registry)),
+            &stamps,
+            None,
+            "codex",
+            session_id,
+            &mut ticket,
+            "fake-live-key-2",
+            Some(alive_pid),
+        )
+        .expect("a live runtime publishes");
+        assert!(matches!(
+            registry.observe("codex", session_id).state,
+            freshell_ownership::OwnershipState::Live { .. }
+        ));
+        assert!(stamps
+            .lock()
+            .expect("stamps lock")
+            .get(session_id)
+            .is_some());
+    }
+
     fn wire_fence_rejects_each_half_fenced_combination_typed() {
         use freshell_ownership::ObservedFence;
 
