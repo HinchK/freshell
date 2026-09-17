@@ -22,7 +22,7 @@ Complete the fresh-agent transcript minimap: fix the recorded optional findings 
 
 **Goal:** Land four fixes on the already-delivered minimap so every recorded optional finding is cleared: (1) the hover preview wraps long unbroken tokens, (2) one landmark sweep per scroll event feeds both the glom chip and the rail, (3) dense prompt clusters get a reliable pointer affordance — one open-list hit target opening a jump menu — without dropping or capping any tick, and (4) a new local setting "Show transcript minimap" (default ON) gates the rail's mount so OFF removes the rail and all of its measurement work.
 
-**Architecture:** The transcript (`FreshAgentTranscript.tsx`), which already owns `scrollerRef`, `displayTurns`, and both consumers, becomes the sole owner of the landmark sweep. A new helper module (`shared/transcript-measurement.ts`) performs one `querySelectorAll('[data-turn-role="user"]')` + per-element-rect sweep and produces a `TranscriptMeasurement`; the transcript stores it once, derives the glom chip's target from it (`deriveGlomTarget`), and passes it down to `FreshAgentTranscriptMinimap`, which becomes a presentational consumer (computes `MinimapLayout` from the prop) and additionally owns only the two `ResizeObserver` subscriptions it needs (article-level, keyed on `transcriptSignature`, and scroller-level), both wired to an `onRemeasure` callback that requests fresh sweeps. This ownership is load-bearing: the glom chip must never depend on the minimap's mount state, so the Task-4 setting can unmount the rail (killing its observers and rendering) while the glom chip keeps its full behavior. Dense-cluster navigation extends the pure layout with a `clusters` output (the packing loop's groups, exposed additively with a `dense` flag keyed to a 4px clickable floor) and renders one extra real `<button>` over each dense cluster's span that opens the repo's `ContextMenu` primitive listing every prompt in the cluster — every per-prompt tick stays in the DOM (the one-tick-per-prompt contract), and below-threshold clusters keep today's per-tick behavior exactly. The setting is a local browser preference (`LocalSettings.freshAgent.showTranscriptMinimap`, default `true`) wired through the repo's existing 8-point local-settings chain and consumed as a live render gate at the transcript's minimap mount site (the `showTimecodes` pattern), so OFF unmounts the component and its effects.
+**Architecture:** The transcript (`FreshAgentTranscript.tsx`), which already owns `scrollerRef`, `displayTurns`, and both consumers, becomes the sole owner of the landmark sweep. A new helper module (`shared/transcript-measurement.ts`) performs one `querySelectorAll('[data-turn-role="user"]')` + per-element-rect sweep and produces a `TranscriptMeasurement`; the transcript stores it once, derives the glom chip's target from it (`deriveGlomTarget`), and passes it down to `FreshAgentTranscriptMinimap`, which becomes a presentational consumer (computes `MinimapLayout` from the prop) and additionally owns only the two `ResizeObserver` subscriptions it needs (article-level, keyed on `transcriptSignature`, and scroller-level), both wired to an `onRemeasure` callback that requests fresh sweeps. This ownership is load-bearing: the glom chip must never depend on the minimap's mount state, so the Task-4 setting can unmount the rail (killing its observers and rendering) while the glom chip keeps its full behavior. Dense-cluster navigation extends the pure layout with a `clusters` output — a second clickability pass over the final laid-out ticks (not the packing loop's groups), joining each next tick that begins within its predecessor's minimum 4px click row into maximal runs (ALL runs listed, singletons included; a `dense` flag marks any run containing a sub-4px member) — and renders one extra real `<button>` over each dense multi-member run's span that opens the repo's `ContextMenu` primitive listing every prompt in the run, while a lone sub-4px tick's own button expands its hit height to the 4px floor (the paint moves to an inner aria-hidden span; the click still jumps directly) — every per-prompt tick stays in the DOM (the one-tick-per-prompt contract), and non-dense ticks keep today's per-tick behavior exactly. The setting is a local browser preference (`LocalSettings.freshAgent.showTranscriptMinimap`, default `true`) wired through the repo's existing 8-point local-settings chain and consumed as a live render gate at the transcript's minimap mount site (the `showTimecodes` pattern), so OFF unmounts the component and its effects.
 
 **Tech Stack:** React 18 + TypeScript (client), Tailwind CSS classes, existing hand-rolled `Tooltip` (`src/components/ui/tooltip.tsx`), existing `ContextMenu` (`src/components/context-menu/ContextMenu.tsx`), Redux Toolkit local-settings chain (`shared/settings.ts` → `settingsSlice` → `browserPreferencesPersistence`), Vitest + Testing Library (jsdom) for unit tests, Playwright (cloud backend) for e2e.
 
@@ -34,7 +34,7 @@ Carried forward from the prior plan (binding unless explicitly amended here):
 - **Worktree:** All work happens in the coordinator-provided worktree `.worktrees/transcript-minimap` on branch `the-usual/transcript-minimap`, continuing from HEAD `cd55891bc`. Run every command from that directory. Do not merge, push, or open a PR — the coordinator gates all of those on explicit user approval.
 - **A11y:** Every interactive element is a real `<button type="button">` with an `aria-label`. `npm run lint` (eslint-plugin-jsx-a11y) must stay clean — it is a CI gate. E2e specs may use only `getByRole`/`getByText`/`getByTestId`/`[data-*]` locator patterns (the a11y gate runs in `--deny` mode). **Pre-existing a11y-gate red (binding):** `npm run test:e2e:a11y-gate:deny` ALREADY exits 1 at the branch point with 11 novel violations in 5 spec files this run never touches (receipt: run-1 ledger, reproduced at origin/main). No task expects a clean exit. The requirement is ZERO violations naming this branch's specs — verify with `npm run test:e2e:a11y-gate:deny 2>&1 | grep -c "transcript-minimap"` → expect 0.
 - **No IntersectionObserver** — it is neither used nor stubbed anywhere in this repo. The visible-region band is computed from `scrollTop`/`scrollHeight`/`clientHeight`.
-- **Tick completeness (binding contract):** every user prompt keeps a tick in a DISTINCT, non-overlapping slot. No tick is ever dropped, capped, sampled, or virtualized — the whole-branch Nit 2 "cap/sampling" remedy is explicitly barred by this run's constraints. Task 3's cluster affordance is purely ADDITIVE (one extra button over a dense cluster); all per-prompt ticks stay in the DOM with unchanged keyboard/screen-reader access.
+- **Tick completeness (binding contract):** every user prompt keeps a tick in a DISTINCT, non-overlapping slot. No tick is ever dropped, capped, sampled, or virtualized — the whole-branch Nit 2 "cap/sampling" remedy is explicitly barred by this run's constraints. Task 3's clickability-run affordances are purely ADDITIVE — one extra button over each dense multi-member run, plus an expanded hit height on a lone sub-4px tick's own button (its paint preserved by an inner span); all per-prompt ticks stay in the DOM with unchanged keyboard/screen-reader access.
 - **jsdom geometry:** jsdom has no layout. Tests mock `clientHeight`/`scrollHeight` with `Object.defineProperty` getters, set `scrollTop` directly, replace `getBoundingClientRect` per element, and assign `el.scrollIntoView = vi.fn()` per element. `ResizeObserver` is globally stubbed as a no-op (`test/setup/dom.ts:46-54`); tests that need firing use the suite-local `CapturingResizeObserver` (per-target callback map). Any unexpected `console.error` fails the test (`test/setup/dom.ts:127-144`) — no React key warnings, no act() warnings. For that reason all measurement work is **synchronous, not rAF-throttled**: a rAF callback would land `setState` outside `fireEvent`'s act() wrapper and fail the suite. (The `ContextMenu` primitive's internal rAF focus call is pre-existing, portal-rendered, and proven safe by its own jsdom suites.)
 - **Focused test command shape** (repo-owned passthrough; raw `npx vitest` is not a coordinated workflow):
   `npm run test:vitest -- run <path> --config config/vitest/vitest.config.ts`
@@ -420,7 +420,7 @@ Expected RED: the whole file errors at import — the module `@/components/fresh
 npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscriptMinimap.test.tsx --config config/vitest/vitest.config.ts
 ```
 
-Expected RED: only the new spy test fails — `landmarkQueries` received length **2** (expected 1): the parent's `recomputeGlom` and the minimap's native-listener `recompute` each sweep (`scrollerRect` also receives 2). All 16 pre-existing tests still pass.
+Expected RED: only the new spy test fails — `landmarkQueries` received length **2** (expected 1): the parent's `recomputeGlom` and the minimap's native-listener `recompute` each sweep (`scrollerRect` also receives 2). All 15 pre-existing tests still pass (the new spy test is the file's 16th and its only RED).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -700,7 +700,7 @@ export function FreshAgentTranscriptMinimap({
 }
 ```
 
-Implementer notes: the removed pieces are the local `useState`/`recompute`/scroll-listener effect and `articleObserverRef` (Task 1 already deleted the redundant body disconnect; this rewrite deletes the whole ref). The component suite needs NO edits to its 16 pre-existing tests: they render the transcript, mock geometry, and fire scroll — the parent's sweep now drives everything through the same observable behavior (the "recomputes ticks when the transcript grows" test's no-scroll design still holds: the PARENT's signature-keyed effect sweeps; the observer tests fire per-target callbacks that now route through `onRemeasure` → the parent sweep, all synchronously inside act()).
+Implementer notes: the removed pieces are the local `useState`/`recompute`/scroll-listener effect and `articleObserverRef` (Task 1 already deleted the redundant body disconnect; this rewrite deletes the whole ref). The component suite needs NO edits to its 16 tests (15 pre-existing + the new spy test, written against the target behavior): they render the transcript, mock geometry, and fire scroll — the parent's sweep now drives everything through the same observable behavior (the "recomputes ticks when the transcript grows" test's no-scroll design still holds: the PARENT's signature-keyed effect sweeps; the observer tests fire per-target callbacks that now route through `onRemeasure` → the parent sweep, all synchronously inside act()).
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -737,30 +737,35 @@ git commit -m "refactor(fresh-agent): share one user-turn landmark sweep between
 ### Task 3: Dense-cluster click-list affordance for extreme prompt density
 
 **Files:**
-- Modify: `src/components/fresh-agent/shared/transcript-minimap-layout.ts` (new constant + `MinimapCluster` type + `clusters` output)
-- Modify: `test/unit/client/components/fresh-agent/transcript-minimap-layout.test.ts` (4 new tests)
-- Modify: `src/components/fresh-agent/FreshAgentTranscriptMinimap.tsx` (cluster hit targets + ContextMenu)
-- Modify: `test/unit/client/components/fresh-agent/FreshAgentTranscriptMinimap.test.tsx` (3 new tests + dense fixture helper; add `within` to the testing-library import)
+- Modify: `src/components/fresh-agent/shared/transcript-minimap-layout.ts` (new constant + `MinimapCluster` type + `clusters` output via a second clickability pass)
+- Modify: `test/unit/client/components/fresh-agent/transcript-minimap-layout.test.ts` (6 new tests)
+- Modify: `src/components/fresh-agent/FreshAgentTranscriptMinimap.tsx` (dense-run hit targets + ContextMenu + lone-tick expanded hit heights)
+- Modify: `test/unit/client/components/fresh-agent/FreshAgentTranscriptMinimap.test.tsx` (4 new tests + two fixture helpers (dense-cluster, evenly-dense); add `within` to the testing-library import)
 - Modify: `test/e2e-browser/specs/transcript-minimap.spec.ts` (dense-cluster e2e with self-verifying density guard)
 
 **Interfaces:**
 - Layout module (additive output — no existing field changes):
   - `export const MINIMAP_TICK_MIN_CLICKABLE_PX = 4` — the clickable floor. Evidence for ~4px: sub-4px hit targets are not reliably individually clickable with a pointer on a 1× display (the recorded delta Finding 1), and 4px is the smallest height the repo's own UI scale treats as a comfortable row (Tailwind `h-1`, the size class used across the minimap/band rounding scale); "strictly below 4" therefore marks unreliable ticks while leaving 4px ticks direct-clickable. The plan guidance's ~4px suggestion, concretized; plan review adjudicates.
-  - `export type MinimapCluster = { top: number; height: number; startIndex: number; endIndex: number; dense: boolean }` — `top`/`height` are the packed span in rail coordinates; `startIndex`/`endIndex` are INCLUSIVE positions into `layout.ticks` (the packing loop's group is a contiguous run of sorted positions); `dense` is true iff the group has ≥ 2 members AND its minimum member tick height is strictly below `MINIMAP_TICK_MIN_CLICKABLE_PX`.
-  - `MinimapLayout` gains `clusters: MinimapCluster[]` (ALL packing groups, singletons included with `dense: false`); the degenerate return gains `clusters: []`.
-- Component: for each `dense` cluster, ONE additional real `<button type="button">` spanning the cluster (`style={{ top: cluster.top, height: cluster.height }}`, full rail width, `pointer-events-auto`, `z-10` so it wins pointer events over the abutting ticks), `aria-haspopup="menu"`, `aria-label="Prompts {startIndex + 1}-{endIndex + 1} — open list"`. Clicking it opens the repo's `ContextMenu` (`src/components/context-menu/ContextMenu.tsx` — controlled, portaled to `document.body`, `role="menu"`, z-50, keyboard-complete, self-closing on selection) positioned at the BUTTON's rect (a keyboard click event carries clientX/clientY 0, so cursor coordinates are unusable; `clampToViewport` handles overflow), listing one `MenuItem` per cluster prompt (label = the prompt's first line truncated to 60 via the same `truncatePrompt` the tick aria-labels use; `onSelect` = the existing `handleTickClick(tick.index)`). Below-threshold clusters render NOTHING extra — per-tick behavior byte-identical.
+  - `export type MinimapCluster = { top: number; height: number; startIndex: number; endIndex: number; dense: boolean }` — derived by a SECOND pass over the final laid-out ticks, NOT from the packing loop's groups: a cluster is a maximal run of consecutive `layout.ticks` (sorted order) where each next tick begins within its predecessor's minimum click row — `ticks[i+1].top < ticks[i].top + MINIMAP_TICK_MIN_CLICKABLE_PX`. `top` is the first member's top; `height` is the last member's bottom minus the first member's top; `startIndex`/`endIndex` are INCLUSIVE positions into `layout.ticks`; `dense` is true iff at least one member tick's height is strictly below `MINIMAP_TICK_MIN_CLICKABLE_PX`. (Join-rule arithmetic: within a packed run each member's top is its predecessor's top plus the predecessor's height, so every multi-member run necessarily contains a sub-4px member — `dense` is what distinguishes menu-bearing multi-member runs and expanded-hit lone ticks from comfortably-clickable runs.)
+  - `MinimapLayout` gains `clusters: MinimapCluster[]` (ALL runs, singletons included — `dense: false` when no member is sub-clickable); the degenerate return gains `clusters: []`.
+- Component, dense MULTI-MEMBER runs (membership ≥ 2): ONE additional real `<button type="button">` over the run (`style={{ top: cluster.top, height: Math.min(Math.max(cluster.height, MINIMAP_TICK_MIN_CLICKABLE_PX), layout.railHeight - cluster.top) }}` — the run's span, floored at the clickable minimum, clamped to the rail bounds — full rail width, `pointer-events-auto`, `z-10` so it wins pointer events over the abutting ticks), `aria-haspopup="menu"`, `aria-label="Prompts {startIndex + 1}-{endIndex + 1} — open list"`. Clicking it opens the repo's `ContextMenu` (`src/components/context-menu/ContextMenu.tsx` — controlled, portaled to `document.body`, `role="menu"`, z-50, keyboard-complete, self-closing on selection) positioned at the BUTTON's rect (a keyboard click event carries clientX/clientY 0, so cursor coordinates are unusable; `clampToViewport` handles overflow), listing one `MenuItem` per run prompt (label = the prompt's first line truncated to 60 via the same `truncatePrompt` the tick aria-labels use; `onSelect` = the existing `handleTickClick(tick.index)`). Member ticks stay in the DOM.
+- Component, LONE sub-4px ticks (a dense run with membership 1): the tick's OWN button gets an expanded hit height — `Math.min(MINIMAP_TICK_MIN_CLICKABLE_PX, layout.railHeight - tick.top)`; by construction an isolated tick has ≥ 4px pitch on both sides (else it would have joined a run), so the 4px hit box never overlaps a neighbor. The painted line becomes an inner `<span aria-hidden="true">` with the tick's visual height (same bg classes, absolute inset-x-0); the button keeps its aria-label and jumps DIRECTLY on click — no menu, the target is unambiguous.
+- Non-dense runs render NOTHING extra — per-tick behavior byte-identical.
 - The tooltip cannot host the menu (`TooltipContent` is `pointer-events-none`, tooltip.tsx:104); `ContextMenu` is the repo's controlled menu primitive and is not bound to the right-click gesture — instantiating it directly is the intended usage.
-- Residual (documented, not silently accepted): a dense cluster's per-prompt ticks remain visually sub-4px (the one-tick-per-prompt contract forbids merging their paint), and a LONE sub-4px tick gets no cluster target (a one-item menu is not an affordance — the tick's own button is the same size as a cluster target would be). At extreme density the reliable pointer path is the cluster menu; keyboard/screen-reader access to every individual prompt is unchanged.
+- Residual (documented, not silently accepted): cluster-member ticks remain visually sub-4px (the one-tick-per-prompt contract forbids merging their paint; their pointer path is the cluster menu; keyboard/AT access to every individual tick is unchanged). A lone sub-4px tick is no longer a residual — its button's expanded hit height is a first-class affordance (above).
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
 Layout tests — add to `test/unit/client/components/fresh-agent/transcript-minimap-layout.test.ts` after the Task-1 tie-break pin, and add `MINIMAP_TICK_MIN_CLICKABLE_PX` to the import list from the layout module (it is used implicitly by the threshold test's arithmetic; import it for the assertion):
 
 ```ts
-  it('exposes packing clusters with span and membership', () => {
-    // The 3-colliding case: proportional tops 0/1/5 at 3px heights form ONE
-    // packed cluster spanning rail 0..9; every member is under the 4px
-    // clickable floor, so the cluster is dense.
+  it('exposes clickability clusters with span and membership (3-colliding case)', () => {
+    // The 3-colliding case: laid-out tops 0/3/6 at 3px heights. The
+    // clickability pass (a second pass over the FINAL ticks, not the
+    // packing loop's groups) joins each next tick that begins within its
+    // predecessor's 4px click row — 3 < 0+4 and 6 < 3+4 — forming ONE run
+    // spanning rail 0..9; every member is under the 4px clickable floor,
+    // so the cluster is dense.
     const layout = computeMinimapLayout({
       scrollHeight: 10000, viewportHeight: 400, scrollTop: 0, railHeight: 100,
       landmarks: [landmark(0, 0), landmark(1, 100), landmark(2, 500)],
@@ -770,37 +775,44 @@ Layout tests — add to `test/unit/client/components/fresh-agent/transcript-mini
     ])
   })
 
-  it('marks clusters of individually-clickable ticks as not dense', () => {
-    // Two huge prompts scale to 50px ticks — colliding into one cluster, but
-    // every member is comfortably clickable: no click-list affordance.
+  it('keeps individually-clickable packed ticks as separate non-dense runs', () => {
+    // Two huge prompts scale to 50px ticks (final-group scaling 60 -> 50)
+    // packed at tops 0/50. They collide for PACKING purposes, but the
+    // clickability pass does not join them (50 >= 0+4): two singleton runs,
+    // each comfortably clickable — no open-list affordance. This is the
+    // case the packing-group cluster design wrongly merged.
     const layout = computeMinimapLayout({
       scrollHeight: 500, viewportHeight: 200, scrollTop: 0, railHeight: 100,
       landmarks: [landmark(0, 0, 300), landmark(1, 250, 300)],
     })
     expect(layout.clusters).toEqual([
-      { top: 0, height: 100, startIndex: 0, endIndex: 1, dense: false },
+      { top: 0, height: 50, startIndex: 0, endIndex: 0, dense: false },
+      { top: 50, height: 50, startIndex: 1, endIndex: 1, dense: false },
     ])
   })
 
   it('treats the clickable floor as inclusive — 4px ticks stay directly clickable', () => {
-    // scale 0.04: 100px turns land exactly at the 4px floor. Two of them
-    // collide into one cluster whose members are exactly 4px — still
-    // individually clickable (dense is strictly-below the floor). A 75px
-    // turn (3px) makes the same collision dense.
+    // scale 0.04: 100px turns land exactly at the 4px floor. Both ticks
+    // are exactly 4px and abut at tops 0/4 — the clickability pass does
+    // not join them (4 < prevTop+4 is false) and each singleton run is
+    // dense: false (dense is strictly-below the floor). A 75px turn (3px)
+    // in the same geometry stays separate too, but its singleton run is
+    // dense: a lone sub-4px tick.
     const atFloor = computeMinimapLayout({
       scrollHeight: 2500, viewportHeight: 400, scrollTop: 0, railHeight: 100,
       landmarks: [landmark(0, 0, 100), landmark(1, 10, 100)],
     })
     expect(atFloor.ticks[0].height).toBeCloseTo(MINIMAP_TICK_MIN_CLICKABLE_PX, 5)
     expect(atFloor.clusters).toEqual([
-      { top: 0, height: 8, startIndex: 0, endIndex: 1, dense: false },
+      { top: 0, height: 4, startIndex: 0, endIndex: 0, dense: false },
+      { top: 4, height: 4, startIndex: 1, endIndex: 1, dense: false },
     ])
 
     const belowFloor = computeMinimapLayout({
       scrollHeight: 2500, viewportHeight: 400, scrollTop: 0, railHeight: 100,
       landmarks: [landmark(0, 0, 100), landmark(1, 10, 75)],
     })
-    expect(belowFloor.clusters[0].dense).toBe(true)
+    expect(belowFloor.clusters[1].dense).toBe(true)
   })
 
   it('reports singleton clusters for non-colliding ticks (never dense) and none for degenerate inputs', () => {
@@ -820,6 +832,47 @@ Layout tests — add to `test/unit/client/components/fresh-agent/transcript-mini
     })
     expect(degenerate.clusters).toEqual([])
   })
+
+  it('collapses absurd density into ONE dense run — 30 sub-pixel ticks, every join satisfied', () => {
+    // rail 20, scrollHeight 3000, 30 landmarks at i*100: 30 ticks at 2/3px
+    // pitch and 2/3px height (the packer keeps every proportional top —
+    // see the pre-existing absurd-density tick test). The clickability
+    // pass joins EVERY consecutive pair (2/3 < prevTop+4), so the whole
+    // rail is ONE run, startIndex 0..endIndex 29, dense (every member is
+    // sub-4px). This is the extreme-density case the packing-group
+    // cluster design missed.
+    const layout = computeMinimapLayout({
+      scrollHeight: 3000, viewportHeight: 400, scrollTop: 0, railHeight: 20,
+      landmarks: Array.from({ length: 30 }, (_, i) => landmark(i, i * 100)),
+    })
+    expect(layout.clusters).toHaveLength(1)
+    expect(layout.clusters[0].startIndex).toBe(0)
+    expect(layout.clusters[0].endIndex).toBe(29)
+    expect(layout.clusters[0].dense).toBe(true)
+    expect(layout.clusters[0].top).toBeCloseTo(0, 5)
+    expect(layout.clusters[0].height).toBeCloseTo(20, 5)
+  })
+
+  it('keeps evenly-dense isolated ticks as dense singletons — every lone sub-4px tick is its own run', () => {
+    // rail 200, scrollHeight 10000, 50 landmarks at i*200 with 150px rects:
+    // scale 0.02, proportional heights 150*0.02 = 3, effectiveMin
+    // min(3, 200/50) = 3, tops at 4px pitch (i*4). The clickability pass
+    // joins NOTHING (4 < prevTop+4 is false) — 50 singleton clusters, each
+    // dense (membership 1, sub-4px member): lone sub-4px ticks, the
+    // geometry the component's expanded-hit treatment is built for.
+    const layout = computeMinimapLayout({
+      scrollHeight: 10000, viewportHeight: 400, scrollTop: 0, railHeight: 200,
+      landmarks: Array.from({ length: 50 }, (_, i) => landmark(i, i * 200, 150)),
+    })
+    expect(layout.clusters).toHaveLength(50)
+    layout.clusters.forEach((cluster, i) => {
+      expect(cluster.startIndex).toBe(i)
+      expect(cluster.endIndex).toBe(i)
+      expect(cluster.top).toBeCloseTo(i * 4, 5)
+      expect(cluster.height).toBeCloseTo(3, 5)
+      expect(cluster.dense).toBe(true)
+    })
+  })
 ```
 
 Component tests — add a dense fixture helper next to `setupScrollableTranscript` in `test/unit/client/components/fresh-agent/FreshAgentTranscriptMinimap.test.tsx`:
@@ -828,9 +881,11 @@ Component tests — add a dense fixture helper next to `setupScrollableTranscrip
 /** Dense-cluster geometry: scrollHeight 1000, clientHeight 248 -> railHeight
  *  200, scale 0.2. Four short user turns bunched at content offsets
  *  500/510/520/530 with 10px rects: proportional tops 100/102/104/106
- *  collide at the 3px density floor (max(min(3, 200/4), 10*0.2) = 3, under
- *  the 4px clickable floor) into ONE dense cluster spanning rail 100..112,
- *  ticks abutting at 100/103/106/109. */
+ *  at the 3px density floor (max(min(3, 200/4), 10*0.2) = 3, under the
+ *  4px clickable floor), packed abutting at 100/103/106/109. The
+ *  clickability pass joins every consecutive pair (103 < 100+4,
+ *  106 < 103+4, 109 < 106+4) into ONE dense multi-member run spanning
+ *  rail 100..112 (last bottom 109+3 minus first top 100). */
 function setupDenseClusterTranscript() {
   const turns = Array.from({ length: 4 }, (_, i) => ({
     id: `du${i}`,
@@ -847,9 +902,33 @@ function setupDenseClusterTranscript() {
   fireEvent.scroll(scroller)
   return { ...utils, scroller, userTurns }
 }
+
+/** Evenly-dense isolated-tick geometry (the lone sub-4px tick fixture):
+ *  scrollHeight 10000, clientHeight 248 -> railHeight 200, scale 0.02.
+ *  Fifty short user turns at content offsets i*200 with 150px rects:
+ *  proportional heights 150*0.02 = 3 (effectiveMin min(3, 200/50) = 3),
+ *  tops at exact 4px pitch (i*4). The clickability pass joins nothing
+ *  (4 < prevTop+4 is false) — 50 dense SINGLETON clusters: every tick is
+ *  a lone sub-4px tick, none collides into a multi-member run. */
+function setupEvenlyDenseTranscript() {
+  const turns = Array.from({ length: 50 }, (_, i) => ({
+    id: `eu${i}`,
+    role: 'user' as const,
+    summary: `Even dense prompt number ${i + 1}`,
+    items: [{ id: `ei${i}`, kind: 'text' as const, text: `Even dense prompt number ${i + 1}` }],
+  }))
+  const utils = render(<FreshAgentTranscript turns={turns} />)
+  const scroller = utils.container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+  mockScroll(scroller, 0, 10000, 248)
+  const userTurns = utils.container.querySelectorAll('[data-turn-role="user"]')
+  mockRect(scroller, 0)
+  userTurns.forEach((el, i) => mockRect(el, i * 200, 150))
+  fireEvent.scroll(scroller)
+  return { ...utils, scroller, userTurns }
+}
 ```
 
-and three tests inside the describe (add `within` to the `@testing-library/react` import at the top of the file):
+and four tests inside the describe (add `within` to the `@testing-library/react` import at the top of the file):
 
 ```tsx
   it('renders one open-list target over a dense cluster; every per-prompt tick stays in the DOM', () => {
@@ -888,6 +967,28 @@ and three tests inside the describe (add `within` to the `@testing-library/react
     fireEvent.click(items[2])
     expect(scrollIntoViewSpy).toHaveBeenCalledWith({ block: 'start' })
     // ContextMenu closes itself after a selection.
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+  })
+
+  it('gives a lone sub-4px tick a 4px hit target with a 3px painted span and a direct jump (no menu)', () => {
+    const { userTurns } = setupEvenlyDenseTranscript()
+    const firstTick = screen.getByRole('button', { name: 'Jump to prompt: Even dense prompt number 1' })
+
+    // The button's hit height expands to the 4px clickable floor...
+    expect(heightOf(firstTick)).toBeCloseTo(4, 5)
+    // ...while the painted line is an inner aria-hidden span at the tick's
+    // visual 3px height (same bg classes).
+    const painted = firstTick.querySelector('span')
+    expect(painted).not.toBeNull()
+    expect(painted).toHaveAttribute('aria-hidden', 'true')
+    expect(heightOf(painted as HTMLElement)).toBeCloseTo(3, 5)
+
+    // No menu anywhere — the target is unambiguous; clicking jumps directly.
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+    const scrollIntoViewSpy = vi.fn()
+    userTurns[0].scrollIntoView = scrollIntoViewSpy
+    fireEvent.click(firstTick)
+    expect(scrollIntoViewSpy).toHaveBeenCalledWith({ block: 'start' })
     expect(screen.queryByRole('menu')).not.toBeInTheDocument()
   })
 ```
@@ -971,13 +1072,32 @@ New test inside the describe (unique sessionId `…aa103`):
 npm run test:vitest -- run test/unit/client/components/fresh-agent/transcript-minimap-layout.test.ts --config config/vitest/vitest.config.ts
 ```
 
-Expected RED: the four new tests fail on `layout.clusters` being `undefined` (`toEqual` receives `undefined`), and the import of `MINIMAP_TICK_MIN_CLICKABLE_PX` fails to resolve. The 16 pre-existing layout tests still pass.
+Expected RED: the six new tests fail on `layout.clusters` being `undefined` (`toEqual` receives `undefined`; the direct field/`forEach` assertions fail on the `undefined` value), and the import of `MINIMAP_TICK_MIN_CLICKABLE_PX` fails to resolve. The 16 pre-existing layout tests still pass.
 
 ```bash
 npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscriptMinimap.test.tsx --config config/vitest/vitest.config.ts
 ```
 
-Expected RED: the dense-target and menu tests fail with "Unable to find an accessible element with the role 'button' and name 'Prompts 1-4 — open list'"; the normal-density no-target test passes vacuously (it becomes load-bearing once the feature exists).
+Expected RED: the dense-target and menu tests fail with "Unable to find an accessible element with the role 'button' and name 'Prompts 1-4 — open list'"; the lone-tick test fails on the tick button's unexpanded height (3, not 4 — and no inner span). The normal-density no-target test passes vacuously — it is a regression pin, so prove it load-bearing with a bounded, immediately-restored mutation (the Global-Constraints proof for pins):
+
+```bash
+# Bounded mutation — make the negative test's subject fail: point it at the
+# DENSE fixture, the world it must reject.
+#   FreshAgentTranscriptMinimap.test.tsx, 'keeps normal-density clusters on
+#   per-tick behavior — no open-list targets':
+#   BEFORE: setupScrollableTranscript()
+#   AFTER:  setupDenseClusterTranscript()
+npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscriptMinimap.test.tsx --config config/vitest/vitest.config.ts
+# Expected RED (only the mutated test): the dense fixture renders 4 prompt
+# ticks — toHaveLength(3) receives 4. The test is wired to a world its
+# expectations reject; it is not structurally incapable of failing.
+# Restore the fixture call MANUALLY (do NOT git-restore — this file holds
+# the task's uncommitted Step-1 tests) and re-run: the file returns to its
+# intended RED state. AFTER Step 3 lands the feature, repeat the same swap:
+# the failure moves to the open-list queryByRole assertion itself (the
+# dense world HAS an '— open list' target) — the load-bearing proof for
+# that assertion. Record both observations in the task report.
+```
 
 ```bash
 bash -lc 'npm run test:e2e:cloud -- --project=chromium test/e2e-browser/specs/transcript-minimap.spec.ts'
@@ -994,8 +1114,9 @@ Expected RED: the new dense-cluster e2e fails at `await expect(clusterTargets.fi
 ```ts
 /** Tick heights at or above this remain individually pointer-clickable;
  *  below it, individual hits are physically unreliable on a 1× display, so
- *  the component layer adds one open-list hit target over the cluster's span
- *  (every per-prompt tick still renders — never dropped or capped). */
+ *  the component layer adds one open-list hit target over each dense
+ *  multi-member clickability run and expands a lone sub-4px tick's own hit
+ *  height (every per-prompt tick still renders — never dropped or capped). */
 export const MINIMAP_TICK_MIN_CLICKABLE_PX = 4
 ```
 
@@ -1003,16 +1124,18 @@ New type after `MinimapViewportBand`:
 
 ```ts
 export type MinimapCluster = {
-  /** Rail-space top of the packed cluster (its anchor). */
+  /** Rail-space top of the run's first member tick. */
   top: number
-  /** Packed span height, px. */
+  /** Run span, px: last member's bottom minus first member's top. */
   height: number
   /** Inclusive position of the first member tick within layout.ticks. */
   startIndex: number
   /** Inclusive position of the last member tick within layout.ticks. */
   endIndex: number
-  /** True when member ticks are too thin for reliable individual pointer hits
-   *  (>= 2 members and min member height strictly below the clickable floor). */
+  /** True when at least one member tick's height is strictly below the
+   *  clickable floor: dense multi-member runs get the open-list hit target;
+   *  dense singletons (lone sub-4px ticks) get the expanded-hit treatment
+   *  in the component. */
   dense: boolean
 }
 ```
@@ -1023,7 +1146,8 @@ export type MinimapCluster = {
 export type MinimapLayout = {
   ticks: MinimapTick[]
   viewport: MinimapViewportBand
-  /** The packing loop's groups, exposed additively (singletons included). */
+  /** Clickability runs over the final laid-out ticks — ALL runs, singletons
+   *  included (see the second pass at the end of computeMinimapLayout). */
   clusters: MinimapCluster[]
   /** Echoes the input railHeight for consumers (e.g. the tooltip side rule). */
   railHeight: number
@@ -1038,32 +1162,33 @@ and the degenerate return at the top of `computeMinimapLayout` becomes:
   }
 ```
 
-(c) Collect groups in the packing loop. Immediately before the `while` loop (next to `const tops`), add:
+(c) Add the clickability pass AFTER the packing loop — the packing loop itself stays byte-identical to the shipped code (clusters are no longer the packing loop's groups; that design missed both the 30-tick absurd-density case, where one group per tick still forms one clickability run, and the two-50px-tick case, where one packed group is two comfortably-clickable runs). Immediately after the `const ticks = sorted.map(...)` statement, add:
 
 ```ts
+  // Clickability pass — a SECOND pass over the final laid-out ticks, NOT
+  // the packing loop's groups: a cluster is a maximal run of consecutive
+  // ticks where each next tick begins within its predecessor's minimum
+  // click row (ticks[i + 1].top < ticks[i].top + MINIMAP_TICK_MIN_CLICKABLE_PX).
+  // Packed-but-clickable ticks stay separate runs; sub-4px-pitched ticks
+  // merge even when the packer kept every proportional top. ALL runs are
+  // listed (singletons included); `dense` marks any sub-clickable member.
   const clusters: MinimapCluster[] = []
-```
-
-Inside the loop, replace the final section (from `let cursor = anchor` through `i += group.length`) with:
-
-```ts
-    let cursor = anchor
-    group.forEach((k, j) => {
-      tops[k] = cursor
-      cursor += groupHeights[j]
-    })
-    // Expose the packed group as a cluster: span = anchor..packed end; dense
-    // when >= 2 members and any member too thin to click reliably. Member
-    // heights are final here (final-group scaling wrote back above).
-    const memberMinHeight = group.reduce((min, k) => Math.min(min, heights[k]), Infinity)
+  for (let k = 0; k < ticks.length; k++) {
+    const runStart = k
+    while (
+      k + 1 < ticks.length &&
+      ticks[k + 1].top < ticks[k].top + MINIMAP_TICK_MIN_CLICKABLE_PX
+    ) {
+      k++
+    }
     clusters.push({
-      top: anchor,
-      height: cursor - anchor,
-      startIndex: i,
-      endIndex: i + group.length - 1,
-      dense: group.length >= 2 && memberMinHeight < MINIMAP_TICK_MIN_CLICKABLE_PX,
+      top: ticks[runStart].top,
+      height: ticks[k].top + ticks[k].height - ticks[runStart].top,
+      startIndex: runStart,
+      endIndex: k,
+      dense: ticks.slice(runStart, k + 1).some((tick) => tick.height < MINIMAP_TICK_MIN_CLICKABLE_PX),
     })
-    i += group.length
+  }
 ```
 
 and the return statement becomes:
@@ -1072,11 +1197,11 @@ and the return statement becomes:
   return { ticks, clusters, viewport: { top: bandTop, height: bandHeight }, railHeight: input.railHeight }
 ```
 
-(`startIndex`/`endIndex` are sorted-array positions; `layout.ticks` is built from `sorted` in that same order immediately after, so `layout.ticks.slice(cluster.startIndex, cluster.endIndex + 1)` is exactly the member run.)
+(`startIndex`/`endIndex` are sorted-array positions; `layout.ticks` is built from `sorted` in that same order, so `layout.ticks.slice(cluster.startIndex, cluster.endIndex + 1)` is exactly the member run.)
 
-`src/components/fresh-agent/FreshAgentTranscriptMinimap.tsx` — three changes on top of the Task-2 file:
+`src/components/fresh-agent/FreshAgentTranscriptMinimap.tsx` — four changes on top of the Task-2 file:
 
-(a) Imports: add `useState` to the react import, and add after the tooltip import:
+(a) Imports: add `useState` to the react import, add `MINIMAP_TICK_MIN_CLICKABLE_PX` to the existing `transcript-minimap-layout` import, and add after the tooltip import:
 
 ```tsx
 import { ContextMenu } from '@/components/context-menu/ContextMenu'
@@ -1089,34 +1214,107 @@ import type { MenuItem } from '@/components/context-menu/context-menu-types'
   const [clusterMenu, setClusterMenu] = useState<{ items: MenuItem[]; position: { x: number; y: number } } | null>(null)
 ```
 
-(c) Render — after the `layout.ticks.map(...)` block, still inside the rail `<div>` before its close:
+(c) Lone-tick lookup — immediately after the `if (!layout) return null` guard:
 
 ```tsx
-      {layout.clusters.filter((cluster) => cluster.dense).map((cluster) => (
-        <button
-          key={`cluster-${cluster.startIndex}`}
-          type="button"
-          className="pointer-events-auto absolute left-0 z-10 w-full rounded-sm bg-transparent transition-colors hover:bg-primary/15 focus-visible:bg-primary/15"
-          style={{ top: cluster.top, height: cluster.height }}
-          aria-haspopup="menu"
-          aria-label={`Prompts ${cluster.startIndex + 1}-${cluster.endIndex + 1} — open list`}
-          onClick={(event) => {
-            // Button-rect positioning works for pointer AND keyboard
-            // activation (a keyboard click event carries clientX/Y 0).
-            const rect = event.currentTarget.getBoundingClientRect()
-            const memberTicks = layout.ticks.slice(cluster.startIndex, cluster.endIndex + 1)
-            setClusterMenu({
-              items: memberTicks.map((tick) => ({
-                type: 'item' as const,
-                id: `cluster-prompt-${tick.index}`,
-                label: truncatePrompt(tick.label.split('\n')[0], ARIA_LABEL_MAX_LENGTH),
-                onSelect: () => handleTickClick(tick.index),
-              })),
-              position: { x: rect.left, y: rect.top },
-            })
-          }}
-        />
-      ))}
+  // Dense-singleton clusters are lone sub-4px ticks: their OWN buttons get
+  // the expanded-hit treatment (dense multi-member clusters get the
+  // open-list button below instead). Keyed by the member tick's landmark
+  // index (tick.index), which is unique across the rail.
+  const loneDenseTickIndexes = new Set(
+    layout.clusters
+      .filter((cluster) => cluster.dense && cluster.startIndex === cluster.endIndex)
+      .map((cluster) => layout.ticks[cluster.startIndex].index),
+  )
+```
+
+(d) Render, two edits inside the rail `<div>`:
+
+First, replace the whole `layout.ticks.map(...)` block with:
+
+```tsx
+      {layout.ticks.map((tick) => {
+        const firstLine = tick.label.split('\n')[0]
+        // LONE sub-4px tick (dense-singleton run member): it never joined a
+        // clickability run, so it has >= 4px pitch on both sides — expanding
+        // the button's hit height to the clickable floor can never overlap a
+        // neighbor (clamped to the rail bottom). The paint moves to an inner
+        // aria-hidden span at the tick's visual height; the button keeps its
+        // aria-label and jumps DIRECTLY on click (no menu — one tick, one
+        // unambiguous target).
+        const loneSubFloorTick = loneDenseTickIndexes.has(tick.index)
+        const hitHeight = loneSubFloorTick
+          ? Math.min(MINIMAP_TICK_MIN_CLICKABLE_PX, layout.railHeight - tick.top)
+          : tick.height
+        return (
+          <Tooltip key={tick.index}>
+            <TooltipTrigger asChild>
+              <button
+                type="button"
+                className={loneSubFloorTick
+                  ? 'fresh-agent-minimap-tick pointer-events-auto absolute left-0 w-full rounded-sm transition-colors hover:bg-primary/15 focus-visible:bg-primary/15'
+                  : 'fresh-agent-minimap-tick pointer-events-auto absolute left-0 w-full rounded-sm bg-muted-foreground/40 transition-colors hover:bg-primary focus-visible:bg-primary'}
+                style={{ top: tick.top, height: hitHeight }}
+                aria-label={`Jump to prompt: ${truncatePrompt(firstLine, ARIA_LABEL_MAX_LENGTH)}`}
+                onClick={() => handleTickClick(tick.index)}
+              >
+                {loneSubFloorTick ? (
+                  <span
+                    aria-hidden="true"
+                    className="absolute inset-x-0 top-0 rounded-sm bg-muted-foreground/40"
+                    style={{ height: tick.height }}
+                  />
+                ) : null}
+              </button>
+            </TooltipTrigger>
+            <TooltipContent
+              side={tick.top < layout.railHeight * 0.25 ? 'bottom' : 'top'}
+              align="end"
+              className="max-w-64 whitespace-pre-wrap break-words"
+            >
+              {truncatePrompt(firstLine, TOOLTIP_MAX_LENGTH)}
+            </TooltipContent>
+          </Tooltip>
+        )
+      })}
+```
+
+Second, after that block, still inside the rail `<div>` before its close:
+
+```tsx
+      {layout.clusters
+        .filter((cluster) => cluster.dense && cluster.endIndex > cluster.startIndex)
+        .map((cluster) => (
+          <button
+            key={`cluster-${cluster.startIndex}`}
+            type="button"
+            className="pointer-events-auto absolute left-0 z-10 w-full rounded-sm bg-transparent transition-colors hover:bg-primary/15 focus-visible:bg-primary/15"
+            style={{
+              top: cluster.top,
+              height: Math.min(
+                Math.max(cluster.height, MINIMAP_TICK_MIN_CLICKABLE_PX),
+                layout.railHeight - cluster.top,
+              ),
+            }}
+            aria-haspopup="menu"
+            aria-label={`Prompts ${cluster.startIndex + 1}-${cluster.endIndex + 1} — open list`}
+            onClick={(event) => {
+              // Button-rect positioning works for pointer AND keyboard
+              // activation (a keyboard click event carries clientX/Y 0).
+              const rect = event.currentTarget.getBoundingClientRect()
+              const memberTicks = layout.ticks.slice(cluster.startIndex, cluster.endIndex + 1)
+              setClusterMenu({
+                items: memberTicks.map((tick) => ({
+                  type: 'item' as const,
+                  id: `cluster-prompt-${tick.index}`,
+                  label: truncatePrompt(tick.label.split('\n')[0], ARIA_LABEL_MAX_LENGTH),
+                  onSelect: () => handleTickClick(tick.index),
+                })),
+                position: { x: rect.left, y: rect.top },
+              })
+            }}
+          />
+        ))}
       <ContextMenu
         open={clusterMenu !== null}
         items={clusterMenu?.items ?? []}
@@ -1125,7 +1323,7 @@ import type { MenuItem } from '@/components/context-menu/context-menu-types'
       />
 ```
 
-Semantics: the cluster target is transparent and sits above the abutting ticks (`z-10`), so pointer events over a dense cluster route to the open-list button while every tick button remains in the DOM, tab-focusable, and directly Enter/Space-clickable (keyboard/screen-reader access unchanged; tick tab order is untouched because the cluster buttons render after the ticks). `ContextMenu` portals to `document.body` (outside the rail's `pointer-events-none` container) at z-50, closes on Escape/Tab/selection, and its `clampToViewport` handles overflow. If geometry hides the rail mid-interaction, the menu unmounts with it — accepted edge, no dangling state.
+Semantics: the open-list target is transparent and sits above the run (`z-10`), so pointer events over a dense multi-member run route to the open-list button while every tick button remains in the DOM, tab-focusable, and directly Enter/Space-clickable (keyboard/screen-reader access unchanged; tick tab order is untouched because the cluster buttons render after the ticks). A lone sub-4px tick's expanded hit height lives on its OWN button — same DOM position, same aria-label, same tab stop; only the hit box grows (the paint is preserved by the inner span), and by the run rule its 4px box never overlaps a neighbor tick's box. The open-list button's height is the run's span floored at the clickable minimum (`max(cluster.height, 4)`, so even a run of sub-pixel ticks gets a 4px target) and clamped to the rail bounds. `ContextMenu` portals to `document.body` (outside the rail's `pointer-events-none` container) at z-50, closes on Escape/Tab/selection, and its `clampToViewport` handles overflow. If geometry hides the rail mid-interaction, the menu unmounts with it — accepted edge, no dangling state.
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -1134,11 +1332,11 @@ npm run test:vitest -- run test/unit/client/components/fresh-agent/transcript-mi
 bash -lc 'npm run test:e2e:cloud -- --project=chromium test/e2e-browser/specs/transcript-minimap.spec.ts'
 ```
 
-Expected: PASS — 20 layout tests, 19 component tests (15 post-Task-1 pre-existing + the Task-2 spy test + the 3 cluster tests), and all 4 e2e tests including the dense-cluster flow with its density guard satisfied.
+Expected: PASS — 22 layout tests (16 post-Task-2 pre-existing + the 6 cluster tests), 20 component tests (15 post-Task-1 pre-existing + the Task-2 spy test + the 4 cluster tests), and all 3 e2e tests (2 pre-existing + the dense-cluster test) including the dense-cluster flow with its density guard satisfied.
 
 - [ ] **Step 5: Refactor while green**
 
-No refactor needed. The cluster exposure is three additive lines inside the existing packing loop (the loop already computed groups; it now records them), and the component adds one state slot + one render block on two pre-existing primitives (button, ContextMenu).
+No refactor needed. The clickability pass is one self-contained loop over the already-final `ticks` array (the packing loop is untouched); the component adds one state slot, one small lookup set, one conditional in the tick map, and one render block on pre-existing primitives (button, span, ContextMenu).
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -1150,7 +1348,7 @@ npm run test:e2e:a11y-gate:deny 2>&1 | grep -c "transcript-minimap" || true   # 
 git grep -n "transcript-minimap" test/e2e-browser/playwright.cloud.config.ts || echo "not skipped"
 ```
 
-Expected: PASS / clean. A11y: the new button carries a real role + aria-label + aria-haspopup; the menu is the repo's own role="menu"/menuitem primitive; all spec locators stay in the permitted set, and zero gate violations name transcript-minimap.spec.ts. No `docs/index.html` change for this task: the cluster target is an extreme-density-only affordance, not part of the default experience the mock depicts (AGENTS.md's "only major changes" rule).
+Expected: PASS / clean. A11y: the new button carries a real role + aria-label + aria-haspopup; the lone-tick paint span is aria-hidden (its button keeps the accessible name and role); the menu is the repo's own role="menu"/menuitem primitive; all spec locators stay in the permitted set, and zero gate violations name transcript-minimap.spec.ts. No `docs/index.html` change for this task: the cluster affordances (open-list targets, expanded lone-tick hit heights) are extreme-density-only, not part of the default experience the mock depicts (AGENTS.md's "only major changes" rule).
 
 - [ ] **Step 7: Commit the task**
 
@@ -1445,11 +1643,15 @@ async function openSettings(page: any) {
     const blob = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
     expect(JSON.parse(blob ?? '{}').settings?.freshAgent?.showTranscriptMinimap).toBe(false)
 
-    // Reload with the persisted OFF blob; the rail stays hidden.
+    // Reload with the persisted OFF blob; the rail stays hidden. Persistence
+    // restored the CONVERTED pane — it comes back as a fresh-agent pane, so
+    // no terminal exists on this leg: wait for the restored pane itself
+    // (the settings.spec.ts reload precedent — harness waits, then assert
+    // on the restored UI; never waitForTerminal() here).
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await harness.waitForHarness()
     await harness.waitForConnection(undefined, { selfHealReload: isCloudLaneWindowConfigured() })
-    await terminal.waitForTerminal()
+    await expect(freshPane).toBeVisible({ timeout: 10_000 })
     await seedTurns()
     await expect(freshPane.getByText('Finally, summarize the risks', { exact: true })).toBeVisible({ timeout: 10_000 })
     await expect(freshPane.getByRole('button', { name: /Jump to prompt:/ })).toHaveCount(0)
@@ -1464,11 +1666,12 @@ async function openSettings(page: any) {
     const blobOn = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
     expect(JSON.parse(blobOn ?? '{}').settings?.freshAgent).toBeUndefined()
 
-    // Reload once more; the rail is back.
+    // Reload once more; the rail is back. Same restored-pane wait — the
+    // persisted pane is a fresh-agent pane on this leg too.
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await harness.waitForHarness()
     await harness.waitForConnection(undefined, { selfHealReload: isCloudLaneWindowConfigured() })
-    await terminal.waitForTerminal()
+    await expect(freshPane).toBeVisible({ timeout: 10_000 })
     await seedTurns()
     await expect(freshPane.getByText('Finally, summarize the risks', { exact: true })).toBeVisible({ timeout: 10_000 })
     await expect(freshPane.getByRole('button', { name: /Jump to prompt:/ })).toHaveCount(3)
@@ -1482,7 +1685,25 @@ npm run test:vitest -- run test/unit/shared/settings.test.ts test/unit/client/st
 ```
 
 Expected RED (each for its own stated reason):
-- settings.test.ts: "defaults the transcript minimap setting on" fails — `resolveLocalSettings(undefined).freshAgent.showTranscriptMinimap` is `undefined`, not `true`. The round-trip assertions fail the same way. The new schema-rejection line: verify the observed result — the strict server schema may already reject the unknown key (then the line is a pin of existing behavior, like the Task-1 tie-break pin; record which occurred) or it may pass (then it is RED until the local key is properly split; either way the final state must be `false`).
+- settings.test.ts: "defaults the transcript minimap setting on" fails — `resolveLocalSettings(undefined).freshAgent.showTranscriptMinimap` is `undefined`, not `true`. The round-trip assertions fail the same way. The new schema-rejection line: verify the observed result — the strict server schema may already reject the unknown key (then the line is a pin of existing behavior, like the Task-1 tie-break pin; record which occurred) or it may pass (then it is RED until the local key is properly split; either way the final state must be `false`). The pin case needs its Global-Constraints bounded-mutation RED proof — temporarily make the assertion's subject fail:
+
+```bash
+# Bounded mutation — temporarily ADMIT the local-only key into the server
+# patch schema's freshAgent object (the assertion's subject is "the server
+# schema rejects this key"; admitting it must flip the pin to RED):
+#   shared/settings.ts, buildServerSettingsPatchSchema, the freshAgent
+#   z.object (:818-823) — temporarily ADD after the `enabled` clause (:819):
+#     showTranscriptMinimap: z.coerce.boolean().optional(),
+npm run test:vitest -- run test/unit/shared/settings.test.ts --config config/vitest/vitest.config.ts
+# Expected RED (the schema-rejection line): safeParse({ freshAgent:
+#   { showTranscriptMinimap: true } }) now SUCCEEDS — expected `false`,
+#   received `true`. The pin detects a local/server split regression.
+# (The other new settings tests keep their own stated RED.)
+git restore shared/settings.ts
+npm run test:vitest -- run test/unit/shared/settings.test.ts --config config/vitest/vitest.config.ts
+# Expected: the pin passes again (the strict schema rejects the key) and the
+# file returns to its intended RED state. Record the round trip.
+```
 - settingsSlice.test.ts: `initialState.localSettings.freshAgent.showTranscriptMinimap` is `undefined` — both expectations fail.
 - browserPreferencesPersistence.test.ts: `optedOut.settings.freshAgent` is `undefined` (the key is never persisted — `buildLocalSettingsPatch` doesn't know it yet).
 - SettingsView.agent-chat.test.tsx: "Unable to find an accessible element with the role 'switch' and name 'Show transcript minimap'".
@@ -1497,7 +1718,7 @@ Expected RED: the transcript gate test fails — the rail renders under canonica
 bash -lc 'npm run test:e2e:cloud -- --project=chromium test/e2e-browser/specs/transcript-minimap.spec.ts --grep "Show transcript minimap"'
 ```
 
-Expected RED: the new e2e fails at `await expect(minimapSwitch).toHaveAttribute('aria-checked', 'true')` (or the locator's click timeout) — no such switch renders in Settings. Record the failing output. (Also confirm the `--grep` filter matched exactly 1 test in the output.)
+Expected RED: the new e2e fails at `await expect(minimapSwitch).toHaveAttribute('aria-checked', 'true')` (or the locator's click timeout) — no such switch renders in Settings. Note: each in-test reload restores the persisted pane as a fresh-agent pane, so no terminal exists on the reload legs — they wait for the restored pane's visibility, never `terminal.waitForTerminal()` (only the pre-conversion first leg has a terminal). Record the failing output. (Also confirm the `--grep` filter matched exactly 1 test in the output.)
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -1645,7 +1866,7 @@ npm run test:vitest -- run test/unit/shared/settings.test.ts test/unit/client/st
 bash -lc 'npm run test:e2e:cloud -- --project=chromium test/e2e-browser/specs/transcript-minimap.spec.ts'
 ```
 
-Expected: PASS — all new tests green; the two updated full-shape assertions in settings.test.ts (now including `showTranscriptMinimap: true`) green; every pre-existing fresh-agent test green; the full e2e spec (all 5 tests, including the two reload legs) green on the cloud backend.
+Expected: PASS — all new tests green; the two updated full-shape assertions in settings.test.ts (now including `showTranscriptMinimap: true`) green; every pre-existing fresh-agent test green; the full e2e spec (all 4 tests — 3 post-Task-3 + the setting test with its two reload legs) green on the cloud backend.
 
 - [ ] **Step 5: Refactor while green**
 
@@ -1675,14 +1896,14 @@ git commit -m "feat(fresh-agent): add Show transcript minimap setting (default o
 
 ## Recorded residuals (carry into the recap verbatim)
 
-1. **Extreme-density physical limits** (accepted by the User Request): dense-cluster per-prompt ticks remain visually sub-4px — the one-tick-per-prompt contract forbids merging their paint. The reliable pointer path at extreme density is the cluster's open-list menu; a LONE sub-4px tick gets no cluster target (its own button is the same size a cluster target would be). Keyboard/screen-reader access to every prompt is unchanged.
+1. **Extreme-density physical limits** (accepted by the User Request): cluster-member ticks remain visually sub-4px — the one-tick-per-prompt contract forbids merging their paint; their pointer path is the cluster's open-list menu. A LONE sub-4px tick is directly clickable via its button's expanded 4px hit height (a one-item menu would add nothing — the tick itself is the affordance). Keyboard/screen-reader access to every individual tick is unchanged.
 2. **Stale measurement while the rail is unmounted**: with the setting OFF, a content-only resize (disclosure toggle) leaves the stored shared measurement stale until the next scroll/signature trigger; when the rail remounts, real browsers self-heal within a frame (ResizeObserver fires on initial observe). (The fits-viewport-hidden mode is NOT stale: the component stays mounted with live observers there, so content-only resizes still re-sweep.) The glom chip — the only consumer live at that moment — does not depend on article-resize freshness.
 3. **Local-only setting**: `showTranscriptMinimap` persists per-browser (localStorage diff-vs-defaults blob) and does not roam across devices — identical to its `expandThinking`/`expandTools`/`showTimecodes` siblings. The server track exists (settings report §3) if roaming is ever wanted; it is out of scope here.
-4. **Mount-cost note**: the initial transcript mount runs the shared sweep once (parent signature effect); the rail's own ResizeObservers no longer trigger a second sweep on mount — per-SCROLL cost is the finding's subject and is exactly one sweep.
+4. **Mount-cost note**: the initial transcript mount runs the shared sweep once (parent signature effect). The one-sweep guarantee covers the scroll trigger; the rail's own ResizeObserver subscriptions still deliver an initial callback on observe/remount (ResizeObserver fires on initial observe), so a rail (re)mount can request one bounded extra sweep — mount-time only, it does not reintroduce per-scroll double-sweeping. Per-SCROLL cost is the finding's subject and is exactly one sweep.
 
 ## Convergence checklist (for the recap)
 
-- Delta Finding 1 (extreme-density clickability) → CLEARED by Task 3 (cluster open-list affordance; one-tick-per-prompt preserved; residual physical limits documented above).
+- Delta Finding 1 (extreme-density clickability) → CLEARED by Task 3 (second-pass clickability runs: open-list affordance over dense multi-member runs, expanded hit heights on lone sub-4px ticks; one-tick-per-prompt preserved; residual physical limits documented above).
 - Delta Finding 2 / whole-branch Nit 1 (doubled per-scroll scan) → CLEARED by Task 2 (one sweep per scroll, proven by the spy test; glom behavior and its tests unchanged).
 - Delta Finding 3 (tooltip word-break) → CLEARED by Task 1 (class + unit pin + e2e text-range assertion).
 - Task-001 Nit 1 (`let heights`) → CLEARED by Task 1 (`const`).
