@@ -209,6 +209,18 @@ describe('FreshAgentTranscript minimap rail', () => {
     expect(screen.getByRole('tooltip')).toHaveTextContent(`${'A'.repeat(119)}…`)
   })
 
+  it('wraps long unbroken tokens in the hover preview (break-words)', () => {
+    setupScrollableTranscript()
+    const tick = screen.getByRole('button', { name: 'Jump to prompt: Second user message here' })
+
+    fireEvent.mouseEnter(tick)
+    // jsdom cannot observe visual wrapping; this class-presence pin plus the
+    // e2e range assertion (transcript-minimap.spec.ts) carry the real behavior.
+    expect(screen.getByRole('tooltip')).toHaveClass('break-words')
+    fireEvent.mouseLeave(tick)
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
+  })
+
   it('recomputes ticks when the transcript grows', () => {
     const utils = setupScrollableTranscript()
     expect(screen.getAllByRole('button', { name: /Jump to prompt:/ })).toHaveLength(3)

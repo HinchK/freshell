@@ -136,6 +136,22 @@ describe('computeMinimapLayout', () => {
     expect(layout.ticks[1].top).toBeCloseTo(50, 5)
   })
 
+  it('breaks offsetTop ties by landmark index (reversed input order)', () => {
+    // Equal offsetTops: without the index tie-break, modern V8's STABLE sort
+    // keeps the tied pair in INPUT order (2 before 1) and the output would be
+    // [0, 2, 1] — the pre-existing test only exercises distinct offsetTops,
+    // so the tie comparator was never behaviorally pinned.
+    const layout = computeMinimapLayout({
+      scrollHeight: 2000, viewportHeight: 400, scrollTop: 0, railHeight: 100,
+      landmarks: [landmark(2, 500), landmark(1, 500), landmark(0, 0)],
+    })
+    expect(layout.ticks.map((t) => t.index)).toEqual([0, 1, 2])
+    // The tied pair collides proportionally (both tops 25 at scale 0.05) and
+    // packs by abut: index 1 anchors at 25, index 2 abuts at 30.
+    expect(layout.ticks[1].top).toBeCloseTo(25, 5)
+    expect(layout.ticks[2].top).toBeCloseTo(30, 5)
+  })
+
   it('keeps a single landmark', () => {
     const layout = computeMinimapLayout({
       scrollHeight: 2000, viewportHeight: 400, scrollTop: 0, railHeight: 100,

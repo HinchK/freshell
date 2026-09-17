@@ -7,6 +7,13 @@ function tallBody(tag: string): string {
   ).join('\n\n')
 }
 
+/** One 200-char unbreakable token: no spaces AND no line-break opportunities
+ * (no hyphens, slashes, or punctuation — CSS creates break opportunities at
+ * those even without overflow-wrap, which load-bearing validation proved
+ * empirically in headless Chromium), so only overflow-wrap can keep it
+ * inside the 16rem tooltip box. */
+const LONG_UNBROKEN_TOKEN = 'B'.repeat(200)
+
 /** Convert the active terminal leaf into a freshclaude pane whose routed
  * thread snapshot carries the given turns. Mirrors installFreshclaudeStripPane
  * (fresh-agent.spec.ts): network effects suppressed BEFORE the conversion so
@@ -69,7 +76,7 @@ test.describe('Transcript minimap', () => {
     await terminal.waitForTerminal()
     const sessionId = '63333000-0000-4333-8333-0000000aa101'
     await seedMinimapPane(page, sessionId, [
-      { id: 'turn-mm-u1', turnId: 'turn-mm-u1', role: 'user', summary: 'Draft the release notes', items: [{ id: 'item-mm-u1', kind: 'text', text: 'Draft the release notes' }] },
+      { id: 'turn-mm-u1', turnId: 'turn-mm-u1', role: 'user', summary: LONG_UNBROKEN_TOKEN, items: [{ id: 'item-mm-u1', kind: 'text', text: LONG_UNBROKEN_TOKEN }] },
       { id: 'turn-mm-a1', turnId: 'turn-mm-a1', role: 'assistant', summary: 'Notes body', items: [{ id: 'item-mm-a1', kind: 'text', text: tallBody('Notes') }] },
       { id: 'turn-mm-u2', turnId: 'turn-mm-u2', role: 'user', summary: 'Now add the upgrade guide', items: [{ id: 'item-mm-u2', kind: 'text', text: 'Now add the upgrade guide' }] },
       { id: 'turn-mm-a2', turnId: 'turn-mm-a2', role: 'assistant', summary: 'Guide body', items: [{ id: 'item-mm-a2', kind: 'text', text: tallBody('Guide') }] },
@@ -95,6 +102,24 @@ test.describe('Transcript minimap', () => {
     await expect(page.getByRole('tooltip')).toHaveText('Now add the upgrade guide')
     await page.mouse.move(0, 0)
     await expect(page.getByRole('tooltip')).toHaveCount(0)
+
+    // Word-break: hovering the unbreakable-token prompt must keep the rendered
+    // text inside the tooltip box (break-words). Without overflow-wrap the
+    // 120-char truncated token paints as one ~840px line spilling past the
+    // 16rem box (verified: a plain-alphanumeric token has no CSS break
+    // opportunities, so it genuinely cannot wrap without overflow-wrap).
+    const first = freshPane.getByRole('button', { name: /^Jump to prompt: B/ })
+    await first.hover()
+    const tooltip = page.getByRole('tooltip')
+    await expect(tooltip).toBeVisible()
+    const textFitsBox = await tooltip.evaluate((el: HTMLElement) => {
+      const range = document.createRange()
+      range.selectNodeContents(el)
+      return range.getBoundingClientRect().right <= el.getBoundingClientRect().right + 1
+    })
+    expect(textFitsBox).toBe(true)
+    await page.mouse.move(0, 0)
+    await expect(tooltip).toHaveCount(0)
 
     // Click-to-jump: the transcript loads pinned to the bottom (atBottom
     // layout effect), so jumping to the second prompt moves scrollTop up and

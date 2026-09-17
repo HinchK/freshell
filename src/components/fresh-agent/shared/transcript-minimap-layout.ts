@@ -67,7 +67,7 @@ export function computeMinimapLayout(input: {
   )
 
   const sorted = [...input.landmarks].sort((a, b) => a.offsetTop - b.offsetTop || a.index - b.index)
-  let heights = sorted.map((mark) => Math.min(
+  const heights = sorted.map((mark) => Math.min(
     input.railHeight,
     Math.max(effectiveMinTickHeight, mark.height * scale),
   ))

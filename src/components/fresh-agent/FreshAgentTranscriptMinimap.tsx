@@ -95,7 +95,6 @@ export function FreshAgentTranscriptMinimap({
     recompute()
     const scroller = scrollerRef.current
     if (!scroller || typeof ResizeObserver === 'undefined') return
-    articleObserverRef.current?.disconnect()
     const observer = new ResizeObserver(recompute)
     // Observe EVERY direct child of the scroller, not just turn articles:
     // the rolled-back-history disclosure section (and any caption) sits
@@ -170,7 +169,7 @@ export function FreshAgentTranscriptMinimap({
             <TooltipContent
               side={tick.top < layout.railHeight * 0.25 ? 'bottom' : 'top'}
               align="end"
-              className="max-w-64 whitespace-pre-wrap"
+              className="max-w-64 whitespace-pre-wrap break-words"
             >
               {truncatePrompt(firstLine, TOOLTIP_MAX_LENGTH)}
             </TooltipContent>
