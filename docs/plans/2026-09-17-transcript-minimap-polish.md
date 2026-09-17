@@ -737,22 +737,23 @@ git commit -m "refactor(fresh-agent): share one user-turn landmark sweep between
 ### Task 3: Dense-cluster click-list affordance for extreme prompt density
 
 **Files:**
+- Modify: `src/components/context-menu/ContextMenu.tsx` (round-3 primitive edits: additive `className` + `scrollFocusedItemIntoView` props — defaults preserve today's behavior byte-identically; the long-press provider suite must stay green)
 - Modify: `src/components/fresh-agent/shared/transcript-minimap-layout.ts` (new constant + `MinimapCluster` type + `clusters` output via a second clickability pass)
 - Modify: `test/unit/client/components/fresh-agent/transcript-minimap-layout.test.ts` (6 new tests)
-- Modify: `src/components/fresh-agent/FreshAgentTranscriptMinimap.tsx` (dense-run hit targets hosting member hover previews + ContextMenu with opener focus restoration + lone-tick expanded hit heights + rail-hidden menu-state hygiene)
-- Modify: `test/unit/client/components/fresh-agent/FreshAgentTranscriptMinimap.test.tsx` (13 new tests + two fixture helpers (dense-cluster, evenly-dense); add `within` to the testing-library import)
-- Modify: `test/e2e-browser/specs/transcript-minimap.spec.ts` (dense-cluster e2e with self-verifying density guard)
+- Modify: `src/components/fresh-agent/FreshAgentTranscriptMinimap.tsx` (dense-run hit targets hosting member hover previews + bounded scrollable ContextMenu with opener focus restoration + lone-tick expanded hit heights + rail-hidden AND re-measure menu-state hygiene)
+- Modify: `test/unit/client/components/fresh-agent/FreshAgentTranscriptMinimap.test.tsx` (16 new tests + two fixture helpers (dense-cluster, round-3 count-parameterized; evenly-dense); add `within` to the testing-library import)
+- Modify: `test/e2e-browser/specs/transcript-minimap.spec.ts` (dense-cluster e2e with self-verifying density guard, round-3 scaled to a 40-prompt single cluster whose bounded menu genuinely overflows)
 
 **Interfaces:**
 - Layout module (additive output — no existing field changes):
   - `export const MINIMAP_TICK_MIN_CLICKABLE_PX = 4` — the clickable floor. Evidence for ~4px: sub-4px hit targets are not reliably individually clickable with a pointer on a 1× display (the recorded delta Finding 1), and 4px is the smallest height the repo's own UI scale treats as a comfortable row (Tailwind `h-1`, the size class used across the minimap/band rounding scale); "strictly below 4" therefore marks unreliable ticks while leaving 4px ticks direct-clickable. The plan guidance's ~4px suggestion, concretized; plan review adjudicates.
   - `export type MinimapCluster = { top: number; height: number; startIndex: number; endIndex: number; dense: boolean }` — derived by a SECOND pass over the final laid-out ticks, NOT from the packing loop's groups: a cluster is a maximal run of consecutive `layout.ticks` (sorted order) where each next tick begins within its predecessor's minimum click row — `ticks[i+1].top < ticks[i].top + MINIMAP_TICK_MIN_CLICKABLE_PX`. `top` is the first member's top; `height` is the last member's bottom minus the first member's top; `startIndex`/`endIndex` are INCLUSIVE positions into `layout.ticks`; `dense` is true iff at least one member tick's height is strictly below `MINIMAP_TICK_MIN_CLICKABLE_PX`. (Join-rule arithmetic: within a packed run each member's top is its predecessor's top plus the predecessor's height, so every multi-member run necessarily contains a sub-4px member — `dense` is what distinguishes menu-bearing multi-member runs and expanded-hit lone ticks from comfortably-clickable runs.)
   - `MinimapLayout` gains `clusters: MinimapCluster[]` (ALL runs, singletons included — `dense: false` when no member is sub-clickable); the degenerate return gains `clusters: []`.
-- Component, dense MULTI-MEMBER runs (membership ≥ 2): ONE additional real `<button type="button">` over the run (`style={{ top: cluster.top, height: Math.min(Math.max(cluster.height, MINIMAP_TICK_MIN_CLICKABLE_PX), layout.railHeight - cluster.top) }}` — the run's span, floored at the clickable minimum, clamped to the rail bounds — full rail width, `pointer-events-auto`, `z-10` so it wins pointer events over the abutting member ticks — and therefore HOSTS their hover previews, since under the overlay the member ticks are pointer-unreachable in dense runs). Cluster-target hover design: the button is wrapped in the same `Tooltip`/`TooltipTrigger`/`TooltipContent` primitive the ticks already use (the minimap's existing tooltip import), with STATE-DRIVEN content — `onMouseMove` (and `onMouseEnter`, so a pointer entering without moving still previews the band under it) maps the pointer into rail coordinates via the button's own `getBoundingClientRect()` (`offset = clientY − rect.top`), finds the LAST member tick whose `top ≤ cluster.top + offset` (the nearest band; a Y above the run clamps to the first member, and a Y past the run's end is already the last member by the same last-qualifying rule), and stores `{ clusterKey, tick }` in a `hoveredMember` state; `TooltipContent` renders only while the hovered member belongs to THIS cluster, showing the SAME preview content formatting the per-tick tooltips use for that member's prompt (first line, `truncatePrompt(…, TOOLTIP_MAX_LENGTH)`); `onMouseLeave` clears the state and the primitive closes the tooltip — with no hovered member the content node is simply absent (the hidden-preview state; the shell may be open with nothing in it, e.g. on focus, which carries no pointer position). Member ticks stay in the DOM with their own tooltips UNCHANGED — under the z-10 overlay they are unreachable by pointer in dense runs, but they remain the keyboard/AT path: focusing a member tick opens its own per-prompt tooltip, while focusing the cluster target opens no preview (its accessible name announces the run). The button also carries `aria-haspopup="menu"`, `aria-expanded` (true while ITS menu is open — the open menu's cluster key is stored in the menu state, and each target expands iff the keys match), and `aria-label="Prompts {startIndex + 1}-{endIndex + 1} — open list"`. Clicking it opens the repo's `ContextMenu` (`src/components/context-menu/ContextMenu.tsx` — controlled, portaled to `document.body`, `role="menu"`, z-50, keyboard-complete, self-closing on selection) positioned at the BUTTON's rect (a keyboard click event carries clientX/clientY 0, so cursor coordinates are unusable; `clampToViewport` handles overflow), listing one `MenuItem` per run prompt (label = the prompt's first line truncated to 60 via the same `truncatePrompt` the tick aria-labels use; `onSelect` = the existing `handleTickClick(tick.index)`). The click handler captures the opener element (`event.currentTarget`) and the cluster key into the menu state; on close — `onClose` fires for selection, Escape, and Tab-out, and the primitive itself never restores focus (verified: `ContextMenu.tsx` routes Escape/Tab (:86-94), Enter/Space (:122-128), and item clicks (:154-157) through `onClose()` and focuses nothing outside its own items) — the minimap's `onClose` calls `opener.focus()` and then clears the state, so focus lands back on the cluster opener every time. Keyboard users reach the target natively (a real `<button>` in DOM order; Enter/Space trigger the same click path).
+- Component, dense MULTI-MEMBER runs (membership ≥ 2): ONE additional real `<button type="button">` over the run (`style={{ top: cluster.top, height: Math.min(Math.max(cluster.height, MINIMAP_TICK_MIN_CLICKABLE_PX), layout.railHeight - cluster.top) }}` — the run's span, floored at the clickable minimum, clamped to the rail bounds — full rail width, `pointer-events-auto`, `z-10` so it wins pointer events over the abutting member ticks — and therefore HOSTS their hover previews, since under the overlay the member ticks are pointer-unreachable in dense runs). Cluster-target hover design: the button is wrapped in the same `Tooltip`/`TooltipTrigger`/`TooltipContent` primitive the ticks already use (the minimap's existing tooltip import), with STATE-DRIVEN content — `onMouseMove` (and `onMouseEnter`, so a pointer entering without moving still previews the band under it) maps the pointer into rail coordinates via the button's own `getBoundingClientRect()` (`offset = clientY − rect.top`), finds the LAST member tick whose `top ≤ cluster.top + offset` (the nearest band; a Y above the run clamps to the first member, and a Y past the run's end is already the last member by the same last-qualifying rule), and stores `{ clusterKey, tick }` in a `hoveredMember` state; `TooltipContent` renders only while the hovered member belongs to THIS cluster, showing the SAME preview content formatting the per-tick tooltips use for that member's prompt (first line, `truncatePrompt(…, TOOLTIP_MAX_LENGTH)`); `onMouseLeave` clears the state and the primitive closes the tooltip — with no hovered member the content node is simply absent (the hidden-preview state; the shell may be open with nothing in it, e.g. on focus, which carries no pointer position). Member ticks stay in the DOM with their own tooltips UNCHANGED — under the z-10 overlay they are unreachable by pointer in dense runs, but they remain the keyboard/AT path: focusing a member tick opens its own per-prompt tooltip, while focusing the cluster target opens no preview (its accessible name announces the run). The button also carries `aria-haspopup="menu"`, `aria-expanded` (true while ITS menu is open — the open menu's cluster key is stored in the menu state, and each target expands iff the keys match), and `aria-label="Prompts {startIndex + 1}-{endIndex + 1} — open list"`. Clicking it opens the repo's `ContextMenu` (`src/components/context-menu/ContextMenu.tsx` — controlled, portaled to `document.body`, `role="menu"`, z-50, keyboard-complete, self-closing on selection) positioned at the BUTTON's rect (a keyboard click event carries clientX/clientY 0, so cursor coordinates are unusable; `clampToViewport` POSITIONS the menu inside the viewport, and the instantiation's `className="max-h-[60vh] overflow-y-auto"` BOUNDS it as a scrollable surface), listing one `MenuItem` per run prompt (label = the prompt's first line truncated to 60 via the same `truncatePrompt` the tick aria-labels use; `onSelect` = the existing `handleTickClick(tick.index)`). The click handler captures the opener element (`event.currentTarget`), the cluster key, AND the measurement identity the menu opened under (`openedMeasurement: measurement` — the render gate's `|| !measurement` narrowing added in Step 3(b) makes the capture type-honest without a cast) into the menu state; on close — `onClose` fires for selection, Escape, and Tab-out, and the primitive itself never restores focus (verified: `ContextMenu.tsx` routes Escape/Tab (:86-94), Enter/Space (:122-128), and item clicks (:154-157) through `onClose()` and focuses nothing outside its own items) — the minimap's `onClose` calls `opener.focus()` — guarded by `if (opener.isConnected)`, because a streamed prompt can unmount the opener before the close runs and focusing a detached node is a silent no-op that strands focus on body — and then clears the state, so focus lands back on the cluster opener every time. Keyboard users reach the target natively (a real `<button>` in DOM order; Enter/Space trigger the same click path). Round-3 stale-snapshot hygiene: any re-measure while the menu is open — transcript scroll, pane resize, or a streamed prompt — produces a NEW `TranscriptMeasurement` object; the hygiene effect detects it by identity (`measurement !== clusterMenu.openedMeasurement`) and closes the menu, so the open menu's captured items/position/opener can never outlive the geometry they were computed from (standard popover behavior). Scrolling the menu's OWN portaled list never re-measures the transcript — its wheel/scroll events fire on the document.body portal, outside the scroller, and never reach the transcript's onScroll — so list scrolling never dismisses the menu; only transcript-side geometry changes do.
 - Component, LONE sub-4px ticks (a dense run with membership 1): the tick's OWN button gets an expanded hit height — `Math.min(MINIMAP_TICK_MIN_CLICKABLE_PX, layout.railHeight - tick.top)`; by construction an isolated tick has ≥ 4px pitch on both sides (else it would have joined a run), so the 4px hit box never overlaps a neighbor. The painted line becomes an inner `<span aria-hidden="true">` with the tick's visual height (same bg classes, absolute inset-x-0); the button keeps its aria-label and jumps DIRECTLY on click — no menu, the target is unambiguous.
 - Non-dense runs render NOTHING extra — per-tick behavior byte-identical.
-- The tooltip cannot host the menu (`TooltipContent` is `pointer-events-none`, tooltip.tsx:104); `ContextMenu` is the repo's controlled menu primitive and is not bound to the right-click gesture — instantiating it directly is the intended usage.
-- Residual (documented, not silently accepted): cluster-member ticks remain visually sub-4px (the one-tick-per-prompt contract forbids merging their paint; their pointer path is the cluster target — hover preview hosted on the target, jumps via its menu; keyboard/AT access to every individual tick is unchanged). A lone sub-4px tick is no longer a residual — its button's expanded hit height is a first-class affordance (above). NEW rail-bottom residual: dense targets within the final 4px of the rail render SHORTER than 4px — a lone tick's hit box clamps to `railHeight − top`, a cluster target's to `min(max(span, 4), railHeight − cluster.top)` — a documented physical limit (the run contract accepts documented physical limits): at a fixed rail edge with exact-4px-pitch neighbors, a full 4px box necessarily overlaps a neighbor's own ≥4px box, and later-in-DOM hit-testing would starve it; shifting the box up to keep its 4px would instead eat a 4px-pitch predecessor's contiguous click area below 4px — the same defect one level up. The clamp guarantees every OTHER tick keeps its full clickable area. The two rail-bottom boundary tests pin the exact clamped heights. This replaces silence, not a behavior change.
+- The tooltip cannot host the menu (`TooltipContent` is `pointer-events-none`, tooltip.tsx:104); `ContextMenu` is the repo's controlled menu primitive and is not bound to the right-click gesture — instantiating it directly is the intended usage. Round 3 makes the primitive a first-class host for long lists via two ADDITIVE, default-off props, edited in this task: `className?: string` (merged through the menu div's existing `cn(...)` at ContextMenu.tsx:76-79, after the fixed base classes) and `scrollFocusedItemIntoView?: boolean` (when true, `focusItem` — after the existing `focus({ preventScroll: true })` — additionally calls `itemRefs.current[index]?.scrollIntoView?.({ block: 'nearest' })` so keyboard arrows keep the focused item visible in a bounded list; default false keeps the long-press provider's preventScroll dismissal-guard semantics byte-identical — the focusItem comment at ContextMenu.tsx:39-47 explains why the native focus scroll must not run there: it would reach the provider's capture-phase scroll listener and dismiss the menu; direct instantiation has no provider and is immune). The minimap passes `className="max-h-[60vh] overflow-y-auto"` plus the flag: pointer users scroll the bounded list directly, keyboard users get item-scroll on arrow keys via the flag, and Playwright's click auto-scrolls the list for the e2e.
+- Residual (documented, not silently accepted): cluster-member ticks remain visually sub-4px (the one-tick-per-prompt contract forbids merging their paint; their pointer path is the cluster target — hover preview hosted on the target, jumps via its menu; keyboard/AT access to every individual tick is unchanged). A lone sub-4px tick is no longer a residual — its button's expanded hit height is a first-class affordance (above). NEW rail-bottom residual: dense targets within the final 4px of the rail render SHORTER than 4px — a lone tick's hit box clamps to `railHeight − top`, a cluster target's to `min(max(span, 4), railHeight − cluster.top)` — a documented physical limit (the run contract accepts documented physical limits): at a fixed rail edge with exact-4px-pitch neighbors, a full 4px box necessarily overlaps a neighbor's own ≥4px box, and later-in-DOM hit-testing would starve it; shifting the box up to keep its 4px would instead eat a 4px-pitch predecessor's contiguous click area below 4px — the same defect one level up. The clamp guarantees every OTHER tick keeps its full clickable area. The two rail-bottom boundary tests pin the exact clamped heights. This replaces silence, not a behavior change. Round-3 menu bound: the open-list menu is BOUNDED (`className="max-h-[60vh] overflow-y-auto"` on the ContextMenu instantiation) and scrollable — every prompt in a cluster is reachable by pointer (direct list scrolling) and by keyboard (arrow keys scroll the focused item into view via the primitive's `scrollFocusedItemIntoView` flag), proven by the 30-prompt component tests and the overflowing-menu e2e; the ONLY accepted physical-limit residual is the rail-edge clamp above (unchanged from round 2).
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
@@ -879,15 +880,18 @@ Component tests — add a dense fixture helper next to `setupScrollableTranscrip
 
 ```tsx
 /** Dense-cluster geometry: scrollHeight 1000, clientHeight 248 -> railHeight
- *  200, scale 0.2. Four short user turns bunched at content offsets
- *  500/510/520/530 with 10px rects: proportional tops 100/102/104/106
- *  at the 3px density floor (max(min(3, 200/4), 10*0.2) = 3, under the
- *  4px clickable floor), packed abutting at 100/103/106/109. The
- *  clickability pass joins every consecutive pair (103 < 100+4,
- *  106 < 103+4, 109 < 106+4) into ONE dense multi-member run spanning
- *  rail 100..112 (last bottom 109+3 minus first top 100). */
-function setupDenseClusterTranscript() {
-  const turns = Array.from({ length: 4 }, (_, i) => ({
+ *  200, scale 0.2. `count` short user turns bunched at content offsets
+ *  500 + i*10 with 10px rects: proportional tops 100 + 2i at the 3px
+ *  density floor (max(min(3, 200/count), 10*0.2) = 3 for both counts this
+ *  suite uses — min(3, 200/4) and min(3, 200/30) are both 3 — under the
+ *  4px clickable floor), packed abutting at a 3px pitch. The clickability
+ *  pass joins every consecutive pair (nextTop < prevTop + 4) into ONE
+ *  dense multi-member run. Default count 4: tops 100/103/106/109, rail
+ *  span 100..112 (last bottom 109+3 minus first top 100). Count 30
+ *  (round 3, the bounded-menu fixture): packed tops 100..187 at 3px
+ *  pitch, ONE run spanning rail 100..190 whose menu lists 30 items. */
+function setupDenseClusterTranscript(count = 4) {
+  const turns = Array.from({ length: count }, (_, i) => ({
     id: `du${i}`,
     role: 'user' as const,
     summary: `Dense prompt number ${i + 1}`,
@@ -928,7 +932,7 @@ function setupEvenlyDenseTranscript() {
 }
 ```
 
-and thirteen tests inside the describe (add `within` to the `@testing-library/react` import at the top of the file):
+and sixteen tests inside the describe (add `within` to the `@testing-library/react` import at the top of the file):
 
 ```tsx
   it('renders one open-list target over a dense cluster; every per-prompt tick stays in the DOM', () => {
@@ -1165,6 +1169,71 @@ and thirteen tests inside the describe (add `within` to the `@testing-library/re
     expect(screen.getByRole('button', { name: 'Prompts 1-4 — open list' })).toBeInTheDocument()
     expect(screen.queryByRole('menu')).not.toBeInTheDocument()
   })
+
+  // Round-3 Finding 1 (bounded menu): a dense run can list dozens of
+  // prompts; the menu must be a BOUNDED, scrollable surface so it can never
+  // overflow the viewport. jsdom cannot compute overflow — these class pins
+  // plus the e2e's scrollHeight > clientHeight assertion carry the real
+  // bounding behavior.
+  it('bounds the cluster menu at 60vh and lists every prompt of a 30-member dense run', () => {
+    setupDenseClusterTranscript(30)
+    fireEvent.click(screen.getByRole('button', { name: 'Prompts 1-30 — open list' }))
+
+    const menu = screen.getByRole('menu')
+    expect(within(menu).getAllByRole('menuitem')).toHaveLength(30)
+    // Bounded surface: the instantiation passes max-h + overflow classes
+    // through the primitive's new className prop (merged by its cn(...)).
+    expect(menu).toHaveClass('max-h-[60vh]')
+    expect(menu).toHaveClass('overflow-y-auto')
+  })
+
+  it('keeps the keyboard-focused menu item visible in the bounded list (scrollFocusedItemIntoView)', () => {
+    setupDenseClusterTranscript(30)
+    fireEvent.click(screen.getByRole('button', { name: 'Prompts 1-30 — open list' }))
+    const menu = screen.getByRole('menu')
+    const items = within(menu).getAllByRole('menuitem')
+    // jsdom 25 has NO Element.prototype.scrollIntoView (and vi.spyOn refuses
+    // absent properties), so install the mock the suite's standard way:
+    // per-element vi.fn() assignment (Global Constraints).
+    const scrollIntoViewSpy = vi.fn()
+    items.forEach((item) => { item.scrollIntoView = scrollIntoViewSpy })
+    // Arrow to the last item: every step moves focus; with the flag on,
+    // focusItem also scrolls the focused item into view inside the
+    // bounded list (the primitive's default stays preventScroll — the
+    // focusItem comment).
+    for (let i = 0; i < items.length - 1; i++) {
+      fireEvent.keyDown(menu, { key: 'ArrowDown' })
+    }
+    expect(scrollIntoViewSpy).toHaveBeenCalledWith({ block: 'nearest' })
+    expect(document.activeElement).toBe(items[items.length - 1])
+  })
+
+  // Round-3 Finding 2 (stale snapshot): the open menu's items/position were
+  // captured at open; ANY re-measure must close it — a menu that outlives
+  // its geometry shows stale prompts and a stale position. This is the
+  // geometry-change path, NOT the rail-hidden one: the layout stays
+  // non-null and the rail keeps rendering throughout.
+  it('closes the open cluster menu when a re-measure replaces the transcript geometry', () => {
+    const { scroller } = setupDenseClusterTranscript()
+    fireEvent.click(screen.getByRole('button', { name: 'Prompts 1-4 — open list' }))
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+
+    // A streamed prompt grows the transcript: same article rects, new
+    // scrollHeight — a NEW measurement object while the layout stays
+    // non-null.
+    mockScroll(scroller, 0, 1200, CLIENT_HEIGHT)
+    fireEvent.scroll(scroller)
+    // Assert immediately after the change event (not just after restore):
+    // the menu closed on the re-measure itself, while the rail and its
+    // cluster target stayed mounted.
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Prompts 1-4 — open list' })).toBeInTheDocument()
+
+    // Restoring the geometry does NOT resurrect the closed menu.
+    mockScroll(scroller, 0, 1000, CLIENT_HEIGHT)
+    fireEvent.scroll(scroller)
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+  })
 ```
 
 E2e — add to `test/e2e-browser/specs/transcript-minimap.spec.ts`. New helper next to `tallBody`:
@@ -1178,7 +1247,7 @@ function veryTallBody(tag: string): string {
 }
 ```
 
-New test inside the describe (unique sessionId `…aa103`):
+New test inside the describe (unique sessionId `…aa103`; round 3 scales the bunched seed from 12 to 40 prompts so the ONE dense cluster's menu genuinely overflows the bounded 60vh surface, and appends a trailing tall assistant body so the FINAL menu item's jump is an observable scroll):
 
 ```ts
   test('dense prompt clusters get one open-list target whose menu jumps to any prompt', async ({ freshellPage: _freshellPage, page, terminal }) => {
@@ -1191,22 +1260,42 @@ New test inside the describe (unique sessionId `…aa103`):
         items: [{ id: `item-dense-a${i}`, kind: 'text', text: veryTallBody(`Body${i}`) }],
       })
     }
-    for (let i = 0; i < 12; i++) {
+    // Round 3 scales the bunched seed from 12 to 40 prompts: at this
+    // density the whole bunch joins into ONE dense cluster whose 40-item
+    // menu genuinely overflows the bounded 60vh surface (a 12-item menu
+    // never overflows, so "every prompt is reachable in the bounded list"
+    // was unproven). Keep the prompts consecutive one-liners — tiny
+    // offsets, one bunched cluster, exactly as the 12-prompt seed did.
+    for (let i = 0; i < 40; i++) {
       turns.push({
         id: `turn-dense-u${i}`, turnId: `turn-dense-u${i}`, role: 'user', summary: `Dense prompt ${i + 1}`,
         items: [{ id: `item-dense-u${i}`, kind: 'text', text: `Dense prompt ${i + 1}` }],
       })
     }
+    // Trailing tall assistant body (round 3): the FINAL bunched prompt must
+    // sit far above the pinned-to-bottom scroll position — without trailing
+    // content the last prompt lands inside the initial bottom viewport and
+    // jumping to it clamps to a no-op scroll, so the final-item jump below
+    // would prove nothing.
+    turns.push({
+      id: 'turn-dense-a-tail', turnId: 'turn-dense-a-tail', role: 'assistant', summary: 'Tail body',
+      items: [{ id: 'item-dense-a-tail', kind: 'text', text: veryTallBody('Tail') }],
+    })
     await seedMinimapPane(page, sessionId, turns)
 
     const freshPane = page.locator('[data-context="fresh-agent"]')
-    await expect(freshPane.getByText('Dense prompt 12', { exact: true })).toBeVisible({ timeout: 20_000 })
+    // The load pins to the bottom, and the trailing tail body now ENDS the
+    // content — the initially visible text is the tail body's last line,
+    // not the final bunched prompt (prompt 40 sits a full tall body above
+    // the bottom). Wait on the tail line; the tick-count assertion below
+    // proves the prompts rendered.
+    await expect(freshPane.getByText('Tail line 240', { exact: false })).toBeVisible({ timeout: 20_000 })
     const scroller = freshPane.locator('[data-context="fresh-agent-transcript"]')
     await expect(scroller).toBeVisible()
 
     // Every prompt keeps its tick (one-tick-per-prompt contract).
     const ticks = freshPane.getByRole('button', { name: /Jump to prompt:/ })
-    await expect(ticks).toHaveCount(12)
+    await expect(ticks).toHaveCount(40)
 
     // Self-verifying density guard: the first prompt tick must be under the
     // 4px clickable floor in THIS pane geometry — otherwise the cluster
@@ -1216,27 +1305,45 @@ New test inside the describe (unique sessionId `…aa103`):
     const firstTickHeight = await ticks.first().evaluate((el: HTMLElement) => el.getBoundingClientRect().height)
     expect(firstTickHeight).toBeLessThan(4)
 
-    // One open-list target covers the bunched cluster; clicking it opens a menu.
+    // One open-list target covers the bunched cluster — EXACTLY one: the
+    // whole 40-prompt bunch must join into a single dense run. Clicking it
+    // opens a menu listing every prompt in the run.
     const clusterTargets = freshPane.getByRole('button', { name: /— open list/ })
-    await expect(clusterTargets.first()).toBeVisible()
+    await expect(clusterTargets).toHaveCount(1)
     await clusterTargets.first().click()
     const menu = page.getByRole('menu')
     await expect(menu).toBeVisible()
     const itemCount = await page.getByRole('menuitem').count()
-    expect(itemCount).toBeGreaterThanOrEqual(2)
-    expect(itemCount).toBeLessThanOrEqual(12)
+    expect(itemCount).toBe(40)
 
-    // Selecting a listed prompt jumps there: the transcript loads pinned to
-    // the bottom and the bunched prompts sit ~600px above it, so scrollTop drops.
+    // The menu is BOUNDED and genuinely overflows in a real browser:
+    // max-h-[60vh] caps the list's box below its 40-item content.
+    const menuOverflows = await menu.evaluate((el: HTMLElement) => el.scrollHeight > el.clientHeight)
+    expect(menuOverflows).toBe(true)
+
+    // Selecting the FINAL menu item is the load-bearing choice: in an
+    // UNBOUNDED menu every item is trivially reachable (the list just runs
+    // past the viewport); only in THIS bounded menu does the last item sit
+    // below the fold — Playwright's click must scroll the menu's own list
+    // to reach it, exactly what a pointer user does by hand.
     const before = await scroller.evaluate((el: HTMLElement) => el.scrollTop)
-    await page.getByRole('menuitem').first().click()
+    await page.getByRole('menuitem').last().click()
     await expect(menu).toHaveCount(0)
+    // The transcript jumped to the final bunched prompt: scrollTop drops
+    // (the load starts pinned to the bottom; the trailing tail body keeps
+    // prompt 40 far above it) and the prompt lands at the scrollport top
+    // (block: 'start') — the same landing assertion as the tick-click jump
+    // in test 1.
     await expect.poll(
       async () => scroller.evaluate((el: HTMLElement) => el.scrollTop),
       { timeout: 5_000 },
     ).toBeLessThan(before)
+    const scrollerTop = await scroller.evaluate((el: HTMLElement) => el.getBoundingClientRect().top)
+    const targetTop = await freshPane.locator('article[data-turn-role="user"]').last()
+      .evaluate((el: HTMLElement) => el.getBoundingClientRect().top)
+    expect(Math.abs(targetTop - scrollerTop)).toBeLessThan(60)
     // The ticks never went anywhere.
-    await expect(ticks).toHaveCount(12)
+    await expect(ticks).toHaveCount(40)
   })
 ```
 
@@ -1252,7 +1359,7 @@ Expected RED: the six new tests fail on `layout.clusters` being `undefined` (`to
 npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTranscriptMinimap.test.tsx --config config/vitest/vitest.config.ts
 ```
 
-Expected RED: the dense-target and menu tests fail with "Unable to find an accessible element with the role 'button' and name 'Prompts 1-4 — open list'" — that includes the three hover-preview tests, the three opener a11y/focus tests, and the stale-menu-state test (all locate the cluster target first), plus the rail-bottom CLUSTER boundary test ('Prompts 2-4 — open list' does not exist yet). The lone-tick test fails on the tick button's unexpanded height (3, not 4 — and no inner span). The rail-bottom LONE-tick boundary test fails on the missing inner span and the predecessor's unexpanded height (3, not 4) — its last-tick height assertion (3) equals the pre-implementation value by construction: it is the clamp pin, load-bearing against ever REMOVING the clamp (see the post-GREEN mutation proof below), while the span/predecessor assertions carry the RED. The normal-density no-target test passes vacuously — it is a regression pin, so prove it load-bearing with a bounded, immediately-restored mutation (the Global-Constraints proof for pins):
+Expected RED: the dense-target and menu tests fail with "Unable to find an accessible element with the role 'button' and name 'Prompts 1-4 — open list'" — that includes the three hover-preview tests, the three opener a11y/focus tests, the stale-menu-state test, and the round-3 re-measure-close test (all locate the 'Prompts 1-4' cluster target first), plus the two round-3 bounded-menu tests (same failure class on 'Prompts 1-30 — open list') and the rail-bottom CLUSTER boundary test ('Prompts 2-4 — open list' does not exist yet). The lone-tick test fails on the tick button's unexpanded height (3, not 4 — and no inner span). The rail-bottom LONE-tick boundary test fails on the missing inner span and the predecessor's unexpanded height (3, not 4) — its last-tick height assertion (3) equals the pre-implementation value by construction: it is the clamp pin, load-bearing against ever REMOVING the clamp (see the post-GREEN mutation proof below), while the span/predecessor assertions carry the RED. The normal-density no-target test passes vacuously — it is a regression pin, so prove it load-bearing with a bounded, immediately-restored mutation (the Global-Constraints proof for pins):
 
 ```bash
 # Bounded mutation — make the negative test's subject fail: point it at the
@@ -1296,9 +1403,77 @@ npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTra
 bash -lc 'npm run test:e2e:cloud -- --project=chromium test/e2e-browser/specs/transcript-minimap.spec.ts'
 ```
 
-Expected RED: the new dense-cluster e2e fails at `await expect(clusterTargets.first()).toBeVisible()` (no open-list button renders). Record the failing output.
+Expected RED: the new dense-cluster e2e fails at `await expect(clusterTargets).toHaveCount(1)` (no open-list button renders, so the locator count is 0). Record the failing output.
 
 - [ ] **Step 3: Add the minimal production implementation**
+
+`src/components/context-menu/ContextMenu.tsx` — two ADDITIVE changes (round 3; defaults preserve today's behavior byte-identically — every existing consumer, the ContextMenuProvider long-press flow included, passes neither prop, so `className` is undefined (ignored by `cn`) and the flag defaults false; the provider's preventScroll dismissal-guard semantics are untouched, and its suite must stay green — run it focused in Step 4):
+
+Change 1 — `ContextMenuProps` (lines 8-13) gains two optional props, and the component destructures the flag with its default:
+
+```tsx
+export type ContextMenuProps = {
+  open: boolean
+  items: MenuItem[]
+  position: { x: number; y: number }
+  onClose: () => void
+  /** Extra classes merged onto the menu container div — e.g. a max-h +
+   *  overflow-y pair bounding a long list into a scrollable surface.
+   *  Merged through the div's existing cn(...) after the base classes. */
+  className?: string
+  /** Opt in to scrolling the keyboard-focused item into view inside the
+   *  menu's OWN scroll box — for bounded, scrollable menus. Default false
+   *  keeps the long-press provider's preventScroll dismissal-guard
+   *  semantics byte-identical (the focusItem comment at :39-47: the native
+   *  focus scroll reaches the provider's capture-phase scroll listener and
+   *  dismisses that menu; consumers that instantiate ContextMenu directly,
+   *  with no provider, are immune and can opt in). */
+  scrollFocusedItemIntoView?: boolean
+}
+```
+
+```tsx
+export const ContextMenu = forwardRef<HTMLDivElement, ContextMenuProps>(function ContextMenu(
+  { open, items, position, onClose, className, scrollFocusedItemIntoView = false },
+  ref
+) {
+```
+
+Change 2a — the menu div's className (lines 76-79) merges the new prop (appended AFTER the fixed base classes so a consumer can never drop them):
+
+```tsx
+      className={cn(
+        'fixed min-w-[200px] rounded-md border border-border bg-card shadow-lg py-1 select-none',
+        OVERLAY_Z.menu,
+        className,
+      )}
+```
+
+Change 2b — `focusItem` (lines 38-48) gains the opt-in item-scroll AFTER the existing preventScroll focus; the existing comment block (lines 39-46) stays byte-identical:
+
+```tsx
+  const focusItem = useCallback((index: number) => {
+    // preventScroll: focusing a menu item should never scroll it into view.
+    // The resulting native scroll event would reach the provider's
+    // capture-phase scroll listener and dismiss the menu the moment it
+    // opens (visible with the on-screen keyboard up, where the menu could
+    // mount outside the visual viewport). NOTE: preventScroll is a no-op
+    // on Chrome Android (crbug.com/41453122) — there the provider's
+    // post-open grace window absorbs the focus scroll; this option still
+    // helps on desktop and iOS Safari 15.5+.
+    itemRefs.current[index]?.focus({ preventScroll: true })
+    // Opt-in supplement for BOUNDED menus (e.g. the minimap's 60vh cluster
+    // list): keep the keyboard-focused item visible inside the menu's own
+    // scroll box. Method-level ?. — jsdom has no scrollIntoView (the same
+    // guard the glom chip and handleTickClick use). Default OFF: the
+    // native item scroll would reach the long-press provider's
+    // capture-phase scroll listener and dismiss that menu (the comment
+    // above); direct instantiation (no provider) is immune.
+    if (scrollFocusedItemIntoView) {
+      itemRefs.current[index]?.scrollIntoView?.({ block: 'nearest' })
+    }
+  }, [scrollFocusedItemIntoView])
+```
 
 `src/components/fresh-agent/shared/transcript-minimap-layout.ts` — three changes:
 
@@ -1401,17 +1576,22 @@ import { ContextMenu } from '@/components/context-menu/ContextMenu'
 import type { MenuItem } from '@/components/context-menu/context-menu-types'
 ```
 
-(b) Menu + hover state, after the `handleTickClick` callback and BEFORE the `if (!layout) return null` guard (all hooks must precede the early return):
+(b) Menu + hover state + stale-snapshot hygiene + the render gate's narrowing addition, after the `handleTickClick` callback (all hooks must precede the gate; the gate itself is this block's last line — it REPLACES the Task-2 `if (!layout) return null` line):
 
 ```tsx
   // The open cluster menu: which cluster's key opened it, its items, its
-  // position, and the OPENER element (focus is restored to it on close —
-  // the ContextMenu primitive never does that itself).
+  // position, the OPENER element (focus is restored to it on close — the
+  // ContextMenu primitive never does that itself), and — round 3 — the
+  // measurement identity it opened UNDER: every sweep mints a NEW
+  // TranscriptMeasurement object, so the hygiene effect below detects ANY
+  // re-measure while the menu is open (scroll, pane resize, streamed
+  // prompt) and closes the menu before its captured snapshot goes stale.
   const [clusterMenu, setClusterMenu] = useState<{
     key: string
     items: MenuItem[]
     position: { x: number; y: number }
     opener: HTMLButtonElement
+    openedMeasurement: TranscriptMeasurement
   } | null>(null)
   // The dense-cluster hover preview: which member tick the pointer is over,
   // scoped to its cluster so one cluster's focus-tooltip can never surface
@@ -1442,20 +1622,41 @@ import type { MenuItem } from '@/components/context-menu/context-menu-types'
   // while the cluster menu is open, the menu unmounts — clear its state so
   // a later rail restoration cannot resurrect a stale menu whose opener
   // element is detached; the same applies to the stale hover selection (a
-  // restored rail + focus on a target would otherwise surface it). The plan
-  // imposes no "no passive effects" rule — the component has owned effects
-  // since Task 2 (its two ResizeObserver subscriptions); this effect never
-  // sweeps, and the Global-Constraints synchronous-measurement rule is
-  // untouched.
+  // restored rail + focus on a target would otherwise surface it). Round 3
+  // adds the stale-SNAPSHOT close: any re-measure while the menu is open —
+  // transcript scroll, pane resize, or a streamed prompt — replaces the
+  // measurement OBJECT; the menu's items/position/opener were captured at
+  // open, so it closes (standard popover behavior). Identity comparison,
+  // not deep equality: every sweep mints a fresh TranscriptMeasurement, so
+  // `!==` detects every re-measure. Scrolling the MENU's own portaled list
+  // never re-measures the transcript (the list lives in a document.body
+  // portal, outside the scroller — its wheel/scroll events never reach the
+  // transcript's onScroll), so list scrolling never dismisses the menu;
+  // only transcript-side geometry changes do. The plan imposes no "no
+  // passive effects" rule — the component has owned effects since Task 2
+  // (its two ResizeObserver subscriptions); this effect never sweeps, and
+  // the Global-Constraints synchronous-measurement rule is untouched.
   useEffect(() => {
     if (!layout) {
       if (clusterMenu) setClusterMenu(null)
       if (hoveredMember) setHoveredMember(null)
+      return
     }
-  }, [layout, clusterMenu, hoveredMember])
+    if (clusterMenu && measurement !== clusterMenu.openedMeasurement) {
+      setClusterMenu(null)
+    }
+  }, [layout, clusterMenu, hoveredMember, measurement])
+
+  // Render gate (the Task-2 line, one addition): `!measurement` is dead by
+  // construction — layout is null whenever measurement is, because layout
+  // derives from it — but it narrows `measurement` to non-null for the
+  // cluster-target onClick's `openedMeasurement: measurement` capture in
+  // (d), keeping the state type honest without a cast or a dead in-handler
+  // guard.
+  if (!layout || !measurement) return null
 ```
 
-(c) Lone-tick lookup — immediately after the `if (!layout) return null` guard:
+(c) Lone-tick lookup — immediately after the render gate at the end of (b):
 
 ```tsx
   // Dense-singleton clusters are lone sub-4px ticks: their OWN buttons get
@@ -1578,6 +1779,10 @@ Second, after that block, still inside the rail `<div>` before its close:
                       })),
                       position: { x: rect.left, y: rect.top },
                       opener: event.currentTarget,
+                      // The measurement identity this menu opened under
+                      // (narrowed non-null by the render gate) — the
+                      // hygiene effect's staleness reference.
+                      openedMeasurement: measurement,
                     })
                   }}
                 />
@@ -1599,49 +1804,54 @@ Second, after that block, still inside the rail `<div>` before its close:
           open={clusterMenu !== null}
           items={clusterMenu.items}
           position={clusterMenu.position}
+          className="max-h-[60vh] overflow-y-auto"
+          scrollFocusedItemIntoView
           onClose={() => {
             // The primitive closes for selection, Escape, and Tab-out but
             // never restores focus itself (ContextMenu.tsx:86-94, :122-128,
             // :154-157 — all route through onClose, no external focus()) —
-            // land focus back on the opener, then clear the state.
-            clusterMenu.opener.focus()
+            // land focus back on the opener, then clear the state. The
+            // isConnected guard (round 3): a streamed prompt can unmount
+            // the opener before this runs; focusing a detached node is a
+            // silent no-op that would strand focus on body.
+            if (clusterMenu.opener.isConnected) clusterMenu.opener.focus()
             setClusterMenu(null)
           }}
         />
       ) : null}
 ```
 
-Semantics: the open-list target is transparent and sits above the run (`z-10`), so pointer events over a dense multi-member run route to the open-list target — which therefore HOSTS the member hover previews: the tooltip over the cluster target shows the prompt of the member band under the pointer (mapped from `clientY` via the target's own rect), updates as the pointer moves between bands, and clears on leave. The member ticks' own tooltips render the identical preview formatting and stay unchanged — under the z-10 overlay they are unreachable by pointer in dense runs, but they remain the keyboard/AT path (focusing a member tick opens its own per-prompt tooltip; focusing the cluster target opens no preview — its accessible name announces the run). Every tick button remains in the DOM, tab-focusable, and directly Enter/Space-clickable (keyboard/screen-reader access unchanged; tick tab order is untouched because the cluster targets render after the ticks; the target itself is a real `<button>` in DOM order, so keyboard users reach it natively and Enter/Space drive the same click path). The target carries `aria-expanded` while its menu is open, and every close path (selection, Escape, Tab-out) restores focus to it: the repo's `ContextMenu` routes all three through `onClose` and never restores focus itself (ContextMenu.tsx:86-94, :122-128, :154-157), so the minimap's `onClose` calls `opener.focus()` before clearing the state. The tooltip and the menu can be open at once (the pointer stays on the target while the menu is open); the tooltip is `pointer-events-none` (tooltip.tsx:104) and z-40 under the menu's z-50 portal, so it cannot intercept menu input. A lone sub-4px tick's expanded hit height lives on its OWN button — same DOM position, same aria-label, same tab stop; only the hit box grows (the paint is preserved by the inner span), and by the run rule its 4px box never overlaps a neighbor tick's box. The open-list target's height is the run's span floored at the clickable minimum (`max(cluster.height, 4)`, so even a run of sub-pixel ticks gets a 4px target) and clamped to the rail bounds — at the rail's bottom edge that clamp can leave the target shorter than 4px, the documented physical limit in the Residual above, pinned by the two rail-bottom boundary tests. `ContextMenu` portals to `document.body` (outside the rail's `pointer-events-none` container) at z-50, closes on Escape/Tab/selection, and its `clampToViewport` handles overflow. If geometry hides the rail while the menu is open, the menu unmounts AND its state is cleared (the `!layout` hygiene effect) with the ContextMenu render gated on `layout && clusterMenu` — a later rail restoration cannot resurrect a stale menu whose opener element is detached.
+Semantics: the open-list target is transparent and sits above the run (`z-10`), so pointer events over a dense multi-member run route to the open-list target — which therefore HOSTS the member hover previews: the tooltip over the cluster target shows the prompt of the member band under the pointer (mapped from `clientY` via the target's own rect), updates as the pointer moves between bands, and clears on leave. The member ticks' own tooltips render the identical preview formatting and stay unchanged — under the z-10 overlay they are unreachable by pointer in dense runs, but they remain the keyboard/AT path (focusing a member tick opens its own per-prompt tooltip; focusing the cluster target opens no preview — its accessible name announces the run). Every tick button remains in the DOM, tab-focusable, and directly Enter/Space-clickable (keyboard/screen-reader access unchanged; tick tab order is untouched because the cluster targets render after the ticks; the target itself is a real `<button>` in DOM order, so keyboard users reach it natively and Enter/Space drive the same click path). The target carries `aria-expanded` while its menu is open, and every close path (selection, Escape, Tab-out) restores focus to it: the repo's `ContextMenu` routes all three through `onClose` and never restores focus itself (ContextMenu.tsx:86-94, :122-128, :154-157), so the minimap's `onClose` calls `opener.focus()` — guarded by `opener.isConnected` (a streamed prompt can unmount the opener before the close runs; focusing a detached node is a silent no-op) — before clearing the state. The tooltip and the menu can be open at once (the pointer stays on the target while the menu is open); the tooltip is `pointer-events-none` (tooltip.tsx:104) and z-40 under the menu's z-50 portal, so it cannot intercept menu input. A lone sub-4px tick's expanded hit height lives on its OWN button — same DOM position, same aria-label, same tab stop; only the hit box grows (the paint is preserved by the inner span), and by the run rule its 4px box never overlaps a neighbor tick's box. The open-list target's height is the run's span floored at the clickable minimum (`max(cluster.height, 4)`, so even a run of sub-pixel ticks gets a 4px target) and clamped to the rail bounds — at the rail's bottom edge that clamp can leave the target shorter than 4px, the documented physical limit in the Residual above, pinned by the two rail-bottom boundary tests. `ContextMenu` portals to `document.body` (outside the rail's `pointer-events-none` container) at z-50 and closes on Escape/Tab/selection; `clampToViewport` POSITIONS the menu inside the viewport, and the passed `className="max-h-[60vh] overflow-y-auto"` BOUNDS it as a scrollable surface — pointer users scroll the bounded list directly, keyboard users keep the focused item visible via the `scrollFocusedItemIntoView` flag (the primitive's `focusItem` scrolls the focused `menuitem` into view inside the menu's own scroll box), and Playwright's click auto-scrolls the list for the e2e. If geometry hides the rail while the menu is open, the menu unmounts AND its state is cleared (the `!layout` hygiene effect) with the ContextMenu render gated on `layout && clusterMenu` — a later rail restoration cannot resurrect a stale menu whose opener element is detached. Round 3 adds the stale-SNAPSHOT close: ANY re-measure while the menu is open (transcript scroll, pane resize, streamed prompt — detected by `measurement !== clusterMenu.openedMeasurement`, the identity captured at open) closes the menu the same way, so its item list and position can never outlive the geometry they were computed from; scrolling the menu's OWN portaled list never re-measures the transcript (its scroll events fire on the document.body portal, outside the scroller), so list scrolling never dismisses it — only transcript-side geometry changes do.
 
 - [ ] **Step 4: Run the focused tests**
 
 ```bash
-npm run test:vitest -- run test/unit/client/components/fresh-agent/transcript-minimap-layout.test.ts test/unit/client/components/fresh-agent/FreshAgentTranscriptMinimap.test.tsx --config config/vitest/vitest.config.ts
+npm run test:vitest -- run test/unit/client/components/fresh-agent/transcript-minimap-layout.test.ts test/unit/client/components/fresh-agent/FreshAgentTranscriptMinimap.test.tsx test/unit/client/components/context-menu/ContextMenu.longpress.test.tsx --config config/vitest/vitest.config.ts
 bash -lc 'npm run test:e2e:cloud -- --project=chromium test/e2e-browser/specs/transcript-minimap.spec.ts'
 ```
 
-Expected: PASS — 22 layout tests (16 post-Task-2 pre-existing + the 6 cluster tests), 29 component tests (15 post-Task-1 pre-existing + the Task-2 spy test + the 13 Task-3 tests: 4 cluster affordance + 3 cluster hover-preview + 3 opener a11y/focus + 2 rail-bottom clamp boundary + 1 stale-menu-state hygiene; the suite's cumulative arithmetic is now 14 pre-Task-1 → 15 (Task 1) → 16 (Task 2) → 29 (Task 3) → 30 (Task 4, its gate test)), and all 3 e2e tests (2 pre-existing + the dense-cluster test) including the dense-cluster flow with its density guard satisfied.
+Expected: PASS — 22 layout tests (16 post-Task-2 pre-existing + the 6 cluster tests), 32 component tests (15 post-Task-1 pre-existing + the Task-2 spy test + the 16 Task-3 tests: 4 cluster affordance + 3 cluster hover-preview + 3 opener a11y/focus + 2 rail-bottom clamp boundary + 1 rail-hidden menu-state hygiene + 2 bounded-menu (30-prompt render/class pins + keyboard item-scroll) + 1 re-measure menu-close hygiene; the suite's cumulative arithmetic is now 14 pre-Task-1 → 15 (Task 1) → 16 (Task 2) → 32 (Task 3) → 33 (Task 4, its gate test)), the `ContextMenu.longpress.test.tsx` suite green (the primitive's edits are additive default-off props — the long-press provider passes neither, so its dismissal-guard behavior is byte-identical), and all 3 e2e tests (2 pre-existing + the dense-cluster test, round-3 scaled to a 40-prompt single cluster whose bounded menu genuinely overflows) including the dense-cluster flow with its density guard satisfied.
 
 - [ ] **Step 5: Refactor while green**
 
-No refactor needed. The clickability pass is one self-contained loop over the already-final `ticks` array (the packing loop is untouched); the component adds two state slots (the menu payload and the hover selection), one pure band-mapping helper, one UI-state hygiene effect, one small lookup set, one conditional in the tick map, and one render block on pre-existing primitives (button, span, Tooltip, ContextMenu).
+No refactor needed. The clickability pass is one self-contained loop over the already-final `ticks` array (the packing loop is untouched); the component adds two state slots (the menu payload — widened round 3 with the opened-measurement identity — and the hover selection), one pure band-mapping helper, one UI-state hygiene effect (rail-hidden plus re-measure closes), one small lookup set, one conditional in the tick map, one render block on pre-existing primitives (button, span, Tooltip, ContextMenu), and one narrowing clause on the render gate; the shared primitive gains only two additive default-off props, already in their final shape.
 
 - [ ] **Step 6: Run impacted-test verification**
 
 ```bash
-npm run test:vitest -- run test/unit/client/components/fresh-agent/ --config config/vitest/vitest.config.ts
+npm run test:vitest -- run test/unit/client/components/fresh-agent/ test/unit/client/components/context-menu/ --config config/vitest/vitest.config.ts
 npm run typecheck:client
 npm run lint
 npm run test:e2e:a11y-gate:deny 2>&1 | grep -c "transcript-minimap" || true   # expect 0 violations naming our spec (gate itself is pre-existing red — Global Constraints)
 git grep -n "transcript-minimap" test/e2e-browser/playwright.cloud.config.ts || echo "not skipped"
 ```
 
-Expected: PASS / clean. A11y: the new target carries a real role + aria-label + aria-haspopup + aria-expanded (mirroring its menu's open state), restores focus to its opener on every close path, and hosts its members' hover previews through the same tooltip primitive (state-driven content, hidden when no member is hovered); the lone-tick paint span is aria-hidden (its button keeps the accessible name and role); the menu is the repo's own role="menu"/menuitem primitive; all spec locators stay in the permitted set, and zero gate violations name transcript-minimap.spec.ts. No `docs/index.html` change for this task: the cluster affordances (open-list targets, expanded lone-tick hit heights) are extreme-density-only, not part of the default experience the mock depicts (AGENTS.md's "only major changes" rule).
+Expected: PASS / clean — including the context-menu suites (the primitive's edits are additive default-off props; the long-press provider passes neither, so its dismissal-guard behavior is byte-identical). A11y: the new target carries a real role + aria-label + aria-haspopup + aria-expanded (mirroring its menu's open state), restores focus to its opener on every close path, and hosts its members' hover previews through the same tooltip primitive (state-driven content, hidden when no member is hovered); the lone-tick paint span is aria-hidden (its button keeps the accessible name and role); the menu is the repo's own role="menu"/menuitem primitive; all spec locators stay in the permitted set, and zero gate violations name transcript-minimap.spec.ts. No `docs/index.html` change for this task: the cluster affordances (open-list targets, expanded lone-tick hit heights) are extreme-density-only, not part of the default experience the mock depicts (AGENTS.md's "only major changes" rule).
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/components/fresh-agent/shared/transcript-minimap-layout.ts test/unit/client/components/fresh-agent/transcript-minimap-layout.test.ts src/components/fresh-agent/FreshAgentTranscriptMinimap.tsx test/unit/client/components/fresh-agent/FreshAgentTranscriptMinimap.test.tsx test/e2e-browser/specs/transcript-minimap.spec.ts
+git add src/components/context-menu/ContextMenu.tsx src/components/fresh-agent/shared/transcript-minimap-layout.ts test/unit/client/components/fresh-agent/transcript-minimap-layout.test.ts src/components/fresh-agent/FreshAgentTranscriptMinimap.tsx test/unit/client/components/fresh-agent/FreshAgentTranscriptMinimap.test.tsx test/e2e-browser/specs/transcript-minimap.spec.ts
 git commit -m "feat(fresh-agent): dense-cluster click-list affordance for minimap ticks"
 ```
 
@@ -1765,7 +1975,7 @@ git commit -m "feat(fresh-agent): dense-cluster click-list affordance for minima
   })
 ```
 
-5. `test/unit/client/components/fresh-agent/FreshAgentTranscriptMinimap.test.tsx` — gate test (after the "hides the rail when the transcript fits the viewport" test; it proves the SETTING hides the rail under geometry that would otherwise render it, and that the rail's work never starts). With this test the component suite reaches 30 tests (14 pre-Task-1 + 1 Task-1 + 1 Task-2 + 13 Task-3 + this gate — the Task-3 Step-4 arithmetic carried one task forward):
+5. `test/unit/client/components/fresh-agent/FreshAgentTranscriptMinimap.test.tsx` — gate test (after the "hides the rail when the transcript fits the viewport" test; it proves the SETTING hides the rail under geometry that would otherwise render it, and that the rail's work never starts). With this test the component suite reaches 33 tests (14 pre-Task-1 + 1 Task-1 + 1 Task-2 + 16 Task-3 + this gate — the Task-3 Step-4 arithmetic carried one task forward):
 
 ```tsx
   it('hides the rail and its measurement work when showTranscriptMinimap is false', () => {
@@ -2190,14 +2400,14 @@ git commit -m "feat(fresh-agent): add Show transcript minimap setting (default o
 
 ## Recorded residuals (carry into the recap verbatim)
 
-1. **Extreme-density physical limits** (accepted by the User Request): cluster-member ticks remain visually sub-4px — the one-tick-per-prompt contract forbids merging their paint; their pointer path is the cluster's open-list target (hover preview hosted on the target, jumps via its menu). A LONE sub-4px tick is directly clickable via its button's expanded 4px hit height (a one-item menu would add nothing — the tick itself is the affordance). Keyboard/screen-reader access to every individual tick is unchanged. **Rail-bottom clamp:** dense targets within the final 4px of the rail render shorter than 4px — a documented physical limit (the run contract accepts documented physical limits): at a fixed rail edge with exact-4px-pitch neighbors, a full 4px box necessarily overlaps a neighbor's own ≥4px box, and later-in-DOM hit-testing would starve it; the clamp guarantees every OTHER tick keeps its full clickable area. Pinned by Task 3's two rail-bottom boundary tests; this replaces silence, not a behavior change.
+1. **Extreme-density physical limits** (accepted by the User Request): cluster-member ticks remain visually sub-4px — the one-tick-per-prompt contract forbids merging their paint; their pointer path is the cluster's open-list target (hover preview hosted on the target, jumps via its menu). A LONE sub-4px tick is directly clickable via its button's expanded 4px hit height (a one-item menu would add nothing — the tick itself is the affordance). Keyboard/screen-reader access to every individual tick is unchanged. **Rail-bottom clamp:** dense targets within the final 4px of the rail render shorter than 4px — a documented physical limit (the run contract accepts documented physical limits): at a fixed rail edge with exact-4px-pitch neighbors, a full 4px box necessarily overlaps a neighbor's own ≥4px box, and later-in-DOM hit-testing would starve it; the clamp guarantees every OTHER tick keeps its full clickable area. Pinned by Task 3's two rail-bottom boundary tests; this replaces silence, not a behavior change. **Menu bound (round 3):** the cluster menu is bounded at `max-h-[60vh]` and scrollable (`overflow-y-auto`) — every prompt in a cluster is reachable by pointer (direct list scrolling) and by keyboard (arrow keys scroll the focused item into view via the primitive's `scrollFocusedItemIntoView` flag), so the accepted physical-limit residual is ONLY the rail-edge clamp above.
 2. **Stale measurement while the rail is unmounted**: with the setting OFF, a content-only resize (disclosure toggle) leaves the stored shared measurement stale until the next scroll/signature trigger; when the rail remounts, real browsers self-heal within a frame (ResizeObserver fires on initial observe). (The fits-viewport-hidden mode is NOT stale: the component stays mounted with live observers there, so content-only resizes still re-sweep.) The glom chip — the only consumer live at that moment — does not depend on article-resize freshness.
 3. **Local-only setting**: `showTranscriptMinimap` persists per-browser (localStorage diff-vs-defaults blob) and does not roam across devices — identical to its `expandThinking`/`expandTools`/`showTimecodes` siblings. The server track exists (settings report §3) if roaming is ever wanted; it is out of scope here.
 4. **Mount-cost note**: the initial transcript mount runs the shared sweep once (parent signature effect). The one-sweep guarantee covers the scroll trigger; the rail owns TWO independent ResizeObserver subscriptions (children + scroller), and each delivers an initial callback on observe (ResizeObserver fires on initial observe), so a rail (re)mount can request up to two bounded extra initial sweeps (one per subscription: children + scroller) — mount-time only, it does not reintroduce per-scroll double-sweeping. Per-SCROLL cost is the finding's subject and is exactly one sweep.
 
 ## Convergence checklist (for the recap)
 
-- Delta Finding 1 (extreme-density clickability) → CLEARED by Task 3 (second-pass clickability runs: hover-preserving open-list targets over dense multi-member runs — the target hosts its members' hover previews — with opener focus restoration (aria-expanded; focus lands back on the opener on selection/Escape/Tab) — plus expanded hit heights on lone sub-4px ticks; one-tick-per-prompt preserved; rail-bottom clamp boundary-pinned; residual physical limits documented above).
+- Delta Finding 1 (extreme-density clickability) → CLEARED by Task 3 (second-pass clickability runs: hover-preserving open-list targets over dense multi-member runs — the target hosts its members' hover previews — with opener focus restoration (aria-expanded; focus lands back on the opener on selection/Escape/Tab) — plus expanded hit heights on lone sub-4px ticks; the cluster menu is bounded at 60vh and scrollable, so every cluster prompt is reachable by pointer and keyboard; one-tick-per-prompt preserved; rail-bottom clamp boundary-pinned; residual physical limits documented above).
 - Delta Finding 2 / whole-branch Nit 1 (doubled per-scroll scan) → CLEARED by Task 2 (one sweep per scroll, proven by the spy test; glom behavior and its tests unchanged).
 - Delta Finding 3 (tooltip word-break) → CLEARED by Task 1 (class + unit pin + e2e text-range assertion).
 - Task-001 Nit 1 (`let heights`) → CLEARED by Task 1 (`const`).
