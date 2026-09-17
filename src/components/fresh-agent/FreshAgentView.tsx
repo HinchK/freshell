@@ -1148,7 +1148,16 @@ export function FreshAgentView({
       fence = attachFenceRef.current.fence
     } else {
       fence = selectPaneOwnerFence(state, content)
-      attachFenceRef.current = { sessionKey, fence }
+      // b8ke ext r38 F1: only a PRESENT fence is cached — an absent
+      // observation (the owner record has not synced yet, the
+      // cold-restore shape) re-observes on the next send. The server's
+      // atomic adopt refuses the UNFENCED existing-session attach typed
+      // (a bridge restart must adopt the observed owner specifically), so
+      // freezing the absent observation would wedge every redrive unfenced
+      // until the reconcile window exhausted; re-observing converges the
+      // first retry after the record arrives. A present pair stays frozen
+      // per identity — automatic retries still carry the ORIGINAL pair.
+      if (fence) attachFenceRef.current = { sessionKey, fence }
     }
     const cwd = getFreshOpenCodeRouteCwd(content, { sessionCwd: freshOpenCodeRouteCwdRef.current })
     sendFreshAgentMessage(buildFreshAgentAttachMessage(content, cwd, fence))

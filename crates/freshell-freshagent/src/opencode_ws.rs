@@ -5158,33 +5158,82 @@ impl FreshOpencodeState {
         // serve-bridge restart + the attach tail, so a handoff/stop begin
         // inside the window answers the typed Blocked outcome (the
         // coordinator covers the attach through completion; pre-r12 the
-        // point-in-time snapshot closed no window — a handoff could
-        // commit between the check and the bridge restart, and the
-        // delayed attach restarted the torn-down session's SSE bridge).
+        // point-in-time snapshot closed no window — a handoff could commit
+        // between the check and the bridge restart, and the delayed attach
+        // restarted the torn-down session's SSE bridge).
         // Armed on the LIVE-key shapes only (the Vacant-key registration
         // above holds its own claim; the untracked resume below claims
         // through resume_durable_session).
+        // b8ke ext r38 F1: the arm is the ATOMIC ADOPT — the request's
+        // FULL observed pair plus the EXPECTED fresh-agent owner, validated
+        // in ONE coordinator-lock decision. Pre-r38 the arm passed NO
+        // generation at all: a terminal handoff committing between the
+        // state precheck and the arm let the guard arm on the terminal
+        // owner and the attach RESTART the superseded OpenCode event
+        // bridge beside the terminal. The absent pair (a legacy
+        // unfenced request) cannot adopt specifically — a lane that
+        // RESTARTS a runtime/bridge must adopt specifically — so it
+        // refuses typed (the FENCE_REQUIRED contract: re-observe the
+        // owner record and retry with the pair).
         let mut existing_session_attach_guard = None;
         if session_arc.is_some() {
-            existing_session_attach_guard = match crate::ownership_lane::arm_attach_guard(
-                &self.fresh_agent.ownership,
-                PROVIDER,
-                &msg.session_id,
-                &format!("attach-{}", uuid::Uuid::new_v4()),
-                None,
-                "freshopencode/attach",
-            ) {
-                crate::ownership_lane::LaneAttachGuard::Armed(guard) => Some(guard),
-                crate::ownership_lane::LaneAttachGuard::Unwired => None,
-                crate::ownership_lane::LaneAttachGuard::Refused => {
+            match attach_fence {
+                Some(adopt_fence) => {
+                    let expected_fresh_owner = freshell_ownership::OwnerIdentity {
+                        kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                        terminal_id: None,
+                        live_session_key: None,
+                        pid: None,
+                        ownership_id: None,
+                    };
+                    existing_session_attach_guard = match crate::ownership_lane::arm_adopt_guard(
+                        &self.fresh_agent.ownership,
+                        PROVIDER,
+                        &msg.session_id,
+                        &format!("attach-{}", uuid::Uuid::new_v4()),
+                        &expected_fresh_owner,
+                        adopt_fence,
+                        "freshopencode/attach",
+                    ) {
+                        crate::ownership_lane::LaneAttachGuard::Armed(guard) => Some(guard),
+                        crate::ownership_lane::LaneAttachGuard::Unwired => None,
+                        crate::ownership_lane::LaneAttachGuard::Refused => {
+                            self.emit_fresh_agent_error(
+                                &msg.session_id,
+                                "SESSION_RESERVED",
+                                "A lifecycle operation owns this session; retry after it settles",
+                            );
+                            return;
+                        }
+                    };
+                }
+                // The absent pair on a WIRED lane cannot adopt specifically —
+                // the existing-session attach restarts the serve-event
+                // bridge, so it refuses typed (the FENCE_REQUIRED
+                // contract: re-observe the owner record and retry with
+                // the pair). On an UNWIRED lane there is no coordinator
+                // to adopt from — the pre-wiring legacy semantics hold
+                // (no guard, the attach proceeds).
+                None if self.fresh_agent.ownership.is_some() => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %msg.session_id,
+                        code = "FENCE_REQUIRED",
+                        "fresh_agent_attach_refused: the existing-session attach carries \
+                         no observed ownership pair against a coordinator-wired lane — \
+                         the bridge restart must adopt the observed owner specifically; \
+                         the client re-observes the owner record and retries with the \
+                         pair (kata b8ke ext r38 F1)"
+                    );
                     self.emit_fresh_agent_error(
                         &msg.session_id,
                         "SESSION_RESERVED",
-                        "A lifecycle operation owns this session; retry after it settles",
+                        "The attach carried no observed ownership pair; re-observe the \
+                         session's owner record and retry",
                     );
                     return;
                 }
-            };
+                None => {}
+            }
         }
         let session_arc = match session_arc {
             Some(session_arc) => session_arc,
@@ -7207,6 +7256,144 @@ mod tests {
             ),
             "the terminal owner stays authoritative — the attach was \
              refused typed (no bridge restart beside it)"
+        );
+    }
+
+    /// b8ke ext r38 F1: the existing-session attach arms the ATOMIC ADOPT
+    /// — the request's observed pair plus the expected fresh-agent owner,
+    /// validated in ONE coordinator decision. A STALE pair (ownership
+    /// advanced after the client observed it — a handoff-and-fail-restore
+    /// bumped the generation) refuses typed with NO bridge restart. This
+    /// is the deterministic stand-in for the precheck-to-arm race: a
+    /// terminal handoff committing between the state precheck and the arm
+    /// advances the generation the same way, so a client whose pair
+    /// predates the commit can never arm. Pre-r38 the arm passed NO pair
+    /// and armed on whatever was live (the laundering class) — a restart
+    /// over a record the request never observed.
+    #[tokio::test]
+    async fn a_stale_pair_existing_session_attach_refuses_typed_without_restarting_the_bridge() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        // A materialized session — the existing-session attach path.
+        st.handle_create(create_msg("req-r38-f1-oc-stale"), None)
+            .await;
+        let placeholder = "freshopencode-req-r38-f1-oc-stale";
+        st.handle_send(send_msg(placeholder, "hi")).await;
+        let real_id = {
+            let sessions = st.sessions.lock().await;
+            let guard = sessions
+                .get(placeholder)
+                .expect("placeholder tracked")
+                .lock()
+                .await;
+            guard
+                .real_session_id
+                .clone()
+                .expect("the session materialized")
+        };
+        // The create's adoption must commit the Live fresh-agent owner.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if matches!(
+                registry.observe("opencode", &real_id).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the create's adoption never committed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // The CLIENT'S pair — observed before the bump.
+        let before = registry.observe("opencode", &real_id);
+
+        // The generation ADVANCES without an owner flip: a handoff
+        // begin (granted) whose fail-restore reinstates the SAME
+        // fresh-agent Live record at the bumped generation.
+        let freshell_ownership::BeginOutcome::Granted { .. } = registry.begin_handoff(
+            "opencode",
+            &real_id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-r38-f1-oc-bump",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("the generation-bump handoff must grant")
+        };
+        let _ = registry.fail("opencode", &real_id, "op-r38-f1-oc-bump", 2, true);
+        assert!(
+            matches!(
+                registry.observe("opencode", &real_id).state,
+                freshell_ownership::OwnershipState::Live { owner, generation, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                        && generation == before.generation + 1,
+            ),
+            "the fail-restore must reinstate the fresh-agent owner at the \
+             bumped generation"
+        );
+
+        // THE DELAYED ATTACH with the STALE pair — the state precheck sees
+        // Live (passes); the ADOPT validates the pair and refuses typed.
+        st.handle_attach(FreshAgentAttach {
+            provider: AgentProvider::Opencode,
+            session_id: real_id.clone(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+            observed_epoch: Some(before.epoch),
+            observed_generation: Some(before.generation),
+            resume_session_id: None,
+            session_ref: None,
+        })
+        .await;
+
+        let mut saw_typed_refusal = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match rx.try_recv() {
+                Ok(frame) => {
+                    let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                    if frame["type"] == "freshAgent.event"
+                        && frame["event"]["type"] == "freshAgent.error"
+                        && frame["event"]["code"] == "SESSION_RESERVED"
+                    {
+                        saw_typed_refusal = true;
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the stale-pair attach never answered the typed refusal"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_typed_refusal,
+            "the stale-pair existing-session attach must answer the typed refusal"
+        );
+        // The fresh-agent owner stays authoritative at the bumped
+        // generation — the adopt never armed, the bridge never restarted.
+        assert!(
+            matches!(
+                registry.observe("opencode", &real_id).state,
+                freshell_ownership::OwnershipState::Live { owner, generation, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                        && generation == before.generation + 1,
+            ),
+            "the fresh-agent owner stays authoritative at the bumped generation"
         );
     }
 

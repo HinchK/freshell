@@ -1584,6 +1584,191 @@ impl RuntimeOwnershipRegistry {
         }))
     }
 
+    /// b8ke ext r38 F1: the ATOMIC ADOPT — the guard PRIMITIVE for every
+    /// path that starts or restarts a runtime/bridge over an existing
+    /// owner. `begin_attach_guard` is a generic window (any Live owner,
+    /// an optional generation, no epoch check) — a precheck-then-guard
+    /// sequence can observe one owner and arm on ANOTHER (a terminal
+    /// handoff committing between the caller's snapshot and the guard
+    /// acquisition armed the rollback's guard on the TERMINAL owner and
+    /// let it spawn a Fresh Claude sidecar beside the terminal before
+    /// the late rekey tore it down). The adopt validates EVERYTHING in
+    /// ONE coordinator-lock decision: the observed EPOCH (a different
+    /// boot's pair is stale), the observed GENERATION (exactly — the
+    /// adopt names the specific record the caller observed; any advance
+    /// is a changed world), the owner's KIND (the caller's expectation),
+    /// and every identity field the caller supplies (terminal_id /
+    /// live_session_key / pid — `None`-valued fields are unchecked, the
+    /// caller's honest knowledge boundary). Any mismatch answers the
+    /// typed refusal: a kind/identity mismatch as `Refused` carrying the
+    /// CURRENT owner (the lane surfaces SESSION_RESERVED + the owner
+    /// fields), an epoch/generation mismatch as `StaleGeneration` (the
+    /// refresh-and-retry contract). The armed window is the SAME
+    /// r32-identified attach window (`in_flight_attaches` +
+    /// `armed_attach_ops`), so the holder's late-claim exemption and the
+    /// exit-during-guard deferral apply unchanged.
+    pub fn begin_adopt_guard(
+        self: &Arc<Self>,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        expected: &OwnerIdentity,
+        observed: ObservedFence,
+        initiator: &str,
+    ) -> AttachGuardOutcome {
+        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let key = SessionKey::new(provider, session_id);
+        // (1) THE EPOCH — the pair is one fence; a different boot's pair
+        // is stale regardless of the generation.
+        if observed.epoch != self.epoch {
+            tracing::warn!(target: "freshell_ownership",
+                event = "ownership.adopt_guard.stale_epoch",
+                operation_id, provider, session_id, initiator,
+                from_kind = ?Some(expected.kind),
+                to_kind = ?Option::<RuntimeOwnerKind>::None,
+                runtime_id = ?expected.terminal_id, pid = ?expected.pid,
+                observed_epoch = observed.epoch, observed_generation = observed.generation,
+                epoch = self.epoch,
+                duration_ms = 0u64,
+                outcome = "refused", failure_reason = "STALE_EPOCH",
+                "the adopt's observed epoch predates this boot — the adopt \
+                 refuses typed (refresh and retry)");
+            return AttachGuardOutcome::StaleGeneration {
+                current_epoch: self.epoch,
+                current_generation: 0,
+            };
+        }
+        let Some(record) = inner.get_mut(&key) else {
+            tracing::warn!(target: "freshell_ownership",
+                event = "ownership.adopt_guard.refused",
+                operation_id, provider, session_id, initiator,
+                from_kind = ?Some(expected.kind),
+                to_kind = ?Option::<RuntimeOwnerKind>::None,
+                runtime_id = ?expected.terminal_id, pid = ?expected.pid,
+                observed_generation = observed.generation,
+                epoch = self.epoch,
+                duration_ms = 0u64,
+                outcome = "refused", failure_reason = "NOT_LIVE",
+                "the adopt's key holds no coordinator record — the adopt \
+                 refuses typed");
+            return AttachGuardOutcome::Refused {
+                state: OwnershipState::Vacant,
+                generation: 0,
+            };
+        };
+        // (2) THE STATE — only a Live owner can be adopted.
+        let OwnershipState::Live {
+            owner: current_owner,
+            generation: current_generation,
+            ..
+        } = record.state.clone()
+        else {
+            tracing::warn!(target: "freshell_ownership",
+                event = "ownership.adopt_guard.refused",
+                operation_id, provider, session_id, initiator,
+                from_kind = ?Some(expected.kind),
+                to_kind = ?Option::<RuntimeOwnerKind>::None,
+                runtime_id = ?expected.terminal_id, pid = ?expected.pid,
+                observed_generation = observed.generation,
+                epoch = self.epoch, generation = snapshot_generation(record),
+                duration_ms = 0u64,
+                outcome = "refused", failure_reason = "NOT_LIVE",
+                "a lifecycle transition (or a non-Live shape) owns the key — \
+                 the adopt refuses typed; the guard never arms");
+            return AttachGuardOutcome::Refused {
+                state: record.state.clone(),
+                generation: snapshot_generation(record),
+            };
+        };
+        // (3) THE GENERATION — exactly. The adopt names the SPECIFIC
+        // record the caller observed; any advance (a committed handoff
+        // bumped it) is a changed world, never the owner the caller
+        // decided on.
+        if observed.generation != current_generation {
+            tracing::warn!(target: "freshell_ownership",
+                event = "ownership.adopt_guard.stale_generation",
+                operation_id, provider, session_id, initiator,
+                from_kind = ?Some(expected.kind),
+                to_kind = ?Option::<RuntimeOwnerKind>::None,
+                runtime_id = ?expected.terminal_id, pid = ?expected.pid,
+                observed_generation = observed.generation,
+                epoch = self.epoch, generation = current_generation,
+                duration_ms = 0u64,
+                outcome = "refused", failure_reason = "STALE_GENERATION",
+                "the adopt's observed generation does not name the current \
+                 record — ownership advanced between the caller's decision \
+                 and the adopt; refresh and retry");
+            return AttachGuardOutcome::StaleGeneration {
+                current_epoch: self.epoch,
+                current_generation,
+            };
+        }
+        // (4) THE EXPECTED OWNER — the kind always; every identity field
+        // the caller supplied (a `None`-valued field is the caller's
+        // honest "unknown", unchecked).
+        let kind_mismatch = current_owner.kind != expected.kind;
+        let identity_mismatch = expected
+            .terminal_id
+            .as_ref()
+            .is_some_and(|tid| current_owner.terminal_id.as_ref() != Some(tid))
+            || expected
+                .live_session_key
+                .as_ref()
+                .is_some_and(|key| current_owner.live_session_key.as_ref() != Some(key))
+            || expected
+                .pid
+                .is_some_and(|pid| current_owner.pid != Some(pid));
+        if kind_mismatch || identity_mismatch {
+            tracing::warn!(target: "freshell_ownership",
+                event = "ownership.adopt_guard.owner_mismatch",
+                operation_id, provider, session_id, initiator,
+                from_kind = ?Some(expected.kind),
+                to_kind = ?Option::<RuntimeOwnerKind>::None,
+                runtime_id = ?expected.terminal_id, pid = ?expected.pid,
+                observed_generation = observed.generation,
+                epoch = self.epoch, generation = current_generation,
+                current_kind = ?current_owner.kind,
+                current_runtime_id = ?current_owner.terminal_id,
+                current_pid = ?current_owner.pid,
+                duration_ms = 0u64,
+                outcome = "refused", failure_reason = "OWNER_MISMATCH",
+                "the current owner is not the owner the caller observed and \
+                 expected — the adopt refuses typed, never arming over a \
+                 runtime the caller did not decide on");
+            return AttachGuardOutcome::Refused {
+                state: record.state.clone(),
+                generation: current_generation,
+            };
+        }
+        // (5) ARM — the same identified r32 window.
+        record.in_flight_attaches = record.in_flight_attaches.saturating_add(1);
+        record.armed_attach_ops.push(operation_id.to_string());
+        tracing::info!(target: "freshell_ownership",
+            event = "ownership.adopt_guard.armed",
+            operation_id, provider, session_id, initiator,
+            from_kind = ?Some(expected.kind),
+            to_kind = ?Option::<RuntimeOwnerKind>::None,
+            runtime_id = ?current_owner.terminal_id, pid = ?current_owner.pid,
+            epoch = self.epoch, generation = current_generation,
+            in_flight_attaches = record.in_flight_attaches,
+            duration_ms = 0u64,
+            outcome = "armed", failure_reason = "",
+            "the ATOMIC adopt armed — the observed fence and the expected \
+             owner validated in ONE coordinator-lock decision; the window \
+             covers the adopt through completion and concurrent lifecycle \
+             begins answer Blocked");
+        AttachGuardOutcome::Armed(Box::new(AttachGuard {
+            registry: Arc::clone(self),
+            provider: provider.to_string(),
+            session_id: session_id.to_string(),
+            operation_id: operation_id.to_string(),
+            generation: current_generation,
+            disarmed: std::sync::atomic::AtomicBool::new(false),
+            armed_at_ms: now_epoch_ms(),
+            initiator: initiator.to_string(),
+        }))
+    }
+
     /// b8ke ext r17 F1: the ATOMIC acknowledged start — the ONE-lock-hold
     /// conditional transition `Fenced{ClearedUnverified} → Handoff` with
     /// the acknowledged-risk arm carried INTO the claim. Pre-r17 the
@@ -10584,6 +10769,228 @@ mod tests {
                 assert!(matches!(state, OwnershipState::Handoff { .. }));
             }
             other => panic!("a mid-Handoff key must refuse the guard: {other:?}"),
+        }
+    }
+
+    /// b8ke ext r38 F1: the ATOMIC ADOPT — `begin_adopt_guard` validates
+    /// the epoch, the Live state, the EXACT generation, and the EXPECTED
+    /// owner in ONE lock-held decision, then arms the same r32 window. A
+    /// stale epoch or generation answers StaleGeneration; a non-Live key
+    /// or an owner that is not the expected kind/identity answers Refused
+    /// carrying the CURRENT state; only the observed-and-expected owner
+    /// arms. The check-to-guard laundering (re-observe whatever's live and
+    /// arm on it) is structurally impossible here: the caller's decision
+    /// pair and expectation ARE the arming condition.
+    #[test]
+    fn the_adopt_guard_validates_epoch_state_generation_and_expected_owner_atomically() {
+        let registry = Arc::new(RuntimeOwnershipRegistry::new());
+        let fresh_owner = OwnerIdentity {
+            kind: RuntimeOwnerKind::FreshAgent,
+            terminal_id: None,
+            live_session_key: None,
+            pid: None,
+            ownership_id: None,
+        };
+
+        // (1) A Vacant key: Refused typed.
+        match registry.begin_adopt_guard(
+            "claude",
+            "sid-adopt-v",
+            "adopt-v",
+            &fresh_owner,
+            ObservedFence {
+                epoch: registry.epoch,
+                generation: 1,
+            },
+            "test",
+        ) {
+            AttachGuardOutcome::Refused { state, .. } => {
+                assert!(matches!(state, OwnershipState::Vacant));
+            }
+            other => panic!("a Vacant key must refuse the adopt: {other:?}"),
+        }
+
+        // A Live FRESH-AGENT key as the adopt fixture.
+        let BeginOutcome::Granted { generation } = registry.begin_start(
+            "claude",
+            "sid-adopt",
+            RuntimeOwnerKind::FreshAgent,
+            "op-live-adopt",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("fixture start granted")
+        };
+        assert_eq!(
+            registry.commit_live(
+                "claude",
+                "sid-adopt",
+                "op-live-adopt",
+                generation,
+                OwnerIdentity {
+                    kind: RuntimeOwnerKind::FreshAgent,
+                    live_session_key: Some("k-adopt".into()),
+                    ..fresh_owner.clone()
+                },
+            ),
+            CommitOutcome::Committed
+        );
+        let live_fence = ObservedFence {
+            epoch: registry.epoch,
+            generation,
+        };
+
+        // (2) A stale EPOCH (a different boot's pair): StaleGeneration
+        // typed, never Refused-with-live-state (the caller must refresh,
+        // not re-decide).
+        match registry.begin_adopt_guard(
+            "claude",
+            "sid-adopt",
+            "adopt-epoch",
+            &fresh_owner,
+            ObservedFence {
+                epoch: registry.epoch + 1,
+                generation,
+            },
+            "test",
+        ) {
+            AttachGuardOutcome::StaleGeneration { current_epoch, .. } => {
+                assert_eq!(current_epoch, registry.epoch);
+            }
+            other => panic!("a foreign epoch must refuse the adopt typed-stale: {other:?}"),
+        }
+
+        // (3) A stale GENERATION (ownership advanced — a handoff
+        // committed between the caller's decision and the adopt):
+        // StaleGeneration typed.
+        match registry.begin_adopt_guard(
+            "claude",
+            "sid-adopt",
+            "adopt-stale-gen",
+            &fresh_owner,
+            ObservedFence {
+                epoch: registry.epoch,
+                generation: generation - 1,
+            },
+            "test",
+        ) {
+            AttachGuardOutcome::StaleGeneration {
+                current_generation, ..
+            } => {
+                assert_eq!(current_generation, generation);
+            }
+            other => panic!("a stale generation must refuse the adopt typed-stale: {other:?}"),
+        }
+
+        // (4) The EXPECTED-OWNER mismatch — the caller's pair is CURRENT
+        // but the live owner is not the kind the caller decided on (the
+        // defense-in-depth under the generation check): Refused carrying
+        // the CURRENT live state, never Armed.
+        let expected_terminal = OwnerIdentity {
+            kind: RuntimeOwnerKind::Terminal,
+            terminal_id: Some("t-decoy".into()),
+            live_session_key: None,
+            pid: None,
+            ownership_id: None,
+        };
+        match registry.begin_adopt_guard(
+            "claude",
+            "sid-adopt",
+            "adopt-kind",
+            &expected_terminal,
+            live_fence,
+            "test",
+        ) {
+            AttachGuardOutcome::Refused {
+                state,
+                generation: ref gen,
+            } => {
+                assert!(matches!(state, OwnershipState::Live { .. }), "{state:?}");
+                assert_eq!(*gen, generation);
+            }
+            other => panic!("a kind mismatch must refuse the adopt: {other:?}"),
+        }
+
+        // (4b) An identity mismatch with the RIGHT kind — the caller
+        // supplied a terminal id the live owner does not hold: Refused.
+        let wrong_terminal = OwnerIdentity {
+            kind: RuntimeOwnerKind::FreshAgent,
+            terminal_id: Some("t-wrong".into()),
+            ..fresh_owner.clone()
+        };
+        match registry.begin_adopt_guard(
+            "claude",
+            "sid-adopt",
+            "adopt-identity",
+            &wrong_terminal,
+            live_fence,
+            "test",
+        ) {
+            AttachGuardOutcome::Refused { state, .. } => {
+                assert!(matches!(state, OwnershipState::Live { .. }), "{state:?}");
+            }
+            other => panic!("an identity mismatch must refuse the adopt: {other:?}"),
+        }
+
+        // (5) The HAPPY adopt — the current pair over the expected owner:
+        // Armed, the r32 window open (a concurrent handoff begin answers
+        // Blocked), and the window CLOSES on drop (the handoff then
+        // grants).
+        let guard = match registry.begin_adopt_guard(
+            "claude",
+            "sid-adopt",
+            "adopt-happy",
+            &fresh_owner,
+            live_fence,
+            "test",
+        ) {
+            AttachGuardOutcome::Armed(guard) => guard,
+            other => panic!("the observed-and-expected owner must arm: {other:?}"),
+        };
+        assert_eq!(guard.operation_id(), "adopt-happy");
+        match registry.begin_handoff(
+            "claude",
+            "sid-adopt",
+            RuntimeOwnerKind::Terminal,
+            "op-competitor-adopt",
+            None,
+            "competitor",
+            2_000,
+        ) {
+            BeginOutcome::Blocked { .. } => {}
+            other => panic!("the armed adopt window must block a competitor: {other:?}"),
+        }
+        drop(guard);
+        let BeginOutcome::Granted { .. } = registry.begin_handoff(
+            "claude",
+            "sid-adopt",
+            RuntimeOwnerKind::Terminal,
+            "op-competitor-adopt-2",
+            None,
+            "competitor",
+            3_000,
+        ) else {
+            panic!("the closed adopt window must let a competitor through")
+        };
+
+        // (6) A mid-transition key (the handoff above never committed —
+        // still in Handoff): Refused, never Armed.
+        match registry.begin_adopt_guard(
+            "claude",
+            "sid-adopt",
+            "adopt-mid",
+            &fresh_owner,
+            ObservedFence {
+                epoch: registry.epoch,
+                generation: generation + 1,
+            },
+            "test",
+        ) {
+            AttachGuardOutcome::Refused { state, .. } => {
+                assert!(matches!(state, OwnershipState::Handoff { .. }), "{state:?}");
+            }
+            other => panic!("a mid-transition key must refuse the adopt: {other:?}"),
         }
     }
 }

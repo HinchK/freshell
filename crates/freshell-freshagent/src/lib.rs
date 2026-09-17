@@ -1460,6 +1460,71 @@ pub mod ownership_lane {
         }
     }
 
+    /// b8ke ext r38 F1: the ATOMIC-ADOPT arm — the guard for every path
+    /// that starts or restarts a runtime/bridge over an existing owner.
+    /// Takes the request's FULL observed fence (epoch + generation) and
+    /// the EXPECTED owner (the kind always; the identity fields the
+    /// caller knows); the coordinator validates all of it in ONE
+    /// lock-held decision. Typed refusals: a stale epoch/generation or
+    /// a kind/identity mismatch — the precheck-then-guard laundering
+    /// (re-observe whatever's live and arm on it) is gone.
+    pub fn arm_adopt_guard(
+        registry: &Option<Arc<RuntimeOwnershipRegistry>>,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        expected: &freshell_ownership::OwnerIdentity,
+        observed: freshell_ownership::ObservedFence,
+        initiator: &str,
+    ) -> LaneAttachGuard {
+        let Some(registry) = registry.as_ref() else {
+            return LaneAttachGuard::Unwired;
+        };
+        match registry.begin_adopt_guard(
+            provider,
+            session_id,
+            operation_id,
+            expected,
+            observed,
+            initiator,
+        ) {
+            freshell_ownership::AttachGuardOutcome::Armed(guard) => LaneAttachGuard::Armed(*guard),
+            freshell_ownership::AttachGuardOutcome::Refused { state, generation } => {
+                tracing::warn!(target: "freshell_ownership",
+                    operation_id = %operation_id, provider = %provider,
+                    session_id = %session_id, initiator,
+                    expected_kind = ?expected.kind,
+                    state = ?state, generation,
+                    event = "ownership.adopt_guard.refused",
+                    outcome = "refused", failure_reason = "ADOPT_MISMATCH",
+                    "the atomic adopt refused to arm (the key is not held \
+                     by the expected owner at the observed pair) — the \
+                     caller aborts typed, nothing is killed or spawned"
+                );
+                LaneAttachGuard::Refused
+            }
+            freshell_ownership::AttachGuardOutcome::StaleGeneration {
+                current_epoch,
+                current_generation,
+            } => {
+                tracing::warn!(target: "freshell_ownership",
+                    operation_id = %operation_id, provider = %provider,
+                    session_id = %session_id, initiator,
+                    expected_kind = ?expected.kind,
+                    observed_epoch = observed.epoch,
+                    observed_generation = observed.generation,
+                    current_epoch, current_generation,
+                    event = "ownership.adopt_guard.refused",
+                    outcome = "refused", failure_reason = "STALE_GENERATION",
+                    "the atomic adopt refused to arm (the observed fence is \
+                     stale or names a different epoch) — the caller aborts \
+                     typed; refresh and retry"
+                );
+                LaneAttachGuard::Refused
+            }
+        }
+    }
+
     /// b8ke ext r18 F1: the RELEASED owner frame — the vacant owner state
     /// plus the post-stop (epoch, generation) pair a connected client
     /// refreshes its observed fence from. Emitted by every SUCCESSFUL
@@ -4072,15 +4137,53 @@ async fn resume_session_ref_tab(
         // same-pane re-open) proceeds ONLY under HELD authority (pre-r13
         // the arm proceeded with NO claim: a handoff could commit while
         // the stale request installed the pane).
+        // b8ke ext r38 F1: the arm is the ATOMIC ADOPT — the retained
+        // stamp's pair (the server's own recorded fence for this durable
+        // id, observed above) plus the EXPECTED fresh-agent owner,
+        // validated in ONE coordinator decision. Pre-r38 the arm passed
+        // NO pair (None) — a terminal handoff committing between the
+        // claim and the arm let the resume spawn/adopt beside the
+        // terminal owner. The absent stamp on a WIRED lane (nothing
+        // retained — a foreign-owned live key the lane cannot vouch for)
+        // refuses typed: the resume spawns a runtime and must adopt
+        // specifically; on an UNWIRED lane there is no coordinator to
+        // adopt from (the pre-wiring legacy semantics hold — no guard).
         ownership_lane::LaneClaim::Adopt => {
-            match ownership_lane::arm_attach_guard(
-                &state.ownership,
-                PROVIDER,
-                &durable_id,
-                &format!("{resume_op}-adopt"),
-                None,
-                "freshopencode/rest-resume-adopt",
-            ) {
+            let expected_fresh_owner = freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: None,
+                pid: None,
+                ownership_id: None,
+            };
+            let adopt_outcome = match resume_fence {
+                Some(adopt_fence) => ownership_lane::arm_adopt_guard(
+                    &state.ownership,
+                    PROVIDER,
+                    &durable_id,
+                    &format!("{resume_op}-adopt"),
+                    &expected_fresh_owner,
+                    adopt_fence,
+                    "freshopencode/rest-resume-adopt",
+                ),
+                None if state.ownership.is_some() => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        provider = PROVIDER, session_id = %durable_id,
+                        "freshagent.opencode.rest_resume_adopt_guard_refused: no \
+                         retained ownership stamp for the adopt — the resume spawns \
+                         a runtime and must adopt the observed owner specifically; \
+                         the request aborts typed, nothing is registered or \
+                         broadcast (kata b8ke ext r38 F1)"
+                    );
+                    return fail_json(
+                        StatusCode::CONFLICT,
+                        "SESSION_RESERVED: another lifecycle operation owns this session"
+                            .to_string(),
+                    );
+                }
+                None => ownership_lane::LaneAttachGuard::Unwired,
+            };
+            match adopt_outcome {
                 ownership_lane::LaneAttachGuard::Armed(guard) => {
                     _resume_adopt_guard = Some(guard);
                     None
@@ -4089,8 +4192,9 @@ async fn resume_session_ref_tab(
                 ownership_lane::LaneAttachGuard::Refused => {
                     tracing::warn!(target: "freshell_freshagent::opencode",
                         provider = PROVIDER, session_id = %durable_id,
-                        "freshagent.opencode.rest_resume_adopt_guard_refused: the key \
-                         entered a transition — the resume aborts typed, nothing is \
+                        "freshagent.opencode.rest_resume_adopt_guard_refused: the \
+                         adopt refused to arm (ownership advanced or a foreign owner \
+                         holds the key) — the resume aborts typed, nothing is \
                          registered or broadcast"
                     );
                     return fail_json(

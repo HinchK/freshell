@@ -4639,25 +4639,70 @@ impl FreshCodexState {
                     return;
                 }
                 freshell_ownership::OwnershipState::Live { .. } => {
-                    tracked_attach_guard = match crate::ownership_lane::arm_attach_guard(
-                        &self.ownership,
-                        PROVIDER,
-                        &msg.session_id,
-                        &format!("attach-{}", uuid::Uuid::new_v4()),
-                        Some(snap.generation),
-                        "freshcodex/attach",
-                    ) {
-                        crate::ownership_lane::LaneAttachGuard::Armed(guard) => Some(guard),
-                        crate::ownership_lane::LaneAttachGuard::Unwired => None,
-                        crate::ownership_lane::LaneAttachGuard::Refused => {
+                    // b8ke ext r38 F1: the ATOMIC ADOPT — the request's
+                    // ORIGINAL observed pair plus the EXPECTED
+                    // fresh-agent owner, validated in ONE coordinator
+                    // decision. Pre-r38 the arm re-observed whatever was
+                    // live (`Some(snap.generation)`) or took None — a
+                    // handoff committing between the state precheck and
+                    // the arm could restart the superseded codex
+                    // sidecar/bridge beside the terminal owner. The
+                    // absent pair on a WIRED lane cannot adopt
+                    // specifically — the tracked attach restarts a
+                    // runtime/bridge — so it refuses typed (re-observe
+                    // and retry with the pair); on an UNWIRED lane there
+                    // is no coordinator to adopt from (the pre-wiring
+                    // legacy semantics hold).
+                    match attach_fence {
+                        Some(adopt_fence) => {
+                            let expected_fresh_owner = freshell_ownership::OwnerIdentity {
+                                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                                terminal_id: None,
+                                live_session_key: None,
+                                pid: None,
+                                ownership_id: None,
+                            };
+                            tracked_attach_guard = match crate::ownership_lane::arm_adopt_guard(
+                                &self.ownership,
+                                PROVIDER,
+                                &msg.session_id,
+                                &format!("attach-{}", uuid::Uuid::new_v4()),
+                                &expected_fresh_owner,
+                                adopt_fence,
+                                "freshcodex/attach",
+                            ) {
+                                crate::ownership_lane::LaneAttachGuard::Armed(guard) => Some(guard),
+                                crate::ownership_lane::LaneAttachGuard::Unwired => None,
+                                crate::ownership_lane::LaneAttachGuard::Refused => {
+                                    self.emit_fresh_agent_error(
+                                        &msg.session_id,
+                                        "SESSION_RESERVED",
+                                        "A lifecycle operation owns this session; retry after it settles",
+                                    );
+                                    return;
+                                }
+                            };
+                        }
+                        None if self.ownership.is_some() => {
+                            tracing::warn!(target: "freshell_freshagent::codex",
+                                session_id = %msg.session_id,
+                                code = "FENCE_REQUIRED",
+                                "fresh_agent_attach_refused: the tracked attach carries \
+                                 no observed ownership pair against a coordinator-wired \
+                                 lane — the sidecar/bridge restart must adopt the observed \
+                                 owner specifically; re-observe and retry with the pair \
+                                 (kata b8ke ext r38 F1)"
+                            );
                             self.emit_fresh_agent_error(
                                 &msg.session_id,
                                 "SESSION_RESERVED",
-                                "A lifecycle operation owns this session; retry after it settles",
+                                "The attach carried no observed ownership pair; re-observe \
+                                 the session's owner record and retry",
                             );
                             return;
                         }
-                    };
+                        None => {}
+                    }
                 }
                 _ => {}
             }

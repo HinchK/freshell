@@ -121,6 +121,14 @@ pub struct FreshClaudeState {
     /// the prior-reap-window abort test's deterministic hold. `None` in
     /// production and every other test.
     handoff_kill_pause: Option<std::sync::Arc<tokio::sync::Notify>>,
+    /// Test seam (b8ke ext r38 F1): park `handle_rollback`'s Adopt arm with
+    /// the claim ANSWERED (AdoptLive) but the adopt guard NOT yet armed —
+    /// the claim-to-arm race test's deterministic hold. The handler
+    /// notifies `rollback_adopt_parked` once it reaches the seam, then
+    /// waits on `rollback_adopt_release`. `None`/`None` in production and
+    /// every other test.
+    rollback_adopt_parked: Option<std::sync::Arc<tokio::sync::Notify>>,
+    rollback_adopt_release: Option<std::sync::Arc<tokio::sync::Notify>>,
     /// Test seam (b8ke focused FR3): `kill_for_handoff`'s tree-death
     /// confirmation round budget override — `None` in production (the
     /// [`TREE_DEATH_CONFIRM_ROUNDS`] default).
@@ -736,6 +744,8 @@ impl FreshClaudeState {
             alias_tombstones: Arc::new(std::sync::Mutex::new(AliasTombstones::default())),
             close_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
             handoff_kill_pause: None,
+            rollback_adopt_parked: None,
+            rollback_adopt_release: None,
             handoff_confirm_rounds: None,
             handoff_platform_limited: None,
             handoff_resume_pause: None,
@@ -840,6 +850,20 @@ impl FreshClaudeState {
     ) {
         self.handoff_kill_pause = kill_pause;
         self.handoff_resume_pause = resume_pause;
+    }
+
+    /// Test seam (b8ke ext r38 F1): arm the deterministic hold for the
+    /// rollback Adopt claim-to-arm race test — `handle_rollback` parks
+    /// after the claim answers AdoptLive, BEFORE the atomic adopt arms,
+    /// notifying `parked` on arrival and waiting on `release`.
+    /// `None`/`None` in production.
+    pub fn set_rollback_adopt_park_for_test(
+        &mut self,
+        parked: Option<std::sync::Arc<tokio::sync::Notify>>,
+        release: Option<std::sync::Arc<tokio::sync::Notify>>,
+    ) {
+        self.rollback_adopt_parked = parked;
+        self.rollback_adopt_release = release;
     }
 
     /// Test seam (b8ke focused FR3): shrink `kill_for_handoff`'s tree-death
@@ -5014,23 +5038,71 @@ impl FreshClaudeState {
         // the same evidence shape the codex spawn hook rearms with the
         // real pid).
         // b8ke ext r13 F3: the Adopt arm holds REAL authority across the
-        // replace window — the ext-r12 attach guard arms on the live
-        // incumbent's key and is held through the kill + respawn +
-        // register + rekey (this handler's scope), so a handoff or stop
-        // begin inside the window answers the typed Blocked outcome and
-        // can NEVER start a terminal beside the replacement (pre-r13 the
-        // Adopt arm proceeded with NO claim, and the rekey's verify was
-        // the only — post-overlap — defense).
+        // replace window — the guard arms on the live incumbent's key and
+        // is held through the kill + respawn + register + rekey (this
+        // handler's scope), so a handoff or stop begin inside the window
+        // answers the typed Blocked outcome and can NEVER start a terminal
+        // beside the replacement (pre-r13 the Adopt arm proceeded with NO
+        // claim, and the rekey's verify was the only — post-overlap —
+        // defense).
+        // b8ke ext r38 F1: the arm is the ATOMIC ADOPT — the request's
+        // ORIGINAL observed fence (the pair the coordinator's claim already
+        // verified when it answered AdoptLive) plus the EXPECTED
+        // fresh-agent owner, validated in ONE coordinator-lock decision.
+        // Pre-r38 the arm RE-OBSERVED whatever was live and armed on it
+        // (the discard-and-re-observe laundering): a terminal handoff
+        // committing between the claim and the arm armed the guard on the
+        // TERMINAL owner and the rollback spawned a Fresh Claude sidecar
+        // beside the terminal before the late rekey tore it down — two
+        // live writers. The adopt closes the window: the observed pair
+        // names the record the rollback decided on; any advance or a
+        // foreign owner refuses typed BEFORE anything is killed or
+        // spawned.
         let mut _rollback_adopt_guard: Option<freshell_ownership::AttachGuard> = None;
         if granted_ticket.is_none() && self.ownership.is_some() {
+            // Test seam (b8ke ext r38 F1): park with the claim ANSWERED
+            // (AdoptLive) but the adopt guard NOT yet armed — the
+            // claim-to-arm race test's deterministic hold (the test
+            // commits a terminal handoff against the key mid-park).
+            if let (Some(parked), Some(release)) = (
+                self.rollback_adopt_parked.as_ref(),
+                self.rollback_adopt_release.as_ref(),
+            ) {
+                parked.notify_one();
+                let _ = release.notified().await;
+            }
             let resolved = self.resolve_ownership_key(&durable_id);
-            let snap = self.ownership_snapshot(PROVIDER, &resolved);
-            match crate::ownership_lane::arm_attach_guard(
+            // The Adopt arm only fires on a WIRED lane, where the
+            // original pair is REQUIRED (the ep5-r4-F3 gate above refused
+            // the absent pair typed).
+            let Some(adopt_fence) = rollback_fence else {
+                tracing::warn!(target: "freshell_freshagent::claude",
+                    session_id = %durable_id,
+                    "fresh_agent_rollback_refused: the Adopt arm requires the \
+                     original observed pair (unreachable — the gate above refused \
+                     the absent pair)"
+                );
+                reply_sink(rollback_error_frame(
+                    &op,
+                    "SESSION_RESERVED",
+                    "Another resume for this session is in flight",
+                ));
+                return;
+            };
+            let expected_fresh_owner = freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: None,
+                pid: None,
+                ownership_id: None,
+            };
+            match crate::ownership_lane::arm_adopt_guard(
                 &self.ownership,
                 PROVIDER,
                 &resolved,
                 &format!("rollback-adopt-{rollback_lease_id}"),
-                Some(snap.generation),
+                &expected_fresh_owner,
+                adopt_fence,
                 "freshclaude/rollback-adopt",
             ) {
                 crate::ownership_lane::LaneAttachGuard::Armed(guard) => {
@@ -5040,9 +5112,10 @@ impl FreshClaudeState {
                 crate::ownership_lane::LaneAttachGuard::Refused => {
                     tracing::warn!(target: "freshell_freshagent::claude",
                         session_id = %durable_id,
-                        "fresh_agent_rollback_refused: the Adopt arm's attach guard \
-                         refused to arm (the key entered a transition) — the rollback \
-                         aborts typed, nothing is killed or spawned"
+                        "fresh_agent_rollback_refused: the Adopt arm's atomic adopt \
+                         refused to arm (ownership advanced or a foreign owner holds \
+                         the key) — the rollback aborts typed, nothing is killed or \
+                         spawned"
                     );
                     reply_sink(rollback_error_frame(
                         &op,
@@ -6062,25 +6135,68 @@ impl FreshClaudeState {
         // stop beginning inside the window answers the typed Blocked
         // outcome and can never commit around the rebind (pre-r12 the
         // point-in-time snapshot closed no window).
-        let rebind_guard = match crate::ownership_lane::arm_attach_guard(
-            &self.ownership,
-            PROVIDER,
-            &rebind_key,
-            &format!("attach-rebind-{}", uuid::Uuid::new_v4()),
-            Some(rebind_snap.generation),
-            "freshclaude/attach-rebind",
-        ) {
-            crate::ownership_lane::LaneAttachGuard::Armed(guard) => Some(guard),
-            crate::ownership_lane::LaneAttachGuard::Unwired => None,
-            crate::ownership_lane::LaneAttachGuard::Refused => {
-                self.emit_fresh_agent_error(
-                    &msg.session_id,
-                    session_type_str(msg.session_type),
-                    "SESSION_RESERVED",
-                    "A lifecycle operation owns this session; retry after it settles",
-                );
-                return;
+        // b8ke ext r38 F1: `try_rebind_to_live` is an OBSERVER bind (the
+        // broadcast alias flip + the status ack; it never spawns or
+        // restarts — the fall-through RESUME claims independently through
+        // `begin_lane_claim_at` with the attach's observed fence, the
+        // Task-3 round-2 discipline). So the rebind ADOPTS SPECIFICALLY
+        // when the request carries a pair (a superseded-session bind —
+        // ownership advanced or a foreign owner — refuses typed, the
+        // laundering class closed), and keeps the pre-r38 owner-agnostic
+        // window when the pair is ABSENT (the observer boundary: a pane
+        // bind misdirected by a mid-window handoff self-heals through
+        // the dead-session/reconcile flow; no writer hazard).
+        let expected_fresh_owner = freshell_ownership::OwnerIdentity {
+            kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            terminal_id: None,
+            live_session_key: None,
+            pid: None,
+            ownership_id: None,
+        };
+        let rebind_guard = match attach_fence {
+            Some(adopt_fence) => {
+                match crate::ownership_lane::arm_adopt_guard(
+                    &self.ownership,
+                    PROVIDER,
+                    &rebind_key,
+                    &format!("attach-rebind-{}", uuid::Uuid::new_v4()),
+                    &expected_fresh_owner,
+                    adopt_fence,
+                    "freshclaude/attach-rebind",
+                ) {
+                    crate::ownership_lane::LaneAttachGuard::Armed(guard) => Some(guard),
+                    crate::ownership_lane::LaneAttachGuard::Unwired => None,
+                    crate::ownership_lane::LaneAttachGuard::Refused => {
+                        self.emit_fresh_agent_error(
+                            &msg.session_id,
+                            session_type_str(msg.session_type),
+                            "SESSION_RESERVED",
+                            "A lifecycle operation owns this session; retry after it settles",
+                        );
+                        return;
+                    }
+                }
             }
+            None => match crate::ownership_lane::arm_attach_guard(
+                &self.ownership,
+                PROVIDER,
+                &rebind_key,
+                &format!("attach-rebind-{}", uuid::Uuid::new_v4()),
+                None,
+                "freshclaude/attach-rebind",
+            ) {
+                crate::ownership_lane::LaneAttachGuard::Armed(guard) => Some(guard),
+                crate::ownership_lane::LaneAttachGuard::Unwired => None,
+                crate::ownership_lane::LaneAttachGuard::Refused => {
+                    self.emit_fresh_agent_error(
+                        &msg.session_id,
+                        session_type_str(msg.session_type),
+                        "SESSION_RESERVED",
+                        "A lifecycle operation owns this session; retry after it settles",
+                    );
+                    return;
+                }
+            },
         };
         let rebound = self
             .try_rebind_to_live(&durable, session_type_str(msg.session_type))
@@ -13214,6 +13330,141 @@ rl.on('line', (line) => {
         }
         // No terminal ever started beside the replacement.
         let _ = task.await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+        drop(captured);
+    }
+
+    /// b8ke ext r38 F1: the rollback Adopt arm is the ATOMIC ADOPT — a
+    /// terminal handoff COMMITTING between the AdoptLive claim answer and
+    /// the guard arm refuses typed, and NO sidecar ever spawns beside the
+    /// terminal. Pre-r38 the arm re-observed whatever was live and armed
+    /// on it (the discard-and-re-observe laundering): the terminal
+    /// handoff's committed owner armed the guard and the rollback spawned
+    /// a Fresh Claude sidecar beside the terminal — two live writers held
+    /// the same session until the late rekey tore the sidecar down. The
+    /// adopt validates the request's ORIGINAL pair + the expected
+    /// fresh-agent owner in ONE coordinator decision, so the committed
+    /// terminal handoff (a generation advance) refuses before any
+    /// teardown or spawn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_terminal_handoff_between_the_rollback_claim_and_the_adopt_arm_refuses_typed_without_spawning(
+    ) {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let _env = FakeClaudeSidecarEnv::install_with_knobs(Some(3_000), false);
+        let (mut st, mut rx) = state_with_bus();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+
+        // A LIVE owner under the OLD durable id — the Adopt shape the
+        // rollback's claim observes.
+        st.handle_create(dedup_create_msg("req-r38-f1-race"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "req-r38-f1-race").await;
+        let map_key = created["sessionId"].as_str().unwrap().to_string();
+        let old_dur = FRESH_CREATE_DURABLE_ID;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if matches!(
+                registry.observe("claude", old_dur).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the create's adoption never committed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // A rollback the sidecar can service (the transcript + record),
+        // so the pre-fix RED shape can reach its spawn.
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+        write_rollback_transcript(home.path(), old_dur, &two_turn_transcript());
+
+        // Truncate the spawn log: the FIXTURE's create already logged a
+        // spawn — only a ROLLBACK respawn line proves the bug.
+        if let Ok(log) = std::env::var("FRESHELL_TEST_CLAUDE_SPAWN_LOG") {
+            let _ = std::fs::write(&log, "");
+        }
+
+        // Arm the claim-to-arm park seam.
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        st.set_rollback_adopt_park_for_test(Some(parked.clone()), Some(release.clone()));
+
+        // The honest client shape: the op CARRIES its observed pair.
+        let before = registry.observe("claude", old_dur);
+        let mut op = rollback_op(&map_key, "req-r38-f1-race", RollbackDirection::Undo);
+        op.observed_epoch = Some(before.epoch);
+        op.observed_generation = Some(before.generation);
+        let (sink, captured) = capturing_sink();
+        let st_for_task = st.clone();
+        let task = tokio::spawn(async move {
+            st_for_task.handle_rollback(op, sink).await;
+        });
+
+        // Arrival proof: the claim answered Adopt and the handler sits
+        // BETWEEN the claim and the guard arm.
+        parked.notified().await;
+
+        // THE RACE: a terminal handoff COMMITS against the key while the
+        // rollback holds no window (the guard is not yet armed).
+        let freshell_ownership::BeginOutcome::Granted {
+            generation: term_generation,
+        } = registry.begin_handoff(
+            "claude",
+            old_dur,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-r38-f1-racing-terminal-handoff",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        )
+        else {
+            panic!("the racing terminal handoff must grant against the pre-arm key")
+        };
+        assert_eq!(
+            registry.commit_live(
+                "claude",
+                old_dur,
+                "op-r38-f1-racing-terminal-handoff",
+                term_generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-r38-race".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed,
+        );
+
+        // Release the park: the ATOMIC adopt validates the ORIGINAL pair
+        // + the expected fresh-agent owner — the committed terminal
+        // handoff refused typed, nothing torn down or spawned.
+        release.notify_one();
+        let _ = task.await;
+
+        let frames = captured_json(&captured);
+        assert!(
+            frames.iter().any(|f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == json!("freshAgent.error")
+                    && f["event"]["code"] == json!("SESSION_RESERVED")
+            }),
+            "the raced adopt must answer the typed refusal: {frames:?}"
+        );
+        let spawned = std::env::var("FRESHELL_TEST_CLAUDE_SPAWN_LOG")
+            .ok()
+            .and_then(|log| std::fs::read_to_string(log).ok())
+            .unwrap_or_default();
+        assert!(
+            spawned.trim().is_empty(),
+            "no sidecar may spawn beside the terminal owner: {spawned:?}"
+        );
         std::env::remove_var("CLAUDE_CONFIG_DIR");
         drop(captured);
     }
