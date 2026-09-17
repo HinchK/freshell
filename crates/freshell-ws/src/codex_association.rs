@@ -1118,17 +1118,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// b8ke ext r14 F1: a durable-binding FAILURE unwinds the held
-    /// authority — NO committed owner. The adoption's ledger write fails
-    /// (a ledger root that is a FILE: every write errors) — the adoption
-    /// returns false and the canonical key stays non-Live (pre-r14 the
-    /// owner committed FIRST, so the key was Live{Terminal} over a
-    /// terminal whose durable binding never landed).
+    /// b8ke ext r14 F1 (reshaped by ext r39 F2): a durable-binding FAILURE
+    /// installs and announces NOTHING, and the held authority COMMITS.
+    /// The adoption's ledger write fails (a read-only ledger root: every
+    /// write errors) — the adoption returns false, the identity homes
+    /// keep the consistent prior state, no association frame
+    /// broadcasts, and the canonical key names the LIVE terminal as its
+    /// owner: never a Vacant-with-live-writer (pre-r39 the tail
+    /// installed and announced FIRST, and the caller failed the ticket
+    /// to Vacant while the registries and clients still identified the
+    /// terminal as the session writer — a later lifecycle command could
+    /// start a second writer beside it).
     #[tokio::test]
-    async fn a_binding_failure_leaves_no_committed_owner() {
+    async fn a_binding_failure_installs_nothing_and_keeps_the_live_owner() {
         const TID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let home = unique_temp_dir("r14-f1-bindfail");
-        let (mut state, _rx) = state_with_locator(home.clone());
+        let (mut state, mut rx) = state_with_locator(home.clone());
         let ownership = wire_ownership(&mut state);
         // A ledger rooted at a READ-ONLY directory: every durable row
         // write errors (EACCES).
@@ -1185,17 +1190,57 @@ mod tests {
         )
         .await;
 
-        // THE CONTRACT: the binding write failed → the adoption FAILED and
-        // the canonical key holds NO committed owner.
+        // THE CONTRACT: the binding write failed → the adoption FAILED
+        // (the typed answer)...
         assert!(!adopted, "the adoption fails on a binding failure");
+        // ...NOTHING installed or announced: no identity row for the
+        // thread (the consistent prior state stands)...
         assert!(
-            !matches!(
+            state
+                .identity
+                .find_by_session_including_retired("codex", TID)
+                .is_none(),
+            "no identity row may install on a failed binding"
+        );
+        // ...no association frame broadcast (the runtime-owner truth
+        // frame may broadcast — it is the coordinator's owner fact, not
+        // the identity announcement).
+        while let Ok(frame) = rx.try_recv() {
+            let value: serde_json::Value = serde_json::from_str(&frame).expect("json frame");
+            assert_ne!(
+                value["type"], "terminal.session.associated",
+                "no association frame may broadcast on a failed binding: {value}"
+            );
+        }
+        // ...and the canonical key names the LIVE terminal as its owner
+        // (NEVER a Vacant-with-live-writer — the held authority commits).
+        assert!(
+            matches!(
                 ownership.observe("codex", TID).state,
-                freshell_ownership::OwnershipState::Live { .. }
+                freshell_ownership::OwnershipState::Live { ref owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+                        && owner.terminal_id.as_deref() == Some("t1"),
             ),
-            "a binding failure leaves NO committed owner — state: {:?}",
+            "the failed binding must keep the live terminal as the named owner: {:?}",
             ownership.observe("codex", TID).state
         );
+        // A later lifecycle command CANNOT start a second writer over
+        // the session (the cross-kind begin answers the typed conflict,
+        // never Granted).
+        match ownership.begin_start(
+            "codex",
+            TID,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-r14-f1-bindfail-second-writer",
+            None,
+            "test",
+            3_000,
+        ) {
+            freshell_ownership::BeginOutcome::OwnedByOtherKind { .. } => {}
+            other => {
+                panic!("a second writer must not start over the live terminal owner: {other:?}")
+            }
+        }
         state.registry.kill("t1");
         let _ = std::fs::remove_dir_all(&home);
         #[cfg(unix)]

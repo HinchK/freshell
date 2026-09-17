@@ -89,9 +89,34 @@ pub(crate) async fn adopt_codex_identity(state: &WsState, a: CodexAdoption<'_>) 
     )
     .await;
     if !applied {
-        // The binding write failed: unwind the held authority — NO
-        // committed owner, no broadcast.
-        crate::identity_ownership::coordinator_fail_identity(authority);
+        // b8ke ext r39 F2: the durable binding write failed with NOTHING
+        // installed or announced (the reorder above: the identity homes
+        // keep the consistent prior state, no association frame
+        // broadcast). The held authority COMMITS instead of failing —
+        // the terminal process is alive and IS the session's writer, so
+        // failing the ticket to Vacant would let a later lifecycle
+        // command start a SECOND writer beside it. The committed owner
+        // keeps the one-writer invariant; the missing durable row is the
+        // typed recoverable state — the next locator sweep re-adopts
+        // (the idempotent re-adopt) and retries the binding write.
+        tracing::warn!(target: "freshell_ws::codex_identity",
+            terminal_id = %a.terminal_id, thread_id = %a.thread_id,
+            event = "codex_identity.adoption_binding_failed",
+            outcome = "committed_owner_kept", failure_reason = "DURABLE_BINDING_WRITE_FAILED",
+            "codex_identity_adoption_refused: the durable binding write failed — \
+             nothing installed/announced; the held authority commits so the \
+             live terminal stays the named owner (never a \
+             Vacant-with-live-writer)"
+        );
+        crate::identity_ownership::coordinator_commit_identity(
+            state,
+            authority,
+            "codex",
+            a.terminal_id,
+            a.thread_id,
+            None,
+        )
+        .await;
         return false;
     }
     crate::identity_ownership::coordinator_commit_identity(
@@ -171,9 +196,34 @@ pub(crate) async fn rebind_codex_identity(state: &WsState, r: CodexRebind<'_>) -
     )
     .await;
     if !applied {
-        // The binding write failed: unwind the held authority — NO
-        // committed owner, no broadcast, no key move.
-        crate::identity_ownership::coordinator_fail_identity(authority);
+        // b8ke ext r39 F2: the durable binding write failed with NOTHING
+        // installed or announced (the identity homes still name the OLD
+        // session, no association frame broadcast). The held authority
+        // COMMITS instead of failing — the forked CLI process is alive
+        // and IS the new session's writer, so failing the ticket to
+        // Vacant would let a later lifecycle command start a SECOND
+        // writer beside it. The commit's atomic move (new key Live,
+        // old key Aliased) keeps the one-writer invariant; the missing
+        // durable row is the typed recoverable state.
+        tracing::warn!(target: "freshell_ws::codex_identity",
+            terminal_id = %r.terminal_id,
+            old_session_id = %r.old_session_id, new_session_id = %r.new_session_id,
+            event = "codex_identity.rebind_binding_failed",
+            outcome = "committed_owner_kept", failure_reason = "DURABLE_BINDING_WRITE_FAILED",
+            "codex_identity_rebind_refused: the durable binding write failed — \
+             nothing installed/announced; the held authority commits so the \
+             live forked writer stays the named owner (never a \
+             Vacant-with-live-writer)"
+        );
+        crate::identity_ownership::coordinator_commit_identity(
+            state,
+            authority,
+            "codex",
+            r.terminal_id,
+            r.new_session_id,
+            Some(r.old_session_id),
+        )
+        .await;
         return false;
     }
     crate::identity_ownership::coordinator_commit_identity(
@@ -245,9 +295,19 @@ async fn codex_claim_refused(state: &WsState, terminal_id: &str, thread_id: &str
 }
 
 /// The shared identity write tail (adoption AND rebind), in the PINNED
-/// load-bearing order: identity.upsert -> registry set_meta -> durable ledger
-/// (awaited; fsync-before-announce) -> broadcast `terminal.session.associated`
-/// THEN `terminal.meta.updated` -> activity hub. Do not reorder.
+/// load-bearing order: durable ledger (awaited; fsync-before-announce) ->
+/// identity.upsert -> registry set_meta -> broadcast `terminal.session.
+/// associated` -> activity hub. Do not reorder.
+/// b8ke ext r39 F2: the DURABLE BINDING GATES THE INSTALL/ANNOUNCE — the
+/// binding write runs FIRST and a failure installs/announces NOTHING
+/// (the volatile identity homes keep the consistent prior state, no
+/// association frame broadcasts, no activity-hub update). Pre-r39 the
+/// upsert/set_meta/association broadcast/activity hub all landed BEFORE
+/// the awaited binding write, so a failure had already installed and
+/// announced the identity and the caller's ticket fail left a
+/// Vacant-with-live-writer: the volatile registries and clients still
+/// identified the terminal as the session writer while the coordinator
+/// held nothing — a later lifecycle command could start a second writer.
 async fn apply_codex_identity(
     state: &WsState,
     terminal_id: &str,
@@ -256,6 +316,26 @@ async fn apply_codex_identity(
     cwd: Option<&str>,
     previous_session_id: Option<&str>,
 ) -> bool {
+    // Durable ledger: binding row FIRST, pending marker delete SECOND --
+    // awaited BEFORE any install/announce (fsync-before-announce; a
+    // failed write installs nothing). On a rebind the marker is long gone
+    // (a no-op delete) and the write supersedes the old bound row (new
+    // bound row FIRST, then retire old).
+    if !crate::pane_ledger::ledger_resolve_identity(state, terminal_id, "codex", thread_id, cwd)
+        .await
+    {
+        tracing::warn!(target: "freshell_ws::codex_identity",
+            terminal_id = %terminal_id, thread_id = %thread_id,
+            event = "codex_identity.binding_failed",
+            outcome = "refused", failure_reason = "DURABLE_BINDING_WRITE_FAILED",
+            "codex_identity_binding_failed: the durable binding write failed — \
+             nothing installed or announced (the identity homes keep the \
+             prior state); the caller commits the held authority (the live \
+             terminal stays the owner) and the binding retries on the next \
+             locator sweep"
+        );
+        return false;
+    }
     // Both identity homes -- different consumers (see opencode_association.rs:135-148).
     state
         .identity
@@ -267,13 +347,6 @@ async fn apply_codex_identity(
         Some("codex".to_string()),
         Some(thread_id.to_string()),
     );
-    // Durable ledger: binding row FIRST, pending marker delete SECOND --
-    // awaited before the broadcast (fsync-before-announce). On a rebind the
-    // marker is long gone (a no-op delete) and the write supersedes the old
-    // bound row (new bound row FIRST, then retire old).
-    let binding_ok =
-        crate::pane_ledger::ledger_resolve_identity(state, terminal_id, "codex", thread_id, cwd)
-            .await;
     broadcast_terminal_session_associated(
         state,
         "codex",
@@ -291,7 +364,7 @@ async fn apply_codex_identity(
             hub.attach_codex_rollout(terminal_id, thread_id, path);
         }
     }
-    binding_ok
+    true
 }
 
 /// Fan `terminal.session.associated` + a `terminal.meta.updated` upsert to

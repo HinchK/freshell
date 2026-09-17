@@ -162,6 +162,52 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
             continue;
         };
 
+        // P1.8 (trigger c) + P1.10: locator resolution is an identity event —
+        // durable binding row first, then the spawn-time pending marker is
+        // deleted. Registry-truth cwd, same as the in-memory binds above.
+        // Awaited (drain_and_associate is async; the helper spawn_blockings
+        // the fsync off this sweep task — V1.md).
+        // b8ke ext r39 F2: the binding write GATES THE INSTALL/ANNOUNCE —
+        // it runs FIRST (before the identity homes, the registry meta, the
+        // association broadcast, and the activity hub), so a failure
+        // installs and announces NOTHING (the consistent prior state
+        // stands) and the caller commits the held authority (the live
+        // terminal stays the named owner — never a
+        // Vacant-with-live-writer). Pre-r39 the homes/broadcast/hub all
+        // landed BEFORE the awaited write and a failure unwound to a
+        // Vacant key while the registries and clients still identified
+        // the terminal as the session writer.
+        let binding_ok = crate::pane_ledger::ledger_resolve_identity(
+            state,
+            &located.terminal_id,
+            "opencode",
+            &located.session_id,
+            entry.cwd.as_deref(),
+        )
+        .await;
+        if !binding_ok {
+            tracing::warn!(target: "freshell_ws::opencode_association",
+                terminal_id = %located.terminal_id, session_id = %located.session_id,
+                event = "opencode_association.binding_failed",
+                outcome = "committed_owner_kept",
+                failure_reason = "DURABLE_BINDING_WRITE_FAILED",
+                "opencode_association_binding_failed: the durable binding write \
+                 failed — nothing installed/announced; the held authority commits \
+                 so the live terminal stays the named owner (never a \
+                 Vacant-with-live-writer); the next route poll re-adopts and \
+                 retries the binding"
+            );
+            crate::identity_ownership::coordinator_commit_identity(
+                state,
+                authority,
+                "opencode",
+                &located.terminal_id,
+                &located.session_id,
+                None,
+            )
+            .await;
+            continue;
+        }
         state.identity.upsert(
             &located.terminal_id,
             Some("opencode"),
@@ -176,19 +222,6 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
             Some("opencode".to_string()),
             Some(located.session_id.clone()),
         );
-        // P1.8 (trigger c) + P1.10: locator resolution is an identity event —
-        // durable binding row first, then the spawn-time pending marker is
-        // deleted. Registry-truth cwd, same as the in-memory binds above.
-        // Awaited (drain_and_associate is async; the helper spawn_blockings
-        // the fsync off this sweep task — V1.md).
-        let binding_ok = crate::pane_ledger::ledger_resolve_identity(
-            state,
-            &located.terminal_id,
-            "opencode",
-            &located.session_id,
-            entry.cwd.as_deref(),
-        )
-        .await;
         broadcast_terminal_session_associated(
             state,
             &located.terminal_id,
@@ -202,12 +235,6 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
         // codex_identity.rs:221 precedent).
         if let Some(hub) = &state.activity {
             hub.bind_opencode_session(&located.terminal_id, &located.session_id);
-        }
-        if !binding_ok {
-            // The durable binding write failed — unwind the held
-            // authority (NO committed owner, no broadcast).
-            crate::identity_ownership::coordinator_fail_identity(authority);
-            continue;
         }
         crate::identity_ownership::coordinator_commit_identity(
             state,

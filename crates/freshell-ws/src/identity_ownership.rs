@@ -271,20 +271,14 @@ pub(crate) async fn coordinator_begin_identity(
     Some(authority)
 }
 
-/// b8ke ext r14 F1: the FAIL phase — the caller's identity/metadata/
-/// durable-binding writes failed: the held authority unwinds (the
-/// ticket's typed fail restores the key; the guards' Drop close the
-/// windows) with NO committed owner and NO broadcast.
-pub(crate) fn coordinator_fail_identity(authority: IdentityAuthority) {
-    match authority {
-        // The RAII Drop performs the typed fail / the guard release.
-        IdentityAuthority::Ticket(_) => {}
-        IdentityAuthority::AdoptGuard(_) => {}
-        IdentityAuthority::RebindTicket { .. } => {}
-        IdentityAuthority::RebindAdopt { .. } => {}
-        IdentityAuthority::Unwired => {}
-    }
-}
+// b8ke ext r39 F2: the FAIL phase is DELETED — under the binding-gates-
+// install contract a failed durable binding write installs/announces
+// NOTHING and the held authority COMMITS (the live terminal process
+// stays the named owner — never a Vacant-with-live-writer beside it,
+// which a ticket fail would produce). The authority's own Drop remains
+// the panic/early-return unwind (the ticket's typed fail, the guards'
+// window close) — there is deliberately no explicit fail call left on
+// any identity path.
 
 /// b8ke ext r14 F1: the COMMIT phase — the callers' identity registry,
 /// terminal-metadata, and awaited durable pane-ledger writes have ALL
