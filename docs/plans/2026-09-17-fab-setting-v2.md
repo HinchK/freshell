@@ -19,7 +19,7 @@
 
 **Goal:** The existing Settings → Panes toggle for the floating add/split button gets the clear user-facing label "Show button to split panes", and its default flips from "off everywhere" to "on at desktop viewport width, off at mobile viewport width", with persistence, unit tests, e2e coverage, and committed screenshot baselines all following the new default.
 
-**Architecture:** Keep the browser-local setting key `panes.floatingActionButton` exactly as the prior run landed it (no schema/key rename — the user's naming request is the user-facing label). Keep `shared/settings.ts`'s static `floatingActionButton: false` as the shared, Node/SSR-neutral default, and add an explicit, defaulted options parameter (`LocalSettingsPlatformDefaults.floatingActionButtonDefault`) to `resolveLocalSettings` and `buildLocalSettingsPatch` (following the `resolveDefaultLoggingDebug` injectable-default precedent, `src/store/settingsSlice.ts:22-32`). The client computes the platform default ONCE at boot — `resolveDefaultFloatingActionButton(isMobileDevice())` = `!isMobileDevice()` — and threads that single `localSettingsPlatformDefaults` const through every client path that can resolve or diff local settings without an explicit saved value: the settings-slice boot resolution (`loadInitialLocalSettings`), the cross-tab hydrate re-resolution (`crossTabSync.ts:283-284`), the legacy-seed bootstrap path (`App.tsx:674,692`), and the browser-preferences write-diff (`browserPreferencesPersistence.ts:115,169,283`). The default is sticky per boot: resizing across the 767px breakpoint mid-session does not re-resolve until the next reload. Persistence semantics are **sticky-explicit**: the write path uses the computed platform default as the diff base only for values the user has never explicitly saved (a desktop boot with no saved key keeps the blob FAB-free — no spurious `true` blobs that would pin the FAB on for later mobile boots), while a `floatingActionButton` key that is already present in the saved blob is always re-written verbatim with the current value, whatever the active platform default is. Explicit choices therefore can never be erased by an unrelated flush under the opposite viewport class; they change only through an explicit toggle. Consequence: until the user's first explicit toggle, each viewport class follows its own default; after it, the choice is global for that browser (a single global preference, matching the single global toggle the UI exposes). After boot, the resolved `localSettings` always carry a concrete boolean that survives every reducer round-trip (`PANES_LOCAL_KEYS` whitelists the key, `pickKeys` copies own keys, `mergeLocalSettings` merges panes via `mergeDefined`), so the reducers themselves never resolve the FAB from a default and need no threading.
+**Architecture:** Keep the browser-local setting key `panes.floatingActionButton` exactly as the prior run landed it (no schema/key rename — the user's naming request is the user-facing label). Keep `shared/settings.ts`'s static `floatingActionButton: false` as the shared, Node/SSR-neutral default, and add an explicit, defaulted options parameter (`LocalSettingsPlatformDefaults.floatingActionButtonDefault`) to `resolveLocalSettings` and `buildLocalSettingsPatch` (following the `resolveDefaultLoggingDebug` injectable-default precedent, `src/store/settingsSlice.ts:22-32`). The client computes the platform default ONCE at boot — `resolveDefaultFloatingActionButton(isMobileDevice())` = `!isMobileDevice()` — and threads that single `localSettingsPlatformDefaults` const through every client path that can resolve or diff local settings without an explicit saved value: the settings-slice boot resolution (`loadInitialLocalSettings`), the cross-tab hydrate re-resolution (`crossTabSync.ts:283-284`), the legacy-seed bootstrap path (`App.tsx:674,692`), and the browser-preferences write-diff (`browserPreferencesPersistence.ts:115,169,283`). The default is sticky per boot: resizing across the 767px breakpoint mid-session does not re-resolve until the next reload. Persistence semantics are **sticky-explicit**: the write path uses the computed platform default as the diff base only for values the user has never explicitly saved (a desktop boot with no saved key keeps the blob FAB-free — no spurious `true` blobs that would pin the FAB on for later mobile boots), while a `floatingActionButton` key that is already present in the saved blob is always re-written verbatim with the current value, whatever the active platform default is. Explicit choices therefore can never be erased by an unrelated flush under the opposite viewport class; they change only through an explicit toggle. Consequence: until the user's first explicit toggle, each viewport class follows its own default; after a toggle reaches a PERSISTED state, the choice is global for that browser (a single global preference, matching the single global toggle the UI exposes). One documented limit of the diff-based persistence: an off-and-back-on double-toggle that lands entirely inside one 500ms debounce window on a fresh boot ends on the platform default with no key ever written — indistinguishable from never-toggled, so cross-class stickiness is not established for a net-no-op that equals the current class's default (the three-state limit: never-toggled vs explicitly-set is only observable after a flush). After boot, the resolved `localSettings` always carry a concrete boolean that survives every reducer round-trip (`PANES_LOCAL_KEYS` whitelists the key, `pickKeys` copies own keys, `mergeLocalSettings` merges panes via `mergeDefined`), so the reducers themselves never resolve the FAB from a default and need no threading.
 
 **Tech Stack:** TypeScript (NodeNext/ESM, `.js` relative imports), React 18 + Redux Toolkit, Zod-validated shared settings contract (`shared/settings.ts`), localStorage blob `freshell.browser-preferences.v1` (diff-vs-defaults, 500 ms debounce), Vitest + Testing Library (jsdom, desktop-ambient matchMedia mock in `test/setup/dom.ts`), Playwright (local + Cloud Run lanes), static HTML mock (`docs/index.html`).
 
@@ -682,16 +682,22 @@ Replace the two tests at `:381-422` (inside the `rendering` describe) with three
     const fabSwitch = page.getByRole('switch', { name: 'Show button to split panes' })
     await expect(fabSwitch).toHaveAttribute('aria-checked', 'true')
 
-    // Disable: the resolved setting flips, the FAB disappears, and the
-    // persisted blob (diff vs the DESKTOP platform default) records the
-    // explicit false.
+    // Disable: the resolved setting flips, the persisted blob (diff vs the
+    // DESKTOP platform default) records the explicit false. Settings replaces
+    // the terminal view (App.tsx:2059 vs :2095), so navigate back to the
+    // terminal view before asserting the FAB is gone — no PaneLayout mounts
+    // while Settings is open. (Executed form: the Task 3 implementer
+    // corrected the draft's in-Settings presence assertions; the with-
+    // Settings-open absence is NOT asserted — it would pass for the wrong
+    // reason.)
     await fabSwitch.click()
     await expect(fabSwitch).toHaveAttribute('aria-checked', 'false')
-    await expect(page.getByRole('button', { name: 'Add pane' })).toHaveCount(0)
     await page.waitForTimeout(PERSIST_DEBOUNCE_WAIT_MS)
     expect((await harness.getSettings()).panes.floatingActionButton).toBe(false)
     const blob = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
     expect(JSON.parse(blob ?? '{}').settings?.panes?.floatingActionButton).toBe(false)
+    await page.getByTitle('Coding Agents (Ctrl+B T)').click()
+    await expect(page.getByRole('button', { name: 'Add pane' })).toHaveCount(0)
 
     // The explicit disable survives reload — the saved false wins over the
     // platform default on the next desktop boot.
@@ -706,13 +712,16 @@ Replace the two tests at `:381-422` (inside the `rendering` describe) with three
     // Re-enable: the sticky-explicit rule keeps the key in the blob (an
     // already-explicit choice is preserved verbatim; it changes only through
     // an explicit toggle — it is never dropped for equaling the platform
-    // default), now recording true, and the FAB returns.
+    // default), now recording true, and the FAB returns. Navigate back to
+    // the terminal view first: Settings replaces the terminal view, so no
+    // PaneLayout — and no FAB — mounts while it is open. (Executed form.)
     await openSettingsSection(page, 'Panes')
     await fabSwitch.click()
     await expect(fabSwitch).toHaveAttribute('aria-checked', 'true')
     await page.waitForTimeout(PERSIST_DEBOUNCE_WAIT_MS)
     const blobOn = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
     expect(JSON.parse(blobOn ?? '{}').settings?.panes?.floatingActionButton).toBe(true)
+    await page.getByTitle('Coding Agents (Ctrl+B T)').click()
     await expect(page.getByRole('button', { name: 'Add pane' })).toBeVisible()
   })
 
@@ -1099,7 +1108,8 @@ The three terminal-view desktop PNG baselines (`default-layout`, `multiple-tabs`
 - Modify: `test/e2e-browser/specs/screenshot-baselines.spec.ts-snapshots/default-layout-chromium-linux.png`
 - Modify: `test/e2e-browser/specs/screenshot-baselines.spec.ts-snapshots/multiple-tabs-chromium-linux.png`
 - Modify: `test/e2e-browser/specs/screenshot-baselines.spec.ts-snapshots/sidebar-collapsed-chromium-linux.png`
-- Unchanged (negative controls — do NOT commit any byte change to them): `settings-view-chromium-linux.png` (Settings open ⇒ no PaneLayout/FAB), `auth-modal-chromium-linux.png` (no tab view), `mobile-layout-chromium-linux.png` (boots at 390px ⇒ mobile default keeps the FAB hidden).
+- Modify: `test/e2e-browser/specs/screenshot-baselines.spec.ts-snapshots/mobile-layout-chromium-linux.png` (EXECUTED TRUTH, amended post-review: the baseline entering this task was a March-era unconditional-FAB capture — it SHOWED a FAB, contradicting the mobile default-off. The original draft wrongly assumed it already depicted no FAB and froze it. The task review's F3 chain cleared the misdepiction: commit f81b40996 re-captured it with no FAB, independently pixel-verified (0/2304 FAB-tone pixels vs the old capture's ~1716/2304), both lanes green.)
+- Unchanged (negative controls — do NOT commit any byte change to them): `settings-view-chromium-linux.png` (Settings open ⇒ no PaneLayout/FAB), `auth-modal-chromium-linux.png` (no tab view).
 
 **Interfaces:**
 - Consumes: Task 3's landed default (desktop boots render the FAB); the `test:e2e:update-snapshots` script; the spec's `maxDiffPixelRatio: 0.05` comparisons.
@@ -1115,7 +1125,7 @@ Expected: PASS on tolerance or FAIL — either outcome is acceptable input to th
 
 Run: `FRESHELL_VITEST_BACKEND=cloud FRESHELL_E2E_BACKEND=cloud FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com npm run test:e2e:update-snapshots -- --project=chromium test/e2e-browser/specs/screenshot-baselines.spec.ts`
 
-Expected: all six baseline PNGs re-captured; the three terminal-view desktop PNGs (`default-layout`, `multiple-tabs`, `sidebar-collapsed`) now include the FAB. Verify with `git status --short test/e2e-browser/specs/screenshot-baselines.spec.ts-snapshots/` — expect exactly those three PNGs modified, `settings-view.png` byte-identical (negative control: Settings open ⇒ no FAB; a byte change there is a red flag — inspect before proceeding, do not commit it silently), and `auth-modal.png` / `mobile-layout.png` either unchanged or byte-equivalent re-captures (they depict no FAB before and after). If `git status` shows any other change, inspect the PNGs before committing — do not commit a regression you cannot explain.
+Expected: all six baseline PNGs re-captured; the three terminal-view desktop PNGs (`default-layout`, `multiple-tabs`, `sidebar-collapsed`) now include the FAB, and `mobile-layout.png` re-captures WITHOUT the FAB (its entering baseline was a March-era unconditional-FAB capture — see the amended Files list; as executed, the corrected mobile re-capture landed as the follow-up commit f81b40996 after the task review's F3 chain, not in this task's own commit). Verify with `git status --short test/e2e-browser/specs/screenshot-baselines.spec.ts-snapshots/` — expect the three desktop PNGs plus the corrected `mobile-layout.png` as the to-be-committed set across the task and its follow-up, `settings-view.png` and `auth-modal.png` byte-identical (negative controls; a byte change to either is a red flag — inspect before proceeding, do not commit it silently). If `git status` shows any other change, inspect the PNGs before committing — do not commit a regression you cannot explain.
 
 - [ ] **Step 3: Verify green on the local lane**
 
