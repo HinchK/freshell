@@ -7,10 +7,10 @@
 ## User Request
 
 ### Requested result
-Produce one complete, executable implementation plan for unified, persistent coding-agent names in Freshell, covering Claude, Codex, and OpenCode in both CLI and fresh* modes. Complete the-usual's planning, load-bearing validation, and independent plan review, then pause before implementation.
+Execute the committed unified coding-agent names plan (`docs/plans/2026-09-16-unified-agent-names.md`) in the unified-agent-names worktree: complete the-usual stages 4–6 — implement all eight plan tasks with red/green/refactor TDD and per-task independent review, pass the full-suite gate, obtain Fresh Eyes review of the complete delta, and deliver the recap.
 
 ### Explicit constraints
-- Plan the whole naming change as one implementation; the earlier two-wave split is superseded.
+- Implement the whole naming change as one implementation; the earlier two-wave split is superseded.
 - Scope naming changes and AI title generation to Claude, Codex, and OpenCode coding-agent sessions in CLI and fresh* modes. Preserve the current naming approach for shells, browsers, document viewers, editors, other non-agent panes, and coding providers outside those three.
 - Each coding-agent session has one saved name shared by its pane, sidebar/history entry, associated terminal presentation, and tab when that tab takes its name from the session. Do not offer or maintain separately targetable pane/tab/terminal aliases or independent group names for these sessions.
 - Rename from any applicable UI or API/MCP surface changes that same saved session name everywhere. Agent suggestions must not accidentally acquire the permanence of a user's explicit rename.
@@ -22,7 +22,7 @@ Produce one complete, executable implementation plan for unified, persistent cod
 - Make automatic Freshell naming reliable from server-side coding-agent session activity for UI, CLI, and API-created sessions, with an immediate fallback and bounded retries. Complete native title ingestion and supported provider writeback in the same plan.
 - Expose Rename only for user-directed naming. Do not add or retain a user-facing Generate a new name action, custom-label controls, or Reset to provider title for these sessions.
 - Include meaningful red/green/refactor, integration, and end-to-end verification across all six modes, including lifecycle, identity, concurrency, migration, and non-agent non-regression cases.
-- Stop after the plan is finished and reviewed. Do not implement, create a PR, merge, deploy, or restart the live server.
+- Do not create a PR, merge, deploy, or restart the live self-hosted server; the-usual run ends at the recap with safe next-step options.
 
 ### Accepted tradeoffs and residuals
 - Different sessions in a split tab keep their own session names; the tab uses one stable session as its naming source.
