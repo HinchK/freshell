@@ -59,7 +59,7 @@ Build and implement a ChatGPT-style scroll minimap for Freshell's fresh-agent tr
   - `type MinimapViewportBand = { top: number; height: number }`
   - `type MinimapLayout = { ticks: MinimapTick[]; viewport: MinimapViewportBand; railHeight: number }` (`railHeight` echoes the input so consumers — the tooltip side rule — need no second state slot)
   - `computeMinimapLayout(input: { scrollHeight: number; viewportHeight: number; scrollTop: number; railHeight: number; landmarks: readonly MinimapLandmark[] }): MinimapLayout`
-- Semantics (all pinned by tests below): ticks scale by `railHeight / scrollHeight`; under density the minimum tick height thins to `effectiveMinTickHeight = min(3, railHeight / landmarkCount)` with NO pixel floor — sub-pixel heights keep every tick in a DISTINCT, non-overlapping y-range (two ticks never share coordinates, so no tick ever occludes another's paint or hit-test). **Regime A (fits):** iterate landmarks sorted by `offsetTop` (ties by `index`); each tick's top is `min(max(proportionalTop, previousTickBottom), railHeight - height)` — proportional position preserved, colliding ticks pushed below their predecessor, single ticks past the rail clamped at the bottom edge; the regime is valid while the bottom clamp never pushes a tick below its predecessor's bottom. **Regime B (cannot fit):** when the chain would overlap, scale all tick heights by `min(1, railHeight / Σheights)` and place cumulative packed tops in transcript order — every tick keeps its own distinct slot and the whole band fits the rail exactly. The viewport band height is `min(railHeight, max(MIN_TICK, viewportHeight * scale))` and its top maps the clamped scroll fraction `scrollTop / (scrollHeight - viewportHeight)` onto `[0, railHeight - bandHeight]` so the band reaches exactly the rail bottom at max scroll; degenerate inputs (`scrollHeight <= 0` or `railHeight <= 0`) return `{ ticks: [], viewport: { top: 0, height: 0 }, railHeight: 0 }`.
+- Semantics (all pinned by tests below): ticks scale by `railHeight / scrollHeight`; under density the minimum tick height thins to `effectiveMinTickHeight = min(3, railHeight / landmarkCount)` with NO pixel floor — sub-pixel heights keep every tick in a DISTINCT, non-overlapping y-range (two ticks never share coordinates, so no tick ever occludes another's paint or hit-test). **Cluster packing:** iterate landmarks sorted by `offsetTop` (ties by `index`); a tick with room keeps its EXACT proportional top; colliding ticks form a group packed by abut from the group's anchor (the first member's proportional top, raised to the previous group's end, clamped to `railHeight - height`); a later tick joins the group when it cannot start at or after the group's packed end — either it overlaps proportionally or the rail-bottom clamp would push it back into the group. Non-final groups provably fit before the next group's anchor; only the final group may overflow, and it scales its member heights by `(railHeight - anchor) / Σheights` so it ends exactly at the rail bottom while keeping its anchor — late prompts stay near the rail bottom instead of resetting to the top. The viewport band height is `min(railHeight, max(MIN_TICK, viewportHeight * scale))` and its top maps the clamped scroll fraction `scrollTop / (scrollHeight - viewportHeight)` onto `[0, railHeight - bandHeight]` so the band reaches exactly the rail bottom at max scroll; degenerate inputs (`scrollHeight <= 0` or `railHeight <= 0`) return `{ ticks: [], viewport: { top: 0, height: 0 }, railHeight: 0 }`.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -129,9 +129,10 @@ describe('computeMinimapLayout', () => {
 
   it('never drops a landmark at absurd density — every tick keeps a distinct in-bounds slot', () => {
     // rail 20, 30 landmarks: effectiveMin = min(3, 20/30) = 0.667 (sub-pixel
-    // allowed). Proportional tops and the abut chain coincide exactly, so
-    // Regime A holds with a 2/3px pitch — 30 distinct ticks, monotonic,
-    // in-bounds. No two ticks share coordinates: nothing occludes anything.
+    // allowed). Proportional spacing exactly equals the thinned height
+    // (2/3px each), so every tick keeps its exact proportional top — 30
+    // distinct ticks, monotonic, in-bounds. No two ticks share coordinates:
+    // nothing occludes anything.
     const layout = computeMinimapLayout({
       scrollHeight: 3000, viewportHeight: 400, scrollTop: 0, railHeight: 20,
       landmarks: Array.from({ length: 30 }, (_, i) => landmark(i, i * 100)),
@@ -145,11 +146,12 @@ describe('computeMinimapLayout', () => {
     expect(layout.ticks[29].top).toBeCloseTo(29 * (20 / 30), 5)
   })
 
-  it('packs ticks in transcript order when proportional placement cannot fit (Regime B)', () => {
+  it('scales the final colliding group to fit the rail, anchored at its proportional start', () => {
     // Two huge prompts: proportional heights 60px each cannot fit a 100px
-    // rail while keeping proportional tops (the second would clamp back onto
-    // the first), so the layout scales heights to fit (x100/120 = 50 each)
-    // and packs cumulative tops 0 / 50 — both distinct and in-bounds.
+    // rail (the second would clamp back onto the first), so they form one
+    // group anchored at the first proportional top (0) whose heights scale
+    // by 100/120 -> 50 each, tops 0 / 50 — distinct, in-bounds, and the
+    // anchor keeps the group's proportional start.
     const layout = computeMinimapLayout({
       scrollHeight: 500, viewportHeight: 200, scrollTop: 0, railHeight: 100,
       landmarks: [landmark(0, 0, 300), landmark(1, 250, 300)],
@@ -159,6 +161,35 @@ describe('computeMinimapLayout', () => {
     expect(layout.ticks[0].height).toBeCloseTo(50, 5)
     expect(layout.ticks[1].top).toBeCloseTo(50, 5)
     expect(layout.ticks[1].height).toBeCloseTo(50, 5)
+  })
+
+  it('keeps a locally dense cluster near its proportional position — no reset to the rail top', () => {
+    // One early prompt, then five short prompts bunched after a long
+    // response (offsets 9500..9900 of a 10000px transcript on a 200px
+    // rail): proportional tops 190/192/194/196/198 collide at the 3px
+    // minimum (effectiveMin = min(3, 200/6) = 3), forming one final group
+    // anchored at 190. It scales to end at the rail bottom — the five late
+    // prompts stay near the BOTTOM, near their proportional positions,
+    // never packed from the rail top.
+    const layout = computeMinimapLayout({
+      scrollHeight: 10000, viewportHeight: 400, scrollTop: 0, railHeight: 200,
+      landmarks: [
+        landmark(0, 0),
+        landmark(1, 9500), landmark(2, 9600), landmark(3, 9700),
+        landmark(4, 9800), landmark(5, 9900),
+      ],
+    })
+    expect(layout.ticks.map((t) => t.index)).toEqual([0, 1, 2, 3, 4, 5])
+    expect(layout.ticks[0].top).toBeCloseTo(0, 5)
+    expect(layout.ticks[0].height).toBeCloseTo(3, 5)
+    expect(layout.ticks[1].top).toBeCloseTo(190, 5)
+    expect(layout.ticks[2].top).toBeCloseTo(192, 5)
+    expect(layout.ticks[3].top).toBeCloseTo(194, 5)
+    expect(layout.ticks[4].top).toBeCloseTo(196, 5)
+    expect(layout.ticks[5].top).toBeCloseTo(198, 5)
+    // Heights thinned 3 -> 2 (scale 10/15) so the group ends at the rail bottom.
+    expect(layout.ticks[1].height).toBeCloseTo(2, 5)
+    expect(layout.ticks[5].top + layout.ticks[5].height).toBeCloseTo(200, 5)
   })
 
   it('sorts unsorted landmarks by offsetTop (ties by index)', () => {
@@ -320,45 +351,58 @@ export function computeMinimapLayout(input: {
     input.railHeight,
     Math.max(effectiveMinTickHeight, mark.height * scale),
   ))
+  const proportionalTops = sorted.map((mark) => mark.offsetTop * scale)
 
-  // Regime A — proportional tops with abut push-down: each tick keeps its
-  // proportional position, is pushed below its predecessor on collision, and
-  // a lone overshoot clamps at the rail bottom (rail - height). Valid only
-  // while that clamp never pushes a tick below its predecessor's bottom,
-  // which would occlude the predecessor's hit area.
-  let fits = true
-  const tops: number[] = []
-  for (let i = 0; i < sorted.length; i++) {
-    const prevBottom = i === 0 ? 0 : tops[i - 1] + heights[i - 1]
-    const desired = Math.max(sorted[i].offsetTop * scale, prevBottom)
-    const maxTop = input.railHeight - heights[i]
-    if (maxTop < prevBottom - 1e-9) {
-      fits = false
-      break
+  // Cluster layout: a tick with room keeps its EXACT proportional top;
+  // colliding ticks form groups packed by abut from the group's anchor
+  // (first member's proportional top, raised to the previous group's end,
+  // clamped to railHeight - height). A later tick joins the group when it
+  // cannot start at or after the group's packed end — it overlaps
+  // proportionally, or the rail-bottom clamp would push it back into the
+  // group. Non-final groups provably fit before the next group's anchor;
+  // only the final group may overflow, and it scales its member heights to
+  // end exactly at the rail bottom while keeping its anchor — late prompts
+  // stay near the rail bottom, never reset to the top. Every tick keeps a
+  // distinct slot; no two ticks ever share a y-range.
+  const tops: number[] = new Array(sorted.length)
+  let i = 0
+  while (i < sorted.length) {
+    const anchor = Math.min(
+      Math.max(proportionalTops[i], i === 0 ? 0 : tops[i - 1] + heights[i - 1]),
+      Math.max(0, input.railHeight - heights[i]),
+    )
+    const group: number[] = [i]
+    let packed = heights[i]
+    while (i + group.length < sorted.length) {
+      const next = i + group.length
+      const nextStart = Math.min(
+        proportionalTops[next],
+        Math.max(0, input.railHeight - heights[next]),
+      )
+      if (nextStart >= anchor + packed - 1e-9) break
+      group.push(next)
+      packed += heights[next]
     }
-    tops.push(Math.min(Math.max(desired, 0), Math.max(maxTop, 0)))
-  }
-  if (!fits) {
-    // Regime B — pack: scale every tick height by railHeight / Σheights and
-    // place cumulative tops in transcript order. Every tick keeps its own
-    // distinct slot and the whole band fits the rail exactly; under density
-    // the rail is honestly a packed index, never an occluding stack.
-    const total = heights.reduce((sum, h) => sum + h, 0)
-    const factor = Math.min(1, input.railHeight / total)
-    heights = heights.map((h) => h * factor)
-    tops.length = 0
-    let cursor = 0
-    for (const h of heights) {
-      tops.push(cursor)
-      cursor += h
+    let groupHeights = group.map((k) => heights[k])
+    const span = input.railHeight - anchor
+    if (packed > span + 1e-9) {
+      const factor = span / packed
+      groupHeights = groupHeights.map((h) => h * factor)
+      group.forEach((k, j) => { heights[k] = groupHeights[j] })
     }
+    let cursor = anchor
+    group.forEach((k, j) => {
+      tops[k] = cursor
+      cursor += groupHeights[j]
+    })
+    i += group.length
   }
 
-  const ticks = sorted.map((mark, i) => ({
+  const ticks = sorted.map((mark, k) => ({
     index: mark.index,
     label: mark.label,
-    top: tops[i],
-    height: heights[i],
+    top: tops[k],
+    height: heights[k],
   }))
 
   const bandHeight = Math.min(
@@ -416,7 +460,7 @@ git commit -m "feat(fresh-agent): add pure transcript minimap layout math"
   - Rail container: `<div class="fresh-agent-minimap …" role="group" aria-label="Transcript minimap">` — `pointer-events-none` on the container, `pointer-events-auto` on the tick buttons only; positioned `right-2` (8px inset) so the rail sits exactly in the scroller's 12px right padding gutter, clear of the repo's 8px custom scrollbar (`src/index.css:1475` `::-webkit-scrollbar { width: 0.5rem }`) — never overlapping it; `z-30` so ticks stay clickable over the full-width z-20 glom chip at the transcript top (ticks are 12px wide; the chip keeps its click target everywhere else).
   - Visibility gate: the rail renders `null` when `scrollHeight <= clientHeight` (content fits the viewport) or the scroller is missing/zero-sized (also the jsdom default). Every user prompt with landmark text keeps a tick — no `< 2` prompts gate; a lone prompt renders a one-tick rail.
 - Measurement math (exact): for each `[data-turn-role="user"]` article inside the scroller, `index = Number(el.getAttribute('data-turn-index'))` (skip missing/NaN), `turn = displayTurns[index]` (skip missing), `label = turnPlainText(turn)` (skip empty), `rect = el.getBoundingClientRect()`, `offsetTop = rect.top - scroller.getBoundingClientRect().top + scroller.scrollTop`, `height = rect.height`. `railHeight = scroller.clientHeight - MINIMAP_RAIL_BOTTOM_INSET_PX`.
-- Recompute triggers: an effect keyed on `transcriptSignature` (mirrors the glom chip's effect at `FreshAgentTranscript.tsx:1241-1243`); a native `scroll` listener and a `ResizeObserver` on the scroller installed in a mount effect; and article-level observation — the signature effect also (re)subscribes a second `ResizeObserver` to every `[data-turn-role]` article (assistant articles included: their height changes move later landmarks), so content-only layout changes — tool/thinking disclosure expand-collapse, font-size reflow — re-measure even though neither `transcriptSignature` nor the scroller's border box changed. All observers/listeners call the recompute **synchronously** (see Global Constraints for why this is not rAF-throttled). Both observer subscriptions are guarded `typeof ResizeObserver !== 'undefined'` (the jsdom global stub makes them no-ops in tests unless a test stubs a capturable implementation).
+- Recompute triggers: an effect keyed on `transcriptSignature` (mirrors the glom chip's effect at `FreshAgentTranscript.tsx:1241-1243`); a native `scroll` listener and a `ResizeObserver` on the scroller installed in a mount effect; and child-level observation — the signature effect also (re)subscribes a second `ResizeObserver` to EVERY DIRECT CHILD of the scroller (`scroller.children`: turn articles, the tail caption, and the rolled-back-history `<section aria-label="Rolled back turns">` — its expand/collapse changes `scrollHeight` outside the articles AND outside `transcriptSignature`, which is derived only from `displayTurns`), so content-only layout changes — tool/thinking disclosure expand-collapse, rolled-back history expansion, font-size reflow — re-measure even though neither `transcriptSignature` nor the scroller's border box changed. All observers/listeners call the recompute **synchronously** (see Global Constraints for why this is not rAF-throttled). Both observer subscriptions are guarded `typeof ResizeObserver !== 'undefined'` (the jsdom global stub makes them no-ops in tests unless a test stubs a capturable implementation).
 - Click behavior: `scroller.querySelector('[data-turn-index="${index}"]')?.scrollIntoView?.({ block: 'start' })` — optional-call tolerance for jsdom, mirroring `handleGlomClick` (`FreshAgentTranscript.tsx:1156-1162`). The resulting scroll event flips `atBottom` false via the existing `onScroll` handler, so stick-to-bottom disengages with no fight.
 - Tooltip: `side` is per-tick — `'bottom'` for ticks in the top quarter of the rail (`tick.top < layout.railHeight * 0.25`), `'top'` otherwise (the tooltip clamps horizontally but computes its `style.top` unclamped — `tooltip.tsx:89-95` — so the topmost ticks must open downward to keep multi-line previews inside the viewport) — always `align="end"`. Content is the prompt's first line truncated to 120 chars with `…`; aria-label truncates the same first line to 60 chars.
 
@@ -707,6 +751,36 @@ describe('FreshAgentTranscript minimap rail', () => {
     expect(topOf(ticks[2])).toBeCloseTo(130, 5)
   })
 
+  it('re-measures when the rolled-back history disclosure resizes', async () => {
+    vi.stubGlobal('ResizeObserver', CapturingResizeObserver)
+    const rolledBack = [
+      { id: 'r1', turnId: 'r1', role: 'user' as const, summary: 'rolled prompt one', items: [{ id: 'r1i', kind: 'text' as const, text: 'rolled prompt one' }], restorable: false },
+      { id: 'r2', turnId: 'r2', role: 'user' as const, summary: 'rolled prompt two', items: [{ id: 'r2i', kind: 'text' as const, text: 'rolled prompt two' }], restorable: false },
+    ]
+    const utils = render(<FreshAgentTranscript turns={TRANSCRIPT} rolledBackTurns={rolledBack} />)
+    const scroller = utils.container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+    mockScroll(scroller, SCROLL_TOP, SCROLL_HEIGHT, CLIENT_HEIGHT)
+    const userTurns = utils.container.querySelectorAll('[data-turn-role="user"]')
+    mockRect(scroller, 0)
+    mockUserTurnRects(userTurns)
+    fireEvent.scroll(scroller)
+    const section = screen.getByRole('region', { name: 'Rolled back turns' })
+
+    // The disclosure expands outside the turn articles: the live ticks slide
+    // deeper. Fire ONLY the section's callbacks — not the articles', not the
+    // scroller's — so this test fails unless non-article children are
+    // observed.
+    mockRect(userTurns[1], 124)
+    mockRect(userTurns[2], 274)
+    await act(async () => {
+      for (const fire of resizeCallbacksByTarget.get(section) ?? []) fire()
+    })
+
+    const ticks = screen.getAllByRole('button', { name: /Jump to prompt:/ })
+    expect(topOf(ticks[1])).toBeCloseTo(100, 5)
+    expect(topOf(ticks[2])).toBeCloseTo(130, 5)
+  })
+
   it('opens topmost ticks downward (side bottom) and lower ticks upward (side top)', () => {
     setupScrollableTranscript()
     // railHeight 200 -> top-quarter threshold 50. Tick 0 (top 0) is in the
@@ -842,7 +916,12 @@ export function FreshAgentTranscriptMinimap({
     if (!scroller || typeof ResizeObserver === 'undefined') return
     articleObserverRef.current?.disconnect()
     const observer = new ResizeObserver(recompute)
-    scroller.querySelectorAll('[data-turn-role]').forEach((el) => observer.observe(el))
+    // Observe EVERY direct child of the scroller, not just turn articles:
+    // the rolled-back-history disclosure section (and any caption) sits
+    // outside the articles, and its expand/collapse changes scrollHeight
+    // without touching transcriptSignature (derived only from displayTurns)
+    // or the scroller's own border box.
+    Array.from(scroller.children).forEach((el) => observer.observe(el))
     articleObserverRef.current = observer
     return () => {
       observer.disconnect()
@@ -1128,23 +1207,23 @@ test.describe('Transcript minimap', () => {
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-The spec is written after Task 2 landed, so demonstrate red by removing the feature from the working tree (the cloud e2e image builds from the worktree content; a dirty tree pays the one-time ~13 min `-dirty` rebuild — that is expected and correct here):
+The spec is written after Task 2 landed, so demonstrate red by temporarily removing the feature from the working tree. This is a deliberate, bounded working-tree mutation performed under discipline so it cannot lose work:
+
+1. The tracked tree is clean at this point (Task 2 is committed; the only untracked file is the new spec, which `git restore` cannot touch). Verify first: `git status --short` shows only `?? test/e2e-browser/specs/transcript-minimap.spec.ts`.
+2. Remove ONLY the Task-2 render block from `src/components/fresh-agent/FreshAgentTranscript.tsx`:
+   `<FreshAgentTranscriptMinimap scrollerRef={scrollerRef} displayTurns={displayTurns} transcriptSignature={transcriptSignature} />`
+   (leave the import in place harmlessly — either way the rail is gone).
+3. Run the spec, then immediately restore exactly that one file and re-verify the tree is clean apart from the untracked spec.
 
 ```bash
-# Remove the Task-2 render block (and only it) from the transcript:
-${EDITOR:-vi} src/components/fresh-agent/FreshAgentTranscript.tsx
-#   delete:
-#       <FreshAgentTranscriptMinimap
-#         scrollerRef={scrollerRef}
-#         displayTurns={displayTurns}
-#         transcriptSignature={transcriptSignature}
-#       />
-#   (leave the import in place harmlessly, or remove it too — either way the
-#   rail is gone)
+git status --short   # expect only: ?? test/e2e-browser/specs/transcript-minimap.spec.ts
+# <edit src/components/fresh-agent/FreshAgentTranscript.tsx: delete the FreshAgentTranscriptMinimap render block>
 bash -lc 'npm run test:e2e:cloud -- --project=chromium test/e2e-browser/specs/transcript-minimap.spec.ts'
 git restore src/components/fresh-agent/FreshAgentTranscript.tsx
+git status --short   # expect only: ?? test/e2e-browser/specs/transcript-minimap.spec.ts
 ```
 
+(The cloud e2e image builds from the worktree content; a dirty tree pays the one-time ~13 min `-dirty` rebuild — that is expected and correct here.)
 Expected: FAIL because the minimap rail does not render — the first test fails at `expect(ticks).toHaveCount(3)` (receives 0). (The hide-when-fits test passes vacuously without the feature; it is a guard that becomes load-bearing once the rail exists.)
 
 - [ ] **Step 3: Add the minimal production implementation**
