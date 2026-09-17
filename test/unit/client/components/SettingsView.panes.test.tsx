@@ -267,8 +267,10 @@ describe('SettingsView Panes section', () => {
     expect(api.patch).not.toHaveBeenCalled()
   })
 
-  it('exposes the floating add-pane button toggle as an accessible switch, unchecked by default', () => {
-    const store = createTestStore()
+  it('exposes the floating add-pane button toggle as an accessible switch, checked by default on desktop', () => {
+    const store = configureStore({
+      reducer: { settings: settingsReducer, network: networkReducer },
+    })
     render(
       <Provider store={store}>
         <SettingsView />
@@ -276,12 +278,16 @@ describe('SettingsView Panes section', () => {
     )
     switchSettingsTab('Panes')
 
+    // The bare store uses the real settingsReducer boot resolution; jsdom is
+    // desktop-ambient, so the platform default (desktop ON) is what shows.
     const toggle = screen.getByRole('switch', { name: 'Show button to split panes' })
-    expect(toggle).not.toBeChecked()
+    expect(toggle).toBeChecked()
   })
 
   it('toggles the floating add-pane button locally without calling /api/settings', async () => {
-    const store = createTestStore()
+    const store = configureStore({
+      reducer: { settings: settingsReducer, network: networkReducer },
+    })
     render(
       <Provider store={store}>
         <SettingsView />
@@ -293,9 +299,11 @@ describe('SettingsView Panes section', () => {
     // accessible name (the Toggle sets aria-label="Show button to split
     // panes"); do not use the iconsOnTabs test's closest('div') pattern.
     const toggle = screen.getByRole('switch', { name: 'Show button to split panes' })
+    expect(toggle).toBeChecked()
     fireEvent.click(toggle)
 
-    expect(store.getState().settings.settings.panes.floatingActionButton).toBe(true)
+    // Desktop boots ON, so the first click disables it.
+    expect(store.getState().settings.settings.panes.floatingActionButton).toBe(false)
 
     await act(async () => {
       vi.advanceTimersByTime(600)

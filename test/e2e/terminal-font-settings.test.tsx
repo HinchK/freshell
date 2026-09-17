@@ -104,7 +104,7 @@ function createSettingsState(options: {
   loaded?: boolean
 } = {}) {
   const serverSettings = mergeServerSettings(defaultServerSettings, options.server ?? {})
-  const localSettings = resolveLocalSettings(options.local)
+  const localSettings = resolveLocalSettings(options.local, { floatingActionButtonDefault: true })
 
   return {
     serverSettings,

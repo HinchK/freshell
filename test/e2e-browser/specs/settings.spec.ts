@@ -252,52 +252,85 @@ test.describe('Settings', () => {
     expect(JSON.parse(blobOff ?? '{}').settings?.freshAgent).toBeUndefined()
   })
 
-  test('floating add-pane button is hidden by default, can be enabled, and persists locally', async ({ freshellPage, page, harness, serverInfo }) => {
-    // Two reload legs plus two settings sessions; the cloud-gated budget
-    // follows the Expand thinking reload-leg precedent in this file.
+  test('floating add-pane button is visible by default on desktop, can be disabled, and persists locally', async ({ freshellPage, page, harness, serverInfo }) => {
+    // One reload leg plus two settings sessions; the cloud-gated budget
+    // follows the settings-persist reload-leg precedent in this file.
     if (isCloudLaneWindowConfigured()) test.setTimeout(120_000)
 
-    // The FAB is opt-in: a default boot never renders it.
-    await expect(page.getByRole('button', { name: 'Add pane' })).toHaveCount(0)
+    // Desktop default boot (1280x720): the FAB renders without touching
+    // Settings — the panes.floatingActionButton platform default is ON at
+    // desktop width.
+    await expect(page.getByRole('button', { name: 'Add pane' })).toBeVisible({ timeout: 10_000 })
 
     await openSettingsSection(page, 'Panes')
     const fabSwitch = page.getByRole('switch', { name: 'Show button to split panes' })
-    await expect(fabSwitch).toHaveAttribute('aria-checked', 'false')
+    await expect(fabSwitch).toHaveAttribute('aria-checked', 'true')
 
-    // Opt in; the resolved setting and the persisted blob (diff-vs-defaults)
-    // both carry the key.
+    // Disable: the resolved setting flips, the FAB disappears, and the
+    // persisted blob (diff vs the DESKTOP platform default) records the
+    // explicit false. Settings replaces the terminal view (App.tsx:2059 vs
+    // :2095), so navigate back to the terminal view before asserting the
+    // FAB is gone — no PaneLayout mounts while Settings is open.
+    await fabSwitch.click()
+    await expect(fabSwitch).toHaveAttribute('aria-checked', 'false')
+    await page.waitForTimeout(PERSIST_DEBOUNCE_WAIT_MS)
+    expect((await harness.getSettings()).panes.floatingActionButton).toBe(false)
+    const blob = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
+    expect(JSON.parse(blob ?? '{}').settings?.panes?.floatingActionButton).toBe(false)
+    await page.getByTitle('Coding Agents (Ctrl+B T)').click()
+    await expect(page.getByRole('button', { name: 'Add pane' })).toHaveCount(0)
+
+    // The explicit disable survives reload — the saved false wins over the
+    // platform default on the next desktop boot.
+    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    await harness.waitForHarness()
+    await harness.waitForConnection(undefined, {
+      selfHealReload: isCloudLaneWindowConfigured(),
+    })
+    expect((await harness.getSettings()).panes.floatingActionButton).toBe(false)
+    await expect(page.getByRole('button', { name: 'Add pane' })).toHaveCount(0)
+
+    // Re-enable: the sticky-explicit rule keeps the key in the blob (an
+    // already-explicit choice is preserved verbatim; it changes only through
+    // an explicit toggle — it is never dropped for equaling the platform
+    // default), now recording true, and the FAB returns. Navigate back to
+    // the terminal view first: Settings replaces the terminal view, so no
+    // PaneLayout — and no FAB — mounts while it is open.
+    await openSettingsSection(page, 'Panes')
     await fabSwitch.click()
     await expect(fabSwitch).toHaveAttribute('aria-checked', 'true')
     await page.waitForTimeout(PERSIST_DEBOUNCE_WAIT_MS)
-    expect((await harness.getSettings()).panes.floatingActionButton).toBe(true)
-    const blob = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
-    expect(JSON.parse(blob ?? '{}').settings?.panes?.floatingActionButton).toBe(true)
+    const blobOn = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
+    expect(JSON.parse(blobOn ?? '{}').settings?.panes?.floatingActionButton).toBe(true)
+    await page.getByTitle('Coding Agents (Ctrl+B T)').click()
+    await expect(page.getByRole('button', { name: 'Add pane' })).toBeVisible()
+  })
 
-    // The opt-in persists across reload and the FAB is visible on the next
-    // boot (tabs/panes restore from localStorage; the 10s timeout rides
-    // out the restore).
+  test('floating add-pane button is hidden by default on a mobile-width viewport', async ({ page, serverInfo, harness }) => {
+    // Cloud-runnable presence-only pin for the mobile half of the default.
+    // mobile-viewport.spec.ts is cloud-skipped as environment-sensitive
+    // (CLOUD_SKIP_SPECS), but this test asserts presence only — the same
+    // boot shape as screenshot-baselines.spec.ts's mobile layout capture,
+    // which runs on the cloud lane. The boot chain here has no freshellPage
+    // fixture slot, so it needs the cloud-gated body budget.
+    if (isCloudLaneWindowConfigured()) test.setTimeout(120_000)
+
+    // Boot a fresh page at phone width BEFORE goto so the platform default
+    // resolves mobile at boot (sticky per boot thereafter). Mobile = viewport
+    // width (max-width: 767px), not device class.
+    await page.setViewportSize({ width: 390, height: 844 })
     await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
     await harness.waitForHarness()
     await harness.waitForConnection(undefined, {
       selfHealReload: isCloudLaneWindowConfigured(),
     })
-    expect((await harness.getSettings()).panes.floatingActionButton).toBe(true)
-    await expect(page.getByRole('button', { name: 'Add pane' })).toBeVisible({ timeout: 10_000 })
 
-    // Resetting to the default drops the key from the blob, and the next
-    // boot renders without the FAB again.
-    await openSettingsSection(page, 'Panes')
-    await fabSwitch.click()
-    await expect(fabSwitch).toHaveAttribute('aria-checked', 'false')
-    await page.waitForTimeout(PERSIST_DEBOUNCE_WAIT_MS)
-    const blobOff = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
-    expect(JSON.parse(blobOff ?? '{}').settings?.panes?.floatingActionButton).toBeUndefined()
-
-    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
-    await harness.waitForHarness()
-    await harness.waitForConnection(undefined, {
-      selfHealReload: isCloudLaneWindowConfigured(),
-    })
+    // Non-vacuity: the pane area really mounts (the first tab's pane-picker
+    // pane), and the mobile platform default keeps the FAB out of it. The
+    // desktop story above proves the same boot chain shows the FAB at
+    // desktop width, so this absence is the mobile default, not a missing
+    // pane area.
+    await expect(page.locator('[data-pane-root]')).toBeVisible({ timeout: 10_000 })
     await expect(page.getByRole('button', { name: 'Add pane' })).toHaveCount(0)
   })
 })

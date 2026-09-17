@@ -5,7 +5,8 @@ import { Provider } from 'react-redux'
 import PaneLayout from '@/components/panes/PaneLayout'
 import panesReducer from '@/store/panesSlice'
 import tabsReducer from '@/store/tabsSlice'
-import settingsReducer from '@/store/settingsSlice'
+import settingsReducer, { setLocalSettings } from '@/store/settingsSlice'
+import { resolveLocalSettings } from '@shared/settings'
 import type { PanesState } from '@/store/panesSlice'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
 import { installPaneGeometry } from '@test/helpers/pane-geometry'
@@ -378,7 +379,7 @@ describe('PaneLayout', () => {
       expect(await screen.findByTestId(`editor-${existingPaneId}`)).toBeInTheDocument()
     })
 
-    it('hides the floating action button by default', async () => {
+    it('shows the floating action button by default on desktop', async () => {
       const existingPaneId = 'pane-1'
       const store = createStore({
         layouts: {
@@ -396,13 +397,15 @@ describe('PaneLayout', () => {
         store
       )
 
-      // The FAB is opt-in via the panes.floatingActionButton local setting.
-      expect(screen.queryByTitle('Add pane')).not.toBeInTheDocument()
+      // jsdom boots desktop-ambient: the panes.floatingActionButton platform
+      // default is ON (desktop true / mobile false), so a default boot shows
+      // the FAB with no Settings change.
+      expect(screen.getByTitle('Add pane')).toBeInTheDocument()
     })
 
-    it('renders the floating action button when the setting is enabled', async () => {
+    it('hides the floating action button when the setting is explicitly disabled', async () => {
       const existingPaneId = 'pane-1'
-      const store = createStoreWithFab({
+      const store = createStore({
         layouts: {
           'tab-1': {
             type: 'leaf',
@@ -412,13 +415,45 @@ describe('PaneLayout', () => {
         },
         activePane: { 'tab-1': existingPaneId },
       })
+      store.dispatch({
+        type: 'settings/updateSettingsLocal',
+        payload: { panes: { floatingActionButton: false } },
+      })
 
       renderWithStore(
         <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} />,
         store
       )
 
-      expect(screen.getByTitle('Add pane')).toBeInTheDocument()
+      expect(screen.queryByTitle('Add pane')).not.toBeInTheDocument()
+    })
+
+    it('hides the floating action button when the store resolved the mobile platform default', async () => {
+      const existingPaneId = 'pane-1'
+      const store = createStore({
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: existingPaneId,
+            content: createTerminalContent(),
+          },
+        },
+        activePane: { 'tab-1': existingPaneId },
+      })
+      // Model a mobile boot's local settings exactly as the settings slice
+      // would resolve them at mobile width (module-init is desktop-ambient in
+      // this file, so the mobile default is injected through the resolution
+      // option instead of matchMedia timing).
+      store.dispatch(setLocalSettings(
+        resolveLocalSettings(undefined, { floatingActionButtonDefault: false }),
+      ))
+
+      renderWithStore(
+        <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} />,
+        store
+      )
+
+      expect(screen.queryByTitle('Add pane')).not.toBeInTheDocument()
     })
   })
 

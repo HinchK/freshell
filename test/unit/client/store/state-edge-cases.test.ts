@@ -845,6 +845,8 @@ describe('State Edge Cases', () => {
           },
           panes: {
             ...defaultSettings.panes,
+            // jsdom boots desktop-ambient: the platform default is ON.
+            floatingActionButton: true,
             defaultNewPane: 'shell',
           },
           codingCli: {

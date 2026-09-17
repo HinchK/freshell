@@ -40,8 +40,9 @@ test.describe('Pane picker', () => {
     await terminal.waitForTerminal()
 
     // Swap the terminal pane for an editor pane so no .xterm is visible and
-    // openPanePicker must take its add-pane-button fallback branch (the FAB
-    // is opt-in; the adapted helper enables it through the test harness).
+    // openPanePicker must take its add-pane-button fallback branch (the
+    // helper enables the FAB through the test harness so the branch works
+    // at any boot width).
     const tabId = await harness.getActiveTabId()
     expect(tabId).toBeTruthy()
     const layout = await harness.getPaneLayout(tabId!)

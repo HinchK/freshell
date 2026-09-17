@@ -1330,6 +1330,12 @@ export function mergeServerSettings(base: ServerSettings, patch: ServerSettingsP
   }
 }
 
+export function panesDefaultsWith(options: LocalSettingsPlatformDefaults): LocalSettings['panes'] {
+  return options.floatingActionButtonDefault === undefined
+    ? defaultLocalSettings.panes
+    : { ...defaultLocalSettings.panes, floatingActionButton: options.floatingActionButtonDefault }
+}
+
 export function resolveLocalSettings(
   patch?: LocalSettingsPatch,
   options: LocalSettingsPlatformDefaults = {},
@@ -1340,9 +1346,7 @@ export function resolveLocalSettings(
   const freshAgentPatch = sanitizeFreshAgentLocalSettingsPatchInput(
     isRecord(migratedFreshAgentPatch) ? migratedFreshAgentPatch : {},
   )
-  const panesDefaults = options.floatingActionButtonDefault === undefined
-    ? defaultLocalSettings.panes
-    : { ...defaultLocalSettings.panes, floatingActionButton: options.floatingActionButtonDefault }
+  const panesDefaults = panesDefaultsWith(options)
   return {
     ...defaultLocalSettings,
     ...(hasOwn(patch, 'theme') ? { theme: patch?.theme ?? defaultLocalSettings.theme } : {}),

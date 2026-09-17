@@ -12,10 +12,11 @@ export async function openPanePicker(page: Page): Promise<Locator> {
     await termContainer.click({ button: 'right' })
     await page.getByRole('menuitem', { name: /split horizontally/i }).click()
   } else {
-    // The floating add-pane button is opt-in (panes.floatingActionButton,
-    // default off). Enable it through the e2e test harness before falling
-    // back to clicking it, so this branch keeps working on pages with no
-    // visible terminal yet.
+    // The floating add-pane button is default-ON at desktop width and
+    // default-OFF at mobile width (panes.floatingActionButton). Enable it
+    // through the e2e test harness before falling back to clicking it, so
+    // this branch works at any boot width and on pages with no visible
+    // terminal yet.
     await page.evaluate(() => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({
         type: 'settings/updateSettingsLocal',

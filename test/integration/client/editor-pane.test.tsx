@@ -197,9 +197,10 @@ const createTestStore = () => {
     },
   })
   store.dispatch(setStatus('ready'))
-  // The floating add-pane button is opt-in (panes.floatingActionButton,
-  // default off); enable it so this file's FAB-driven pane-creation flows
-  // keep exercising their real input path.
+  // The floating add-pane button's platform default is ON at desktop width
+  // and OFF at mobile width (panes.floatingActionButton). Enable it
+  // explicitly so this file's FAB-driven pane-creation flows keep
+  // exercising their real input path regardless of the ambient default.
   store.dispatch({
     type: 'settings/updateSettingsLocal',
     payload: { panes: { floatingActionButton: true } },
