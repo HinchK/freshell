@@ -97,10 +97,10 @@ export default function PanesSettings({
           />
         </SettingsRow>
 
-        <SettingsRow label="Floating add-pane button" description="Show the floating add/split button in the corner of the pane area.">
+        <SettingsRow label="Show button to split panes" description="Show the floating add/split button in the corner of the pane area.">
           <Toggle
             checked={settings.panes?.floatingActionButton ?? false}
-            aria-label="Toggle floating add-pane button"
+            aria-label="Show button to split panes"
             onChange={(checked) => {
               applyLocalSetting({ panes: { floatingActionButton: checked } })
             }}

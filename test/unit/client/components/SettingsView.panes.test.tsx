@@ -276,7 +276,7 @@ describe('SettingsView Panes section', () => {
     )
     switchSettingsTab('Panes')
 
-    const toggle = screen.getByRole('switch', { name: 'Toggle floating add-pane button' })
+    const toggle = screen.getByRole('switch', { name: 'Show button to split panes' })
     expect(toggle).not.toBeChecked()
   })
 
@@ -290,9 +290,9 @@ describe('SettingsView Panes section', () => {
     switchSettingsTab('Panes')
 
     // This row has a description, so the switch must be selected by its
-    // accessible name (the Toggle sets aria-label="Toggle floating add-pane
-    // button"); do not use the iconsOnTabs test's closest('div') pattern.
-    const toggle = screen.getByRole('switch', { name: 'Toggle floating add-pane button' })
+    // accessible name (the Toggle sets aria-label="Show button to split
+    // panes"); do not use the iconsOnTabs test's closest('div') pattern.
+    const toggle = screen.getByRole('switch', { name: 'Show button to split panes' })
     fireEvent.click(toggle)
 
     expect(store.getState().settings.settings.panes.floatingActionButton).toBe(true)

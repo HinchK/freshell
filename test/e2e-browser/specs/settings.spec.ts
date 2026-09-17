@@ -261,7 +261,7 @@ test.describe('Settings', () => {
     await expect(page.getByRole('button', { name: 'Add pane' })).toHaveCount(0)
 
     await openSettingsSection(page, 'Panes')
-    const fabSwitch = page.getByRole('switch', { name: 'Toggle floating add-pane button' })
+    const fabSwitch = page.getByRole('switch', { name: 'Show button to split panes' })
     await expect(fabSwitch).toHaveAttribute('aria-checked', 'false')
 
     // Opt in; the resolved setting and the persisted blob (diff-vs-defaults)
