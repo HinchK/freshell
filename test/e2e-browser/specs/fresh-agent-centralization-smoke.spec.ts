@@ -139,6 +139,21 @@ async function openFreshAgentPaneFromPicker(page: Page, label: string) {
 
 function legacyLayoutPayload() {
   return {
+    // Match the real writers' shapes so the boot health gate keeps this
+    // envelope (classifyPersistedLayoutHealth) instead of rebuilding from
+    // the server. The persist middleware stamps every flush with persistedAt
+    // (epoch ms) and, only when a machine identity is known, machineId
+    // (persistMiddleware.ts:673-676; selectStampMachineId :536-544 emits
+    // nothing in a fresh context): a missing persistedAt classifies age 0 →
+    // 'stale' (layout-health.ts:759-760), and any machineId we could invent
+    // here would name a different machine than this fresh context resolves
+    // → 'foreign' (layout-health.ts:756-758) — so the stamp is persistedAt
+    // only. The terminal pane's status must be a real TerminalStatus
+    // (src/store/types.ts:1 — creating/running/recovering/exited/error):
+    // the legacy 'idle' the old seed carried is not in the union, and the
+    // gate's terminal lifecycle check rejects the whole envelope as corrupt
+    // for it (layout-health.ts:480, TERMINAL_STATUS_SET :14-19).
+    persistedAt: Date.now(),
     version: 3,
     tabs: {
       activeTabId: 'tab-legacy',
@@ -196,7 +211,7 @@ function legacyLayoutPayload() {
                   content: {
                     kind: 'terminal',
                     createRequestId: 'req-shell',
-                    status: 'idle',
+                    status: 'running',
                     mode: 'shell',
                     shell: 'system',
                   },
@@ -256,33 +271,53 @@ async function fetchWithAuth(serverInfo: E2eServerInfo, path: string, init: Requ
   })
 }
 
-async function fetchNormalizedLayoutProducedByLegacySync(serverInfo: E2eServerInfo, tabId: string): Promise<LayoutSnapshot> {
+async function fetchNormalizedLayoutProducedByLegacySync(page: Page, serverInfo: E2eServerInfo, tabId: string): Promise<LayoutSnapshot> {
   await expect.poll(async () => {
     const response = await fetchWithAuth(serverInfo, `/api/layout/snapshot?tabId=${encodeURIComponent(tabId)}`)
     const body = await response.json()
     const layout = body?.data?.layouts?.[tabId] as PaneNode | undefined
-    return collectLeaves(layout).map((leaf) => ({
+    const leaves = collectLeaves(layout)
+    if (!leaves.some((leaf) => leaf.id === 'pane-legacy-agent')) {
+      // Same eviction exposure as the two reads above (same hazard window):
+      // re-craft — nothing re-inserts the pane before the render step.
+      await sendLegacyLayoutSync(page)
+    }
+    return leaves.map((leaf) => ({
       id: leaf.id,
       kind: leaf.content?.kind,
       createRequestId: leaf.content?.createRequestId,
     }))
-  }).toEqual(expect.arrayContaining([
+  }, { timeout: 30_000 }).toEqual(expect.arrayContaining([
     { id: 'pane-legacy-agent', kind: 'fresh-agent', createRequestId: 'req-legacy-agent' },
     { id: 'pane-legacy-agent-nested', kind: 'fresh-agent', createRequestId: 'req-legacy-agent-nested' },
     { id: 'pane-shell', kind: 'terminal', createRequestId: 'req-shell' },
   ]))
 
-  const response = await fetchWithAuth(serverInfo, `/api/layout/snapshot?tabId=${encodeURIComponent(tabId)}`)
-  expect(response.status).toBe(200)
-  const body = await response.json()
-  const snapshot = body.data as LayoutSnapshot
+  // The follow-up one-shot snapshot fetch has the SAME adjacent-read
+  // eviction exposure (an eviction can land between the poll's success and
+  // this fetch — plan review round 3, Finding 1): shield it too. The poll
+  // hands the snapshot out via closure once the entry is present.
+  let snapshot: LayoutSnapshot | undefined
+  await expect.poll(async () => {
+    const response = await fetchWithAuth(serverInfo, `/api/layout/snapshot?tabId=${encodeURIComponent(tabId)}`)
+    if (response.status !== 200) return { status: response.status, present: false }
+    const body = await response.json()
+    const candidate = body.data as LayoutSnapshot
+    if (!collectLeaves(candidate.layouts[tabId]).some((leaf) => leaf.id === 'pane-legacy-agent')) {
+      await sendLegacyLayoutSync(page)
+      return { status: response.status, present: false }
+    }
+    snapshot = candidate
+    return { status: response.status, present: true }
+  }, { timeout: 30_000 }).toMatchObject({ status: 200, present: true })
+
   const serialized = JSON.stringify(snapshot)
-  expect(snapshot.tabs).toEqual([expect.objectContaining({ id: tabId, title: 'Remote legacy' })])
-  expect(snapshot.activePane).toMatchObject({ [tabId]: 'pane-legacy-agent' })
+  expect(snapshot!.tabs).toEqual([expect.objectContaining({ id: tabId, title: 'Remote legacy' })])
+  expect(snapshot!.activePane).toMatchObject({ [tabId]: 'pane-legacy-agent' })
   expect(serialized).toContain('"fresh-agent"')
   expect(serialized).not.toContain('"agent-chat"')
 
-  const leaves = collectLeaves(snapshot.layouts[tabId])
+  const leaves = collectLeaves(snapshot!.layouts[tabId])
   const rootFreshAgent = leaves.find((leaf) => leaf.id === 'pane-legacy-agent')
   const nestedFreshAgent = leaves.find((leaf) => leaf.id === 'pane-legacy-agent-nested')
   expect(rootFreshAgent?.content).toMatchObject({
@@ -299,7 +334,7 @@ async function fetchNormalizedLayoutProducedByLegacySync(serverInfo: E2eServerIn
     createRequestId: 'req-legacy-agent-nested',
     sessionRef: { provider: 'claude', sessionId: CANONICAL_CLAUDE_SESSION_ID },
   })
-  return snapshot
+  return snapshot!
 }
 
 async function renderNormalizedLegacySyncSnapshot(page: Page, snapshot: LayoutSnapshot, tabId: string) {
@@ -414,22 +449,73 @@ test.describe('Fresh-agent centralization smoke', () => {
     await expect.poll(async () => {
       const response = await fetchWithAuth(serverInfo, '/api/panes?tabId=tab-remote-legacy')
       const body = await response.json()
-      return body?.data?.panes ?? []
-    }).toEqual(expect.arrayContaining([
+      const panes: Array<{ id?: string }> = body?.data?.panes ?? []
+      if (!panes.some((pane) => pane.id === 'pane-legacy-agent')) {
+        // Evicted by the page's own debounced mirror sync (same WS
+        // connection key): the server's same-key ingest REPLACED the
+        // crafted entry, and no writer re-inserts it before the render
+        // step — re-craft it (per reports/load-bearing-validator-LB-2.md).
+        await sendLegacyLayoutSync(page)
+      }
+      return panes
+    }, { timeout: 30_000 }).toEqual(expect.arrayContaining([
       expect.objectContaining({
         id: 'pane-legacy-agent',
         kind: 'fresh-agent',
       }),
     ]))
 
-    const capture = await fetchWithAuth(serverInfo, '/api/panes/pane-legacy-agent/capture')
-    expect(capture.status).toBe(422)
-    expect(await capture.json()).toMatchObject({
-      status: 'error',
+    // Deterministic eviction exercise: dispatch a layout-visible change
+    // through the harness so the page's own mirror MUST re-sync
+    // (change-gated, 200ms debounce) and evict the crafted entry — the
+    // final-head lane window, now under the test's own control. The bound
+    // matches the family's other layout observations (related reads
+    // exceeded 5-10s under full-lane load).
+    await page.evaluate(() => {
+      window.__FRESHELL_TEST_HARNESS__?.dispatch({
+        type: 'tabs/addTab',
+        payload: { id: 'tab-eviction-trigger', title: 'Eviction trigger', status: 'running' },
+      })
+    })
+    // Eviction-dependency documentation (delta-review round-1 F11): this 404
+    // depends on the server layout store REPLACING same-connection-key
+    // ui.layout.sync payloads — no merge: the page's own debounced mirror
+    // sync overwrites the crafted entry wholesale, evicting
+    // pane-legacy-agent. A future change to MERGE same-key payloads instead
+    // would keep the crafted entry in the store (capture would answer the
+    // pinned 422, not 404) and surface as THIS poll timing out — a timeout
+    // here means the replace semantics changed, not a flake.
+    await expect.poll(async () => {
+      const capture = await fetchWithAuth(serverInfo, '/api/panes/pane-legacy-agent/capture')
+      return capture.status
+    }, { timeout: 30_000 }).toBe(404)
+
+    // Capture contract: the pinned answer is 422 "pane kind \"fresh-agent\"
+    // is unsupported for capture-pane". The crafted entry is evictable at
+    // any pre-render moment by the page's own debounced ui.layout.sync (the
+    // mirror sends the REAL Redux layout on the same WsClient; the server
+    // keys layout-store entries by connection id and same-key ingest
+    // replaces the crafted entry). After eviction NO writer re-inserts
+    // pane-legacy-agent before the render step, so a bare poll would re-time
+    // the failure (every iteration 404 until the bound). Re-send the
+    // crafted sync whenever the evicted state (404) is observed and keep
+    // polling for the pinned contract answer; any other non-422 status
+    // fails the contract assertion loudly at the bound.
+    await expect.poll(async () => {
+      const capture = await fetchWithAuth(serverInfo, '/api/panes/pane-legacy-agent/capture')
+      if (capture.status === 404) {
+        await sendLegacyLayoutSync(page)
+        return { status: 404 }
+      }
+      const body = await capture.json().catch(() => undefined)
+      return { status: capture.status, bodyStatus: body?.status, message: body?.message }
+    }, { timeout: 30_000 }).toMatchObject({
+      status: 422,
+      bodyStatus: 'error',
       message: expect.stringContaining('pane kind "fresh-agent"'),
     })
 
-    const normalizedLegacySyncSnapshot = await fetchNormalizedLayoutProducedByLegacySync(serverInfo, 'tab-remote-legacy')
+    const normalizedLegacySyncSnapshot = await fetchNormalizedLayoutProducedByLegacySync(page, serverInfo, 'tab-remote-legacy')
     await renderNormalizedLegacySyncSnapshot(page, normalizedLegacySyncSnapshot, 'tab-remote-legacy')
 
     await expect(page.locator('[data-context="fresh-agent"]')).toHaveCount(2, { timeout: 10_000 })
@@ -484,8 +570,12 @@ test.describe('Fresh-agent centralization smoke', () => {
     }
 
     await page.getByRole('button', { name: /Settings/ }).click()
-    await page.getByRole('tab', { name: 'Workspace' }).click()
-    await expect(page.getByText('Fresh agent')).toBeVisible()
+    // The Fresh agent display section lives in the Coding Agents tab since
+    // the settings-tab refactor (b29f7133a moved it out of Workspace); the
+    // 30s bound is the family's load-tolerance literal for settings-modal
+    // waits (Task 6's deflake class).
+    await page.getByRole('tab', { name: 'Coding Agents' }).click()
+    await expect(page.getByText('Fresh agent')).toBeVisible({ timeout: 30_000 })
     await expect(page.getByText(/agent chat/i)).toHaveCount(0)
   })
 })

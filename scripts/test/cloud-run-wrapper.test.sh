@@ -215,6 +215,14 @@ if echo "$CLOUD_STUB_OUTPUT" | grep -q "Running locally"; then
   rm -rf "$STUB_DIR"
   exit 1
 fi
+# cloud-path provenance (kata 67jt, gate-integrity half): the cloud lane
+# must self-identify its CONFIG file and the selection rules in force.
+if ! printf '%s' "$CLOUD_STUB_OUTPUT" | grep -q 'Config:  test/e2e-browser/playwright.cloud.config.ts'; then
+  echo "FAIL: cloud path is missing the Config provenance line"
+  printf '%s' "$CLOUD_STUB_OUTPUT" | tail -20
+  rm -rf "$STUB_DIR"
+  exit 1
+fi
 if ! grep -qE -- "--image=[^ ]+freshell-e2e:${EXPECTED_TAG} " "$STUB_CAPTURE/create.args" 2>/dev/null; then
   echo "FAIL: cloud job did not target the HEAD-addressed image tag ($EXPECTED_TAG)"
   echo "create args: $(cat "$STUB_CAPTURE/create.args" 2>/dev/null || echo '<none>')"

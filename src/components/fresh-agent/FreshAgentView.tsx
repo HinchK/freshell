@@ -357,25 +357,6 @@ function buildFreshAgentAttachMessage(content: FreshAgentPaneContent, cwd?: stri
   } as const
 }
 
-function buildLegacyRestoreContext(tab: { title?: string; createdAt?: number; updatedAt?: number } | undefined) {
-  if (!tab) return undefined
-  const title = typeof tab.title === 'string' && tab.title.trim().length > 0
-    ? tab.title.trim()
-    : undefined
-  const createdAt = typeof tab.createdAt === 'number' && Number.isFinite(tab.createdAt)
-    ? tab.createdAt
-    : undefined
-  const updatedAt = typeof tab.updatedAt === 'number' && Number.isFinite(tab.updatedAt)
-    ? tab.updatedAt
-    : undefined
-  if (!title && createdAt === undefined && updatedAt === undefined) return undefined
-  return {
-    ...(title ? { title } : {}),
-    ...(createdAt !== undefined ? { createdAt } : {}),
-    ...(updatedAt !== undefined ? { updatedAt } : {}),
-  }
-}
-
 function getQuestionAgentLabel(paneContent: FreshAgentPaneContent, descriptorLabel?: string): string {
   if (paneContent.sessionType === 'kilroy') return 'Kilroy'
   switch (paneContent.provider) {
@@ -603,9 +584,6 @@ export function FreshAgentView({
   const pendingCreateFailure = useAppSelector(
     (state) => state.freshAgent?.pendingCreateFailures?.[paneContent.createRequestId],
   )
-  const tabRestoreSource = useAppSelector((state) => (
-    state.tabs?.tabs?.find((tab) => tab.id === tabId)
-  ))
   const claudeSession = useAppSelector((state) => {
     if (paneContent.provider !== 'claude' || !paneContent.sessionId) return undefined
     const sessionKey = makeFreshAgentSessionKey({
@@ -1222,16 +1200,12 @@ export function FreshAgentView({
   ])
 
   const buildCreateMessage = useCallback((content: FreshAgentPaneContent) => {
-    const legacyRestoreContext = content.provider === 'opencode'
-      ? buildLegacyRestoreContext(tabRestoreSource)
-      : undefined
     return {
       type: 'freshAgent.create',
       requestId: content.createRequestId,
       sessionType: content.sessionType,
       provider: content.provider,
       cwd: content.initialCwd,
-      ...(legacyRestoreContext ? { legacyRestoreContext } : {}),
       sessionRef: effectiveSessionRef(content),
       modelSelection: content.modelSelection,
       model: resolveEffectiveFreshAgentModel(content, providerDefaults),
@@ -1243,7 +1217,7 @@ export function FreshAgentView({
       // tabKey as `deviceId:tabId` from the connection identity + this field.
       tabId,
     } as const
-  }, [providerDefaults, tabRestoreSource, tabId])
+  }, [providerDefaults, tabId])
 
   const startNewConversation = useCallback(() => {
     const current = paneContentRef.current
@@ -2218,8 +2192,34 @@ export function FreshAgentView({
           status: sessionStatus,
         }))
       }
+      // An idle/busy-less snapshot must not clear a genuinely running turn.
+      // The pane-content status echo is user-visible state and deserves the
+      // same protection the session record has — the two writes must never
+      // disagree. "Genuinely running" is the session record's positive busy
+      // assertion (the server's running broadcast / status events): while
+      // the record asserts busy, a busy-less snapshot status may not
+      // overwrite the pane's 'running' unless the session-record gate's own
+      // adoption legality (canAdoptSnapshotStatus and its companion
+      // conditions; the busy disjunct is already excluded by the trigger
+      // below) would allow the same adoption; once the record no longer
+      // asserts busy (authoritative events already ended the turn), the
+      // pane's 'running' is stale and adopting the snapshot's status
+      // restores the agreement.
+      const sessionRecordAssertsBusy = agentSessionStatusRef.current !== undefined
+        && BUSY_STATES.has(agentSessionStatusRef.current)
+      const snapshotClearsGenuineRunning = !snapshotIsBusy
+        && fresh.status === 'running'
+        && sessionRecordAssertsBusy
+        && !(
+          sessionStatus
+          && nextSessionId
+          && canAdoptSnapshotStatus
+          && !wouldRegressStatus
+          && (!hasBlockingLocalEchoForSession && !statusChangedSinceRequest)
+        )
+      const nextPaneStatus = snapshotClearsGenuineRunning ? fresh.status : nextStatus
       if (
-        nextStatus === fresh.status
+        nextPaneStatus === fresh.status
         && nextSessionId === fresh.sessionId
         && nextResumeSessionId === fresh.resumeSessionId
         && nextSessionRef?.provider === fresh.sessionRef?.provider
@@ -2234,7 +2234,7 @@ export function FreshAgentView({
           ...fresh,
           sessionId: nextSessionId,
           sessionRef: nextSessionRef,
-          status: nextStatus,
+          status: nextPaneStatus,
           resumeSessionId: nextResumeSessionId,
           pendingLocalEcho: landedEcho || staleEcho ? undefined : fresh.pendingLocalEcho,
         },
@@ -2364,6 +2364,40 @@ export function FreshAgentView({
       updates: { status: claudeSessionStatus },
     }))
   }, [claudeSession?.lost, claudeSessionStatus, dispatch, paneContent.provider, paneContent.status, paneId, tabId])
+
+  // Delta-review round-1 F2: the Task 4 content-status gate (in applySnapshot)
+  // can strand the pane-content status at a busy state. When a turn ends
+  // without a snapshot-invalidating event (freshAgent.error via sessionError,
+  // freshAgent.exit via sessionExited, codex stuck/exited — none of which is
+  // in SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS), the record clears busy
+  // through a path that triggers no follow-up snapshot, and the busy poll
+  // stops once the record is idle — so the pane's refused 'running' echo has
+  // nothing left to repair it. (Opencode's interrupt and end-of-turn paths DO
+  // emit freshAgent.session.snapshot, which refetches; this effect covers the
+  // event-shaped endings.) The record's busy→non-busy edge is the last
+  // authoritative signal: re-derive the pane-content status from it.
+  // Claude is excluded because the level-triggered mirror above already
+  // covers it. This cannot weaken the gate: it fires only once the record
+  // ITSELF no longer asserts busy, which is exactly when the Task 4
+  // invariant considers the pane's 'running' stale. Edge-triggered (not
+  // level-triggered) so it never fights the opencode send path's optimistic
+  // 'running' write, which lands while the record is already non-busy.
+  const agentSessionStatus = agentSession?.status
+  const previousSessionRecordStatusRef = useRef(agentSessionStatus)
+  useEffect(() => {
+    const previousStatus = previousSessionRecordStatusRef.current
+    previousSessionRecordStatusRef.current = agentSessionStatus
+    if (paneContent.provider === 'claude') return
+    if (!agentSessionStatus || !previousStatus) return
+    if (!BUSY_STATES.has(previousStatus) || BUSY_STATES.has(agentSessionStatus)) return
+    if (!BUSY_STATES.has(paneContent.status)) return
+    if (isStatusRegression(paneContent.status, agentSessionStatus)) return
+    dispatch(mergePaneContent({
+      tabId,
+      paneId,
+      updates: { status: agentSessionStatus },
+    }))
+  }, [agentSessionStatus, dispatch, paneContent.provider, paneContent.status, paneId, tabId])
 
   useEffect(() => {
     if (paneContent.provider !== 'claude') return
