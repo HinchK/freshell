@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
-use freshell_sessions::parse::OpencodeProvider;
+use freshell_sessions::parse::{OpencodeProvider, OpencodeSession};
 use rusqlite::Connection;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -369,4 +369,263 @@ fn legacy_schema_without_model_column_stays_listable() {
     let s = list_one(&dir);
     assert_eq!(s.model, None);
     assert_eq!(s.last_usage, None);
+}
+
+// ── Row-stamped usage cache (freshopencode re-list storm fix) ──────────
+//
+// Production shape under test: every dirty-mark/WAL-move re-list re-runs
+// the WHOLE listing (the pinned change-token contract), but the usage walk
+// must only execute for rows whose time_updated moved. The provider's
+// walk counter (mirroring OpencodeLocator::db_scan_count) is the
+// observable-work seam: cache hits never increment it.
+//
+// Fixture note (Stage-2 validated fact 1): live opencode bumps
+// session.time_updated on prompts and step-finishes, NOT on bare
+// message/part inserts — so these fixtures move the stamp EXPLICITLY
+// wherever a re-walk is expected (and the staleness-leg test deliberately
+// does not, to pin the accepted bound).
+
+fn list_sessions_from(provider: &OpencodeProvider, now_ms: i64) -> Vec<OpencodeSession> {
+    provider.list_sessions(now_ms).expect("read ok").sessions
+}
+
+#[test]
+fn usage_cache_unchanged_row_stamp_skips_the_walk() {
+    let dir = TmpDir::new();
+    let conn = Connection::open(dir.join("opencode.db")).unwrap();
+    create_schema(&conn);
+    insert_session(&conn, "ses_1", "Named", Some(MODEL_JSON));
+    insert_message(&conn, "msg_1", "ses_1", 100, "assistant");
+    insert_part(&conn, "prt_1", "msg_1", "ses_1", STEP_FINISH_FULL);
+    drop(conn);
+    let provider = OpencodeProvider::new(dir.to_path_buf());
+    let first = list_sessions_from(&provider, 42);
+    assert_eq!(first.len(), 1);
+    assert_eq!(provider.usage_walk_count(), 1);
+    let second = list_sessions_from(&provider, 43);
+    assert_eq!(
+        provider.usage_walk_count(),
+        1,
+        "an unchanged session row (time_updated still 5000) must not re-run the usage walk"
+    );
+    assert_eq!(second[0].last_usage, first[0].last_usage);
+}
+
+#[test]
+fn usage_cache_row_stamp_change_rewalks_exactly_that_session() {
+    let dir = TmpDir::new();
+    {
+        let conn = Connection::open(dir.join("opencode.db")).unwrap();
+        create_schema(&conn);
+        insert_session(&conn, "ses_1", "Named", Some(MODEL_JSON));
+        insert_session(&conn, "ses_2", "Named", Some(MODEL_JSON));
+        insert_message(&conn, "msg_1", "ses_1", 100, "assistant");
+        insert_part(&conn, "prt_1", "msg_1", "ses_1", STEP_FINISH_FULL);
+        insert_message(&conn, "msg_2", "ses_2", 100, "assistant");
+        insert_part(&conn, "prt_2", "msg_2", "ses_2", STEP_FINISH_FULL);
+    }
+    let provider = OpencodeProvider::new(dir.to_path_buf());
+    let _ = list_sessions_from(&provider, 42);
+    assert_eq!(provider.usage_walk_count(), 2);
+
+    // ses_1's row changes: a newer step-finish with different tokens + a stamp bump.
+    let conn = Connection::open(dir.join("opencode.db")).unwrap();
+    insert_message(&conn, "msg_3", "ses_1", 200, "assistant");
+    insert_part(
+        &conn,
+        "prt_3",
+        "msg_3",
+        "ses_1",
+        r#"{"reason":"stop","type":"step-finish","tokens":{"total":777777,"input":7,"output":7,"reasoning":1,"cache":{"write":0,"read":777763}},"cost":0}"#,
+    );
+    conn.execute(
+        "UPDATE session SET time_updated = time_updated + 1 WHERE id = 'ses_1'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let second = list_sessions_from(&provider, 43);
+    assert_eq!(
+        provider.usage_walk_count(),
+        3,
+        "only the session whose row stamp moved re-walks"
+    );
+    let ses1 = second.iter().find(|s| s.session_id == "ses_1").unwrap();
+    assert_eq!(ses1.last_usage.as_ref().unwrap().total, Some(777_777));
+    let ses2 = second.iter().find(|s| s.session_id == "ses_2").unwrap();
+    assert_eq!(ses2.last_usage.as_ref().unwrap().total, Some(215_242));
+}
+
+#[test]
+fn usage_cache_serves_cached_usage_until_the_row_stamp_moves() {
+    // The accepted residual, pinned deliberately: a step-finish written
+    // WITHOUT a session-row change serves the cached value; the staleness
+    // bound is the session row's time_updated (live opencode bumps the row
+    // on prompts and step-finishes — the fixture here deliberately does NOT).
+    let dir = TmpDir::new();
+    {
+        let conn = Connection::open(dir.join("opencode.db")).unwrap();
+        create_schema(&conn);
+        insert_session(&conn, "ses_1", "Named", Some(MODEL_JSON));
+        insert_message(&conn, "msg_1", "ses_1", 100, "assistant");
+        insert_part(&conn, "prt_1", "msg_1", "ses_1", STEP_FINISH_FULL);
+    }
+    let provider = OpencodeProvider::new(dir.to_path_buf());
+    let first = list_sessions_from(&provider, 42);
+    assert_eq!(first[0].last_usage.as_ref().unwrap().total, Some(215_242));
+
+    let conn = Connection::open(dir.join("opencode.db")).unwrap();
+    insert_part(
+        &conn,
+        "prt_2",
+        "msg_1",
+        "ses_1",
+        r#"{"reason":"stop","type":"step-finish","tokens":{"total":999999,"input":9,"output":9,"reasoning":1,"cache":{"write":0,"read":999981}},"cost":0}"#,
+    );
+    drop(conn);
+    let stale = list_sessions_from(&provider, 43);
+    assert_eq!(
+        stale[0].last_usage.as_ref().unwrap().total,
+        Some(215_242),
+        "without a row-stamp move the cached value is served (the documented bound)"
+    );
+
+    let conn = Connection::open(dir.join("opencode.db")).unwrap();
+    conn.execute(
+        "UPDATE session SET time_updated = time_updated + 1 WHERE id = 'ses_1'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let fresh = list_sessions_from(&provider, 44);
+    assert_eq!(fresh[0].last_usage.as_ref().unwrap().total, Some(999_999));
+}
+
+#[test]
+fn usage_cache_null_time_updated_row_is_never_cached() {
+    let dir = TmpDir::new();
+    {
+        let conn = Connection::open(dir.join("opencode.db")).unwrap();
+        create_schema(&conn);
+        conn.execute(
+            "INSERT INTO session VALUES ('ses_1', '/repo/x', 'Named', 1000, NULL, NULL, NULL, NULL, ?1)",
+            rusqlite::params![MODEL_JSON],
+        )
+        .unwrap();
+        insert_message(&conn, "msg_1", "ses_1", 100, "assistant");
+        insert_part(&conn, "prt_1", "msg_1", "ses_1", STEP_FINISH_FULL);
+    }
+    let provider = OpencodeProvider::new(dir.to_path_buf());
+    let first = list_sessions_from(&provider, 42);
+    assert_eq!(first[0].last_usage.as_ref().unwrap().total, Some(215_242));
+    assert_eq!(provider.usage_walk_count(), 1);
+    let _ = list_sessions_from(&provider, 43);
+    assert_eq!(
+        provider.usage_walk_count(),
+        2,
+        "a NULL time_updated row cannot be stamp-validated and always re-walks"
+    );
+}
+
+#[test]
+fn usage_cache_caches_a_none_result_until_the_row_stamp_moves() {
+    // None is cached like any result — BOTH the legitimate miss (no
+    // step-finish yet) and the transient-error degrade return None
+    // indistinguishably (recorded residual, the plan's "Recorded accepted
+    // residuals / Error-None caching"): the cap-None pathological session
+    // is exactly the storm's worst case and must not re-walk per re-list.
+    let dir = TmpDir::new();
+    {
+        let conn = Connection::open(dir.join("opencode.db")).unwrap();
+        create_schema(&conn);
+        insert_session(&conn, "ses_1", "Named", Some(MODEL_JSON));
+        insert_message(&conn, "msg_1", "ses_1", 100, "assistant");
+        insert_part(
+            &conn,
+            "prt_1",
+            "msg_1",
+            "ses_1",
+            r#"{"type":"text","text":"no finish yet"}"#,
+        );
+    }
+    let provider = OpencodeProvider::new(dir.to_path_buf());
+    let first = list_sessions_from(&provider, 42);
+    assert_eq!(first[0].last_usage, None);
+    assert_eq!(provider.usage_walk_count(), 1);
+    let second = list_sessions_from(&provider, 43);
+    assert_eq!(second[0].last_usage, None);
+    assert_eq!(
+        provider.usage_walk_count(),
+        1,
+        "a None walk result (miss or degrade) is cached like any result"
+    );
+
+    let conn = Connection::open(dir.join("opencode.db")).unwrap();
+    insert_part(&conn, "prt_2", "msg_1", "ses_1", STEP_FINISH_FULL);
+    conn.execute(
+        "UPDATE session SET time_updated = time_updated + 1 WHERE id = 'ses_1'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let third = list_sessions_from(&provider, 44);
+    assert_eq!(third[0].last_usage.as_ref().unwrap().total, Some(215_242));
+    assert_eq!(provider.usage_walk_count(), 2);
+}
+
+#[test]
+fn usage_cache_prunes_sessions_that_left_the_listing() {
+    let dir = TmpDir::new();
+    {
+        let conn = Connection::open(dir.join("opencode.db")).unwrap();
+        create_schema(&conn);
+        insert_session(&conn, "ses_1", "Named", Some(MODEL_JSON));
+        insert_session(&conn, "ses_2", "Named", Some(MODEL_JSON));
+        insert_message(&conn, "msg_1", "ses_1", 100, "assistant");
+        insert_part(&conn, "prt_1", "msg_1", "ses_1", STEP_FINISH_FULL);
+        insert_message(&conn, "msg_2", "ses_2", 100, "assistant");
+        insert_part(&conn, "prt_2", "msg_2", "ses_2", STEP_FINISH_FULL);
+    }
+    let provider = OpencodeProvider::new(dir.to_path_buf());
+    let _ = list_sessions_from(&provider, 42);
+    assert_eq!(provider.usage_walk_count(), 2);
+
+    // ses_2 archives (leaves the listing)...
+    let conn = Connection::open(dir.join("opencode.db")).unwrap();
+    conn.execute(
+        "UPDATE session SET time_archived = 6000 WHERE id = 'ses_2'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let _ = list_sessions_from(&provider, 43); // ses_2 gone; ses_1 cached
+    assert_eq!(provider.usage_walk_count(), 2);
+
+    // ...then returns with the SAME time_updated stamp but different part
+    // data: the prune means it is not a cache hit — the re-list re-walks it.
+    let conn = Connection::open(dir.join("opencode.db")).unwrap();
+    conn.execute(
+        "UPDATE session SET time_archived = NULL WHERE id = 'ses_2'",
+        [],
+    )
+    .unwrap();
+    conn.execute("DELETE FROM part WHERE id = 'prt_2'", [])
+        .unwrap();
+    insert_part(
+        &conn,
+        "prt_2",
+        "msg_2",
+        "ses_2",
+        r#"{"reason":"stop","type":"step-finish","tokens":{"total":888888,"input":8,"output":8,"reasoning":1,"cache":{"write":0,"read":888872}},"cost":0}"#,
+    );
+    drop(conn);
+    let third = list_sessions_from(&provider, 44);
+    let ses2 = third.iter().find(|s| s.session_id == "ses_2").unwrap();
+    assert_eq!(
+        ses2.last_usage.as_ref().unwrap().total,
+        Some(888_888),
+        "a session re-entering the listing is re-walked even under an unchanged stamp"
+    );
+    assert_eq!(provider.usage_walk_count(), 3);
 }

@@ -501,6 +501,46 @@ fn last_step_finish_usage_for_session(
     }
 }
 
+/// Cache-or-walk wrapper around [`last_step_finish_usage_for_session`]:
+/// consults the row-stamped cache first; only a stamp change (or a NULL
+/// stamp, which can never be validated) executes the walk. `None` results
+/// are cached like any other — a walk that legitimately found nothing
+/// should not re-run per re-list (the pathological 64-probe-cap session is
+/// exactly the one this must not re-walk on every WAL move). A poisoned
+/// lock recovers rather than breaking the listing (degrade discipline).
+fn cached_or_walked_usage(
+    cache: &std::sync::Mutex<std::collections::HashMap<String, CachedUsage>>,
+    walk_count: &std::sync::atomic::AtomicU64,
+    conn: &Connection,
+    session_id: &str,
+    stamp: Option<i64>,
+) -> Option<OpencodeStepUsage> {
+    let Some(stamp) = stamp else {
+        // NULL time_updated: never cacheable — no stamp to validate
+        // against. Always walk, exactly as the pre-cache code did.
+        walk_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        return last_step_finish_usage_for_session(conn, session_id);
+    };
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(hit) = cache.get(session_id) {
+        if hit.stamp == stamp {
+            return hit.usage.clone();
+        }
+    }
+    walk_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let usage = last_step_finish_usage_for_session(conn, session_id);
+    cache.insert(
+        session_id.to_string(),
+        CachedUsage {
+            stamp,
+            usage: usage.clone(),
+        },
+    );
+    usage
+}
+
 fn run_opencode_query_inner(
     conn: &Connection,
     marker_pattern: &str,
@@ -634,21 +674,52 @@ fn run_opencode_query_inner(
     })
 }
 
+/// One cached usage-walk result, keyed by session id and validated by the
+/// session row's `time_updated` stamp (the listing already SELECTs it as
+/// `lastActivityAt`). `usage: None` is a legitimate cached value — a walk
+/// that found no step-finish, a capped miss, or a transient-error degrade
+/// — the stamp, not the value, decides freshness (freshopencode re-list
+/// storm fix: docs/plans/2026-09-17-freshopencode-relist-storm.md).
+#[derive(Debug, Clone)]
+struct CachedUsage {
+    stamp: i64,
+    usage: Option<OpencodeStepUsage>,
+}
+
 /// The read-only opencode provider (path derivation + direct listing).
 pub struct OpencodeProvider {
     home_dir: PathBuf,
+    /// Row-stamped usage-walk cache: every dirty-mark/WAL-move re-list
+    /// re-runs the whole listing (the pinned trigger contract), but the
+    /// per-session usage walk only re-executes for rows whose
+    /// `time_updated` moved. Pruned to the listed id-set at the end of
+    /// each successful listing, so the map stays O(live sessions).
+    usage_cache: std::sync::Mutex<std::collections::HashMap<String, CachedUsage>>,
+    /// Counts actual usage-walk executions (cache misses) — test/diagnostic
+    /// hook mirroring `OpencodeLocator::db_scan_count`
+    /// (crates/freshell-sessions/src/opencode_locator.rs:172-177).
+    usage_walks: std::sync::atomic::AtomicU64,
 }
 
 impl OpencodeProvider {
     pub fn new(home_dir: impl Into<PathBuf>) -> Self {
         Self {
             home_dir: home_dir.into(),
+            usage_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            usage_walks: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// `getDatabasePath` — `<homeDir>/opencode.db`.
     pub fn database_path(&self) -> PathBuf {
         self.home_dir.join("opencode.db")
+    }
+
+    /// How many usage walks have actually executed (cache misses) so far —
+    /// test/diagnostic hook mirroring `OpencodeLocator::db_scan_count`:
+    /// proves unchanged session rows skip the walk across re-lists.
+    pub fn usage_walk_count(&self) -> u64 {
+        self.usage_walks.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// `getWatchedDatabasePaths` — `[db, db-wal]`.
@@ -753,9 +824,16 @@ impl OpencodeProvider {
             let model = row.model.as_deref().and_then(opencode_model_composite);
             // Bounded usage lookup, gated on a resolvable model: usage
             // without a model can never produce meter fields (limits are
-            // resolved per model), so those sessions skip the query.
+            // resolved per model), so those sessions skip the query. The
+            // row-stamped cache serves unchanged rows without re-walking.
             let last_usage = if model.is_some() {
-                last_step_finish_usage_for_session(&conn, &row.session_id)
+                cached_or_walked_usage(
+                    &self.usage_cache,
+                    &self.usage_walks,
+                    &conn,
+                    &row.session_id,
+                    row.last_activity_at,
+                )
             } else {
                 None
             };
@@ -772,6 +850,18 @@ impl OpencodeProvider {
                 model,
                 last_usage,
             });
+        }
+
+        // Prune the usage cache to the listed id-set: sessions that left
+        // the listing (archived, deleted) drop their cached walk so a
+        // later re-entry re-walks even under an unchanged stamp.
+        {
+            let listed: std::collections::HashSet<&str> =
+                sessions.iter().map(|s| s.session_id.as_str()).collect();
+            self.usage_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|id, _| listed.contains(id.as_str()));
         }
 
         Ok(OpencodeListing { sessions, degrade })
