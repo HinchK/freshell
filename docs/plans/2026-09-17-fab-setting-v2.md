@@ -19,7 +19,7 @@
 
 **Goal:** The existing Settings → Panes toggle for the floating add/split button gets the clear user-facing label "Show button to split panes", and its default flips from "off everywhere" to "on at desktop viewport width, off at mobile viewport width", with persistence, unit tests, e2e coverage, and committed screenshot baselines all following the new default.
 
-**Architecture:** Keep the browser-local setting key `panes.floatingActionButton` exactly as the prior run landed it (no schema/key rename — the user's naming request is the user-facing label). Keep `shared/settings.ts`'s static `floatingActionButton: false` as the shared, Node/SSR-neutral default, and add an explicit, defaulted options parameter (`LocalSettingsPlatformDefaults.floatingActionButtonDefault`) to `resolveLocalSettings` and `buildLocalSettingsPatch` (following the `resolveDefaultLoggingDebug` injectable-default precedent, `src/store/settingsSlice.ts:22-32`). The client computes the platform default ONCE at boot — `resolveDefaultFloatingActionButton(isMobileDevice())` = `!isMobileDevice()` — and threads that single `localSettingsPlatformDefaults` const through every client path that can resolve or diff local settings without an explicit saved value: the settings-slice boot resolution (`loadInitialLocalSettings`), the cross-tab hydrate re-resolution (`crossTabSync.ts:283-284`), the legacy-seed bootstrap path (`App.tsx:674,692`), and the browser-preferences write-diff (`browserPreferencesPersistence.ts:115,169,283`). The default is sticky per boot: resizing across the 767px breakpoint mid-session does not re-resolve until the next reload. The persistence write-diff MUST use the same computed platform default as resolution — otherwise desktop boots silently persist spurious `floatingActionButton: true` blobs on any unrelated settings flush, which then show the FAB on later mobile boots of the same browser. After boot, the resolved `localSettings` always carry a concrete boolean that survives every reducer round-trip (`PANES_LOCAL_KEYS` whitelists the key, `pickKeys` copies own keys, `mergeLocalSettings` merges panes via `mergeDefined`), so the reducers themselves never resolve the FAB from a default and need no threading.
+**Architecture:** Keep the browser-local setting key `panes.floatingActionButton` exactly as the prior run landed it (no schema/key rename — the user's naming request is the user-facing label). Keep `shared/settings.ts`'s static `floatingActionButton: false` as the shared, Node/SSR-neutral default, and add an explicit, defaulted options parameter (`LocalSettingsPlatformDefaults.floatingActionButtonDefault`) to `resolveLocalSettings` and `buildLocalSettingsPatch` (following the `resolveDefaultLoggingDebug` injectable-default precedent, `src/store/settingsSlice.ts:22-32`). The client computes the platform default ONCE at boot — `resolveDefaultFloatingActionButton(isMobileDevice())` = `!isMobileDevice()` — and threads that single `localSettingsPlatformDefaults` const through every client path that can resolve or diff local settings without an explicit saved value: the settings-slice boot resolution (`loadInitialLocalSettings`), the cross-tab hydrate re-resolution (`crossTabSync.ts:283-284`), the legacy-seed bootstrap path (`App.tsx:674,692`), and the browser-preferences write-diff (`browserPreferencesPersistence.ts:115,169,283`). The default is sticky per boot: resizing across the 767px breakpoint mid-session does not re-resolve until the next reload. Persistence semantics are **sticky-explicit**: the write path uses the computed platform default as the diff base only for values the user has never explicitly saved (a desktop boot with no saved key keeps the blob FAB-free — no spurious `true` blobs that would pin the FAB on for later mobile boots), while a `floatingActionButton` key that is already present in the saved blob is always re-written verbatim with the current value, whatever the active platform default is. Explicit choices therefore can never be erased by an unrelated flush under the opposite viewport class; they change only through an explicit toggle. Consequence: until the user's first explicit toggle, each viewport class follows its own default; after it, the choice is global for that browser (a single global preference, matching the single global toggle the UI exposes). After boot, the resolved `localSettings` always carry a concrete boolean that survives every reducer round-trip (`PANES_LOCAL_KEYS` whitelists the key, `pickKeys` copies own keys, `mergeLocalSettings` merges panes via `mergeDefined`), so the reducers themselves never resolve the FAB from a default and need no threading.
 
 **Tech Stack:** TypeScript (NodeNext/ESM, `.js` relative imports), React 18 + Redux Toolkit, Zod-validated shared settings contract (`shared/settings.ts`), localStorage blob `freshell.browser-preferences.v1` (diff-vs-defaults, 500 ms debounce), Vitest + Testing Library (jsdom, desktop-ambient matchMedia mock in `test/setup/dom.ts`), Playwright (local + Cloud Run lanes), static HTML mock (`docs/index.html`).
 
@@ -51,7 +51,7 @@ Additive-only: an options parameter on `resolveLocalSettings` and `buildLocalSet
 
 **Interfaces:**
 - Consumes: existing `LocalSettingsPatch`, `defaultLocalSettings`, `mergeDefined` (`shared/settings.ts:296-305`), `assignChangedScalar` (`src/store/browserPreferencesPersistence.ts:76-85`).
-- Produces: `export interface LocalSettingsPlatformDefaults { floatingActionButtonDefault?: boolean }` (shared/settings.ts); `resolveLocalSettings(patch?: LocalSettingsPatch, options?: LocalSettingsPlatformDefaults): LocalSettings`; `buildLocalSettingsPatch(localSettings: LocalSettings, options?: LocalSettingsPlatformDefaults): LocalSettingsPatch`. Task 3 consumes exactly these signatures; `resolveBrowserPreferenceSettings` gains the same passthrough in Task 3.
+- Produces: `export interface LocalSettingsPlatformDefaults { floatingActionButtonDefault?: boolean }` (shared/settings.ts); `resolveLocalSettings(patch?: LocalSettingsPatch, options?: LocalSettingsPlatformDefaults): LocalSettings`; `buildLocalSettingsPatch(localSettings: LocalSettings, options?: LocalSettingsPlatformDefaults, previousPatch?: LocalSettingsPatch): LocalSettingsPatch`. The `previousPatch` parameter is the saved blob's settings fragment (the record's `.settings`), and it encodes the sticky-explicit rule: a `floatingActionButton` key present in `previousPatch` is always re-written with the current value, regardless of the platform default; when absent from `previousPatch`, the key is written only if the current value differs from the platform default. Task 3 consumes exactly these signatures; `resolveBrowserPreferenceSettings` gains the same passthrough in Task 3.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -96,13 +96,42 @@ In `test/unit/shared/settings.test.ts`, inside the `panes.floatingActionButton (
       const local = resolveLocalSettings(record?.settings, { floatingActionButtonDefault: false })
       expect(local.panes.floatingActionButton).toBe(true)
     })
+
+    it('preserves an explicitly saved false across a flush under the platform default it equals (sticky explicit)', () => {
+      const previous: LocalSettingsPatch = { panes: { floatingActionButton: false } }
+      const local = resolveLocalSettings(previous, { floatingActionButtonDefault: false })
+      const patch = buildLocalSettingsPatch(local, { floatingActionButtonDefault: false }, previous)
+      expect(patch.panes?.floatingActionButton).toBe(false)
+    })
+
+    it('preserves an explicitly saved true across a flush under the desktop platform default (sticky explicit)', () => {
+      const previous: LocalSettingsPatch = { panes: { floatingActionButton: true } }
+      const local = resolveLocalSettings(previous, { floatingActionButtonDefault: true })
+      const patch = buildLocalSettingsPatch(local, { floatingActionButtonDefault: true }, previous)
+      expect(patch.panes?.floatingActionButton).toBe(true)
+    })
+
+    it('omits a fresh platform-default value when no explicit choice was ever saved', () => {
+      const local = resolveLocalSettings(undefined, { floatingActionButtonDefault: true })
+      const patch = buildLocalSettingsPatch(local, { floatingActionButtonDefault: true })
+      expect(patch.panes?.floatingActionButton).toBeUndefined()
+    })
+
+    it('keeps an explicit value change flowing through the sticky rule (user toggles under the opposite class)', () => {
+      const previous: LocalSettingsPatch = { panes: { floatingActionButton: true } }
+      const local = resolveLocalSettings({ panes: { floatingActionButton: false } }, { floatingActionButtonDefault: true })
+      const patch = buildLocalSettingsPatch(local, { floatingActionButtonDefault: true }, previous)
+      expect(patch.panes?.floatingActionButton).toBe(false)
+    })
 ```
+
+(If the `LocalSettingsPatch` type is not already imported at the top of `test/unit/shared/settings.test.ts`, add it to the existing `@shared/settings` import list alongside `resolveLocalSettings` and `buildLocalSettingsPatch`.)
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
 Run: `FRESHELL_VITEST_BACKEND=cloud FRESHELL_E2E_BACKEND=cloud FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com npm run test:vitest -- run test/unit/shared/settings.test.ts`
 
-Expected: FAIL — exactly two tests fail because the option does not exist yet and is silently ignored: `defaults to true when the desktop platform default is provided` (resolves the static `false` instead of `true`) and `persists ... (desktop base)` (both halves fail against the static base: the `off` value diffs `false === false`, produces no entry, and `toBe(false)` fails; the `on` value diffs `true !== false`, produces a spurious entry, and `toBeUndefined()` fails). The other four new tests are regression guards that pass before implementation and must keep passing after: the mobile-default pin and the explicit-over-platform pin pass either way (the static default is also `false`), the mobile-base diff test passes either way (`true` already differs from the static `false`, `false` already equals it), and the old-blob pin passes because explicit patches already win today. All ten pre-existing tests in the describe stay green (their zero-arg calls are unchanged).
+Expected: FAIL — exactly five tests fail because the option and the `previousPatch` parameter do not exist yet and are silently ignored: `defaults to true when the desktop platform default is provided` (resolves the static `false` instead of `true`); `persists ... (desktop base)` (both halves fail against the static base: the `off` value diffs `false === false`, produces no entry, and `toBe(false)` fails; the `on` value diffs `true !== false`, produces a spurious entry, and `toBeUndefined()` fails); `preserves an explicitly saved false across a flush under the platform default it equals` (third argument ignored, `false` equals the static `false`, the entry is omitted, and `toBe(false)` fails on `undefined`); `omits a fresh platform-default value when no explicit choice was ever saved` (options ignored, `true` differs from the static `false`, the entry is written, and `toBeUndefined()` fails); and `keeps an explicit value change flowing through the sticky rule` (third argument ignored, `false` equals the static `false`, the entry is omitted, `toBe(false)` fails). The other five new tests are regression guards that pass before implementation and must keep passing after: the mobile-default pin and the explicit-over-platform pin pass either way (the static default is also `false`); the mobile-base diff test passes either way (`true` already differs from the static `false`, `false` already equals it); the old-blob pin passes because explicit patches already win today; and the sticky-true-desktop pin passes because `true` already differs from the static `false`. All ten pre-existing tests in the describe stay green (their zero-arg calls are unchanged).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -161,11 +190,12 @@ import { mergeLocalSettings, defaultLocalSettings, type LocalSettings, type Loca
 export function buildLocalSettingsPatch(
   localSettings: LocalSettings,
   options: LocalSettingsPlatformDefaults = {},
+  previousPatch?: LocalSettingsPatch,
 ): LocalSettingsPatch {
   const patch: LocalSettingsPatch = {}
 ```
 
-and inside the panes block, compute the diff base once (before the first `assignChangedScalar(panes, ...)` line) and change only the FAB line:
+and inside the panes block, compute the diff base once (before the first `assignChangedScalar(panes, ...)` line), change the FAB line, and append the sticky-explicit rule (the `previousPatch` parameter is the saved blob's settings fragment; a key already present there is always re-written with the current value):
 
 ```ts
   const panes: LocalSettingsPatch['panes'] = {}
@@ -181,10 +211,15 @@ and inside the panes block, compute the diff base once (before the first `assign
   assignChangedScalar(panes, localSettings.panes, defaultLocalSettings.panes, 'repoIconsOnTabs')
   assignChangedScalar(panes, localSettings.panes, defaultLocalSettings.panes, 'tabBarRows')
   assignChangedScalar(panes, localSettings.panes, panesDefaults, 'floatingActionButton')
+  if (previousPatch?.panes?.floatingActionButton !== undefined) {
+    panes.floatingActionButton = localSettings.panes.floatingActionButton
+  }
   if (Object.keys(panes).length > 0) {
     patch.panes = panes
   }
 ```
+
+(`assignChangedScalar` against `panesDefaults` keeps the never-saved case platform-coherent — a value equal to the platform default and never explicitly saved stays out of the blob; the `previousPatch` guard keeps an already-explicit value in the blob across every later flush, whatever the active platform default is. Every other panes key keeps diffing against the static defaults.)
 
 No other production caller changes in this task: `src/App.tsx:674`, the middleware (`:169`, `:283`), and every test caller keep calling with no options, so the diff base stays static everywhere until Task 3 threads the computed platform default.
 
@@ -192,7 +227,7 @@ No other production caller changes in this task: `src/App.tsx:674`, the middlewa
 
 Run: `FRESHELL_VITEST_BACKEND=cloud FRESHELL_E2E_BACKEND=cloud FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com npm run test:vitest -- run test/unit/shared/settings.test.ts`
 
-Expected: PASS (all pre-existing tests plus the six new ones).
+Expected: PASS (all pre-existing tests plus the ten new ones).
 
 - [ ] **Step 5: Refactor while green**
 
@@ -352,9 +387,9 @@ git commit -m "feat(settings): rename split-panes button setting label for clari
 This is the atomic behavior change. The client computes the platform default once at settings-slice module init and threads it through every path that can see a saved-preferences patch without an explicit FAB value; every unit and e2e pin of the old default-off story is re-pinned in the same task so each lane is green at the commit. Design facts this task relies on (all verified against the tree):
 
 1. After boot, the resolved `localSettings` always carry a concrete `floatingActionButton` boolean, and it survives every reducer round-trip (`PANES_LOCAL_KEYS` at `shared/settings.ts:85`, `pickKeys` copies own keys at `:429-437`, `mergeLocalSettings` merges panes via `mergeDefined` at `:1359-1362`, `normalizeExtractedLocalSeed` keeps booleans at `:588-590`). So the slice reducers (`setLocalSettings`/`updateSettingsLocal`) never resolve the FAB from a default and are NOT threaded — only boot, cross-tab hydrate, the legacy-seed bootstrap path, and the write-diff are.
-2. The write-diff must use the same computed platform default as boot resolution (browserPreferencesPersistence.ts:115). Without it, desktop boots diff `true` against static `false` and silently persist `floatingActionButton: true` on any unrelated flush — poisoning later mobile boots of the same browser. The exact-blob unit tests are the canaries.
+2. The write-diff must use the same computed platform default as boot resolution (browserPreferencesPersistence.ts:115), and Task 1's sticky-explicit rule governs the key's blob presence: without the platform base, desktop boots diff `true` against static `false` and silently persist `floatingActionButton: true` on any unrelated flush — poisoning later mobile boots of the same browser; without the sticky rule, an explicit choice equal to the ACTIVE class's default is dropped from the blob by an unrelated flush and later resurrects the OPPOSITE class's default — erasing a deliberate user choice during ordinary use. The threading therefore passes BOTH the platform defaults AND the saved record's settings fragment (`previousPatch`) at the blob-writing call sites. The exact-blob unit tests are the canaries.
 3. `defaultSettings` (the exported static composite, `settingsSlice.ts:30`) keeps the static local defaults; it has no production consumer of the FAB key (whole-tree grep) and tests preload it deliberately to keep the FAB out of unrelated suites.
-4. Cross-tab coherence: each browser window threads its own boot-time platform default, so a wide window (default on) and a narrowed window (default off) of the same browser each keep their own coherent answer; an explicit saved value wins in every window.
+4. Cross-tab coherence: each browser window threads its own boot-time platform default, so a wide window (default on) and a narrowed window (default off) of the same browser each keep their own coherent answer; an explicit saved value wins in every window and is never erased by a flush under the opposite class (Task 1's sticky-explicit rule) — after a user's first explicit toggle, the choice is global for that browser.
 5. Sticky per boot: resizing across the 767px breakpoint mid-session does not re-resolve until the next reload — pinned by a dedicated unit test.
 6. The consumption fallbacks (`settings.panes?.floatingActionButton ?? false` at `PaneLayout.tsx:63` and `PanesSettings.tsx:102`) stay `false` and are deliberately NOT separately unit-pinned: after module init the resolved store always carries a concrete boolean, so an undefined-key store state is not a real app state — the defined-value behavior (desktop default-on, explicit-disable, mobile default) is what the three PaneLayout tests pin.
 
@@ -362,13 +397,13 @@ This is the atomic behavior change. The client computes the platform default onc
 - Modify: `src/store/settingsSlice.ts:3-24` (imports + new resolver/const), `:71-73` (`loadInitialLocalSettings`)
 - Modify: `src/lib/browser-preferences.ts:212-214` (`resolveBrowserPreferenceSettings`)
 - Modify: `src/store/crossTabSync.ts:7,282-284`
-- Modify: `src/store/browserPreferencesPersistence.ts:3,7,87-118,161-182,280-284`
+- Modify: `src/store/browserPreferencesPersistence.ts:3,7,87-118,161-182,280-284` (platform-default + `previousPatch` threading at the blob-writing sites)
 - Modify: `src/App.tsx:5,674,692`
 - Modify: `src/components/panes/PaneLayout.tsx:63` (comment only — the `?? false` stays)
 - Modify: `shared/settings.ts` (Step 5 refactor: extract the shared `panesDefaultsWith` helper used by `resolveLocalSettings` and `buildLocalSettingsPatch`)
 - Test: `test/unit/client/store/settingsSlice.test.ts` (2 consequence fixes + 3 new tests)
 - Test: `test/unit/client/store/state-edge-cases.test.ts:846-849` (1 consequence fix)
-- Test: `test/unit/client/store/browserPreferencesPersistence.test.ts` (2 consequence fixes at `:42`, `:99` + 2 new direction pins)
+- Test: `test/unit/client/store/browserPreferencesPersistence.test.ts` (2 consequence fixes at `:42`, `:99` + 3 new direction pins: explicit-off persists, no-poisoning on unrelated flush, sticky-explicit no-erasure)
 - Test: `test/unit/client/components/panes/PaneLayout.test.tsx:1-9,381-422` (default-test flip + 2 new pins)
 - Test: `test/unit/client/components/SettingsView.panes.test.tsx:270-305` (default-checked + click-direction flip on bare reducer-booted stores; `createTestStore` unchanged)
 - Test: `test/integration/client/editor-pane.test.tsx:200-204` (comment only)
@@ -379,7 +414,7 @@ This is the atomic behavior change. The client computes the platform default onc
 
 **Interfaces:**
 - Consumes: Task 1's `LocalSettingsPlatformDefaults` + the option-aware `resolveLocalSettings`/`buildLocalSettingsPatch`; Task 2's switch accessible name `Show button to split panes`; `isMobileDevice()` from `src/lib/mobile-device.ts:11`; the jsdom matchMedia mock (`test/setup/dom.ts:56-102` — `__MOBILE_MATCHES__` defaults to `false` = desktop, `setMobileForTest(bool)` global helper); the e2e `freshellPage`/`page`/`serverInfo`/`harness` fixtures and `isCloudLaneWindowConfigured()` from `test/e2e-browser/helpers/*`.
-- Produces: `export function resolveDefaultFloatingActionButton(isMobile: boolean): boolean` and `export const localSettingsPlatformDefaults: LocalSettingsPlatformDefaults` from `src/store/settingsSlice.ts` (desktop-true/mobile-false at module init); a settings store whose boot-resolved `localSettings.panes.floatingActionButton` is `true` at desktop width and `false` at mobile width; a persistence blob that records only explicit choices relative to the same platform default; e2e evidence for both defaults on the cloud gate lane.
+- Produces: `export function resolveDefaultFloatingActionButton(isMobile: boolean): boolean` and `export const localSettingsPlatformDefaults: LocalSettingsPlatformDefaults` from `src/store/settingsSlice.ts` (desktop-true/mobile-false at module init); a settings store whose boot-resolved `localSettings.panes.floatingActionButton` is `true` at desktop width and `false` at mobile width; a persistence blob that records only explicit choices (sticky-explicit: platform-coherent base for never-saved values, verbatim preservation of already-saved ones); e2e evidence for both defaults on the cloud gate lane.
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
@@ -602,6 +637,29 @@ Replace the two tests at `:381-422` (inside the `rendering` describe) with three
     const blob = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
     expect(blob.settings?.panes?.floatingActionButton).toBeUndefined()
   })
+
+  it('never erases an explicitly saved floatingActionButton on an unrelated flush, even when it equals the active platform default (sticky explicit)', () => {
+    // Model a mobile opt-in (explicit true saved by a default-off-era boot or
+    // a mobile-width session) now living in a DESKTOP-width browser: the
+    // store resolves true (explicit wins over the desktop default, which is
+    // also true). An unrelated flush must preserve the saved key verbatim —
+    // dropping it would resurrect the mobile default on the next
+    // mobile-width boot of this browser, erasing a deliberate user choice.
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      settings: { panes: { floatingActionButton: true } },
+    }))
+    try {
+      const store = createStore()
+
+      store.dispatch(updateSettingsLocal({ theme: 'dark' }))
+      vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+
+      const blob = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+      expect(blob.settings?.panes?.floatingActionButton).toBe(true)
+    } finally {
+      localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
+    }
+  })
 ```
 
 (e) `test/e2e-browser/specs/settings.spec.ts` — replace the whole FAB story test (lines 255-302) with the inverted desktop story plus the new cloud-runnable mobile presence test:
@@ -642,14 +700,16 @@ Replace the two tests at `:381-422` (inside the `rendering` describe) with three
     expect((await harness.getSettings()).panes.floatingActionButton).toBe(false)
     await expect(page.getByRole('button', { name: 'Add pane' })).toHaveCount(0)
 
-    // Re-enable: true IS the desktop default, so the diff drops the key from
-    // the blob and the FAB returns.
+    // Re-enable: the sticky-explicit rule keeps the key in the blob (an
+    // already-explicit choice is preserved verbatim; it changes only through
+    // an explicit toggle — it is never dropped for equaling the platform
+    // default), now recording true, and the FAB returns.
     await openSettingsSection(page, 'Panes')
     await fabSwitch.click()
     await expect(fabSwitch).toHaveAttribute('aria-checked', 'true')
     await page.waitForTimeout(PERSIST_DEBOUNCE_WAIT_MS)
     const blobOn = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
-    expect(JSON.parse(blobOn ?? '{}').settings?.panes?.floatingActionButton).toBeUndefined()
+    expect(JSON.parse(blobOn ?? '{}').settings?.panes?.floatingActionButton).toBe(true)
     await expect(page.getByRole('button', { name: 'Add pane' })).toBeVisible()
   })
 
@@ -707,7 +767,7 @@ Expected: FAIL, for the intended reasons (missing platform-default behavior, not
 - `settingsSlice.test.ts`: `resolves the ... platform default at boot: desktop true, mobile false` fails at the desktop expectation (the boot still resolves the static `false`); the mobile expectation passes before the flip (static `false` equals the mobile default — it is the companion pin). `keeps the boot-time platform default ... session` fails (the boot value is `false`, so it stays `false` instead of `true`). `hydrates a saved explicit false ...` passes before the flip (explicit patches already win) — it is the persistence-of-choice guard.
 - `PaneLayout.test.tsx`: `shows the floating action button by default on desktop` fails (`queryByTitle`-style absence today); `hides ... explicitly disabled` and `hides ... mobile platform default` pass before the flip (everything hides today) — companion pins whose discriminating power arrives with the implementation.
 - `SettingsView.panes.test.tsx`: `checked by default on desktop` fails because the bare reducer-booted store still resolves the static `false` (the switch renders unchecked); the click-direction test fails at the first `toBeChecked()` and at `toBe(false)` (the first click from the static-off base produces `true`).
-- `browserPreferencesPersistence.test.ts`: `persists an explicit floatingActionButton=false on desktop now that the desktop default is true` fails (the flush diffs `false` against the static `false` and records nothing); `does not persist floatingActionButton when it equals the boot platform default` passes before the flip (boot is static `false`, diff base static `false` — it becomes discriminating only after the flip).
+- `browserPreferencesPersistence.test.ts`: `persists an explicit floatingActionButton=false on desktop now that the desktop default is true` fails (the flush diffs `false` against the static `false` and records nothing); `does not persist floatingActionButton when it equals the boot platform default` passes before the flip (boot is static `false`, diff base static `false` — it becomes discriminating only after the flip); `never erases an explicitly saved floatingActionButton ... (sticky explicit)` passes before the flip (the zero-arg flush diffs the saved `true` against the static `false` and writes it anyway) — its discriminating power arrives with the threading: after Task 3, dropping the `previousPatch` thread would make the flush omit the key, and this pin fails.
 
 Run: `FRESHELL_VITEST_BACKEND=cloud FRESHELL_E2E_BACKEND=cloud FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com npm run test:e2e:local -- --project=chromium --grep=floating`
 
@@ -775,20 +835,24 @@ import { setLocalSettings, localSettingsPlatformDefaults } from './settingsSlice
     : resolveBrowserPreferenceSettings(parsed, localSettingsPlatformDefaults)
 ```
 
-(d) `src/store/browserPreferencesPersistence.ts` — import the platform defaults (value import next to the existing type-only import at line 7) and thread them into BOTH internal diff calls so the write-diff base matches the boot resolution base:
+(d) `src/store/browserPreferencesPersistence.ts` — import the platform defaults (value import next to the existing type-only import at line 7) and thread them into the internal diff calls, threading the saved record's settings fragment as `previousPatch` at every site that can WRITE the blob (the sticky-explicit rule from Task 1 — a saved FAB key is preserved verbatim, so explicit choices survive unrelated flushes under the opposite viewport class):
 
 ```ts
 import { localSettingsPlatformDefaults } from './settingsSlice'
 import type { SettingsState } from './settingsSlice'
 ```
 
-Inside `buildBrowserPreferencesRecord` (line 169):
+Inside `buildBrowserPreferencesRecord` (the ONLY settings blob write path, line 167-171 — `current = loadBrowserPreferencesRecord()` is already in scope two lines above):
 
 ```ts
-  const settingsPatch = buildLocalSettingsPatch(state.settings.localSettings, localSettingsPlatformDefaults)
+  const settingsPatch = buildLocalSettingsPatch(
+    state.settings.localSettings,
+    localSettingsPlatformDefaults,
+    current.settings,
+  )
 ```
 
-Inside the middleware's `settings/setLocalSettings` branch (line 283):
+Inside the middleware's `settings/setLocalSettings` branch (line 283) — this feeds `pending.settingsPatch`, a query artifact consumed by `getPendingBrowserPreferencesWriteState`/crossTabSync where an absent key means "no pending change" (the authoritative blob broadcast happens on flush via `broadcastPersistedRaw`), so it threads the platform base but needs no `previousPatch`:
 
 ```ts
         const nextPatch = buildLocalSettingsPatch(action.payload as LocalSettings, localSettingsPlatformDefaults)
@@ -802,10 +866,16 @@ Inside the middleware's `settings/setLocalSettings` branch (line 283):
 import { setLocalSettings, setServerConfigDir, setServerSettings, localSettingsPlatformDefaults } from '@/store/settingsSlice'
 ```
 
-Line 674:
+Line 674 (the legacy-seed bootstrap can persist the computed patch into the record via `patchBrowserPreferencesRecord`, so it is a blob-writing site — thread the saved record's patch as `previousPatch`; hoist the existing `const currentPreferencesPatch = currentPreferences.settings ?? {}` above the call, since it is currently defined one line below):
 
 ```ts
-              const currentLocalSettingsPatch = buildLocalSettingsPatch(appStore.getState().settings.localSettings, localSettingsPlatformDefaults)
+              const currentPreferences = loadBrowserPreferencesRecord()
+              const currentPreferencesPatch = currentPreferences.settings ?? {}
+              const currentLocalSettingsPatch = buildLocalSettingsPatch(
+                appStore.getState().settings.localSettings,
+                localSettingsPlatformDefaults,
+                currentPreferencesPatch,
+              )
 ```
 
 Line 692:
@@ -940,17 +1010,18 @@ Expected: PASS — all 7 mobile-viewport tests (including the new default-hidden
 
 - [ ] **Step 5: Refactor while green**
 
-The Task 1 `panesDefaults` computation now appears in two places (`resolveLocalSettings` and `buildLocalSettingsPatch`). Extract a tiny shared helper in `shared/settings.ts` and use it from both call sites:
+The Task 1 `panesDefaults` computation now appears in two places (`resolveLocalSettings` in `shared/settings.ts` and `buildLocalSettingsPatch` in `src/store/browserPreferencesPersistence.ts`). Extract a tiny shared helper in `shared/settings.ts`, EXPORT it (the persistence module is a separate file and cannot see a module-private function), and import it there:
 
 ```ts
-function panesDefaultsWith(options: LocalSettingsPlatformDefaults): LocalSettings['panes'] {
+// shared/settings.ts
+export function panesDefaultsWith(options: LocalSettingsPlatformDefaults): LocalSettings['panes'] {
   return options.floatingActionButtonDefault === undefined
     ? defaultLocalSettings.panes
     : { ...defaultLocalSettings.panes, floatingActionButton: options.floatingActionButtonDefault }
 }
 ```
 
-(`resolveLocalSettings` computes `const panesDefaults = panesDefaultsWith(options)` and `buildLocalSettingsPatch` does the same; the diff line becomes `assignChangedScalar(panes, localSettings.panes, panesDefaultsWith(options), 'floatingActionButton')` — or keep the local `const` and pass it, matching the file's style.) Then re-run the Task 1 + Task 3 focused suites:
+(`resolveLocalSettings` computes `const panesDefaults = panesDefaultsWith(options)`; `src/store/browserPreferencesPersistence.ts` adds `panesDefaultsWith` to its existing `@shared/settings` import and its panes block computes the same const — keep the sticky-explicit `previousPatch` guard exactly as Task 1 wrote it.) Then re-run the Task 1 + Task 3 focused suites:
 
 Run: `FRESHELL_VITEST_BACKEND=cloud FRESHELL_E2E_BACKEND=cloud FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com npm run test:vitest -- run test/unit/shared/settings.test.ts test/unit/client/store/browserPreferencesPersistence.test.ts`
 
@@ -982,7 +1053,7 @@ Expected: PASS — 1 passed (the pane-picker fallback test; the helper's dispatc
 
 Run: `FRESHELL_VITEST_BACKEND=cloud FRESHELL_E2E_BACKEND=cloud FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/screenshot-baselines.spec.ts`
 
-Expected: PASS on tolerance — the FAB adds roughly 0.3–0.5% changed pixels to the four desktop frames (`default-layout.png`, `settings-view.png`, `multiple-tabs.png`, `sidebar-collapsed.png`), well inside `maxDiffPixelRatio: 0.05` (the estimate is unmeasured arithmetic; the FAB is absolutely positioned, so non-local diffs are not expected); `auth-modal.png` shows no tab view and `mobile-layout.png` boots at 390px (mobile default ⇒ still no FAB). Record the per-test outcome. Either tolerance outcome is handled, never debugged (load-bearing ledger LB-2): if any desktop frame exceeds tolerance, pull Task 4's regeneration forward to this step immediately (regenerate via `test:e2e:update-snapshots` + the Task 4 visual checks) instead of investigating the app — the FAB addition is the expected diff. Tolerance-green is NOT sufficient either: the committed baselines must depict the default experience — Task 4 regenerates them immediately regardless.
+Expected: PASS on tolerance — the FAB adds roughly 0.3–0.5% changed pixels to the three terminal-view desktop frames (`default-layout.png`, `multiple-tabs.png`, `sidebar-collapsed.png`), well inside `maxDiffPixelRatio: 0.05` (the estimate is unmeasured arithmetic; the FAB is absolutely positioned, so non-local diffs are not expected). `settings-view.png` is a byte-identical NEGATIVE CONTROL: while Settings is open the app renders the `SettingsView` branch instead of the terminal `TabContent` branch (App.tsx:2059 vs :2095), so no `PaneLayout` — and no FAB — mounts for that capture, and the committed baseline must not change in this run at all. `auth-modal.png` shows no tab view and `mobile-layout.png` boots at 390px (mobile default ⇒ still no FAB). Record the per-test outcome. Either tolerance outcome is handled, never debugged (load-bearing ledger LB-2): if any changing frame exceeds tolerance, pull Task 4's regeneration forward to this step immediately (regenerate via `test:e2e:update-snapshots` + the Task 4 visual checks) instead of investigating the app — the FAB addition is the expected diff. Tolerance-green is NOT sufficient either: the committed baselines must depict the default experience — Task 4 regenerates them immediately regardless.
 
 - [ ] **Step 7: Commit the task**
 
@@ -995,14 +1066,13 @@ git commit -m "feat(settings): platform default for split-panes button (desktop 
 
 ### Task 4: Regenerate the committed screenshot baselines to depict the default-on desktop experience
 
-The four desktop PNG baselines now render a visible FAB at every default boot. Even where the 5% tolerance absorbs the diff (expected, per Task 3 Step 6), the committed artifacts must depict the default experience. The repo's exact baseline-regeneration mechanism is the first-class npm script `test:e2e:update-snapshots` (`package.json:83`: `playwright test --config test/e2e-browser/playwright.config.ts --update-snapshots`) — a raw Playwright invocation that always runs locally (it never dispatches through the cloud/local backend wrapper; the pinned env vars are inert for it and are kept only for command uniformity). The PNGs are committed artifacts under `test/e2e-browser/specs/screenshot-baselines.spec.ts-snapshots/` (chromium-linux platform suffix).
+The three terminal-view desktop PNG baselines (`default-layout`, `multiple-tabs`, `sidebar-collapsed`) now render a visible FAB at every default boot; `settings-view.png` does NOT change (while Settings is open the app renders the `SettingsView` branch instead of the terminal `TabContent` branch — App.tsx:2059 vs :2095 — so no `PaneLayout` and no FAB mounts for that capture) and serves as the run's negative control. Even where the 5% tolerance absorbs the diff (expected, per Task 3 Step 6), the committed artifacts must depict the default experience. The repo's exact baseline-regeneration mechanism is the first-class npm script `test:e2e:update-snapshots` (`package.json:83`: `playwright test --config test/e2e-browser/playwright.config.ts --update-snapshots`) — a raw Playwright invocation that always runs locally (it never dispatches through the cloud/local backend wrapper; the pinned env vars are inert for it and are kept only for command uniformity). The PNGs are committed artifacts under `test/e2e-browser/specs/screenshot-baselines.spec.ts-snapshots/` (chromium-linux platform suffix).
 
 **Files:**
 - Modify: `test/e2e-browser/specs/screenshot-baselines.spec.ts-snapshots/default-layout-chromium-linux.png`
-- Modify: `test/e2e-browser/specs/screenshot-baselines.spec.ts-snapshots/settings-view-chromium-linux.png`
 - Modify: `test/e2e-browser/specs/screenshot-baselines.spec.ts-snapshots/multiple-tabs-chromium-linux.png`
 - Modify: `test/e2e-browser/specs/screenshot-baselines.spec.ts-snapshots/sidebar-collapsed-chromium-linux.png`
-- (Any byte-identical re-capture of `auth-modal.png` / `mobile-layout.png` may also be committed — both depict no FAB by design: the auth modal shows no tab view, and the mobile-layout capture boots at 390px where the mobile default keeps the FAB hidden.)
+- Unchanged (negative controls — do NOT commit any byte change to them): `settings-view-chromium-linux.png` (Settings open ⇒ no PaneLayout/FAB), `auth-modal-chromium-linux.png` (no tab view), `mobile-layout-chromium-linux.png` (boots at 390px ⇒ mobile default keeps the FAB hidden).
 
 **Interfaces:**
 - Consumes: Task 3's landed default (desktop boots render the FAB); the `test:e2e:update-snapshots` script; the spec's `maxDiffPixelRatio: 0.05` comparisons.
@@ -1012,13 +1082,13 @@ The four desktop PNG baselines now render a visible FAB at every default boot. E
 
 Run: `FRESHELL_VITEST_BACKEND=cloud FRESHELL_E2E_BACKEND=cloud FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/screenshot-baselines.spec.ts`
 
-Expected: PASS on tolerance or FAIL — either outcome is acceptable input to this task; record which of the four desktop baselines diffed and by how much (from the Playwright report). The decision to regenerate does not depend on the outcome: the committed PNGs must show the FAB because they are the repo's visual record of the DEFAULT experience, and a tolerance-passing stale baseline would silently stop protecting the desktop default's visual contract.
+Expected: PASS on tolerance or FAIL — either outcome is acceptable input to this task; record which of the three terminal-view desktop baselines diffed and by how much (from the Playwright report), and confirm `settings-view.png` reports zero diff (negative control). The decision to regenerate does not depend on the outcome: the committed PNGs must show the FAB because they are the repo's visual record of the DEFAULT experience, and a tolerance-passing stale baseline would silently stop protecting the desktop default's visual contract.
 
 - [ ] **Step 2: Regenerate the baselines**
 
 Run: `FRESHELL_VITEST_BACKEND=cloud FRESHELL_E2E_BACKEND=cloud FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com npm run test:e2e:update-snapshots -- --project=chromium test/e2e-browser/specs/screenshot-baselines.spec.ts`
 
-Expected: all six baseline PNGs re-captured; the four desktop PNGs now include the FAB. Verify with `git status --short test/e2e-browser/specs/screenshot-baselines.spec.ts-snapshots/` — expect the four desktop PNGs modified; `auth-modal.png` and `mobile-layout.png` either unchanged or byte-equivalent re-captures (they depict no FAB before and after). If `git status` shows an unexpected fifth/sixth desktop-looking change, inspect the PNGs before committing — do not commit a regression you cannot explain.
+Expected: all six baseline PNGs re-captured; the three terminal-view desktop PNGs (`default-layout`, `multiple-tabs`, `sidebar-collapsed`) now include the FAB. Verify with `git status --short test/e2e-browser/specs/screenshot-baselines.spec.ts-snapshots/` — expect exactly those three PNGs modified, `settings-view.png` byte-identical (negative control: Settings open ⇒ no FAB; a byte change there is a red flag — inspect before proceeding, do not commit it silently), and `auth-modal.png` / `mobile-layout.png` either unchanged or byte-equivalent re-captures (they depict no FAB before and after). If `git status` shows any other change, inspect the PNGs before committing — do not commit a regression you cannot explain.
 
 - [ ] **Step 3: Verify green on the local lane**
 
@@ -1057,15 +1127,16 @@ git commit -m "test(e2e): regenerate screenshot baselines for default-on split-p
 
 ### Task 5: Add the split-panes button to the docs/index.html static mock (default desktop experience)
 
-Decision (explicit, per AGENTS.md's rule that the mock reflects the default experience): ADD a static, clearly-nonfunctional FAB to the mock's content area. Rationale: the mock never depicted the FAB even when it was unconditional pre-prior-run (a pre-existing gap that default-off accidentally made accurate); the new DEFAULT desktop experience shows the FAB, and the mock is the repo's static depiction of that default experience, so the gap re-opens with the flip and this task closes it. The addition is pure static HTML + CSS with no JS behavior (the mock's buttons are uniformly inert; this one gets no exception). A separate mobile variant is not needed — the mock has none, and the FAB is desktop-default.
+Decision (explicit, per AGENTS.md's rule that the mock reflects the default experience): ADD a static, clearly-nonfunctional FAB to the mock's content area. Rationale: the mock never depicted the FAB even when it was unconditional pre-prior-run (a pre-existing gap that default-off accidentally made accurate); the new DEFAULT desktop experience shows the FAB, and the mock is the repo's static depiction of that default experience, so the gap re-opens with the flip and this task closes it. The addition is pure static HTML + CSS with no new JS behavior (the mock's buttons are uniformly inert; this one gets no exception). The mock is NOT purely desktop: it has a mobile media query (`@media (max-width: 768px)` at `docs/index.html:476`) and a JS-toggled Settings view (`showSettingsView()`/`hideSettingsView()` deactivate all `.tab-panel`s and activate `#settings-view` at `:1355-1390`). The mock FAB therefore mirrors BOTH halves of the new default: hidden at mobile width (inside the mock's own media query), hidden while the settings view is active (the real app mounts no `PaneLayout`/FAB while Settings is open — `App.tsx:2059` vs `:2095`), visible on the desktop terminal experience. Hiding while settings is active is achieved with a pure-CSS general-sibling rule (`#settings-view.active ~ .fab { display: none; }`), which works because the button is inserted after `#settings-view`'s closing `</section>` within the same `.content` parent.
 
 **Files:**
 - Modify: `docs/index.html:235` (CSS after the `.content { ... }` rule)
-- Modify: `docs/index.html:712-713` (HTML between the tabbar's closing `</div>` and the `<!-- Welcome -->` comment)
+- Modify: `docs/index.html:476-482` (one rule inside the existing `@media (max-width: 768px)` block)
+- Modify: `docs/index.html:1301-1302` (HTML immediately after the settings-view `</section>`, before `.content`'s closing `</div>`)
 
 **Interfaces:**
-- Consumes: the mock's existing CSS variable conventions (`hsl(var(--foreground) / .7)` alpha-modifier style used throughout), its lucide icon mechanism (`<i data-lucide="plus" class="icon">` — the same icon the tab-add control uses at `:711`), and the real FAB's placement contract (`absolute bottom-12 right-4 z-50`, 48px circle — `src/components/panes/FloatingActionButton.tsx:19,59`).
-- Produces: a static FAB element in the mock, matching the real control's placement and the default desktop experience.
+- Consumes: the mock's existing CSS variable conventions (`hsl(var(--foreground) / .7)` alpha-modifier style used throughout), its lucide icon mechanism (`<i data-lucide="plus" class="icon">` — the same icon the tab-add control uses at `:711`), the real FAB's placement contract (`absolute bottom-12 right-4 z-50`, 48px circle — `src/components/panes/FloatingActionButton.tsx:19,59`), and the mock's own mobile breakpoint (`max-width: 768px` — the mock's convention, slightly wider than the app's 767px; follow the mock's own media query, not the app's).
+- Produces: a static FAB element in the mock, matching the real control's placement, with the mobile-hidden and settings-hidden states mirroring the real default behavior.
 
 - [ ] **Step 1: Write the failing check**
 
@@ -1087,7 +1158,9 @@ The check in Step 1 is the red: the static mock of the default experience is mis
 
 ```css
 /* Floating add/split pane button — part of the default desktop experience
-   (panes.floatingActionButton platform default; static mock, no JS behavior). */
+   (panes.floatingActionButton platform default; static mock, no JS behavior).
+   Hidden while the settings view is active (the real app mounts no
+   PaneLayout/FAB while Settings is open) and at mobile width below. */
 .fab {
   position: absolute; bottom: 48px; right: 16px; z-index: 50;
   width: 48px; height: 48px; border-radius: 9999px;
@@ -1097,22 +1170,31 @@ The check in Step 1 is the red: the static mock of the default experience is mis
   cursor: pointer; transition: background .15s;
 }
 .fab:hover { background: hsl(var(--foreground) / .85); }
+#settings-view.active ~ .fab { display: none; }
 ```
 
-(b) HTML — insert between the tabbar's closing `</div>` (line 712) and `<!-- Welcome -->` (line 713):
+(b) CSS — add one rule inside the existing `@media (max-width: 768px)` block (`docs/index.html:476-482`, mirroring the mobile half of the platform default):
+
+```css
+  .fab { display: none; }
+```
+
+(c) HTML — insert immediately after the settings-view section's closing `</section>` (`docs/index.html:1301`), before `.content`'s closing `</div>`, so the button is a later sibling of `#settings-view` (the sibling rule above keys on that order) and a direct child of `.content` (its `position: relative` anchors the absolute placement):
 
 ```html
       <!-- Floating add/split pane button (default-on at desktop width; nonfunctional mock) -->
-      <button type="button" class="fab" title="Add pane"><i data-lucide="plus" class="icon"></i></button>
+      <button type="button" class="fab" title="Add pane" aria-label="Add pane"><i data-lucide="plus" class="icon"></i></button>
 ```
+
+(The `aria-label` is required: this is an icon-only button and the repo's a11y rules demand an accessible name beyond `title`.)
 
 - [ ] **Step 4: Run the focused check**
 
 ```bash
-rg -n 'class="fab"|title="Add pane"' docs/index.html
+rg -n '\.fab\b|class="fab"|aria-label="Add pane"' docs/index.html
 ```
 
-Expected: matches for the new `.fab` CSS rule (twice: base + hover) and the new `title="Add pane"` button — and no other new "Add pane" occurrences. Optionally open `docs/index.html` in a browser and visually confirm the button renders bottom-right of the pane area on the welcome panel, styled as a translucent circle matching the mock's theme.
+Expected: matches for the `.fab` base rule, the `.fab:hover` rule, the settings-hide rule (`#settings-view.active ~ .fab`), the mobile media-query `.fab { display: none; }` rule, and the button element carrying both `class="fab"` and `aria-label="Add pane"` — and no other new occurrences. Optionally open `docs/index.html` in a browser and visually confirm the button renders bottom-right of the pane area on the welcome panel, styled as a translucent circle matching the mock's theme, disappears when the mock's Settings nav entry is clicked (settings view active), and stays hidden when the window is narrowed below 768px.
 
 - [ ] **Step 5: Refactor while green**
 
@@ -1124,7 +1206,7 @@ Nothing imports or tests `docs/index.html` (verified: no test references it), an
 
 Run: `git diff --stat -- docs/index.html`
 
-Expected: exactly the two insertion sites changed (CSS block + one button element).
+Expected: exactly the three insertion sites changed (base CSS block, one rule inside the mobile media query, one button element).
 
 Run: `npm run typecheck:client && npm run lint`
 
@@ -1144,6 +1226,6 @@ git commit -m "docs: depict the default-on split-panes button in the static mock
 - **Clear label (explicit constraint):** the Settings → Panes switch is named `Show button to split panes` (label, description aligned, aria-label identical to the visible label — label-in-name), proven by unit tests (Task 2) and the e2e switch interaction (Tasks 2-3).
 - **Default true on desktop (explicit constraint):** boot-resolution unit pin (settingsSlice.test.ts, desktop-ambient fresh import), consumption unit pin (PaneLayout shows-by-default), SettingsView checked-by-default pin, and e2e evidence on the cloud gate lane (visible at default boot in `settings.spec.ts`).
 - **Default false on mobile (explicit constraint):** boot-resolution unit pin (fresh import under `setMobileForTest(true)`), consumption unit pin (PaneLayout mobile-resolved store), local-lane e2e pin (mobile-viewport.spec.ts default-hidden line), and a cloud-runnable presence-only mobile-width boot test in `settings.spec.ts` (non-vacuous via the pane-root mount plus the desktop story in the same spec). Mobile means viewport width ≤767px — a narrowed desktop window counts as mobile, matching every existing mobile behavior in the repo.
-- **Persistence correctness:** the write-diff uses the same boot-time platform default as resolution (unit canaries: exact-blob tests stay FAB-free on unrelated flushes; direction pins both ways; old default-off-era explicit `true` opt-ins still resolve true), and the e2e blob legs show explicit `false` persisting across reload and the key dropping on re-enable.
+- **Persistence correctness:** the write-diff uses the same boot-time platform default as resolution for never-saved values, and the sticky-explicit rule preserves an already-saved key verbatim across unrelated flushes under the opposite viewport class (unit canaries: exact-blob tests stay FAB-free on unrelated flushes; direction pins both ways; the no-erasure pin; old default-off-era explicit `true` opt-ins still resolve true). The e2e blob legs show explicit `false` persisting across reload and the sticky key recording `true` on re-enable.
 - **Sticky per boot:** pinned in settingsSlice.test.ts (a mid-session matchMedia flip plus an unrelated settings update keeps the boot answer).
 - **Nothing regressed:** screenshot baselines regenerated and green on local + cloud lanes; the e2e helper fallback, mobile overlap contract, editor-pane integration flows, and every unaffected asset keep working under the new default (enumerated in Task 3 Step 6 and the blast-radius report).
