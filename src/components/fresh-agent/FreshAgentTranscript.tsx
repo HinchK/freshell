@@ -1015,6 +1015,10 @@ export type FreshAgentTranscriptProps = {
   /** "Expand tools": the activity strip's starting state. */
   expandTools?: boolean
   showTimecodes?: boolean
+  /** "Show transcript minimap" (local setting, default on): a LIVE gate —
+   *  false unmounts the rail and its measurement work; the glom chip's shared
+   *  sweep is unaffected. */
+  showTranscriptMinimap?: boolean
   isStreaming?: boolean
   onForkFromTurn?: (turnId: string) => void
   onRewindToTurn?: (turn: FreshAgentTurn) => void
@@ -1048,6 +1052,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   expandThinking = false,
   expandTools = false,
   showTimecodes,
+  showTranscriptMinimap = true,
   isStreaming = false,
   onForkFromTurn,
   onRewindToTurn,
@@ -1376,12 +1381,14 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
           {newMessages > 0 ? `${newMessages} new` : 'Bottom'}
         </button>
       ) : null}
-      <FreshAgentTranscriptMinimap
-        scrollerRef={scrollerRef}
-        measurement={transcriptMeasurement}
-        onRemeasure={sweepTranscript}
-        transcriptSignature={transcriptSignature}
-      />
+      {showTranscriptMinimap ? (
+        <FreshAgentTranscriptMinimap
+          scrollerRef={scrollerRef}
+          measurement={transcriptMeasurement}
+          onRemeasure={sweepTranscript}
+          transcriptSignature={transcriptSignature}
+        />
+      ) : null}
     </div>
   )
 })

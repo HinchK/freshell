@@ -98,6 +98,7 @@ const FRESH_AGENT_LOCAL_KEYS = [
   'expandThinking',
   'expandTools',
   'showTimecodes',
+  'showTranscriptMinimap',
 ] as const
 
 export type ThemeMode = (typeof THEME_VALUES)[number]
@@ -230,6 +231,7 @@ export type LocalSettings = {
     expandThinking: boolean
     expandTools: boolean
     showTimecodes: boolean
+    showTranscriptMinimap: boolean
   }
   notifications: {
     soundEnabled: boolean
@@ -639,6 +641,9 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
     if (typeof patch.freshAgent.showTimecodes === 'boolean') {
       freshAgent.showTimecodes = patch.freshAgent.showTimecodes as boolean
     }
+    if (typeof patch.freshAgent.showTranscriptMinimap === 'boolean') {
+      freshAgent.showTranscriptMinimap = patch.freshAgent.showTranscriptMinimap as boolean
+    }
     if (Object.keys(freshAgent).length > 0) {
       normalized.freshAgent = freshAgent
     }
@@ -921,6 +926,7 @@ export const defaultLocalSettings: LocalSettings = {
     expandThinking: false,
     expandTools: false,
     showTimecodes: false,
+    showTranscriptMinimap: true,
   },
   notifications: {
     soundEnabled: true,
@@ -951,6 +957,9 @@ function sanitizeFreshAgentLocalSettingsPatchInput(
   }
   if (typeof rawFreshAgent.showTimecodes === 'boolean') {
     freshAgent.showTimecodes = rawFreshAgent.showTimecodes
+  }
+  if (typeof rawFreshAgent.showTranscriptMinimap === 'boolean') {
+    freshAgent.showTranscriptMinimap = rawFreshAgent.showTranscriptMinimap
   }
   return Object.keys(freshAgent).length > 0 ? freshAgent : undefined
 }

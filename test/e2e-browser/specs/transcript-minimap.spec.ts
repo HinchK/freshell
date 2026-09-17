@@ -1,4 +1,24 @@
 import { test, expect } from '../helpers/fixtures.js'
+import { isCloudLaneWindowConfigured } from '../helpers/test-harness.js'
+
+// The browser-preferences persist path debounces localStorage writes by
+// 500ms; wait past it before reading the blob.
+const PERSIST_DEBOUNCE_WAIT_MS = 600
+
+/** Navigate to the settings view. Pin the sidebar button's EXACT accessible
+ *  name — this spec seeds a fresh-agent pane first, and every fresh-agent
+ *  pane header also renders an "Agent settings" button that a /settings/i
+ *  regex matches too (Playwright strict-mode violation on the click). Same
+ *  exact-name pin as fresh-agent.spec.ts:1846
+ *  (`page.getByRole('button', { name: 'Settings (Ctrl+B ,)' })`); the
+ *  helper shape is settings.spec.ts's, kept local per the repo's
+ *  spec-local-helper convention. Both openSettings legs of the test below
+ *  (toggle-off and toggle-back-on) route through this one locator. */
+async function openSettings(page: any) {
+  const settingsButton = page.getByRole('button', { name: 'Settings (Ctrl+B ,)' })
+  await settingsButton.click()
+  await expect(page.getByRole('tab', { name: /^Appearance$/i })).toBeVisible({ timeout: 5_000 })
+}
 
 function tallBody(tag: string): string {
   return `${tag}.\n\n` + Array.from(
@@ -263,5 +283,78 @@ test.describe('Transcript minimap', () => {
     expect(Math.abs(targetTop - scrollerTop)).toBeLessThan(60)
     // The ticks never went anywhere.
     await expect(ticks).toHaveCount(40)
+  })
+
+  test('the Show transcript minimap setting defaults on and hides the rail when toggled off', async ({ freshellPage: _freshellPage, page, terminal, harness, serverInfo }) => {
+    // Two reloads with self-healing connection waits (opted in on the cloud
+    // lane); each leg needs the wait's envelope, so declare generously.
+    if (isCloudLaneWindowConfigured()) test.setTimeout(240_000)
+    await terminal.waitForTerminal()
+    const sessionId = '63333000-0000-4333-8333-0000000aa104'
+    const seedTurns = () => seedMinimapPane(page, sessionId, [
+      { id: 'turn-mm4-u1', turnId: 'turn-mm4-u1', role: 'user', summary: 'Draft the release notes', items: [{ id: 'item-mm4-u1', kind: 'text', text: 'Draft the release notes' }] },
+      { id: 'turn-mm4-a1', turnId: 'turn-mm4-a1', role: 'assistant', summary: 'Notes body', items: [{ id: 'item-mm4-a1', kind: 'text', text: tallBody('Notes') }] },
+      { id: 'turn-mm4-u2', turnId: 'turn-mm4-u2', role: 'user', summary: 'Now add the upgrade guide', items: [{ id: 'item-mm4-u2', kind: 'text', text: 'Now add the upgrade guide' }] },
+      { id: 'turn-mm4-a2', turnId: 'turn-mm4-a2', role: 'assistant', summary: 'Guide body', items: [{ id: 'item-mm4-a2', kind: 'text', text: tallBody('Guide') }] },
+      { id: 'turn-mm4-u3', turnId: 'turn-mm4-u3', role: 'user', summary: 'Finally, summarize the risks', items: [{ id: 'item-mm4-u3', kind: 'text', text: 'Finally, summarize the risks' }] },
+      { id: 'turn-mm4-a3', turnId: 'turn-mm4-a3', role: 'assistant', summary: 'Risks body', items: [{ id: 'item-mm4-a3', kind: 'text', text: tallBody('Risks') }] },
+    ])
+
+    // Default ON: the rail renders with one tick per prompt.
+    await seedTurns()
+    const freshPane = page.locator('[data-context="fresh-agent"]')
+    // The tall seeded bodies leave the last user prompt above the bottom-pinned
+    // viewport, so the glom chip renders the SAME text as the turn paragraph —
+    // scope the content waits to the transcript scroller (the chip is its
+    // sibling, never inside it) to keep Playwright strict mode happy.
+    const transcriptScroller = freshPane.locator('[data-context="fresh-agent-transcript"]')
+    await expect(transcriptScroller.getByText('Finally, summarize the risks', { exact: true })).toBeVisible({ timeout: 10_000 })
+    await expect(freshPane.getByRole('button', { name: /Jump to prompt:/ })).toHaveCount(3)
+
+    // Toggle the real switch off in Settings → Coding Agents.
+    await openSettings(page)
+    await page.getByRole('tab', { name: /^Coding Agents$/i }).click()
+    const minimapSwitch = page.getByRole('switch', { name: 'Show transcript minimap' })
+    await expect(minimapSwitch).toHaveAttribute('aria-checked', 'true')
+    await minimapSwitch.click()
+    await expect(minimapSwitch).toHaveAttribute('aria-checked', 'false')
+    await page.waitForTimeout(PERSIST_DEBOUNCE_WAIT_MS)
+    const settings = await harness.getSettings()
+    expect(settings.freshAgent.showTranscriptMinimap).toBe(false)
+    const blob = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
+    expect(JSON.parse(blob ?? '{}').settings?.freshAgent?.showTranscriptMinimap).toBe(false)
+
+    // Reload with the persisted OFF blob; the rail stays hidden. Persistence
+    // restored the CONVERTED pane — it comes back as a fresh-agent pane, so
+    // no terminal exists on this leg: wait for the restored pane itself
+    // (the settings.spec.ts reload precedent — harness waits, then assert
+    // on the restored UI; never waitForTerminal() here).
+    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    await harness.waitForHarness()
+    await harness.waitForConnection(undefined, { selfHealReload: isCloudLaneWindowConfigured() })
+    await expect(freshPane).toBeVisible({ timeout: 10_000 })
+    await seedTurns()
+    await expect(transcriptScroller.getByText('Finally, summarize the risks', { exact: true })).toBeVisible({ timeout: 10_000 })
+    await expect(freshPane.getByRole('button', { name: /Jump to prompt:/ })).toHaveCount(0)
+
+    // Toggle the real switch back on; the diff-vs-defaults blob drops the
+    // key again (a default-ON key writes nothing when ON).
+    await openSettings(page)
+    await page.getByRole('tab', { name: /^Coding Agents$/i }).click()
+    await minimapSwitch.click()
+    await expect(minimapSwitch).toHaveAttribute('aria-checked', 'true')
+    await page.waitForTimeout(PERSIST_DEBOUNCE_WAIT_MS)
+    const blobOn = await page.evaluate(() => localStorage.getItem('freshell.browser-preferences.v1'))
+    expect(JSON.parse(blobOn ?? '{}').settings?.freshAgent).toBeUndefined()
+
+    // Reload once more; the rail is back. Same restored-pane wait — the
+    // persisted pane is a fresh-agent pane on this leg too.
+    await page.goto(`${serverInfo.baseUrl}/?token=${serverInfo.token}&e2e=1`)
+    await harness.waitForHarness()
+    await harness.waitForConnection(undefined, { selfHealReload: isCloudLaneWindowConfigured() })
+    await expect(freshPane).toBeVisible({ timeout: 10_000 })
+    await seedTurns()
+    await expect(transcriptScroller.getByText('Finally, summarize the risks', { exact: true })).toBeVisible({ timeout: 10_000 })
+    await expect(freshPane.getByRole('button', { name: /Jump to prompt:/ })).toHaveCount(3)
   })
 })

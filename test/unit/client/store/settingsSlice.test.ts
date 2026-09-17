@@ -196,6 +196,25 @@ describe('settingsSlice', () => {
     expect(state.settings.sidebar.sortMode).toBe('project')
   })
 
+  it('applies the showTranscriptMinimap local setting and defaults it on', async () => {
+    const {
+      default: settingsReducer,
+      updateSettingsLocal,
+    } = await importFreshSettingsSlice()
+
+    const initialState = settingsReducer(undefined, { type: 'unknown' })
+    expect(initialState.localSettings.freshAgent.showTranscriptMinimap).toBe(true)
+    expect(initialState.settings.freshAgent.showTranscriptMinimap).toBe(true)
+
+    const state = settingsReducer(initialState, updateSettingsLocal({
+      freshAgent: { showTranscriptMinimap: false },
+    }))
+    expect(state.localSettings.freshAgent.showTranscriptMinimap).toBe(false)
+    expect(state.settings.freshAgent.showTranscriptMinimap).toBe(false)
+    // Local patch only: server fields untouched.
+    expect(state.serverSettings).toEqual(initialState.serverSettings)
+  })
+
   it('markSaved updates lastSavedAt without disturbing split state', async () => {
     vi.useFakeTimers()
     const now = 1_700_000_000_000

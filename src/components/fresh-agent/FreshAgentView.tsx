@@ -597,6 +597,10 @@ export function FreshAgentView({
       ?? false,
   )
   const effectiveShowTimecodes = paneContent.showTimecodes ?? globalShowTimecodes
+  const showTranscriptMinimap = useAppSelector(
+    (state) => state.settings.settings.freshAgent?.showTranscriptMinimap
+      ?? true,
+  )
   const activeStyle = normalizeFreshAgentStyle(
     paneContent.style ?? providerDefaults?.style ?? DEFAULT_FRESH_AGENT_STYLE,
   )
@@ -3027,6 +3031,7 @@ export function FreshAgentView({
                 expandThinking={globalExpandThinking}
                 expandTools={globalExpandTools}
                 showTimecodes={effectiveShowTimecodes}
+                showTranscriptMinimap={showTranscriptMinimap}
                 isStreaming={isBusy}
                 onForkFromTurn={(turnId) => sendFork(turnId)}
                 onRollbackToTurn={(turnId) => {
@@ -3147,6 +3152,7 @@ export function FreshAgentView({
     effectiveStatus,
     globalExpandThinking,
     effectiveShowTimecodes,
+    showTranscriptMinimap,
     globalExpandTools,
     isBusy,
     isRestoring,

@@ -237,6 +237,21 @@ describe('browserPreferencesPersistence', () => {
     expect(bp.settings?.agentChat).toBeUndefined()
   })
 
+  it('persists a showTranscriptMinimap opt-out and drops it back at the default', () => {
+    const store = createStore()
+
+    store.dispatch(updateSettingsLocal({ freshAgent: { showTranscriptMinimap: false } }))
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+    const optedOut = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    // Default-ON key: only the NON-default value appears in the diff-vs-defaults blob.
+    expect(optedOut.settings.freshAgent).toEqual({ showTranscriptMinimap: false })
+
+    store.dispatch(updateSettingsLocal({ freshAgent: { showTranscriptMinimap: true } }))
+    vi.advanceTimersByTime(BROWSER_PREFERENCES_PERSIST_DEBOUNCE_MS)
+    const restored = JSON.parse(localStorage.getItem(BROWSER_PREFERENCES_STORAGE_KEY) || '{}')
+    expect(restored.settings?.freshAgent).toBeUndefined()
+  })
+
   it('round-trips freshAgent expansion opt-ins through localStorage', () => {
     const store = createStore()
 

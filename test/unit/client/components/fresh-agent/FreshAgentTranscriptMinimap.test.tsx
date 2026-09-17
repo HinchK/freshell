@@ -306,6 +306,31 @@ describe('FreshAgentTranscript minimap rail', () => {
     expect(screen.queryByTestId('transcript-minimap-viewport')).not.toBeInTheDocument()
   })
 
+  it('hides the rail and its measurement work when showTranscriptMinimap is false', () => {
+    vi.stubGlobal('ResizeObserver', CapturingResizeObserver)
+    const utils = render(<FreshAgentTranscript turns={TRANSCRIPT} showTranscriptMinimap={false} />)
+    const scroller = utils.container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+    mockScroll(scroller, SCROLL_TOP, SCROLL_HEIGHT, CLIENT_HEIGHT)
+    const userTurns = utils.container.querySelectorAll('[data-turn-role="user"]')
+    mockRect(scroller, 0)
+    mockUserTurnRects(userTurns)
+    fireEvent.scroll(scroller)
+
+    // The rail is absent under geometry that renders it when the setting is
+    // on (this suite's canonical mocks) — the setting, not geometry, hid it.
+    expect(screen.queryByRole('group', { name: 'Transcript minimap' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Jump to prompt:/ })).not.toBeInTheDocument()
+    expect(screen.queryByTestId('transcript-minimap-viewport')).not.toBeInTheDocument()
+    // "And its work": the unmounted rail registered no ResizeObserver
+    // subscriptions (fresh elements cannot have stale entries in the shared
+    // per-target callback map).
+    for (const el of [scroller, ...Array.from(scroller.children)]) {
+      expect(resizeCallbacksByTarget.get(el)).toBeUndefined()
+    }
+    // The glom chip still works — the shared sweep survives the rail's absence.
+    expect(screen.getByRole('button', { name: 'Jump to your message: Second user message here' })).toBeInTheDocument()
+  })
+
   it('renders a lone tick for a single-prompt transcript (no < 2 gate)', () => {
     const utils = render(<FreshAgentTranscript turns={[TRANSCRIPT[0], TRANSCRIPT[1]]} />)
     const scroller = utils.container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
