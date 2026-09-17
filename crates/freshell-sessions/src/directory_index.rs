@@ -1994,10 +1994,11 @@ fn refresh_snapshot(
     // conservatively during any failed sweep until a healthy scan marks them.
     let mut file_backed_discovery_failed = false;
     let mut failed_file_source_names = HashSet::<String>::new();
-    // Count of file-cache mutations + direct-listed sources re-queried this
-    // sweep -- the persistent-parse-cache save gate's "how much changed"
-    // signal (`SessionIndex::take_pending_save`). Stats-only unchanged
-    // files/tokens don't count.
+    // Count of file-cache mutations + direct re-lists whose published items
+    // actually moved this sweep -- the persistent-parse-cache save gate's
+    // "how much changed" signal (`SessionIndex::take_pending_save`).
+    // Stats-only unchanged files/tokens don't count, and neither does a
+    // byte-identical direct re-list (the content rules below).
     let mut changed = 0usize;
     for (idx, source) in sources.iter().enumerate() {
         if let Some(token) = source.direct_change_token() {
@@ -2038,8 +2039,27 @@ fn refresh_snapshot(
                         if let Some(name) = source.provider_name() {
                             scan_failures.remove(name);
                         }
+                        // Direct-arm twin of the file-backed content-identical
+                        // rule (the parse loop's `content_moved` below): a
+                        // re-list whose items are byte-identical to the cached
+                        // listing (a WAL append that changed no listed row)
+                        // publishes exactly the cached view — count ONLY a
+                        // re-list whose published view actually differs as a
+                        // change, so a phantom generation advance cannot fan a
+                        // spurious `sessions.changed` refetch to every client.
+                        // The token bookkeeping is refreshed either way so the
+                        // NEXT sweep treats the listing as unchanged. Second
+                        // consumer recorded (finder F-02):
+                        // take_pending_save_from_parts also stops receiving
+                        // phantom save pressure — benign (DirectEntry is
+                        // in-memory only; saves stay driven by real changes).
+                        let content_moved = direct_cache
+                            .get(&idx)
+                            .is_none_or(|entry| entry.items != items);
                         direct_cache.insert(idx, DirectEntry { token, items });
-                        changed += 1;
+                        if content_moved {
+                            changed += 1;
+                        }
                     }
                     Err(err) => {
                         // Record the outage (`getScanFailures` parity) so the
@@ -4333,6 +4353,92 @@ pub(crate) mod tests {
             Some(222),
             "the unchanged session keeps serving its (cached) usage"
         );
+
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    /// Direct-arm twin of the file-backed content-identical rule
+    /// (`content_identical_rewrite_reparses_without_bumping_generation`):
+    /// a WAL-move re-list whose items are byte-identical to the cached
+    /// listing (a WAL append that changed no listed row — a child-session
+    /// write invisible to the root listing, a checkpoint, a vacuum) must
+    /// NOT advance the change generation, because a phantom generation
+    /// advance fans a spurious `sessions.changed` refetch to every client
+    /// (the same rationale as the file-backed `content_moved` comment). A
+    /// real row change still advances it.
+    #[tokio::test]
+    async fn opencode_content_identical_relist_does_not_bump_generation() {
+        let data_home = opencode_data_home_with_sessions(
+            "opencode-content-identical",
+            &[("ses_a", "/repo/a", "Session A", 1000, 5000)],
+        );
+        let source = CountingWrapper::new(OpencodeSource::new(data_home.clone()));
+        let direct_list_calls = Arc::clone(&source.direct_list_calls);
+        let index = test_index_with_ttl(vec![Arc::new(source)], Duration::from_millis(10));
+        let mut rx = index.subscribe_changes();
+
+        // Cold snapshot: inline sweep, publishes the first generation.
+        let snap = index.snapshot().await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(direct_list_calls.load(Ordering::SeqCst), 1);
+        rx.borrow_and_update(); // mark the first publish as seen
+
+        // WAL move with NO listed-row change: the re-list runs (pinned
+        // contract, observed via the counter after settling) and
+        // publishes byte-identical items — the generation must hold.
+        let wal = data_home.join("opencode.db-wal");
+        std::fs::write(&wal, b"wal-bytes-changed").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await; // past TTL, deterministically stale
+        let _ = index.snapshot().await; // stale-while-revalidate: detaches the sweep
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                direct_list_calls.load(Ordering::SeqCst) >= 2
+            })
+            .await,
+            "the WAL-move re-list must fire and settle"
+        );
+        assert_eq!(direct_list_calls.load(Ordering::SeqCst), 2);
+        assert!(
+            !rx.has_changed().unwrap(),
+            "a byte-identical direct re-list must not advance the change generation"
+        );
+        // Late-bump guard: the generation publish runs in the async
+        // continuation AFTER the spawn_blocking sweep, so a phantom bump
+        // can land after the counter settle — hold the negative for a
+        // bounded window and re-assert no change (the file-backed twin's
+        // ~500 ms rule).
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), rx.changed())
+                .await
+                .is_err(),
+            "no late generation bump may follow a content-identical direct re-list"
+        );
+
+        // A real row change still advances the generation.
+        let conn = rusqlite::Connection::open(data_home.join("opencode.db")).unwrap();
+        conn.execute(
+            "UPDATE session SET time_updated = time_updated + 1 WHERE id = 'ses_a'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        tokio::time::sleep(Duration::from_millis(30)).await; // past TTL, deterministically stale
+        let _ = index.snapshot().await; // detaches the sweep again
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                direct_list_calls.load(Ordering::SeqCst) >= 3
+            })
+            .await,
+            "the row-change re-list must fire and settle"
+        );
+        assert_eq!(direct_list_calls.load(Ordering::SeqCst), 3);
+        // The publish lands in the post-sweep continuation, so AWAIT the
+        // generation change with a bounded timeout instead of assuming the
+        // counter settle implies the publish.
+        tokio::time::timeout(Duration::from_secs(5), rx.changed())
+            .await
+            .expect("a content-moving re-list must advance the change generation")
+            .unwrap();
 
         std::fs::remove_dir_all(&data_home).ok();
     }
