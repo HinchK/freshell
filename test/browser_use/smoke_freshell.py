@@ -92,7 +92,7 @@ Steps:
      - Use the input action on that text field with clear=true to replace the text with the new name, then press Enter to confirm.
      - Verify the tab now displays the new name before moving on.
    - Add shell panes until this tab has {pane_target} panes total.
-     - Do it one pane at a time: click "Add pane" once, then pick ONE shell type in the picker.
+     - Do it one pane at a time: right_click a terminal pane, click "Split horizontally" in the menu, then pick ONE shell type in the picker.
      - If you have multiple shell choices (CMD / PowerShell / WSL), rotate them as you go.
 
 5) Mixed panes on a new in-app tab:
@@ -102,7 +102,7 @@ Steps:
      - one Editor pane
      - one CMD shell pane
      - one Browser pane
-   - Use the "Add pane" button to split, then pick the pane type in the new pane chooser.
+   - Use right_click on a terminal pane, then "Split horizontally", to split, then pick the pane type in the new pane chooser.
 
 6) Editor pane check:
    - In the Editor pane, open this file:
@@ -167,7 +167,7 @@ Steps:
    - Rename it to: Coding CLIs (same rename approach: double_click tab name -> input with clear=true -> Enter -> verify).
    - You should see a pane type picker. Look at the options.
      - If you see "Claude": click it to create a Claude Code pane. Wait a few seconds for it to initialize.
-     - Split once ("Add pane") to get another picker.
+     - Split once (right_click a terminal pane, then "Split horizontally") to get another picker.
      - If you see "Codex": click it to create a Codex pane. Wait a few seconds.
      - If neither "Claude" nor "Codex" is visible, pick "Shell" instead. This is NOT a failure; it just means the CLIs are not installed on this system.
    - Confirm this tab ends up with at least 2 panes.
@@ -402,7 +402,7 @@ async def _run(args: argparse.Namespace) -> int:
     # Wait for the SPA to fully bootstrap auth:
     # - token removed from URL
     # - auth-token stored in localStorage
-    # - terminal view rendered (Add Pane button present)
+    # - terminal view rendered (pane layout present)
     #
     # Without this, the agent may refresh/navigate and lose auth, causing flaky failures.
     deadline = time.monotonic() + 30.0
@@ -412,9 +412,9 @@ async def _run(args: argparse.Namespace) -> int:
         # These checks intentionally avoid reading the token value to keep it out of any debug logs.
         auth_present = await page.evaluate("() => !!localStorage.getItem('freshell.auth-token')")
         token_removed = await page.evaluate("() => !new URLSearchParams(window.location.search).has('token')")
-        has_add_pane = await page.evaluate("() => !!document.querySelector('button[aria-label=\"Add pane\"]')")
+        has_pane_root = await page.evaluate("() => !!document.querySelector('[data-pane-root]')")
         has_connected = await page.evaluate("() => !!document.querySelector('[title=\"Connected\"]')")
-        if auth_present and token_removed and has_add_pane and has_connected:
+        if auth_present and token_removed and has_pane_root and has_connected:
           ready = True
           break
       except Exception:
@@ -647,6 +647,34 @@ async def _run(args: argparse.Namespace) -> int:
       return ActionResult(extracted_content=memory, long_term_memory=memory)
     except Exception as e:
       return ActionResult(error=f"Failed to double-click: {type(e).__name__}: {e}")
+
+  class RightClickAction(BaseModel):
+    index: int
+
+  @tools.registry.action("Right-click an element by index (dispatches a contextmenu MouseEvent).", param_model=RightClickAction)
+  async def right_click(params: RightClickAction, browser_session):  # type: ignore[no-untyped-def]
+    try:
+      element = await browser_session.get_element_by_index(params.index)
+      if element is None:
+        return ActionResult(error=f"Element index {params.index} not found")
+      cdp_session = await browser_session.get_or_create_cdp_session(target_id=None, focus=True)
+      sid = cdp_session.session_id
+      resolved = await cdp_session.cdp_client.send.DOM.resolveNode(
+        params={"backendNodeId": element.backend_node_id}, session_id=sid,
+      )
+      object_id = resolved["object"]["objectId"]
+      await cdp_session.cdp_client.send.Runtime.callFunctionOn(
+        params={
+          "objectId": object_id,
+          "functionDeclaration": "function() { const r = this.getBoundingClientRect(); this.dispatchEvent(new MouseEvent('contextmenu', {bubbles: true, cancelable: true, button: 2, clientX: r.left + Math.max(1, r.width / 2), clientY: r.top + Math.max(1, r.height / 2)})); }",
+          "returnByValue": True,
+        },
+        session_id=sid,
+      )
+      memory = f"Right-clicked element at index {params.index}"
+      return ActionResult(extracted_content=memory, long_term_memory=memory)
+    except Exception as e:
+      return ActionResult(error=f"Failed to right-click: {type(e).__name__}: {e}")
 
   agent = Agent(
     task=task.strip(),

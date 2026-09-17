@@ -5,6 +5,7 @@ import {
   composeResolvedSettings,
   createDefaultServerSettings,
   extractLegacyLocalSettingsSeed,
+  type LocalSettingsPatch,
   migrateLegacyFreshAgentSettingsInput,
   mergeLocalSettings,
   mergeServerSettings,
@@ -13,6 +14,9 @@ import {
   TERMINAL_FONT_SIZE_PX_OPTIONS,
   UI_SCALE_PERCENT_OPTIONS,
 } from '@shared/settings'
+
+import { buildLocalSettingsPatch } from '@/store/browserPreferencesPersistence'
+import { parseBrowserPreferencesRaw } from '@/lib/browser-preferences'
 
 describe('shared settings contract', () => {
   it('accepts representative server-backed fields in the server patch schema', () => {
@@ -635,6 +639,143 @@ describe('shared settings contract', () => {
     it('is rejected by the server patch schema (stays local)', () => {
       const schema = buildServerSettingsPatchSchema()
       expect(schema.safeParse({ panes: { repoIconsOnTabs: true } }).success).toBe(false)
+    })
+  })
+
+  describe('panes.floatingActionButton (browser-local)', () => {
+    it('defaults to false', () => {
+      const local = resolveLocalSettings(undefined)
+      expect(local.panes.floatingActionButton).toBe(false)
+    })
+
+    it('applies a boolean patch', () => {
+      const local = resolveLocalSettings({ panes: { floatingActionButton: true } })
+      expect(local.panes.floatingActionButton).toBe(true)
+    })
+
+    it('merges patches preserving other pane keys', () => {
+      const merged = mergeLocalSettings(
+        { panes: { iconsOnTabs: false } },
+        { panes: { floatingActionButton: true } },
+      )
+      expect(merged.panes?.iconsOnTabs).toBe(false)
+      expect(merged.panes?.floatingActionButton).toBe(true)
+    })
+
+    it('preserves floatingActionButton when extracting the legacy local settings seed', () => {
+      expect(extractLegacyLocalSettingsSeed({
+        panes: {
+          floatingActionButton: true,
+        },
+      } as Record<string, unknown>)).toEqual({
+        panes: {
+          floatingActionButton: true,
+        },
+      })
+    })
+
+    it('rejects non-boolean floatingActionButton in legacy seed extraction', () => {
+      expect(extractLegacyLocalSettingsSeed({
+        panes: {
+          floatingActionButton: 'yes',
+        },
+      } as Record<string, unknown>)).toEqual(undefined)
+    })
+
+    it('is rejected by the server patch schema (stays local)', () => {
+      const schema = buildServerSettingsPatchSchema()
+      expect(schema.safeParse({ panes: { floatingActionButton: true } }).success).toBe(false)
+    })
+
+    it('includes floatingActionButton in composed resolved settings', () => {
+      const resolved = composeResolvedSettings(
+        createDefaultServerSettings({ loggingDebug: false }),
+        resolveLocalSettings({ panes: { floatingActionButton: true } }),
+      )
+      expect(resolved.panes.floatingActionButton).toBe(true)
+    })
+
+    it('persists a non-default value through the browser-preferences diff', () => {
+      const resolved = resolveLocalSettings({ panes: { floatingActionButton: true } })
+      const patch = buildLocalSettingsPatch(resolved)
+      expect(patch.panes?.floatingActionButton).toBe(true)
+    })
+
+    it('produces no persisted patch entry at the default value', () => {
+      const patch = buildLocalSettingsPatch(resolveLocalSettings({}))
+      expect(patch.panes?.floatingActionButton).toBeUndefined()
+    })
+
+    it('survives the reload path: a parsed browser-preferences record preserves floatingActionButton', () => {
+      const raw = JSON.stringify({ settings: { panes: { floatingActionButton: true } } })
+      const record = parseBrowserPreferencesRaw(raw)
+      expect(record?.settings?.panes?.floatingActionButton).toBe(true)
+    })
+
+    it('defaults to true when the desktop platform default is provided', () => {
+      const local = resolveLocalSettings(undefined, { floatingActionButtonDefault: true })
+      expect(local.panes.floatingActionButton).toBe(true)
+    })
+
+    it('defaults to false when the mobile platform default is provided', () => {
+      const local = resolveLocalSettings(undefined, { floatingActionButtonDefault: false })
+      expect(local.panes.floatingActionButton).toBe(false)
+    })
+
+    it('keeps an explicit value over the platform default (old default-off-era opt-ins survive the flip)', () => {
+      const local = resolveLocalSettings(
+        { panes: { floatingActionButton: true } },
+        { floatingActionButtonDefault: false },
+      )
+      expect(local.panes.floatingActionButton).toBe(true)
+    })
+
+    it('persists a value that differs from the provided platform default and omits one that equals it (desktop base)', () => {
+      const off = resolveLocalSettings({ panes: { floatingActionButton: false } }, { floatingActionButtonDefault: true })
+      expect(buildLocalSettingsPatch(off, { floatingActionButtonDefault: true }).panes?.floatingActionButton).toBe(false)
+      const on = resolveLocalSettings({ panes: { floatingActionButton: true } }, { floatingActionButtonDefault: true })
+      expect(buildLocalSettingsPatch(on, { floatingActionButtonDefault: true }).panes?.floatingActionButton).toBeUndefined()
+    })
+
+    it('persists a value that differs from the provided platform default and omits one that equals it (mobile base)', () => {
+      const on = resolveLocalSettings({ panes: { floatingActionButton: true } }, { floatingActionButtonDefault: false })
+      expect(buildLocalSettingsPatch(on, { floatingActionButtonDefault: false }).panes?.floatingActionButton).toBe(true)
+      const off = resolveLocalSettings({ panes: { floatingActionButton: false } }, { floatingActionButtonDefault: false })
+      expect(buildLocalSettingsPatch(off, { floatingActionButtonDefault: false }).panes?.floatingActionButton).toBeUndefined()
+    })
+
+    it('resolves an old default-off-era blob as an explicit true even under the mobile platform default', () => {
+      const raw = JSON.stringify({ settings: { panes: { floatingActionButton: true } } })
+      const record = parseBrowserPreferencesRaw(raw)
+      const local = resolveLocalSettings(record?.settings, { floatingActionButtonDefault: false })
+      expect(local.panes.floatingActionButton).toBe(true)
+    })
+
+    it('preserves an explicitly saved false across a flush under the platform default it equals (sticky explicit)', () => {
+      const previous: LocalSettingsPatch = { panes: { floatingActionButton: false } }
+      const local = resolveLocalSettings(previous, { floatingActionButtonDefault: false })
+      const patch = buildLocalSettingsPatch(local, { floatingActionButtonDefault: false }, previous)
+      expect(patch.panes?.floatingActionButton).toBe(false)
+    })
+
+    it('preserves an explicitly saved true across a flush under the desktop platform default (sticky explicit)', () => {
+      const previous: LocalSettingsPatch = { panes: { floatingActionButton: true } }
+      const local = resolveLocalSettings(previous, { floatingActionButtonDefault: true })
+      const patch = buildLocalSettingsPatch(local, { floatingActionButtonDefault: true }, previous)
+      expect(patch.panes?.floatingActionButton).toBe(true)
+    })
+
+    it('omits a fresh platform-default value when no explicit choice was ever saved', () => {
+      const local = resolveLocalSettings(undefined, { floatingActionButtonDefault: true })
+      const patch = buildLocalSettingsPatch(local, { floatingActionButtonDefault: true })
+      expect(patch.panes?.floatingActionButton).toBeUndefined()
+    })
+
+    it('keeps an explicit value change flowing through the sticky rule (user toggles under the opposite class)', () => {
+      const previous: LocalSettingsPatch = { panes: { floatingActionButton: true } }
+      const local = resolveLocalSettings({ panes: { floatingActionButton: false } }, { floatingActionButtonDefault: true })
+      const patch = buildLocalSettingsPatch(local, { floatingActionButtonDefault: true }, previous)
+      expect(patch.panes?.floatingActionButton).toBe(false)
     })
   })
 

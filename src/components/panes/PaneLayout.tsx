@@ -60,6 +60,11 @@ export default function PaneLayout({ tabId, defaultContent, hidden }: PaneLayout
 
   // Invalid/stale zoom IDs use the normal layout, including its dividers.
   const effectiveZoom = resolveSurfaceZoom(collectSurfaceLeaves(layout), zoomedPaneId)
+  // Post-load the resolved settings always carry a concrete boolean (the
+  // store resolves the platform default at boot: desktop true / mobile
+  // false); `?? false` only covers the pre-load window, where "hidden" is
+  // the safe fallback on both platforms.
+  const showFloatingActionButton = settings.panes?.floatingActionButton ?? false
 
   return (
     <div ref={containerRef} data-pane-root className="relative h-full w-full">
@@ -67,11 +72,13 @@ export default function PaneLayout({ tabId, defaultContent, hidden }: PaneLayout
       {!effectiveZoom && (
         <IntersectionDragOverlay tabId={tabId} containerRef={containerRef} />
       )}
-      <FloatingActionButton
-        onAdd={handleAddPane}
-        onSplitHorizontal={() => handleSplit('horizontal')}
-        onSplitVertical={() => handleSplit('vertical')}
-      />
+      {showFloatingActionButton && (
+        <FloatingActionButton
+          onAdd={handleAddPane}
+          onSplitHorizontal={() => handleSplit('horizontal')}
+          onSplitVertical={() => handleSplit('vertical')}
+        />
+      )}
     </div>
   )
 }

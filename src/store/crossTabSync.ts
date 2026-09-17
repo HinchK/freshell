@@ -4,7 +4,7 @@ import { getSelectedMachineId } from '@/lib/machine-identity'
 import { paneTitleMetadataEquals } from './hydrate-pane-metadata-merge'
 import type { PanesState } from './paneTypes'
 import { hydratePanes, hydratePaneTitles } from './panesSlice'
-import { setLocalSettings } from './settingsSlice'
+import { setLocalSettings, localSettingsPlatformDefaults } from './settingsSlice'
 import { setTabRegistryClosedTabRetentionDays } from './tabRegistrySlice'
 import { hydrateTabs } from './tabsSlice'
 import { getPendingBrowserPreferencesWriteState } from './browserPreferencesPersistence'
@@ -280,8 +280,8 @@ function dispatchHydrateBrowserPreferencesFromPersisted(
     mergedSettingsPatch = mergeLocalSettings(mergedSettingsPatch, pendingWriteState.settingsPatch)
   }
   const nextSettings = pendingWriteState.settingsPatch
-    ? resolveLocalSettings(mergedSettingsPatch)
-    : resolveBrowserPreferenceSettings(parsed)
+    ? resolveLocalSettings(mergedSettingsPatch, localSettingsPlatformDefaults)
+    : resolveBrowserPreferenceSettings(parsed, localSettingsPlatformDefaults)
   const hasPendingRetention = pendingWriteState.hasPendingClosedTabRetentionDays ?? pendingWriteState.hasPendingSearchRangeDays
   const pendingRetention = pendingWriteState.closedTabRetentionDays ?? pendingWriteState.searchRangeDays
   const nextClosedTabRetentionDays = hasPendingRetention
