@@ -1740,15 +1740,8 @@ describe('FreshAgentView', () => {
     })
   })
 
-  it('sends tab restore context when recreating a legacy freshopencode placeholder', async () => {
+  it('re-creates (never snapshot-loads) a legacy freshopencode placeholder pane', async () => {
     const store = createStore()
-    store.dispatch(updateTab({
-      id: 'tab-1',
-      updates: {
-        title: 'Identifying skills from GitHub repos',
-        createdAt: 1_781_291_230_743,
-      },
-    }))
     store.dispatch(initLayout({
       tabId: 'tab-1',
       paneId: 'pane-1',
@@ -1769,6 +1762,14 @@ describe('FreshAgentView', () => {
       </Provider>,
     )
 
+    // The placeholder repair feature (legacyRestoreContext: tab title/created
+    // hints consumed by the pre-Rust server to adopt a DB session) was
+    // intentionally dropped with user approval — its migration window (panes
+    // persisted by clients older than 2026-06) has elapsed and no current
+    // code mints placeholder ids. The still-live contract: a legacy
+    // placeholder pane re-creates server-side, and the snapshot route is
+    // never called with the placeholder id (the
+    // isFreshOpencodePlaceholderId guard in fresh-agent-snapshot-thread).
     await waitFor(() => {
       expect(sentFreshAgentMessages('freshAgent.create').at(-1)).toMatchObject({
         requestId: '-gP4qyCL7bwp8-xbw9G7b',
@@ -1776,12 +1777,8 @@ describe('FreshAgentView', () => {
         provider: 'opencode',
         cwd: '/home/dan/code',
         sessionRef: { provider: 'opencode', sessionId: 'freshopencode--gP4qyCL7bwp8-xbw9G7b' },
-        legacyRestoreContext: {
-          title: 'Identifying skills from GitHub repos',
-          createdAt: 1_781_291_230_743,
-          updatedAt: expect.any(Number),
-        },
       })
+      expect(sentFreshAgentMessages('freshAgent.create').at(-1)).not.toHaveProperty('legacyRestoreContext')
     })
     expect(apiMock.getFreshAgentThreadSnapshot).not.toHaveBeenCalledWith(
       'freshopencode',

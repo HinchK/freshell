@@ -989,6 +989,10 @@ git add test/e2e-browser/specs/fresh-agent-centralization-smoke.spec.ts
 git commit -m "test(e2e): deflake fresh-agent-centralization-smoke (eviction-proof capture path, 30s explicit bounds)"
 ```
 
+### jwc7 disposition (2026-09-16, user decision — RESOLVED)
+
+The class-(f) leg (freshopencode-db-history "repairs a persisted legacy placeholder from a unique DB session", terminally red since the Rust migration lost the legacy placeholder DB-repair) was escalated to the user (delta review round 1 Major: merging under the pre-approval while the decision was open would land a knowingly-red named-family test). The user reviewed the scenario (a one-time migration convenience from 2026-06-12 for panes persisted by pre-durable-id clients; no current code mints placeholder ids; the migration window has elapsed; without repair the old conversation is still findable via the session history browser) and confirmed: **drop the feature, remove the test, remove the dead client-side sender.** Landed: the :409 test deleted (seedLegacyOpencodeSession kept — the no-adoption test still uses it), `buildLegacyRestoreContext` + the `legacyRestoreContext` create-message field + the `tabRestoreSource` selector removed from FreshAgentView, and the unit test re-pinned to the still-live contract (a legacy placeholder pane re-creates; the snapshot route is never called with the placeholder id; no legacyRestoreContext is sent). The defensive guards that tolerate stale placeholder ids in old persisted data (isFreshOpencodePlaceholderId, the panesSlice identity clamps) stay. The unused `legacyRestoreContext` field remains in the WS protocol schema (additive, inert) — follow-up kata filed for its removal. jwc7 closes wontfix.
+
 ### Task 8: Final gate — full-lane proof on both lanes + disposition standard (T-last)
 
 **Files:**

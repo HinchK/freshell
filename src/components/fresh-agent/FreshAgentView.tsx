@@ -357,25 +357,6 @@ function buildFreshAgentAttachMessage(content: FreshAgentPaneContent, cwd?: stri
   } as const
 }
 
-function buildLegacyRestoreContext(tab: { title?: string; createdAt?: number; updatedAt?: number } | undefined) {
-  if (!tab) return undefined
-  const title = typeof tab.title === 'string' && tab.title.trim().length > 0
-    ? tab.title.trim()
-    : undefined
-  const createdAt = typeof tab.createdAt === 'number' && Number.isFinite(tab.createdAt)
-    ? tab.createdAt
-    : undefined
-  const updatedAt = typeof tab.updatedAt === 'number' && Number.isFinite(tab.updatedAt)
-    ? tab.updatedAt
-    : undefined
-  if (!title && createdAt === undefined && updatedAt === undefined) return undefined
-  return {
-    ...(title ? { title } : {}),
-    ...(createdAt !== undefined ? { createdAt } : {}),
-    ...(updatedAt !== undefined ? { updatedAt } : {}),
-  }
-}
-
 function getQuestionAgentLabel(paneContent: FreshAgentPaneContent, descriptorLabel?: string): string {
   if (paneContent.sessionType === 'kilroy') return 'Kilroy'
   switch (paneContent.provider) {
@@ -603,9 +584,6 @@ export function FreshAgentView({
   const pendingCreateFailure = useAppSelector(
     (state) => state.freshAgent?.pendingCreateFailures?.[paneContent.createRequestId],
   )
-  const tabRestoreSource = useAppSelector((state) => (
-    state.tabs?.tabs?.find((tab) => tab.id === tabId)
-  ))
   const claudeSession = useAppSelector((state) => {
     if (paneContent.provider !== 'claude' || !paneContent.sessionId) return undefined
     const sessionKey = makeFreshAgentSessionKey({
@@ -1222,16 +1200,12 @@ export function FreshAgentView({
   ])
 
   const buildCreateMessage = useCallback((content: FreshAgentPaneContent) => {
-    const legacyRestoreContext = content.provider === 'opencode'
-      ? buildLegacyRestoreContext(tabRestoreSource)
-      : undefined
     return {
       type: 'freshAgent.create',
       requestId: content.createRequestId,
       sessionType: content.sessionType,
       provider: content.provider,
       cwd: content.initialCwd,
-      ...(legacyRestoreContext ? { legacyRestoreContext } : {}),
       sessionRef: effectiveSessionRef(content),
       modelSelection: content.modelSelection,
       model: resolveEffectiveFreshAgentModel(content, providerDefaults),
@@ -1243,7 +1217,7 @@ export function FreshAgentView({
       // tabKey as `deviceId:tabId` from the connection identity + this field.
       tabId,
     } as const
-  }, [providerDefaults, tabRestoreSource, tabId])
+  }, [providerDefaults, tabId])
 
   const startNewConversation = useCallback(() => {
     const current = paneContentRef.current
