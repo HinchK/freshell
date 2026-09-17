@@ -21,6 +21,7 @@ import {
   turnPlainText,
 } from './FreshAgentTurnActions'
 import { FreshAgentActionSheet } from './FreshAgentActionSheet'
+import { FreshAgentTranscriptMinimap } from './FreshAgentTranscriptMinimap'
 import { registerFreshAgentTurnItems } from '@/lib/pane-action-registry'
 import { buildLongPressHandlers, useCoarsePointer } from '@/lib/pointer'
 import { getFreshAgentDisplayTurnKey, turnSummaryIsAuthored } from '@shared/fresh-agent-turns'
@@ -1386,6 +1387,11 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
           {newMessages > 0 ? `${newMessages} new` : 'Bottom'}
         </button>
       ) : null}
+      <FreshAgentTranscriptMinimap
+        scrollerRef={scrollerRef}
+        displayTurns={displayTurns}
+        transcriptSignature={transcriptSignature}
+      />
     </div>
   )
 })
