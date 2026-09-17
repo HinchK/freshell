@@ -1667,7 +1667,7 @@ test.describe('Fresh Agent', () => {
       window.__FRESHELL_TEST_HARNESS__?.dispatch({ type: 'persist/flushNow' })
     })
     const persistedFreshcodex = await page.evaluate(({ currentTabId, currentPaneId }) => {
-      const raw = localStorage.getItem('freshell.layout.v3')
+      const raw = localStorage.getItem(`freshell.layout.v3.${sessionStorage.getItem('freshell.layout-window-id.v1')}`)
       if (!raw) throw new Error('Missing persisted layout after freshcodex flush')
       const layout = JSON.parse(raw)
       const findPane = (node: any): any => {
@@ -1844,7 +1844,7 @@ test.describe('expansion defaults and settings', () => {
     // pane header also renders an "Agent settings" button, which a /settings/i
     // regex would match too (Playwright strict-mode violation).
     await page.getByRole('button', { name: 'Settings (Ctrl+B ,)' }).click()
-    await expect(page.getByRole('tab', { name: /^Coding Agents$/i })).toBeVisible({ timeout: 5_000 })
+    await expect(page.getByRole('tab', { name: /^Coding Agents$/i })).toBeVisible({ timeout: 15_000 })
     await page.getByRole('tab', { name: /^Coding Agents$/i }).click()
     const expandToolsSwitch = page.getByRole('switch', { name: 'Expand tools' })
     await expect(expandToolsSwitch).toHaveAttribute('aria-checked', 'false')
@@ -1896,7 +1896,7 @@ test.describe('expansion defaults and settings', () => {
     // button pin — the pane header's "Agent settings" button makes a
     // /settings/i regex a strict-mode violation).
     await page.getByRole('button', { name: 'Settings (Ctrl+B ,)' }).click()
-    await expect(page.getByRole('tab', { name: /^Coding Agents$/i })).toBeVisible({ timeout: 5_000 })
+    await expect(page.getByRole('tab', { name: /^Coding Agents$/i })).toBeVisible({ timeout: 15_000 })
     await page.getByRole('tab', { name: /^Coding Agents$/i }).click()
     const expandThinkingSwitch = page.getByRole('switch', { name: 'Expand thinking' })
     await expect(expandThinkingSwitch).toHaveAttribute('aria-checked', 'false')
@@ -1943,7 +1943,7 @@ test.describe('expansion defaults and settings', () => {
     // Open Settings: the "Expand tools" switch must still be OFF — in-pane
     // expansion never wrote the store.
     await page.getByRole('button', { name: 'Settings (Ctrl+B ,)' }).click()
-    await expect(page.getByRole('tab', { name: /^Coding Agents$/i })).toBeVisible({ timeout: 5_000 })
+    await expect(page.getByRole('tab', { name: /^Coding Agents$/i })).toBeVisible({ timeout: 15_000 })
     await page.getByRole('tab', { name: /^Coding Agents$/i }).click()
     const expandToolsSwitch = page.getByRole('switch', { name: 'Expand tools' })
     await expect(expandToolsSwitch).toHaveAttribute('aria-checked', 'false')

@@ -155,30 +155,39 @@ function findFreshAgentLeaf(node: any): any {
   return null
 }
 
-async function persistedFreshAgentIdentity(page: Page, tabId: string): Promise<string> {
+/** The durable session id this window's persisted layout names for the tab's
+ * fresh-agent pane — read from the per-window envelope the product actually
+ * writes (freshell.layout.v3.<layoutWindowId>, derived exactly like
+ * window-layout-keys.ts: the layout-window id from sessionStorage). Absence
+ * is never a silent '': a missing layout-window id (the per-window key
+ * cannot be derived) or a corrupt envelope throws immediately, while an
+ * envelope not written yet (the natural 500ms debounce the caller polls
+ * for) yields null so the poll keeps waiting and fails loudly on timeout
+ * instead of reporting an indistinguishable empty string. */
+async function persistedFreshAgentIdentity(page: Page, tabId: string): Promise<string | null> {
   return page.evaluate((id) => {
-    const raw = window.localStorage.getItem('freshell.layout.v3')
-    if (!raw) return ''
-    try {
-      const layout = JSON.parse(raw)
-      const visit = (node: any): string => {
-        if (!node) return ''
-        if (node.type === 'leaf' && node.content?.kind === 'fresh-agent') {
-          return node.content.sessionRef?.sessionId
-            ?? node.content.resumeSessionId
-            ?? node.content.sessionId
-            ?? ''
-        }
-        for (const child of node.children ?? []) {
-          const found = visit(child)
-          if (found) return found
-        }
-        return ''
-      }
-      return visit(layout?.panes?.layouts?.[id])
-    } catch {
-      return ''
+    const layoutWindowId = sessionStorage.getItem('freshell.layout-window-id.v1')
+    if (!layoutWindowId) {
+      throw new Error('Missing layout-window-id: cannot derive the per-window layout key')
     }
+    const raw = window.localStorage.getItem(`freshell.layout.v3.${layoutWindowId}`)
+    if (!raw) return null
+    const layout = JSON.parse(raw)
+    const visit = (node: any): string | null => {
+      if (!node) return null
+      if (node.type === 'leaf' && node.content?.kind === 'fresh-agent') {
+        return node.content.sessionRef?.sessionId
+          ?? node.content.resumeSessionId
+          ?? node.content.sessionId
+          ?? null
+      }
+      for (const child of node.children ?? []) {
+        const found = visit(child)
+        if (found) return found
+      }
+      return null
+    }
+    return visit(layout?.panes?.layouts?.[id])
   }, tabId)
 }
 

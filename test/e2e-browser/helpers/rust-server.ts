@@ -494,6 +494,70 @@ export class RustServer implements E2eServerHandle {
     return this.boot(homeDir, priorInfo.port, priorInfo.token)
   }
 
+  /**
+   * HARD-kill the current server process WITHOUT rebooting and WITHOUT the
+   * graceful shutdown path (no clean WS close frames, so the server's own
+   * PTY-reaping Drop path never ran — see the class doc comment's
+   * process-group boundary). Same kill semantics as `restartAbrupt`'s first
+   * half: signal the server's OWN process group (negative pid —
+   * ownership-safe by construction), then run the ownership-safe descendant
+   * sweep (`reapSurvivingChildren`) as the PRIMARY reap, since the graceful
+   * reap never ran. Unlike `restartAbrupt`, does NOT boot a replacement:
+   * the caller owns the restart decision (e.g. opencode-restart-recovery
+   * boots its own server2 bound to the same port and token).
+   *
+   * Escalation (delta-review round-1 F7, mirroring `killCurrentProcess`):
+   * the requested signal is delivered to the group; if the process has not
+   * exited within 5s, SIGKILL the group — a signal that fails to stop the
+   * server must never leave a live, untracked server that `stop()` can no
+   * longer reach. Deferring the `this.process` null only matters while the
+   * kill is still in flight: a `stop()` racing the 5s window still finds the
+   * handle. Once the promise resolves (exit observed, group kill threw, or
+   * SIGKILL issued without waiting for exit), the handle is nulled and the
+   * fixture no longer tracks the process — that is the hard-kill contract
+   * (signals only, no shutdown handshake; the only current caller passes
+   * SIGKILL at opencode-restart-recovery.spec.ts:525).
+   */
+  async kill(signal: NodeJS.Signals = 'SIGKILL'): Promise<void> {
+    const proc = this.process
+    const pid = proc?.pid
+
+    if (!proc || !pid) return
+
+    const childPidsBeforeKill = ownedDescendantPids(pid)
+
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => {
+        try {
+          process.kill(-pid, 'SIGKILL')
+        } catch {
+          // Process group already gone.
+        }
+        resolve()
+      }, 5000)
+
+      proc.once('exit', () => {
+        clearTimeout(timeout)
+        resolve()
+      })
+
+      try {
+        // Negative pid targets the server's OWN process group only (see the
+        // class doc comment and `killCurrentProcess` for the ownership
+        // rationale). Does NOT reach PTY shell children — the sweep below
+        // backstops those.
+        process.kill(-pid, signal)
+      } catch {
+        clearTimeout(timeout)
+        resolve()
+      }
+    })
+
+    this.process = null
+
+    await this.reapSurvivingChildren(childPidsBeforeKill)
+  }
+
   async stop(): Promise<void> {
     await this.stopProcess(!this.options.preserveHomeOnStop)
   }
