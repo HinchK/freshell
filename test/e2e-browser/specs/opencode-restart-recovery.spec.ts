@@ -415,6 +415,14 @@ async function waitForStdinAudit(
   label: string,
 ): Promise<FakeAuditEvent[]> {
   let latestAuditEvents: FakeAuditEvent[] = []
+  // 30s (delta-gate iteration, kata mv9m layer): the 15s wall was measured
+  // reachable under co-tenant host load — one terminal failure at the
+  // definitive gate's focused lane (36fbc18f7, first attempt, retries=0)
+  // waiting for the fake's audit flush after a ~96KB overflow write, green in
+  // every other recorded lane at/near that HEAD. The ladder's per-assertion
+  // ceiling (30s, never test.setTimeout); still far inside the declared 240s
+  // envelope. Same sizing standard as the reverted-unproven raises: this one
+  // carries direct failure evidence.
   await expect.poll(async () => {
     latestAuditEvents = await readAuditEvents(auditLogPath)
     return expectedByTab.every(({ tabId, sessionId }) =>
@@ -425,7 +433,7 @@ async function waitForStdinAudit(
         && event.data.includes(`${label} ${tabId}`)
       )
     )
-  }, { timeout: 15_000 }).toBe(true)
+  }, { timeout: 30_000 }).toBe(true)
   return latestAuditEvents
 }
 
