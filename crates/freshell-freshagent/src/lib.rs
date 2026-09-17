@@ -44,6 +44,7 @@ pub mod identity_sink;
 pub mod layout_store;
 pub mod layout_tree;
 pub mod model_capabilities;
+pub mod naming;
 pub mod opencode_ws;
 pub mod pane_ops;
 mod pane_resize;
@@ -81,6 +82,12 @@ pub use rollback_record::{
 };
 pub use snapshot::SnapshotState;
 pub use spawn_gate::{SpawnGate, SpawnGateError};
+// Unified agent names (Task 1): the injected naming interface the store
+// (freshell-server) implements and WS/fresh composition consumes.
+pub use naming::{
+    BindNameInput, NameActivity, NameActivityReason, NameError, NameFuture, NativeNameObservation,
+    NativeNameOrigin, PendingNameInput, RenameNameInput, SessionNaming,
+};
 
 /// Task 13b: the injected cross-kind liveness probe -- `(provider, session_id) -> bool`,
 /// true when a live terminal PTY currently owns that session. Constructed by

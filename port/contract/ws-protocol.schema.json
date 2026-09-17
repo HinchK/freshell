@@ -842,6 +842,10 @@
               "default": "shell",
               "type": "string"
             },
+            "namingHandle": {
+              "minLength": 1,
+              "type": "string"
+            },
             "paneId": {
               "minLength": 1,
               "type": "string"
@@ -1755,6 +1759,10 @@
                   "type": "null"
                 }
               ]
+            },
+            "namingHandle": {
+              "minLength": 1,
+              "type": "string"
             },
             "permissionMode": {
               "type": "string"
@@ -3107,6 +3115,10 @@
                 }
               ]
             },
+            "namingHandle": {
+              "minLength": 1,
+              "type": "string"
+            },
             "permissionMode": {
               "type": "string"
             },
@@ -4010,6 +4022,10 @@
               "type": "null"
             }
           ]
+        },
+        "namingHandle": {
+          "minLength": 1,
+          "type": "string"
         },
         "permissionMode": {
           "type": "string"
@@ -7941,6 +7957,10 @@
         },
         "mode": {
           "default": "shell",
+          "type": "string"
+        },
+        "namingHandle": {
+          "minLength": 1,
           "type": "string"
         },
         "paneId": {

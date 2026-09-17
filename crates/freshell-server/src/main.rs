@@ -52,6 +52,7 @@ mod screenshots;
 mod serve_client;
 mod session_directory;
 mod session_metadata;
+mod session_names;
 mod sessions;
 mod settings;
 mod settings_store;

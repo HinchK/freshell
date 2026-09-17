@@ -24,12 +24,16 @@
 
 pub mod client_messages;
 pub mod common;
+pub mod native_location;
 pub mod server_messages;
+pub mod session_names;
 pub mod settings;
 
 pub use client_messages::*;
 pub use common::*;
+pub use native_location::*;
 pub use server_messages::*;
+pub use session_names::*;
 pub use settings::*;
 
 /// The frozen WebSocket protocol version. Asserted equal to the committed
@@ -37,7 +41,7 @@ pub use settings::*;
 pub const WS_PROTOCOL_VERSION: u32 = 10;
 
 /// Every `type` discriminant the protocol speaks, both directions, sorted.
-/// (40 client→server + 64 server→client = 105.)
+/// (41 client→server + 65 server→client = 106.)
 pub fn all_message_types() -> Vec<&'static str> {
     let mut types: Vec<&'static str> = client_messages::CLIENT_MESSAGE_TYPES
         .iter()

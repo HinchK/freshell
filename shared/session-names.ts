@@ -1,0 +1,172 @@
+/**
+ * Canonical coding-agent session names — shared wire contract
+ * (unified-agent-names plan, Task 1).
+ *
+ * One saved name per scoped Claude/Codex/OpenCode session (terminal modes
+ * `claude`/`codex`/`opencode` and fresh types `freshclaude`/`freshcodex`/
+ * `freshopencode`). The Rust server's `SessionNames` store is the authority;
+ * these Zod schemas are the language-neutral wire shapes mirrored by
+ * `crates/freshell-protocol/src/session_names.rs`.
+ *
+ * Wire rules:
+ * - `NameRevision`-typed counters are JS-safe integers (`0 ..= 2^53-1`).
+ * - `SessionNameRef` keys encode as a JSON discriminated TUPLE
+ *   (`sessionNameRefKey`) — never colon-split opaque provider session IDs.
+ * - Kilroy is out of scope: it shares the Claude runtime but keeps its
+ *   existing naming behavior.
+ */
+import { z } from 'zod'
+
+export const NamedProviderSchema = z.enum(['claude', 'codex', 'opencode'])
+export type NamedProvider = z.infer<typeof NamedProviderSchema>
+
+/** The six scoped coding-agent modes: three terminal CLIs + three fresh types. */
+export const UnifiedAgentModeSchema = z.enum([
+  'claude',
+  'codex',
+  'opencode',
+  'freshclaude',
+  'freshcodex',
+  'freshopencode',
+])
+export type UnifiedAgentMode = z.infer<typeof UnifiedAgentModeSchema>
+
+/** Who asked for a name: a human (`user`) or automation (`automatic`). */
+export const NameIntentSchema = z.enum(['user', 'automatic'])
+export type NameIntent = z.infer<typeof NameIntentSchema>
+
+/**
+ * Provenance of an accepted name. `legacy_protected` is assigned ONLY by the
+ * Task 7 migration: its historic origin is unknown (never claimed as human).
+ */
+export const NameSourceSchema = z.enum([
+  'manual',
+  'legacy_protected',
+  'freshell_ai',
+  'provider_ai',
+  'first_message',
+  'directory',
+])
+export type NameSource = z.infer<typeof NameSourceSchema>
+
+export const LEGACY_ORIGIN_UNKNOWN = 'unknown' as const
+
+/** Monotonically allocated, JS-safe revision counter (0 ..= 2^53-1). */
+export const NameRevisionSchema = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
+export type NameRevision = z.infer<typeof NameRevisionSchema>
+
+/**
+ * Naming target: a pre-durable pending handle (minted per logical
+ * conversation before provider identity exists) or the durable
+ * provider/session identity. The session variant reuses the existing
+ * structured provider/session identity — no new restore identity.
+ */
+export const SessionNameRefSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('pending'), id: z.string().min(1) }),
+  z.object({ kind: z.literal('session'), provider: NamedProviderSchema, sessionId: z.string().min(1) }),
+])
+export type SessionNameRef = z.infer<typeof SessionNameRefSchema>
+
+/**
+ * Which session names a tab: `{kind:'session',paneId}` follows that pane's
+ * canonical session name; `{kind:'legacy'}` keeps the existing non-agent
+ * derivation. A tab stores the relationship, never a second name.
+ */
+export const TabNameSourceSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('session'), paneId: z.string().min(1) }),
+  z.object({ kind: z.literal('legacy') }),
+])
+export type TabNameSource = z.infer<typeof TabNameSourceSchema>
+
+/**
+ * One accepted name record. `manualRevision`/`renamedAt` are assigned only by
+ * an actual explicit user rename; `legacyOrigin` is required (and only
+ * legal) for `legacy_protected`.
+ */
+export const SessionNameRecordSchema = z
+  .object({
+    ref: SessionNameRefSchema,
+    name: z.string().min(1),
+    source: NameSourceSchema,
+    revision: NameRevisionSchema,
+    manualRevision: NameRevisionSchema.optional(),
+    renamedAt: z.number().int().nonnegative().optional(),
+    legacyOrigin: z.literal(LEGACY_ORIGIN_UNKNOWN).optional(),
+  })
+  .superRefine((record, ctx) => {
+    // Only migration assigns legacy_protected, and it must never claim human
+    // origin: legacyOrigin is required there and illegal everywhere else.
+    if (record.source === 'legacy_protected' && record.legacyOrigin !== LEGACY_ORIGIN_UNKNOWN) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'legacyOrigin is required for legacy_protected records',
+        path: ['legacyOrigin'],
+      })
+    }
+    if (record.source !== 'legacy_protected' && record.legacyOrigin !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'legacyOrigin is only legal on legacy_protected records',
+        path: ['legacyOrigin'],
+      })
+    }
+  })
+export type SessionNameRecord = z.infer<typeof SessionNameRecordSchema>
+
+/** Pending→durable redirect, so late operations on a bound handle resolve. */
+export const SessionNameRedirectSchema = z.object({
+  from: SessionNameRefSchema,
+  to: SessionNameRefSchema,
+  revision: NameRevisionSchema,
+})
+export type SessionNameRedirect = z.infer<typeof SessionNameRedirectSchema>
+
+/** The common response/broadcast shape for every naming operation. */
+export const SessionNameUpdateSchema = z.object({
+  record: SessionNameRecordSchema,
+  documentGeneration: NameRevisionSchema,
+  redirects: z.array(SessionNameRedirectSchema),
+  changed: z.boolean(),
+})
+export type SessionNameUpdate = z.infer<typeof SessionNameUpdateSchema>
+
+/** Rename request (HTTP PATCH body / MCP-bridged rename). */
+export const RenameSessionNameRequestSchema = z.object({
+  target: SessionNameRefSchema,
+  name: z.string(),
+  nameIntent: NameIntentSchema.optional(),
+  ifRevision: NameRevisionSchema.optional(),
+})
+export type RenameSessionNameRequest = z.infer<typeof RenameSessionNameRequestSchema>
+
+const TERMINAL_UNIFIED_MODES = new Set(['claude', 'codex', 'opencode'])
+const FRESH_UNIFIED_SESSION_TYPES = new Set(['freshclaude', 'freshcodex', 'freshopencode'])
+
+/**
+ * Scope predicate: is this pane content one of the six unified naming modes?
+ * Terminal scope is `mode in {claude,codex,opencode}`; fresh scope is
+ * `sessionType in {freshclaude,freshcodex,freshopencode}` (fresh types also
+ * match when passed as the mode, since fresh panes identify by session type).
+ * Kilroy is explicitly out of scope even though it shares the Claude
+ * runtime — a kilroy sessionType is never scoped, regardless of mode.
+ */
+export function isUnifiedAgentMode(mode: string | undefined, sessionType?: string): boolean {
+  // Kilroy shares the Claude runtime but keeps its existing naming behavior:
+  // a kilroy sessionType is never scoped, regardless of the mode it rides on.
+  if (sessionType === 'kilroy') return false
+  // Fresh panes identify by sessionType (fresh types also match when a caller
+  // passes one as the mode).
+  if (sessionType !== undefined && FRESH_UNIFIED_SESSION_TYPES.has(sessionType)) return true
+  return mode !== undefined && (TERMINAL_UNIFIED_MODES.has(mode) || FRESH_UNIFIED_SESSION_TYPES.has(mode))
+}
+
+/**
+ * Stable key for a naming ref: the JSON encoding of a discriminated TUPLE
+ * (["pending",id] / ["session",provider,sessionId]) — never colon-splitting
+ * opaque provider session IDs.
+ */
+export function sessionNameRefKey(ref: SessionNameRef): string {
+  return ref.kind === 'pending'
+    ? JSON.stringify(['pending', ref.id])
+    : JSON.stringify(['session', ref.provider, ref.sessionId])
+}

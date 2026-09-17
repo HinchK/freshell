@@ -1,4 +1,4 @@
-//! Server → client messages (`ServerMessage`, 63 discriminants).
+//! Server → client messages (`ServerMessage`, 64 discriminants).
 //!
 //! These are TypeScript-typed (not runtime-validated) on the wire; their frozen
 //! shape authority is `port/contract/ws-server-messages.schema.json`.
@@ -12,6 +12,7 @@ use crate::common::{
     CodexDurability, ErrorCode, OpencodeActivityRecord, SessionLocator, TerminalMetaRecord,
     TurnCompletionSnapshot,
 };
+use crate::session_names::SessionNameUpdated;
 use crate::settings::ServerSettings;
 
 /// A message sent from the server to a client.
@@ -94,6 +95,11 @@ pub enum ServerMessage {
     Ready(Ready),
     #[serde(rename = "session.repair.activity")]
     SessionRepairActivity(SessionRepairActivity),
+    // Unified agent names (Task 1): the canonical name broadcast — payload is
+    // a `SessionNameUpdate`. Additive server→client only; the protocol
+    // version deliberately stays 10 (pre-frame servers simply never send it).
+    #[serde(rename = "session.name.updated")]
+    SessionNameUpdated(SessionNameUpdated),
     #[serde(rename = "session.status")]
     SessionStatus(SessionStatus),
     #[serde(rename = "sessions.changed")]
@@ -174,7 +180,7 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 64] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 65] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
@@ -211,6 +217,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 64] = [
     "perf.logging",
     "pong",
     "ready",
+    "session.name.updated",
     "session.repair.activity",
     "session.status",
     "sessions.changed",

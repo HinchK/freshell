@@ -21,6 +21,11 @@ import type {
 } from '@shared/settings'
 import type { CodingCliProviderName, TokenSummary, SessionLocator } from '@shared/ws-protocol'
 import type { CodexDurabilityRef } from '@shared/codex-durability'
+import type {
+  SessionNameRecord,
+  SessionNameRef,
+  TabNameSource,
+} from '@shared/session-names'
 import type { TitleSource } from '../../shared/title-source'
 export type { CodingCliProviderName }
 
@@ -65,6 +70,13 @@ export interface Tab {
   updatedAt?: number
   titleSetByUser?: boolean     // If true, don't auto-update title
   lastInputAt?: number
+  /**
+   * Unified agent names (Task 1): which session names this tab — a stable
+   * source-pane relationship, never a separately stored tab name. Absent
+   * until initial content or migration resolves ownership (undefined ⇒
+   * existing non-agent derivation).
+   */
+  nameSource?: TabNameSource
 }
 
 export interface BackgroundTerminal {
@@ -86,6 +98,11 @@ export interface BackgroundTerminal {
    * showSubagents filtering applies.
    */
   resumeTargetIsSubagent?: boolean
+  /** Unified agent names (Task 1): canonical name projection (last-known). */
+  sessionName?: SessionNameRecord
+  /** Unified agent names (Task 1): the naming identity this terminal's
+   * displayed name resolves through. */
+  nameRef?: SessionNameRef
 }
 
 export interface CodingCliSession {
@@ -129,6 +146,17 @@ export interface CodingCliSession {
    * the session-title mirror keys row freshness on it.
    */
   fetchSeq?: number
+  /**
+   * Unified agent names (Task 1): the canonical naming identity for this
+   * row's session (pending handle before durable identity exists).
+   */
+  nameRef?: SessionNameRef
+  /**
+   * Unified agent names (Task 1): last-known canonical name projection.
+   * Never an independent override — the server's session.name.updated
+   * broadcast and batch reads refresh it by revision.
+   */
+  sessionName?: SessionNameRecord
 }
 
 export interface ProjectGroup {
