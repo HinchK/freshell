@@ -715,6 +715,14 @@ impl OpencodeSource {
         self
     }
 
+    /// Usage walks actually executed by the wrapped provider so far (cache
+    /// misses) — the index-level observable-work pin for the row-stamped
+    /// usage cache: a re-list that changed no session row must not move
+    /// it (delegates to `OpencodeProvider::usage_walk_count`).
+    pub fn usage_walk_count(&self) -> u64 {
+        self.provider.usage_walk_count()
+    }
+
     /// Convenience: one-shot listing, ignoring any incremental cache.
     /// Test/perf use only — mirrors `ClaudeSource::scan()`/`CodexSource::scan()`,
     /// but goes through `direct_list()` since this source has no per-file
@@ -2649,6 +2657,14 @@ pub(crate) mod tests {
                 stat_scoped_calls: Arc::new(AtomicUsize::new(0)),
             }
         }
+
+        /// Read-only access to the wrapped source — lets index-level tests
+        /// reach source-specific observation seams (e.g.
+        /// `OpencodeSource::usage_walk_count`) while the wrapper's own
+        /// counters keep proving the re-list side.
+        pub(crate) fn counting_inner(&self) -> &S {
+            &self.inner
+        }
     }
 
     /// Counter access for OTHER modules' negative no-scan pins (the
@@ -4161,6 +4177,161 @@ pub(crate) mod tests {
             direct_list_calls.load(Ordering::SeqCst),
             2,
             "a wal-only mtime change must trigger exactly one more query"
+        );
+
+        std::fs::remove_dir_all(&data_home).ok();
+    }
+
+    /// The re-list storm bound, end-to-end at the index level: a WAL move
+    /// still re-runs the WHOLE listing (the pinned change-token contract
+    /// above), but the per-session usage walk only executes for rows whose
+    /// `time_updated` moved — unchanged rows are served from the
+    /// provider's row-stamped cache. Observable on BOTH counters, never on
+    /// the change generation alone (the observable-work rule,
+    /// session_watcher_tests.rs:405-413).
+    #[tokio::test]
+    async fn opencode_wal_move_relists_without_rewalking_unchanged_sessions() {
+        let data_home = opencode_data_home_with_sessions(
+            "opencode-usage-cache",
+            &[
+                ("ses_a", "/repo/a", "Session A", 1000, 5000),
+                ("ses_b", "/repo/b", "Session B", 1000, 5000),
+            ],
+        );
+        set_opencode_session_model(&data_home, "ses_a", OPENCODE_TEST_MODEL);
+        set_opencode_session_model(&data_home, "ses_b", OPENCODE_TEST_MODEL);
+        // seed_opencode_step_finish uses fixed msg/part ids, so only ses_a
+        // can go through it; ses_b is seeded through the lower-level
+        // helpers with distinct ids (same real-schema shape).
+        seed_opencode_step_finish(
+            &data_home,
+            "ses_a",
+            r#"{"total":111,"input":1,"output":1,"reasoning":0,"cache":{"write":0,"read":109}}"#,
+        );
+        {
+            let conn = rusqlite::Connection::open(data_home.join("opencode.db")).unwrap();
+            ensure_opencode_message_tables(&conn);
+            insert_opencode_message(&conn, "msg_b", "ses_b", 200, "assistant");
+            insert_opencode_part(
+                &conn,
+                "prt_b",
+                "msg_b",
+                "ses_b",
+                r#"{"reason":"stop","type":"step-finish","tokens":{"total":222,"input":2,"output":2,"reasoning":0,"cache":{"write":0,"read":218}},"cost":0}"#,
+            );
+        }
+
+        let source =
+            std::sync::Arc::new(CountingWrapper::new(OpencodeSource::new(data_home.clone())));
+        let direct_list_calls = Arc::clone(&source.direct_list_calls);
+        let index = test_index_with_ttl(vec![source.clone()], Duration::from_millis(10));
+
+        // Cold snapshot: runs inline (truly cold has nothing stale to
+        // serve), so synchronous asserts are final once it returns.
+        let snap = index.snapshot().await;
+        assert_eq!(snap.len(), 2);
+        assert_eq!(direct_list_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(source.counting_inner().usage_walk_count(), 2);
+
+        // Touch ONLY the wal (the storm driver). snapshot() is
+        // stale-while-revalidate: it spawns a DETACHED sweep and returns
+        // the stale view — settle on the observable counters before
+        // asserting (finder F-01; the file-backed twin's discipline).
+        let wal = data_home.join("opencode.db-wal");
+        std::fs::write(&wal, b"wal-bytes-changed").unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await; // past the 10ms test TTL, deterministically stale
+        let snap2 = index.snapshot().await;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                direct_list_calls.load(Ordering::SeqCst) >= 2
+            })
+            .await,
+            "the WAL-move re-list must fire and settle"
+        );
+        // The walk count must NOT advance; settling on the walk counter
+        // itself — not merely piggybacking on the direct-list counter,
+        // which increments BEFORE the listing runs — proves the sweep
+        // finished its walk decisions without new walks.
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                source.counting_inner().usage_walk_count() == 2
+            })
+            .await,
+            "the WAL-move re-list must finish without re-walking unchanged sessions"
+        );
+        assert_eq!(
+            direct_list_calls.load(Ordering::SeqCst),
+            2,
+            "the WAL-move re-list still fires"
+        );
+        assert_eq!(
+            source.counting_inner().usage_walk_count(),
+            2,
+            "unchanged session rows must not re-run the usage walk"
+        );
+        assert_eq!(snap2.len(), 2);
+
+        // One session's row changes — and its step-finish data with it:
+        // exactly that session re-walks, and the published view serves the
+        // FRESH usage (the new newest step-finish, not the cached 111).
+        {
+            let conn = rusqlite::Connection::open(data_home.join("opencode.db")).unwrap();
+            insert_opencode_message(&conn, "msg_a2", "ses_a", 300, "assistant");
+            insert_opencode_part(
+                &conn,
+                "prt_a2",
+                "msg_a2",
+                "ses_a",
+                r#"{"reason":"stop","type":"step-finish","tokens":{"total":333,"input":3,"output":3,"reasoning":0,"cache":{"write":0,"read":327}},"cost":0}"#,
+            );
+            conn.execute(
+                "UPDATE session SET time_updated = time_updated + 1 WHERE id = 'ses_a'",
+                [],
+            )
+            .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await; // past TTL, deterministically stale
+        let _ = index.snapshot().await; // stale view; the re-list detaches
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                direct_list_calls.load(Ordering::SeqCst) >= 3
+            })
+            .await,
+            "the row-change re-list must fire and settle"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                source.counting_inner().usage_walk_count() >= 3
+            })
+            .await,
+            "the changed session's re-walk must happen"
+        );
+        assert_eq!(direct_list_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            source.counting_inner().usage_walk_count(),
+            3,
+            "exactly the session whose row stamp moved re-walks"
+        );
+
+        // The re-walk's FRESH result reaches the published view (the meter
+        // serves current usage, not a stale cache). The counters above are
+        // settled; this sleep lets the woken sweep publish (and re-stales
+        // the cache), so the snapshot below returns the new generation —
+        // its own detached sweep is change-token-gated (no further
+        // row/db/wal move) and runs no new listing.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let snap3 = index.snapshot().await;
+        let ses_a = snap3.iter().find(|s| s.session_id == "ses_a").unwrap();
+        assert_eq!(
+            ses_a.token_usage.as_ref().map(|t| t.total_tokens),
+            Some(333),
+            "the changed session's fresh usage is served, not the cached 111"
+        );
+        let ses_b = snap3.iter().find(|s| s.session_id == "ses_b").unwrap();
+        assert_eq!(
+            ses_b.token_usage.as_ref().map(|t| t.total_tokens),
+            Some(222),
+            "the unchanged session keeps serving its (cached) usage"
         );
 
         std::fs::remove_dir_all(&data_home).ok();
