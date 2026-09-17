@@ -14,6 +14,12 @@ export const MINIMAP_MIN_TICK_HEIGHT_PX = 3
  * pane style with one code path — in the default sans style the button is
  * bottom-centered and never overlaps the right edge anyway. */
 export const MINIMAP_RAIL_BOTTOM_INSET_PX = 48
+/** Tick heights at or above this remain individually pointer-clickable;
+ *  below it, individual hits are physically unreliable on a 1× display, so
+ *  the component layer adds one open-list hit target over each dense
+ *  multi-member clickability run and expands a lone sub-4px tick's own hit
+ *  height (every per-prompt tick still renders — never dropped or capped). */
+export const MINIMAP_TICK_MIN_CLICKABLE_PX = 4
 
 export type MinimapLandmark = {
   /** Index into the transcript's displayTurns (the article's data-turn-index). */
@@ -40,9 +46,28 @@ export type MinimapViewportBand = {
   height: number
 }
 
+export type MinimapCluster = {
+  /** Rail-space top of the run's first member tick. */
+  top: number
+  /** Run span, px: last member's bottom minus first member's top. */
+  height: number
+  /** Inclusive position of the first member tick within layout.ticks. */
+  startIndex: number
+  /** Inclusive position of the last member tick within layout.ticks. */
+  endIndex: number
+  /** True when at least one member tick's height is strictly below the
+   *  clickable floor: dense multi-member runs get the open-list hit target;
+   *  dense singletons (lone sub-4px ticks) get the expanded-hit treatment
+   *  in the component. */
+  dense: boolean
+}
+
 export type MinimapLayout = {
   ticks: MinimapTick[]
   viewport: MinimapViewportBand
+  /** Clickability runs over the final laid-out ticks — ALL runs, singletons
+   *  included (see the second pass at the end of computeMinimapLayout). */
+  clusters: MinimapCluster[]
   /** Echoes the input railHeight for consumers (e.g. the tooltip side rule). */
   railHeight: number
 }
@@ -55,7 +80,7 @@ export function computeMinimapLayout(input: {
   landmarks: readonly MinimapLandmark[]
 }): MinimapLayout {
   if (input.scrollHeight <= 0 || input.railHeight <= 0) {
-    return { ticks: [], viewport: { top: 0, height: 0 }, railHeight: 0 }
+    return { ticks: [], viewport: { top: 0, height: 0 }, clusters: [], railHeight: 0 }
   }
   const scale = input.railHeight / input.scrollHeight
   // Under density the minimum tick height thins — sub-pixel allowed, no pixel
@@ -125,6 +150,31 @@ export function computeMinimapLayout(input: {
     height: heights[k],
   }))
 
+  // Clickability pass — a SECOND pass over the final laid-out ticks, NOT
+  // the packing loop's groups: a cluster is a maximal run of consecutive
+  // ticks where each next tick begins within its predecessor's minimum
+  // click row (ticks[i + 1].top < ticks[i].top + MINIMAP_TICK_MIN_CLICKABLE_PX).
+  // Packed-but-clickable ticks stay separate runs; sub-4px-pitched ticks
+  // merge even when the packer kept every proportional top. ALL runs are
+  // listed (singletons included); `dense` marks any sub-clickable member.
+  const clusters: MinimapCluster[] = []
+  for (let k = 0; k < ticks.length; k++) {
+    const runStart = k
+    while (
+      k + 1 < ticks.length &&
+      ticks[k + 1].top < ticks[k].top + MINIMAP_TICK_MIN_CLICKABLE_PX
+    ) {
+      k++
+    }
+    clusters.push({
+      top: ticks[runStart].top,
+      height: ticks[k].top + ticks[k].height - ticks[runStart].top,
+      startIndex: runStart,
+      endIndex: k,
+      dense: ticks.slice(runStart, k + 1).some((tick) => tick.height < MINIMAP_TICK_MIN_CLICKABLE_PX),
+    })
+  }
+
   const bandHeight = Math.min(
     input.railHeight,
     Math.max(MINIMAP_MIN_TICK_HEIGHT_PX, input.viewportHeight * scale),
@@ -134,5 +184,5 @@ export function computeMinimapLayout(input: {
   const fraction = maxScroll > 0 ? clampedScrollTop / maxScroll : 0
   const bandTop = fraction * (input.railHeight - bandHeight)
 
-  return { ticks, viewport: { top: bandTop, height: bandHeight }, railHeight: input.railHeight }
+  return { ticks, clusters, viewport: { top: bandTop, height: bandHeight }, railHeight: input.railHeight }
 }

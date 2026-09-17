@@ -1,9 +1,14 @@
-import { useCallback, useEffect, useMemo } from 'react'
+import { useCallback, useEffect, useMemo, useState, type MouseEvent } from 'react'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { ContextMenu } from '@/components/context-menu/ContextMenu'
+import type { MenuItem } from '@/components/context-menu/context-menu-types'
 import {
   computeMinimapLayout,
   MINIMAP_RAIL_BOTTOM_INSET_PX,
+  MINIMAP_TICK_MIN_CLICKABLE_PX,
+  type MinimapCluster,
   type MinimapLayout,
+  type MinimapTick,
 } from './shared/transcript-minimap-layout'
 import type { TranscriptMeasurement } from './shared/transcript-measurement'
 
@@ -93,7 +98,91 @@ export function FreshAgentTranscriptMinimap({
     el?.scrollIntoView?.({ block: 'start' })
   }, [scrollerRef])
 
-  if (!layout) return null
+  // The open cluster menu: which cluster's key opened it, its items, its
+  // position, the OPENER element (focus is restored to it on close — the
+  // ContextMenu primitive never does that itself), and — round 3 — the
+  // measurement identity it opened UNDER: every sweep mints a NEW
+  // TranscriptMeasurement object, so the hygiene effect below detects ANY
+  // re-measure while the menu is open (scroll, pane resize, streamed
+  // prompt) and closes the menu before its captured snapshot goes stale.
+  const [clusterMenu, setClusterMenu] = useState<{
+    key: string
+    items: MenuItem[]
+    position: { x: number; y: number }
+    opener: HTMLButtonElement
+    openedMeasurement: TranscriptMeasurement
+  } | null>(null)
+  // The dense-cluster hover preview: which member tick the pointer is over,
+  // scoped to its cluster so one cluster's focus-tooltip can never surface
+  // another cluster's member.
+  const [hoveredMember, setHoveredMember] = useState<{ clusterKey: string; tick: MinimapTick } | null>(null)
+
+  /** Rail-Y → member band: offset the pointer into the cluster button
+   *  (clientY − rect.top), add the run's rail top, and keep the LAST member
+   *  tick whose top is at or below that Y — the nearest band at or above the
+   *  pointer (a run's members sit at sub-4px pitch, so this is the band the
+   *  pointer is in; a Y above the run clamps to the first member, and a Y
+   *  past the run's end is already the last member by the same rule). */
+  const memberUnderPointer = (
+    event: MouseEvent<HTMLButtonElement>,
+    cluster: MinimapCluster,
+    memberTicks: MinimapTick[],
+  ): MinimapTick => {
+    const rect = event.currentTarget.getBoundingClientRect()
+    const railY = cluster.top + (event.clientY - rect.top)
+    let hit = memberTicks[0]
+    for (const member of memberTicks) {
+      if (member.top <= railY) hit = member
+    }
+    return hit
+  }
+
+  // UI-state hygiene, NOT measurement: when the rail hides (layout null)
+  // while the cluster menu is open, the menu unmounts — clear its state so
+  // a later rail restoration cannot resurrect a stale menu whose opener
+  // element is detached; the same applies to the stale hover selection (a
+  // restored rail + focus on a target would otherwise surface it). Round 3
+  // adds the stale-SNAPSHOT close: any re-measure while the menu is open —
+  // transcript scroll, pane resize, or a streamed prompt — replaces the
+  // measurement OBJECT; the menu's items/position/opener were captured at
+  // open, so it closes (standard popover behavior). Identity comparison,
+  // not deep equality: every sweep mints a fresh TranscriptMeasurement, so
+  // `!==` detects every re-measure. Scrolling the MENU's own portaled list
+  // never re-measures the transcript (the list lives in a document.body
+  // portal, outside the scroller — its wheel/scroll events never reach the
+  // transcript's onScroll), so list scrolling never dismisses the menu;
+  // only transcript-side geometry changes do. The plan imposes no "no
+  // passive effects" rule — the component has owned effects since Task 2
+  // (its two ResizeObserver subscriptions); this effect never sweeps, and
+  // the Global-Constraints synchronous-measurement rule is untouched.
+  useEffect(() => {
+    if (!layout) {
+      if (clusterMenu) setClusterMenu(null)
+      if (hoveredMember) setHoveredMember(null)
+      return
+    }
+    if (clusterMenu && measurement !== clusterMenu.openedMeasurement) {
+      setClusterMenu(null)
+    }
+  }, [layout, clusterMenu, hoveredMember, measurement])
+
+  // Render gate (the Task-2 line, one addition): `!measurement` is dead by
+  // construction — layout is null whenever measurement is, because layout
+  // derives from it — but it narrows `measurement` to non-null for the
+  // cluster-target onClick's `openedMeasurement: measurement` capture in
+  // (d), keeping the state type honest without a cast or a dead in-handler
+  // guard.
+  if (!layout || !measurement) return null
+
+  // Dense-singleton clusters are lone sub-4px ticks: their OWN buttons get
+  // the expanded-hit treatment (dense multi-member clusters get the
+  // open-list button below instead). Keyed by the member tick's landmark
+  // index (tick.index), which is unique across the rail.
+  const loneDenseTickIndexes = new Set(
+    layout.clusters
+      .filter((cluster) => cluster.dense && cluster.startIndex === cluster.endIndex)
+      .map((cluster) => layout.ticks[cluster.startIndex].index),
+  )
 
   return (
     <div
@@ -110,16 +199,37 @@ export function FreshAgentTranscriptMinimap({
       />
       {layout.ticks.map((tick) => {
         const firstLine = tick.label.split('\n')[0]
+        // LONE sub-4px tick (dense-singleton run member): it never joined a
+        // clickability run, so it has >= 4px pitch on both sides — expanding
+        // the button's hit height to the clickable floor can never overlap a
+        // neighbor (clamped to the rail bottom). The paint moves to an inner
+        // aria-hidden span at the tick's visual height; the button keeps its
+        // aria-label and jumps DIRECTLY on click (no menu — one tick, one
+        // unambiguous target).
+        const loneSubFloorTick = loneDenseTickIndexes.has(tick.index)
+        const hitHeight = loneSubFloorTick
+          ? Math.min(MINIMAP_TICK_MIN_CLICKABLE_PX, layout.railHeight - tick.top)
+          : tick.height
         return (
           <Tooltip key={tick.index}>
             <TooltipTrigger asChild>
               <button
                 type="button"
-                className="fresh-agent-minimap-tick pointer-events-auto absolute left-0 w-full rounded-sm bg-muted-foreground/40 transition-colors hover:bg-primary focus-visible:bg-primary"
-                style={{ top: tick.top, height: tick.height }}
+                className={loneSubFloorTick
+                  ? 'fresh-agent-minimap-tick pointer-events-auto absolute left-0 w-full rounded-sm transition-colors hover:bg-primary/15 focus-visible:bg-primary/15'
+                  : 'fresh-agent-minimap-tick pointer-events-auto absolute left-0 w-full rounded-sm bg-muted-foreground/40 transition-colors hover:bg-primary focus-visible:bg-primary'}
+                style={{ top: tick.top, height: hitHeight }}
                 aria-label={`Jump to prompt: ${truncatePrompt(firstLine, ARIA_LABEL_MAX_LENGTH)}`}
                 onClick={() => handleTickClick(tick.index)}
-              />
+              >
+                {loneSubFloorTick ? (
+                  <span
+                    aria-hidden="true"
+                    className="absolute inset-x-0 top-0 rounded-sm bg-muted-foreground/40"
+                    style={{ height: tick.height }}
+                  />
+                ) : null}
+              </button>
             </TooltipTrigger>
             <TooltipContent
               side={tick.top < layout.railHeight * 0.25 ? 'bottom' : 'top'}
@@ -131,6 +241,101 @@ export function FreshAgentTranscriptMinimap({
           </Tooltip>
         )
       })}
+      {layout.clusters
+        .filter((cluster) => cluster.dense && cluster.endIndex > cluster.startIndex)
+        .map((cluster) => {
+          const clusterKey = `cluster-${cluster.startIndex}`
+          const memberTicks = layout.ticks.slice(cluster.startIndex, cluster.endIndex + 1)
+          // The hovered member, when it belongs to THIS cluster (the
+          // clusterKey scoping keeps one cluster's focus-tooltip from ever
+          // surfacing another cluster's member).
+          const hoveredTick =
+            hoveredMember !== null && hoveredMember.clusterKey === clusterKey
+              ? hoveredMember.tick
+              : null
+          return (
+            <Tooltip key={clusterKey}>
+              <TooltipTrigger asChild>
+                <button
+                  type="button"
+                  className="pointer-events-auto absolute left-0 z-10 w-full rounded-sm bg-transparent transition-colors hover:bg-primary/15 focus-visible:bg-primary/15"
+                  style={{
+                    top: cluster.top,
+                    height: Math.min(
+                      Math.max(cluster.height, MINIMAP_TICK_MIN_CLICKABLE_PX),
+                      layout.railHeight - cluster.top,
+                    ),
+                  }}
+                  aria-haspopup="menu"
+                  aria-expanded={clusterMenu !== null && clusterMenu.key === clusterKey}
+                  aria-label={`Prompts ${cluster.startIndex + 1}-${cluster.endIndex + 1} — open list`}
+                  // The z-10 target wins pointer events over the member
+                  // ticks, so it HOSTS their hover previews: enter and move
+                  // both map the pointer's Y to a member band (enter too, so
+                  // a pointer entering without moving still previews the
+                  // band under it); leave clears the selection and the
+                  // tooltip primitive closes the shell.
+                  onMouseEnter={(event) => {
+                    setHoveredMember({ clusterKey, tick: memberUnderPointer(event, cluster, memberTicks) })
+                  }}
+                  onMouseMove={(event) => {
+                    setHoveredMember({ clusterKey, tick: memberUnderPointer(event, cluster, memberTicks) })
+                  }}
+                  onMouseLeave={() => setHoveredMember(null)}
+                  onClick={(event) => {
+                    // Button-rect positioning works for pointer AND keyboard
+                    // activation (a keyboard click event carries clientX/Y 0).
+                    const rect = event.currentTarget.getBoundingClientRect()
+                    setClusterMenu({
+                      key: clusterKey,
+                      items: memberTicks.map((tick) => ({
+                        type: 'item' as const,
+                        id: `cluster-prompt-${tick.index}`,
+                        label: truncatePrompt(tick.label.split('\n')[0], ARIA_LABEL_MAX_LENGTH),
+                        onSelect: () => handleTickClick(tick.index),
+                      })),
+                      position: { x: rect.left, y: rect.top },
+                      opener: event.currentTarget,
+                      // The measurement identity this menu opened under
+                      // (narrowed non-null by the render gate) — the
+                      // hygiene effect's staleness reference.
+                      openedMeasurement: measurement,
+                    })
+                  }}
+                />
+              </TooltipTrigger>
+              {hoveredTick !== null ? (
+                <TooltipContent
+                  side={cluster.top < layout.railHeight * 0.25 ? 'bottom' : 'top'}
+                  align="end"
+                  className="max-w-64 whitespace-pre-wrap break-words"
+                >
+                  {truncatePrompt(hoveredTick.label.split('\n')[0], TOOLTIP_MAX_LENGTH)}
+                </TooltipContent>
+              ) : null}
+            </Tooltip>
+          )
+        })}
+      {layout && clusterMenu ? (
+        <ContextMenu
+          open={clusterMenu !== null}
+          items={clusterMenu.items}
+          position={clusterMenu.position}
+          className="max-h-[60vh] overflow-y-auto"
+          scrollFocusedItemIntoView
+          onClose={() => {
+            // The primitive closes for selection, Escape, and Tab-out but
+            // never restores focus itself (ContextMenu.tsx:86-94, :122-128,
+            // :154-157 — all route through onClose, no external focus()) —
+            // land focus back on the opener, then clear the state. The
+            // isConnected guard (round 3): a streamed prompt can unmount
+            // the opener before this runs; focusing a detached node is a
+            // silent no-op that would strand focus on body.
+            if (clusterMenu.opener.isConnected) clusterMenu.opener.focus()
+            setClusterMenu(null)
+          }}
+        />
+      ) : null}
     </div>
   )
 }

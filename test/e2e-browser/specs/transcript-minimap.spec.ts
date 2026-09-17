@@ -7,6 +7,13 @@ function tallBody(tag: string): string {
   ).join('\n\n')
 }
 
+function veryTallBody(tag: string): string {
+  return `${tag}.\n\n` + Array.from(
+    { length: 240 },
+    (_, i) => `${tag} line ${i + 1}: the quick brown fox jumps over the lazy dog, and then it jumps again.`,
+  ).join('\n\n')
+}
+
 /** One 200-char unbreakable token: no spaces AND no line-break opportunities
  * (no hyphens, slashes, or punctuation — CSS creates break opportunities at
  * those even without overflow-wrap, which load-bearing validation proved
@@ -160,5 +167,101 @@ test.describe('Transcript minimap', () => {
     const fits = await scroller.evaluate((el: HTMLElement) => el.scrollHeight <= el.clientHeight)
     expect(fits).toBe(true)
     await expect(freshPane.getByRole('button', { name: /Jump to prompt:/ })).toHaveCount(0)
+  })
+
+  test('dense prompt clusters get one open-list target whose menu jumps to any prompt', async ({ freshellPage: _freshellPage, page, terminal }) => {
+    await terminal.waitForTerminal()
+    const sessionId = '63333000-0000-4333-8333-0000000aa103'
+    const turns: unknown[] = []
+    for (let i = 0; i < 4; i++) {
+      turns.push({
+        id: `turn-dense-a${i}`, turnId: `turn-dense-a${i}`, role: 'assistant', summary: `Body ${i}`,
+        items: [{ id: `item-dense-a${i}`, kind: 'text', text: veryTallBody(`Body${i}`) }],
+      })
+    }
+    // Round 3 scales the bunched seed from 12 to 40 prompts: at this
+    // density the whole bunch joins into ONE dense cluster whose 40-item
+    // menu genuinely overflows the bounded 60vh surface (a 12-item menu
+    // never overflows, so "every prompt is reachable in the bounded list"
+    // was unproven). Keep the prompts consecutive one-liners — tiny
+    // offsets, one bunched cluster, exactly as the 12-prompt seed did.
+    for (let i = 0; i < 40; i++) {
+      turns.push({
+        id: `turn-dense-u${i}`, turnId: `turn-dense-u${i}`, role: 'user', summary: `Dense prompt ${i + 1}`,
+        items: [{ id: `item-dense-u${i}`, kind: 'text', text: `Dense prompt ${i + 1}` }],
+      })
+    }
+    // Trailing tall assistant body (round 3): the FINAL bunched prompt must
+    // sit far above the pinned-to-bottom scroll position — without trailing
+    // content the last prompt lands inside the initial bottom viewport and
+    // jumping to it clamps to a no-op scroll, so the final-item jump below
+    // would prove nothing.
+    turns.push({
+      id: 'turn-dense-a-tail', turnId: 'turn-dense-a-tail', role: 'assistant', summary: 'Tail body',
+      items: [{ id: 'item-dense-a-tail', kind: 'text', text: veryTallBody('Tail') }],
+    })
+    await seedMinimapPane(page, sessionId, turns)
+
+    const freshPane = page.locator('[data-context="fresh-agent"]')
+    // The load pins to the bottom, and the trailing tail body now ENDS the
+    // content — the initially visible text is the tail body's last line,
+    // not the final bunched prompt (prompt 40 sits a full tall body above
+    // the bottom). Wait on the tail line; the tick-count assertion below
+    // proves the prompts rendered.
+    await expect(freshPane.getByText('Tail line 240', { exact: false })).toBeVisible({ timeout: 20_000 })
+    const scroller = freshPane.locator('[data-context="fresh-agent-transcript"]')
+    await expect(scroller).toBeVisible()
+
+    // Every prompt keeps its tick (one-tick-per-prompt contract).
+    const ticks = freshPane.getByRole('button', { name: /Jump to prompt:/ })
+    await expect(ticks).toHaveCount(40)
+
+    // Self-verifying density guard: the first prompt tick must be under the
+    // 4px clickable floor in THIS pane geometry — otherwise the cluster
+    // affordance is not in play and the test proves nothing. If this fails
+    // on cloud geometry, grow veryTallBody's paragraph count — do not
+    // delete the guard.
+    const firstTickHeight = await ticks.first().evaluate((el: HTMLElement) => el.getBoundingClientRect().height)
+    expect(firstTickHeight).toBeLessThan(4)
+
+    // One open-list target covers the bunched cluster — EXACTLY one: the
+    // whole 40-prompt bunch must join into a single dense run. Clicking it
+    // opens a menu listing every prompt in the run.
+    const clusterTargets = freshPane.getByRole('button', { name: /— open list/ })
+    await expect(clusterTargets).toHaveCount(1)
+    await clusterTargets.first().click()
+    const menu = page.getByRole('menu')
+    await expect(menu).toBeVisible()
+    const itemCount = await page.getByRole('menuitem').count()
+    expect(itemCount).toBe(40)
+
+    // The menu is BOUNDED and genuinely overflows in a real browser:
+    // max-h-[60vh] caps the list's box below its 40-item content.
+    const menuOverflows = await menu.evaluate((el: HTMLElement) => el.scrollHeight > el.clientHeight)
+    expect(menuOverflows).toBe(true)
+
+    // Selecting the FINAL menu item is the load-bearing choice: in an
+    // UNBOUNDED menu every item is trivially reachable (the list just runs
+    // past the viewport); only in THIS bounded menu does the last item sit
+    // below the fold — Playwright's click must scroll the menu's own list
+    // to reach it, exactly what a pointer user does by hand.
+    const before = await scroller.evaluate((el: HTMLElement) => el.scrollTop)
+    await page.getByRole('menuitem').last().click()
+    await expect(menu).toHaveCount(0)
+    // The transcript jumped to the final bunched prompt: scrollTop drops
+    // (the load starts pinned to the bottom; the trailing tail body keeps
+    // prompt 40 far above it) and the prompt lands at the scrollport top
+    // (block: 'start') — the same landing assertion as the tick-click jump
+    // in test 1.
+    await expect.poll(
+      async () => scroller.evaluate((el: HTMLElement) => el.scrollTop),
+      { timeout: 5_000 },
+    ).toBeLessThan(before)
+    const scrollerTop = await scroller.evaluate((el: HTMLElement) => el.getBoundingClientRect().top)
+    const targetTop = await freshPane.locator('article[data-turn-role="user"]').last()
+      .evaluate((el: HTMLElement) => el.getBoundingClientRect().top)
+    expect(Math.abs(targetTop - scrollerTop)).toBeLessThan(60)
+    // The ticks never went anywhere.
+    await expect(ticks).toHaveCount(40)
   })
 })

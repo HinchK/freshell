@@ -10,10 +10,22 @@ export type ContextMenuProps = {
   items: MenuItem[]
   position: { x: number; y: number }
   onClose: () => void
+  /** Extra classes merged onto the menu container div — e.g. a max-h +
+   *  overflow-y pair bounding a long list into a scrollable surface.
+   *  Merged through the div's existing cn(...) after the base classes. */
+  className?: string
+  /** Opt in to scrolling the keyboard-focused item into view inside the
+   *  menu's OWN scroll box — for bounded, scrollable menus. Default false
+   *  keeps the long-press provider's preventScroll dismissal-guard
+   *  semantics byte-identical (the focusItem comment at :39-47: the native
+   *  focus scroll reaches the provider's capture-phase scroll listener and
+   *  dismisses that menu; consumers that instantiate ContextMenu directly,
+   *  with no provider, are immune and can opt in). */
+  scrollFocusedItemIntoView?: boolean
 }
 
 export const ContextMenu = forwardRef<HTMLDivElement, ContextMenuProps>(function ContextMenu(
-  { open, items, position, onClose },
+  { open, items, position, onClose, className, scrollFocusedItemIntoView = false },
   ref
 ) {
   const innerRef = useRef<HTMLDivElement | null>(null)
@@ -45,7 +57,17 @@ export const ContextMenu = forwardRef<HTMLDivElement, ContextMenuProps>(function
     // post-open grace window absorbs the focus scroll; this option still
     // helps on desktop and iOS Safari 15.5+.
     itemRefs.current[index]?.focus({ preventScroll: true })
-  }, [])
+    // Opt-in supplement for BOUNDED menus (e.g. the minimap's 60vh cluster
+    // list): keep the keyboard-focused item visible inside the menu's own
+    // scroll box. Method-level ?. — jsdom has no scrollIntoView (the same
+    // guard the glom chip and handleTickClick use). Default OFF: the
+    // native item scroll would reach the long-press provider's
+    // capture-phase scroll listener and dismiss that menu (the comment
+    // above); direct instantiation (no provider) is immune.
+    if (scrollFocusedItemIntoView) {
+      itemRefs.current[index]?.scrollIntoView?.({ block: 'nearest' })
+    }
+  }, [scrollFocusedItemIntoView])
 
   useLayoutEffect(() => {
     if (!open) return
@@ -75,7 +97,8 @@ export const ContextMenu = forwardRef<HTMLDivElement, ContextMenuProps>(function
       aria-orientation="vertical"
       className={cn(
         'fixed min-w-[200px] rounded-md border border-border bg-card shadow-lg py-1 select-none',
-        OVERLAY_Z.menu
+        OVERLAY_Z.menu,
+        className,
       )}
       style={{
         left: pos.x,

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { FreshAgentTranscript } from '@/components/fresh-agent/FreshAgentTranscript'
 
 // Render markdown bodies synchronously — the same LazyMarkdown mock the
@@ -96,6 +96,58 @@ function setupScrollableTranscript(turns = TRANSCRIPT) {
   mockRect(scroller, 0)
   mockUserTurnRects(userTurns)
   // The minimap's synchronous scroll listener recomputes landmark geometry.
+  fireEvent.scroll(scroller)
+  return { ...utils, scroller, userTurns }
+}
+
+/** Dense-cluster geometry: scrollHeight 1000, clientHeight 248 -> railHeight
+ *  200, scale 0.2. `count` short user turns bunched at content offsets
+ *  500 + i*10 with 10px rects: proportional tops 100 + 2i at the 3px
+ *  density floor (max(min(3, 200/count), 10*0.2) = 3 for both counts this
+ *  suite uses — min(3, 200/4) and min(3, 200/30) are both 3 — under the
+ *  4px clickable floor), packed abutting at a 3px pitch. The clickability
+ *  pass joins every consecutive pair (nextTop < prevTop + 4) into ONE
+ *  dense multi-member run. Default count 4: tops 100/103/106/109, rail
+ *  span 100..112 (last bottom 109+3 minus first top 100). Count 30
+ *  (round 3, the bounded-menu fixture): packed tops 100..187 at 3px
+ *  pitch, ONE run spanning rail 100..190 whose menu lists 30 items. */
+function setupDenseClusterTranscript(count = 4) {
+  const turns = Array.from({ length: count }, (_, i) => ({
+    id: `du${i}`,
+    role: 'user' as const,
+    summary: `Dense prompt number ${i + 1}`,
+    items: [{ id: `di${i}`, kind: 'text' as const, text: `Dense prompt number ${i + 1}` }],
+  }))
+  const utils = render(<FreshAgentTranscript turns={turns} />)
+  const scroller = utils.container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+  mockScroll(scroller, 0, 1000, 248)
+  const userTurns = utils.container.querySelectorAll('[data-turn-role="user"]')
+  mockRect(scroller, 0)
+  userTurns.forEach((el, i) => mockRect(el, 500 + i * 10, 10))
+  fireEvent.scroll(scroller)
+  return { ...utils, scroller, userTurns }
+}
+
+/** Evenly-dense isolated-tick geometry (the lone sub-4px tick fixture):
+ *  scrollHeight 10000, clientHeight 248 -> railHeight 200, scale 0.02.
+ *  Fifty short user turns at content offsets i*200 with 150px rects:
+ *  proportional heights 150*0.02 = 3 (effectiveMin min(3, 200/50) = 3),
+ *  tops at exact 4px pitch (i*4). The clickability pass joins nothing
+ *  (4 < prevTop+4 is false) — 50 dense SINGLETON clusters: every tick is
+ *  a lone sub-4px tick, none collides into a multi-member run. */
+function setupEvenlyDenseTranscript() {
+  const turns = Array.from({ length: 50 }, (_, i) => ({
+    id: `eu${i}`,
+    role: 'user' as const,
+    summary: `Even dense prompt number ${i + 1}`,
+    items: [{ id: `ei${i}`, kind: 'text' as const, text: `Even dense prompt number ${i + 1}` }],
+  }))
+  const utils = render(<FreshAgentTranscript turns={turns} />)
+  const scroller = utils.container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+  mockScroll(scroller, 0, 10000, 248)
+  const userTurns = utils.container.querySelectorAll('[data-turn-role="user"]')
+  mockRect(scroller, 0)
+  userTurns.forEach((el, i) => mockRect(el, i * 200, 150))
   fireEvent.scroll(scroller)
   return { ...utils, scroller, userTurns }
 }
@@ -399,5 +451,305 @@ describe('FreshAgentTranscript minimap rail', () => {
 
     sweepQuery.mockRestore()
     scrollerRect.mockRestore()
+  })
+
+  it('renders one open-list target over a dense cluster; every per-prompt tick stays in the DOM', () => {
+    setupDenseClusterTranscript()
+
+    // The one-tick-per-prompt contract: all four tick buttons remain, fully
+    // keyboard/screen-reader accessible as today.
+    const ticks = screen.getAllByRole('button', { name: /Jump to prompt:/ })
+    expect(ticks).toHaveLength(4)
+    // The dense cluster gains exactly one hit-target button over its span.
+    const clusterTarget = screen.getByRole('button', { name: 'Prompts 1-4 — open list' })
+    expect(topOf(clusterTarget)).toBeCloseTo(100, 5)
+    expect(heightOf(clusterTarget)).toBeCloseTo(12, 5)
+    expect(clusterTarget).toHaveAttribute('aria-haspopup', 'menu')
+  })
+
+  it('keeps normal-density clusters on per-tick behavior — no open-list targets', () => {
+    setupScrollableTranscript()
+    expect(screen.queryByRole('button', { name: /— open list/ })).not.toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: /Jump to prompt:/ })).toHaveLength(3)
+  })
+
+  it('opens a ContextMenu listing every prompt in the dense cluster; selecting one jumps to it', () => {
+    const { userTurns } = setupDenseClusterTranscript()
+    const scrollIntoViewSpy = vi.fn()
+    userTurns[2].scrollIntoView = scrollIntoViewSpy
+
+    fireEvent.click(screen.getByRole('button', { name: 'Prompts 1-4 — open list' }))
+
+    const menu = screen.getByRole('menu')
+    const items = within(menu).getAllByRole('menuitem')
+    expect(items).toHaveLength(4)
+    expect(items[0]).toHaveTextContent('Dense prompt number 1')
+    expect(items[3]).toHaveTextContent('Dense prompt number 4')
+
+    fireEvent.click(items[2])
+    expect(scrollIntoViewSpy).toHaveBeenCalledWith({ block: 'start' })
+    // ContextMenu closes itself after a selection.
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+  })
+
+  it('gives a lone sub-4px tick a 4px hit target with a 3px painted span and a direct jump (no menu)', () => {
+    const { userTurns } = setupEvenlyDenseTranscript()
+    const firstTick = screen.getByRole('button', { name: 'Jump to prompt: Even dense prompt number 1' })
+
+    // The button's hit height expands to the 4px clickable floor...
+    expect(heightOf(firstTick)).toBeCloseTo(4, 5)
+    // ...while the painted line is an inner aria-hidden span at the tick's
+    // visual 3px height (same bg classes).
+    const painted = firstTick.querySelector('span')
+    expect(painted).not.toBeNull()
+    expect(painted).toHaveAttribute('aria-hidden', 'true')
+    expect(heightOf(painted as HTMLElement)).toBeCloseTo(3, 5)
+
+    // No menu anywhere — the target is unambiguous; clicking jumps directly.
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+    const scrollIntoViewSpy = vi.fn()
+    userTurns[0].scrollIntoView = scrollIntoViewSpy
+    fireEvent.click(firstTick)
+    expect(scrollIntoViewSpy).toHaveBeenCalledWith({ block: 'start' })
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+  })
+
+  it('previews the member prompt under the pointer from the dense cluster target', () => {
+    setupDenseClusterTranscript()
+    const clusterTarget = screen.getByRole('button', { name: 'Prompts 1-4 — open list' })
+    // The target's mocked rect mirrors its rail span (top 100); a pointer Y
+    // over member 1's band (rail 103-106 -> clientY 104) previews member 1
+    // ('Dense prompt number 2' - member indexes are 0-based).
+    mockRect(clusterTarget, 100)
+    fireEvent.mouseEnter(clusterTarget, { clientY: 104 })
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Dense prompt number 2')
+  })
+
+  it('updates the cluster preview when the pointer moves to another member band', () => {
+    setupDenseClusterTranscript()
+    const clusterTarget = screen.getByRole('button', { name: 'Prompts 1-4 — open list' })
+    mockRect(clusterTarget, 100)
+    fireEvent.mouseEnter(clusterTarget, { clientY: 101 }) // member 0 band (100-103)
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Dense prompt number 1')
+    fireEvent.mouseMove(clusterTarget, { clientY: 107 }) // member 2 band (106-109)
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Dense prompt number 3')
+  })
+
+  it('clears the cluster hover preview on mouse leave', () => {
+    setupDenseClusterTranscript()
+    const clusterTarget = screen.getByRole('button', { name: 'Prompts 1-4 — open list' })
+    mockRect(clusterTarget, 100)
+    fireEvent.mouseEnter(clusterTarget, { clientY: 104 })
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Dense prompt number 2')
+    fireEvent.mouseLeave(clusterTarget)
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument()
+  })
+
+  // Cluster-opener a11y/focus: the opener is a real <button> in DOM order,
+  // so keyboard users reach it natively and Enter/Space drive the same click
+  // path as the pointer. The menu primitive moves focus into the menu and
+  // never restores it itself (ContextMenu.tsx), so the minimap must. (The
+  // primitive's initial rAF item-focus does not run synchronously; these
+  // assertions run inside fireEvent's act() - Global Constraints note.)
+  it('expands the cluster opener while its menu is open and restores aria-expanded on selection', () => {
+    setupDenseClusterTranscript()
+    const clusterTarget = screen.getByRole('button', { name: 'Prompts 1-4 — open list' })
+    expect(clusterTarget).toHaveAttribute('aria-expanded', 'false')
+
+    fireEvent.click(clusterTarget)
+    expect(clusterTarget).toHaveAttribute('aria-expanded', 'true')
+    const menu = screen.getByRole('menu')
+
+    // Selection closes the menu and flips the opener back to collapsed.
+    fireEvent.click(within(menu).getAllByRole('menuitem')[0])
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+    expect(clusterTarget).toHaveAttribute('aria-expanded', 'false')
+  })
+
+  it('restores focus to the cluster opener after selecting a menu item', () => {
+    const { userTurns } = setupDenseClusterTranscript()
+    const scrollIntoViewSpy = vi.fn()
+    userTurns[3].scrollIntoView = scrollIntoViewSpy
+    const clusterTarget = screen.getByRole('button', { name: 'Prompts 1-4 — open list' })
+
+    fireEvent.click(clusterTarget)
+    const menu = screen.getByRole('menu')
+    fireEvent.click(within(menu).getAllByRole('menuitem')[3])
+    // The selection still jumps...
+    expect(scrollIntoViewSpy).toHaveBeenCalledWith({ block: 'start' })
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+    // ...and focus lands back on the opener, not stranded on body.
+    expect(document.activeElement).toBe(clusterTarget)
+  })
+
+  it('closes the cluster menu on Escape and restores focus to the opener', () => {
+    setupDenseClusterTranscript()
+    const clusterTarget = screen.getByRole('button', { name: 'Prompts 1-4 — open list' })
+    fireEvent.click(clusterTarget)
+    const menu = screen.getByRole('menu')
+    fireEvent.keyDown(menu, { key: 'Escape' })
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+    expect(document.activeElement).toBe(clusterTarget)
+  })
+
+  it('clamps a lone sub-4px tick hit box at the rail bottom (railHeight - top, not 4)', () => {
+    // rail 100 (clientHeight 148), scrollHeight 10000 -> scale 0.01;
+    // effectiveMin min(3, 100/4) = 3 floors every tick at 3px. Landmarks at
+    // content offsets 0/4000/8000/9800 (200px article rects): proportional
+    // tops 0/40/80/98, and the packing loop's rail-bottom clamp lifts the
+    // last tick to top 97 (railHeight - height); pitches 40/40/17 -> every
+    // run is a singleton and every tick is dense (3 < 4): four LONE
+    // sub-4px ticks. The last tick's 4px floor would overhang the rail
+    // (97 + 4 > 100): its hit box clamps to railHeight - top = 3 exactly,
+    // its paint span stays 3px, and its predecessor keeps the full 4px box.
+    const turns = Array.from({ length: 4 }, (_, i) => ({
+      id: `bu${i}`,
+      role: 'user' as const,
+      summary: `Bottom prompt number ${i + 1}`,
+      items: [{ id: `bi${i}`, kind: 'text' as const, text: `Bottom prompt number ${i + 1}` }],
+    }))
+    const utils = render(<FreshAgentTranscript turns={turns} />)
+    const scroller = utils.container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+    mockScroll(scroller, 0, 10000, 148)
+    const userTurns = utils.container.querySelectorAll('[data-turn-role="user"]')
+    mockRect(scroller, 0)
+    userTurns.forEach((el, i) => mockRect(el, [0, 4000, 8000, 9800][i], 200))
+    fireEvent.scroll(scroller)
+
+    // All-lone geometry: no multi-member run anywhere.
+    expect(screen.getAllByRole('button', { name: /Jump to prompt:/ })).toHaveLength(4)
+    expect(screen.queryByRole('button', { name: /— open list/ })).not.toBeInTheDocument()
+    const last = screen.getByRole('button', { name: 'Jump to prompt: Bottom prompt number 4' })
+    expect(topOf(last)).toBeCloseTo(97, 5)
+    // min(4, 100 - 97): the rail-bottom clamp, pinned exactly.
+    expect(heightOf(last)).toBeCloseTo(3, 5)
+    const lastPaint = last.querySelector('span')
+    expect(lastPaint).not.toBeNull()
+    expect(lastPaint).toHaveAttribute('aria-hidden', 'true')
+    expect(heightOf(lastPaint as HTMLElement)).toBeCloseTo(3, 5)
+    // The predecessor's own hit box is untouched by the edge: full 4px.
+    const predecessor = screen.getByRole('button', { name: 'Jump to prompt: Bottom prompt number 3' })
+    expect(heightOf(predecessor)).toBeCloseTo(4, 5)
+    expect(heightOf(predecessor.querySelector('span') as HTMLElement)).toBeCloseTo(3, 5)
+  })
+
+  it('clamps a dense run open-list target at the rail bottom (span ends at the rail edge)', () => {
+    // rail 100 (clientHeight 148), scrollHeight 10000 -> scale 0.01. Four
+    // landmarks: one at offset 0, three bunched at 9700/9800/9900 (200px
+    // rects -> 3px ticks after the effectiveMin floor). The bunched three
+    // collide into ONE packed group anchored at the rail-bottom clamp
+    // (railHeight - height = 97); the group's packed 9px overflows the 3px
+    // span, so the packer scales it to fill 97..100 exactly - members at
+    // tops 97/98/99 with 1px heights, ONE dense multi-member run whose
+    // span (3px) ends AT the rail bottom. The target's 4px floor would
+    // overhang (97 + 4 > 100): min(max(3, 4), 100 - 97) clamps it to 3
+    // exactly.
+    const turns = Array.from({ length: 4 }, (_, i) => ({
+      id: `cu${i}`,
+      role: 'user' as const,
+      summary: `Clamp prompt number ${i + 1}`,
+      items: [{ id: `ci${i}`, kind: 'text' as const, text: `Clamp prompt number ${i + 1}` }],
+    }))
+    const utils = render(<FreshAgentTranscript turns={turns} />)
+    const scroller = utils.container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+    mockScroll(scroller, 0, 10000, 148)
+    const userTurns = utils.container.querySelectorAll('[data-turn-role="user"]')
+    mockRect(scroller, 0)
+    userTurns.forEach((el, i) => mockRect(el, [0, 9700, 9800, 9900][i], 200))
+    fireEvent.scroll(scroller)
+
+    const clusterTarget = screen.getByRole('button', { name: 'Prompts 2-4 — open list' })
+    expect(topOf(clusterTarget)).toBeCloseTo(97, 5)
+    // min(max(3, 4), 100 - 97): the rail-bottom clamp, pinned exactly.
+    expect(heightOf(clusterTarget)).toBeCloseTo(3, 5)
+  })
+
+  it('clears the open cluster menu when geometry hides the rail, so it cannot reappear stale', () => {
+    const { scroller } = setupDenseClusterTranscript()
+    fireEvent.click(screen.getByRole('button', { name: 'Prompts 1-4 — open list' }))
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+
+    // Collapse geometry the way the fits-viewport test does (scrollHeight
+    // <= clientHeight): the shared sweep yields a null layout and the rail -
+    // menu included - unmounts. Without the hygiene effect the menu STATE
+    // would survive this.
+    mockScroll(scroller, 0, 200, CLIENT_HEIGHT)
+    mockRect(scroller, 0)
+    fireEvent.scroll(scroller)
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /— open list/ })).not.toBeInTheDocument()
+
+    // Restore scrollable geometry: the rail and its cluster target return,
+    // but the STALE menu must not reappear - the hygiene effect cleared it
+    // (and its opener element, now detached, with it).
+    mockScroll(scroller, 0, 1000, CLIENT_HEIGHT)
+    fireEvent.scroll(scroller)
+    expect(screen.getByRole('button', { name: 'Prompts 1-4 — open list' })).toBeInTheDocument()
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+  })
+
+  // Round-3 Finding 1 (bounded menu): a dense run can list dozens of
+  // prompts; the menu must be a BOUNDED, scrollable surface so it can never
+  // overflow the viewport. jsdom cannot compute overflow — these class pins
+  // plus the e2e's scrollHeight > clientHeight assertion carry the real
+  // bounding behavior.
+  it('bounds the cluster menu at 60vh and lists every prompt of a 30-member dense run', () => {
+    setupDenseClusterTranscript(30)
+    fireEvent.click(screen.getByRole('button', { name: 'Prompts 1-30 — open list' }))
+
+    const menu = screen.getByRole('menu')
+    expect(within(menu).getAllByRole('menuitem')).toHaveLength(30)
+    // Bounded surface: the instantiation passes max-h + overflow classes
+    // through the primitive's new className prop (merged by its cn(...)).
+    expect(menu).toHaveClass('max-h-[60vh]')
+    expect(menu).toHaveClass('overflow-y-auto')
+  })
+
+  it('keeps the keyboard-focused menu item visible in the bounded list (scrollFocusedItemIntoView)', () => {
+    setupDenseClusterTranscript(30)
+    fireEvent.click(screen.getByRole('button', { name: 'Prompts 1-30 — open list' }))
+    const menu = screen.getByRole('menu')
+    const items = within(menu).getAllByRole('menuitem')
+    // jsdom 25 has NO Element.prototype.scrollIntoView (and vi.spyOn refuses
+    // absent properties), so install the mock the suite's standard way:
+    // per-element vi.fn() assignment (Global Constraints).
+    const scrollIntoViewSpy = vi.fn()
+    items.forEach((item) => { item.scrollIntoView = scrollIntoViewSpy })
+    // Arrow to the last item: every step moves focus; with the flag on,
+    // focusItem also scrolls the focused item into view inside the
+    // bounded list (the primitive's default stays preventScroll — the
+    // focusItem comment).
+    for (let i = 0; i < items.length - 1; i++) {
+      fireEvent.keyDown(menu, { key: 'ArrowDown' })
+    }
+    expect(scrollIntoViewSpy).toHaveBeenCalledWith({ block: 'nearest' })
+    expect(document.activeElement).toBe(items[items.length - 1])
+  })
+
+  // Round-3 Finding 2 (stale snapshot): the open menu's items/position were
+  // captured at open; ANY re-measure must close it — a menu that outlives
+  // its geometry shows stale prompts and a stale position. This is the
+  // geometry-change path, NOT the rail-hidden one: the layout stays
+  // non-null and the rail keeps rendering throughout.
+  it('closes the open cluster menu when a re-measure replaces the transcript geometry', () => {
+    const { scroller } = setupDenseClusterTranscript()
+    fireEvent.click(screen.getByRole('button', { name: 'Prompts 1-4 — open list' }))
+    expect(screen.getByRole('menu')).toBeInTheDocument()
+
+    // A streamed prompt grows the transcript: same article rects, new
+    // scrollHeight — a NEW measurement object while the layout stays
+    // non-null.
+    mockScroll(scroller, 0, 1200, CLIENT_HEIGHT)
+    fireEvent.scroll(scroller)
+    // Assert immediately after the change event (not just after restore):
+    // the menu closed on the re-measure itself, while the rail and its
+    // cluster target stayed mounted.
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Prompts 1-4 — open list' })).toBeInTheDocument()
+
+    // Restoring the geometry does NOT resurrect the closed menu.
+    mockScroll(scroller, 0, 1000, CLIENT_HEIGHT)
+    fireEvent.scroll(scroller)
+    expect(screen.queryByRole('menu')).not.toBeInTheDocument()
   })
 })
