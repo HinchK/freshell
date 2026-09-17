@@ -163,14 +163,46 @@ pub(crate) async fn coordinator_begin_identity(
                     if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
                         && owner.terminal_id.as_deref() == Some(terminal_id) =>
                 {
-                    // b8ke ext r14 F1: the re-adopt proceeds under the
-                    // ext-r12 guard (held authority across the caller's
-                    // writes).
-                    match ownership.begin_attach_guard(
+                    // b8ke ext r14 F1 → ext r39 F1: the re-adopt proceeds
+                    // under HELD authority across the caller's writes —
+                    // and the arm is the ATOMIC ADOPT (the r38 primitive):
+                    // the snapshot's observed pair plus the EXPECTED
+                    // owner (this kind AND this terminal id) validated in
+                    // ONE coordinator-lock decision. Pre-r39 the arm was
+                    // the generic `begin_attach_guard` with NO fence and
+                    // NO expected identity: a completed cross-kind handoff
+                    // between the snapshot and the arm made the guard arm
+                    // on the NEW Fresh Agent owner (the generic guard
+                    // accepts any Live owner), and the path applied
+                    // terminal identity changes and broadcast a terminal
+                    // owner over the Fresh Agent's session. The adopt
+                    // closes the interval: any advance or a foreign
+                    // owner refuses typed BEFORE anything mutates.
+                    //
+                    // Test seam (ext r39 F1): park with the precheck
+                    // observation taken but the adopt NOT yet armed — the
+                    // deterministic-race tests commit a cross-kind handoff
+                    // in THIS interval (the one the post-arm pauses can
+                    // never reach). No-op in production.
+                    if let Some(pause) = state.registry.identity_readopt_pause_hook() {
+                        pause(provider, session_id).await;
+                    }
+                    let expected_terminal = freshell_ownership::OwnerIdentity {
+                        kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                        terminal_id: Some(terminal_id.to_string()),
+                        live_session_key: None,
+                        pid: None,
+                        ownership_id: None,
+                    };
+                    match ownership.begin_adopt_guard(
                         provider,
                         session_id,
                         &format!("{operation_id}-readopt"),
-                        None,
+                        &expected_terminal,
+                        freshell_ownership::ObservedFence {
+                            epoch: snapshot.epoch,
+                            generation: snapshot.generation,
+                        },
                         initiator,
                     ) {
                         freshell_ownership::AttachGuardOutcome::Armed(guard) => {
@@ -180,8 +212,9 @@ pub(crate) async fn coordinator_begin_identity(
                             tracing::warn!(target: "freshell_ws::identity_ownership",
                                 provider = %provider, session_id = %session_id,
                                 terminal_id = %terminal_id, state = ?state,
-                                "identity_association_refused: the re-adopt's key entered \
-                                 a transition — the adoption mutates nothing"
+                                "identity_association_refused: the re-adopt's atomic adopt \
+                                 refused to arm (ownership advanced or a foreign owner \
+                                 holds the key) — the adoption mutates nothing"
                             );
                             return None;
                         }
@@ -189,8 +222,9 @@ pub(crate) async fn coordinator_begin_identity(
                             tracing::warn!(target: "freshell_ws::identity_ownership",
                                 provider = %provider, session_id = %session_id,
                                 terminal_id = %terminal_id,
-                                "identity_association_refused: the re-adopt's fence is \
-                                 stale — the adoption mutates nothing"
+                                "identity_association_refused: the re-adopt's atomic adopt \
+                                 refused to arm (the observed pair is stale or names a \
+                                 different epoch) — the adoption mutates nothing"
                             );
                             return None;
                         }
@@ -310,17 +344,38 @@ pub(crate) async fn coordinator_commit_identity(
             // terminal — nothing to commit; the guard closes with the
             // scope and the frame refreshes the authoritative owner.
             drop(guard);
-            let snapshot = ownership.observe(provider, session_id);
-            broadcast_owner_frame(
+            // b8ke ext r39 F1: the broadcast carries the coordinator's
+            // POST-COMMIT truth — never an unconditional terminal owner.
+            // The guard's drop opens the key before this observe, so a
+            // completed handoff in that interval can have moved the
+            // owner: broadcasting "terminal" over a Fresh Agent (or
+            // mid-transition) record would converge clients and durable
+            // recovery state on the reaped terminal. The conditional
+            // frame only fires when the coordinator still names THIS
+            // terminal; otherwise this is the honest stale shape (the
+            // identity homes hold a binding the coordinator does not
+            // name — the stale-teardown discipline owns it).
+            if broadcast_owner_frame_if_authoritative(
                 state,
+                ownership,
                 provider,
                 session_id,
                 terminal_id,
                 &operation_id,
-                snapshot.generation,
                 "handoff-committed",
-            );
-            true
+            ) {
+                true
+            } else {
+                tracing::warn!(target: "freshell_ws::identity_ownership",
+                    provider = %provider, session_id = %session_id,
+                    terminal_id = %terminal_id,
+                    "identity_association_commit_stale: the re-adopt's owner frame \
+                     suppressed — the coordinator no longer names this terminal \
+                     (the adoption's homes hold a binding the coordinator does not \
+                     name; the stale-teardown discipline owns the bound terminal)"
+                );
+                false
+            }
         }
         IdentityAuthority::RebindAdopt {
             adopt_guard,
@@ -374,16 +429,33 @@ pub(crate) async fn coordinator_commit_identity(
                              stale until the next successful stamp)"
                         );
                     }
-                    broadcast_owner_frame(
+                    // b8ke ext r39 F1: the broadcast carries the
+                    // POST-COMMIT truth — the commit and this observe are
+                    // two coordinator reads, so a handoff completing in
+                    // between must NOT be overwritten with an
+                    // unconditional terminal frame.
+                    if broadcast_owner_frame_if_authoritative(
                         state,
+                        ownership,
                         provider,
                         session_id,
                         terminal_id,
                         &operation_id,
-                        snapshot.generation,
                         "handoff-committed",
-                    );
-                    true
+                    ) {
+                        true
+                    } else {
+                        tracing::warn!(target: "freshell_ws::identity_ownership",
+                            provider = %provider, session_id = %session_id,
+                            terminal_id = %terminal_id,
+                            "identity_association_commit_stale: the committed owner \
+                             frame suppressed — the coordinator moved on between \
+                             the commit and the broadcast (the adoption's homes hold \
+                             a binding the coordinator does not name; the \
+                             stale-teardown discipline owns the bound terminal)"
+                        );
+                        false
+                    }
                 }
                 stale => {
                     tracing::error!(target: "invariant",
@@ -684,6 +756,52 @@ pub(crate) fn broadcast_vacant_frame(
 
 /// The owner frame broadcast (the `broadcast_owner` shape the handoff
 /// runner uses, adapted to the WS state's broadcast bus).
+/// b8ke ext r39 F1: the POST-COMMIT truth broadcast — the terminal owner
+/// frame fires ONLY when the coordinator's current record still names
+/// THIS terminal as the live owner. An unconditional terminal frame over
+/// a moved-on record (a completed cross-kind handoff in the
+/// commit-to-broadcast interval) would converge clients and durable
+/// recovery state on the reaped terminal; the caller logs the suppressed
+/// frame and takes the stale path (the identity homes hold a binding the
+/// coordinator does not name). Returns `true` when the frame broadcast.
+pub(crate) fn broadcast_owner_frame_if_authoritative(
+    state: &WsState,
+    ownership: &std::sync::Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+    provider: &str,
+    session_id: &str,
+    terminal_id: &str,
+    operation_id: &str,
+    transition: &str,
+) -> bool {
+    let snapshot = ownership.observe(provider, session_id);
+    match snapshot.state {
+        freshell_ownership::OwnershipState::Live { ref owner, .. }
+            if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+                && owner.terminal_id.as_deref() == Some(terminal_id) =>
+        {
+            broadcast_owner_frame(
+                state,
+                provider,
+                session_id,
+                terminal_id,
+                operation_id,
+                snapshot.generation,
+                transition,
+            );
+            true
+        }
+        other => {
+            tracing::warn!(target: "freshell_ws::identity_ownership",
+                provider = %provider, session_id = %session_id,
+                terminal_id = %terminal_id, state = ?other,
+                "identity_owner_frame_suppressed: the coordinator does not name \
+                 this terminal as the live owner — no terminal frame broadcast"
+            );
+            false
+        }
+    }
+}
+
 fn broadcast_owner_frame(
     state: &WsState,
     provider: &str,
@@ -731,5 +849,282 @@ pub(crate) fn holds_live_terminal_owner(
                 && owner.terminal_id.as_deref() == Some(terminal_id)
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// The r39 race-test fixture: a full `WsState` with a WIRED ownership
+    /// coordinator (the fields mirror `opencode_association`'s
+    /// `state_with_locator`; no locator — the tests drive the coordinator
+    /// identity phase directly, the entry all four identity lanes share).
+    fn race_state(
+        ownership: Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+    ) -> (WsState, tokio::sync::broadcast::Receiver<String>) {
+        let auth_token = Arc::new("s3cr3t-token-abcdef".to_string());
+        let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(16).0);
+        let rx = broadcast_tx.subscribe();
+        let state = WsState {
+            pane_ledger: std::sync::Arc::new(crate::pane_ledger::PaneLedger::disabled()),
+            layout: Default::default(),
+            identity: crate::identity::TerminalIdentityRegistry::new(),
+            terminal_meta: Default::default(),
+            auth_token: Arc::clone(&auth_token),
+            server_instance_id: Arc::new("srv-r39".to_string()),
+            boot_id: Arc::new("boot-r39".to_string()),
+            settings: Arc::new(crate::test_settings()),
+            handshake_settings: Arc::new(tokio::sync::RwLock::new(crate::test_settings())),
+            broadcast_tx: Arc::clone(&broadcast_tx),
+            auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+            auto_resume_cancels: Default::default(),
+            fresh_codex: freshell_freshagent::FreshCodexState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+                serde_json::json!({ "freshAgent": { "enabled": false } }),
+            ),
+            fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+            fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+                freshell_freshagent::FreshAgentState::new(auth_token, broadcast_tx),
+            ),
+            registry: freshell_terminal::TerminalRegistry::new()
+                .with_ownership(Arc::clone(&ownership)),
+            shutdown: Arc::new(tokio::sync::Notify::new()),
+            tabs: crate::tabs::TabsRegistry::new(),
+            screenshots: crate::screenshot::ScreenshotBroker::new(state_broadcast_tx()),
+            subagent_interest: Default::default(),
+            host_stats: Default::default(),
+            terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            cli_commands: Arc::new(Vec::new()),
+            ping_interval_ms: 30_000,
+            hello_timeout_ms: 5_000,
+            allowed_origins: Arc::new(crate::origin::default_allowed_origins()),
+            ws_max_payload_bytes: 16 * 1024 * 1024,
+            term09: crate::backpressure::Term09Config::default(),
+            create_protect: crate::create_limit::CreateProtectConfig::default(),
+            spawn_gate: Arc::new(crate::spawn_gate::SpawnGate::new(4, 64)),
+            shutdown_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            create_dedupe: Arc::new(crate::create_dedupe::CreateDedupe::default()),
+            config_fallback: None,
+            opencode_locator: None,
+            codex_locator: None,
+            activity: None,
+            session_existence: Arc::new(crate::existence::NoIndexProbe::default()),
+            reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+            fresh_agent_respawn_counts: Default::default(),
+            ownership: Some(ownership),
+        };
+        (state, rx)
+    }
+
+    fn state_broadcast_tx() -> Arc<tokio::sync::broadcast::Sender<String>> {
+        Arc::new(tokio::sync::broadcast::channel::<String>(16).0)
+    }
+
+    const SID: &str = "ses_r39race00000000000000000";
+    const TID: &str = "t-r39-race";
+
+    fn seed_live_terminal_owner(ownership: &Arc<freshell_ownership::RuntimeOwnershipRegistry>) {
+        let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
+            "codex",
+            SID,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-r39-fixture-start",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("fixture start grants")
+        };
+        assert_eq!(
+            ownership.commit_live(
+                "codex",
+                SID,
+                "op-r39-fixture-start",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some(TID.to_string()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+    }
+
+    fn commit_cross_kind_handoff(
+        ownership: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        op: &str,
+    ) {
+        let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_handoff(
+            "codex",
+            SID,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            op,
+            None,
+            "test",
+            2_000,
+        ) else {
+            panic!("the racing cross-kind handoff must grant against the pre-arm key")
+        };
+        assert_eq!(
+            ownership.commit_live(
+                "codex",
+                SID,
+                op,
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("k-r39-race".to_string()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+    }
+
+    /// b8ke ext r39 F1: the re-adopt's PRE-ARM interval — the claim
+    /// answered AdoptLive, the precheck snapshot observed THIS terminal's
+    /// live record, and THEN a completed cross-kind handoff lands before
+    /// the guard arms (the deterministic park seam — the interval the
+    /// r12-era post-arm pauses never cover). The ATOMIC ADOPT validates
+    /// the snapshot's observed pair + the expected owner in ONE
+    /// coordinator decision: the raced association answers the typed
+    /// refusal (no authority — the caller's identity homes mutate
+    /// nothing, no terminal owner frame broadcasts over the Fresh
+    /// Agent's session). Pre-r39 the generic guard armed on the NEW
+    /// Fresh Agent owner (it accepts ANY Live owner) — the red/green
+    /// proves the interval.
+    #[tokio::test]
+    async fn a_cross_kind_handoff_in_the_readopt_pre_arm_interval_refuses_typed() {
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let (state, mut rx) = race_state(ownership.clone());
+        seed_live_terminal_owner(&ownership);
+
+        // The park seam: between the precheck observation and the adopt.
+        let parked = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        {
+            let parked = Arc::clone(&parked);
+            let release = Arc::clone(&release);
+            state
+                .registry
+                .set_identity_readopt_pause_for_tests(Arc::new(
+                    move |_provider: &str, _session_id: &str| {
+                        let parked = Arc::clone(&parked);
+                        let release = Arc::clone(&release);
+                        Box::pin(async move {
+                            parked.notify_one();
+                            let _ = release.notified().await;
+                        })
+                    },
+                ));
+        }
+
+        // The claim phase — parks INSIDE the re-adopt arm's interval.
+        let st = state.clone();
+        let task =
+            tokio::spawn(
+                async move { coordinator_begin_identity(&st, "codex", TID, SID, None).await },
+            );
+        parked.notified().await;
+
+        // THE RACE: a completed cross-kind handoff in the snapshot-to-arm
+        // interval (no guard window is open — the adopt has not armed).
+        commit_cross_kind_handoff(&ownership, "op-r39-racing-handoff");
+
+        release.notify_one();
+        let authority = task.await.expect("the claim task must join");
+
+        // GREEN: the atomic adopt refused typed — NO authority, so the
+        // caller's four identity lanes mutate nothing and never reach the
+        // commit phase.
+        assert!(
+            authority.is_none(),
+            "the raced re-adopt must answer the typed refusal (no authority)"
+        );
+        // The Fresh Agent owner stays authoritative at the bumped
+        // generation — the adopt never armed over it.
+        assert!(matches!(
+            ownership.observe("codex", SID).state,
+            freshell_ownership::OwnershipState::Live { ref owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ));
+        // No terminal owner frame broadcast over the Fresh Agent's
+        // session (the claim phase alone broadcasts nothing).
+        match rx.try_recv() {
+            Ok(frame) => panic!("a refused re-adopt must broadcast nothing: {frame}"),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+        }
+        state.registry.clear_identity_readopt_pause_for_tests();
+    }
+
+    /// b8ke ext r39 F1: the commit-phase broadcast carries the
+    /// coordinator's POST-COMMIT truth — the re-adopt commit drops its
+    /// guard and then observes, so the broadcast decision is
+    /// `broadcast_owner_frame_if_authoritative`'s contract: a record
+    /// still naming THIS terminal broadcasts the terminal owner frame; a
+    /// moved-on record (a completed cross-kind handoff in the
+    /// drop-to-observe interval) suppresses the frame — never
+    /// "terminal" broadcast over the Fresh Agent's session — and the
+    /// caller takes the honest stale shape. Pre-r39 the commit
+    /// broadcast the terminal owner unconditionally.
+    #[tokio::test]
+    async fn a_moved_on_readopt_commit_suppresses_the_terminal_owner_frame() {
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let (state, mut rx) = race_state(ownership.clone());
+        seed_live_terminal_owner(&ownership);
+
+        // The authoritative shape: the record names THIS terminal — the
+        // frame broadcasts.
+        assert!(
+            broadcast_owner_frame_if_authoritative(
+                &state,
+                &ownership,
+                "codex",
+                SID,
+                TID,
+                "assoc-adopt-r39",
+                "handoff-committed",
+            ),
+            "the authoritative record must broadcast"
+        );
+        let frame = rx.try_recv().expect("the terminal owner frame broadcasts");
+        let value: serde_json::Value = serde_json::from_str(&frame).expect("json frame");
+        assert_eq!(value["type"], "session.runtimeOwner");
+        assert_eq!(value["ownerKind"], "terminal");
+        assert_eq!(value["terminalId"], TID);
+
+        // The moved-on shape: a completed cross-kind handoff in the
+        // commit's drop-to-observe interval — NO frame over the Fresh
+        // Agent's session.
+        commit_cross_kind_handoff(&ownership, "op-r39-commit-race");
+        assert!(
+            !broadcast_owner_frame_if_authoritative(
+                &state,
+                &ownership,
+                "codex",
+                SID,
+                TID,
+                "assoc-adopt-r39",
+                "handoff-committed",
+            ),
+            "the moved-on record must suppress the terminal owner frame"
+        );
+        match rx.try_recv() {
+            Ok(frame) => panic!("the moved-on commit must not broadcast a terminal owner: {frame}"),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+        }
     }
 }

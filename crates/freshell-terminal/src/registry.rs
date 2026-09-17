@@ -578,6 +578,20 @@ pub type TerminalCreatePauseHook = std::sync::Arc<
     dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
 >;
 
+/// b8ke ext r39 F1: the identity re-adopt PRE-ARM pause hook — the
+/// deterministic-race tests park `coordinator_begin_identity`'s re-adopt
+/// arm between the precheck observation and the atomic adopt (the
+/// vulnerable interval the post-arm pauses cannot reach), to prove a
+/// completed cross-kind handoff in that interval answers the typed
+/// refusal instead of arming the guard on the new owner. Keyed
+/// `(provider, session_id)`. Interior-shared like the create seam. Never
+/// set in production.
+pub type IdentityReadoptPauseHook = std::sync::Arc<
+    dyn Fn(&str, &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 #[derive(Clone)]
 pub struct TerminalRegistry {
     inner: Arc<Mutex<RegistryInner>>,
@@ -676,6 +690,9 @@ pub struct TerminalRegistry {
     /// [`Self::set_terminal_attach_pause_for_tests`]). Never set in
     /// production.
     terminal_attach_pause: Arc<std::sync::RwLock<Option<TerminalCreatePauseHook>>>,
+    /// b8ke ext r39 F1: the identity re-adopt PRE-ARM pause hook (see
+    /// [`IdentityReadoptPauseHook`]). Never set in production.
+    identity_readopt_pause: Arc<std::sync::RwLock<Option<IdentityReadoptPauseHook>>>,
     /// b8ke ext r13 F1: the create POST-CLAIM park seam (see
     /// [`Self::set_terminal_create_postclaim_pause_for_tests`]). Never set
     /// in production.
@@ -857,6 +874,7 @@ impl TerminalRegistry {
             session_ref_ownership: Arc::new(Mutex::new(HashMap::new())),
             terminal_create_pause: Arc::new(std::sync::RwLock::new(None)),
             terminal_attach_pause: Arc::new(std::sync::RwLock::new(None)),
+            identity_readopt_pause: Arc::new(std::sync::RwLock::new(None)),
             terminal_create_postclaim_pause: Arc::new(std::sync::RwLock::new(None)),
         }
     }
@@ -933,6 +951,34 @@ impl TerminalRegistry {
             .terminal_attach_pause
             .write()
             .expect("terminal attach pause lock") = None;
+    }
+
+    /// b8ke ext r39 F1: install the identity re-adopt PRE-ARM pause hook —
+    /// the deterministic-race tests park `coordinator_begin_identity`'s
+    /// re-adopt arm between the precheck observation and the atomic adopt.
+    /// Never set in production.
+    pub fn set_identity_readopt_pause_for_tests(&self, hook: IdentityReadoptPauseHook) {
+        *self
+            .identity_readopt_pause
+            .write()
+            .expect("identity re-adopt pause lock") = Some(hook);
+    }
+
+    /// b8ke ext r39 F1: clear the identity re-adopt pause hook.
+    pub fn clear_identity_readopt_pause_for_tests(&self) {
+        *self
+            .identity_readopt_pause
+            .write()
+            .expect("identity re-adopt pause lock") = None;
+    }
+
+    /// b8ke ext r39 F1: read the identity re-adopt pause hook (None in
+    /// production and every test that does not install it).
+    pub fn identity_readopt_pause_hook(&self) -> Option<IdentityReadoptPauseHook> {
+        self.identity_readopt_pause
+            .read()
+            .expect("identity re-adopt pause lock")
+            .clone()
     }
 
     /// b8ke ext r13 F1: install the terminal-create POST-CLAIM pause hook —

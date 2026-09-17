@@ -7090,36 +7090,50 @@ async fn the_attach_guard_and_kill_transitions_record_the_connection_device_iden
     })
     .await;
 
-    // THE ASSERTION: the attach_guard.armed event's initiator carries the
-    // connection's device identity — never a constant.
+    // THE ASSERTION: the attach's armed-guard event's initiator carries
+    // the connection's device identity — never a constant. b8ke ext
+    // r39 F1: the terminal attach arms the ATOMIC ADOPT (the r38
+    // primitive — the observed pair + the expected terminal owner
+    // validated in ONE coordinator decision), so the armed event is the
+    // adopt's `ownership.adopt_guard.armed` (same initiator contract).
     let armed: Vec<_> = events
         .lock()
         .expect("capture lock")
         .iter()
         .filter(|e| {
             e.target == "freshell_ownership"
-                && e.event == "ownership.attach_guard.armed"
+                && e.event == "ownership.adopt_guard.armed"
                 && e.fields.get("session_id").map(String::as_str) == Some(sid.as_str())
         })
         .cloned()
         .collect();
+    // The diagnostic counts are hoisted BEFORE the assert so the panic's
+    // format arguments never re-lock the capture mutex (std::Mutex is not
+    // reentrant — evaluating three `events.lock()` args while a guard
+    // temporary is still alive self-deadlocks the panicking test thread;
+    // b8ke ext r39 F1 found this the hard way when the event rename
+    // failed this assert).
+    let (total_adopt_armed, total_events, total_ownership_events) = {
+        let guard = events.lock().expect("capture lock");
+        (
+            guard
+                .iter()
+                .filter(|e| e.event == "ownership.adopt_guard.armed")
+                .count(),
+            guard.len(),
+            guard
+                .iter()
+                .filter(|e| e.target == "freshell_ownership")
+                .count(),
+        )
+    };
     assert!(
         !armed.is_empty(),
-        "the attach guard armed (the event exists for {sid}): total armed events = {}, \
+        "the attach's atomic adopt armed (the event exists for {sid}): total armed events = {}, \
          total captured events = {}, ownership events = {}",
-        events
-            .lock()
-            .expect("capture lock")
-            .iter()
-            .filter(|e| e.event == "ownership.attach_guard.armed")
-            .count(),
-        events.lock().expect("capture lock").len(),
-        events
-            .lock()
-            .expect("capture lock")
-            .iter()
-            .filter(|e| e.target == "freshell_ownership")
-            .count()
+        total_adopt_armed,
+        total_events,
+        total_ownership_events
     );
     for e in &armed {
         let initiator = e.fields.get("initiator").map(String::as_str).unwrap_or("");

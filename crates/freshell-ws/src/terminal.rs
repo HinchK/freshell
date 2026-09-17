@@ -1094,10 +1094,11 @@ async fn handle_client_text(
                 // all), a stale generation answers typed, and a current
                 // attach proceeds and restamps under the held claim.
                 // b8ke ext r12 F2: the resolved session ref + the wire
-                // fence's generation — hoisted for the attach guard below
-                // (the REAL claim held across the restamp + attach).
+                // fence's full pair — hoisted for the attach's atomic
+                // adopt below (the REAL claim held across the restamp +
+                // attach).
                 let mut attach_session_ref: Option<SessionLocator> = None;
-                let mut attach_observed_generation: Option<u64> = None;
+                let mut attach_observed_fence: Option<freshell_ownership::ObservedFence> = None;
                 if let Some(session_ref) = state.identity.session_ref_for(&attach.terminal_id) {
                     attach_session_ref = Some(session_ref.clone());
                     // A half-sent observed pair is the typed invalid-fence
@@ -1108,7 +1109,7 @@ async fn handle_client_text(
                         attach.observed_generation,
                     ) {
                         Ok(fence) => {
-                            attach_observed_generation = fence.map(|f| f.generation);
+                            attach_observed_fence = fence;
                             fence
                         }
                         Err(err) => {
@@ -1328,15 +1329,51 @@ async fn handle_client_text(
                 // superseded runtime). Identity-less attaches (no
                 // sessionRef) stay unguarded exactly as they stayed
                 // unfenced.
+                // b8ke ext r39 F1: the arm is the ATOMIC ADOPT (the r38
+                // primitive) — the request's observed pair when fenced,
+                // else the precheck snapshot's pair, plus the EXPECTED
+                // owner (THIS kind AND THIS terminal id) validated in ONE
+                // coordinator-lock decision. Pre-r39 the generic guard
+                // carried no expected identity and the unfenced shape
+                // carried no generation: a completed cross-kind handoff
+                // between the precheck and the arm made the guard arm on
+                // the NEW Fresh Agent owner (the generic guard accepts any
+                // Live owner), and the attach restamped durable binding
+                // and registered over the Fresh Agent's session. The
+                // adopt closes the interval: any advance or a foreign
+                // owner refuses typed BEFORE anything restamps.
                 let mut attach_guard = None;
                 if let (Some(ownership), Some(session_ref)) =
                     (state.ownership.as_ref(), attach_session_ref.as_ref())
                 {
-                    match ownership.begin_attach_guard(
+                    let expected_terminal = freshell_ownership::OwnerIdentity {
+                        kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                        terminal_id: Some(attach.terminal_id.clone()),
+                        live_session_key: None,
+                        pid: None,
+                        ownership_id: None,
+                    };
+                    // The pair: the request's observed pair when fenced;
+                    // else the precheck-window observation (the adopt
+                    // re-validates it atomically — the observe-to-arm
+                    // interval is closed by the ONE-lock adopt).
+                    let adopt_fence = match attach_observed_fence {
+                        Some(fence) => fence,
+                        None => {
+                            let pair_snap =
+                                ownership.observe(&session_ref.provider, &session_ref.session_id);
+                            freshell_ownership::ObservedFence {
+                                epoch: pair_snap.epoch,
+                                generation: pair_snap.generation,
+                            }
+                        }
+                    };
+                    match ownership.begin_adopt_guard(
                         &session_ref.provider,
                         &session_ref.session_id,
                         &format!("attach-{}", attach.terminal_id),
-                        attach_observed_generation,
+                        &expected_terminal,
+                        adopt_fence,
                         // b8ke ext r24 F2: the connection's real device/client
                         // identity — never the constant lane label, so the
                         // structured coordinator records name the initiator.
@@ -1345,39 +1382,6 @@ async fn handle_client_text(
                         freshell_ownership::AttachGuardOutcome::Armed(guard) => {
                             attach_guard = Some(guard);
                         }
-                        freshell_ownership::AttachGuardOutcome::Refused {
-                            state: refused_state,
-                            generation,
-                        } => {
-                            tracing::warn!(target: "freshell_ws::terminal",
-                                terminal_id = %attach.terminal_id,
-                                session_id = %session_ref.session_id,
-                                state = ?refused_state,
-                                "terminal_attach_refused: the attach guard refused to arm \
-                                 (a lifecycle transition owns the key) — the attach aborts \
-                                 typed, nothing restamps"
-                            );
-                            return send(
-                                ws_tx,
-                                &ServerMessage::Error(ErrorMsg {
-                                    owner_kind: None,
-                                    owner_generation: Some(generation),
-                                    owner_epoch: Some(ownership.boot_epoch()),
-                                    code: ErrorCode::SessionReserved,
-                                    message: "A lifecycle operation is in flight for this session; retry after it settles."
-                                        .to_string(),
-                                    timestamp: crate::now_iso(),
-                                    actual_session_ref: None,
-                                    expected_session_ref: None,
-                                    request_id: None,
-                                    retry_after_ms: None,
-                                    terminal_exit_code: None,
-                                    terminal_id: Some(attach.terminal_id.clone()),
-                                    live_terminal_id: None,
-                                }),
-                            )
-                            .await;
-                        }
                         freshell_ownership::AttachGuardOutcome::StaleGeneration {
                             current_epoch,
                             current_generation,
@@ -1385,11 +1389,13 @@ async fn handle_client_text(
                             tracing::warn!(target: "freshell_ws::terminal",
                                 terminal_id = %attach.terminal_id,
                                 session_id = %session_ref.session_id,
-                                observed_generation = ?attach_observed_generation,
-                                current_epoch, current_generation,
-                                "terminal_attach_refused: the attach guard refused to arm \
-                                 (the observed generation is stale) — the attach aborts \
-                                 typed, nothing restamps"
+                                observed_epoch = adopt_fence.epoch,
+                                observed_generation = adopt_fence.generation,
+                                current_epoch,
+                                current_generation,
+                                "terminal_attach_refused: the atomic adopt refused to arm \
+                                 (the observed pair is stale or names a different epoch) — \
+                                 the attach aborts typed, nothing restamps"
                             );
                             return send(
                                 ws_tx,
@@ -1403,6 +1409,39 @@ async fn handle_client_text(
                                          generation); refresh and retry. (session {})",
                                         session_ref.session_id
                                     ),
+                                    timestamp: crate::now_iso(),
+                                    actual_session_ref: None,
+                                    expected_session_ref: None,
+                                    request_id: None,
+                                    retry_after_ms: None,
+                                    terminal_exit_code: None,
+                                    terminal_id: Some(attach.terminal_id.clone()),
+                                    live_terminal_id: None,
+                                }),
+                            )
+                            .await;
+                        }
+                        freshell_ownership::AttachGuardOutcome::Refused {
+                            state: refused_state,
+                            generation,
+                        } => {
+                            tracing::warn!(target: "freshell_ws::terminal",
+                                terminal_id = %attach.terminal_id,
+                                session_id = %session_ref.session_id,
+                                state = ?refused_state,
+                                "terminal_attach_refused: the atomic adopt refused to arm \
+                                 (ownership advanced or a foreign owner holds the key) — \
+                                 the attach aborts typed, nothing restamps"
+                            );
+                            return send(
+                                ws_tx,
+                                &ServerMessage::Error(ErrorMsg {
+                                    owner_kind: None,
+                                    owner_generation: Some(generation),
+                                    owner_epoch: Some(ownership.boot_epoch()),
+                                    code: ErrorCode::SessionReserved,
+                                    message: "A lifecycle operation is in flight for this session; retry after it settles."
+                                        .to_string(),
                                     timestamp: crate::now_iso(),
                                     actual_session_ref: None,
                                     expected_session_ref: None,
@@ -3552,15 +3591,44 @@ pub(crate) async fn handle_create(
                     // then hold authority). A guard refusal (the incumbent
                     // entered a transition, or the observed fence is
                     // stale) answers the typed refusal and NOTHING spawns.
+                    // b8ke ext r39 F1: the arm is the ATOMIC ADOPT (the
+                    // r38 primitive) — the request's observed pair (else
+                    // the arm-time observation) plus the EXPECTED owner
+                    // KIND (the wire create carries no terminal id — the
+                    // id is minted at spawn; the adopt's kind validation
+                    // closes the cross-kind race: a completed handoff to
+                    // a Fresh Agent between the claim and this arm
+                    // answers the typed refusal instead of arming on the
+                    // new owner and spawning a terminal beside it). The
+                    // same-kind (terminal) incumbent re-open semantics
+                    // are unchanged.
                     let Some(ownership_ref) = state.ownership.as_ref() else {
                         unreachable!("the wire claim ran under a wired coordinator");
                     };
-                    let observed_generation = observed.map(|fence| fence.generation);
-                    match ownership_ref.begin_attach_guard(
+                    let expected_terminal = freshell_ownership::OwnerIdentity {
+                        kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                        terminal_id: None,
+                        live_session_key: None,
+                        pid: None,
+                        ownership_id: None,
+                    };
+                    let adopt_fence = match observed {
+                        Some(fence) => fence,
+                        None => {
+                            let pair_snap =
+                                ownership_ref.observe(&locator.provider, &locator.session_id);
+                            freshell_ownership::ObservedFence {
+                                epoch: pair_snap.epoch,
+                                generation: pair_snap.generation,
+                            }
+                        }
+                    };
+                    match ownership_ref.begin_adopt_guard(
                         &locator.provider,
                         &locator.session_id,
                         &format!("create-adopt-{}", create.request_id),
-                        observed_generation,
+                        &expected_terminal,
+                        adopt_fence,
                         "ws-terminal-create/adopt",
                     ) {
                         freshell_ownership::AttachGuardOutcome::Armed(guard) => {
@@ -3576,8 +3644,9 @@ pub(crate) async fn handle_create(
                                 session_id = %locator.session_id,
                                 request_id = %create.request_id,
                                 state = ?refused_state,
-                                "terminal_create_refused: the Adopt arm's attach guard \
-                                 refused to arm (a lifecycle transition owns the key) — \
+                                "terminal_create_refused: the Adopt arm's atomic adopt \
+                                 refused to arm (ownership advanced or a foreign owner \
+                                 holds the key) — \
                                  the create aborts typed, nothing spawns"
                             );
                             let _ = send_create_error(
@@ -3599,10 +3668,11 @@ pub(crate) async fn handle_create(
                                 provider = %locator.provider,
                                 session_id = %locator.session_id,
                                 request_id = %create.request_id,
-                                observed_generation = ?observed_generation,
+                                observed_generation = adopt_fence.generation,
                                 current_epoch, current_generation,
-                                "terminal_create_refused: the Adopt arm's attach guard \
-                                 refused to arm (the observed generation is stale) — \
+                                "terminal_create_refused: the Adopt arm's atomic adopt \
+                                 refused to arm (the observed pair is stale or names a \
+                                 different epoch) — \
                                  the create aborts typed, nothing spawns"
                             );
                             let _ = send_create_error(

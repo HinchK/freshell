@@ -1776,13 +1776,42 @@ pub(crate) async fn spawn_terminal_pane_with_handoff(
                 // refusal (the incumbent entered a transition, or the
                 // observed fence is stale) answers the typed refusal and
                 // NOTHING spawns.
+                // b8ke ext r39 F1: the arm is the ATOMIC ADOPT (the r38
+                // primitive) — the request's observed pair (else the
+                // arm-time observation) plus the EXPECTED owner KIND (the
+                // REST create has no minted terminal id at the adopt —
+                // the id exists only post-spawn; the adopt's kind
+                // validation closes the cross-kind race: a completed
+                // handoff to a Fresh Agent between the claim and this arm
+                // answers the typed refusal instead of arming on the new
+                // owner and spawning a terminal beside it). The
+                // same-kind (terminal) incumbent re-open semantics are
+                // unchanged.
                 let ownership_ref = state.ownership.as_ref().expect("claimed above");
-                let observed_generation = observed.map(|fence| fence.generation);
-                match ownership_ref.begin_attach_guard(
+                let expected_terminal = freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: None,
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                };
+                let adopt_fence = match observed {
+                    Some(fence) => fence,
+                    None => {
+                        let pair_snap =
+                            ownership_ref.observe(&locator.provider, &locator.session_id);
+                        freshell_ownership::ObservedFence {
+                            epoch: pair_snap.epoch,
+                            generation: pair_snap.generation,
+                        }
+                    }
+                };
+                match ownership_ref.begin_adopt_guard(
                     &locator.provider,
                     &locator.session_id,
                     &format!("rest-create-adopt-{create_request_id}"),
-                    observed_generation,
+                    &expected_terminal,
+                    adopt_fence,
                     "rest-terminal-create/adopt",
                 ) {
                     freshell_ownership::AttachGuardOutcome::Armed(guard) => {
