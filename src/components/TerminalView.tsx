@@ -901,6 +901,29 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
   // Refs for terminal lifecycle (only meaningful if isTerminal)
   // CRITICAL: Use refs to avoid callback/effect dependency on changing content
   const requestIdRef = useRef<string>(terminalContent?.createRequestId || '')
+  // b8ke ext r35 F1: the PER-REQUEST observed-fence capture — the pair the
+  // request's FIRST send observed, REUSED by every automatic resend of the
+  // SAME request id (rate-limit backoff, launch-interrupted, the
+  // SESSION_RESERVED bounded re-drive, the INVALID_TERMINAL_ID pump). An
+  // automatic retry must never silently substitute a current fence for the
+  // original observation (pre-r35 every sendCreate re-read the record: a
+  // gen-5 request refused after another device advanced the record to
+  // gen 9 was resent with the refreshed gen-9 pair — and since failed
+  // creates leave the server's dedupe state and a gen-9 Vacant grants a
+  // gen-9 claim, the old request recreated a terminal the newer lifecycle
+  // had explicitly stopped). The ORIGINAL pair flows either way honestly:
+  // still current → the retry proceeds; stale → the server refuses it
+  // typed (the delayed-request safety net) and the recovery state
+  // surfaces. The capture key includes the pane's reconcileEpoch — the
+  // failure card's user-initiated Retry launch (resetPaneForReconcileCreate)
+  // bumps the epoch as its ONLY re-fire signal, so that NEW lifecycle
+  // decision captures a FRESH fence while every automatic retry (no bump)
+  // reuses the original pair.
+  const requestFenceRef = useRef<{
+    requestId: string
+    reconcileEpoch: number | undefined
+    fence: ReturnType<typeof selectPaneOwnerFence>
+  } | null>(null)
   const terminalIdRef = useRef<string | undefined>(terminalContent?.terminalId)
   const seqStateRef = useRef<AttachSeqState>(createAttachSeqState())
   const parserAppliedSeqRef = useRef(0)
@@ -3435,10 +3458,25 @@ function TerminalView({ tabId, paneId, paneContent, hidden }: TerminalViewProps)
         recoveryIntent,
       })
       // kata b8ke (round-2 review): the delayed-request fence — the observed
-      // (epoch, generation) pair read from the runtime-owner record AT SEND
-      // TIME, so a re-drive after a stale-generation refusal always carries
-      // the refreshed pair, never the stale one. Read once, sent together.
-      const ownerFence = selectPaneOwnerFence(appStore.getState(), contentRef.current ?? {})
+      // (epoch, generation) pair read from the runtime-owner record at the
+      // request's FIRST send, so every automatic resend of the SAME request
+      // id carries the SAME original pair. b8ke ext r35 F1: the capture is
+      // PER-REQUEST — an automatic re-drive must never carry a refreshed
+      // fence over the original observation (the reviewer's class: a
+      // silently-substituted current fence defeats the server's
+      // stale-generation safety net and can recreate what a newer lifecycle
+      // stopped). Read once per request id, sent on every send.
+      let ownerFence: ReturnType<typeof selectPaneOwnerFence>
+      const reconcileEpoch = contentRef.current?.reconcileEpoch
+      if (
+        requestFenceRef.current?.requestId === requestId
+        && requestFenceRef.current.reconcileEpoch === reconcileEpoch
+      ) {
+        ownerFence = requestFenceRef.current.fence
+      } else {
+        ownerFence = selectPaneOwnerFence(appStore.getState(), contentRef.current ?? {})
+        requestFenceRef.current = { requestId, reconcileEpoch, fence: ownerFence }
+      }
       ws.send({
         type: 'terminal.create',
         requestId,

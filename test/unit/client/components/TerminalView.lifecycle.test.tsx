@@ -3581,7 +3581,18 @@ describe('TerminalView lifecycle updates', () => {
       expect(within(card).queryByRole('button', { name: 'Attach to running session' })).toBeNull()
     })
 
-    it('a stale-fence create refusal re-drives with the REFRESHED observed pair from the runtime-owner record', async () => {
+    // b8ke ext r35 F1: an AUTOMATIC re-drive of the same request carries
+    // the request's ORIGINAL observed pair — never a refreshed one. Pre-r35
+    // every sendCreate re-read the record at send time, so this scenario
+    // (a gen-5 request refused after another device advanced the record to
+    // gen 9) resent with the refreshed gen-9 pair — and since failed
+    // creates leave the server's dedupe state and a gen-9 Vacant grants a
+    // gen-9 claim, the OLD request recreated a terminal the newer
+    // lifecycle had explicitly stopped. The honest automatic contract: the
+    // original pair flows to the server, which refuses it typed (the
+    // delayed-request safety net); the failure card's user-initiated
+    // Retry (a NEW lifecycle decision) is what may capture a fresh fence.
+    it('a stale-fence create refusal re-drives with the ORIGINAL observed pair, never a refreshed one', async () => {
       const { store } = setupTypedPane({
         seed: (seededStore) => {
           act(() => {
@@ -3618,8 +3629,10 @@ describe('TerminalView lifecycle updates', () => {
         })
       })
 
-      // The bounded re-drive re-sends the create carrying the REFRESHED
-      // pair from the record — the stale (1, 5) pair is never re-sent.
+      // The bounded re-drive re-sends the create carrying the ORIGINAL
+      // (epoch 1, generation 5) pair — the request's own observation, so
+      // the server's stale-generation safety net refuses it typed (the
+      // automatic retry can never present the old request as current).
       await waitFor(() => {
         expect(createCalls()).toHaveLength(2)
       })
@@ -3627,8 +3640,11 @@ describe('TerminalView lifecycle updates', () => {
         requestId: 'req-b8ke',
         sessionRef: { provider: 'codex', sessionId: TYPED_SESSION_ID },
         observedEpoch: 1,
-        observedGeneration: 9,
+        observedGeneration: 5,
       })
+      // NEVER the refreshed pair: the gen-9 record did not license the old
+      // request.
+      expect(createCalls()[1].observedGeneration).not.toBe(9)
     })
 
     it('b8ke ext r7: a terminal pane holding the PRE-REKEY id resolves the alias chain to the canonical owner', async () => {
