@@ -2393,12 +2393,14 @@ export function FreshAgentView({
 
   // Delta-review round-1 F2: the Task 4 content-status gate (in applySnapshot)
   // can strand the pane-content status at a busy state. When a turn ends
-  // without a snapshot-invalidating event (an interrupt or error: only
-  // freshAgent.status:idle ever arrives), the record clears busy through a
-  // path that triggers no follow-up snapshot — freshAgent.status is not in
-  // SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS, and the busy poll stops once
-  // the record is idle — so the pane's refused 'running' echo has nothing
-  // left to repair it. The record's busy→non-busy edge is the last
+  // without a snapshot-invalidating event (freshAgent.error via sessionError,
+  // freshAgent.exit via sessionExited, codex stuck/exited — none of which is
+  // in SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS), the record clears busy
+  // through a path that triggers no follow-up snapshot, and the busy poll
+  // stops once the record is idle — so the pane's refused 'running' echo has
+  // nothing left to repair it. (Opencode's interrupt and end-of-turn paths DO
+  // emit freshAgent.session.snapshot, which refetches; this effect covers the
+  // event-shaped endings.) The record's busy→non-busy edge is the last
   // authoritative signal: re-derive the pane-content status from it.
   // Claude is excluded because the level-triggered mirror above already
   // covers it. This cannot weaken the gate: it fires only once the record

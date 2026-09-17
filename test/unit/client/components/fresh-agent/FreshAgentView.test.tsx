@@ -5,7 +5,7 @@ import { configureStore, type Middleware } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
 import sessionsReducer, { applySessionsPatch, applyContextUsageExtras } from '@/store/sessionsSlice'
-import freshAgentReducer, { sessionInit, sessionMetadataReceived, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
+import freshAgentReducer, { sessionError, sessionExited, sessionInit, sessionMetadataReceived, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES } from '@/components/fresh-agent/FreshAgentView'
@@ -3675,18 +3675,20 @@ describe('FreshAgentView', () => {
     })
     expect(getFreshAgentPaneContent(store).status).toBe('running')
 
-    // The turn now ends WITHOUT a snapshot-invalidating event (an interrupt
-    // or error: only freshAgent.status:idle ever arrives). freshAgent.status
-    // is not in SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS, so no new snapshot
-    // fetch runs and the busy poll has torn down -- the record's busy-clear
-    // edge is the only remaining authoritative signal, so the stranded
-    // pane-content 'running' must be re-derived from it.
+    // The turn now ends WITHOUT a snapshot-invalidating event, through a path
+    // the server really sends: freshAgent.error -> sessionError drops a
+    // 'running' record to idle (freshAgentSlice sessionError). None of the
+    // event-shaped endings (freshAgent.error, freshAgent.exit, codex
+    // stuck/exited) is in SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS, so no new
+    // snapshot fetch runs and the busy poll has torn down -- the record's
+    // busy-clear edge is the only remaining authoritative signal, so the
+    // stranded pane-content 'running' must be re-derived from it.
     await act(async () => {
-      store.dispatch(setSessionStatus({
+      store.dispatch(sessionError({
         sessionId,
         sessionType: 'freshopencode',
         provider: 'opencode',
-        status: 'idle',
+        message: 'hard error ends the turn',
       }))
     })
 
@@ -3694,6 +3696,75 @@ describe('FreshAgentView', () => {
       expect(getFreshAgentPaneContent(store).status).toBe('idle')
     })
     expect(store.getState().freshAgent.sessions[`freshopencode:opencode:${sessionId}`]?.status).toBe('idle')
+  })
+
+  it('re-derives pane-content status from the record busy→non-busy edge on freshAgent.exit (exited lands in saved pane content)', async () => {
+    const store = createStore()
+    const sessionId = 'ses_stranded_exited'
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: sessionId,
+      sessionId,
+      status: 'idle',
+      revision: 214,
+      latestTurnId: null,
+      capabilities: { send: true, interrupt: true, fork: true },
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+      turns: [],
+      pendingApprovals: [],
+      pendingQuestions: [],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionId,
+        sessionRef: { provider: 'opencode', sessionId },
+        resumeSessionId: sessionId,
+        createRequestId: 'req-stranded-exited',
+        status: 'running',
+        initialCwd: '/home/dan/code/freshell',
+      },
+    }))
+    store.dispatch(setSessionStatus({
+      sessionId,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      status: 'running',
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+    })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(getFreshAgentPaneContent(store).status).toBe('running')
+
+    // freshAgent.exit -> sessionExited writes the record to 'exited' (a real
+    // server-shaped ending with no snapshot refetch). The pane-content status
+    // must re-derive to 'exited' too -- PaneContainer reads that saved value
+    // for effectiveStatus after a reload.
+    await act(async () => {
+      store.dispatch(sessionExited({
+        sessionId,
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+      }))
+    })
+
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store).status).toBe('exited')
+    })
   })
 
   it('preserves loaded transcript history when a submit refresh returns only the in-flight turn', async () => {

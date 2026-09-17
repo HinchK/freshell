@@ -510,9 +510,13 @@ export class RustServer implements E2eServerHandle {
    * the requested signal is delivered to the group; if the process has not
    * exited within 5s, SIGKILL the group — a signal that fails to stop the
    * server must never leave a live, untracked server that `stop()` can no
-   * longer reach. The `this.process` handle is only nulled AFTER the kill
-   * has landed (exit observed or SIGKILL issued), so a failed first signal
-   * keeps the fixture's stop()/killCurrentProcess() paths armed.
+   * longer reach. Deferring the `this.process` null only matters while the
+   * kill is still in flight: a `stop()` racing the 5s window still finds the
+   * handle. Once the promise resolves (exit observed, group kill threw, or
+   * SIGKILL issued without waiting for exit), the handle is nulled and the
+   * fixture no longer tracks the process — that is the hard-kill contract
+   * (signals only, no shutdown handshake; the only current caller passes
+   * SIGKILL at opencode-restart-recovery.spec.ts:525).
    */
   async kill(signal: NodeJS.Signals = 'SIGKILL'): Promise<void> {
     const proc = this.process
