@@ -2984,10 +2984,30 @@ pub(crate) async fn rename_scoped_session(
     let Some(target) = resolution.target.clone() else {
         return fail_json(
             StatusCode::BAD_REQUEST,
-            "NAME_TARGET_UNRESOLVED: this agent pane has no naming binding on              this server (no sessionRef or namingHandle) — open it from the              sidebar so its identity binds, then rename"
+            "NAME_TARGET_UNRESOLVED: this agent pane has no naming binding on this \
+             server (no sessionRef or namingHandle) — open it from the sidebar so \
+             its identity binds, then rename"
                 .to_string(),
         );
     };
+    // A scoped null/reset request answers the SAME machine-readable refusal
+    // as the canonical/session/terminal surfaces: a protected saved name is
+    // never cleared through any route.
+    if body
+        .get("name")
+        .and_then(Value::as_str)
+        .is_none_or(|name| name.trim().is_empty())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": naming::NAME_RESET_UNSUPPORTED,
+                "message": "a scoped session's saved name is never cleared; rename it instead",
+                "nameRef": target,
+            })),
+        )
+            .into_response();
+    }
     // `expectedNameRef`: the editor's captured binding — a pane whose
     // conversation switched must never receive the rename (409, visibly).
     if let Some(expected) = body.get("expectedNameRef") {
@@ -3079,13 +3099,13 @@ async fn rename_pane(
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
 
-    let Some(name) = parse_required_name(body.get("name")) else {
-        return fail_json(StatusCode::BAD_REQUEST, "name required".to_string());
-    };
-
     // Unified agent names (Task 2): a scoped agent pane's rename targets its
     // saved SESSION name (the one name shared by pane/sidebar/terminal/tab);
-    // the legacy layout label remains for every out-of-scope pane.
+    // the shared helper owns the scoped blank/reset refusal
+    // (`NAME_RESET_UNSUPPORTED`), so this resolution runs BEFORE the legacy
+    // `name required` gate — a scoped blank rename must answer the uniform
+    // code, not the legacy message. The legacy layout label remains for
+    // every out-of-scope pane.
     if let Some(resolution) = resolve_pane_name_target(&state, &pane_id) {
         if resolution.scoped {
             let tab_id = state
@@ -3102,6 +3122,10 @@ async fn rename_pane(
             .await;
         }
     }
+
+    let Some(name) = parse_required_name(body.get("name")) else {
+        return fail_json(StatusCode::BAD_REQUEST, "name required".to_string());
+    };
 
     if name.len() > MAX_PANE_NAME_LEN {
         return fail_json(

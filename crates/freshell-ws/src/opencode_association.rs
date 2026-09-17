@@ -150,9 +150,11 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
         // Unified agent names (Task 2): the locator resolved the session from
         // opencode's SQLite database — the row IS the verified persistence
         // evidence (zero-message sessions persist at creation). The upsert
-        // retargeted the pane's name ref; the stashed pending handle
+        // established the durable identity and deliberately left a
+        // still-pending name ref for THIS transfer (the switch rule
+        // retargets only already-durable refs); the stashed pending handle
         // transfers onto the session with the database as the native
-        // location.
+        // location, then the identity/registry bindings advance.
         {
             let acquisition = freshell_protocol::native_location::NativeAcquisition {
                 location: freshell_protocol::native_location::NativeLocation::Opencode {

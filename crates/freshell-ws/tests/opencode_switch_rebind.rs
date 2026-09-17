@@ -25,6 +25,18 @@
 mod common;
 
 #[cfg(unix)]
+use freshell_freshagent::naming::{
+    BindNameInput, PendingNameInput, RenameNameInput, SessionNaming as _,
+};
+#[cfg(unix)]
+use freshell_protocol::native_location::{
+    NativeAcquisition, NativeEvidenceKind, NativeLocation, NativePersistence,
+};
+#[cfg(unix)]
+use freshell_protocol::session_names::NameIntent;
+#[cfg(unix)]
+use freshell_protocol::session_names::{NamedProvider, SessionNameRef};
+#[cfg(unix)]
 use futures_util::{SinkExt, StreamExt};
 #[cfg(unix)]
 use serde_json::json;
@@ -185,12 +197,16 @@ async fn wait_for_frame(
 
 /// [`common::spawn_server_with_specs`], but ALSO returning the `WsState`
 /// handle so the test can drive `drain_and_rebind_opencode` directly
-/// (deterministic — no sweep-timer race), and with an ENABLED pane ledger
+/// (deterministic — no sweep-timer race), with an ENABLED pane ledger
 /// rooted at `ledger_root` (the claude template's `PaneLedger::disabled()`
-/// stores nothing, so no ledger assertion could pass against it). Ledger
-/// assertions go through `state.pane_ledger` — the SAME instance the server
-/// writes through (a separately-constructed reader over the same dir loads
-/// its read index once at construction and would never see later writes).
+/// stores nothing, so no ledger assertion could pass against it), and —
+/// like [`common::spawn_server_with_specs_and_naming`] — the ONE
+/// `NamingProbeSink` naming authority wired into the identity registry and
+/// the fresh states, returned so the naming lanes can seed records and
+/// inspect transfers. Ledger assertions go through `state.pane_ledger` —
+/// the SAME instance the server writes through (a separately-constructed
+/// reader over the same dir loads its read index once at construction and
+/// would never see later writes).
 #[cfg(unix)]
 async fn spawn_server_returning_state(
     cli_commands: Vec<freshell_platform::CliCommandSpec>,
@@ -200,6 +216,7 @@ async fn spawn_server_returning_state(
     String,
     freshell_terminal::TerminalRegistry,
     freshell_ws::WsState,
+    std::sync::Arc<common::NamingProbeSink>,
 ) {
     use std::sync::Arc;
     let auth_token = Arc::new(common::AUTH_TOKEN.to_string());
@@ -208,6 +225,9 @@ async fn spawn_server_returning_state(
         serde_json::from_value(common::test_settings_value()).expect("valid settings fixture"),
     );
     let registry = freshell_terminal::TerminalRegistry::new();
+    let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+    let sink = Arc::new(common::NamingProbeSink::default());
+    identity.set_session_naming(sink.clone());
 
     let state = freshell_ws::WsState {
         layout: Default::default(),
@@ -215,7 +235,7 @@ async fn spawn_server_returning_state(
         pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             ledger_root,
         ))),
-        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        identity,
         auth_token: Arc::clone(&auth_token),
         server_instance_id: Arc::new("srv-test".to_string()),
         boot_id: Arc::new("boot-test".to_string()),
@@ -224,18 +244,31 @@ async fn spawn_server_returning_state(
         broadcast_tx: Arc::clone(&broadcast_tx),
         auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
         auto_resume_cancels: Default::default(),
-        fresh_codex: freshell_freshagent::FreshCodexState::new(
-            Arc::clone(&auth_token),
-            Arc::clone(&broadcast_tx),
-            serde_json::json!({ "freshAgent": { "enabled": false } }),
-        ),
-        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
-        fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
-            freshell_freshagent::FreshAgentState::new(
+        fresh_codex: {
+            let fresh_codex = freshell_freshagent::FreshCodexState::new(
                 Arc::clone(&auth_token),
                 Arc::clone(&broadcast_tx),
-            ),
-        ),
+                serde_json::json!({ "freshAgent": { "enabled": false } }),
+            );
+            fresh_codex.set_session_naming(sink.clone());
+            fresh_codex
+        },
+        fresh_claude: {
+            let fresh_claude =
+                freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+            fresh_claude.set_session_naming(sink.clone());
+            fresh_claude
+        },
+        fresh_opencode: {
+            let fresh_opencode = freshell_freshagent::FreshOpencodeState::new(
+                freshell_freshagent::FreshAgentState::new(
+                    Arc::clone(&auth_token),
+                    Arc::clone(&broadcast_tx),
+                ),
+            );
+            fresh_opencode.set_session_naming(sink.clone());
+            fresh_opencode
+        },
         registry: registry.clone(),
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
@@ -276,7 +309,7 @@ async fn spawn_server_returning_state(
         let _ = axum::serve(listener, router).await;
     });
 
-    (format!("ws://{addr}/ws", addr = addr), registry, state)
+    (format!("ws://{addr}/ws"), registry, state, sink)
 }
 
 /// Scan WS text frames until the next `terminal.session.associated` for
@@ -535,7 +568,7 @@ async fn tui_switch_signal_reclassifies_is_subagent_in_both_directions() {
     let watcher = freshell_ws::opencode_signal::OpencodeSignalWatcher::new(signal_root.clone());
 
     let ledger_dir = tempfile::tempdir().expect("ledger root");
-    let (url, registry, state) = spawn_server_returning_state(
+    let (url, registry, state, _sink) = spawn_server_returning_state(
         vec![common::sleeper_cli_spec("opencode")],
         ledger_dir.path().to_path_buf(),
         Some(data_home.path().to_path_buf()),
@@ -577,6 +610,252 @@ async fn tui_switch_signal_reclassifies_is_subagent_in_both_directions() {
     registry.kill(&terminal_id);
 }
 
+/// Seed `<data_home>/opencode.db` with the real `session`/`project` schema
+/// plus the project row — the session ROW itself is inserted later with the
+/// pane's real cwd (the locator diffs rows newer than its arm snapshot, so
+/// the row must not exist when the pane is created).
+#[cfg(unix)]
+fn seed_opencode_db_schema(data_home: &std::path::Path, id: &str) {
+    std::fs::create_dir_all(data_home).unwrap();
+    let conn = rusqlite::Connection::open(data_home.join("opencode.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+         CREATE TABLE session (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL,
+            parent_id TEXT,
+            slug TEXT NOT NULL,
+            directory TEXT NOT NULL,
+            title TEXT NOT NULL,
+            version TEXT NOT NULL,
+            time_created INTEGER NOT NULL,
+            time_updated INTEGER NOT NULL,
+            time_archived INTEGER
+         );",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO project (id, worktree) VALUES (?1, ?2)",
+        rusqlite::params![format!("proj-{id}"), "/proj"],
+    )
+    .unwrap();
+}
+
+/// The naming lanes' durable opencode session ref.
+#[cfg(unix)]
+fn opencode_session_ref(session_id: &str) -> SessionNameRef {
+    SessionNameRef::Session {
+        provider: NamedProvider::Opencode,
+        session_id: session_id.to_string(),
+    }
+}
+
+/// Unified agent names (Task 2 review, C1/I1): the opencode CLI lane's
+/// FIRST-BIND — the SQLite locator association transfers the pane's pending
+/// record (carrying the user's pre-identity manual rename) onto the session
+/// the DB row verifies — and its CONVERSATION SWITCH — the TUI-plugin signal
+/// moves an established binding onto a session with its OWN record; the
+/// pane's naming ref follows the move, the new session's own name surfaces,
+/// and the superseded session keeps its name. The dead `bind_pending_naming`
+/// lane left these panes record-less (renames 404, pre-identity renames
+/// orphaned); this test drives the real locator + signal lanes end to end.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn cli_db_association_transfers_pending_and_switch_surfaces_own_record() {
+    const ASSOC: &str = "ses_assoc000000000000000000000a";
+    const SWITCH: &str = "ses_switch00000000000000000000b";
+
+    // NO OPENCODE_CMD / OPENCODE_ARGV_CAPTURE_PATH: the sleeper spec's
+    // env_var is None, so this fn never races the sibling tests' env swaps.
+
+    let data_home = tempfile::tempdir().expect("opencode data home");
+    seed_opencode_db_schema(data_home.path(), ASSOC);
+
+    let signal_dir = tempfile::tempdir().expect("signal root");
+    let signal_root = signal_dir.path().to_path_buf();
+    let watcher = freshell_ws::opencode_signal::OpencodeSignalWatcher::new(signal_root.clone());
+
+    let ledger_dir = tempfile::tempdir().expect("ledger root");
+    let pane_cwd = tempfile::tempdir().expect("pane cwd");
+    let (url, registry, state, sink) = spawn_server_returning_state(
+        vec![common::sleeper_cli_spec("opencode")],
+        ledger_dir.path().to_path_buf(),
+        Some(data_home.path().to_path_buf()),
+    )
+    .await;
+    // The DB locator sweep (production spawns it in `freshell-server`'s
+    // boot; 150 ms mirrors the codex harness's re-declared cadence).
+    freshell_ws::opencode_association::spawn_opencode_locator_sweep(
+        state.clone(),
+        Duration::from_millis(150),
+    );
+    let (mut ws, _inventory) = common::connect_and_capture_inventory(&url).await;
+
+    // ── First-bind: a fresh opencode pane admits its pre-durable handle,
+    // the user renames pre-identity, then the CLI's own session row lands
+    // in opencode.db and the locator associates it.
+    let created = send_create(
+        &mut ws,
+        json!({
+            "type": "terminal.create",
+            "requestId": "req-oc-name-1",
+            "mode": "opencode",
+            "shell": "system",
+            "cwd": pane_cwd.path().to_string_lossy(),
+        }),
+    )
+    .await;
+    let tid = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let handle = created["nameRef"]["id"]
+        .as_str()
+        .expect("a fresh scoped create carries its pending namingHandle")
+        .to_string();
+    sink.rename(RenameNameInput {
+        target: SessionNameRef::Pending { id: handle.clone() },
+        name: "Pre Identity Opencode".into(),
+        intent: NameIntent::User,
+        if_revision: None,
+    })
+    .await
+    .unwrap();
+
+    // Enter opens the locator's evaluation window; the session row then
+    // appears with the pane's cwd (the real DB row the CLI writes).
+    common::send_input(&mut ws, &tid, "\r").await;
+    {
+        let row_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let conn = rusqlite::Connection::open(data_home.path().join("opencode.db")).unwrap();
+        conn.execute(
+            "INSERT INTO session
+                (id, project_id, parent_id, slug, directory, title, version,
+                 time_created, time_updated, time_archived)
+             VALUES (?1, ?2, NULL, ?1, ?3, ?1, 'test', ?4, ?4, NULL)",
+            rusqlite::params![
+                ASSOC,
+                format!("proj-{ASSOC}"),
+                pane_cwd.path().to_string_lossy().into_owned(),
+                row_ms,
+            ],
+        )
+        .unwrap();
+    }
+
+    let associated = next_associated_frame(&mut ws, &tid, "opencode-name/association").await;
+    assert_eq!(
+        associated["sessionRef"],
+        json!({ "provider": "opencode", "sessionId": ASSOC }),
+        "the locator association must bind the session: {associated}"
+    );
+
+    // The pending record transferred onto the associated session, carrying
+    // the pre-identity manual name.
+    let bound = sink
+        .get(vec![opencode_session_ref(ASSOC)])
+        .await
+        .expect("get through the probe sink");
+    assert_eq!(
+        bound.len(),
+        1,
+        "the opencode CLI first-bind must create the durable session's record \
+         (C1's dead lane left it absent, so every rename surface 404'd forever)"
+    );
+    assert_eq!(
+        bound[0].record.name, "Pre Identity Opencode",
+        "the pending record's manual name must carry through the bind"
+    );
+    assert_eq!(
+        state.identity.name_ref_for(&tid),
+        Some(opencode_session_ref(ASSOC)),
+        "the pane's naming ref must follow the verified first-bind"
+    );
+    assert!(
+        !state
+            .identity
+            .pending_naming_binds()
+            .iter()
+            .any(|(t, ..)| *t == tid),
+        "a bound row leaves the pending reconcile list"
+    );
+
+    // ── Conversation switch: the TUI plugin reports a NEW session whose
+    // OWN record already exists (a previously opened and named session).
+    sink.ensure_pending(PendingNameInput {
+        handle: "handle-oc-switch".into(),
+        provider: NamedProvider::Opencode,
+        cwd: None,
+    })
+    .await
+    .unwrap();
+    sink.bind_pending(BindNameInput {
+        pending: SessionNameRef::Pending {
+            id: "handle-oc-switch".into(),
+        },
+        target: opencode_session_ref(SWITCH),
+        acquisition: NativeAcquisition {
+            location: NativeLocation::Opencode {
+                database_path: data_home.path().join("opencode.db").display().to_string(),
+                native_session_id: Some(SWITCH.to_string()),
+                original_directory: Some(pane_cwd.path().to_string_lossy().into_owned()),
+                owned_local_endpoint: None,
+            },
+            evidence: NativeEvidenceKind::IndexedFile,
+            persistence: NativePersistence::Verified,
+        },
+    })
+    .await
+    .unwrap();
+    sink.rename(RenameNameInput {
+        target: opencode_session_ref(SWITCH),
+        name: "Switch Own Name".into(),
+        intent: NameIntent::User,
+        if_revision: None,
+    })
+    .await
+    .unwrap();
+
+    write_opencode_signal(&signal_root, &tid, 90, SWITCH);
+    freshell_ws::opencode_signal::drain_and_rebind_opencode(&state, &watcher).await;
+    tokio::task::yield_now().await;
+
+    let rebound = next_associated_frame(&mut ws, &tid, "opencode-name/switch").await;
+    assert_eq!(
+        rebound["sessionRef"],
+        json!({ "provider": "opencode", "sessionId": SWITCH }),
+        "the switch signal must move the pane: {rebound}"
+    );
+    assert_eq!(rebound["previousSessionId"], json!(ASSOC));
+    assert_eq!(
+        state.identity.name_ref_for(&tid),
+        Some(opencode_session_ref(SWITCH)),
+        "the pane's naming ref must follow the conversation switch (an \
+         established binding never strands the pane on the superseded session)"
+    );
+    let switch_record = sink
+        .get(vec![opencode_session_ref(SWITCH)])
+        .await
+        .expect("get the switch target");
+    assert_eq!(
+        switch_record[0].record.name, "Switch Own Name",
+        "the new session's OWN record must surface through the pane's binding"
+    );
+    let kept = sink
+        .get(vec![opencode_session_ref(ASSOC)])
+        .await
+        .expect("get the superseded session");
+    assert_eq!(
+        kept[0].record.name, "Pre Identity Opencode",
+        "the superseded session keeps its own name, never copied over"
+    );
+
+    registry.kill(&tid);
+}
+
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn tui_switch_signal_rebinds_and_restart_resumes_the_new_id() {
@@ -602,7 +881,7 @@ async fn tui_switch_signal_rebinds_and_restart_resumes_the_new_id() {
     let watcher = freshell_ws::opencode_signal::OpencodeSignalWatcher::new(signal_root.clone());
 
     let ledger_dir = tempfile::tempdir().expect("ledger root");
-    let (url, registry, state) = spawn_server_returning_state(
+    let (url, registry, state, _sink) = spawn_server_returning_state(
         vec![opencode_capture_spec()],
         ledger_dir.path().to_path_buf(),
         None,

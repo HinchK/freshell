@@ -1948,3 +1948,141 @@ async fn worker_guard_try_acquire_is_exclusive() {
         .expect("release on drop allows re-acquisition");
     drop(third);
 }
+
+// ── unified agent names (Task 2 review, M1): the naming publisher's lag
+// recovery ─────────────────────────────────────────────────────────────────
+
+/// A `Lagged` recv — a burst of commits overran the broadcast history while
+/// the publisher was slow — must re-adopt the full document
+/// (`refresh_current`) and re-diff EVERY record through the same push, so
+/// the missed frames cannot leave a registry display cache or a WS client
+/// stale until the record changes again; the buffered tail still publishes
+/// normally; and a `Closed` channel ENDS the task (never a busy-loop). The
+/// publisher's receiver is a parameter, so the test drives it with a tiny
+/// capacity-2 channel — three sends without a recv lag it deterministically,
+/// and dropping the sender ends the loop through the Closed arm.
+#[tokio::test]
+async fn publisher_recovers_a_lagged_subscription_by_re_diffing_every_record() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+
+    // One durable record the store knows about, with a name the caches have
+    // never seen (the lag recovery must surface it WITHOUT a new commit).
+    ensure(
+        &store,
+        "handle-lag",
+        NamedProvider::Claude,
+        Some("/w/homes/claude/proj"),
+    )
+    .await
+    .expect("ensure the pending record");
+    store
+        .bind_pending(BindNameInput {
+            pending: pending("handle-lag"),
+            target: session(NamedProvider::Claude, "sess-lag"),
+            acquisition: claude_acquisition("/w/homes/claude", NativePersistence::Verified),
+        })
+        .await
+        .expect("bind the durable record");
+    rename_user(
+        &store,
+        session(NamedProvider::Claude, "sess-lag"),
+        "Lag Recovery Name",
+    )
+    .await
+    .expect("name the durable record");
+
+    // A terminal bound to that record — the publisher's write-through target.
+    let registry = freshell_terminal::TerminalRegistry::new();
+    registry.register_headless(freshell_terminal::registry::HeadlessTerminal {
+        terminal_id: "t-lag".into(),
+        stream_id: "s-lag".into(),
+        mode: "claude".into(),
+        resume_session_id: None,
+        create_request_id: None,
+        created_at: None,
+    });
+    registry.set_naming(
+        "t-lag",
+        Some(session(NamedProvider::Claude, "sess-lag")),
+        None,
+    );
+    assert!(
+        registry.session_name_of("t-lag").is_none(),
+        "precondition: the display cache has never seen the record"
+    );
+
+    // Lag the publisher's receiver deterministically: capacity 2, three
+    // sends, nobody recv'ing. The two freshest updates stay buffered; the
+    // first recv reports the lag. Dropping the sender closes the channel
+    // after the buffered tail, which must END the loop.
+    let (tx, rx) = tokio::sync::broadcast::channel::<SessionNameUpdate>(2);
+    let dummy = |id: &str| SessionNameUpdate {
+        redirects: Vec::new(),
+        record: SessionNameRecord {
+            name_ref: session(NamedProvider::Claude, id),
+            name: "unused".into(),
+            source: NameSource::Directory,
+            revision: 1,
+            manual_revision: None,
+            renamed_at: None,
+            legacy_origin: None,
+        },
+        document_generation: 1,
+        changed: true,
+    };
+    tx.send(dummy("buried-1")).expect("send 1");
+    tx.send(dummy("buried-2")).expect("send 2");
+    tx.send(dummy("buried-3")).expect("send 3");
+    drop(tx);
+
+    let (broadcast_tx, mut client) = tokio::sync::broadcast::channel::<String>(64);
+    let sessions_revision = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+
+    // The publisher must RUN TO COMPLETION once the channel closes — a
+    // Closed channel may never busy-loop (the timeout makes that defect a
+    // loud failure instead of a hang).
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        run_naming_publisher(
+            store.clone(),
+            rx,
+            registry.clone(),
+            std::sync::Arc::new(broadcast_tx),
+            sessions_revision.clone(),
+        ),
+    )
+    .await
+    .expect("the publisher must end on a closed channel");
+
+    // The lag recovery re-diffed the store's record to the bound terminal.
+    let cached = registry
+        .session_name_of("t-lag")
+        .expect("the recovery must refresh every bound terminal's display cache");
+    assert_eq!(cached.name, "Lag Recovery Name");
+
+    // The canonical frame reached the WS channel (the recovery re-publishes
+    // the record), and the session directory was invalidated.
+    let mut saw_name_update = false;
+    let mut saw_sessions_changed = false;
+    while let Ok(frame) = client.try_recv() {
+        if frame.contains("session.name.updated") && frame.contains("Lag Recovery Name") {
+            saw_name_update = true;
+        }
+        if frame.contains("sessions.changed") {
+            saw_sessions_changed = true;
+        }
+    }
+    assert!(
+        saw_name_update,
+        "the lag recovery must re-publish the record as a session.name.updated frame"
+    );
+    assert!(
+        saw_sessions_changed,
+        "the lag recovery must invalidate the session directory"
+    );
+    assert!(
+        sessions_revision.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+        "every pushed update (recovery + buffered tail) bumps the revision"
+    );
+}

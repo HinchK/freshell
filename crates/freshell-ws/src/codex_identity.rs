@@ -197,10 +197,13 @@ async fn apply_codex_identity(
         .upsert(terminal_id, Some("codex"), Some(thread_id), cwd, now_ms());
     // Unified agent names (Task 2): the rollout locator's adoption/rebind —
     // the rollout file IS the verified persistence evidence (the locator's
-    // whole job is finding persisted rollouts). The upsert retargeted the
-    // pane's name ref; the stashed pending handle transfers onto the thread
-    // with the rollout path as the native location. A pathless adoption
-    // stays pending for the main.rs naming tick.
+    // whole job is finding persisted rollouts). The upsert established the
+    // durable identity and deliberately left a still-pending name ref for
+    // THIS transfer (the switch rule retargets only already-durable refs);
+    // the stashed pending handle transfers onto the thread with the rollout
+    // path as the native location, then the identity/registry bindings
+    // advance. A pathless adoption keeps the handle pending for a later
+    // located edge.
     if let Some(rollout) = rollout_path {
         let acquisition = freshell_protocol::native_location::NativeAcquisition {
             location: freshell_protocol::native_location::NativeLocation::Codex {

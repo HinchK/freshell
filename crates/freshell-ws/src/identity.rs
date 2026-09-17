@@ -53,9 +53,12 @@ pub struct TerminalIdentity {
     /// Unified agent names (Task 2): the naming identity this terminal's
     /// saved name resolves through — the pre-durable pending handle before
     /// verified materialization, the durable provider/session ref after.
-    /// Written at scoped create (pending admission), advanced by the
-    /// identity upsert's auto-retarget (the pane follows its current
-    /// binding), and read by every rename route/projection resolver.
+    /// Written at scoped create (pending admission); advanced onto the
+    /// durable identity by the verified bind lanes (`bind_pending_naming`,
+    /// the main.rs naming tick), which own the pending→durable transition;
+    /// retargeted onto a NEW durable session by the identity upsert's
+    /// switch rule (an already-durable ref follows its current binding).
+    /// Read by every rename route/projection resolver.
     /// `None` on terminals outside the six unified modes.
     pub name_ref: Option<SessionNameRef>,
     /// Unified agent names: the pre-durable naming handle retained for the
@@ -97,11 +100,6 @@ fn minimal_entry(terminal_id: &str) -> TerminalIdentity {
     }
 }
 
-/// Shared, cheaply-cloneable registry (`Arc<RwLock<..>>`), analogous to
-/// [`freshell_terminal::TerminalRegistry`]'s sharing model: one instance
-/// constructed in `freshell-server::main`, cloned into `WsState` (the writer --
-/// terminal create/kill/exit) and into the `freshell-server` REST states that read
-/// it (`TerminalsState`, `SessionsState`, `SessionDirectoryState`).
 /// Shared, cheaply-cloneable registry (`Arc<RwLock<..>>`), analogous to
 /// [`freshell_terminal::TerminalRegistry`]'s sharing model: one instance
 /// constructed in `freshell-server::main`, cloned into `WsState` (the writer --
@@ -210,6 +208,12 @@ impl TerminalIdentityRegistry {
             .expect("identity registry lock poisoned")
             .values()
             .filter_map(|entry| {
+                if entry.retired {
+                    // A retired pane's binding can never advance again —
+                    // listing it would re-locate it every tick for the
+                    // process lifetime.
+                    return None;
+                }
                 let handle = entry.naming_handle.as_ref()?;
                 // Only still-pending refs need a bind; a bound handle's ref
                 // is already the durable session ref (or redirects in the
@@ -262,16 +266,18 @@ impl TerminalIdentityRegistry {
                 entry.updated_at = updated_at;
                 entry.retired = false;
                 // Unified agent names (Task 2): the pane's name follows its
-                // CURRENT binding — an established SCOPED (provider,
-                // session_id) retargets a still-pending name ref onto the
-                // durable session (the switch/adoption rule: the pane adopts
-                // the new session's own name). The pending handle's durable
-                // BIND stays with the evidence-driven lanes (the store
-                // transfer runs where durability is verified); a partial
-                // identity (either half absent) and every NON-scoped provider
-                // keep the prior ref.
+                // CURRENT binding — but only across an ALREADY-DURABLE ref.
+                // An established SCOPED (provider, session_id) retargets a
+                // `Session` name ref onto the new session (the switch/fork
+                // rule: a conversation move never strands the pane on the
+                // superseded session). A STILL-PENDING ref is NEVER moved by
+                // the upsert: the evidence-verified bind lanes own the
+                // pending→durable transition, where the retained handle
+                // transfers onto this identity (`bind_pending_naming` +
+                // the main.rs naming tick). A partial identity (either half
+                // absent) and every NON-scoped provider keep the prior ref.
                 if let (Some(provider), Some(session_id)) = (provider, session_id) {
-                    if matches!(entry.name_ref, Some(SessionNameRef::Pending { .. })) {
+                    if matches!(entry.name_ref, Some(SessionNameRef::Session { .. })) {
                         if let Some(next) = named_session_ref(provider, session_id) {
                             entry.name_ref = Some(next);
                         }
@@ -499,13 +505,18 @@ impl TerminalIdentityRegistry {
 
 /// Unified agent names (Task 2): the verified pending→durable bind at a
 /// CLI identity adoption (claude signal, codex locator, opencode locator).
-/// The identity `upsert` has already retargeted the terminal's name ref onto
-/// the durable session; this transfers the stashed PENDING record onto that
-/// session once the caller's existing durability evidence verified it —
-/// idempotent (an already-bound handle answers a Read), never blocking the
-/// adoption (a failure retains the handle for the main.rs naming tick's
-/// visible retry). The terminal registry's display cache follows the
-/// accepted record.
+/// The identity `upsert` has ALREADY established the durable (provider,
+/// session_id) — and deliberately left a still-pending `name_ref` alone (the
+/// switch rule retargets only already-durable refs, so the pending→durable
+/// transition stays HERE) — so this transfers the stashed PENDING record onto
+/// that session once the caller's existing durability evidence verified it,
+/// then advances both identity homes (the ref onto the durable session; the
+/// retained handle is never erased). Idempotent (an already-bound handle
+/// answers a Read in the store), never blocking the adoption (a failure
+/// retains the handle for the main.rs naming tick's visible retry). The
+/// terminal registry's display cache follows the accepted record. Answers
+/// whether the binding is in place (a successful or already-idempotent
+/// bind), so the tick's reconcile can report its progress.
 pub(crate) async fn bind_pending_naming(
     identity: &TerminalIdentityRegistry,
     registry: &freshell_terminal::TerminalRegistry,
@@ -513,12 +524,12 @@ pub(crate) async fn bind_pending_naming(
     provider: freshell_protocol::session_names::NamedProvider,
     session_id: &str,
     acquisition: freshell_protocol::native_location::NativeAcquisition,
-) {
+) -> bool {
     let Some(sink) = identity.naming() else {
-        return;
+        return false;
     };
     let Some(handle) = identity.naming_handle_of(terminal_id) else {
-        return; // no pending handle: the pane was never in naming scope
+        return false; // no pending handle: the pane was never in naming scope
     };
     // Only a still-pending name ref needs the transfer; a ref already
     // retargeted to THIS session (or bound earlier) makes this a no-op.
@@ -526,7 +537,7 @@ pub(crate) async fn bind_pending_naming(
         identity.name_ref_for(terminal_id),
         Some(SessionNameRef::Pending { .. })
     ) {
-        return;
+        return false;
     }
     let pending = SessionNameRef::Pending { id: handle };
     let target = SessionNameRef::Session {
@@ -547,11 +558,73 @@ pub(crate) async fn bind_pending_naming(
                 registry.set_naming(terminal_id, Some(target), None);
             }
             registry.update_session_name(terminal_id, &update.record);
+            true
         }
         Err(error) => {
-            freshell_freshagent::naming::log_name_error("bind_pending", &pending, &error);
+            // Structured failure log under THIS crate's target (the shared
+            // `log_name_error` logs under the freshagent crate's own target).
+            tracing::warn!(
+                target: "freshell_ws::naming",
+                op = "bind_pending",
+                name_ref = %freshell_freshagent::naming::name_ref_debug_key(&pending),
+                revision = error.log_revision(),
+                class = %error.code(),
+                "session_names.operation_failed: {error}"
+            );
+            false
         }
     }
+}
+
+/// Unified agent names: the claude reconcile tick's one pending row — locate
+/// the session's transcript and, when it exists, transfer the retained
+/// pending handle onto the durable session through the CLI lanes' SHARED
+/// bind ([`bind_pending_naming`]), so a successful tick advances the
+/// identity binding and the registry display cache exactly like a signal/
+/// locator adoption and the row leaves the pending list (no re-location on
+/// subsequent ticks). The transcript file IS the verified persistence
+/// evidence (the CLI writes the session transcript at startup, so a
+/// zero-turn create binds as soon as the file lands). `false` leaves the
+/// row pending for the next tick's visible retry: no transcript yet, no
+/// authority wired, or a failed transfer (logged, never blocking).
+///
+/// `pub`: `freshell-server`'s naming tick drives it per pending row, and the
+/// ws integration tests drive it directly for determinism (the file's
+/// drive-the-sweep-body-directly convention). The retained handle is read
+/// from the identity row itself (the same source [`bind_pending_naming`]
+/// trusts).
+pub async fn bind_pending_claude_transcript(
+    identity: &TerminalIdentityRegistry,
+    registry: &freshell_terminal::TerminalRegistry,
+    terminal_id: &str,
+    session_id: &str,
+) -> bool {
+    if identity.naming().is_none() {
+        return false;
+    }
+    let Some(selected) = freshell_freshagent::locate_transcript_selected(session_id) else {
+        return false;
+    };
+    let acquisition = freshell_protocol::native_location::NativeAcquisition {
+        location: freshell_protocol::native_location::NativeLocation::Claude {
+            config_root: selected.config_root.to_string_lossy().into_owned(),
+            transcript_path: Some(selected.transcript_path.to_string_lossy().into_owned()),
+            project_directory_key: None,
+            transcript_cwd: selected.transcript_cwd.clone(),
+            effective_project_key_override: None,
+        },
+        evidence: freshell_protocol::native_location::NativeEvidenceKind::SelectedTranscript,
+        persistence: freshell_protocol::native_location::NativePersistence::Verified,
+    };
+    bind_pending_naming(
+        identity,
+        registry,
+        terminal_id,
+        freshell_protocol::session_names::NamedProvider::Claude,
+        session_id,
+        acquisition,
+    )
+    .await
 }
 
 /// D7 guard seam: expose this registry to `TerminalRegistry::live_session_owner`
@@ -780,13 +853,168 @@ mod tests {
 
     // ── unified agent names (Task 2): binding, retarget, reconcile ─────────
 
-    /// The pane's name follows its CURRENT binding: an established (provider,
-    /// session_id) upsert retargets a still-pending name ref onto the durable
-    /// session (the switch/adoption rule). A partial identity (either half
-    /// absent) and a non-scoped provider keep the prior ref, and the
-    /// pre-durable handle is always retained for the bind lanes.
+    /// A tiny recording sink for the bind-lane unit tests (the integration
+    /// binaries have `common::NamingProbeSink`; lib tests cannot): records
+    /// every `bind_pending` input verbatim and answers the transferred
+    /// target record, mirroring the real store's same-target idempotence
+    /// closely enough to pin the identity-side contract.
+    struct BindRecordingSink {
+        binds: std::sync::Mutex<Vec<(SessionNameRef, SessionNameRef)>>,
+    }
+
+    impl freshell_freshagent::naming::SessionNaming for BindRecordingSink {
+        fn get(
+            &self,
+            refs: Vec<SessionNameRef>,
+        ) -> freshell_freshagent::naming::NameFuture<
+            Vec<freshell_protocol::session_names::SessionNameUpdate>,
+        > {
+            let updates = refs
+                .into_iter()
+                .map(
+                    |target| freshell_protocol::session_names::SessionNameUpdate {
+                        redirects: Vec::new(),
+                        record: freshell_protocol::session_names::SessionNameRecord {
+                            name_ref: target,
+                            name: "unit".into(),
+                            source: freshell_protocol::session_names::NameSource::Directory,
+                            revision: 1,
+                            manual_revision: None,
+                            renamed_at: None,
+                            legacy_origin: None,
+                        },
+                        document_generation: 1,
+                        changed: false,
+                    },
+                )
+                .collect();
+            Box::pin(async move { Ok(updates) })
+        }
+
+        fn ensure_pending(
+            &self,
+            _input: freshell_freshagent::naming::PendingNameInput,
+        ) -> freshell_freshagent::naming::NameFuture<
+            freshell_protocol::session_names::SessionNameUpdate,
+        > {
+            Box::pin(async move {
+                Err(freshell_freshagent::naming::NameError::NotFound(
+                    "not needed here".into(),
+                ))
+            })
+        }
+
+        fn bind_pending(
+            &self,
+            input: freshell_freshagent::naming::BindNameInput,
+        ) -> freshell_freshagent::naming::NameFuture<
+            freshell_protocol::session_names::SessionNameUpdate,
+        > {
+            self.binds
+                .lock()
+                .unwrap()
+                .push((input.pending.clone(), input.target.clone()));
+            let record = freshell_protocol::session_names::SessionNameRecord {
+                name_ref: input.target,
+                name: "bound".into(),
+                source: freshell_protocol::session_names::NameSource::Directory,
+                revision: 2,
+                manual_revision: None,
+                renamed_at: None,
+                legacy_origin: None,
+            };
+            Box::pin(async move {
+                Ok(freshell_protocol::session_names::SessionNameUpdate {
+                    redirects: Vec::new(),
+                    record,
+                    document_generation: 1,
+                    changed: true,
+                })
+            })
+        }
+
+        fn rename(
+            &self,
+            _input: freshell_freshagent::naming::RenameNameInput,
+        ) -> freshell_freshagent::naming::NameFuture<
+            freshell_protocol::session_names::SessionNameUpdate,
+        > {
+            Box::pin(async move {
+                Err(freshell_freshagent::naming::NameError::NotFound(
+                    "not needed here".into(),
+                ))
+            })
+        }
+
+        fn activity(
+            &self,
+            _input: freshell_freshagent::naming::NameActivity,
+        ) -> freshell_freshagent::naming::NameFuture<
+            freshell_protocol::session_names::SessionNameUpdate,
+        > {
+            Box::pin(async move {
+                Err(freshell_freshagent::naming::NameError::NotFound(
+                    "not needed here".into(),
+                ))
+            })
+        }
+
+        fn observe_native(
+            &self,
+            _input: freshell_freshagent::naming::NativeNameObservation,
+        ) -> freshell_freshagent::naming::NameFuture<
+            freshell_protocol::session_names::SessionNameUpdate,
+        > {
+            Box::pin(async move {
+                Err(freshell_freshagent::naming::NameError::NotFound(
+                    "not needed here".into(),
+                ))
+            })
+        }
+
+        fn record_acquisition(
+            &self,
+            _target: SessionNameRef,
+            _acquisition: freshell_protocol::native_location::NativeAcquisition,
+        ) -> freshell_freshagent::naming::NameFuture<
+            freshell_protocol::session_names::SessionNameUpdate,
+        > {
+            Box::pin(async move {
+                Err(freshell_freshagent::naming::NameError::NotFound(
+                    "not needed here".into(),
+                ))
+            })
+        }
+    }
+
+    /// A verified claude acquisition (the bind lanes' unit tests only need
+    /// `Verified` persistence — the store's own decision logic is pinned in
+    /// `freshell-server`).
+    fn verified_claude_acquisition() -> freshell_protocol::native_location::NativeAcquisition {
+        freshell_protocol::native_location::NativeAcquisition {
+            location: freshell_protocol::native_location::NativeLocation::Claude {
+                config_root: "/store".into(),
+                transcript_path: Some("/store/projects/-p/s.jsonl".into()),
+                project_directory_key: None,
+                transcript_cwd: Some("/p".into()),
+                effective_project_key_override: None,
+            },
+            evidence: freshell_protocol::native_location::NativeEvidenceKind::SelectedTranscript,
+            persistence: freshell_protocol::native_location::NativePersistence::Verified,
+        }
+    }
+
+    /// The pane's name follows its CURRENT binding, with the two halves of
+    /// the transition owned separately: an established SCOPED (provider,
+    /// session_id) upsert retargets an ALREADY-DURABLE name ref onto the new
+    /// session (the switch/fork rule — an established binding never strands
+    /// the pane on the superseded session), while a STILL-PENDING ref is
+    /// NEVER moved by the upsert — the evidence-verified bind lanes own the
+    /// pending→durable transition, where the retained handle transfers. A
+    /// partial identity (either half absent) and every NON-scoped provider
+    /// keep the prior ref, and the pre-durable handle is always retained.
     #[test]
-    fn upsert_auto_retargets_a_still_pending_name_ref() {
+    fn upsert_retargets_only_an_already_durable_name_ref() {
         let reg = TerminalIdentityRegistry::new();
         reg.set_name_binding(
             "t1",
@@ -794,22 +1022,108 @@ mod tests {
             Some("nh-1".into()),
         );
 
-        // A partial upsert (no session id) keeps the pending ref.
+        // A partial upsert (no session id) keeps the pending ref...
         reg.upsert("t1", Some("claude"), None, None, 1);
         assert_eq!(
             reg.name_ref_for("t1"),
             Some(SessionNameRef::Pending { id: "nh-1".into() })
         );
-
-        // A non-scoped provider never retargets.
+        // ...and so does a non-scoped provider...
         reg.upsert("t1", Some("gemini"), Some("s-g"), None, 2);
         assert_eq!(
             reg.name_ref_for("t1"),
             Some(SessionNameRef::Pending { id: "nh-1".into() })
         );
-
-        // The established scoped identity retargets the pending ref...
+        // ...and so does the FULLY-ESTABLISHED scoped upsert itself — a
+        // first-bind's pending ref stays pending for the bind lanes (the
+        // CLI lanes' upsert-then-bind order relies on this exact hand-off).
         reg.upsert("t1", Some("claude"), Some("s-1"), None, 3);
+        assert_eq!(
+            reg.name_ref_for("t1"),
+            Some(SessionNameRef::Pending { id: "nh-1".into() }),
+            "a first-bind upsert must NOT retarget the pending ref — \
+             bind_pending_naming owns the transfer"
+        );
+
+        // The verified bind advances the ref onto the durable session...
+        reg.set_name_binding(
+            "t1",
+            Some(SessionNameRef::Session {
+                provider: freshell_protocol::session_names::NamedProvider::Claude,
+                session_id: "s-1".into(),
+            }),
+            None,
+        );
+
+        // ...and a LATER scoped identity move (the conversation switch /
+        // fork) retargets the already-durable ref onto the new session.
+        reg.upsert("t1", Some("claude"), Some("s-2"), None, 4);
+        assert_eq!(
+            reg.name_ref_for("t1"),
+            Some(SessionNameRef::Session {
+                provider: freshell_protocol::session_names::NamedProvider::Claude,
+                session_id: "s-2".into(),
+            }),
+            "an established binding must follow a scoped identity move"
+        );
+        // A NON-scoped provider never touches the moved ref.
+        reg.upsert("t1", Some("gemini"), Some("s-g2"), None, 5);
+        assert_eq!(
+            reg.name_ref_for("t1"),
+            Some(SessionNameRef::Session {
+                provider: freshell_protocol::session_names::NamedProvider::Claude,
+                session_id: "s-2".into(),
+            })
+        );
+        // The pre-durable handle stays retained for the bind lanes throughout.
+        assert_eq!(reg.naming_handle_of("t1"), Some("nh-1".to_string()));
+    }
+
+    /// `bind_pending_naming` — the CLI lanes' shared transfer: a still-
+    /// pending ref with a retained handle transfers onto the verified target
+    /// and ADVANCES both identity homes (the ref, never erasing the handle);
+    /// an already-durable ref never re-binds (the store's redirect covers
+    /// it, and a moved pane names through its NEW session's own record).
+    #[tokio::test]
+    async fn bind_pending_naming_transfers_a_still_pending_ref_and_advances() {
+        let reg = TerminalIdentityRegistry::new();
+        let sink = std::sync::Arc::new(BindRecordingSink {
+            binds: std::sync::Mutex::new(Vec::new()),
+        });
+        reg.set_session_naming(sink.clone());
+        let terminal_registry = freshell_terminal::TerminalRegistry::new();
+        reg.set_name_binding(
+            "t1",
+            Some(SessionNameRef::Pending { id: "nh-1".into() }),
+            Some("nh-1".into()),
+        );
+
+        bind_pending_naming(
+            &reg,
+            &terminal_registry,
+            "t1",
+            freshell_protocol::session_names::NamedProvider::Claude,
+            "s-1",
+            verified_claude_acquisition(),
+        )
+        .await;
+
+        // Exactly one transfer, from the retained handle to the target.
+        let binds = sink.binds.lock().unwrap();
+        assert_eq!(binds.len(), 1, "{binds:?}");
+        assert_eq!(
+            binds[0],
+            (
+                SessionNameRef::Pending { id: "nh-1".into() },
+                SessionNameRef::Session {
+                    provider: freshell_protocol::session_names::NamedProvider::Claude,
+                    session_id: "s-1".into(),
+                }
+            )
+        );
+        drop(binds);
+        // The identity ref advanced onto the durable session; the handle is
+        // retained (a binding advances, never erases).
         assert_eq!(
             reg.name_ref_for("t1"),
             Some(SessionNameRef::Session {
@@ -817,19 +1131,53 @@ mod tests {
                 session_id: "s-1".into(),
             })
         );
-        // ...while the handle stays discoverable for the bind lanes.
         assert_eq!(reg.naming_handle_of("t1"), Some("nh-1".to_string()));
+        // The advanced row left the pending reconcile list.
+        assert!(reg.pending_naming_binds().is_empty());
+    }
 
-        // An ALREADY-durable ref is never moved by a later upsert (a bound
-        // handle's ref redirects in the store; the identity keeps what it
-        // bound).
-        reg.upsert("t1", Some("claude"), Some("s-2"), None, 4);
+    /// The guard half: `bind_pending_naming` is a no-op for an already-
+    /// durable ref (only a still-pending ref needs the transfer — a bound
+    /// handle's ref redirects in the store, and a pane whose binding moved
+    /// names through its NEW session's own record, never a re-transfer).
+    #[tokio::test]
+    async fn bind_pending_naming_skips_an_already_durable_ref() {
+        let reg = TerminalIdentityRegistry::new();
+        let sink = std::sync::Arc::new(BindRecordingSink {
+            binds: std::sync::Mutex::new(Vec::new()),
+        });
+        reg.set_session_naming(sink.clone());
+        let terminal_registry = freshell_terminal::TerminalRegistry::new();
+        reg.set_name_binding(
+            "t1",
+            Some(SessionNameRef::Session {
+                provider: freshell_protocol::session_names::NamedProvider::Claude,
+                session_id: "old".into(),
+            }),
+            Some("nh-1".into()),
+        );
+
+        bind_pending_naming(
+            &reg,
+            &terminal_registry,
+            "t1",
+            freshell_protocol::session_names::NamedProvider::Claude,
+            "new",
+            verified_claude_acquisition(),
+        )
+        .await;
+
+        assert!(
+            sink.binds.lock().unwrap().is_empty(),
+            "an already-durable ref must not re-transfer"
+        );
         assert_eq!(
             reg.name_ref_for("t1"),
             Some(SessionNameRef::Session {
                 provider: freshell_protocol::session_names::NamedProvider::Claude,
-                session_id: "s-1".into(),
-            })
+                session_id: "old".into(),
+            }),
+            "the skip must leave the existing binding untouched"
         );
     }
 
@@ -912,6 +1260,44 @@ mod tests {
                     "nh-b".to_string(),
                 ),
             ]
+        );
+    }
+
+    /// `pending_naming_binds` excludes RETIRED rows: a terminal whose
+    /// process exited never re-enters the naming tick's reconcile list (the
+    /// tick's per-row cost is a filesystem walk + a store transaction — a
+    /// retired pane's binding can never advance again, so listing it would
+    /// re-locate it every 2s for the process lifetime).
+    #[test]
+    fn pending_naming_binds_excludes_retired_rows() {
+        let reg = TerminalIdentityRegistry::new();
+        reg.upsert("t-live", Some("claude"), Some("s-live"), None, 1);
+        reg.set_name_binding(
+            "t-live",
+            Some(SessionNameRef::Pending {
+                id: "nh-live".into(),
+            }),
+            Some("nh-live".into()),
+        );
+        reg.upsert("t-exited", Some("claude"), Some("s-exited"), None, 2);
+        reg.set_name_binding(
+            "t-exited",
+            Some(SessionNameRef::Pending {
+                id: "nh-exited".into(),
+            }),
+            Some("nh-exited".into()),
+        );
+        assert!(reg.retire("t-exited"));
+
+        let pending: Vec<String> = reg
+            .pending_naming_binds()
+            .into_iter()
+            .map(|(t, ..)| t)
+            .collect();
+        assert_eq!(
+            pending,
+            vec!["t-live".to_string()],
+            "a retired pane must never re-enter the naming tick's reconcile list"
         );
     }
 

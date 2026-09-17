@@ -540,9 +540,9 @@ async fn main() -> ExitCode {
         // Codex/opencode: their runtime edges (the rollout walk / the DB
         // row) own the verified binds — the tick never fabricates one.
         {
-            use freshell_freshagent::naming::SessionNaming as _;
             let names = names.clone();
             let identity = terminal_identity.clone();
+            let registry = registry.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -558,62 +558,23 @@ async fn main() -> ExitCode {
                             "session_names.operation_failed: {error}"
                         );
                     }
-                    for (terminal_id, provider, session_id, handle) in
+                    for (terminal_id, provider, session_id, _handle) in
                         identity.pending_naming_binds()
                     {
                         if provider != "claude" {
                             continue;
                         }
-                        let Some(selected) =
-                            freshell_freshagent::locate_transcript_selected(&session_id)
-                        else {
-                            continue;
-                        };
-                        let acquisition =
-                            freshell_protocol::native_location::NativeAcquisition {
-                                location: freshell_protocol::native_location::NativeLocation::Claude {
-                                    config_root: selected.config_root.to_string_lossy().into_owned(),
-                                    transcript_path: Some(
-                                        selected.transcript_path.to_string_lossy().into_owned(),
-                                    ),
-                                    project_directory_key: None,
-                                    transcript_cwd: selected.transcript_cwd.clone(),
-                                    effective_project_key_override: None,
-                                },
-                                evidence:
-                                    freshell_protocol::native_location::NativeEvidenceKind::SelectedTranscript,
-                                persistence:
-                                    freshell_protocol::native_location::NativePersistence::Verified,
-                            };
-                        let bind = names
-                            .bind_pending(freshell_freshagent::naming::BindNameInput {
-                                pending:
-                                    freshell_protocol::session_names::SessionNameRef::Pending {
-                                        id: handle.clone(),
-                                    },
-                                target: freshell_protocol::session_names::SessionNameRef::Session {
-                                    provider:
-                                        freshell_protocol::session_names::NamedProvider::Claude,
-                                    session_id: session_id.clone(),
-                                },
-                                acquisition,
-                            })
-                            .await;
-                        if let Err(error) = bind {
-                            tracing::warn!(
-                                target: "freshell_server::session_names",
-                                op = "bind_pending",
-                                name_ref = %freshell_freshagent::naming::name_ref_debug_key(
-                                    &freshell_protocol::session_names::SessionNameRef::Pending {
-                                        id: handle,
-                                    }
-                                ),
-                                revision = 0,
-                                class = %error.code(),
-                                terminal_id = %terminal_id,
-                                "session_names.operation_failed: {error}"
-                            );
-                        }
+                        // One bounded locate + bind per still-pending claude
+                        // row; a miss or failure keeps the row pending for
+                        // the next tick's visible retry (the helper logs its
+                        // own failure classes).
+                        let _ = freshell_ws::identity::bind_pending_claude_transcript(
+                            &identity,
+                            &registry,
+                            &terminal_id,
+                            &session_id,
+                        )
+                        .await;
                     }
                 }
             });
@@ -627,37 +588,17 @@ async fn main() -> ExitCode {
         // (`sessions.changed`) so renamed rows re-read immediately.
         {
             let names = names.clone();
+            let updates = names.subscribe();
             let registry = registry.clone();
             let broadcast_tx = Arc::clone(&broadcast_tx);
             let sessions_revision = Arc::clone(&sessions_revision);
-            tokio::spawn(async move {
-                let mut updates = names.subscribe();
-                loop {
-                    let Ok(update) = updates.recv().await else {
-                        continue;
-                    };
-                    for terminal_id in registry.terminals_bound_to(&update.record.name_ref) {
-                        registry.update_session_name(&terminal_id, &update.record);
-                    }
-                    let frame = freshell_protocol::ServerMessage::SessionNameUpdated(
-                        freshell_protocol::session_names::SessionNameUpdated {
-                            record: update.record.clone(),
-                            document_generation: update.document_generation,
-                            redirects: update.redirects.clone(),
-                            changed: update.changed,
-                        },
-                    );
-                    if let Ok(serialized) = serde_json::to_string(&frame) {
-                        let _ = broadcast_tx.send(serialized);
-                    }
-                    let revision =
-                        sessions_revision.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-                    let _ = broadcast_tx.send(
-                        serde_json::json!({ "type": "sessions.changed", "revision": revision })
-                            .to_string(),
-                    );
-                }
-            });
+            tokio::spawn(session_names::run_naming_publisher(
+                names,
+                updates,
+                registry,
+                broadcast_tx,
+                sessions_revision,
+            ));
         }
     }
     // TERM-11 fix: honor `settings.safety.autoKillIdleMinutes` at boot (the

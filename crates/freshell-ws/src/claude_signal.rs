@@ -317,12 +317,15 @@ async fn apply_claude_signal(state: &WsState, sig: &ClaudeSignal) -> SignalDispo
         now_ms(),
     );
     // Unified agent names (Task 2): the SessionStart identity move. The
-    // upsert retargeted the pane's name ref onto the reported session; the
-    // stashed pending handle (if any — a first bind) transfers onto it with
-    // the EXISTING claude durability evidence: the CLI writes the session
-    // transcript at startup, so a located transcript verifies the binding
-    // (a zero-turn miss keeps the handle pending — InitialRecovery updates
-    // the acquired location only, never the name authority).
+    // upsert established the durable identity and retargets only an
+    // ALREADY-DURABLE name ref (the switch rule: an established binding
+    // follows its session); a still-pending ref waits HERE for its
+    // first-bind transfer — the stashed pending handle transfers onto the
+    // reported session with the EXISTING claude durability evidence: the CLI
+    // writes the session transcript at startup, so a located transcript
+    // verifies the binding (a zero-turn miss keeps the handle pending —
+    // InitialRecovery updates the acquired location only, never the name
+    // authority; the main.rs naming tick retries the verified transition).
     {
         let selected = freshell_freshagent::locate_transcript_selected(&sig.session_id);
         let (persistence, evidence) = if selected.is_some() {
@@ -369,10 +372,14 @@ async fn apply_claude_signal(state: &WsState, sig: &ClaudeSignal) -> SignalDispo
                 let pending =
                     freshell_protocol::session_names::SessionNameRef::Pending { id: handle };
                 if let Err(error) = sink.record_acquisition(pending.clone(), acquisition).await {
-                    freshell_freshagent::naming::log_name_error(
-                        "record_acquisition",
-                        &pending,
-                        &error,
+                    // Structured failure log under THIS crate's target.
+                    tracing::warn!(
+                        target: "freshell_ws::naming",
+                        op = "record_acquisition",
+                        name_ref = %freshell_freshagent::naming::name_ref_debug_key(&pending),
+                        revision = error.log_revision(),
+                        class = %error.code(),
+                        "session_names.operation_failed: {error}"
                     );
                 }
             }

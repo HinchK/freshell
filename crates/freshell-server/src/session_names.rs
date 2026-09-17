@@ -636,6 +636,101 @@ impl SessionNaming for SessionNames {
 }
 
 // ---------------------------------------------------------------------------
+// Naming publisher (Task 2 wiring)
+// ---------------------------------------------------------------------------
+
+/// Unified agent names (Task 2): the naming publisher task body — every
+/// committed update (this process's own writes and adopted external ones)
+/// reaches WS clients as the canonical `session.name.updated` frame, refreshes
+/// the registry display caches of every terminal bound to the record (title
+/// write-through), and invalidates the session directory (`sessions.changed`)
+/// so renamed rows re-read immediately. Extracted from `main`'s spawned
+/// block so the subscription-lag recovery is testable against the real store.
+///
+/// Subscription-lag recovery (plan rule 8): a `Lagged` recv — a burst of
+/// commits overran the broadcast history while this task was slow —
+/// re-adopts the full document (`refresh_current`, a strict Read that does
+/// NOT re-publish to the channel) and re-diffs EVERY record through the
+/// same push, so a missed frame cannot leave a registry display cache or a
+/// WS client stale until the record changes again. A `Closed` channel ends
+/// the task — never a busy-loop.
+pub(crate) async fn run_naming_publisher(
+    names: Arc<SessionNames>,
+    mut updates: broadcast::Receiver<SessionNameUpdate>,
+    registry: freshell_terminal::TerminalRegistry,
+    broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+    sessions_revision: Arc<std::sync::atomic::AtomicI64>,
+) {
+    async fn push(
+        registry: &freshell_terminal::TerminalRegistry,
+        broadcast_tx: &tokio::sync::broadcast::Sender<String>,
+        sessions_revision: &std::sync::atomic::AtomicI64,
+        update: SessionNameUpdate,
+    ) {
+        for terminal_id in registry.terminals_bound_to(&update.record.name_ref) {
+            registry.update_session_name(&terminal_id, &update.record);
+        }
+        let frame = freshell_protocol::ServerMessage::SessionNameUpdated(
+            freshell_protocol::session_names::SessionNameUpdated {
+                record: update.record.clone(),
+                document_generation: update.document_generation,
+                redirects: update.redirects.clone(),
+                changed: update.changed,
+            },
+        );
+        if let Ok(serialized) = serde_json::to_string(&frame) {
+            let _ = broadcast_tx.send(serialized);
+        }
+        let revision = sessions_revision.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let _ = broadcast_tx.send(
+            serde_json::json!({ "type": "sessions.changed", "revision": revision }).to_string(),
+        );
+    }
+
+    loop {
+        match updates.recv().await {
+            Ok(update) => {
+                push(&registry, &broadcast_tx, &sessions_revision, update).await;
+            }
+            Err(broadcast::error::RecvError::Lagged(missed)) => {
+                tracing::warn!(
+                    target: "freshell_server::session_names",
+                    op = "publisher_lag",
+                    name_ref = "-",
+                    revision = 0,
+                    class = "lagged",
+                    missed = missed,
+                    "session_names.operation_failed: publisher lagged behind {missed} \
+                     update(s); re-adopting the document and re-diffing every record"
+                );
+                match names.refresh_current().await {
+                    Ok(recovered) => {
+                        for update in recovered {
+                            push(&registry, &broadcast_tx, &sessions_revision, update).await;
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "freshell_server::session_names",
+                            op = "refresh_current",
+                            name_ref = "-",
+                            revision = 0,
+                            class = %error.code(),
+                            "session_names.operation_failed: {error}"
+                        );
+                    }
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                // The store is gone (its Arc dropped with it): the publisher
+                // ends.
+                break;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Transaction runner
 // ---------------------------------------------------------------------------
 

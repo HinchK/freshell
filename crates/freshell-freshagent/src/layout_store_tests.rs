@@ -1292,3 +1292,145 @@ fn update_from_ui_stores_unresolvable_fresh_agent_content_verbatim() {
         "unresolvable payload passes through verbatim — legacy key rides along"
     );
 }
+
+// ── unified agent names (Task 2 review, M2): the stable-tab-ownership
+// nameSource contract (derive/read/remap) ────────────────────────────────────
+
+/// A tab's name source is DERIVED DETERMINISTICALLY from its first
+/// depth-first leaf: a scoped agent leaf owns the tab (`Session` with that
+/// pane id); any other real content leaf is `legacy`; a tab with no
+/// resolvable leaf stays `None` (the initial-picker state).
+#[test]
+fn name_source_derivation_first_leaf_scoped_legacy_and_empty_picker() {
+    let store = LayoutStore::default();
+
+    // First leaf scoped => that leaf's session owns the tab.
+    store.update_from_ui(
+        &sync_from(json!({
+            "tabs": [{ "id": "t1", "title": "T" }],
+            "activeTabId": "t1",
+            "layouts": { "t1": split("s1", "horizontal", [50, 50],
+                leaf("p-agent", json!({ "kind": "terminal", "mode": "claude" })),
+                leaf("p-shell", json!({ "kind": "terminal", "mode": "shell" }))) },
+            "activePane": { "t1": "p-shell" },
+            "timestamp": 1,
+        })),
+        "conn",
+    );
+    assert_eq!(
+        store.tab_name_source("t1"),
+        Some(freshell_protocol::session_names::TabNameSource::Session {
+            pane_id: "p-agent".into(),
+        }),
+        "the FIRST leaf decides: the scoped agent leaf owns the tab even when \
+         it is not the active pane"
+    );
+
+    // First leaf non-agent => legacy, even with an agent added LATER.
+    store.update_from_ui(
+        &sync_from(json!({
+            "tabs": [{ "id": "t2", "title": "T2" }],
+            "activeTabId": "t2",
+            "layouts": { "t2": split("s2", "horizontal", [50, 50],
+                leaf("p-shell-2", json!({ "kind": "terminal", "mode": "shell" })),
+                leaf("p-agent-2", json!({ "kind": "terminal", "mode": "codex" }))) },
+            "activePane": { "t2": "p-agent-2" },
+            "timestamp": 2,
+        })),
+        "conn",
+    );
+    assert_eq!(
+        store.tab_name_source("t2"),
+        Some(freshell_protocol::session_names::TabNameSource::Legacy),
+        "a legacy tab that later gains an agent pane NEVER flips its naming"
+    );
+
+    // A tab whose leaves carry no resolvable content kind stays `None`
+    // (the initial-picker state — never a fabricated owner).
+    store.update_from_ui(
+        &sync_from(json!({
+            "tabs": [{ "id": "t3", "title": "T3" }],
+            "activeTabId": "t3",
+            "layouts": { "t3": leaf("p-empty", json!({})) },
+            "activePane": { "t3": "p-empty" },
+            "timestamp": 3,
+        })),
+        "conn",
+    );
+    assert_eq!(
+        store.tab_name_source("t3"),
+        None,
+        "an empty picker stays None until content resolves ownership"
+    );
+
+    // The server-minted bootstrap tab (create_tab's detached terminal
+    // leaf) derives `legacy`, and an unknown tab answers None.
+    let (tab_id, _pane_id) = store.create_tab(Some("Minted"));
+    assert_eq!(
+        store.tab_name_source(&tab_id),
+        Some(freshell_protocol::session_names::TabNameSource::Legacy),
+        "a detached terminal leaf is the existing non-agent derivation"
+    );
+    assert_eq!(store.tab_name_source("no-such-tab"), None);
+}
+
+/// Closing the tab's SOURCE pane re-derives the ownership ONCE,
+/// deterministically: the first remaining scoped leaf takes over; with no
+/// scoped leaf left the tab falls back to `legacy`; closing a NON-source
+/// pane never moves the source.
+#[test]
+fn name_source_remaps_once_deterministically_when_the_source_closes() {
+    let store = LayoutStore::default();
+    store.update_from_ui(
+        &sync_from(json!({
+            "tabs": [{ "id": "t1", "title": "T" }],
+            "activeTabId": "t1",
+            "layouts": { "t1": split("s1", "horizontal", [50, 50],
+                leaf("p-a", json!({ "kind": "terminal", "mode": "claude" })),
+                split("s2", "horizontal", [50, 50],
+                    split("s3", "horizontal", [50, 50],
+                        leaf("p-b", json!({ "kind": "terminal", "mode": "opencode" })),
+                        leaf("p-shell", json!({ "kind": "terminal", "mode": "shell" }))),
+                    leaf("p-shell2", json!({ "kind": "terminal", "mode": "shell" }))) ) },
+            "activePane": { "t1": "p-shell" },
+            "timestamp": 1,
+        })),
+        "conn",
+    );
+    assert_eq!(
+        store.tab_name_source("t1"),
+        Some(freshell_protocol::session_names::TabNameSource::Session {
+            pane_id: "p-a".into(),
+        })
+    );
+
+    // Closing a NON-source pane never moves the source.
+    store
+        .close_pane("p-shell2")
+        .expect("close a non-source pane");
+    assert_eq!(
+        store.tab_name_source("t1"),
+        Some(freshell_protocol::session_names::TabNameSource::Session {
+            pane_id: "p-a".into(),
+        }),
+        "closing a non-source pane must not re-derive the source"
+    );
+
+    // Closing the SOURCE re-derives once: the first remaining scoped leaf.
+    store.close_pane("p-a").expect("close the source pane");
+    assert_eq!(
+        store.tab_name_source("t1"),
+        Some(freshell_protocol::session_names::TabNameSource::Session {
+            pane_id: "p-b".into(),
+        }),
+        "the close re-derives to the first remaining scoped leaf (depth-first)"
+    );
+
+    // With no scoped leaf left, the tab falls back to legacy.
+    store.close_pane("p-b").expect("close the successor source");
+    assert_eq!(
+        store.tab_name_source("t1"),
+        Some(freshell_protocol::session_names::TabNameSource::Legacy),
+        "a tab with no scoped leaf left returns to the non-agent derivation"
+    );
+}

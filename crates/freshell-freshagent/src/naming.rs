@@ -175,6 +175,17 @@ impl NameError {
         }
     }
 
+    /// The revision a structured error log should attribute: the accepted
+    /// record's revision for a compare-and-set conflict, else 0. Shared by
+    /// this crate's `log_name_error` and the other crates' inline naming
+    /// error logs (their `tracing` targets must be their own literals).
+    pub fn log_revision(&self) -> NameRevision {
+        match self {
+            Self::Conflict { current, .. } => current.as_ref().map(|r| r.revision).unwrap_or(0),
+            _ => 0,
+        }
+    }
+
     /// Stable machine-readable code for route payloads/logs.
     pub fn code(&self) -> &'static str {
         match self {
@@ -356,17 +367,20 @@ impl std::fmt::Debug for NamingSink {
 /// Global Constraints' severity/operation/name-reference/revision/failure-
 /// class JSONL requirement — `tracing` is this server's JSONL channel; no
 /// prompts, credentials, or native payloads are ever included).
+///
+/// `tracing` macro targets must be literals, so this fn logs under THIS
+/// crate's own target (`freshell_freshagent::naming`) — call sites that live
+/// in OTHER crates (`freshell-ws`' identity/signal lanes, `freshell-server`'s
+/// route handlers) write their own inline `tracing::warn!` under their own
+/// crate's target instead of calling this fn, sharing
+/// [`NameError::log_revision`] and [`NameError::code`]; log filtering then
+/// routes by the code that owns each call site.
 pub fn log_name_error(op: &str, target: &SessionNameRef, error: &NameError) {
-    let revision = if let NameError::Conflict { current, .. } = error {
-        current.as_ref().map(|r| r.revision).unwrap_or(0)
-    } else {
-        0
-    };
     tracing::warn!(
-        target: "freshell_server::session_names",
+        target: "freshell_freshagent::naming",
         op = %op,
         name_ref = %name_ref_debug_key(target),
-        revision = revision,
+        revision = error.log_revision(),
         class = %error.code(),
         "session_names.operation_failed: {}",
         error

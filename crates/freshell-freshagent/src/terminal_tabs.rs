@@ -2285,11 +2285,41 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                         })
                         .await
                     {
-                        Ok(_) => {
+                        Ok(update) => {
                             state.stash_naming_handle(&terminal_id, &handle);
                             pane_content["namingHandle"] = json!(handle);
                             naming_handle = Some(handle);
-                            let _ = pending;
+                            // Unified agent names (Task 2 review, I3): the
+                            // CLI-supplied `name` seeds the admitted record
+                            // with the SAME intent default as the fresh-agent
+                            // create lane (`lib.rs` `create_tab`'s seed —
+                            // automatic: an agent/API suggestion never
+                            // acquires a user rename's permanence), so the
+                            // saved name agrees with the layout title.
+                            // Logged, never blocking.
+                            if let Some(seed) = body
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                            {
+                                if let Err(error) = sink
+                                    .rename(crate::naming::RenameNameInput {
+                                        target: pending,
+                                        name: seed.to_string(),
+                                        intent:
+                                            freshell_protocol::session_names::NameIntent::Automatic,
+                                        if_revision: None,
+                                    })
+                                    .await
+                                {
+                                    crate::naming::log_name_error(
+                                        "rename",
+                                        &update.record.name_ref,
+                                        &error,
+                                    );
+                                }
+                            }
                         }
                         Err(error) => {
                             crate::naming::log_name_error("ensure_pending", &pending, &error);
@@ -4028,6 +4058,74 @@ if (args.includes('app-server')) {{
             1,
             "codex mode must arm the codex locator"
         );
+    }
+
+    /// Unified agent names (Task 2 review, I3): the REST/CLI terminal-create
+    /// lane seeds the CLI-supplied `name` into the admitted pending record
+    /// with the automatic intent — mirroring `lib.rs::create_tab`'s
+    /// fresh-agent seed, so a scoped terminal pane's saved name agrees with
+    /// its layout title instead of silently regressing to the
+    /// directory-basename fallback once the client prefers the session
+    /// record.
+    #[tokio::test]
+    async fn rest_cli_terminal_create_seeds_the_requested_name_into_the_pending_record() {
+        use crate::naming::SessionNaming as _;
+        use freshell_protocol::session_names::{NameIntent, SessionNameRef};
+
+        let argv_file = unique_argv_file("opencode-name-seed");
+        let state =
+            state_with_registry().with_cli_commands(std::sync::Arc::new(vec![recording_cli_spec(
+                "opencode", &argv_file,
+            )]));
+        let sink = crate::naming::test_support::RecordingSink::new();
+        state.set_session_naming(sink.clone());
+        let tmp = std::env::temp_dir();
+
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            json!({
+                "mode": "opencode",
+                "name": "Research Spike",
+                "cwd": tmp.to_string_lossy(),
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let terminal_id = body["data"]["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+
+        // The CLI-supplied name landed on the pending record with the
+        // automatic intent (an agent suggestion never acquires a user
+        // rename's permanence).
+        let renames = sink.renames.lock().unwrap().clone();
+        assert_eq!(
+            renames.len(),
+            1,
+            "the create must seed the CLI-supplied name exactly once: {renames:?}"
+        );
+        assert_eq!(renames[0].name, "Research Spike");
+        assert_eq!(renames[0].intent, NameIntent::Automatic);
+        assert!(
+            matches!(renames[0].target, SessionNameRef::Pending { .. }),
+            "the seed targets the pane's pre-durable record: {renames:?}"
+        );
+
+        // The record ANSWERS through the pending handle the create stashed.
+        let handle = state
+            .peek_naming_handle(&terminal_id)
+            .expect("the create stashed its pending handle by terminal id");
+        let got = sink
+            .get(vec![SessionNameRef::Pending { id: handle }])
+            .await
+            .expect("get the seeded record");
+        assert_eq!(got[0].record.name, "Research Spike");
+
+        state.terminal_registry.clone().unwrap().kill(&terminal_id);
+        let _ = std::fs::remove_file(&argv_file);
     }
 
     /// A recording spec whose `resume_args` mirror the REAL amplifier

@@ -50,6 +50,20 @@ async fn patch_pane(router: Router, pane_id: &str, name: &str) -> (StatusCode, V
     (status, body_json(resp).await)
 }
 
+/// `PATCH /api/tabs/:id` with the given body (the tab rename route).
+async fn patch_tab(router: Router, tab_id: &str, body: Value) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("PATCH")
+        .uri(format!("/api/tabs/{tab_id}"))
+        .header("content-type", "application/json")
+        .header("x-auth-token", "tok")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
 /// Create a REAL registry terminal via the Slice-1 shell-tab route, returning
 /// its `terminalId` (`pane_ops_tests::create_shell_tab` pattern).
 async fn create_registry_terminal(router: Router) -> String {
@@ -537,6 +551,140 @@ async fn naming_resume_and_new_conversation_follow_the_current_binding() {
         2,
         "the refused rename never reached the authority: {renames:?}"
     );
+}
+
+/// Unified agent names (Task 2 review, M2): a session-owned tab has NO
+/// separately stored name — renaming the TAB targets the SOURCE pane's
+/// session (the deterministic first-leaf the mirror recorded), never the
+/// ACTIVE pane. This tab's active pane is a shell leaf; its source pane is
+/// the scoped claude leaf — the rename must land on the source session and
+/// never write the layout alias.
+#[tokio::test]
+async fn rename_tab_routes_a_multi_pane_tab_through_its_source_pane_not_the_active_pane() {
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+    let state = state_with(tx.clone());
+    let sink = wire_recording_sink(&state);
+    seed_durable_record(&sink, "handle-tabsrc", "sess-tab-src").await;
+
+    // Tab t1: the SOURCE pane p1 (first leaf, scoped claude) plus a shell
+    // leaf p2 that holds the ACTIVE-PANE slot — the pane a rename routed
+    // through `activePane` would wrongly target (falling to the legacy
+    // layout rename).
+    seed_layout(
+        &state,
+        json!({
+            "tabs": [{ "id": "t1", "title": "First" }],
+            "activeTabId": "t1",
+            "layouts": { "t1": {
+                "type": "split", "id": "s1", "direction": "horizontal", "sizes": [50, 50],
+                "children": [
+                    { "type": "leaf", "id": "p1", "content": {
+                        "kind": "terminal", "mode": "claude",
+                        "sessionRef": { "provider": "claude", "sessionId": "sess-tab-src" },
+                    } },
+                    { "type": "leaf", "id": "p2", "content": { "kind": "terminal", "mode": "shell" } },
+                ],
+            } },
+            "activePane": { "t1": "p2" },
+            "paneTitles": {},
+            "paneTitleSetByUser": {},
+            "timestamp": 1,
+        }),
+    );
+
+    let (status, body) = patch_tab(
+        crate::router(state.clone()),
+        "t1",
+        json!({ "name": "Via Tab Rename" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Exactly ONE rename, targeting the SOURCE pane's durable session.
+    let renames = sink.renames.lock().unwrap();
+    assert_eq!(renames.len(), 1, "{renames:?}");
+    assert_eq!(
+        renames[0].target,
+        SessionNameRef::Session {
+            provider: NamedProvider::Claude,
+            session_id: "sess-tab-src".into(),
+        },
+        "the tab rename must target the SOURCE pane's session, never the active pane"
+    );
+    assert_eq!(renames[0].name, "Via Tab Rename");
+    drop(renames);
+
+    // The accepted record rides the response envelope.
+    assert_eq!(
+        body["data"]["sessionName"]["record"]["name"],
+        json!("Via Tab Rename"),
+        "{body}"
+    );
+    // And NO layout-alias frames: the accepted name publishes through the
+    // naming publisher, never a sticky ui.command title.
+    let mut rx = tx.subscribe();
+    assert!(
+        drain_frames(&mut rx).is_empty(),
+        "a scoped tab rename emits no layout-alias frames"
+    );
+}
+
+/// Unified agent names (Task 2 review, M4): a scoped blank/absent `name`
+/// through the pane/tab convenience routes answers the SAME machine-readable
+/// refusal as the canonical/session/terminal surfaces — 400
+/// `NAME_RESET_UNSUPPORTED` — because a scoped session's saved name is never
+/// cleared. (The legacy `name required` contract stays for non-scoped panes.)
+#[tokio::test]
+async fn scoped_blank_rename_refuses_name_reset_unsupported_on_pane_and_tab_routes() {
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+    let state = state_with(tx.clone());
+    let sink = wire_recording_sink(&state);
+    seed_durable_record(&sink, "handle-blank", "sess-blank-ref").await;
+
+    seed_layout(
+        &state,
+        lone_pane_layout(json!({
+            "kind": "terminal",
+            "mode": "claude",
+            "sessionRef": { "provider": "claude", "sessionId": "sess-blank-ref" },
+        })),
+    );
+
+    // The pane route: a blank name, and an absent name — both must answer
+    // 400 NAME_RESET_UNSUPPORTED.
+    for body in [json!({ "name": "" }), json!({})] {
+        let router = crate::router(state.clone());
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/panes/p1")
+            .header("content-type", "application/json")
+            .header("x-auth-token", "tok")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+        let answered = body_json(resp).await;
+        assert_eq!(
+            answered["error"],
+            json!("NAME_RESET_UNSUPPORTED"),
+            "the scoped pane route must refuse a blank name with the uniform code: {body} -> {answered}"
+        );
+    }
+
+    // The tab route (the tab's source pane is the scoped pane p1): same
+    // refusal, same code.
+    for body in [json!({ "name": "" }), json!({})] {
+        let (status, answered) = patch_tab(crate::router(state.clone()), "t1", body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(
+            answered["error"],
+            json!("NAME_RESET_UNSUPPORTED"),
+            "the scoped tab route must refuse a blank name with the uniform code: {body} -> {answered}"
+        );
+    }
+
+    // Nothing ever reached the authority (a protected name is never cleared).
+    assert!(sink.renames.lock().unwrap().is_empty());
 }
 
 /// Unified agent names (Task 2): the route passes the editor's inputs

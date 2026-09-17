@@ -12,9 +12,9 @@
 //!
 //! Error policy (plan "Name acceptance, storage, and publication"): every
 //! error path logs STRUCTURED severity/operation/name-reference/revision/
-//! failure-class JSONL (`naming::log_name_error` — `tracing` is this
-//! server's JSONL channel) and answers the mapped HTTP status with the
-//! stable machine-readable `NameError::code()`.
+//! failure-class JSONL (inline `tracing::warn!` under this crate's own
+//! target — `tracing` is this server's JSONL channel) and answers the mapped
+//! HTTP status with the stable machine-readable `NameError::code()`.
 
 use std::sync::Arc;
 
@@ -28,7 +28,7 @@ use axum::{
 use serde_json::{json, Value};
 
 use freshell_freshagent::naming::{
-    log_name_error, NameError, RenameNameInput, SessionNaming, NAME_RESET_UNSUPPORTED,
+    name_ref_debug_key, NameError, RenameNameInput, SessionNaming, NAME_RESET_UNSUPPORTED,
 };
 use freshell_protocol::session_names::{
     NameIntent, RenameSessionNameRequest, SessionNameRef, MAX_NAME_REVISION,
@@ -107,7 +107,16 @@ pub(crate) async fn rename_through_authority(
     {
         Ok(update) => Ok(update),
         Err(error) => {
-            log_name_error("rename", &target, &error);
+            // Structured failure log under this server's own target
+            // (`tracing` macro targets must be literals).
+            tracing::warn!(
+                target: "freshell_server::session_names",
+                op = "rename",
+                name_ref = %name_ref_debug_key(&target),
+                revision = error.log_revision(),
+                class = %error.code(),
+                "session_names.operation_failed: {error}"
+            );
             Err(name_error_response(&error, &target))
         }
     }
@@ -182,10 +191,13 @@ async fn read_session_names(
     // polling. Adoption failures degrade to the last established snapshot
     // (the read still answers from it), loudly logged.
     if let Err(error) = state.names.refresh_current().await {
-        log_name_error(
-            "refresh_current",
-            &SessionNameRef::Pending { id: "-".into() },
-            &error,
+        tracing::warn!(
+            target: "freshell_server::session_names",
+            op = "refresh_current",
+            name_ref = "-",
+            revision = 0,
+            class = %error.code(),
+            "session_names.operation_failed: {error}"
         );
     }
     match state.names.get(targets).await {

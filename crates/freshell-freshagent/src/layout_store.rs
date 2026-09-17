@@ -533,8 +533,7 @@ impl LayoutStore {
         seed_pane_title(snapshot, &tab_id, &pane_id, &content);
         // Unified agent names (Task 2): the server-minted tab's name source
         // follows its original pane (a detached terminal leaf is legacy;
-        // the fresh paths re-derive after attaching real content via
-        // [`Self::refresh_tab_name_source`]).
+        // the fresh/attach paths re-derive after real content lands).
         let name_source = derive_name_source(snapshot, &tab_id);
         if let Some(tab) = snapshot.tabs.iter_mut().find(|t| t.id == tab_id) {
             tab.name_source = name_source;
@@ -559,23 +558,6 @@ impl LayoutStore {
                 .and_then(|t| t.name_source.clone())
         });
         found
-    }
-
-    /// Unified agent names (Task 2): re-derive a tab's name source from its
-    /// CURRENT content in every client snapshot that has the tab — the
-    /// attach-a-pane-content path's initializer, and the close/move
-    /// remapping rule's "choose once" arm (first remaining scoped leaf,
-    /// else legacy, else the picker's `None`).
-    pub fn refresh_tab_name_source(&self, tab_id: &str) {
-        let mut inner = self.lock();
-        for snapshot in inner.snapshots_mut() {
-            if snapshot.tabs.iter().any(|t| t.id == tab_id) {
-                let name_source = derive_name_source(snapshot, tab_id);
-                if let Some(tab) = snapshot.tabs.iter_mut().find(|t| t.id == tab_id) {
-                    tab.name_source = name_source;
-                }
-            }
-        }
     }
 
     /// Unified agent names (Task 2): the source-pane remap after a pane

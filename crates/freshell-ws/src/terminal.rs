@@ -2879,7 +2879,17 @@ async fn admit_create_naming(
         let updates = sink
             .get(vec![target.clone()])
             .await
-            .map_err(|error| freshell_freshagent::naming::log_name_error("get", &target, &error))
+            .map_err(|error| {
+                // Structured failure log under THIS crate's target.
+                tracing::warn!(
+                    target: "freshell_ws::naming",
+                    op = "get",
+                    name_ref = %freshell_freshagent::naming::name_ref_debug_key(&target),
+                    revision = error.log_revision(),
+                    class = %error.code(),
+                    "session_names.operation_failed: {error}"
+                );
+            })
             .ok()?;
         let update = updates.into_iter().next()?;
         state
@@ -2903,7 +2913,15 @@ async fn admit_create_naming(
         })
         .await
         .map_err(|error| {
-            freshell_freshagent::naming::log_name_error("ensure_pending", &pending, &error)
+            // Structured failure log under THIS crate's target.
+            tracing::warn!(
+                target: "freshell_ws::naming",
+                op = "ensure_pending",
+                name_ref = %freshell_freshagent::naming::name_ref_debug_key(&pending),
+                revision = error.log_revision(),
+                class = %error.code(),
+                "session_names.operation_failed: {error}"
+            );
         })
         .ok()?;
     let target = update.record.name_ref.clone();

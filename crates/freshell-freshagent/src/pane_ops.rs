@@ -456,15 +456,13 @@ pub(crate) async fn rename_tab(
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
 
-    let Some(name) = parse_required_name(body.get("name")) else {
-        return fail_json(StatusCode::BAD_REQUEST, "name required".to_string());
-    };
-
     // Unified agent names (Task 2): a session-owned tab has NO separately
     // stored name — its display IS its source pane's canonical session name,
     // so a rename targets that pane's saved session (the stable source the
-    // mirror recorded, never the active pane or last activity). Legacy tabs
-    // keep the existing layout rename.
+    // mirror recorded, never the active pane or last activity). The shared
+    // helper owns the scoped blank/reset refusal (`NAME_RESET_UNSUPPORTED`),
+    // so this resolution runs BEFORE the legacy `name required` gate. Legacy
+    // tabs keep the existing layout rename.
     if let Some(freshell_protocol::session_names::TabNameSource::Session {
         pane_id: source_pane_id,
     }) = state.layout.tab_name_source(&tab_id)
@@ -482,6 +480,10 @@ pub(crate) async fn rename_tab(
             }
         }
     }
+
+    let Some(name) = parse_required_name(body.get("name")) else {
+        return fail_json(StatusCode::BAD_REQUEST, "name required".to_string());
+    };
 
     let outcome = state.layout.rename_tab(&tab_id, &name);
 
