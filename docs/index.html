@@ -233,6 +233,20 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
 
 /* ========== Content ========== */
 .content { flex: 1; min-width: 0; display: flex; flex-direction: column; position: relative; }
+/* Floating add/split pane button — part of the default desktop experience
+   (panes.floatingActionButton platform default; static mock, no JS behavior).
+   Hidden while the settings view is active (the real app mounts no
+   PaneLayout/FAB while Settings is open) and at mobile width below. */
+.fab {
+  position: absolute; bottom: 48px; right: 16px; z-index: 50;
+  width: 48px; height: 48px; border-radius: 9999px;
+  background: hsl(var(--foreground) / .7); color: hsl(var(--background));
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 10px 15px -3px rgb(0 0 0 / .35);
+  cursor: pointer; transition: background .15s;
+}
+.fab:hover { background: hsl(var(--foreground) / .85); }
+#settings-view.active ~ .fab { display: none; }
 .tab-panel { display: none; flex: 1; min-height: 0; }
 .tab-panel.active { display: flex; }
 
@@ -480,6 +494,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
   .fresh-composer { grid-template-columns: minmax(0, 1fr); padding-right: 76px; }
   .fresh-actions { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
   .fresh-action { width: 100%; }
+  .fab { display: none; }
 }
 
 /* ========== Settings View ========== */
@@ -1299,6 +1314,8 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
           </div>
         </div>
       </section>
+      <!-- Floating add/split pane button (default-on at desktop width; nonfunctional mock) -->
+      <button type="button" class="fab" title="Add pane" aria-label="Add pane"><i data-lucide="plus" class="icon"></i></button>
     </div>
   </div>
 </div>
