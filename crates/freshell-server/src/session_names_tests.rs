@@ -170,16 +170,19 @@ fn read_raw_document(dir: &Path) -> StoredDocument {
     parse_document(&bytes).expect("raw document parses")
 }
 
-/// Bypass helper for corruption fixtures: write a raw document UNDER the
-/// sidecar lock, mirroring the strict path's discipline.
+/// Bypass helper for corruption fixtures: serialize and write a raw document
+/// UNDER the sidecar lock, mirroring the strict path's discipline.
 fn write_raw_document(dir: &Path, document: &StoredDocument) {
+    let bytes = serialize_document(document).expect("serialize raw document");
+    write_raw_document_bytes(dir, &bytes);
+}
+
+/// Bypass helper writing EXACT raw bytes (restore fixtures) UNDER the
+/// sidecar lock, mirroring the strict path's discipline.
+fn write_raw_document_bytes(dir: &Path, bytes: &[u8]) {
     let lock = open_lock_file(&dir.join(LOCK_FILE_NAME)).expect("open lock for raw write");
     lock.try_lock().expect("lock for raw write");
-    std::fs::write(
-        dir.join(DOCUMENT_FILE_NAME),
-        serialize_document(document).expect("serialize raw document"),
-    )
-    .expect("write raw document");
+    std::fs::write(dir.join(DOCUMENT_FILE_NAME), bytes).expect("write raw document");
 }
 
 /// The contract rank order (independent of the implementation's helper).
@@ -604,6 +607,67 @@ async fn post_replace_error_fences_until_reconciled() {
     assert_eq!(from_fresh.record.source, NameSource::Manual);
 }
 
+#[tokio::test]
+async fn vanished_document_fences_established_store() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = pending("h-vanished");
+    ensure(
+        &store,
+        "h-vanished",
+        NamedProvider::Claude,
+        Some("/w/vanish"),
+    )
+    .await
+    .expect("ensure pending");
+    rename_user(&store, target.clone(), "Accepted before vanish")
+        .await
+        .expect("rename");
+    let doc_path = dir.path().join(DOCUMENT_FILE_NAME);
+    let original_bytes = std::fs::read(&doc_path).expect("read the established document");
+    let established = store.core.current_view();
+    assert!(established.document.document_generation >= 1);
+
+    // The document disappears under the running store (an external
+    // delete/move by a good-faith cleanup or backup tool).
+    std::fs::remove_file(&doc_path).expect("document vanishes");
+
+    // The next operation fences instead of silently reinitializing.
+    let fenced = store.get(vec![target.clone()]).await;
+    assert!(
+        matches!(fenced, Err(NameError::Persistence(ref message)) if message.contains("vanished")),
+        "a vanished document is an error, not reinitialization: {fenced:?}"
+    );
+
+    // The established view is retained and no fresh document is written.
+    assert_eq!(
+        store.core.current_view().document,
+        established.document,
+        "the fence keeps the established view"
+    );
+    assert!(
+        !doc_path.exists(),
+        "the fence never writes a fresh document"
+    );
+    let fenced_rename = rename_user(&store, target.clone(), "Must not land").await;
+    assert!(
+        matches!(fenced_rename, Err(NameError::Persistence(_))),
+        "mutations are fenced too"
+    );
+
+    // Restoring the exact document resumes operation with state intact.
+    write_raw_document_bytes(dir.path(), &original_bytes);
+    let resumed = get_one(&store, target.clone())
+        .await
+        .expect("operation resumes after restore");
+    assert_eq!(resumed.record.name, "Accepted before vanish");
+    assert_eq!(resumed.record.source, NameSource::Manual);
+    let after = rename_user(&store, target.clone(), "Alive again")
+        .await
+        .expect("mutations resume after restore");
+    assert_eq!(after.record.name, "Alive again");
+}
+
 // ---------------------------------------------------------------------------
 // Cross-process discipline (two REAL processes via the test binary itself)
 // ---------------------------------------------------------------------------
@@ -817,6 +881,21 @@ fn finish_child(child: std::process::Child, result_path: &Path) -> Vec<Value> {
         .collect()
 }
 
+/// Poll the holder child's readiness sentinel: the contended phase may only
+/// begin once the child provably holds the document lock. Bounded, so a child
+/// that never acquires fails loudly instead of hanging the lane.
+async fn wait_for_lock_held_sentinel(dir: &Path) {
+    let sentinel = dir.join(LOCK_HELD_SENTINEL_NAME);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !sentinel.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "holder child never signaled that it acquired the document lock"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cross_process_transactions() {
     if let Ok(role) = std::env::var(ROLE_ENV) {
@@ -952,7 +1031,9 @@ async fn cross_process_transactions() {
 
     // -- lock contention: a held child transaction fences the parent --
     let (holder_child, holder_result) = spawn_child("holder", &data_dir, "", "hold_lock:2500");
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The contended rename may only start once the child provably holds the
+    // document lock — a fixed post-spawn sleep was a start race under load.
+    wait_for_lock_held_sentinel(&data_dir).await;
     let started = Instant::now();
     let contended = rename_user(&parent_store, h1.clone(), "Parent during hold").await;
     let elapsed = started.elapsed();
@@ -1789,6 +1870,62 @@ async fn name_validation_rejects_blank_and_oversize() {
         .await
         .expect("unicode accepted");
     assert_eq!(unicode.record.name, "Fix café shipping — now");
+}
+
+#[tokio::test]
+async fn ensure_pending_pathological_cwd_falls_back_to_provider_label() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+
+    // A control-character basename can never be installed as a name.
+    let control = ensure(
+        &store,
+        "h-bad-cwd",
+        NamedProvider::Claude,
+        Some("/w/bad\u{7}dir"),
+    )
+    .await
+    .expect("ensure with a control-character cwd");
+    assert_eq!(
+        control.record.name, "Claude",
+        "the provider label is the fallback, not {:?}",
+        control.record.name
+    );
+    assert_eq!(control.record.source, NameSource::Directory);
+
+    // An oversize basename (>200 scalars) falls back too.
+    let oversize_cwd = format!("/w/{}", "y".repeat(201));
+    let oversize = ensure(
+        &store,
+        "h-long-cwd",
+        NamedProvider::Opencode,
+        Some(&oversize_cwd),
+    )
+    .await
+    .expect("ensure with an oversize cwd");
+    assert_eq!(
+        oversize.record.name,
+        "OpenCode",
+        "the provider label is the fallback, not {} chars",
+        oversize.record.name.chars().count()
+    );
+    assert_eq!(oversize.record.source, NameSource::Directory);
+
+    // A usable basename still wins, and fallback records are ordinary
+    // rename targets.
+    let usable = ensure(
+        &store,
+        "h-good-cwd",
+        NamedProvider::Codex,
+        Some("/w/gooddir"),
+    )
+    .await
+    .expect("ensure with a usable cwd");
+    assert_eq!(usable.record.name, "gooddir");
+    let renamed = rename_user(&store, pending("h-bad-cwd"), "Fixed later")
+        .await
+        .expect("the fallback record is a normal rename target");
+    assert_eq!(renamed.record.name, "Fixed later");
 }
 
 #[tokio::test]

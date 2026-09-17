@@ -145,6 +145,32 @@ describe('SessionNameRecordSchema', () => {
         .success,
     ).toBe(false)
   })
+
+  it('rejects names the Rust store rejects: control characters, blank, oversize', () => {
+    // Control characters anywhere mirror the store's `any(char::is_control)`.
+    expect(
+      SessionNameRecordSchema.safeParse({ ...baseRecord, name: 'bad\u0007name' }).success,
+    ).toBe(false)
+    expect(SessionNameRecordSchema.safeParse({ ...baseRecord, name: 'tab\tname' }).success).toBe(
+      false,
+    )
+    expect(SessionNameRecordSchema.safeParse({ ...baseRecord, name: 'escape\u001b' }).success).toBe(
+      false,
+    )
+    // Whitespace-only and >200 Unicode scalar values are rejected too.
+    expect(SessionNameRecordSchema.safeParse({ ...baseRecord, name: '   ' }).success).toBe(false)
+    expect(
+      SessionNameRecordSchema.safeParse({ ...baseRecord, name: 'y'.repeat(201) }).success,
+    ).toBe(false)
+    // Exactly 200 scalars and non-control Unicode stay legal.
+    expect(SessionNameRecordSchema.safeParse({ ...baseRecord, name: 'y'.repeat(200) }).success).toBe(
+      true,
+    )
+    expect(
+      SessionNameRecordSchema.safeParse({ ...baseRecord, name: 'Fix café shipping — now' })
+        .success,
+    ).toBe(true)
+  })
 })
 
 describe('SessionNameUpdateSchema', () => {
@@ -218,6 +244,34 @@ describe('RenameSessionNameRequestSchema', () => {
         ifRevision: -2,
       }).success,
     ).toBe(false)
+  })
+
+  it('rejects names the Rust store rejects, so a client-valid rename never 400s', () => {
+    expect(
+      RenameSessionNameRequestSchema.safeParse({
+        target: { kind: 'pending', id: 'h' },
+        name: 'bell\u0007name',
+      }).success,
+    ).toBe(false)
+    expect(
+      RenameSessionNameRequestSchema.safeParse({
+        target: { kind: 'pending', id: 'h' },
+        name: 'y'.repeat(201),
+      }).success,
+    ).toBe(false)
+    expect(
+      RenameSessionNameRequestSchema.safeParse({
+        target: { kind: 'pending', id: 'h' },
+        name: '   ',
+      }).success,
+    ).toBe(false)
+    // Untrimmed input is legal: the server trims before storing.
+    expect(
+      RenameSessionNameRequestSchema.safeParse({
+        target: { kind: 'pending', id: 'h' },
+        name: '  Padded name  ',
+      }).success,
+    ).toBe(true)
   })
 })
 

@@ -22,9 +22,12 @@
 //! publishes. Pre-replace failures leave the old state intact
 //! ([`NameError::Persistence`]); post-replace uncertainty fences the writer
 //! and every other participant until durability reconciliation succeeds
-//! ([`NameError::CommitUncertain`]). The executing blocking-IO owner retains
-//! its guard until completion even if an outer caller stops waiting
-//! (transactions run on detached `spawn_blocking` tasks).
+//! ([`NameError::CommitUncertain`]). A missing document initializes only a
+//! store with no established view — for an established store a vanished
+//! document fences every operation instead of silently reinitializing over
+//! accepted names. The executing blocking-IO owner retains its guard until
+//! completion even if an outer caller stops waiting (transactions run on
+//! detached `spawn_blocking` tasks).
 //!
 //! `session.name.updated` publishes only after successful commit/adoption,
 //! in local generation order (publication happens while the lock is held).
@@ -655,8 +658,19 @@ where
             (parse_document(&bytes)?, digest, false)
         }
         Err(e) if e.kind() == ErrorKind::NotFound => {
-            let digest = [0u8; 32];
-            (StoredDocument::initial(), digest, true)
+            // A missing document is initialization ONLY for a store with no
+            // established view. Once a snapshot has been adopted, a vanished
+            // document is external data loss: silently reinitializing would
+            // permanently discard every accepted name (and a cooperating
+            // second process could adopt the empty lineage). Fence instead
+            // and keep the established view.
+            if core.current_view().document.document_generation > 0 {
+                return Err(NameError::Persistence(
+                    "the session-names document vanished while this store held an established view; refusing to reinitialize over it"
+                        .into(),
+                ));
+            }
+            (StoredDocument::initial(), [0u8; 32], true)
         }
         Err(e) => {
             return Err(NameError::Persistence(format!(
@@ -961,6 +975,12 @@ pub(crate) enum TestHook {
     HoldLock(u64),
 }
 
+/// Readiness sentinel written by `HoldLock` hooks while the document lock is
+/// held: cooperating cross-process tests synchronize on proven lock
+/// ownership instead of a fixed post-spawn delay.
+#[cfg(test)]
+const LOCK_HELD_SENTINEL_NAME: &str = ".session-names-lock-held";
+
 #[cfg(test)]
 pub(crate) fn set_test_hooks(data_dir: &Path, hooks: Vec<TestHook>) {
     test_hook_registry()
@@ -1009,8 +1029,23 @@ fn test_hold_once(_data_dir: &Path) {
         if let Some(TestHook::HoldLock(ms)) =
             take_matching_hook(_data_dir, |h| matches!(h, TestHook::HoldLock(_)))
         {
+            write_lock_held_sentinel(_data_dir);
             std::thread::sleep(Duration::from_millis(ms));
         }
+    }
+}
+
+/// Write the lock-held readiness sentinel from inside a held transaction
+/// (right after lock acquisition). A failed write only degrades a test's
+/// synchronization — it never fails the transaction under test.
+#[cfg(test)]
+fn write_lock_held_sentinel(data_dir: &Path) {
+    let sentinel = data_dir.join(LOCK_HELD_SENTINEL_NAME);
+    if let Err(err) = std::fs::write(&sentinel, b"held") {
+        eprintln!(
+            "cannot write session-names lock-held sentinel {}: {err}",
+            sentinel.display()
+        );
     }
 }
 
@@ -1145,10 +1180,15 @@ fn validate_name(raw: &str) -> Result<String, NameError> {
 
 /// The immediate `ensure_pending` fallback: the existing directory-basename
 /// derivation for a usable cwd, otherwise the provider display label —
-/// always at directory rank.
+/// always at directory rank. A pathological basename (control characters or
+/// oversize) is validated away before it can reach a record: the
+/// always-valid provider label is used instead.
 fn directory_fallback_name(cwd: Option<&str>, provider: &NamedProvider) -> String {
-    cwd.and_then(basename_segment)
-        .unwrap_or_else(|| provider.display_label().to_string())
+    let label = provider.display_label().to_string();
+    let candidate = cwd
+        .and_then(basename_segment)
+        .unwrap_or_else(|| label.clone());
+    validate_name(&candidate).unwrap_or(label)
 }
 
 /// The first-message fallback title (the existing 50-char extraction).
@@ -1243,7 +1283,12 @@ fn offer_mut(
 
 /// Record/advance verified routing evidence. `location_revision` is assigned
 /// whenever the verified evidence CHANGES; identical evidence is a no-op.
-fn apply_verified_location(document: &mut StoredDocument, key: &str, location: NativeLocation) {
+/// Returns whether the verified evidence changed.
+fn apply_verified_location(
+    document: &mut StoredDocument,
+    key: &str,
+    location: NativeLocation,
+) -> bool {
     let entry = document.locations.entry(key.to_string()).or_default();
     match &entry.verified {
         None => {
@@ -1251,13 +1296,15 @@ fn apply_verified_location(document: &mut StoredDocument, key: &str, location: N
                 location,
                 location_revision: 1,
             });
+            true
         }
-        Some(existing) if existing.location == location => {}
+        Some(existing) if existing.location == location => false,
         Some(existing) => {
             entry.verified = Some(VerifiedLocation {
                 location,
                 location_revision: existing.location_revision + 1,
             });
+            true
         }
     }
 }
@@ -1733,24 +1780,7 @@ fn record_acquisition_decision(
     let (key, _record) = required_record(document, target)?;
     match acquisition.persistence {
         NativePersistence::Verified => {
-            let entry = document.locations.entry(key.clone()).or_default();
-            let changed = match &entry.verified {
-                None => {
-                    entry.verified = Some(VerifiedLocation {
-                        location: acquisition.location,
-                        location_revision: 1,
-                    });
-                    true
-                }
-                Some(existing) if existing.location == acquisition.location => false,
-                Some(existing) => {
-                    entry.verified = Some(VerifiedLocation {
-                        location: acquisition.location,
-                        location_revision: existing.location_revision + 1,
-                    });
-                    true
-                }
-            };
+            let changed = apply_verified_location(document, &key, acquisition.location);
             if changed {
                 Ok(commit_decision(document, &key, false))
             } else {

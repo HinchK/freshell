@@ -55,6 +55,45 @@ export const LEGACY_ORIGIN_UNKNOWN = 'unknown' as const
 export const NameRevisionSchema = z.number().int().min(0).max(Number.MAX_SAFE_INTEGER)
 export type NameRevision = z.infer<typeof NameRevisionSchema>
 
+/** Hard accepted-name cap in Unicode scalar values — mirrors the Rust store. */
+export const MAX_NAME_SCALARS = 200
+
+/** Unicode control characters (category Cc) — exactly Rust's `char::is_control`. */
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/
+
+/**
+ * Accepted-name text, mirroring the Rust store's `validate_name` exactly so a
+ * client-side-valid name can never fail server-side validation: non-empty
+ * after trimming, at most 200 Unicode scalar values, and no control
+ * characters anywhere (display safety — deliberately stricter than the
+ * plan's control-ONLY rejection, kept on both sides of the wire).
+ */
+export const SessionNameTextSchema = z.string().superRefine((name, ctx) => {
+  if (name.trim().length === 0) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'a session name cannot be empty or whitespace-only',
+      path: [],
+    })
+    return
+  }
+  if ([...name].length > MAX_NAME_SCALARS) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `a session name cannot exceed ${MAX_NAME_SCALARS} characters`,
+      path: [],
+    })
+    return
+  }
+  if (CONTROL_CHARACTERS.test(name)) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: 'a session name cannot contain control characters',
+      path: [],
+    })
+  }
+})
+
 /**
  * Naming target: a pre-durable pending handle (minted per logical
  * conversation before provider identity exists) or the durable
@@ -86,7 +125,7 @@ export type TabNameSource = z.infer<typeof TabNameSourceSchema>
 export const SessionNameRecordSchema = z
   .object({
     ref: SessionNameRefSchema,
-    name: z.string().min(1),
+    name: SessionNameTextSchema,
     source: NameSourceSchema,
     revision: NameRevisionSchema,
     manualRevision: NameRevisionSchema.optional(),
@@ -133,7 +172,7 @@ export type SessionNameUpdate = z.infer<typeof SessionNameUpdateSchema>
 /** Rename request (HTTP PATCH body / MCP-bridged rename). */
 export const RenameSessionNameRequestSchema = z.object({
   target: SessionNameRefSchema,
-  name: z.string(),
+  name: SessionNameTextSchema,
   nameIntent: NameIntentSchema.optional(),
   ifRevision: NameRevisionSchema.optional(),
 })
