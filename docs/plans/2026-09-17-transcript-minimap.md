@@ -324,7 +324,7 @@ git commit -m "feat(fresh-agent): add pure transcript minimap layout math"
   - `FreshAgentTranscriptMinimap(props: { scrollerRef: { current: HTMLDivElement | null }; displayTurns: FreshAgentTurn[]; transcriptSignature: string }): JSX.Element | null`
   - Tick buttons: `<button type="button" aria-label="Jump to prompt: <first line, truncated to 60 chars with …>">`, absolutely positioned via inline `style={{ top, height }}`.
   - Visible-region band: `<div data-testid="transcript-minimap-viewport" aria-hidden="true">` with inline `top`/`height`.
-  - Rail container: `<div class="fresh-agent-minimap …" role="group" aria-label="Transcript minimap">`.
+  - Rail container: `<div class="fresh-agent-minimap …" role="group" aria-label="Transcript minimap">` — `pointer-events-none` on the container, `pointer-events-auto` on the tick buttons only; positioned `right-2` (8px inset) so the rail sits exactly in the scroller's 12px right padding gutter, clear of the repo's 8px custom scrollbar (`src/index.css:1475` `::-webkit-scrollbar { width: 0.5rem }`) — never overlapping it; `z-30` so ticks stay clickable over the full-width z-20 glom chip at the transcript top (ticks are 12px wide; the chip keeps its click target everywhere else).
   - Visibility gate: the rail renders `null` when there are fewer than 2 user-turn landmarks with text, when `scrollHeight <= clientHeight` (content fits the viewport), or when the scroller is missing/zero-sized.
 - Measurement math (exact): for each `[data-turn-role="user"]` article inside the scroller, `index = Number(el.getAttribute('data-turn-index'))` (skip missing/NaN), `turn = displayTurns[index]` (skip missing), `label = turnPlainText(turn)` (skip empty), `rect = el.getBoundingClientRect()`, `offsetTop = rect.top - scroller.getBoundingClientRect().top + scroller.scrollTop`, `height = rect.height`. `railHeight = scroller.clientHeight - MINIMAP_RAIL_BOTTOM_INSET_PX`.
 - Recompute triggers: an effect keyed on `transcriptSignature` (mirrors the glom chip's effect at `FreshAgentTranscript.tsx:1241-1243`), plus a native `scroll` listener and a `ResizeObserver` on the scroller installed in a mount effect (guarded `typeof ResizeObserver !== 'undefined'`; the jsdom global stub makes this a no-op in tests). Both listeners call the recompute **synchronously** — see Global Constraints for why this is not rAF-throttled.
@@ -723,7 +723,7 @@ export function FreshAgentTranscriptMinimap({
 
   return (
     <div
-      className="fresh-agent-minimap absolute right-0 top-0 z-10 w-3"
+      className="fresh-agent-minimap pointer-events-none absolute right-2 top-0 z-30 w-3"
       style={{ bottom: MINIMAP_RAIL_BOTTOM_INSET_PX }}
       role="group"
       aria-label="Transcript minimap"
@@ -741,7 +741,7 @@ export function FreshAgentTranscriptMinimap({
             <TooltipTrigger asChild>
               <button
                 type="button"
-                className="fresh-agent-minimap-tick absolute left-0 w-full rounded-sm bg-muted-foreground/40 transition-colors hover:bg-primary focus-visible:bg-primary"
+                className="fresh-agent-minimap-tick pointer-events-auto absolute left-0 w-full rounded-sm bg-muted-foreground/40 transition-colors hover:bg-primary focus-visible:bg-primary"
                 style={{ top: tick.top, height: tick.height }}
                 aria-label={`Jump to prompt: ${truncatePrompt(firstLine, ARIA_LABEL_MAX_LENGTH)}`}
                 onClick={() => handleTickClick(tick.index)}
@@ -949,6 +949,13 @@ test.describe('Transcript minimap', () => {
 
     const freshPane = page.locator('[data-context="fresh-agent"]')
     await expect(freshPane.getByText('One more thing', { exact: true })).toBeVisible({ timeout: 10_000 })
+    const scroller = freshPane.locator('[data-context="fresh-agent-transcript"]')
+    // Self-verifying precondition: this test's guarantee depends on the
+    // seeded content actually fitting the pane viewport. If this assertion
+    // fails on the cloud pane geometry, shorten the assistant bodies until
+    // it passes — do not delete the guard.
+    const fits = await scroller.evaluate((el: HTMLElement) => el.scrollHeight <= el.clientHeight)
+    expect(fits).toBe(true)
     await expect(freshPane.getByRole('button', { name: /Jump to prompt:/ })).toHaveCount(0)
   })
 })
@@ -983,7 +990,7 @@ Edit 1 — `docs/index.html`, immediately after the existing rule at line 445 (`
 
 ```css
 .fresh-transcript { position: relative; }
-.fresh-minimap { position: absolute; top: 0; right: 0; bottom: 48px; width: 12px; }
+.fresh-minimap { position: absolute; top: 0; right: 8px; bottom: 48px; width: 12px; }
 .fresh-minimap-viewport { position: absolute; left: 0; right: 0; border-radius: 2px; background: rgba(127, 127, 127, 0.18); }
 .fresh-minimap-tick { position: absolute; left: 0; right: 0; height: 3px; border-radius: 2px; background: rgba(127, 127, 127, 0.45); }
 ```
@@ -1017,11 +1024,11 @@ No refactor needed: the spec is two tests sharing one small `seedMinimapPane` he
 Run:
 
 ```bash
-npm run test:e2e:a11y-gate
+npm run test:e2e:a11y-gate:deny
 npm run test:vitest -- run test/unit/client/components/fresh-agent/ --config config/vitest/vitest.config.ts
 ```
 
-Expected: PASS. The a11y selector gate (HARNESS-11) must report no new violations — the spec uses only `getByRole`/`getByText`/`getByTestId` and `[data-context=...]` / `article[data-turn-role="user"]` selectors, all permitted. The unit re-run confirms the docs/spec additions touched no client behavior.
+Expected: PASS. The a11y selector gate must run in `--deny` mode (the plain `test:e2e:a11y-gate` script only warns and always exits 0) and report no new violations — the spec uses only `getByRole`/`getByText`/`getByTestId` and `[data-context=...]` / `article[data-turn-role="user"]` selectors, all permitted. The unit re-run confirms the docs/spec additions touched no client behavior.
 
 - [ ] **Step 7: Commit the task**
 
