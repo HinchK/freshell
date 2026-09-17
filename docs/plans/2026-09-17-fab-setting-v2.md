@@ -936,7 +936,7 @@ Expected: PASS — 2 tests (the reworked desktop story and the mobile presence t
 
 Run: `FRESHELL_VITEST_BACKEND=cloud FRESHELL_E2E_BACKEND=cloud FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/mobile-viewport.spec.ts test/e2e-browser/specs/pane-picker.spec.ts`
 
-Expected: PASS — all 6 mobile-viewport tests (including the new default-hidden line inside the composer-overlap test) and all 3 pane-picker tests. (`mobile-viewport.spec.ts` is local-lane only — `CLOUD_SKIP_SPECS` at `playwright.cloud.config.ts:48` — so its pass/fail must be demonstrated on the local lane where it actually runs.)
+Expected: PASS — all 7 mobile-viewport tests (including the new default-hidden line inside the composer-overlap test) and all 3 pane-picker tests. (`mobile-viewport.spec.ts` is local-lane only — `CLOUD_SKIP_SPECS` at `playwright.cloud.config.ts:48` — so its pass/fail must be demonstrated on the local lane where it actually runs.)
 
 - [ ] **Step 5: Refactor while green**
 
@@ -974,13 +974,15 @@ Run: `FRESHELL_VITEST_BACKEND=cloud FRESHELL_E2E_BACKEND=cloud FRESHELL_GCP_ACCO
 
 Expected: PASS — 2 passed (both settings.spec.ts tests; the spec is not in `CLOUD_SKIP_SPECS`).
 
+Cloud-viability fallback (pre-authorized; load-bearing ledger LB-1): the mobile presence test is cloud-viable by inspection evidence — a same-shape 390×844 cold boot already runs green on the cloud lane in `screenshot-baselines.spec.ts`'s `mobile layout` test under a stricter 5%-pixel comparison and a tighter 60s budget, and `waitForConnection` in-body is cloud-proven by the current settings.spec.ts reload legs. If the cloud run fails ONLY in the mobile presence test while the local run (Step 4) is green: do NOT debug cloud rendering and do NOT add any cloud-skip entry — the failure is an environment sensitivity, so delete the cloud presence test and keep the already-planned local-lane mobile pin (the default-hidden line in mobile-viewport.spec.ts's composer-overlap test), then record the coverage caveat: the cloud lane covers the desktop half of the platform default; the mobile half stays unit-pinned plus local-lane e2e-pinned. A local-lane failure, by contrast, is a real bug: fix the test/app under TDD.
+
 Run: `FRESHELL_VITEST_BACKEND=cloud FRESHELL_E2E_BACKEND=cloud FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com npm run test:e2e:cloud -- --grep=add-pane-button`
 
 Expected: PASS — 1 passed (the pane-picker fallback test; the helper's dispatch is now a desktop no-op and the FAB is default-visible, so the fallback click succeeds).
 
 Run: `FRESHELL_VITEST_BACKEND=cloud FRESHELL_E2E_BACKEND=cloud FRESHELL_GCP_ACCOUNT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/screenshot-baselines.spec.ts`
 
-Expected: PASS on tolerance — the FAB adds roughly 0.3–0.5% changed pixels to the four desktop frames (`default-layout.png`, `settings-view.png`, `multiple-tabs.png`, `sidebar-collapsed.png`), well inside `maxDiffPixelRatio: 0.05`; `auth-modal.png` shows no tab view and `mobile-layout.png` boots at 390px (mobile default ⇒ still no FAB). Record the per-test outcome. Tolerance-green is NOT sufficient: the committed baselines must depict the default experience — Task 4 regenerates them immediately.
+Expected: PASS on tolerance — the FAB adds roughly 0.3–0.5% changed pixels to the four desktop frames (`default-layout.png`, `settings-view.png`, `multiple-tabs.png`, `sidebar-collapsed.png`), well inside `maxDiffPixelRatio: 0.05` (the estimate is unmeasured arithmetic; the FAB is absolutely positioned, so non-local diffs are not expected); `auth-modal.png` shows no tab view and `mobile-layout.png` boots at 390px (mobile default ⇒ still no FAB). Record the per-test outcome. Either tolerance outcome is handled, never debugged (load-bearing ledger LB-2): if any desktop frame exceeds tolerance, pull Task 4's regeneration forward to this step immediately (regenerate via `test:e2e:update-snapshots` + the Task 4 visual checks) instead of investigating the app — the FAB addition is the expected diff. Tolerance-green is NOT sufficient either: the committed baselines must depict the default experience — Task 4 regenerates them immediately regardless.
 
 - [ ] **Step 7: Commit the task**
 
