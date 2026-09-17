@@ -668,7 +668,7 @@ No refactor needed: both edits are small in-page dispatches following each file'
 
 - [ ] **Step 6: Run impacted-test verification**
 
-`openPanePicker` is used by ~43 spec files (~66 call sites), all of which take the context-menu or early-return branches and are unaffected by the fallback edit; the full-lane regression is covered by this run's broad cloud gate. Task-level impacted verification: the directly changed/added specs on the cloud lane (the gate lane), plus the local-only mobile spec.
+`openPanePicker` is used by ~43 spec files (~66 call sites), all of which take the context-menu or early-return branches and are unaffected by the fallback edit: the edit is additive inside the fallback `else` branch, which those consumers cannot reach (the `freshellPage` fixture pre-selects a shell via `selectShellFromPicker` and specs wait for `.xterm`, so they take the byte-identical context-menu branch). NOTE (whole-branch review M-1): the coordinated full-suite gate this run uses (`npm test`) contains NO Playwright phase — there is no broad e2e lane run in this run's gate; the backstop for the helper change is the static-unreachability argument above plus the directly affected specs proven green on their configured lanes (the focused cloud runs in this task's Step 6). Task-level impacted verification: the directly changed/added specs on the cloud lane (the gate lane), plus the local-only mobile spec.
 
 Run: `npm run test:e2e:cloud -- --grep=add-pane-button`
 
