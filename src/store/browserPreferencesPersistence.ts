@@ -1,6 +1,6 @@
 import type { Middleware } from '@reduxjs/toolkit'
 
-import { mergeLocalSettings, defaultLocalSettings, type LocalSettings, type LocalSettingsPatch } from '@shared/settings'
+import { mergeLocalSettings, defaultLocalSettings, type LocalSettings, type LocalSettingsPatch, type LocalSettingsPlatformDefaults } from '@shared/settings'
 import { DEFAULT_CLOSED_TAB_RETENTION_DAYS, loadBrowserPreferencesRecord, type BrowserPreferencesRecord } from '@/lib/browser-preferences'
 import { BROWSER_PREFERENCES_STORAGE_KEY } from './storage-keys'
 import { broadcastPersistedRaw } from './persistBroadcast'
@@ -84,7 +84,11 @@ function assignChangedScalar<T extends Record<string, unknown>, K extends keyof 
   }
 }
 
-export function buildLocalSettingsPatch(localSettings: LocalSettings): LocalSettingsPatch {
+export function buildLocalSettingsPatch(
+  localSettings: LocalSettings,
+  options: LocalSettingsPlatformDefaults = {},
+  previousPatch?: LocalSettingsPatch,
+): LocalSettingsPatch {
   const patch: LocalSettingsPatch = {}
 
   assignChangedScalar(patch, localSettings, defaultLocalSettings, 'theme')
@@ -104,6 +108,9 @@ export function buildLocalSettingsPatch(localSettings: LocalSettings): LocalSett
   }
 
   const panes: LocalSettingsPatch['panes'] = {}
+  const panesDefaults = options.floatingActionButtonDefault === undefined
+    ? defaultLocalSettings.panes
+    : { ...defaultLocalSettings.panes, floatingActionButton: options.floatingActionButtonDefault }
   assignChangedScalar(panes, localSettings.panes, defaultLocalSettings.panes, 'snapThreshold')
   assignChangedScalar(panes, localSettings.panes, defaultLocalSettings.panes, 'iconsOnTabs')
   assignChangedScalar(panes, localSettings.panes, defaultLocalSettings.panes, 'tabAttentionStyle')
@@ -112,7 +119,10 @@ export function buildLocalSettingsPatch(localSettings: LocalSettings): LocalSett
   assignChangedScalar(panes, localSettings.panes, defaultLocalSettings.panes, 'multirowTabs')
   assignChangedScalar(panes, localSettings.panes, defaultLocalSettings.panes, 'repoIconsOnTabs')
   assignChangedScalar(panes, localSettings.panes, defaultLocalSettings.panes, 'tabBarRows')
-  assignChangedScalar(panes, localSettings.panes, defaultLocalSettings.panes, 'floatingActionButton')
+  assignChangedScalar(panes, localSettings.panes, panesDefaults, 'floatingActionButton')
+  if (previousPatch?.panes?.floatingActionButton !== undefined) {
+    panes.floatingActionButton = localSettings.panes.floatingActionButton
+  }
   if (Object.keys(panes).length > 0) {
     patch.panes = panes
   }
