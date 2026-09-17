@@ -5045,11 +5045,32 @@ impl FreshOpencodeState {
             let guard = self.sessions.lock().await;
             guard.get(&msg.session_id).cloned()
         };
+        // b8ke gate C fix: the coordinator consult (the map-hit
+        // registration + the r12/r38 arm) applies ONLY to MATERIALIZED
+        // sessions — a real durable `ses_*` whose serve-SSE bridge the
+        // attach tail can actually restart. An UNMATERIALIZED placeholder
+        // has NO runtime to own or guard: the create claimed nothing (the
+        // key is genuinely vacant), the tail below starts no bridge
+        // ("only meaningful once a durable session exists"), and the
+        // send's materialize claim owns the placeholder's coordinator
+        // lifecycle (the r26-F3 pre-mutation claim). Pre-fix the mount
+        // attach's map-hit registration registered the placeholder
+        // Live{FreshAgent} — NOTHING REAL — and that leaked record made
+        // every send's materialize claim answer AdoptLive (the typed
+        // "duplicate first-send" refusal), so the pane never materialized
+        // and its durable ref stayed the placeholder forever (the gate-C
+        // e2e regression: a fresh `freshopencode-*` id instead of the
+        // stable `ses_*` id).
+        let attach_row_materialized = if let Some(arc) = session_arc.as_ref() {
+            arc.lock().await.real_session_id.clone().is_some()
+        } else {
+            false
+        };
         // b8ke delta round-3 F2: an existing-session attach still CONSULTS
         // the coordinator — a delayed attach during a Handoff (the map entry
         // exists until the stop lands) must be BLOCKED or typed, never a
         // silent reuse against a runtime the handoff owns.
-        if session_arc.is_some() {
+        if session_arc.is_some() && attach_row_materialized {
             let snap = self
                 .fresh_agent
                 .ownership_snapshot(PROVIDER, &msg.session_id);
@@ -7883,6 +7904,71 @@ mod tests {
                 owner, ..
             } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
         ));
+    }
+
+    /// b8ke gate C fix: a fresh pane's MOUNT-TIME attach addresses an
+    /// UNMATERIALIZED placeholder — no durable session, no serve bridge,
+    /// nothing to own or guard. The attach's coordinator consult (the
+    /// map-hit registration + the arm) is SKIPPED for that shape, so the
+    /// placeholder key stays genuinely vacant and the send's materialize
+    /// claim (the r26-F3 pre-mutation claim) GRANTS and materializes.
+    /// Pre-fix the mount attach's map-hit registration committed
+    /// Live{FreshAgent} on the placeholder — registering NOTHING REAL —
+    /// and that leaked record made every send's materialize claim answer
+    /// AdoptLive (the typed "duplicate first-send" refusal), so the pane
+    /// never materialized and its durable ref stayed the placeholder
+    /// forever (the gate-C e2e regression: a fresh `freshopencode-*` id
+    /// instead of the stable `ses_*` id).
+    #[tokio::test]
+    async fn an_unfenced_mount_attach_on_a_fresh_placeholder_adopts_nothing_and_sends_still_materialize(
+    ) {
+        let (mut st, _killed) = state().await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        st.handle_create(create_msg("req-gate-c-mount-attach"), None)
+            .await;
+        let placeholder = "freshopencode-req-gate-c-mount-attach";
+
+        // The pane's mount-time attach — no observed pair (none exists:
+        // the create claims nothing, so there is no owner record to
+        // observe), and NO registration may commit for it.
+        st.handle_attach(attach_msg(placeholder)).await;
+
+        // THE REGRESSION PIN: the placeholder key stays VACANT — no leaked
+        // Live{FreshAgent} owner registered over nothing real.
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, placeholder).state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "an unmaterialized placeholder's mount attach must register \
+             nothing (state: {:?})",
+            registry.observe(PROVIDER, placeholder).state
+        );
+
+        // The send must still materialize — the placeholder's coordinator
+        // lifecycle belongs to the materialize claim (r26-F3).
+        st.handle_send(send_msg(placeholder, "materialize")).await;
+        {
+            let sessions = st.sessions.lock().await;
+            let guard = sessions
+                .get(placeholder)
+                .expect("the placeholder session remains in the map");
+            assert_eq!(
+                guard.lock().await.real_session_id.as_deref(),
+                Some("ses_1"),
+                "the send after an unfenced mount attach materializes the durable id"
+            );
+        }
+        // The placeholder rekeyed to the durable id (the r26-F3 shape).
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, placeholder).state,
+                freshell_ownership::OwnershipState::Aliased { to, .. } if to == "ses_1"
+            ),
+            "the placeholder is aliased to the durable id after materialization"
+        );
     }
 
     /// Delta-r6 close-durability finding, re-staged for the round-4 (F6)
