@@ -64,8 +64,8 @@ pub use claude::FreshClaudeState;
 // claude fallback pairs with it (`claude-transcript-locator.ts` parity).
 // Keep the rest of claude_snapshot crate-private.
 pub use claude_snapshot::{
-    locate_transcript, locate_transcript_checked, transcript_cwd, transcript_cwd_bounded,
-    transcript_cwd_checked,
+    locate_transcript, locate_transcript_checked, locate_transcript_selected, transcript_cwd,
+    transcript_cwd_bounded, transcript_cwd_checked, SelectedTranscript,
 };
 pub use codex::FreshCodexState;
 pub use identity_sink::{
@@ -85,8 +85,9 @@ pub use spawn_gate::{SpawnGate, SpawnGateError};
 // Unified agent names (Task 1): the injected naming interface the store
 // (freshell-server) implements and WS/fresh composition consumes.
 pub use naming::{
-    BindNameInput, NameActivity, NameActivityReason, NameError, NameFuture, NativeNameObservation,
-    NativeNameOrigin, PendingNameInput, RenameNameInput, SessionNaming,
+    BindNameInput, NameActivity, NameActivityReason, NameError, NameFuture, NameTransition,
+    NameTransitionReason, NamingSink, NativeNameObservation, NativeNameOrigin, PendingNameInput,
+    RenameNameInput, SessionNaming,
 };
 
 /// Task 13b: the injected cross-kind liveness probe -- `(provider, session_id) -> bool`,
@@ -289,6 +290,20 @@ pub struct FreshAgentState {
     /// the `OnceLock` sits behind an `Arc`. Wired post-construction by
     /// `freshell-server` (precedent: `TerminalRegistry::set_activity_observer`).
     identity_sink: Arc<std::sync::OnceLock<SharedPaneIdentitySink>>,
+    /// Unified agent names (Task 2): the injected naming authority
+    /// ([`naming::SessionNaming`]) — same set-once/shared model as
+    /// [`Self::identity_sink`]. Production (`freshell-server::main`) wires
+    /// the ONE local store participant via [`Self::set_session_naming`];
+    /// tests outside the naming scope omit it and scoped naming fails
+    /// unavailable.
+    naming: NamingSink,
+    /// Unified agent names: placeholder id → the pre-durable naming handle
+    /// admitted at create, shared by the REST spawn pipeline and the
+    /// freshopencode WS slice (both materialize the same placeholder
+    /// `freshopencode-<createRequestId>`), so the bind lane resolves the
+    /// handle whichever surface drove the create. Popped by the
+    /// materialization bind.
+    pub(crate) naming_handles: Arc<Mutex<HashMap<String, String>>>,
     /// Server-wide PTY spawn gate — the SAME instance the WS terminal.create
     /// path uses (ONE global concurrency budget; see
     /// docs/plans/2026-07-27-rest-spawn-gate.md). Clone-shared + set-once,
@@ -372,6 +387,14 @@ pub struct TerminalCreatedEvent {
     pub mode: String,
     pub resume_session_id: Option<String>,
     pub cwd: Option<String>,
+    /// Unified agent names (Task 2): the pre-durable naming handle admitted
+    /// for a scoped CLI create (the hook in `freshell-server::main` writes it
+    /// onto the shared identity registry + terminal registry, where the CLI
+    /// locator bind lanes read it).
+    pub naming_handle: Option<String>,
+    /// Unified agent names: the durable naming target for a resume create
+    /// (the pane names through the durable session's own record).
+    pub name_ref: Option<freshell_protocol::session_names::SessionNameRef>,
 }
 
 /// The injectable post-create hook (see
@@ -444,6 +467,8 @@ impl FreshAgentState {
             opencode_locator: None,
             codex_locator: None,
             identity_sink: Arc::new(std::sync::OnceLock::new()),
+            naming: NamingSink::default(),
+            naming_handles: Arc::new(Mutex::new(HashMap::new())),
             spawn_gate: Arc::new(std::sync::OnceLock::new()),
             resume_probe: None,
             on_stale_resume: None,
@@ -490,6 +515,48 @@ impl FreshAgentState {
     /// materialization site ([`send_keys`]'s cold-start block).
     fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
         self.identity_sink.get().cloned()
+    }
+
+    /// Unified agent names (Task 2): wire the naming authority (set-once;
+    /// later calls are no-ops). `freshell-server::main` injects the ONE
+    /// local store participant; REST creates/renames in this crate resolve
+    /// scoped names through it.
+    pub fn set_session_naming(&self, sink: std::sync::Arc<dyn SessionNaming>) -> bool {
+        self.naming.set(sink)
+    }
+
+    /// Unified agent names: the wired naming authority, if any (`None` =
+    /// scoped naming fails unavailable — the out-of-scope test state).
+    pub fn naming(&self) -> Option<std::sync::Arc<dyn SessionNaming>> {
+        self.naming.get()
+    }
+
+    /// Unified agent names: stash a pre-durable handle against a placeholder
+    /// id (the create lanes), so the materialization bind resolves it.
+    pub(crate) fn stash_naming_handle(&self, placeholder: &str, handle: &str) {
+        self.naming_handles
+            .lock()
+            .expect("naming_handles mutex")
+            .insert(placeholder.to_string(), handle.to_string());
+    }
+
+    /// Unified agent names: remove and answer a placeholder's stashed
+    /// pre-durable handle (the bind lanes).
+    pub(crate) fn take_naming_handle(&self, placeholder: &str) -> Option<String> {
+        self.naming_handles
+            .lock()
+            .expect("naming_handles mutex")
+            .remove(placeholder)
+    }
+
+    /// Unified agent names: a placeholder's stashed handle without removing
+    /// it (projection reads).
+    pub(crate) fn peek_naming_handle(&self, placeholder: &str) -> Option<String> {
+        self.naming_handles
+            .lock()
+            .expect("naming_handles mutex")
+            .get(placeholder)
+            .cloned()
     }
 
     /// Wire the server-wide spawn gate (set-once; later calls are no-ops).
@@ -2426,6 +2493,58 @@ async fn create_tab(
         }
     }
 
+    // Unified agent names (Task 2): admit the pre-durable handle BEFORE the
+    // tab.create broadcast acknowledges the pane — the caller-supplied
+    // `namingHandle` (CLI/MCP) or a server-minted one. The paneContent
+    // carries it so the client's pane state can target pre-identity
+    // renames. The body's `name` seeds the record with the SAME intent
+    // default (automatic — an agent/API suggestion never acquires a user
+    // rename's permanence). Unwired sinks proceed unnamed.
+    if naming::is_unified_agent_mode(None, Some(SESSION_TYPE)) {
+        let handle = body
+            .get("namingHandle")
+            .and_then(Value::as_str)
+            .filter(|h| !h.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("nh-{}", Uuid::new_v4().simple()));
+        if let Some(sink) = state.naming() {
+            let pending =
+                freshell_protocol::session_names::SessionNameRef::Pending { id: handle.clone() };
+            match sink
+                .ensure_pending(naming::PendingNameInput {
+                    handle: handle.clone(),
+                    provider: freshell_protocol::session_names::NamedProvider::Opencode,
+                    cwd: cwd.clone(),
+                })
+                .await
+            {
+                Ok(update) => {
+                    state.stash_naming_handle(&placeholder, &handle);
+                    pane_content["namingHandle"] = json!(handle);
+                    state
+                        .layout
+                        .attach_pane_content(&tab_id, &pane_id, pane_content.clone());
+                    if let Some(seed) = name.as_deref() {
+                        if let Err(error) = sink
+                            .rename(naming::RenameNameInput {
+                                target: pending,
+                                name: seed.to_string(),
+                                intent: freshell_protocol::session_names::NameIntent::Automatic,
+                                if_revision: None,
+                            })
+                            .await
+                        {
+                            naming::log_name_error("rename", &update.record.name_ref, &error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    naming::log_name_error("ensure_pending", &pending, &error);
+                }
+            }
+        }
+    }
+
     broadcast_tab_create(&state, &tab_id, &pane_id, name.as_deref(), &pane_content);
 
     ok_json(
@@ -2697,6 +2816,26 @@ async fn resume_session_ref_tab(
             durable_id: Some(durable_id.clone()),
         },
     );
+    // Unified agent names (Task 2): the resumed pane names through the
+    // DURABLE session's own record; the body's `name` seeds it with the
+    // same intent default (automatic — never a user rename's permanence).
+    if let (Some(sink), Some(seed)) = (state.naming(), name.as_deref()) {
+        let target = freshell_protocol::session_names::SessionNameRef::Session {
+            provider: freshell_protocol::session_names::NamedProvider::Opencode,
+            session_id: durable_id.clone(),
+        };
+        if let Err(error) = sink
+            .rename(naming::RenameNameInput {
+                target: target.clone(),
+                name: seed.to_string(),
+                intent: freshell_protocol::session_names::NameIntent::Automatic,
+                if_revision: None,
+            })
+            .await
+        {
+            naming::log_name_error("rename", &target, &error);
+        }
+    }
     broadcast_tab_create(state, &tab_id, &pane_id, name.as_deref(), &pane_content);
 
     ok_json(
@@ -2746,6 +2885,190 @@ pub(crate) fn parse_required_name(value: Option<&Value>) -> Option<String> {
 /// formerly `rename_persistence::persist_syncable_terminal_rename`) was
 /// removed, and `PATCH /api/sessions/:key` is now the sole durable
 /// session-rename surface.
+/// Unified agent names (Task 2): one pane's naming-scope resolution —
+/// `scoped` per the six-mode predicate over its pane content, plus the
+/// naming TARGET its saved name resolves through when the content carries
+/// one: a durable `sessionRef` (resume/bound panes), the content's
+/// `namingHandle` (the pre-durable handle), or the create-lane stash keyed
+/// by the placeholder/terminal id. `None` target on a scoped pane means the
+/// content predates the naming contract (answered loudly by the routes,
+/// never a sticky layout title).
+pub(crate) struct PaneNameResolution {
+    pub(crate) scoped: bool,
+    pub(crate) target: Option<freshell_protocol::session_names::SessionNameRef>,
+}
+
+pub(crate) fn resolve_pane_name_target(
+    state: &FreshAgentState,
+    pane_id: &str,
+) -> Option<PaneNameResolution> {
+    let snapshot = state.layout.get_pane_snapshot(pane_id)?;
+    let content = snapshot.pane_content.as_ref()?;
+    let mode = content.get("mode").and_then(Value::as_str);
+    let session_type = content.get("sessionType").and_then(Value::as_str);
+    let scoped = naming::is_unified_agent_mode(mode, session_type);
+    if !scoped {
+        return Some(PaneNameResolution {
+            scoped: false,
+            target: None,
+        });
+    }
+    // Durable sessionRef first (established identity).
+    if let Some(locator) = content.get("sessionRef") {
+        if let (Some(provider), Some(session_id)) = (
+            locator.get("provider").and_then(Value::as_str),
+            locator.get("sessionId").and_then(Value::as_str),
+        ) {
+            if let Some(named) = naming::named_provider_for(Some(provider), None) {
+                return Some(PaneNameResolution {
+                    scoped: true,
+                    target: Some(freshell_protocol::session_names::SessionNameRef::Session {
+                        provider: named,
+                        session_id: session_id.to_string(),
+                    }),
+                });
+            }
+        }
+    }
+    // The content's pre-durable handle.
+    if let Some(handle) = content
+        .get("namingHandle")
+        .and_then(Value::as_str)
+        .filter(|h| !h.trim().is_empty())
+    {
+        return Some(PaneNameResolution {
+            scoped: true,
+            target: Some(freshell_protocol::session_names::SessionNameRef::Pending {
+                id: handle.trim().to_string(),
+            }),
+        });
+    }
+    // The create-lane stash: fresh panes key it by the placeholder
+    // sessionId; terminal panes by the terminal id.
+    let stash_key = content
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .or_else(|| content.get("terminalId").and_then(Value::as_str));
+    if let Some(key) = stash_key {
+        if let Some(handle) = state.peek_naming_handle(key) {
+            return Some(PaneNameResolution {
+                scoped: true,
+                target: Some(freshell_protocol::session_names::SessionNameRef::Pending {
+                    id: handle,
+                }),
+            });
+        }
+    }
+    Some(PaneNameResolution {
+        scoped: true,
+        target: None,
+    })
+}
+
+/// Unified agent names (Task 2): the scoped rename shared by the pane/tab
+/// convenience routes — ONE `rename` call with `nameIntent` (default
+/// `automatic`: an agent suggestion never acquires a user rename's
+/// permanence) and optional `expectedNameRef`/`ifRevision` guards. Never
+/// calls `LayoutStore::rename_pane/rename_tab` for a scoped target; the
+/// accepted name update is returned (the store's commit publishes
+/// `session.name.updated` through the wired publisher), never a sticky
+/// `ui.command` title alias. `pane_id` is the addressed pane for the
+/// response envelope (the tab route passes its resolved source pane).
+pub(crate) async fn rename_scoped_session(
+    state: &FreshAgentState,
+    resolution: &PaneNameResolution,
+    tab_id: Option<&str>,
+    pane_id: Option<&str>,
+    body: &Value,
+) -> Response {
+    let Some(target) = resolution.target.clone() else {
+        return fail_json(
+            StatusCode::BAD_REQUEST,
+            "NAME_TARGET_UNRESOLVED: this agent pane has no naming binding on              this server (no sessionRef or namingHandle) — open it from the              sidebar so its identity binds, then rename"
+                .to_string(),
+        );
+    };
+    // `expectedNameRef`: the editor's captured binding — a pane whose
+    // conversation switched must never receive the rename (409, visibly).
+    if let Some(expected) = body.get("expectedNameRef") {
+        let expected_ref: Option<freshell_protocol::session_names::SessionNameRef> =
+            serde_json::from_value(expected.clone()).ok();
+        if expected_ref.as_ref() != Some(&target) {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "NAME_TARGET_MOVED",
+                    "message": "the pane's naming binding changed since the edit started",
+                    "nameRef": target,
+                })),
+            )
+                .into_response();
+        }
+    }
+    let intent = match body.get("nameIntent").and_then(Value::as_str) {
+        Some("user") => freshell_protocol::session_names::NameIntent::User,
+        // Default omitted intent to `automatic` on every scoped rename —
+        // the plan's rule 3 (agent suggestions are provider_ai rank).
+        _ => freshell_protocol::session_names::NameIntent::Automatic,
+    };
+    let if_revision = body
+        .get("ifRevision")
+        .and_then(Value::as_u64)
+        .filter(|r| *r <= freshell_protocol::session_names::MAX_NAME_REVISION);
+    let name = body
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let Some(sink) = state.naming() else {
+        return fail_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "session naming is unavailable on this server".to_string(),
+        );
+    };
+    match sink
+        .rename(naming::RenameNameInput {
+            target: target.clone(),
+            name,
+            intent,
+            if_revision,
+        })
+        .await
+    {
+        Ok(update) => {
+            let mut data = Map::new();
+            if let Some(tab_id) = tab_id {
+                data.insert("tabId".into(), json!(tab_id));
+            }
+            if let Some(pane_id) = pane_id {
+                data.insert("paneId".into(), json!(pane_id));
+            }
+            data.insert(
+                "nameRef".into(),
+                serde_json::to_value(&update.record.name_ref).unwrap_or(Value::Null),
+            );
+            data.insert(
+                "sessionName".into(),
+                serde_json::to_value(&update).unwrap_or(Value::Null),
+            );
+            ok_json(Value::Object(data), "session renamed")
+        }
+        Err(error) => {
+            naming::log_name_error("rename", &target, &error);
+            (
+                StatusCode::from_u16(error.http_status())
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                Json(json!({
+                    "error": error.code(),
+                    "message": error.to_string(),
+                    "nameRef": target,
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn rename_pane(
     State(state): State<FreshAgentState>,
     Path(pane_id): Path<String>,
@@ -2759,6 +3082,27 @@ async fn rename_pane(
     let Some(name) = parse_required_name(body.get("name")) else {
         return fail_json(StatusCode::BAD_REQUEST, "name required".to_string());
     };
+
+    // Unified agent names (Task 2): a scoped agent pane's rename targets its
+    // saved SESSION name (the one name shared by pane/sidebar/terminal/tab);
+    // the legacy layout label remains for every out-of-scope pane.
+    if let Some(resolution) = resolve_pane_name_target(&state, &pane_id) {
+        if resolution.scoped {
+            let tab_id = state
+                .layout
+                .get_pane_snapshot(&pane_id)
+                .map(|snapshot| snapshot.tab_id);
+            return rename_scoped_session(
+                &state,
+                &resolution,
+                tab_id.as_deref(),
+                Some(&pane_id),
+                &body,
+            )
+            .await;
+        }
+    }
+
     if name.len() > MAX_PANE_NAME_LEN {
         return fail_json(
             StatusCode::BAD_REQUEST,
@@ -2795,6 +3139,66 @@ async fn rename_pane(
 }
 
 // ── POST /api/panes/:id/send-keys (drive one turn) ───────────────────────────────
+
+/// Unified agent names (Task 2): the REST send-keys lane's pending→durable
+/// bind — the twin of `opencode_ws`'s materialization bind, over the SHARED
+/// `FreshAgentState` handle stash (so a REST-created pane's handle resolves
+/// whichever surface drives the materialization). Opencode persistence is
+/// verified here (the SQLite row exists from `create_session`), so the
+/// transfer commits BEFORE the materialized frame publishes the identity.
+/// Never a lane blocker: a failure retains the handle for the main.rs
+/// naming tick's retry. Answers the accepted projection for the frame.
+async fn bind_rest_naming_handle(
+    state: &FreshAgentState,
+    placeholder: &str,
+    durable_id: &str,
+) -> Option<(
+    freshell_protocol::session_names::SessionNameRef,
+    freshell_protocol::session_names::SessionNameRecord,
+)> {
+    let handle = state.take_naming_handle(placeholder)?;
+    let sink = state.naming()?;
+    let pending = freshell_protocol::session_names::SessionNameRef::Pending { id: handle.clone() };
+    let target = freshell_protocol::session_names::SessionNameRef::Session {
+        provider: freshell_protocol::session_names::NamedProvider::Opencode,
+        session_id: durable_id.to_string(),
+    };
+    let acquisition = freshell_protocol::native_location::NativeAcquisition {
+        location: freshell_protocol::native_location::NativeLocation::Opencode {
+            database_path: freshell_sessions::parse::default_opencode_data_home()
+                .join("opencode.db")
+                .display()
+                .to_string(),
+            native_session_id: Some(durable_id.to_string()),
+            original_directory: None,
+            owned_local_endpoint: None,
+        },
+        evidence: freshell_protocol::native_location::NativeEvidenceKind::PersistedMetadata,
+        persistence: freshell_protocol::native_location::NativePersistence::Verified,
+    };
+    let update = match sink
+        .bind_pending(naming::BindNameInput {
+            pending: pending.clone(),
+            target: target.clone(),
+            acquisition,
+        })
+        .await
+    {
+        Ok(update) => update,
+        Err(error) => {
+            naming::log_name_error("bind_pending", &pending, &error);
+            // A failed bind RETAINS the handle — re-stash it for the tick's
+            // visible retry (the plan's "on failed bind retain the handle").
+            state.stash_naming_handle(placeholder, &handle);
+            return None;
+        }
+    };
+    if update.record.name_ref != target {
+        // Not transferred (a read answer): keep the stash entry.
+        state.stash_naming_handle(placeholder, &handle);
+    }
+    Some((update.record.name_ref.clone(), update.record))
+}
 
 async fn send_keys(
     State(state): State<FreshAgentState>,
@@ -2912,6 +3316,11 @@ async fn send_keys(
                         .map(str::to_string),
                     resolves_pending: Some(pane.placeholder_id.clone()),
                     supersedes: None,
+                    // Unified agent names: the REST materialization's naming
+                    // transfer is committed by the dedicated bind lane below
+                    // (BEFORE the materialized frame publishes the identity);
+                    // the ledger edge itself carries no naming fact.
+                    name_transition: None,
                     // D8 (restore-open-sessions-only): REST/MCP lineage rows
                     // intentionally stamp NO provenance — no browser client
                     // connection exists at bind time, so there is nothing true
@@ -2954,6 +3363,16 @@ async fn send_keys(
             session_id: durable_id.clone(),
         };
 
+        // Unified agent names (Task 2): commit the REST lane's pending→durable
+        // name transfer BEFORE the materialized frame publishes the identity
+        // (opencode persistence is verified at materialization — the SQLite
+        // row exists). A missing/unwired handle leaves the frame
+        // projection-less (a neutral fallback), never blocks the send.
+        let naming_projection =
+            bind_rest_naming_handle(&state, &pane.placeholder_id, &durable_id).await;
+        let name_ref = naming_projection.as_ref().map(|(r, _)| r.clone());
+        let session_name = naming_projection.map(|(_, record)| record);
+
         // Broadcast the placeholder→durable materialization (router.ts:1734, broadcast to
         // ALL) — emitted EXACTLY ONCE per pane, only on the send that actually materializes.
         state.broadcast(&ServerMessage::FreshAgentSessionMaterialized(
@@ -2963,6 +3382,8 @@ async fn send_keys(
                 session_id: durable_id.clone(),
                 session_type: SESSION_TYPE.to_string(),
                 session_ref: Some(session_ref.clone()),
+                name_ref,
+                session_name,
             },
         ));
 
@@ -3803,6 +4224,8 @@ mod tests {
                 provider: PROVIDER.to_string(),
                 session_id: "ses_123".to_string(),
             }),
+            name_ref: None,
+            session_name: None,
         });
         let wire: Value = serde_json::to_value(&msg).unwrap();
         assert_eq!(wire["type"], "freshAgent.session.materialized");

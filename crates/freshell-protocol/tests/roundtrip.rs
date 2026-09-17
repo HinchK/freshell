@@ -555,9 +555,15 @@ fn terminal_created_notice_is_optional_and_additive() {
         restore_error: None,
         session_ref: None,
         notice: None,
+        session_name: None,
+        name_ref: None,
     };
     let json = serde_json::to_value(ServerMessage::TerminalCreated(created.clone())).unwrap();
     assert!(json.get("notice").is_none());
+    // Unified agent names (Task 2): absent naming fields stay omitted — the
+    // additive-optional wire contract holds for the frozen client.
+    assert!(json.get("sessionName").is_none());
+    assert!(json.get("nameRef").is_none());
 
     // Present => serialized verbatim.
     let mut with_notice = created;

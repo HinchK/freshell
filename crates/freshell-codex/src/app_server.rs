@@ -200,6 +200,12 @@ pub struct CodexAppServerClient {
     /// Single-flight initialize cache: `Some(result)` once the handshake completed
     /// (`initializePromise`, `client.ts:126,144-166`).
     init: TokioMutex<Option<Value>>,
+    /// Unified agent names (Task 2): the `codexHome` captured from the
+    /// `initialize` result BEFORE any `Ok(_)`/`StartedThread` reduction —
+    /// the initialized root the app-server itself reported (the authority
+    /// for where rollouts live, never re-derived from ambient env). Read by
+    /// [`Self::codex_home`].
+    codex_home: TokioMutex<Option<String>>,
     read_handle: tokio::task::JoinHandle<()>,
 }
 
@@ -256,6 +262,7 @@ impl CodexAppServerClient {
             request_timeout,
             read_timeout,
             init: TokioMutex::new(None),
+            codex_home: TokioMutex::new(None),
             read_handle,
         };
         (client, notify_rx)
@@ -281,8 +288,24 @@ impl CodexAppServerClient {
             .await?;
         // client.ts:158 — the initialized notification follows a successful initialize.
         self.notify("initialized", None).await?;
+        // Unified agent names (Task 2): capture the app-server's own
+        // `codexHome` from the initialize result BEFORE the `Ok(_)`
+        // reduction — the initialized root later StartedThread results are
+        // correlated against (never re-derived from ambient env).
+        if let Some(home) = result.get("codexHome").and_then(Value::as_str) {
+            if !home.is_empty() {
+                *self.codex_home.lock().await = Some(home.to_string());
+            }
+        }
         *guard = Some(result.clone());
         Ok(result)
+    }
+
+    /// Unified agent names (Task 2): the `codexHome` the app-server reported
+    /// at initialize — the initialized root rollouts are written under.
+    /// `None` before the first successful `initialize`.
+    pub async fn codex_home(&self) -> Option<String> {
+        self.codex_home.lock().await.clone()
     }
 
     /// `thread/start` (`client.ts:168-186`) — the stable-from-create codex thread.

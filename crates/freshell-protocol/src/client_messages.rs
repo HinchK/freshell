@@ -322,6 +322,13 @@ pub struct TerminalCreate {
     pub session_ref: Option<SessionLocator>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,
+    /// Unified agent names (Task 1 wire / Task 2 Rust side): the pane's
+    /// pre-durable naming handle, minted per logical conversation before
+    /// provider identity exists. Independent of createRequestId/terminalId/
+    /// sessionRef; creation retries re-send the same handle. Additive
+    /// optional — old servers strip it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub naming_handle: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -725,6 +732,11 @@ pub struct FreshAgentCreate {
     /// optional; conn-less (REST/MCP) creates omit it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,
+    /// Unified agent names (Task 1 wire / Task 2 Rust side): the pane's
+    /// pre-durable naming handle — see `TerminalCreate::naming_handle`.
+    /// Additive optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub naming_handle: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

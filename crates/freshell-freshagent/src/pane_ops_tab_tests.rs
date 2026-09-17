@@ -665,7 +665,17 @@ async fn fresh_agent_rest_create_registers_tab_and_pane_in_the_layout_store() {
 
 #[tokio::test]
 async fn fresh_agent_rest_created_pane_renames_via_patch() {
+    // Unified agent names (Task 2): a REST-created fresh-agent pane is SCOPED
+    // — its rename routes to the ONE naming authority (the create admitted a
+    // pre-durable handle keyed by the pane's placeholder), never writing the
+    // sticky layout alias. The response envelope carries the accepted
+    // update; `tabRenamed`-style layout titles are gone for scoped panes.
+    use crate::naming::test_support::RecordingSink;
+    use freshell_protocol::session_names::SessionNameRef;
+
     let state = state_with_registry();
+    let sink = RecordingSink::new();
+    state.set_session_naming(sink.clone());
     let router = app(state.clone());
     let (status, body) = post(
         router.clone(),
@@ -686,17 +696,31 @@ async fn fresh_agent_rest_created_pane_renames_via_patch() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    // Pre-fix this is {message:"pane not found"}; post-fix it is the real
-    // rename result (router.ts:1420 shape), tabRenamed because single-pane.
+    // The addressed pane/tab echo back with the ACCEPTED naming update.
     assert_eq!(body["data"]["tabId"], json!(tab_id), "{body}");
-    assert_eq!(body["data"]["paneId"], json!(pane_id));
-    assert_eq!(body["data"]["tabRenamed"], json!(true));
+    assert_eq!(body["data"]["paneId"], json!(pane_id), "{body}");
+    assert_eq!(
+        body["data"]["sessionName"]["record"]["name"],
+        json!("Renamed Agent"),
+        "{body}"
+    );
+    // The create-lane admission keyed the pending handle by the pane's
+    // placeholder, so the pre-durable record was the rename target.
+    let renames = sink.renames.lock().unwrap();
+    assert_eq!(renames.len(), 1, "{renames:?}");
+    assert!(
+        matches!(renames[0].target, SessionNameRef::Pending { .. }),
+        "a fresh REST-created pane renames through its pre-durable handle: {renames:?}"
+    );
+    drop(renames);
 
+    // NO sticky layout title for a scoped pane (the naming publisher owns
+    // live propagation; the layout alias is gone by contract).
     let rows = state
         .layout
         .list_panes(Some(&tab_id))
         .expect("tab in store");
-    assert_eq!(rows[0].title.as_deref(), Some("Renamed Agent"));
+    assert_ne!(rows[0].title.as_deref(), Some("Renamed Agent"), "{rows:?}");
 }
 
 #[tokio::test]
@@ -1081,6 +1105,7 @@ async fn rest_resume_resolves_placeholder_sessionref_through_the_ledger() {
     // exactly what the unconditional materialization write produces for a
     // default create) still answers `lookup_by_create_request_id`.
     sink.record_binding(FreshAgentBindingUpsert {
+        name_transition: None,
         provider: "opencode".into(),
         session_id: "ses_placeholder_resumed".into(),
         mode: "freshopencode".into(),

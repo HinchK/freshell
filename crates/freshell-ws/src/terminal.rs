@@ -2838,6 +2838,89 @@ pub(crate) async fn prepare_launch(
     })
 }
 
+/// Unified agent names (Task 2): the scoped-create naming admission. See
+/// [`handle_create`]'s call site for the ordering contract. Answers the
+/// frame projection (`nameRef` + last-known `sessionName`) when the create
+/// is in scope and a naming authority is wired.
+#[allow(clippy::too_many_arguments)]
+async fn admit_create_naming(
+    state: &WsState,
+    create: &TerminalCreate,
+    terminal_id: &str,
+    mode: &str,
+    cwd: Option<&str>,
+    session_locator: Option<&SessionLocator>,
+) -> Option<(
+    freshell_protocol::session_names::SessionNameRef,
+    freshell_protocol::session_names::SessionNameRecord,
+)> {
+    let provider = freshell_freshagent::naming::named_provider_for(Some(mode), None)?;
+    let sink = state.identity.naming()?;
+    // A resume/restore create (a client-sent sessionRef) targets the DURABLE
+    // session's own record — established identities are never re-pended.
+    // The server-side PREALLOCATED identity is deliberately NOT durable
+    // input: a fresh `--session-id` spawn is prospective (the transcript
+    // does not exist yet), so a fresh create always admits its pre-durable
+    // handle and the verified-bind lanes transfer it at materialization.
+    let durable_session = session_locator
+        .filter(|locator| locator.provider == provider.as_str())
+        .map(|locator| locator.session_id.clone());
+    if let Some(session_id) = durable_session {
+        let target = freshell_protocol::session_names::SessionNameRef::Session {
+            provider,
+            session_id: session_id.clone(),
+        };
+        state
+            .identity
+            .set_name_binding(terminal_id, Some(target.clone()), None);
+        state
+            .registry
+            .set_naming(terminal_id, Some(target.clone()), None);
+        let updates = sink
+            .get(vec![target.clone()])
+            .await
+            .map_err(|error| freshell_freshagent::naming::log_name_error("get", &target, &error))
+            .ok()?;
+        let update = updates.into_iter().next()?;
+        state
+            .registry
+            .update_session_name(terminal_id, &update.record);
+        return Some((update.record.name_ref.clone(), update.record));
+    }
+    // Fresh scoped create: admit the pre-durable handle (client-sent, else
+    // server-minted — the nanoid-style uuid facility).
+    let handle = create
+        .naming_handle
+        .clone()
+        .filter(|h| !h.trim().is_empty())
+        .unwrap_or_else(|| format!("nh-{}", uuid::Uuid::new_v4()));
+    let pending = freshell_protocol::session_names::SessionNameRef::Pending { id: handle.clone() };
+    let update = sink
+        .ensure_pending(freshell_freshagent::naming::PendingNameInput {
+            handle: handle.clone(),
+            provider,
+            cwd: cwd.map(str::to_string),
+        })
+        .await
+        .map_err(|error| {
+            freshell_freshagent::naming::log_name_error("ensure_pending", &pending, &error)
+        })
+        .ok()?;
+    let target = update.record.name_ref.clone();
+    // Retain the binding BEFORE the frame acknowledges creation (the
+    // registry row + identity entry are the rename routes' resolvers).
+    state
+        .identity
+        .set_name_binding(terminal_id, Some(target.clone()), Some(handle.clone()));
+    state
+        .registry
+        .set_naming(terminal_id, Some(target.clone()), Some(handle));
+    state
+        .registry
+        .update_session_name(terminal_id, &update.record);
+    Some((update.record.name_ref.clone(), update.record))
+}
+
 /// `terminal.create` — spawn + register the PTY in the shared registry (owned by no
 /// connection), then reply `terminal.created`. Create does NOT attach; the client
 /// sends `terminal.attach` next. `conn_identity` (D8) is the creating connection's
@@ -2912,6 +2995,11 @@ pub(crate) async fn handle_create(
                     notice: None,
                     restore_error: None,
                     session_ref: state.identity.session_ref_for(&existing),
+                    // Unified agent names (Task 2): the adopted terminal's
+                    // retained naming binding (its registry cache carries the
+                    // last-known record).
+                    session_name: state.registry.session_name_of(&existing),
+                    name_ref: state.identity.name_ref_for(&existing),
                 });
                 // An adoption IS a successful create for this requestId:
                 // settle the server-wide dedupe entry exactly like the main
@@ -3005,6 +3093,10 @@ pub(crate) async fn handle_create(
                                 .identity
                                 .session_ref_for(&terminal_id)
                                 .or(Some(locator)),
+                            // Unified agent names: the winner's retained
+                            // naming binding rides the attach answer.
+                            session_name: state.registry.session_name_of(&terminal_id),
+                            name_ref: state.identity.name_ref_for(&terminal_id),
                         });
                         // Attaching to the winner IS a successful create for
                         // this requestId: settle the dedupe entry exactly
@@ -4274,6 +4366,26 @@ pub(crate) async fn handle_create(
         }
     }
 
+    // Unified agent names (Task 2): the scoped-create naming admission —
+    // BEFORE the frame acknowledges creation, so the pane content and the
+    // identity/registry rows never observable precede the name binding. A
+    // resume create targets the durable session's own record; a fresh scoped
+    // create admits its pre-durable handle (the client's `namingHandle` if
+    // sent, else a server-minted one — the REST/CLI lanes have no client).
+    // Unscoped modes and unwired sinks proceed unnamed (scoped RENAMES then
+    // fail unavailable); naming never blocks the create.
+    let naming_projection = admit_create_naming(
+        state,
+        &create,
+        &terminal_id_for_meta,
+        &mode,
+        spec.cwd.as_deref(),
+        create_session_locator(&create).as_ref(),
+    )
+    .await;
+    let name_ref = naming_projection.as_ref().map(|(r, _)| r.clone());
+    let session_name = naming_projection.map(|(_, record)| record);
+
     // Dedupe settle needs both ids, but the `TerminalCreated` literal below
     // MOVES `create.request_id` and `terminal_id` into the struct — clone
     // into locals first.
@@ -4295,6 +4407,9 @@ pub(crate) async fn handle_create(
         // The canonical create-time identity, from the SAME registry every other
         // identity-stamped frame reads (shell creates have no entry -> `None`).
         session_ref: state.identity.session_ref_for(&terminal_id_for_meta),
+        // Unified agent names: the just-admitted naming projection.
+        name_ref,
+        session_name,
     });
     // Record the settled create (server-wide requestId dedupe) and forward
     // the frame to any cross-connection waiters BEFORE the origin reply —

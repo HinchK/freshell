@@ -94,6 +94,7 @@ async fn create_tracked_session_with_resume(
 ) -> String {
     st.handle_create(
         FreshAgentCreate {
+            naming_handle: None,
             request_id: request_id.to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
             provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -222,6 +223,7 @@ async fn failed_spawn_leaves_no_record() {
 
     st.handle_create(
         FreshAgentCreate {
+            naming_handle: None,
             request_id: "req-wfah-t2-fail".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
             provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -424,6 +426,7 @@ async fn create_bail_after_spawn_leaves_no_record() {
 
     st.handle_create(
         FreshAgentCreate {
+            naming_handle: None,
             request_id: "req-wfah-t3-bail".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
             provider: Some(freshell_protocol::AgentProvider::Codex),

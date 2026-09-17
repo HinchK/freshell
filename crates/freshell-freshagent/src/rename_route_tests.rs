@@ -18,7 +18,11 @@ use axum::Router;
 use serde_json::{json, Value};
 use tower::util::ServiceExt;
 
+use freshell_protocol::session_names::{NameIntent, NamedProvider, SessionNameRef};
+
 use super::FreshAgentState;
+use crate::naming::test_support::{verified_claude_acquisition, RecordingSink};
+use crate::naming::{BindNameInput, PendingNameInput, SessionNaming};
 
 // ── helpers (oneshot pattern from `lib.rs`'s `rename_pane_tests`) ───────────
 
@@ -222,19 +226,53 @@ async fn rename_from_non_primary_client_succeeds_and_tab_renamed_uses_that_snaps
     );
 }
 
-// ── b5fb pins: the pane-rename persistence cascade is deleted ────────────────
+// ── unified agent names (Task 2): scoped pane renames route to the authority ──
 
-/// b5fb pin: renaming a SYNCABLE coding-CLI pane writes nothing beyond the
-/// layout store — the registry title is untouched, no `terminals.changed`
-/// fires, and exactly one `ui.command{pane.rename}` frame goes out. The RED
-/// form wired a recording `RenamePersistence` fake into the old cascade and
-/// watched it get called; GREEN holds by structural absence (the seam no
-/// longer exists) observed through the wire frames.
+/// Wire the recording sink into a state the way `main.rs` wires the real
+/// store (the sink is the ONE naming authority for the route).
+fn wire_recording_sink(state: &FreshAgentState) -> Arc<RecordingSink> {
+    let sink = RecordingSink::new();
+    state.set_session_naming(sink.clone());
+    sink
+}
+
+/// Seed a durable record the way the create lane does (pending admission +
+/// verified bind) so the route's rename resolves an existing record.
+async fn seed_durable_record(sink: &Arc<RecordingSink>, handle: &str, session_id: &str) {
+    sink.ensure_pending(PendingNameInput {
+        handle: handle.to_string(),
+        provider: NamedProvider::Claude,
+        cwd: None,
+    })
+    .await
+    .unwrap();
+    sink.bind_pending(BindNameInput {
+        pending: SessionNameRef::Pending {
+            id: handle.to_string(),
+        },
+        target: SessionNameRef::Session {
+            provider: NamedProvider::Claude,
+            session_id: session_id.to_string(),
+        },
+        acquisition: verified_claude_acquisition(session_id),
+    })
+    .await
+    .unwrap();
+}
+
+/// Unified agent names (Task 2): renaming a SCOPED pane routes to the ONE
+/// naming authority — the durable session record — and never writes the
+/// layout alias: NO `ui.command{pane.rename}` frame, no registry title
+/// write-through, no `terminals.changed`. The b5fb invariant survives
+/// (never a settings session override); live propagation is the naming
+/// publisher's `session.name.updated`, not a sticky layout title.
 #[tokio::test]
-async fn rename_pane_never_cascades_for_a_syncable_claude_terminal() {
+async fn rename_pane_routes_a_scoped_claude_pane_to_the_naming_authority() {
     let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
     let registry = freshell_terminal::TerminalRegistry::new();
     let state = state_with(tx.clone()).with_terminal_registry(registry.clone());
+    let sink = wire_recording_sink(&state);
+    seed_durable_record(&sink, "handle-sr1", "sess-ref-1").await;
 
     let terminal_id = create_registry_terminal(crate::router(state.clone())).await;
     seed_layout(
@@ -252,40 +290,59 @@ async fn rename_pane_never_cascades_for_a_syncable_claude_terminal() {
     let (status, body) = patch_pane(crate::router(state.clone()), "p1", "Local Only").await;
 
     assert_eq!(status, StatusCode::OK, "{body}");
+    // ONE rename through the authority, targeting the durable ref, with the
+    // default automatic intent (an agent suggestion never acquires a user
+    // rename's permanence).
+    let renames = sink.renames.lock().unwrap();
+    assert_eq!(renames.len(), 1, "{renames:?}");
+    assert_eq!(
+        renames[0].target,
+        SessionNameRef::Session {
+            provider: NamedProvider::Claude,
+            session_id: "sess-ref-1".into(),
+        }
+    );
+    assert_eq!(renames[0].name, "Local Only");
+    assert_eq!(renames[0].intent, NameIntent::Automatic);
+    drop(renames);
+    // The accepted record rides the response envelope.
+    assert_eq!(
+        body["data"]["sessionName"]["record"]["name"],
+        json!("Local Only"),
+        "{body}"
+    );
+    assert_eq!(
+        body["data"]["nameRef"],
+        json!({ "kind": "session", "provider": "claude", "sessionId": "sess-ref-1" }),
+        "{body}"
+    );
+    // NO layout-alias frames: the scoped rename publishes through the
+    // naming publisher, never a sticky ui.command title.
+    let frames = drain_frames(&mut rx);
+    assert!(
+        frames.is_empty(),
+        "a scoped rename emits no layout-alias frames: {frames:?}"
+    );
+    // The registry title is untouched by the route (the publisher owns the
+    // write-through).
     assert_ne!(
         registry.title_of(&terminal_id).as_deref(),
         Some("Local Only"),
         "registry title untouched by a pane rename"
     );
-    let frames = drain_frames(&mut rx);
-    assert!(
-        frames
-            .iter()
-            .all(|f| f["type"] != json!("terminals.changed")),
-        "no terminals.changed from a pane rename: {frames:?}"
-    );
-    let rename_frames: Vec<&Value> = frames
-        .iter()
-        .filter(|f| f["type"] == json!("ui.command") && f["command"] == json!("pane.rename"))
-        .collect();
-    assert_eq!(
-        rename_frames.len(),
-        1,
-        "exactly one ui.command{{pane.rename}} frame: {frames:?}"
-    );
 }
 
-/// b5fb pin: A→B→C pane reuse carries NO pane label into durable history.
-/// Two renames of the same pane while bound to successive sessions: neither
-/// emits `terminals.changed`, the registry title never takes a pane label,
-/// and each rename yields exactly one `ui.command{pane.rename}` frame. The
-/// RED form recorded the old cascade's `session_calls` (both sessions were
-/// written); GREEN holds by structural absence observed through the frames.
+/// Unified agent names (Task 2): A→B pane reuse routes each rename to the
+/// pane's CURRENT binding — the durable record the content names now —
+/// never carrying a label across sessions. No frames, no registry titles.
 #[tokio::test]
-async fn pane_reuse_across_sessions_never_leaves_durable_titles() {
+async fn pane_reuse_across_sessions_targets_the_current_binding_only() {
     let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
     let registry = freshell_terminal::TerminalRegistry::new();
     let state = state_with(tx.clone()).with_terminal_registry(registry.clone());
+    let sink = wire_recording_sink(&state);
+    seed_durable_record(&sink, "handle-a", "aaaa0000-0000-4000-8000-00000000000a").await;
+    seed_durable_record(&sink, "handle-b", "bbbb0000-0000-4000-8000-00000000000b").await;
 
     let terminal_id = create_registry_terminal(crate::router(state.clone())).await;
     let mut rx = tx.subscribe();
@@ -294,21 +351,40 @@ async fn pane_reuse_across_sessions_never_leaves_durable_titles() {
         &state,
         lone_pane_layout(json!({
             "kind": "terminal", "mode": "claude", "terminalId": terminal_id,
-            "sessionRef": { "provider": "claude", "sessionId": "sess-A" },
+            "sessionRef": { "provider": "claude", "sessionId": "aaaa0000-0000-4000-8000-00000000000a" },
         })),
     );
     let (status, body) = patch_pane(crate::router(state.clone()), "p1", "Reusable Name").await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    // Pane reused for session B
+    // Pane reused for session B (a new conversation on the same pane)
     seed_layout(
         &state,
         lone_pane_layout(json!({
             "kind": "terminal", "mode": "claude", "terminalId": terminal_id,
-            "sessionRef": { "provider": "claude", "sessionId": "sess-B" },
+            "sessionRef": { "provider": "claude", "sessionId": "bbbb0000-0000-4000-8000-00000000000b" },
         })),
     );
     let (status, body) = patch_pane(crate::router(state.clone()), "p1", "Reusable Name 2").await;
     assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Each rename targeted the binding CURRENT at its moment — A then B.
+    let renames = sink.renames.lock().unwrap();
+    assert_eq!(renames.len(), 2, "{renames:?}");
+    assert_eq!(
+        renames[0].target,
+        SessionNameRef::Session {
+            provider: NamedProvider::Claude,
+            session_id: "aaaa0000-0000-4000-8000-00000000000a".into(),
+        }
+    );
+    assert_eq!(
+        renames[1].target,
+        SessionNameRef::Session {
+            provider: NamedProvider::Claude,
+            session_id: "bbbb0000-0000-4000-8000-00000000000b".into(),
+        }
+    );
+    drop(renames);
 
     let title = registry.title_of(&terminal_id);
     assert!(
@@ -317,18 +393,253 @@ async fn pane_reuse_across_sessions_never_leaves_durable_titles() {
     );
     let frames = drain_frames(&mut rx);
     assert!(
-        frames
-            .iter()
-            .all(|f| f["type"] != json!("terminals.changed")),
-        "no terminals.changed across pane reuse: {frames:?}"
+        frames.is_empty(),
+        "scoped reuse renames emit no layout-alias frames: {frames:?}"
     );
-    let rename_frames: Vec<&Value> = frames
-        .iter()
-        .filter(|f| f["type"] == json!("ui.command") && f["command"] == json!("pane.rename"))
-        .collect();
+}
+
+/// Unified agent names (Task 2): a pane renamed BEFORE its durable identity
+/// exists targets its PENDING handle (the pre-durable naming admission) —
+/// the rename never waits for materialization, and the record's later
+/// verified bind carries it.
+#[tokio::test]
+async fn naming_pending_bind_targets_the_pre_durable_handle() {
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+    let state = state_with(tx.clone());
+    let sink = wire_recording_sink(&state);
+    sink.ensure_pending(PendingNameInput {
+        handle: "handle-p".into(),
+        provider: NamedProvider::Claude,
+        cwd: Some("/work/alpha".into()),
+    })
+    .await
+    .unwrap();
+
+    seed_layout(
+        &state,
+        lone_pane_layout(json!({
+            "kind": "terminal",
+            "mode": "claude",
+            "namingHandle": "handle-p",
+        })),
+    );
+    let (status, body) =
+        patch_pane(crate::router(state.clone()), "p1", "Named Before Identity").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let recorded_renames = sink.renames.lock().unwrap().clone();
+    assert_eq!(recorded_renames.len(), 1, "{recorded_renames:?}");
     assert_eq!(
-        rename_frames.len(),
-        2,
-        "each rename yields exactly one ui.command{{pane.rename}} frame: {frames:?}"
+        recorded_renames[0].target,
+        SessionNameRef::Pending {
+            id: "handle-p".into()
+        }
     );
+
+    // The pending record's MANUAL name carries through the verified bind.
+    sink.bind_pending(BindNameInput {
+        pending: SessionNameRef::Pending {
+            id: "handle-p".into(),
+        },
+        target: SessionNameRef::Session {
+            provider: NamedProvider::Claude,
+            session_id: "sess-late".into(),
+        },
+        acquisition: verified_claude_acquisition("sess-late"),
+    })
+    .await
+    .unwrap();
+    let bound = sink
+        .get(vec![SessionNameRef::Session {
+            provider: NamedProvider::Claude,
+            session_id: "sess-late".into(),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(bound[0].record.name, "Named Before Identity");
+}
+
+/// Unified agent names (Task 2): the pane names through its CURRENT binding
+/// — a resume answers the durable record, a new conversation adopts the NEW
+/// session's record — and a stale editor capture (`expectedNameRef`) is
+/// refused visibly (409 NAME_TARGET_MOVED), never silently retargeted.
+#[tokio::test]
+async fn naming_resume_and_new_conversation_follow_the_current_binding() {
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+    let state = state_with(tx.clone());
+    let sink = wire_recording_sink(&state);
+    seed_durable_record(&sink, "handle-a", "aaaa0000-0000-4000-8000-00000000000a").await;
+    seed_durable_record(&sink, "handle-b", "bbbb0000-0000-4000-8000-00000000000b").await;
+
+    // A resumed pane names its durable session.
+    seed_layout(
+        &state,
+        lone_pane_layout(json!({
+            "kind": "fresh-agent", "sessionType": "freshclaude",
+            "provider": "claude", "sessionId": "aaaa0000-0000-4000-8000-00000000000a",
+            "sessionRef": { "provider": "claude", "sessionId": "aaaa0000-0000-4000-8000-00000000000a" },
+        })),
+    );
+    let (status, body) = patch_pane(crate::router(state.clone()), "p1", "Resumed Name").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["data"]["nameRef"],
+        json!({ "kind": "session", "provider": "claude", "sessionId": "aaaa0000-0000-4000-8000-00000000000a" }),
+        "{body}"
+    );
+
+    // A new conversation on the same pane adopts the NEW session's record.
+    seed_layout(
+        &state,
+        lone_pane_layout(json!({
+            "kind": "fresh-agent", "sessionType": "freshclaude",
+            "provider": "claude", "sessionId": "bbbb0000-0000-4000-8000-00000000000b",
+            "sessionRef": { "provider": "claude", "sessionId": "bbbb0000-0000-4000-8000-00000000000b" },
+        })),
+    );
+    let (status, body) =
+        patch_pane(crate::router(state.clone()), "p1", "New Conversation Name").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["data"]["nameRef"],
+        json!({ "kind": "session", "provider": "claude", "sessionId": "bbbb0000-0000-4000-8000-00000000000b" }),
+        "{body}"
+    );
+
+    // A stale editor capture is refused visibly — the rename never lands on
+    // the wrong conversation.
+    let router = crate::router(state.clone());
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/panes/p1")
+                .header("x-auth-token", "tok")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "Stale Editor",
+                        "expectedNameRef": { "kind": "session", "provider": "claude", "sessionId": "aaaa0000-0000-4000-8000-00000000000a" }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let v = body_json(resp).await;
+    assert_eq!(v["error"], json!("NAME_TARGET_MOVED"));
+
+    let renames = sink.renames.lock().unwrap();
+    assert_eq!(
+        renames.len(),
+        2,
+        "the refused rename never reached the authority: {renames:?}"
+    );
+}
+
+/// Unified agent names (Task 2): the route passes the editor's inputs
+/// through faithfully — explicit `nameIntent:"user"` maps to the user intent,
+/// an omitted intent defaults to automatic, and `ifRevision` rides the
+/// compare-and-set.
+#[tokio::test]
+async fn naming_accepted_input_intent_and_revision_pass_through() {
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+    let state = state_with(tx.clone());
+    let sink = wire_recording_sink(&state);
+    seed_durable_record(&sink, "handle-i", "sess-intent").await;
+    seed_layout(
+        &state,
+        lone_pane_layout(json!({
+            "kind": "terminal", "mode": "claude",
+            "sessionRef": { "provider": "claude", "sessionId": "sess-intent" },
+        })),
+    );
+
+    // Omitted intent => automatic (the agent-suggestion default).
+    let router = crate::router(state.clone());
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/panes/p1")
+                .header("x-auth-token", "tok")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "name": "Default Intent" }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Explicit user intent + a compare-and-set revision.
+    let router = crate::router(state.clone());
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/panes/p1")
+                .header("x-auth-token", "tok")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "name": "User Intent", "nameIntent": "user", "ifRevision": 7 })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let renames = sink.renames.lock().unwrap();
+    assert_eq!(renames.len(), 2, "{renames:?}");
+    assert_eq!(renames[0].intent, NameIntent::Automatic);
+    assert_eq!(renames[0].if_revision, None);
+    assert_eq!(renames[1].intent, NameIntent::User);
+    assert_eq!(renames[1].if_revision, Some(7));
+    drop(renames);
+}
+
+/// Unified agent names (Task 2): a zero-turn fresh-agent pane (restarted
+/// before any durable materialization) RETAINS its pre-durable handle — the
+/// create-lane stash keys it by the pane's placeholder sessionId, and the
+/// rename resolves the pending handle from there.
+#[tokio::test]
+async fn naming_zero_turn_initial_recovery_resolves_the_retained_handle() {
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+    let state = state_with(tx.clone());
+    let sink = wire_recording_sink(&state);
+    sink.ensure_pending(PendingNameInput {
+        handle: "handle-z".into(),
+        provider: NamedProvider::Claude,
+        cwd: None,
+    })
+    .await
+    .unwrap();
+    // The create lane stashed the handle under the pane's placeholder.
+    state.stash_naming_handle("placeholder-1", "handle-z");
+
+    // The pane content carries NO sessionRef and NO namingHandle (the
+    // restart reminted the content; only the stash retains the handle).
+    seed_layout(
+        &state,
+        lone_pane_layout(json!({
+            "kind": "fresh-agent", "sessionType": "freshclaude",
+            "provider": "claude", "sessionId": "placeholder-1",
+        })),
+    );
+    let (status, body) = patch_pane(crate::router(state.clone()), "p1", "Recovered Name").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let renames = sink.renames.lock().unwrap();
+    assert_eq!(renames.len(), 1, "{renames:?}");
+    assert_eq!(
+        renames[0].target,
+        SessionNameRef::Pending {
+            id: "handle-z".into()
+        },
+        "the retained pre-durable handle is the rename target: {renames:?}"
+    );
+    drop(renames);
 }

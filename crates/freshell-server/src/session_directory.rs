@@ -627,6 +627,16 @@ async fn session_directory(
     // part of the sidebar's "running" set, matching the original's
     // `TerminalMetadataService.list()` input to `toItems`.
     let items = join_live_terminals(items, &identities);
+    // Unified agent names (Task 2): resolve every scoped item's durable name
+    // BEFORE the query (search/sort must see the manual rename), through the
+    // SAME naming authority every rename route targets. A manual or
+    // migration-protected record wins the displayed `title` in place; every
+    // found record additionally rides the page additively as
+    // `sessionName`/`nameRef` (merged below) — non-manual records never
+    // shadow a provider-generated title (provider titles fold into the
+    // record itself through the observation lanes).
+    let (items, naming_projection) =
+        apply_naming_projection(items, state.identity.naming().as_ref()).await;
     match apply_query(items, &query, &identities) {
         Ok(mut page) => {
             page["revision"] = json!(revision);
@@ -659,6 +669,10 @@ async fn session_directory(
             if !colors.is_empty() {
                 page["projectColors"] = Value::Object(colors);
             }
+            // Unified agent names (Task 2): the additive per-item
+            // `sessionName`/`nameRef` fields (the same durable record every
+            // rename route targets — the client prefers it when present).
+            merge_naming_projection(&mut page, &naming_projection);
             Json(page).into_response()
         }
         // Bad cursor → 400, matching `querySessionDirectory`'s `/cursor/i` → 400.
@@ -1162,6 +1176,137 @@ fn apply_session_overrides(
             Some(item)
         })
         .collect()
+}
+
+/// Unified agent names (Task 2): the directory's read-side resolution — ONE
+/// batched `get` through the SAME naming authority every rename route
+/// targets. A manual or migration-protected record wins the item's displayed
+/// `title` in place (so search/sort/the overlay chain all see the durable
+/// user rename); lower-rank record names (directory/first-message/provider
+/// fallbacks) never shadow a provider-generated title — they fold into the
+/// record itself through the store's own observation lanes. Every FOUND
+/// record also enters the side map, which [`merge_naming_projection`] rides
+/// onto the serialized page as the additive `sessionName`/`nameRef` fields.
+/// A resolution failure degrades to the un-projected page (loudly logged) —
+/// naming is additive here, never a hard dependency of the directory.
+async fn apply_naming_projection(
+    items: Vec<DirItem>,
+    naming: Option<&std::sync::Arc<dyn freshell_freshagent::naming::SessionNaming>>,
+) -> (
+    Vec<DirItem>,
+    std::collections::HashMap<String, (String, freshell_protocol::SessionNameRef)>,
+) {
+    use freshell_protocol::session_names::{NameSource, SessionNameRef};
+    let Some(sink) = naming else {
+        return (items, Default::default());
+    };
+    let mut refs: Vec<SessionNameRef> = Vec::new();
+    for item in &items {
+        if let Some(named) =
+            freshell_freshagent::naming::named_provider_for(Some(&item.provider), None)
+        {
+            refs.push(SessionNameRef::Session {
+                provider: named,
+                session_id: item.session_id.clone(),
+            });
+        }
+    }
+    if refs.is_empty() {
+        return (items, Default::default());
+    }
+    let updates = match sink.get(refs).await {
+        Ok(updates) => updates,
+        Err(error) => {
+            tracing::warn!(
+                target: "freshell_server::session_names",
+                op = "get",
+                name_ref = "-",
+                revision = 0,
+                class = %error.code(),
+                "session_names.operation_failed: {}",
+                error
+            );
+            return (items, Default::default());
+        }
+    };
+    let mut by_key: std::collections::HashMap<String, freshell_protocol::SessionNameUpdate> =
+        std::collections::HashMap::new();
+    for update in updates {
+        if let SessionNameRef::Session {
+            provider,
+            session_id,
+        } = &update.record.name_ref
+        {
+            by_key.insert(format!("{}:{}", provider.as_str(), session_id), update);
+        }
+    }
+    let mut projection: std::collections::HashMap<
+        String,
+        (String, freshell_protocol::SessionNameRef),
+    > = Default::default();
+    let items = items
+        .into_iter()
+        .map(|mut item| {
+            if freshell_freshagent::naming::named_provider_for(Some(&item.provider), None).is_none()
+            {
+                return item;
+            }
+            let key = item.key();
+            if let Some(update) = by_key.get(&key) {
+                if matches!(
+                    update.record.source,
+                    NameSource::Manual | NameSource::LegacyProtected
+                ) {
+                    // The durable manual name wins the displayed title. The
+                    // pre-naming title (provider-native, or a legacy
+                    // override's) is captured into `provider_title` for the
+                    // same preview provenance the settings overlay records —
+                    // never overwriting a capture the overlay pass already
+                    // made. `title_overridden` (the settings-override reset
+                    // affordance) is left alone: scoped resets are refused
+                    // and the additive `sessionName` fields carry the truth.
+                    if item.provider_title.is_none() {
+                        item.provider_title = item.title.clone();
+                    }
+                    item.title = Some(update.record.name.clone());
+                }
+                projection.insert(
+                    key,
+                    (update.record.name.clone(), update.record.name_ref.clone()),
+                );
+            }
+            item
+        })
+        .collect();
+    (items, projection)
+}
+
+/// Unified agent names (Task 2): ride the naming projection onto the
+/// serialized page — per item, the additive `sessionName` (the durable
+/// record's current name) and `nameRef` (its identity). Items without a
+/// record keep their exact prior shape.
+fn merge_naming_projection(
+    page: &mut Value,
+    projection: &std::collections::HashMap<String, (String, freshell_protocol::SessionNameRef)>,
+) {
+    if projection.is_empty() {
+        return;
+    }
+    let Some(items) = page.get_mut("items").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in items {
+        let Some(provider) = item.get("provider").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(session_id) = item.get("sessionId").and_then(Value::as_str) else {
+            continue;
+        };
+        if let Some((name, name_ref)) = projection.get(&format!("{provider}:{session_id}")) {
+            item["sessionName"] = json!(name);
+            item["nameRef"] = serde_json::to_value(name_ref).unwrap_or(Value::Null);
+        }
+    }
 }
 
 /// Task 20 (read-join): overlay `sessionType` from the SESSION-06 metadata

@@ -158,6 +158,16 @@ pub struct FreshClaudeState {
     /// persisted-durably close tears the session down and the gate entry
     /// dies with it.
     close_pending: Arc<std::sync::Mutex<HashMap<String, usize>>>,
+    /// Unified agent names (Task 2): the injected naming authority — same
+    /// set-once/shared model as [`Self::identity_sink`]. Wired by
+    /// `freshell-server::main`; unwired = scoped naming fails unavailable.
+    naming: crate::naming::NamingSink,
+    /// Unified agent names: placeholder session id → the pre-durable naming
+    /// handle admitted at create. Popped by [`Self::adopt_session_init`]'s
+    /// naming hook, so the handle binds to the durable UUID exactly once
+    /// (idempotent in the store) even when blank settings bypass
+    /// `record_binding`.
+    naming_handles: Arc<TokioMutex<HashMap<String, String>>>,
 }
 
 /// Focused-ep5-r1 Finding 1: retention for demoted alias records. The
@@ -584,6 +594,8 @@ impl FreshClaudeState {
             rollback_in_flight: crate::InFlightRegistry::new(),
             alias_tombstones: Arc::new(std::sync::Mutex::new(AliasTombstones::default())),
             close_pending: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            naming: crate::naming::NamingSink::default(),
+            naming_handles: Arc::new(TokioMutex::new(HashMap::new())),
         }
     }
 
@@ -612,6 +624,83 @@ impl FreshClaudeState {
     /// The wired identity sink, if any.
     fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
         self.identity_sink.get().cloned()
+    }
+
+    /// Unified agent names (Task 2): wire the naming authority (set-once;
+    /// later calls are no-ops). `freshell-server::main` injects the ONE local
+    /// store participant.
+    pub fn set_session_naming(
+        &self,
+        sink: std::sync::Arc<dyn crate::naming::SessionNaming>,
+    ) -> bool {
+        self.naming.set(sink)
+    }
+
+    /// Unified agent names: the wired naming authority, if any.
+    pub(crate) fn naming(&self) -> Option<std::sync::Arc<dyn crate::naming::SessionNaming>> {
+        self.naming.get()
+    }
+
+    /// Unified agent names (Task 2): admit a freshclaude create's pre-durable
+    /// naming handle and stash it against the placeholder session id, so the
+    /// `sdk.session.init` adoption binds it to the durable UUID. Kilroy is
+    /// out of scope (its `naming_handle` is ignored); a create WITHOUT a
+    /// handle simply proceeds unnamed. Returns the frame projection when a
+    /// handle was admitted.
+    async fn admit_create_handle(
+        &self,
+        msg: &FreshAgentCreate,
+        session_type: &str,
+        placeholder: &str,
+    ) -> Option<(
+        freshell_protocol::session_names::SessionNameRef,
+        freshell_protocol::session_names::SessionNameRecord,
+    )> {
+        if session_type == "kilroy" {
+            return None;
+        }
+        let handle = msg.naming_handle.as_deref()?.trim().to_string();
+        if handle.is_empty() {
+            return None;
+        }
+        let sink = self.naming();
+        let projection = crate::naming::admit_pending_projection(
+            &sink,
+            &handle,
+            freshell_protocol::session_names::NamedProvider::Claude,
+            msg.cwd.as_deref(),
+        )
+        .await?;
+        self.naming_handles
+            .lock()
+            .await
+            .insert(placeholder.to_string(), handle);
+        Some(projection)
+    }
+
+    /// Unified agent names: the current frame projection for an ALREADY
+    /// created session (the dedup-replay arm) — the stashed handle's
+    /// record, resolved through the wired authority (a pending ref and its
+    /// redirected durable record answer the same record via `get`).
+    async fn created_projection_for(
+        &self,
+        session_id: &str,
+    ) -> Option<(
+        freshell_protocol::session_names::SessionNameRef,
+        freshell_protocol::session_names::SessionNameRecord,
+    )> {
+        let handle = self.naming_handles.lock().await.get(session_id).cloned()?;
+        let sink = self.naming();
+        let target = freshell_protocol::session_names::SessionNameRef::Pending { id: handle };
+        let updates = sink?
+            .get(vec![target.clone()])
+            .await
+            .map_err(|error| crate::naming::log_name_error("get", &target, &error))
+            .ok()?;
+        updates
+            .into_iter()
+            .next()
+            .map(|update| (update.record.name_ref.clone(), update.record))
     }
 
     /// Broadcast a `freshAgent.error` alarm/degradation frame (P1.13; Task 10
@@ -693,6 +782,12 @@ impl FreshClaudeState {
         // serialize instead of each spawning their own sidecar.
         let _dedup_guard = match self.create_dedup.acquire_or_replay(&request_id).await {
             FreshAgentCreateOutcome::Replay(cached) => {
+                // Unified agent names: the replay re-answers with the SAME
+                // naming projection the original create acknowledged (the
+                // handle was stashed against this placeholder at admission).
+                let projection = self.created_projection_for(&cached.session_id).await;
+                let name_ref = projection.as_ref().map(|(r, _)| r.clone());
+                let session_name = projection.map(|(_, record)| record);
                 self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
                     provider: PROVIDER.to_string(),
                     request_id,
@@ -700,6 +795,8 @@ impl FreshClaudeState {
                     session_id: cached.session_id,
                     session_type: session_type.to_string(),
                     session_ref: None,
+                    name_ref,
+                    session_name,
                 }));
                 return;
             }
@@ -895,6 +992,12 @@ impl FreshClaudeState {
         // a fence whose clear it raced — the ordering is structural, not
         // scheduled.
         //
+        // Unified agent names (Task 2): the pre-durable handle is admitted
+        // with the placeholder session id — BEFORE any failure arm that
+        // would otherwise strand a handle the pane content already carries
+        // (creation/recovery retries re-ensure the same handle idempotently).
+        let naming_projection = self.admit_create_handle(&msg, session_type, &created).await;
+        //
         // Round 4 (focused-ep5-r3 Finding 1): the commit is CONDITIONAL —
         // if a kill landed while this create awaited `created`, the durable
         // dead-state has advanced past the claim-start snapshot and the
@@ -1087,6 +1190,12 @@ impl FreshClaudeState {
 
         // Broadcast freshAgent.created (ws-handler.ts:3378). NO sessionRef for claude
         // (adapter.ts returns { sessionId } only); placeholder == the bare nanoid.
+        // Unified agent names: the created frame carries the pane's naming
+        // projection (the pending handle's record) when one was admitted.
+        let name_ref = naming_projection
+            .as_ref()
+            .map(|(reference, _)| reference.clone());
+        let session_name = naming_projection.map(|(_, record)| record);
         self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
             provider: PROVIDER.to_string(),
             request_id,
@@ -1094,6 +1203,8 @@ impl FreshClaudeState {
             session_id: created,
             session_type: session_type.to_string(),
             session_ref: None,
+            name_ref,
+            session_name,
         }));
     }
 
@@ -1135,6 +1246,20 @@ impl FreshClaudeState {
                 },
             )
             .await;
+        // Unified agent names: the adopted pane names through the DURABLE
+        // session's own record (a kilroy pane never carries one).
+        let projection = if session_type == "kilroy" {
+            None
+        } else {
+            crate::naming::session_projection(
+                &self.naming(),
+                freshell_protocol::session_names::NamedProvider::Claude,
+                durable,
+            )
+            .await
+        };
+        let name_ref = projection.as_ref().map(|(r, _)| r.clone());
+        let session_name = projection.map(|(_, record)| record);
         self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
             provider: PROVIDER.to_string(),
             request_id: request_id.to_string(),
@@ -1145,6 +1270,8 @@ impl FreshClaudeState {
                 provider: PROVIDER.to_string(),
                 session_id: durable.to_string(),
             }),
+            name_ref,
+            session_name,
         }));
     }
 
@@ -2762,7 +2889,22 @@ impl FreshClaudeState {
     /// The pane re-key ride (kata 1wxv Task 4): the existing
     /// `freshAgent.session.materialized` broadcast shape (codex's mint-new respawn
     /// precedent), old client-facing id → new adopted durable id.
-    fn broadcast_materialized(&self, old_id: &str, new_id: &str, session_type: &str) {
+    /// Unified agent names: the frame carries the durable record's current
+    /// projection — the pending→durable transfer commits in
+    /// [`Self::adopt_session_init`] BEFORE this publishes the identity.
+    async fn broadcast_materialized(&self, old_id: &str, new_id: &str, session_type: &str) {
+        let projection = if session_type == "kilroy" {
+            None
+        } else {
+            crate::naming::session_projection(
+                &self.naming(),
+                freshell_protocol::session_names::NamedProvider::Claude,
+                new_id,
+            )
+            .await
+        };
+        let name_ref = projection.as_ref().map(|(r, _)| r.clone());
+        let session_name = projection.map(|(_, record)| record);
         self.broadcast(&ServerMessage::FreshAgentSessionMaterialized(
             FreshAgentSessionMaterialized {
                 previous_session_id: old_id.to_string(),
@@ -2773,6 +2915,8 @@ impl FreshClaudeState {
                     provider: PROVIDER.to_string(),
                     session_id: new_id.to_string(),
                 }),
+                name_ref,
+                session_name,
             },
         ));
     }
@@ -3685,7 +3829,8 @@ impl FreshClaudeState {
         // Pane re-key: the existing materialized broadcast (old → new) goes out
         // BEFORE any frame stamped with the new id; the envelope-stamp flip
         // follows it so the re-key never outruns the pane.
-        self.broadcast_materialized(&op.session_id, &adopted_id, session_type);
+        self.broadcast_materialized(&op.session_id, &adopted_id, session_type)
+            .await;
         *broadcast_id.lock().expect("broadcast id lock") = adopted_id.clone();
 
         let removed_ids: Vec<String> = removed_turns
@@ -4314,6 +4459,18 @@ impl FreshClaudeState {
                     "freshagent.claude.alias_tombstone_write_failed");
             }
         }
+        // Unified agent names (Task 2): the init hook runs EVEN WHEN blank
+        // settings bypass `record_binding` below — the naming bind is driven
+        // by verified transcript durability, not by the settings row. The
+        // stashed pre-durable handle (keyed by this placeholder) binds to
+        // the durable UUID exactly once (idempotent in the store); a
+        // zero-turn init whose transcript has not materialized yet retains
+        // the handle and records only the acquired location (InitialRecovery
+        // semantics — the name authority never moves on unverified
+        // evidence). A rollback fork classifies as InternalContinuation (the
+        // child is seeded once with the source preserved).
+        self.bind_naming_handle_at_init(cli_id, session_id, session_type, supersedes)
+            .await;
         let recordable = settings
             .filter(|s| **s != crate::identity_sink::FreshAgentSettings::default())
             .is_some()
@@ -4330,6 +4487,7 @@ impl FreshClaudeState {
                 create_request_id: None,
                 resolves_pending: None,
                 supersedes: supersedes.map(str::to_string),
+                name_transition: None,
                 provenance: provenance.cloned().into(),
                 settings: settings.cloned().unwrap_or_default(),
             })
@@ -4342,6 +4500,121 @@ impl FreshClaudeState {
                 "LEDGER_WRITE_FAILED",
                 "Failed to persist this session's resume record - settings may not survive a server restart.",
             );
+        }
+    }
+
+    /// Unified agent names (Task 2): the `sdk.session.init` naming hook —
+    /// see [`Self::adopt_session_init`]. Deliberately NOT a lane blocker: a
+    /// naming failure never fails the identity event (the handle is
+    /// retained; the main.rs naming tick retries the transition visibly).
+    async fn bind_naming_handle_at_init(
+        &self,
+        cli_id: &str,
+        placeholder: &str,
+        session_type: &str,
+        supersedes: Option<&str>,
+    ) {
+        if session_type == "kilroy" {
+            return;
+        }
+        let Some(sink) = self.naming() else {
+            return;
+        };
+        let Some(handle) = self.naming_handles.lock().await.get(placeholder).cloned() else {
+            return;
+        };
+        // Existing provider durability evidence: the claude CLI writes the
+        // session transcript at startup, so a located transcript file
+        // verifies the durable identity (`claude_snapshot::locate_transcript_selected`
+        // walks the same ordered candidate roots the snapshot lane reads and
+        // answers the selected root + original cwd the store retains).
+        let selected = crate::claude_snapshot::locate_transcript_selected(cli_id);
+        let (persistence, evidence) = if selected.is_some() {
+            (
+                freshell_protocol::native_location::NativePersistence::Verified,
+                freshell_protocol::native_location::NativeEvidenceKind::SelectedTranscript,
+            )
+        } else {
+            (
+                freshell_protocol::native_location::NativePersistence::Prospective,
+                freshell_protocol::native_location::NativeEvidenceKind::InitializedRuntime,
+            )
+        };
+        let acquisition = freshell_protocol::native_location::NativeAcquisition {
+            location: freshell_protocol::native_location::NativeLocation::Claude {
+                config_root: selected
+                    .as_ref()
+                    .map(|s| s.config_root.display().to_string())
+                    .or_else(|| {
+                        crate::claude_snapshot::claude_home_candidates()
+                            .first()
+                            .map(|root| root.display().to_string())
+                    })
+                    .unwrap_or_default(),
+                transcript_path: selected
+                    .as_ref()
+                    .map(|s| s.transcript_path.display().to_string()),
+                project_directory_key: None,
+                transcript_cwd: selected.as_ref().and_then(|s| s.transcript_cwd.clone()),
+                effective_project_key_override: None,
+            },
+            evidence,
+            persistence,
+        };
+        let pending = freshell_protocol::session_names::SessionNameRef::Pending { id: handle };
+        let target = freshell_protocol::session_names::SessionNameRef::Session {
+            provider: freshell_protocol::session_names::NamedProvider::Claude,
+            session_id: cli_id.to_string(),
+        };
+        // Transition classification (retained for the store's routing log):
+        // a rollback fork is an InternalContinuation (the child is seeded
+        // once with the source preserved — the store's collision rules keep
+        // a manual winner); every other init is the initial materialization.
+        let reason = if supersedes.is_some() {
+            crate::naming::NameTransitionReason::InternalContinuation
+        } else {
+            crate::naming::NameTransitionReason::InitialMaterialization
+        };
+        let outcome =
+            if persistence == freshell_protocol::native_location::NativePersistence::Verified {
+                sink.bind_pending(crate::naming::BindNameInput {
+                    pending: pending.clone(),
+                    target: target.clone(),
+                    acquisition,
+                })
+                .await
+            } else {
+                // Zero-turn init: update the acquired location only — the name
+                // authority (and the handle) stay untouched until verified.
+                sink.record_acquisition(pending.clone(), acquisition).await
+            };
+        match outcome {
+            Ok(update) => {
+                tracing::debug!(target: "freshell_freshagent::claude",
+                    session_id = %cli_id,
+                    reason = ?reason,
+                    "freshagent.claude.naming_transition_committed"
+                );
+                // Bound (or retained): the stash entry is consumed once the
+                // handle is redirected to the durable record; a retained
+                // (prospective) stash survives for the tick's retry.
+                if update.record.name_ref == target {
+                    self.naming_handles.lock().await.remove(placeholder);
+                }
+            }
+            Err(error) => {
+                crate::naming::log_name_error(
+                    if persistence
+                        == freshell_protocol::native_location::NativePersistence::Verified
+                    {
+                        "bind_pending"
+                    } else {
+                        "record_acquisition"
+                    },
+                    &pending,
+                    &error,
+                );
+            }
         }
     }
 
@@ -7299,6 +7572,7 @@ rl.on('line', (line) => {
 
     fn dedup_create_msg(request_id: &str) -> FreshAgentCreate {
         FreshAgentCreate {
+            naming_handle: None,
             request_id: request_id.to_string(),
             session_type: SessionType::Freshclaude,
             provider: Some(freshell_protocol::AgentProvider::Claude),
@@ -8911,6 +9185,7 @@ rl.on('line', (line) => {
         // The lineage-only seed: a binding row exists, with an all-blank
         // settings snapshot (load_settings answers None).
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "claude".into(),
             session_id: DURABLE.into(),
             mode: "freshclaude".into(),

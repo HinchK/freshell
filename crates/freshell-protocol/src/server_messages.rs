@@ -12,7 +12,7 @@ use crate::common::{
     CodexDurability, ErrorCode, OpencodeActivityRecord, SessionLocator, TerminalMetaRecord,
     TurnCompletionSnapshot,
 };
-use crate::session_names::SessionNameUpdated;
+use crate::session_names::{SessionNameRecord, SessionNameRef, SessionNameUpdated};
 use crate::settings::ServerSettings;
 
 /// A message sent from the server to a client.
@@ -758,6 +758,17 @@ pub struct FreshAgentCreated {
     pub session_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    /// Unified agent names (Task 1 wire / Task 2 Rust side): canonical
+    /// session-name projection for this session's naming ref (last-known;
+    /// the `session.name.updated` broadcast is the live authority).
+    /// Additive optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<SessionNameRecord>,
+    /// Unified agent names: the naming identity this session's name resolves
+    /// through (the pending handle before durable materialization).
+    /// Additive optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_ref: Option<SessionNameRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -815,6 +826,16 @@ pub struct FreshAgentSessionMaterialized {
     pub session_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    /// Unified agent names (Task 1 wire / Task 2 Rust side): the canonical
+    /// name record AFTER the materialization's pending→durable transfer (the
+    /// commit happens BEFORE this frame publishes the identity). Additive
+    /// optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<SessionNameRecord>,
+    /// Unified agent names: the durable naming identity the materialized
+    /// session's name now resolves through. Additive optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_ref: Option<SessionNameRef>,
 }
 
 // --- pane.reconcile.result ----------------------------------------------------
@@ -1105,6 +1126,17 @@ pub struct TerminalCreated {
     pub restore_error: Option<TerminalRestoreError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    /// Unified agent names (Task 1 wire / Task 2 Rust side): canonical
+    /// session-name projection for this terminal's naming ref (last-known;
+    /// the `session.name.updated` broadcast is the live authority).
+    /// Additive optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<SessionNameRecord>,
+    /// Unified agent names: the naming identity this terminal's name
+    /// resolves through (the pending handle before durable materialization).
+    /// Additive optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_ref: Option<SessionNameRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1140,6 +1172,15 @@ pub struct InventoryTerminal {
     pub runtime_status: Option<RuntimeStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<SessionLocator>,
+    /// Unified agent names (Task 1 wire / Task 2 Rust side): canonical
+    /// session-name projection (last-known display cache; never an accepted
+    /// name input). Additive optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<SessionNameRecord>,
+    /// Unified agent names: the naming identity this terminal's name
+    /// resolves through. Additive optional.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_ref: Option<SessionNameRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

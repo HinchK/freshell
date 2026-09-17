@@ -2244,6 +2244,62 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
         .expect("pane_tabs mutex")
         .insert(pane_id.to_string(), tab_id.to_string());
 
+    // Unified agent names (Task 2): the REST CLI create's naming admission.
+    // A scoped mode gets its pre-durable handle (the caller-supplied
+    // `namingHandle`, else a server-minted one) ensured BEFORE the
+    // tab.create broadcast, stashed by TERMINAL id (the CLI identity binds
+    // by terminal in the locator lanes), and carried in the paneContent so
+    // the client's pane state can target pre-identity renames. A resume
+    // create names through the durable session's own record instead (the
+    // hook receives that nameRef). Unwired sinks proceed unnamed.
+    let (mut naming_handle, mut naming_name_ref) = (None, None);
+    if let Some(provider) = crate::naming::named_provider_for(Some(mode.as_str()), None) {
+        if let Some(sink) = state.naming() {
+            match accepted_session_ref
+                .as_ref()
+                .filter(|sref| sref.provider == provider.as_str())
+                .map(|sref| sref.session_id.clone())
+            {
+                Some(session_id) => {
+                    naming_name_ref =
+                        Some(freshell_protocol::session_names::SessionNameRef::Session {
+                            provider,
+                            session_id,
+                        });
+                }
+                None => {
+                    let handle = body
+                        .get("namingHandle")
+                        .and_then(Value::as_str)
+                        .filter(|h| !h.trim().is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("nh-{}", Uuid::new_v4().simple()));
+                    let pending = freshell_protocol::session_names::SessionNameRef::Pending {
+                        id: handle.clone(),
+                    };
+                    match sink
+                        .ensure_pending(crate::naming::PendingNameInput {
+                            handle: handle.clone(),
+                            provider,
+                            cwd: spec.cwd.clone(),
+                        })
+                        .await
+                    {
+                        Ok(_) => {
+                            state.stash_naming_handle(&terminal_id, &handle);
+                            pane_content["namingHandle"] = json!(handle);
+                            naming_handle = Some(handle);
+                            let _ = pending;
+                        }
+                        Err(error) => {
+                            crate::naming::log_name_error("ensure_pending", &pending, &error);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Fix round 1 (Task 23 gap): fire the injected post-create hook -- Node's
     // registry-'terminal.created'-event analog (`server/index.ts:647-655` ->
     // `seedFromTerminal` for EVERY terminal). `freshell-server` wires it to the
@@ -2258,6 +2314,8 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             mode: mode.clone(),
             resume_session_id: resume_session_id.clone(),
             cwd: spec.cwd.clone(),
+            naming_handle: naming_handle.clone(),
+            name_ref: naming_name_ref.clone(),
         });
     }
 

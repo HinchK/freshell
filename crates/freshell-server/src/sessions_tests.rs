@@ -29,6 +29,11 @@ async fn body_json(resp: axum::response::Response) -> serde_json::Value {
 
 #[tokio::test]
 async fn patch_rename_persists_and_returns_merged_plus_cascade_null() {
+    // Unified agent names (Task 2): the settings-override merge/cascade path
+    // now applies to EXCLUDED providers only — a scoped provider's title
+    // rename routes to the naming authority (see
+    // `session_name_routes_tests`). This pin keeps the excluded-provider
+    // behavior: provider=gemini.
     let dir = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
     std::fs::create_dir_all(dir.join(".freshell")).unwrap();
     let app = super::router(state(&dir));
@@ -36,7 +41,7 @@ async fn patch_rename_persists_and_returns_merged_plus_cascade_null() {
         .oneshot(
             Request::builder()
                 .method("PATCH")
-                .uri("/api/sessions/abc123?provider=claude")
+                .uri("/api/sessions/abc123?provider=gemini")
                 .header("x-auth-token", "tok")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"titleOverride":"My Title"}"#))
@@ -55,6 +60,9 @@ async fn patch_rename_persists_and_returns_merged_plus_cascade_null() {
 /// b5fb: clearing a title (`{"titleOverride": null}`) removes BOTH the override
 /// and its source. A leftover titleSource:"user" would permanently finalize the
 /// row at rank 5, blocking every automatic title update forever after.
+/// Unified agent names (Task 2): the clear path applies to EXCLUDED providers
+/// only (a scoped provider's null/reset is refused — see
+/// `session_name_routes_tests`), so this pin uses provider=gemini.
 #[tokio::test]
 async fn patch_clear_title_removes_override_and_source() {
     let dir = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
@@ -68,7 +76,7 @@ async fn patch_clear_title_removes_override_and_source() {
         .oneshot(
             Request::builder()
                 .method("PATCH")
-                .uri("/api/sessions/abc123?provider=claude")
+                .uri("/api/sessions/abc123?provider=gemini")
                 .header("x-auth-token", "tok")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"titleOverride":"Intentional rename"}"#))
@@ -84,7 +92,7 @@ async fn patch_clear_title_removes_override_and_source() {
         .oneshot(
             Request::builder()
                 .method("PATCH")
-                .uri("/api/sessions/abc123?provider=claude")
+                .uri("/api/sessions/abc123?provider=gemini")
                 .header("x-auth-token", "tok")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"titleOverride":null}"#))
@@ -104,14 +112,14 @@ async fn patch_clear_title_removes_override_and_source() {
     );
 
     let overrides = st.settings.session_overrides();
-    let row = overrides.get("claude:abc123").cloned().unwrap_or_default();
+    let row = overrides.get("gemini:abc123").cloned().unwrap_or_default();
     assert!(row.get("titleOverride").is_none(), "stored row: {row}");
     assert!(row.get("titleSource").is_none(), "stored row: {row}");
 
     // 3) The ladder is unblocked: a first-message sourced write lands again.
     st.settings
         .patch_session_override(
-            "claude:abc123",
+            "gemini:abc123",
             &[
                 (
                     "titleOverride",
@@ -124,7 +132,7 @@ async fn patch_clear_title_removes_override_and_source() {
     let row = st
         .settings
         .session_overrides()
-        .get("claude:abc123")
+        .get("gemini:abc123")
         .cloned()
         .unwrap();
     assert_eq!(row["titleSource"], serde_json::json!("first-message"));
@@ -183,12 +191,16 @@ async fn patch_rename_cascades_all_four_effects_to_a_live_terminal() {
     std::fs::create_dir_all(dir.join(".freshell")).unwrap();
     let st = state(&dir);
 
-    // A terminal currently running `claude:sess-live` (the session key
+    // A terminal currently running `gemini:sess-live` (the session key
     // this PATCH targets) -- `find_by_session` needs a LIVE (non-retired)
     // match, and the registry write-through needs a REAL registered
     // terminal_id (`update_title` is a no-op against an unknown id).
+    // Unified agent names (Task 2): gemini is an EXCLUDED provider — the
+    // reverse cascade is the settings-override flow's own reach-back and
+    // stays with it (scoped providers rename through the naming authority,
+    // which the publisher reflects without a cascade).
     st.identity
-        .upsert("term-live", Some("claude"), Some("sess-live"), None, 1000);
+        .upsert("term-live", Some("gemini"), Some("sess-live"), None, 1000);
     spawn_headless_terminal_for_test(&st.registry, "term-live");
 
     // Subscribe BEFORE the PATCH so the `terminals.changed` send lands in
@@ -200,7 +212,7 @@ async fn patch_rename_cascades_all_four_effects_to_a_live_terminal() {
         .oneshot(
             Request::builder()
                 .method("PATCH")
-                .uri("/api/sessions/sess-live?provider=claude")
+                .uri("/api/sessions/sess-live?provider=gemini")
                 .header("x-auth-token", "tok")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"titleOverride":"Renamed From Session"}"#))
@@ -258,6 +270,8 @@ async fn patch_rename_cascades_all_four_effects_to_a_live_terminal() {
 /// all: b5fb removed that cascade outright (a terminal rename never writes a
 /// session override -- see `title_scope_tests` in `terminals.rs`), so this
 /// live-only session -> terminal reach-back is the only rename cascade left.
+/// Unified agent names (Task 2): gemini is an EXCLUDED provider — the
+/// cascade behavior belongs to the settings-override flow it observes.
 #[tokio::test]
 async fn patch_rename_to_a_retired_terminal_identity_does_not_cascade() {
     let dir = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
@@ -266,7 +280,7 @@ async fn patch_rename_to_a_retired_terminal_identity_does_not_cascade() {
 
     st.identity.upsert(
         "term-exited",
-        Some("claude"),
+        Some("gemini"),
         Some("sess-exited"),
         None,
         1000,
@@ -278,7 +292,7 @@ async fn patch_rename_to_a_retired_terminal_identity_does_not_cascade() {
         .oneshot(
             Request::builder()
                 .method("PATCH")
-                .uri("/api/sessions/sess-exited?provider=claude")
+                .uri("/api/sessions/sess-exited?provider=gemini")
                 .header("x-auth-token", "tok")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"titleOverride":"Renamed After Exit"}"#))
@@ -313,6 +327,10 @@ async fn patch_rename_to_a_retired_terminal_identity_does_not_cascade() {
 /// including `title`), so THIS write site must broadcast directly.
 /// Proves a rename PATCH produces exactly one `sessions.changed` frame
 /// with a positive, monotonic revision.
+/// Unified agent names (Task 2): gemini is an EXCLUDED provider — this
+/// direct-broadcast behavior belongs to the settings-override write
+/// (a scoped provider's rename reaches clients through the naming
+/// publisher instead).
 #[tokio::test]
 async fn patch_rename_broadcasts_sessions_changed_with_increased_revision() {
     let dir = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
@@ -328,7 +346,7 @@ async fn patch_rename_broadcasts_sessions_changed_with_increased_revision() {
         .oneshot(
             Request::builder()
                 .method("PATCH")
-                .uri("/api/sessions/abc123?provider=claude")
+                .uri("/api/sessions/abc123?provider=gemini")
                 .header("x-auth-token", "tok")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"titleOverride":"Renamed Session"}"#))
@@ -584,9 +602,19 @@ async fn generate_title_multiline_takes_first_nonempty_line_truncated() {
 /// End-to-end sanity: a PATCH through THIS router persists a
 /// `sessionOverride` that `session_directory`'s overlay (Task 2) then
 /// surfaces on the matching item — the same `SettingsStore` backs both.
+/// Unified agent names (Task 2): the claude title is now a NAMING record
+/// (created through the create-lane admission — modeled here by a direct
+/// store admit+bind), so the overlay assertion covers the non-title
+/// (`archived`) settings surface while the title rides the naming
+/// projection (`title` + additive `sessionName`/`nameRef`).
 #[tokio::test]
 async fn patch_override_is_visible_through_session_directory_overlay() {
     use axum::http::Request as HttpRequest;
+    use freshell_freshagent::naming::{BindNameInput, PendingNameInput, SessionNaming};
+    use freshell_protocol::native_location::{
+        NativeAcquisition, NativeEvidenceKind, NativeLocation, NativePersistence,
+    };
+    use freshell_protocol::session_names::{NamedProvider, SessionNameRef};
 
     let home = std::env::temp_dir().join(format!("frs-sess-router-{}", uuid_like()));
     let project = home.join(".claude").join("projects").join("-tmp-proj");
@@ -607,12 +635,56 @@ async fn patch_override_is_visible_through_session_directory_overlay() {
     let settings = crate::settings_store::SettingsStore::load(Some(&home), vec!["claude".into()]);
     let auth_token: std::sync::Arc<String> = std::sync::Arc::new("tok".into());
 
-    // Patch title + archived through the sessions router.
+    // The ONE naming authority, shared by both routers below (the identity
+    // registries carry the sink) — and the session's durable record,
+    // admitted + bound the way the create lane does.
+    let names = crate::session_names::SessionNames::open(home.join(".freshell")).unwrap();
+    names
+        .ensure_pending(PendingNameInput {
+            handle: "handle-overlay".into(),
+            provider: NamedProvider::Claude,
+            cwd: Some("/tmp/proj".into()),
+        })
+        .await
+        .unwrap();
+    names
+        .bind_pending(BindNameInput {
+            pending: SessionNameRef::Pending {
+                id: "handle-overlay".into(),
+            },
+            target: SessionNameRef::Session {
+                provider: NamedProvider::Claude,
+                session_id: "healthy-session-id".into(),
+            },
+            acquisition: NativeAcquisition {
+                location: NativeLocation::Claude {
+                    config_root: home.join(".claude").to_string_lossy().into_owned(),
+                    transcript_path: Some(
+                        project
+                            .join("healthy-session-id.jsonl")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    project_directory_key: None,
+                    transcript_cwd: Some("/tmp/proj".into()),
+                    effective_project_key_override: None,
+                },
+                evidence: NativeEvidenceKind::SelectedTranscript,
+                persistence: NativePersistence::Verified,
+            },
+        })
+        .await
+        .unwrap();
+
+    // Patch title + archived through the sessions router (the title routes
+    // to the naming authority; archived patches the settings store).
     let (tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
+    let sessions_identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+    sessions_identity.set_session_naming(names.clone());
     let sessions_app = super::router(super::SessionsState {
         auth_token: std::sync::Arc::clone(&auth_token),
         settings: settings.clone(),
-        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        identity: sessions_identity,
         registry: freshell_terminal::TerminalRegistry::new(),
         broadcast_tx: std::sync::Arc::new(tx),
         terminals_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
@@ -629,13 +701,23 @@ async fn patch_override_is_visible_through_session_directory_overlay() {
                 .header("x-auth-token", "tok")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    r#"{"titleOverride":"Overlay Title","archived":true}"#,
+                    r#"{"titleOverride":"Overlay Title","archived":true,"nameIntent":"user"}"#,
                 ))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(patch_resp.status(), StatusCode::OK);
+    let patch_body = body_json(patch_resp).await;
+    // The scoped title rename answers the accepted naming record — no
+    // settings title override was written, and `archived` (a non-title
+    // field in the SAME request) still patched the settings store.
+    assert_eq!(
+        patch_body["sessionName"]["record"]["name"],
+        serde_json::json!("Overlay Title"),
+        "the session route carries the accepted naming update: {patch_body}"
+    );
+    assert_eq!(patch_body["archived"], serde_json::json!(true));
 
     // Query the session-directory read model with the SAME settings store.
     // Batch B: the read model is backed by a `SessionIndex` now, not a
@@ -652,12 +734,14 @@ async fn patch_override_is_visible_through_session_directory_overlay() {
             None,
         ),
     );
+    let dir_identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+    dir_identity.set_session_naming(names.clone());
     let dir_app =
         crate::session_directory::router(crate::session_directory::SessionDirectoryState {
             auth_token: std::sync::Arc::clone(&auth_token),
             settings,
             session_index: Some(session_index),
-            identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+            identity: dir_identity,
             metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
             server_instance: std::sync::Arc::new("srv-test".to_string()),
         });
@@ -679,7 +763,15 @@ async fn patch_override_is_visible_through_session_directory_overlay() {
         .iter()
         .find(|i| i["sessionId"] == serde_json::json!("healthy-session-id"))
         .expect("patched session present in directory");
+    // The durable manual name wins the displayed title and rides the page
+    // additively; the archived settings overlay still applies.
     assert_eq!(item["title"], serde_json::json!("Overlay Title"));
+    assert_eq!(item["sessionName"], serde_json::json!("Overlay Title"));
+    assert_eq!(
+        item["nameRef"],
+        serde_json::json!({ "kind": "session", "provider": "claude", "sessionId": "healthy-session-id" }),
+        "the item carries the record's identity: {item}"
+    );
     assert_eq!(item["archived"], serde_json::json!(true));
 
     std::fs::remove_dir_all(&home).ok();

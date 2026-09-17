@@ -37,11 +37,12 @@
 //! Task 2 constructs this store in `main.rs`; Tasks 3–4 consume
 //! [`SessionNames::try_background_guard`] for the serial worker.
 
-// Task 1 stages this authority without wiring it into `main`'s composition
-// (construction is Task 2); until then the non-test build sees the module's
-// items as unreferenced. Task 2 removes this allow when it constructs the
-// store.
-#![allow(dead_code)]
+// Unified agent names Task 2: the store is constructed and wired in `main`
+// (routes/sinks/tick/publisher), so no module-level dead-code allow remains.
+// The Tasks 3–4 seams below (`offer`'s automatic-name path, the generation
+// series, the background worker guard) carry item-level allows until their
+// wiring tasks land.
+//
 // `NameError::Conflict` deliberately carries the accepted record so route
 // callers can answer a CAS conflict with the current winner instead of an
 // invisible overwrite — the large Err payload is the design (same rationale
@@ -423,6 +424,8 @@ pub struct SessionNames {
 /// holds it. Acquire worker THEN document, never the reverse. The guard
 /// never acquires the document lock, cannot be cloned, and is never
 /// released through a detached timeout — it lives until its owner drops it.
+// Tasks 3–4 seam: no caller until the background worker lands.
+#[allow(dead_code)]
 pub(crate) struct BackgroundGuard {
     _file: std::fs::File,
 }
@@ -483,6 +486,8 @@ impl SessionNames {
 
     /// Try to take the background worker lock (Tasks 3–4). `Ok(None)` means
     /// another cooperating process holds it; lock failures are errors.
+    // Tasks 3–4 seam: no caller until the background worker lands.
+    #[allow(dead_code)]
     pub(crate) fn try_background_guard(&self) -> Result<Option<BackgroundGuard>, NameError> {
         let file = open_lock_file(&self.core.worker_lock_path)?;
         match file.try_lock() {
@@ -497,6 +502,9 @@ impl SessionNames {
     /// Internal automatic/migration offer seam: arbitrary callers cannot
     /// reach this through HTTP (routes land in Task 2 and never accept
     /// `freshell_ai`/`legacy_protected` from clients).
+    // Tasks 3–4 seam: the automatic-name pipeline (first-message/AI offers)
+    // is the next wiring task.
+    #[allow(dead_code)]
     pub(crate) fn offer(
         &self,
         target: SessionNameRef,
@@ -530,6 +538,8 @@ impl SessionNames {
     /// Durable generation work-claim seam (Task 4's worker dispatches through
     /// this): persist an attempt's start before any provider call, consuming
     /// one of the bounded three starts and exhausting the series at the cap.
+    // Tasks 3–4 seam: the generation worker lands next.
+    #[allow(dead_code)]
     pub(crate) fn claim_generation_start(
         &self,
         target: SessionNameRef,
@@ -544,6 +554,8 @@ impl SessionNames {
     /// Durable generation completion seam (Task 4's worker folds answers
     /// through this): accept a Freshell AI answer only if that same series is
     /// current and the accepted source is below Freshell AI.
+    // Tasks 3–4 seam: the generation worker lands next.
+    #[allow(dead_code)]
     pub(crate) fn complete_generation(
         &self,
         target: SessionNameRef,

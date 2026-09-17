@@ -460,6 +460,29 @@ pub(crate) async fn rename_tab(
         return fail_json(StatusCode::BAD_REQUEST, "name required".to_string());
     };
 
+    // Unified agent names (Task 2): a session-owned tab has NO separately
+    // stored name — its display IS its source pane's canonical session name,
+    // so a rename targets that pane's saved session (the stable source the
+    // mirror recorded, never the active pane or last activity). Legacy tabs
+    // keep the existing layout rename.
+    if let Some(freshell_protocol::session_names::TabNameSource::Session {
+        pane_id: source_pane_id,
+    }) = state.layout.tab_name_source(&tab_id)
+    {
+        if let Some(resolution) = crate::resolve_pane_name_target(&state, &source_pane_id) {
+            if resolution.scoped {
+                return crate::rename_scoped_session(
+                    &state,
+                    &resolution,
+                    Some(&tab_id),
+                    Some(&source_pane_id),
+                    &body,
+                )
+                .await;
+            }
+        }
+    }
+
     let outcome = state.layout.rename_tab(&tab_id, &name);
 
     if let Some(record) = state.tabs.lock().expect("tabs mutex").get_mut(&tab_id) {

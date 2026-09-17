@@ -146,6 +146,37 @@ async fn patch_session(
     }
     let key = composite_key(&raw_id, &provider_of(&q));
 
+    // Unified agent names (Task 2): a scoped provider's title rename routes
+    // to the ONE naming authority — the settings override store never
+    // acquires a competing scoped title. The scoped provider/session is
+    // taken from the composite id when one was passed (its prefix is the
+    // real provider; `provider_of`'s claude default must never retarget an
+    // opencode/codex composite), else from the query. A scoped null/reset
+    // is refused absolutely (NAME_RESET_UNSUPPORTED); the unwired-authority
+    // case fails unavailable. Non-title fields in the same request still
+    // patch through the legacy store.
+    let (scoped_provider, scoped_session_id) = match raw_id.split_once(':') {
+        Some((prefix, rest)) => (prefix.to_string(), rest.to_string()),
+        None => (provider_of(&q), raw_id.clone()),
+    };
+    if body.get("titleOverride").is_some() {
+        if let Some(named) =
+            freshell_freshagent::naming::named_provider_for(Some(&scoped_provider), None)
+        {
+            return scoped_session_rename(
+                &state,
+                &key,
+                freshell_protocol::SessionNameRef::Session {
+                    provider: named,
+                    session_id: scoped_session_id,
+                },
+                clean_string(body.get("titleOverride")),
+                &body,
+            )
+            .await;
+        }
+    }
+
     let title = clean_string(body.get("titleOverride"));
     let mut patch: Vec<(&str, Option<Value>)> = Vec::new();
     if body.get("titleOverride").is_some() {
@@ -230,6 +261,93 @@ async fn patch_session(
         broadcast_sessions_changed_from(&state);
     }
 
+    Json(Value::Object(out)).into_response()
+}
+
+/// Unified agent names (Task 2): the scoped-provider title-rename path of
+/// `PATCH /api/sessions/:id` — ONE `rename` call through the wired authority
+/// (`state.identity`'s naming sink). The response is the accepted update:
+/// additive `sessionName` (the full `SessionNameUpdate`) + `nameRef`, plus
+/// the legacy merged row for the request's NON-title fields (which still
+/// patch through the settings store). Never writes a settings title
+/// override, never cascades a terminal retitle (the naming publisher owns
+/// the live registry refresh), and a null/blank title is the absolute
+/// NAME_RESET_UNSUPPORTED refusal.
+async fn scoped_session_rename(
+    state: &SessionsState,
+    key: &str,
+    target: freshell_protocol::SessionNameRef,
+    title: Option<String>,
+    body: &Value,
+) -> Response {
+    let Some(name) = title.as_deref().map(str::trim).filter(|t| !t.is_empty()) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": freshell_freshagent::naming::NAME_RESET_UNSUPPORTED,
+                "message": "a scoped session's saved name is never cleared; rename it instead",
+                "nameRef": target,
+            })),
+        )
+            .into_response();
+    };
+    let Some(sink) = state.identity.naming() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "error": "NAMING_UNAVAILABLE",
+                "message": "session naming is unavailable on this server",
+                "nameRef": target,
+            })),
+        )
+            .into_response();
+    };
+    let (intent, if_revision) = crate::session_name_routes::parse_rename_intents(body);
+    let update = match crate::session_name_routes::rename_through_authority(
+        sink.as_ref(),
+        target,
+        name.to_string(),
+        intent,
+        if_revision,
+    )
+    .await
+    {
+        Ok(update) => update,
+        Err(response) => return response,
+    };
+
+    // The request's NON-title fields still patch through the legacy store
+    // (title keys excluded — the authority owns the title).
+    let mut patch: Vec<(&str, Option<Value>)> = Vec::new();
+    if body.get("summaryOverride").is_some() {
+        patch.push((
+            "summaryOverride",
+            clean_string(body.get("summaryOverride")).map(Value::from),
+        ));
+    }
+    if let Some(a) = body.get("archived") {
+        patch.push(("archived", Some(a.clone())));
+    }
+    if let Some(d) = body.get("deleted") {
+        patch.push(("deleted", Some(d.clone())));
+    }
+    if let Some(c) = body.get("createdAtOverride") {
+        patch.push(("createdAtOverride", Some(c.clone())));
+    }
+    let merged = state.settings.patch_session_override(key, &patch).await;
+    let mut out = merged.as_object().cloned().unwrap_or_default();
+    out.insert(
+        "sessionName".into(),
+        serde_json::to_value(&update).unwrap_or(Value::Null),
+    );
+    out.insert(
+        "nameRef".into(),
+        serde_json::to_value(&update.record.name_ref).unwrap_or(Value::Null),
+    );
+    out.insert("cascadedTerminalId".into(), Value::Null);
+    if !patch.is_empty() {
+        broadcast_sessions_changed_from(state);
+    }
     Json(Value::Object(out)).into_response()
 }
 

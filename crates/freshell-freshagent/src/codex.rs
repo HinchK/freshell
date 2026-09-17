@@ -83,6 +83,104 @@ use crate::{FreshAgentCreateDedup, FreshAgentCreateOutcome, SharedPaneIdentitySi
 mod controls;
 mod metadata;
 
+/// Unified agent names (Task 2): the ambient `CODEX_HOME` fallback for the
+/// durability-driven pending bind when the app-server's own initialize
+/// result is unavailable (pre-initialize edge). Mirrors
+/// `freshell_codex::durability`'s root resolution (CODEX_HOME > `~/.codex`);
+/// the initialized `codexHome` captured by the app-server client remains
+/// the preferred authority.
+fn codex_home_from_env() -> Option<String> {
+    if let Ok(v) = std::env::var("CODEX_HOME") {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    let home = std::env::var("HOME").ok().filter(|v| !v.is_empty())?;
+    Some(format!("{home}/.codex"))
+}
+
+/// Unified agent names (Task 2): locate the thread's rollout under
+/// `sessions_root` with the SAME ownership proof `freshell-codex`'s rollout
+/// locator applies — the filename contains the thread id (a cheap
+/// prefilter), and the file's first line is a `session_meta` whose
+/// `payload.id`/`payload.session_id` equals the thread (substring matching
+/// alone is unsafe: rollouts embed foreign uuids as fork/resume lineage).
+/// Bounded recursive walk (`sessions/YYYY/MM/DD/rollout-*.jsonl`, flat in
+/// tests). `None` when no rollout is verified — the pending name stays
+/// pending (InitialRecovery semantics) and the tick retries.
+fn locate_thread_rollout(
+    sessions_root: &std::path::Path,
+    thread_id: &str,
+) -> Option<std::path::PathBuf> {
+    fn session_meta_owns(path: &std::path::Path, thread_id: &str) -> bool {
+        use std::io::{BufRead, Read};
+        let Ok(file) = std::fs::File::open(path) else {
+            return false;
+        };
+        let mut first = String::new();
+        if std::io::BufReader::new(file)
+            .take(1024 * 1024)
+            .read_line(&mut first)
+            .is_err()
+        {
+            return false;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(first.trim()) else {
+            return false;
+        };
+        if value.get("type").and_then(serde_json::Value::as_str) != Some("session_meta") {
+            return false;
+        }
+        let Some(payload) = value.get("payload") else {
+            return false;
+        };
+        payload.get("id").and_then(serde_json::Value::as_str) == Some(thread_id)
+            || payload
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(thread_id)
+    }
+    fn walk(
+        dir: &std::path::Path,
+        thread_id: &str,
+        depth: u8,
+        hit: &mut Option<std::path::PathBuf>,
+    ) {
+        if depth > 5 || hit.is_some() {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if hit.is_some() {
+                return;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, thread_id, depth + 1, hit);
+            } else if path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".jsonl") && n.contains(thread_id))
+                && session_meta_owns(&path, thread_id)
+            {
+                *hit = Some(path);
+            }
+        }
+    }
+    if thread_id.is_empty()
+        || thread_id.contains('/')
+        || thread_id.contains('\\')
+        || thread_id.contains("..")
+    {
+        return None;
+    }
+    let mut hit = None;
+    walk(sessions_root, thread_id, 0, &mut hit);
+    hit
+}
+
 /// The codex fresh-agent `sessionType` (`AGENT_SESSION_TYPES.codex`).
 const SESSION_TYPE: &str = "freshcodex";
 /// The runtime provider (`AGENT_SESSION_TYPES.codex.provider`).
@@ -224,6 +322,17 @@ pub struct FreshCodexState {
     /// proceeds and destroys redo ("send waits, rollback wins, then destroys") —
     /// no circular wait, no deadlock.
     rollback_in_flight: crate::InFlightRegistry,
+    /// Unified agent names (Task 2): the injected naming authority — same
+    /// set-once/shared model as [`Self::identity_sink`]. Wired by
+    /// `freshell-server::main`; unwired = scoped naming fails unavailable.
+    naming: crate::naming::NamingSink,
+    /// Unified agent names: thread id → the pre-durable naming handle
+    /// admitted at create. A `thread/start` id/path is PROSPECTIVE (the
+    /// rollout hasn't materialized), so the handle stays pending and the
+    /// record only retains the acquired location; the durability-driven bind
+    /// (turn-completed edge / the main.rs naming tick) transfers it exactly
+    /// once the rollout exists.
+    naming_handles: Arc<TokioMutex<HashMap<String, String>>>,
     controls: controls::ControlRegistry,
 }
 
@@ -476,6 +585,8 @@ impl FreshCodexState {
             fork_in_flight: crate::InFlightRegistry::new(),
             codex_quiet_window_ms: Arc::new(AtomicU64::new(codex_quiet_window_ms_from_env())),
             rollback_in_flight: crate::InFlightRegistry::new(),
+            naming: crate::naming::NamingSink::default(),
+            naming_handles: Arc::new(TokioMutex::new(HashMap::new())),
             controls: Default::default(),
         }
     }
@@ -517,6 +628,159 @@ impl FreshCodexState {
     /// The wired identity sink, if any.
     fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
         self.identity_sink.get().cloned()
+    }
+
+    /// Unified agent names (Task 2): wire the naming authority (set-once;
+    /// later calls are no-ops). `freshell-server::main` injects the ONE
+    /// local store participant.
+    pub fn set_session_naming(
+        &self,
+        sink: std::sync::Arc<dyn crate::naming::SessionNaming>,
+    ) -> bool {
+        self.naming.set(sink)
+    }
+
+    /// Unified agent names: the wired naming authority, if any.
+    pub(crate) fn naming(&self) -> Option<std::sync::Arc<dyn crate::naming::SessionNaming>> {
+        self.naming.get()
+    }
+
+    /// Unified agent names (Task 2): admit a freshcodex create's pre-durable
+    /// naming handle against the thread id, and record the PROSPECTIVE
+    /// runtime acquisition (the initialized `codexHome` + thread id — a
+    /// `thread/start` ack is never verified persistence; the bind waits for
+    /// the rollout). An empty handle answers `None` (an unnamed pane).
+    async fn admit_create_handle_named(
+        &self,
+        handle: &str,
+        cwd: Option<&str>,
+        thread_id: &str,
+        codex_home: Option<&str>,
+    ) -> Option<(
+        freshell_protocol::session_names::SessionNameRef,
+        freshell_protocol::session_names::SessionNameRecord,
+    )> {
+        let handle = handle.trim();
+        if handle.is_empty() {
+            return None;
+        }
+        let handle = handle.to_string();
+        let sink = self.naming();
+        let projection = crate::naming::admit_pending_projection(
+            &sink,
+            &handle,
+            freshell_protocol::session_names::NamedProvider::Codex,
+            cwd,
+        )
+        .await?;
+        self.naming_handles
+            .lock()
+            .await
+            .insert(thread_id.to_string(), handle.clone());
+        // Retain the prospective routing evidence on the pending record
+        // (the durable bind later transfers it): initialized runtime root +
+        // native thread id, Prospective by construction.
+        if let Some(sink) = sink {
+            let pending =
+                freshell_protocol::session_names::SessionNameRef::Pending { id: handle.clone() };
+            let acquisition = freshell_protocol::native_location::NativeAcquisition {
+                location: freshell_protocol::native_location::NativeLocation::Codex {
+                    codex_home: codex_home.map(str::to_string).unwrap_or_default(),
+                    native_thread_id: Some(thread_id.to_string()),
+                    rollout_path: None,
+                    persistence_evidence: None,
+                },
+                evidence:
+                    freshell_protocol::native_location::NativeEvidenceKind::InitializedRuntime,
+                persistence: freshell_protocol::native_location::NativePersistence::Prospective,
+            };
+            if let Err(error) = sink.record_acquisition(pending.clone(), acquisition).await {
+                crate::naming::log_name_error("record_acquisition", &pending, &error);
+            }
+        }
+        Some(projection)
+    }
+
+    /// Unified agent names: the current frame projection for an ALREADY
+    /// created thread (the dedup-replay arm) — the stashed handle's record,
+    /// resolved through the wired authority (a pending ref and its
+    /// redirected durable record answer the same record via `get`).
+    async fn created_projection_for(
+        &self,
+        thread_id: &str,
+    ) -> Option<(
+        freshell_protocol::session_names::SessionNameRef,
+        freshell_protocol::session_names::SessionNameRecord,
+    )> {
+        let handle = self.naming_handles.lock().await.get(thread_id).cloned()?;
+        let sink = self.naming();
+        let target = freshell_protocol::session_names::SessionNameRef::Pending { id: handle };
+        let updates = sink?
+            .get(vec![target.clone()])
+            .await
+            .map_err(|error| crate::naming::log_name_error("get", &target, &error))
+            .ok()?;
+        updates
+            .into_iter()
+            .next()
+            .map(|update| (update.record.name_ref.clone(), update.record))
+    }
+
+    /// Unified agent names (Task 2): the durability-driven pending bind. A
+    /// freshcodex thread is verified ONLY once its rollout exists under the
+    /// initialized `codexHome` sessions tree (the first line a
+    /// `session_meta` naming the thread — the same proof
+    /// `freshell-codex`'s rollout locator applies). Called at the
+    /// turn-completed edge and by the main.rs naming tick; idempotent (the
+    /// store answers the already-bound handle with a Read, and the stash is
+    /// consumed on success). `codex_home` comes from the app-server's own
+    /// initialize result when known.
+    pub(crate) async fn try_bind_pending_naming(&self, thread_id: &str, codex_home: Option<&str>) {
+        let Some(sink) = self.naming() else {
+            return;
+        };
+        let Some(handle) = self.naming_handles.lock().await.get(thread_id).cloned() else {
+            return;
+        };
+        let Some(home) = codex_home.map(str::to_string).or_else(codex_home_from_env) else {
+            return;
+        };
+        let sessions_root = std::path::Path::new(&home).join("sessions");
+        let Some(rollout) = locate_thread_rollout(&sessions_root, thread_id) else {
+            return; // still prospective: the tick retries the transition visibly
+        };
+        let pending = freshell_protocol::session_names::SessionNameRef::Pending { id: handle };
+        let target = freshell_protocol::session_names::SessionNameRef::Session {
+            provider: freshell_protocol::session_names::NamedProvider::Codex,
+            session_id: thread_id.to_string(),
+        };
+        let acquisition = freshell_protocol::native_location::NativeAcquisition {
+            location: freshell_protocol::native_location::NativeLocation::Codex {
+                codex_home: home,
+                native_thread_id: Some(thread_id.to_string()),
+                rollout_path: Some(rollout.display().to_string()),
+                persistence_evidence: Some(rollout.display().to_string()),
+            },
+            evidence: freshell_protocol::native_location::NativeEvidenceKind::PersistedMetadata,
+            persistence: freshell_protocol::native_location::NativePersistence::Verified,
+        };
+        match sink
+            .bind_pending(crate::naming::BindNameInput {
+                pending: pending.clone(),
+                target: target.clone(),
+                acquisition,
+            })
+            .await
+        {
+            Ok(update) => {
+                if update.record.name_ref == target {
+                    self.naming_handles.lock().await.remove(thread_id);
+                }
+            }
+            Err(error) => {
+                crate::naming::log_name_error("bind_pending", &pending, &error);
+            }
+        }
     }
 
     /// Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Finding 4),
@@ -688,6 +952,11 @@ impl FreshCodexState {
                 create_request_id: create_request_id.map(Into::into),
                 resolves_pending: None,
                 supersedes: supersedes.map(Into::into),
+                // Unified agent names: the mint-new respawn's naming
+                // classification is driven by the dedicated naming lanes
+                // (see the materialized broadcast); the ledger edge alone
+                // carries no naming fact.
+                name_transition: None,
                 // Delta-r2 Finding 2 tri-state: a connection-supplied value
                 // asserts (`Replace`); a conn-less refresh/respawn lane
                 // asserts nothing (`Inherit` — the ledger merge keeps prior
@@ -789,14 +1058,23 @@ impl FreshCodexState {
         provenance: Option<crate::BindProvenance>,
     ) {
         let request_id = msg.request_id.clone();
+        // Unified agent names (Task 2): the pane's pre-durable naming handle
+        // (threaded to both create lanes; `None` = an unnamed pane).
+        let naming_handle = msg.naming_handle.clone().filter(|h| !h.trim().is_empty());
 
         // Dedup by requestId (parity gap fix -- see [`crate::FreshAgentCreateDedup`]'s
         // doc and [`Self::create_dedup`]'s field doc). Held for the WHOLE creation
         // attempt below (including the `handle_create_resume` sub-call), so concurrent
-        // duplicate `create`s for the same requestId serialize instead of each spawning
+        // duplicate `create`s for this requestId serialize instead of each spawning
         // their own sidecar.
         let _dedup_guard = match self.create_dedup.acquire_or_replay(&request_id).await {
             FreshAgentCreateOutcome::Replay(cached) => {
+                // Unified agent names: the replay re-answers with the SAME
+                // naming projection the original create acknowledged (the
+                // handle was stashed against this thread at admission).
+                let projection = self.created_projection_for(&cached.session_id).await;
+                let name_ref = projection.as_ref().map(|(r, _)| r.clone());
+                let session_name = projection.map(|(_, record)| record);
                 self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
                     provider: PROVIDER.to_string(),
                     request_id,
@@ -807,6 +1085,8 @@ impl FreshCodexState {
                         provider: PROVIDER.to_string(),
                         session_id: cached.session_id,
                     }),
+                    name_ref,
+                    session_name,
                 }));
                 return;
             }
@@ -957,6 +1237,7 @@ impl FreshCodexState {
                 permission_mode,
                 lease_guard,
                 provenance,
+                naming_handle,
             )
             .await;
             return;
@@ -1014,6 +1295,7 @@ impl FreshCodexState {
             provenance,
             // The plain create lane never commits a claim — nothing to roll back.
             None,
+            naming_handle,
         )
         .await;
     }
@@ -1054,6 +1336,8 @@ impl FreshCodexState {
         // D8: the creating connection's provenance (a resume-create is still a
         // connection-scoped create: this pane IS open in that client's tab).
         provenance: Option<crate::BindProvenance>,
+        // Unified agent names (Task 2): the pane's pre-durable naming handle.
+        naming_handle: Option<String>,
     ) {
         if self.is_known_dead_thread(&resume_session_id).await {
             if let Some(mut g) = lease_guard.take() {
@@ -1227,6 +1511,7 @@ impl FreshCodexState {
             // post-registration re-check (round 5, Finding 1) compares
             // against the claim-start snapshot.
             Some((thread_id.as_str(), claim_dead_state)),
+            naming_handle,
         )
         .await;
     }
@@ -1268,12 +1553,22 @@ impl FreshCodexState {
         // against the snapshot. `None` on the plain create lane (nothing was
         // committed — nothing to roll back or re-check).
         claim: Option<(&str, Option<i64>)>,
+        // Unified agent names (Task 2): the pane's pre-durable naming handle
+        // (None = an unnamed pane; the frame then carries the durable
+        // session's own projection when a record exists).
+        naming_handle: Option<String>,
     ) {
         // D8 (focused-ep1-r5 Finding 2): a HOLLOW `Some` (a partially
         // initialized client's hello — all fields absent) behaves like `None`
         // on every decision below: the park, the eviction-guard adopt, and
         // the binding write's stamps.
         let provenance = provenance.filter(|p| p.is_meaningful());
+
+        // Unified agent names (Task 2): capture the app-server's initialized
+        // `codexHome` BEFORE `client` moves into the session registration
+        // below — the initialized root the prospective acquisition records
+        // and the durability-driven bind walks.
+        let codex_home = client.codex_home().await;
 
         // Task 12 EVICTION GUARD: on base this tail REPLACED a live incumbent under the
         // same threadId -- orphaning the winner's sidecar and stealing its binding
@@ -1492,6 +1787,42 @@ impl FreshCodexState {
             )
             .await;
 
+        // Unified agent names (Task 2): admit the pre-durable handle BEFORE
+        // acknowledging creation (a `thread/start` id is PROSPECTIVE — the
+        // pending record retains the initialized `codexHome` + thread id
+        // and the durability-driven bind transfers it once the rollout
+        // exists). An unnamed create falls back to the durable session's
+        // own record when one exists (the resume lane).
+        let naming_projection = match naming_handle.as_deref() {
+            Some(handle) => {
+                self.admit_create_handle_named(
+                    handle,
+                    cwd.as_deref(),
+                    &thread_id,
+                    codex_home.as_deref(),
+                )
+                .await
+            }
+            None => {
+                crate::naming::session_projection(
+                    &self.naming(),
+                    freshell_protocol::session_names::NamedProvider::Codex,
+                    &thread_id,
+                )
+                .await
+            }
+        };
+        // A resumed thread's rollout already exists — bind the just-admitted
+        // handle immediately (verified persistence); a fresh thread's rollout
+        // has not materialized, so this is a no-op until the turn-completed
+        // edge / the main.rs naming tick observes it.
+        if claim.is_some() {
+            self.try_bind_pending_naming(&thread_id, codex_home.as_deref())
+                .await;
+        }
+        let name_ref = naming_projection.as_ref().map(|(r, _)| r.clone());
+        let session_name = naming_projection.map(|(_, record)| record);
+
         // Broadcast freshAgent.created (ws-handler.ts:3378). sessionId == durable (UUID).
         self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
             provider: PROVIDER.to_string(),
@@ -1503,6 +1834,8 @@ impl FreshCodexState {
                 provider: PROVIDER.to_string(),
                 session_id: thread_id,
             }),
+            name_ref,
+            session_name,
         }));
 
         // ORDERING FIX: release the consumer's gate now that `created` has been
@@ -1610,6 +1943,22 @@ impl FreshCodexState {
                 },
             )
             .await;
+        // Unified agent names: the adopted pane names through the durable
+        // thread's own record (the stashed pending handle if one exists for
+        // this thread, else the durable record when present).
+        let projection = match self.created_projection_for(thread_id).await {
+            Some(projection) => Some(projection),
+            None => {
+                crate::naming::session_projection(
+                    &self.naming(),
+                    freshell_protocol::session_names::NamedProvider::Codex,
+                    thread_id,
+                )
+                .await
+            }
+        };
+        let name_ref = projection.as_ref().map(|(r, _)| r.clone());
+        let session_name = projection.map(|(_, record)| record);
         self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
             provider: PROVIDER.to_string(),
             request_id: request_id.to_string(),
@@ -1620,6 +1969,8 @@ impl FreshCodexState {
                 provider: PROVIDER.to_string(),
                 session_id: thread_id.to_string(),
             }),
+            name_ref,
+            session_name,
         }));
     }
 
@@ -3823,6 +4174,50 @@ impl FreshCodexState {
             "freshagent.crash_recovery.minted_new"
         );
 
+        // Unified agent names (Task 2): classify the mint-new. A still-PENDING
+        // handle (the crashed thread never persisted — the zero-turn case)
+        // RETAINS its handle and name for the new initial thread
+        // (InitialRecovery: the same logical conversation, the name authority
+        // untouched); an ESTABLISHED thread's mint-new is a NEW conversation
+        // — the previous name never copies, and the pane follows the new
+        // session's own (not-yet-named) record.
+        let retained_handle = {
+            let mut handles = self.naming_handles.lock().await;
+            match handles.remove(old_session_id) {
+                Some(handle) => {
+                    handles.insert(new_thread_id.clone(), handle.clone());
+                    Some(handle)
+                }
+                None => None,
+            }
+        };
+        let naming_projection = if let Some(handle) = retained_handle {
+            let sink = self.naming();
+            let pending = freshell_protocol::session_names::SessionNameRef::Pending { id: handle };
+            match sink.as_ref().map(|sink| sink.get(vec![pending.clone()])) {
+                Some(fut) => match fut.await {
+                    Ok(updates) => updates
+                        .into_iter()
+                        .next()
+                        .map(|update| (update.record.name_ref.clone(), update.record)),
+                    Err(error) => {
+                        crate::naming::log_name_error("get", &pending, &error);
+                        None
+                    }
+                },
+                None => None,
+            }
+        } else {
+            crate::naming::session_projection(
+                &self.naming(),
+                freshell_protocol::session_names::NamedProvider::Codex,
+                &new_thread_id,
+            )
+            .await
+        };
+        let name_ref = naming_projection.as_ref().map(|(r, _)| r.clone());
+        let session_name = naming_projection.map(|(_, record)| record);
+
         self.broadcast(&ServerMessage::FreshAgentSessionMaterialized(
             FreshAgentSessionMaterialized {
                 previous_session_id: old_session_id.to_string(),
@@ -3833,6 +4228,8 @@ impl FreshCodexState {
                     provider: PROVIDER.to_string(),
                     session_id: new_thread_id.clone(),
                 }),
+                name_ref,
+                session_name,
             },
         ));
 
@@ -4080,6 +4477,25 @@ impl FreshCodexState {
                     // alone, never the turn's text/response content.
                     if let CodexAdapterEvent::TurnComplete { session_id, .. } = &event {
                         tracing::info!(provider = PROVIDER, session_id = %session_id, "freshagent.turn.complete");
+                        // Unified agent names (Task 2): a completed turn wrote
+                        // history, so the thread's rollout has materialized —
+                        // the durability-driven pending bind fires here (a
+                        // no-op once bound: the stash was consumed). The
+                        // initialized `codexHome` comes from the live
+                        // session's app-server client.
+                        let codex_home = state
+                            .sessions
+                            .lock()
+                            .await
+                            .get(session_id)
+                            .map(|session| session.client.clone());
+                        let codex_home = match codex_home {
+                            Some(client) => client.codex_home().await,
+                            None => None,
+                        };
+                        state
+                            .try_bind_pending_naming(session_id, codex_home.as_deref())
+                            .await;
                     }
                     let frame = adapter_event_to_frame(&event, &thread_id);
                     if let Some(frame) = frame {
@@ -8412,6 +8828,7 @@ pub(crate) mod tests {
         let create = tokio::spawn(async move {
             st2.handle_create(
                 FreshAgentCreate {
+                    naming_handle: None,
                     request_id: "req-post-commit-kill".to_string(),
                     session_type: freshell_protocol::SessionType::Freshcodex,
                     provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -8578,6 +8995,7 @@ pub(crate) mod tests {
         configure_fake_codex_cmd("{}");
         st.handle_create(
             FreshAgentCreate {
+                naming_handle: None,
                 request_id: "req-claim-resume".to_string(),
                 session_type: freshell_protocol::SessionType::Freshcodex,
                 provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -11393,6 +11811,8 @@ pub(crate) mod tests {
                 Some("tab-new"),
                 7_777,
             )),
+            // Unified agent names: no handle on this test's resume lane.
+            None,
         )
         .await;
         let created = await_created(&mut rx, "req-evict-adopt").await;
@@ -11638,6 +12058,7 @@ pub(crate) mod tests {
         // …but the parent's durable row knows the attribution (stamped by a
         // later merge — lineage-only payload so no settings change rides).
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "codex".into(),
             session_id: parent_id.clone(),
             mode: "freshcodex".into(),
@@ -11827,6 +12248,7 @@ pub(crate) mod tests {
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         // A stamped LINEAGE-ONLY row (blank settings).
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "codex".into(),
             session_id: "thread-lineage-adopt".into(),
             mode: "freshcodex".into(),
@@ -11914,6 +12336,7 @@ pub(crate) mod tests {
         // (cwd must be a REAL directory — the fork below spawns the child's
         // sidecar with the parent's inherited cwd.)
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "codex".into(),
             session_id: "thread-row-seeded".into(),
             mode: "freshcodex".into(),
@@ -12017,6 +12440,7 @@ pub(crate) mod tests {
         // A settings-bearing row with NO stamps (recorded via an explicit
         // upsert, not the seed helper, so the row unambiguously has them unset).
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "codex".into(),
             session_id: "thread-unattributed".into(),
             mode: "freshcodex".into(),
@@ -13496,6 +13920,7 @@ pub(crate) mod tests {
             let (st, mut rx) = state_with_bus();
             st.handle_create(
                 FreshAgentCreate {
+                    naming_handle: None,
                     request_id: format!("req-{case}"),
                     session_type: freshell_protocol::SessionType::Freshcodex,
                     provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -13615,6 +14040,7 @@ pub(crate) mod tests {
         let thread = "historical-thread-lineage";
         // The lineage-only seed: a row exists with a blank settings snapshot.
         fake.record_binding(crate::identity_sink::FreshAgentBindingUpsert {
+            name_transition: None,
             provider: "codex".into(),
             session_id: thread.into(),
             mode: "freshcodex".into(),
@@ -14166,6 +14592,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                naming_handle: None,
                 request_id: "req-retryable-1".to_string(),
                 session_type: freshell_protocol::SessionType::Freshcodex,
                 provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -14216,6 +14643,7 @@ pub(crate) mod tests {
     /// `request_id`.
     fn create_msg(request_id: &str) -> FreshAgentCreate {
         FreshAgentCreate {
+            naming_handle: None,
             request_id: request_id.to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
             provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -14554,6 +14982,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                naming_handle: None,
                 request_id: "req-resume-1".to_string(),
                 session_type: freshell_protocol::SessionType::Freshcodex,
                 provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -14621,6 +15050,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                naming_handle: None,
                 request_id: "req-sref-resume-1".to_string(),
                 session_type: freshell_protocol::SessionType::Freshcodex,
                 provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -14699,6 +15129,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                naming_handle: None,
                 request_id: "req-resume-2".to_string(),
                 session_type: freshell_protocol::SessionType::Freshcodex,
                 provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -14765,6 +15196,7 @@ pub(crate) mod tests {
 
         st.handle_create(
             FreshAgentCreate {
+                naming_handle: None,
                 request_id: "req-term25-create".to_string(),
                 session_type: freshell_protocol::SessionType::Freshcodex,
                 provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -15387,6 +15819,7 @@ pub(crate) mod tests {
     ) -> String {
         st.handle_create(
             FreshAgentCreate {
+                naming_handle: None,
                 request_id: "req-1".to_string(),
                 session_type: freshell_protocol::SessionType::Freshcodex,
                 provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -15484,6 +15917,7 @@ pub(crate) mod tests {
         state
             .handle_create(
                 FreshAgentCreate {
+                    naming_handle: None,
                     request_id: "req-bind-1".to_string(),
                     session_type: freshell_protocol::SessionType::Freshcodex,
                     provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -15550,6 +15984,7 @@ pub(crate) mod tests {
         state
             .handle_create(
                 FreshAgentCreate {
+                    naming_handle: None,
                     request_id: "req-bind-prov".to_string(),
                     session_type: freshell_protocol::SessionType::Freshcodex,
                     provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -15627,6 +16062,7 @@ pub(crate) mod tests {
         state
             .handle_create(
                 FreshAgentCreate {
+                    naming_handle: None,
                     request_id: "req-ledger-fail".to_string(),
                     session_type: freshell_protocol::SessionType::Freshcodex,
                     provider: Some(freshell_protocol::AgentProvider::Codex),

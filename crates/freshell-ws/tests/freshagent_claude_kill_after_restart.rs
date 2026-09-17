@@ -403,6 +403,7 @@ fn new_generation(
 
 fn create_msg_resume(request_id: &str, durable: &str) -> FreshAgentCreate {
     FreshAgentCreate {
+        naming_handle: None,
         request_id: request_id.to_string(),
         session_type: SessionType::Freshclaude,
         provider: Some(AgentProvider::Claude),

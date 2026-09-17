@@ -147,6 +147,36 @@ pub(crate) async fn drain_and_associate(state: &WsState) {
             entry.cwd.as_deref(),
             now_ms(),
         );
+        // Unified agent names (Task 2): the locator resolved the session from
+        // opencode's SQLite database — the row IS the verified persistence
+        // evidence (zero-message sessions persist at creation). The upsert
+        // retargeted the pane's name ref; the stashed pending handle
+        // transfers onto the session with the database as the native
+        // location.
+        {
+            let acquisition = freshell_protocol::native_location::NativeAcquisition {
+                location: freshell_protocol::native_location::NativeLocation::Opencode {
+                    database_path: freshell_sessions::parse::default_opencode_data_home()
+                        .join("opencode.db")
+                        .display()
+                        .to_string(),
+                    native_session_id: Some(located.session_id.clone()),
+                    original_directory: entry.cwd.clone(),
+                    owned_local_endpoint: None,
+                },
+                evidence: freshell_protocol::native_location::NativeEvidenceKind::IndexedFile,
+                persistence: freshell_protocol::native_location::NativePersistence::Verified,
+            };
+            crate::identity::bind_pending_naming(
+                &state.identity,
+                &state.registry,
+                &located.terminal_id,
+                freshell_protocol::session_names::NamedProvider::Opencode,
+                &located.session_id,
+                acquisition,
+            )
+            .await;
+        }
         state.registry.set_meta(
             &located.terminal_id,
             None,

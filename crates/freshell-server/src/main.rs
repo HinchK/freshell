@@ -52,6 +52,7 @@ mod screenshots;
 mod serve_client;
 mod session_directory;
 mod session_metadata;
+mod session_name_routes;
 mod session_names;
 mod sessions;
 mod settings;
@@ -497,6 +498,168 @@ async fn main() -> ExitCode {
                 }),
             ),
         ));
+    // Unified agent names (Task 2): the ONE durable session-name authority —
+    // constructed BEFORE publication; every rename route, create/bind lane,
+    // tick, and publisher below shares this Arc (there is no second store).
+    // A `None` home (or an unopenable document) leaves naming UNWIRED:
+    // scoped renames fail unavailable (503) and the read projections
+    // degrade — the same degraded no-home policy as the pane ledger.
+    let session_names: Option<std::sync::Arc<session_names::SessionNames>> = home
+        .as_deref()
+        .map(|h| h.join(".freshell"))
+        .and_then(|dir| match session_names::SessionNames::open(dir) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                tracing::error!(
+                    target: "freshell_server::session_names",
+                    op = "open",
+                    name_ref = "-",
+                    revision = 0,
+                    class = %error.code(),
+                    "session_names.operation_failed: {error}"
+                );
+                None
+            }
+        });
+    if let Some(names) = session_names.clone() {
+        // The identity registry is the shared sink holder the session/
+        // terminal/directory/resolve surfaces already carry; the fresh-agent
+        // states each hold their own OnceLock sink.
+        terminal_identity.set_session_naming(names.clone());
+        fresh_agent_state.set_session_naming(names.clone());
+        fresh_claude_state.set_session_naming(names.clone());
+        fresh_codex_state.set_session_naming(names.clone());
+        fresh_opencode_state.set_session_naming(names.clone());
+
+        // The 2s adoption/reconcile tick: (1) adopt a same-home cooperating
+        // process's committed generation (CLI/MCP writes) — the strict
+        // full-document re-read under the lock, never an mtime shortcut;
+        // (2) bind still-pending handles whose durability has since become
+        // verifiable. Claude: the transcript locator (the signal-first and
+        // zero-turn create lanes bind as soon as the transcript exists).
+        // Codex/opencode: their runtime edges (the rollout walk / the DB
+        // row) own the verified binds — the tick never fabricates one.
+        {
+            use freshell_freshagent::naming::SessionNaming as _;
+            let names = names.clone();
+            let identity = terminal_identity.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    if let Err(error) = names.refresh_current().await {
+                        tracing::warn!(
+                            target: "freshell_server::session_names",
+                            op = "refresh_current",
+                            name_ref = "-",
+                            revision = 0,
+                            class = %error.code(),
+                            "session_names.operation_failed: {error}"
+                        );
+                    }
+                    for (terminal_id, provider, session_id, handle) in
+                        identity.pending_naming_binds()
+                    {
+                        if provider != "claude" {
+                            continue;
+                        }
+                        let Some(selected) =
+                            freshell_freshagent::locate_transcript_selected(&session_id)
+                        else {
+                            continue;
+                        };
+                        let acquisition =
+                            freshell_protocol::native_location::NativeAcquisition {
+                                location: freshell_protocol::native_location::NativeLocation::Claude {
+                                    config_root: selected.config_root.to_string_lossy().into_owned(),
+                                    transcript_path: Some(
+                                        selected.transcript_path.to_string_lossy().into_owned(),
+                                    ),
+                                    project_directory_key: None,
+                                    transcript_cwd: selected.transcript_cwd.clone(),
+                                    effective_project_key_override: None,
+                                },
+                                evidence:
+                                    freshell_protocol::native_location::NativeEvidenceKind::SelectedTranscript,
+                                persistence:
+                                    freshell_protocol::native_location::NativePersistence::Verified,
+                            };
+                        let bind = names
+                            .bind_pending(freshell_freshagent::naming::BindNameInput {
+                                pending:
+                                    freshell_protocol::session_names::SessionNameRef::Pending {
+                                        id: handle.clone(),
+                                    },
+                                target: freshell_protocol::session_names::SessionNameRef::Session {
+                                    provider:
+                                        freshell_protocol::session_names::NamedProvider::Claude,
+                                    session_id: session_id.clone(),
+                                },
+                                acquisition,
+                            })
+                            .await;
+                        if let Err(error) = bind {
+                            tracing::warn!(
+                                target: "freshell_server::session_names",
+                                op = "bind_pending",
+                                name_ref = %freshell_freshagent::naming::name_ref_debug_key(
+                                    &freshell_protocol::session_names::SessionNameRef::Pending {
+                                        id: handle,
+                                    }
+                                ),
+                                revision = 0,
+                                class = %error.code(),
+                                terminal_id = %terminal_id,
+                                "session_names.operation_failed: {error}"
+                            );
+                        }
+                    }
+                }
+            });
+        }
+
+        // The naming publisher: every committed update (this process's own
+        // writes and adopted external ones) reaches WS clients as the
+        // canonical `session.name.updated` frame, refreshes the registry
+        // display caches of every terminal bound to the record (title
+        // write-through), and invalidates the session directory
+        // (`sessions.changed`) so renamed rows re-read immediately.
+        {
+            let names = names.clone();
+            let registry = registry.clone();
+            let broadcast_tx = Arc::clone(&broadcast_tx);
+            let sessions_revision = Arc::clone(&sessions_revision);
+            tokio::spawn(async move {
+                let mut updates = names.subscribe();
+                loop {
+                    let Ok(update) = updates.recv().await else {
+                        continue;
+                    };
+                    for terminal_id in registry.terminals_bound_to(&update.record.name_ref) {
+                        registry.update_session_name(&terminal_id, &update.record);
+                    }
+                    let frame = freshell_protocol::ServerMessage::SessionNameUpdated(
+                        freshell_protocol::session_names::SessionNameUpdated {
+                            record: update.record.clone(),
+                            document_generation: update.document_generation,
+                            redirects: update.redirects.clone(),
+                            changed: update.changed,
+                        },
+                    );
+                    if let Ok(serialized) = serde_json::to_string(&frame) {
+                        let _ = broadcast_tx.send(serialized);
+                    }
+                    let revision =
+                        sessions_revision.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    let _ = broadcast_tx.send(
+                        serde_json::json!({ "type": "sessions.changed", "revision": revision })
+                            .to_string(),
+                    );
+                }
+            });
+        }
+    }
     // TERM-11 fix: honor `settings.safety.autoKillIdleMinutes` at boot (the
     // Rust registry previously never read it at all, so a config that raised
     // or lowered it from the default had no effect). See
@@ -702,6 +865,8 @@ async fn main() -> ExitCode {
         .with_terminal_created_hook({
             let terminal_meta = terminal_meta.clone();
             let broadcast_tx = Arc::clone(&broadcast_tx);
+            let terminal_identity = terminal_identity.clone();
+            let registry = registry.clone();
             Arc::new(move |event: freshell_freshagent::TerminalCreatedEvent| {
                 freshell_ws::terminal_meta::seed_from_terminal(
                     &terminal_meta,
@@ -711,6 +876,25 @@ async fn main() -> ExitCode {
                     event.resume_session_id.as_deref(),
                     event.cwd.as_deref(),
                 );
+                // Unified agent names (Task 2): write the REST create-lane
+                // naming binding onto the SHARED identity registry (the CLI
+                // locator bind lanes and every rename resolver read it) and
+                // the terminal registry row (the display cache the
+                // `/api/terminals` projection carries). The WS create path
+                // performs its own admission — this hook only fires for
+                // REST-pipeline creates, so no row is double-bound.
+                if event.naming_handle.is_some() || event.name_ref.is_some() {
+                    terminal_identity.set_name_binding(
+                        &event.terminal_id,
+                        event.name_ref.clone(),
+                        event.naming_handle.clone(),
+                    );
+                    registry.set_naming(
+                        &event.terminal_id,
+                        event.name_ref.clone(),
+                        event.naming_handle.clone(),
+                    );
+                }
             })
         });
     // Batch B: `session_directory` no longer re-walks + re-parses every
@@ -1778,6 +1962,22 @@ async fn main() -> ExitCode {
             gemini: gemini.clone(),
             index: sessions_state_index,
         }))
+        // Unified agent names (Task 2): the canonical session-name HTTP
+        // surface — `POST /api/session-names/read` + `PATCH
+        // /api/session-names`. Mounted ONLY when the authority opened; a
+        // degraded (no-home) boot exposes no canonical route, and the
+        // convenience surfaces answer their 503 unavailable.
+        .merge(
+            session_names
+                .clone()
+                .map(|names| {
+                    session_name_routes::router(session_name_routes::SessionNamesState {
+                        auth_token: Arc::clone(&auth_token),
+                        names,
+                    })
+                })
+                .unwrap_or_default(),
+        )
         .merge(project_colors::router(project_colors::ProjectColorsState {
             auth_token: Arc::clone(&auth_token),
             settings: settings_store.clone(),
@@ -1880,6 +2080,10 @@ async fn main() -> ExitCode {
             resolve_permits: Arc::new(tokio::sync::Semaphore::new(
                 resolve::RESOLVE_MAX_CONCURRENCY,
             )),
+            // Unified agent names (Task 2): the shared identity registry —
+            // consulted for its naming sink when projecting matches (the
+            // same authority every rename route targets).
+            identity: terminal_identity.clone(),
         }))
         .merge(files::router(files_state))
         .merge(repo_icon::router(repo_icon_state))
