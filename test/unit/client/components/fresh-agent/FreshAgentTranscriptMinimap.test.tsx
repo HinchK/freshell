@@ -312,6 +312,33 @@ describe('FreshAgentTranscript minimap rail', () => {
     expect(topOf(ticks[2])).toBeCloseTo(130, 5)
   })
 
+  it('re-measures when the scroller itself resizes (pane resize re-scales the rail)', async () => {
+    vi.stubGlobal('ResizeObserver', CapturingResizeObserver)
+    const { scroller } = setupScrollableTranscript()
+    const initialTicks = screen.getAllByRole('button', { name: /Jump to prompt:/ })
+    expect(topOf(initialTicks[1])).toBeCloseTo(60, 5)
+    expect(topOf(initialTicks[2])).toBeCloseTo(90, 5)
+
+    // Pane resize: only the scroller's clientHeight grows (248 -> 298). The
+    // content is unchanged (scrollHeight 1000, scrollTop 376) and the article
+    // rects keep their content offsets (0/300/450) — only the rail geometry
+    // changes: railHeight 250, scale 0.25 -> tick tops 0 / 75 / 112.5.
+    mockScroll(scroller, SCROLL_TOP, SCROLL_HEIGHT, 298)
+    // Fire ONLY the callbacks registered for the scroller — never the
+    // articles' or the disclosure section's — so this test fails if the
+    // scroller observation is removed (nothing would fire) instead of
+    // passing via another path. act() wraps the callbacks: they setState
+    // synchronously.
+    await act(async () => {
+      for (const fire of resizeCallbacksByTarget.get(scroller) ?? []) fire()
+    })
+
+    const ticks = screen.getAllByRole('button', { name: /Jump to prompt:/ })
+    expect(topOf(ticks[0])).toBeCloseTo(0, 5)
+    expect(topOf(ticks[1])).toBeCloseTo(75, 5)
+    expect(topOf(ticks[2])).toBeCloseTo(112.5, 5)
+  })
+
   it('opens topmost ticks downward (side bottom) and lower ticks upward (side top)', () => {
     setupScrollableTranscript()
     // railHeight 200 -> top-quarter threshold 50. Tick 0 (top 0) is in the
