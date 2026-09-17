@@ -14,7 +14,8 @@
 //! - degrade classes: `missing_db`, `empty_db`, `schema_missing_parent_id`
 
 use freshell_sessions::parse::{
-    run_opencode_listing_query, OpencodeDegrade, OpencodeProvider, THREE_VIEWS_MARKER_SQL_PATTERN,
+    run_opencode_listing_query, OpencodeDegrade, OpencodeProvider, OpencodeSession,
+    THREE_VIEWS_MARKER_SQL_PATTERN,
 };
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -309,5 +310,227 @@ fn provider_path_derivations_match_reference() {
     assert_eq!(
         provider.session_roots(),
         vec![PathBuf::from("/home/u/.local/share/opencode/opencode.db")]
+    );
+}
+
+// ── Row-stamped marker cache (freshopencode re-list storm fix) ─────────
+//
+// Stage-2 measured the marker EXISTS arms at ~99.7% of the live listing
+// cost (1257 ms -> 4 ms without them), so the listing SELECT drops the
+// inline subqueries and fills each row's marker from a
+// (session_id, time_updated)-stamped cache — probing only stamp-moved,
+// new, and NULL-stamp rows. The provider's probe counter is the
+// observable-work seam; cache hits never increment it.
+
+fn marker_list_sessions(provider: &OpencodeProvider, now_ms: i64) -> Vec<OpencodeSession> {
+    provider.list_sessions(now_ms).expect("read ok").sessions
+}
+
+fn marker_fixture_schema(conn: &Connection) {
+    conn.execute_batch(
+        "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+         CREATE TABLE session (
+            id TEXT PRIMARY KEY, directory TEXT, title TEXT,
+            time_created INTEGER, time_updated INTEGER, time_archived INTEGER,
+            project_id TEXT, parent_id TEXT, model TEXT
+         );
+         CREATE TABLE message (
+            id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+         CREATE TABLE part (
+            id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT,
+            time_created INTEGER NOT NULL, time_updated INTEGER, data TEXT);",
+    )
+    .unwrap();
+}
+
+fn marker_insert_session(conn: &Connection, id: &str, updated: i64) {
+    conn.execute(
+        "INSERT INTO session VALUES (?1, '/repo/x', 'Named', 1000, ?2, NULL, NULL, NULL, NULL)",
+        rusqlite::params![id, updated],
+    )
+    .unwrap();
+}
+
+/// The production marker pattern is `%<freshell-session-metadata
+/// origin=3-views%` (`THREE_VIEWS_MARKER_SQL_PATTERN`) — any data payload
+/// containing that substring marks the row.
+fn marker_payload() -> String {
+    r#"{"text":"<freshell-session-metadata origin=3-views marker"}"#.to_string()
+}
+
+#[test]
+fn marker_cache_unchanged_row_stamp_skips_the_probe() {
+    let dir = TmpDir::new();
+    let conn = Connection::open(dir.join("opencode.db")).unwrap();
+    marker_fixture_schema(&conn);
+    marker_insert_session(&conn, "ses_1", 5000);
+    // The marker lives in a message row (the message arm of the old EXISTS).
+    conn.execute(
+        "INSERT INTO message VALUES ('msg_1', 'ses_1', 100, ?1)",
+        rusqlite::params![marker_payload()],
+    )
+    .unwrap();
+    drop(conn);
+    let provider = OpencodeProvider::new(dir.to_path_buf());
+    let first = marker_list_sessions(&provider, 42);
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        first[0].is_subagent,
+        Some(true),
+        "a session carrying the marker part is still classified (probe path)"
+    );
+    assert_eq!(provider.marker_probe_count(), 1);
+    let second = marker_list_sessions(&provider, 43);
+    assert_eq!(
+        provider.marker_probe_count(),
+        1,
+        "an unchanged session row must not re-run the marker probe"
+    );
+    assert_eq!(second[0].is_subagent, Some(true));
+}
+
+#[test]
+fn marker_cache_row_stamp_change_reprobes_exactly_that_session() {
+    let dir = TmpDir::new();
+    let conn = Connection::open(dir.join("opencode.db")).unwrap();
+    marker_fixture_schema(&conn);
+    marker_insert_session(&conn, "ses_1", 5000);
+    marker_insert_session(&conn, "ses_2", 5000);
+    drop(conn);
+    let provider = OpencodeProvider::new(dir.to_path_buf());
+    let first = marker_list_sessions(&provider, 42);
+    assert_eq!(first.len(), 2);
+    assert!(first.iter().all(|s| s.is_subagent.is_none()));
+    assert_eq!(provider.marker_probe_count(), 2);
+
+    // ses_1 gains a marker part AND a stamp bump; ses_2's stamp is untouched.
+    let conn = Connection::open(dir.join("opencode.db")).unwrap();
+    conn.execute(
+        "INSERT INTO part VALUES ('prt_1', NULL, 'ses_1', 100, NULL, ?1)",
+        rusqlite::params![marker_payload()],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session SET time_updated = time_updated + 1 WHERE id = 'ses_1'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let second = marker_list_sessions(&provider, 43);
+    assert_eq!(
+        provider.marker_probe_count(),
+        3,
+        "only the session whose row stamp moved re-probes"
+    );
+    let ses1 = second.iter().find(|s| s.session_id == "ses_1").unwrap();
+    assert_eq!(ses1.is_subagent, Some(true));
+    let ses2 = second.iter().find(|s| s.session_id == "ses_2").unwrap();
+    assert_eq!(ses2.is_subagent, None, "cached unmarked value is served");
+}
+
+#[test]
+fn marker_cache_serves_stale_marker_until_the_row_stamp_moves() {
+    // The accepted residual, pinned deliberately (Stage-2 validated facts,
+    // marker-staleness row): a marker part written WITHOUT a session-row
+    // change serves the cached (unmarked) value; live opencode bumps the
+    // row on every prompt and step-finish, so the bound is the session's
+    // next activity.
+    let dir = TmpDir::new();
+    let conn = Connection::open(dir.join("opencode.db")).unwrap();
+    marker_fixture_schema(&conn);
+    marker_insert_session(&conn, "ses_1", 5000);
+    drop(conn);
+    let provider = OpencodeProvider::new(dir.to_path_buf());
+    let first = marker_list_sessions(&provider, 42);
+    assert_eq!(first[0].is_subagent, None);
+    assert_eq!(provider.marker_probe_count(), 1);
+
+    let conn = Connection::open(dir.join("opencode.db")).unwrap();
+    conn.execute(
+        "INSERT INTO message VALUES ('msg_1', 'ses_1', 100, ?1)",
+        rusqlite::params![marker_payload()],
+    )
+    .unwrap();
+    drop(conn);
+    let stale = marker_list_sessions(&provider, 43);
+    assert_eq!(
+        stale[0].is_subagent, None,
+        "without a row-stamp move the cached marker is served (the documented bound)"
+    );
+
+    let conn = Connection::open(dir.join("opencode.db")).unwrap();
+    conn.execute(
+        "UPDATE session SET time_updated = time_updated + 1 WHERE id = 'ses_1'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let fresh = marker_list_sessions(&provider, 44);
+    assert_eq!(fresh[0].is_subagent, Some(true));
+}
+
+#[test]
+fn marker_cache_degraded_schema_never_probes_and_never_caches() {
+    // Neither marker table exists: the old inline marker_expr was the
+    // literal 0 (unmarked for every row, zero marker SQL); the cache
+    // preserves that — no probe, no probe-count movement across re-lists.
+    let dir = TmpDir::new();
+    let conn = Connection::open(dir.join("opencode.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+         CREATE TABLE session (
+            id TEXT PRIMARY KEY, directory TEXT, title TEXT,
+            time_created INTEGER, time_updated INTEGER, time_archived INTEGER,
+            project_id TEXT, parent_id TEXT, model TEXT
+         );",
+    )
+    .unwrap();
+    marker_insert_session(&conn, "ses_1", 5000);
+    drop(conn);
+    let provider = OpencodeProvider::new(dir.to_path_buf());
+    let _ = marker_list_sessions(&provider, 42);
+    let _ = marker_list_sessions(&provider, 43);
+    assert_eq!(
+        provider.marker_probe_count(),
+        0,
+        "a schema without marker tables issues no probes and stays unmarked"
+    );
+}
+
+#[test]
+fn marker_cache_null_time_updated_row_is_never_cached() {
+    // The Global Constraints pin this for BOTH caches: a NULL
+    // `time_updated` row cannot be stamp-validated and always re-probes —
+    // never cached.
+    let dir = TmpDir::new();
+    let conn = Connection::open(dir.join("opencode.db")).unwrap();
+    marker_fixture_schema(&conn);
+    conn.execute(
+        "INSERT INTO session VALUES ('ses_1', '/repo/x', 'Named', 1000, NULL, NULL, NULL, NULL, NULL)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO message VALUES ('msg_1', 'ses_1', 100, ?1)",
+        rusqlite::params![marker_payload()],
+    )
+    .unwrap();
+    drop(conn);
+    let provider = OpencodeProvider::new(dir.to_path_buf());
+    let first = marker_list_sessions(&provider, 42);
+    assert_eq!(first.len(), 1);
+    assert_eq!(
+        first[0].is_subagent,
+        Some(true),
+        "the NULL-stamp row is still classified correctly on the first listing"
+    );
+    assert_eq!(provider.marker_probe_count(), 1);
+    let second = marker_list_sessions(&provider, 43);
+    assert_eq!(second[0].is_subagent, Some(true));
+    assert_eq!(
+        provider.marker_probe_count(),
+        2,
+        "a NULL time_updated row cannot be stamp-validated and always re-probes"
     );
 }
