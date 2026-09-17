@@ -423,8 +423,11 @@ function serverProjectDirectory() {
 // reach seedServerDatabase differ in BOTH argv and cwd:
 //   - a serve launch is `opencode serve [--pure] --hostname H --port P`
 //     spawned with cwd: None (crates/freshell-opencode/src/serve.rs:742), so
-//     the fake's own cwd is the server root — it keeps the 504b5122a
-//     serve-lane contract (serverProjectDirectory()).
+//     process.cwd() would be the Rust server's cwd, not the project root —
+//     serverProjectDirectory() instead returns the parent of dataHome (the
+//     server's project root for seeding purposes; the fake's cwd is only
+//     the fallback when that realpath fails), which keeps the 504b5122a
+//     serve-lane contract.
 //   - a terminal-PTY launch is `opencode [--model M] --hostname H --port N
 //     [--session <id>]` (crates/freshell-platform/src/cli_launch.rs
 //     settings_args/resume_args; base_args is empty) spawned IN the pane cwd,

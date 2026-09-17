@@ -477,6 +477,14 @@ test.describe('Fresh-agent centralization smoke', () => {
         payload: { id: 'tab-eviction-trigger', title: 'Eviction trigger', status: 'running' },
       })
     })
+    // Eviction-dependency documentation (delta-review round-1 F11): this 404
+    // depends on the server layout store REPLACING same-connection-key
+    // ui.layout.sync payloads — no merge: the page's own debounced mirror
+    // sync overwrites the crafted entry wholesale, evicting
+    // pane-legacy-agent. A future change to MERGE same-key payloads instead
+    // would keep the crafted entry in the store (capture would answer the
+    // pinned 422, not 404) and surface as THIS poll timing out — a timeout
+    // here means the replace semantics changed, not a flake.
     await expect.poll(async () => {
       const capture = await fetchWithAuth(serverInfo, '/api/panes/pane-legacy-agent/capture')
       return capture.status

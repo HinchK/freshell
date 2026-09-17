@@ -281,15 +281,13 @@ test.describe('Freshopencode DB history restore', () => {
       await sendFreshAgentPrompt(page, prompt)
 
       await expect(page.getByText(response)).toBeVisible({ timeout: 30_000 })
-      // Force the auto-title pipeline's propagation before asserting: the
-      // first prompt is copied into the tab/pane/session titles (under
-      // full-lane load this made the bare getByText below resolve to 3-4
-      // elements — the strict-mode violation this spec terminally failed
-      // on). Waiting for the propagation makes the ambiguity deterministic
-      // instead of load-dependent, so the transcript-scoped locator that
-      // replaces this assertion is exercised against the real condition
-      // every run.
-      await expect.poll(async () => page.getByText(prompt).count(), { timeout: 30_000 }).toBeGreaterThan(1)
+      // The auto-title pipeline copies the first prompt into the tab/pane/
+      // session titles, so a bare getByText(prompt) is ambiguous (a strict-mode
+      // violation) — but whether/when that propagation lands is the title
+      // feature's concern, not history restoration's. The transcript-scoped
+      // locator is the restore assertion; it must stay scoped (delta-review
+      // round-1 F6 removed the coupling poll that waited for the title
+      // copies to appear).
       const transcript = page.locator('[data-context="fresh-agent-transcript"]')
       await expect(transcript.getByText(prompt, { exact: true })).toBeVisible({ timeout: 30_000 })
 

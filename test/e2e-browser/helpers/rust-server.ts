@@ -496,34 +496,47 @@ export class RustServer implements E2eServerHandle {
 
   /**
    * HARD-kill the current server process WITHOUT rebooting and WITHOUT the
-   * graceful shutdown path (no SIGTERM first, no clean WS close frames, so
-   * the server's own PTY-reaping Drop path never ran — see the class doc
-   * comment's process-group boundary). Same kill semantics as
-   * `restartAbrupt`'s first half: signal the server's OWN process group
-   * (negative pid — ownership-safe by construction), then run the
-   * ownership-safe descendant sweep (`reapSurvivingChildren`) as the
-   * PRIMARY reap, since the graceful reap never ran. Unlike
-   * `restartAbrupt`, does NOT boot a replacement: the caller owns the
-   * restart decision (e.g. opencode-restart-recovery boots its own
-   * server2 bound to the same port and token).
+   * graceful shutdown path (no clean WS close frames, so the server's own
+   * PTY-reaping Drop path never ran — see the class doc comment's
+   * process-group boundary). Same kill semantics as `restartAbrupt`'s first
+   * half: signal the server's OWN process group (negative pid —
+   * ownership-safe by construction), then run the ownership-safe descendant
+   * sweep (`reapSurvivingChildren`) as the PRIMARY reap, since the graceful
+   * reap never ran. Unlike `restartAbrupt`, does NOT boot a replacement:
+   * the caller owns the restart decision (e.g. opencode-restart-recovery
+   * boots its own server2 bound to the same port and token).
+   *
+   * Escalation (delta-review round-1 F7, mirroring `killCurrentProcess`):
+   * the requested signal is delivered to the group; if the process has not
+   * exited within 5s, SIGKILL the group — a signal that fails to stop the
+   * server must never leave a live, untracked server that `stop()` can no
+   * longer reach. The `this.process` handle is only nulled AFTER the kill
+   * has landed (exit observed or SIGKILL issued), so a failed first signal
+   * keeps the fixture's stop()/killCurrentProcess() paths armed.
    */
   async kill(signal: NodeJS.Signals = 'SIGKILL'): Promise<void> {
     const proc = this.process
     const pid = proc?.pid
-    this.process = null
 
     if (!proc || !pid) return
 
     const childPidsBeforeKill = ownedDescendantPids(pid)
 
     await new Promise<void>((resolve) => {
-      // Signal delivery is effectively immediate, but keep a hard cap so a
-      // pathological wait can never hang the fixture.
-      const timeout = setTimeout(resolve, 5000)
+      const timeout = setTimeout(() => {
+        try {
+          process.kill(-pid, 'SIGKILL')
+        } catch {
+          // Process group already gone.
+        }
+        resolve()
+      }, 5000)
+
       proc.once('exit', () => {
         clearTimeout(timeout)
         resolve()
       })
+
       try {
         // Negative pid targets the server's OWN process group only (see the
         // class doc comment and `killCurrentProcess` for the ownership
@@ -535,6 +548,8 @@ export class RustServer implements E2eServerHandle {
         resolve()
       }
     })
+
+    this.process = null
 
     await this.reapSurvivingChildren(childPidsBeforeKill)
   }

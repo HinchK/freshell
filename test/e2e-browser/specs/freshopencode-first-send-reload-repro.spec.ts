@@ -175,11 +175,20 @@ test.describe('Freshopencode first-send reload regression', () => {
         return events.some((event) => event.event === 'session_create_requested')
       }, { timeout: 15_000 }).toBe(true)
 
-      // The audit write (fake CLI process) and the client's status broadcast
-      // (WS -> Redux) are different pipelines: under full-lane load the
-      // broadcast lags the audit event, so a one-shot read raced and could
-      // observe the pre-turn 'idle' (the lane failure: Expected "running",
-      // Received "idle"). Poll instead: FAKE_OPENCODE_HANG_SESSION_CREATE=1
+      // Two layers, evidence-corrected (Task 4): the PRIMARY failure was
+      // deterministic, not load lag — on every freshopencode first send
+      // the server's running broadcast is snapshot-invalidating, and the
+      // placeholder short-circuit snapshot it triggers replies
+      // status 'idle'; applySnapshot's pane-content status write was UNGATED
+      // (unlike the session-record write), so that idle snapshot clobbered
+      // the optimistic 'running' even unloaded (Expected "running",
+      // Received "idle" — every run, not just under load). Fixed by the
+      // production gate (Task 4: the pane-content status adoption now
+      // mirrors the session-record gate). The SECONDARY layer the poll also
+      // covers is load lag — the audit write (fake CLI process) and the
+      // client's status broadcast (WS -> Redux) are different pipelines,
+      // and under full-lane load the broadcast can lag the audit event.
+      // Poll instead of a one-shot read: FAKE_OPENCODE_HANG_SESSION_CREATE=1
       // pins the turn in flight, so 'running' is a stable steady state —
       // polling to it does not weaken the pinned contract (the submitted
       // prompt must stay visible across reload while materialization is

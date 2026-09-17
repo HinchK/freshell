@@ -2391,6 +2391,38 @@ export function FreshAgentView({
     }))
   }, [claudeSession?.lost, claudeSessionStatus, dispatch, paneContent.provider, paneContent.status, paneId, tabId])
 
+  // Delta-review round-1 F2: the Task 4 content-status gate (in applySnapshot)
+  // can strand the pane-content status at a busy state. When a turn ends
+  // without a snapshot-invalidating event (an interrupt or error: only
+  // freshAgent.status:idle ever arrives), the record clears busy through a
+  // path that triggers no follow-up snapshot — freshAgent.status is not in
+  // SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS, and the busy poll stops once
+  // the record is idle — so the pane's refused 'running' echo has nothing
+  // left to repair it. The record's busy→non-busy edge is the last
+  // authoritative signal: re-derive the pane-content status from it.
+  // Claude is excluded because the level-triggered mirror above already
+  // covers it. This cannot weaken the gate: it fires only once the record
+  // ITSELF no longer asserts busy, which is exactly when the Task 4
+  // invariant considers the pane's 'running' stale. Edge-triggered (not
+  // level-triggered) so it never fights the opencode send path's optimistic
+  // 'running' write, which lands while the record is already non-busy.
+  const agentSessionStatus = agentSession?.status
+  const previousSessionRecordStatusRef = useRef(agentSessionStatus)
+  useEffect(() => {
+    const previousStatus = previousSessionRecordStatusRef.current
+    previousSessionRecordStatusRef.current = agentSessionStatus
+    if (paneContent.provider === 'claude') return
+    if (!agentSessionStatus || !previousStatus) return
+    if (!BUSY_STATES.has(previousStatus) || BUSY_STATES.has(agentSessionStatus)) return
+    if (!BUSY_STATES.has(paneContent.status)) return
+    if (isStatusRegression(paneContent.status, agentSessionStatus)) return
+    dispatch(mergePaneContent({
+      tabId,
+      paneId,
+      updates: { status: agentSessionStatus },
+    }))
+  }, [agentSessionStatus, dispatch, paneContent.provider, paneContent.status, paneId, tabId])
+
   useEffect(() => {
     if (paneContent.provider !== 'claude') return
     if (!paneContent.sessionId) return

@@ -198,7 +198,7 @@ async function waitForOpenCodeSessions(page: any, tabIds: string[]): Promise<Pan
         && content.sessionRef?.provider === 'opencode'
         && typeof content.sessionRef.sessionId === 'string'
     })
-  }, tabIds, { timeout: 60_000 })
+  }, tabIds, { timeout: 30_000 })
   return getPaneSnapshots(page, tabIds)
 }
 
@@ -831,7 +831,7 @@ test.describe('OpenCode restart recovery', () => {
         return terminals.find((terminal) =>
           terminal.terminalId === beforeAssociation.terminalId
         )?.sessionRef
-      }, { timeout: 30_000 }).toEqual({
+      }, { timeout: 15_000 }).toEqual({
         provider: 'opencode',
         sessionId: expectedSessionId,
       })

@@ -82,6 +82,17 @@ function listedProjects(
   }
 }
 
+// Playwright --list roster lines have the exact shape
+// "  [project] › <specFile>:<line>:<col> › <title>". Extracting the spec
+// token makes presence an exact-filename membership check — substring
+// containment passes vacuously for colliding names
+// (opencode-restart-recovery.spec.ts is contained inside
+// freshopencode-restart-recovery.spec.ts, so a deleted shorter spec would
+// still satisfy a raw toContain; delta-review round-1 F3).
+function listedSpecFiles(output: string): Set<string> {
+  return new Set([...output.matchAll(/› (\S+\.spec\.ts):\d+:\d+/g)].map((match) => match[1]))
+}
+
 describe('browser selection non-vacuity', () => {
   it('resolves only Rust application projects with the exact continuity exclusion', () => {
     const defaultProjects = resolvedConfig(playwrightConfig, cleanEnvironment())
@@ -111,10 +122,23 @@ describe('browser selection non-vacuity', () => {
     // Local coverage pin (kata 67jt): every CLOUD_SKIP_SPECS entry must
     // remain listed on the base/local lane — cloud-skip never means "not
     // covered"; it means "covered locally". A renamed or deleted spec that
-    // forgets the list fails here.
+    // forgets the list fails here. Presence is exact-filename roster
+    // membership (listedSpecFiles), never substring containment: the
+    // opencode-/freshopencode-restart-recovery pair collides as substrings.
+    const baseSpecTokens = listedSpecFiles(chromium.output)
     for (const spec of CLOUD_SKIP_SPECS) {
-      expect(chromium.output, `base lane must still list ${spec}`).toContain(spec)
+      expect(baseSpecTokens, `base lane must still list ${spec}`).toContain(spec)
     }
+    // Self-proving matcher (cheap synthetic negative): a roster holding only
+    // the longer colliding name must not count as the shorter one, and the
+    // real base lane lists both as distinct roster items.
+    expect(baseSpecTokens.has('freshopencode-restart-recovery.spec.ts')).toBe(true)
+    expect(baseSpecTokens.has('opencode-restart-recovery.spec.ts')).toBe(true)
+    const collisionOnlyRoster = listedSpecFiles(
+      '  [chromium] › freshopencode-restart-recovery.spec.ts:360:3 › Freshopencode restart recovery › resumes a session',
+    )
+    expect(collisionOnlyRoster.has('freshopencode-restart-recovery.spec.ts')).toBe(true)
+    expect(collisionOnlyRoster.has('opencode-restart-recovery.spec.ts')).toBe(false)
     // CLOUD_SKIP_TITLES non-vacuity: each grepInvert title must actually
     // select a test in the base lane — else the cloud exclusion would be
     // vacuously green after an edit (today's known hit: editor-pane.spec.ts

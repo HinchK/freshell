@@ -3617,6 +3617,85 @@ describe('FreshAgentView', () => {
     expect(store.getState().freshAgent.sessions[`freshopencode:opencode:${sessionId}`]?.status).toBe('idle')
   })
 
+  it('repairs a stranded pane-content running when the record clears busy after the gate refused an idle snapshot', async () => {
+    const store = createStore()
+    const sessionId = 'ses_stranded_echo'
+    // Mid-turn idle snapshot (not live-reconciled): while the session record
+    // asserts busy, the Task 4 gate refuses the pane-content status
+    // adoption -- intended, and this test first proves the gate held.
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      threadId: sessionId,
+      sessionId,
+      status: 'idle',
+      revision: 213,
+      latestTurnId: null,
+      capabilities: { send: true, interrupt: true, fork: true },
+      tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
+      turns: [],
+      pendingApprovals: [],
+      pendingQuestions: [],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        sessionId,
+        sessionRef: { provider: 'opencode', sessionId },
+        resumeSessionId: sessionId,
+        createRequestId: 'req-stranded-echo',
+        status: 'running',
+        initialCwd: '/home/dan/code/freshell',
+      },
+    }))
+    store.dispatch(setSessionStatus({
+      sessionId,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      status: 'running',
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // The gate held: the pane-content echo stays 'running'.
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+    })
+    await act(async () => {
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(getFreshAgentPaneContent(store).status).toBe('running')
+
+    // The turn now ends WITHOUT a snapshot-invalidating event (an interrupt
+    // or error: only freshAgent.status:idle ever arrives). freshAgent.status
+    // is not in SNAPSHOT_INVALIDATING_FRESH_AGENT_EVENTS, so no new snapshot
+    // fetch runs and the busy poll has torn down -- the record's busy-clear
+    // edge is the only remaining authoritative signal, so the stranded
+    // pane-content 'running' must be re-derived from it.
+    await act(async () => {
+      store.dispatch(setSessionStatus({
+        sessionId,
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        status: 'idle',
+      }))
+    })
+
+    await waitFor(() => {
+      expect(getFreshAgentPaneContent(store).status).toBe('idle')
+    })
+    expect(store.getState().freshAgent.sessions[`freshopencode:opencode:${sessionId}`]?.status).toBe('idle')
+  })
+
   it('preserves loaded transcript history when a submit refresh returns only the in-flight turn', async () => {
     const store = createStore()
     let onMessage: ((message: Record<string, unknown>) => void) | undefined
