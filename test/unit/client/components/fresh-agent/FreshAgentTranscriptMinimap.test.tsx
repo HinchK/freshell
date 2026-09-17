@@ -373,4 +373,31 @@ describe('FreshAgentTranscript minimap rail', () => {
     render(<FreshAgentTranscript turns={TRANSCRIPT} />)
     expect(screen.queryByRole('button', { name: /Jump to prompt:/ })).not.toBeInTheDocument()
   })
+
+  it('runs ONE shared landmark sweep per scroll event, feeding both the glom chip and the rail', () => {
+    const { scroller } = setupScrollableTranscript()
+    // Both consumers render from the shared sweep: the glom chip names the
+    // last prompt above the viewport; the rail shows all three ticks.
+    expect(screen.getByRole('button', { name: /Jump to your message/ })).toHaveTextContent('Second user message here')
+    expect(screen.getAllByRole('button', { name: /Jump to prompt:/ })).toHaveLength(3)
+
+    const sweepQuery = vi.spyOn(scroller, 'querySelectorAll')
+    const scrollerRect = vi.spyOn(scroller, 'getBoundingClientRect')
+    fireEvent.scroll(scroller)
+
+    // ONE querySelectorAll('[data-turn-role="user"]') per scroll event — the
+    // pre-refactor code ran two (recomputeGlom + the minimap's own sweep).
+    const landmarkQueries = sweepQuery.mock.calls.filter(
+      ([selector]) => selector === '[data-turn-role="user"]',
+    )
+    expect(landmarkQueries).toHaveLength(1)
+    // One scroller rect read per sweep (shared), not one per consumer.
+    expect(scrollerRect).toHaveBeenCalledTimes(1)
+    // Both consumers updated from that single sweep.
+    expect(screen.getByRole('button', { name: 'Jump to your message: Second user message here' })).toBeInTheDocument()
+    expect(screen.getAllByRole('button', { name: /Jump to prompt:/ })).toHaveLength(3)
+
+    sweepQuery.mockRestore()
+    scrollerRect.mockRestore()
+  })
 })
