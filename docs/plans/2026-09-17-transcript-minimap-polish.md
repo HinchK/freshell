@@ -32,7 +32,7 @@ Carried forward from the prior plan (binding unless explicitly amended here):
 
 - **TDD:** Red-Green-Refactor per task. Every new test fails first for the stated reason and passes after the shown implementation. Never skip the refactor step (state explicitly when none is needed). The only exceptions are the two behavior-inert style-Nit fixes in Task 1 (`const heights`, redundant-disconnect removal) and regression-pinning assertions, which get bounded-mutation RED proofs instead (exact commands given in the task).
 - **Worktree:** All work happens in the coordinator-provided worktree `.worktrees/transcript-minimap` on branch `the-usual/transcript-minimap`, continuing from HEAD `cd55891bc`. Run every command from that directory. Do not merge, push, or open a PR — the coordinator gates all of those on explicit user approval.
-- **A11y:** Every interactive element is a real `<button type="button">` with an `aria-label`. `npm run lint` (eslint-plugin-jsx-a11y) must stay clean — it is a CI gate. E2e specs may use only `getByRole`/`getByText`/`getByTestId`/`[data-*]` locator patterns (the a11y gate runs in `--deny` mode).
+- **A11y:** Every interactive element is a real `<button type="button">` with an `aria-label`. `npm run lint` (eslint-plugin-jsx-a11y) must stay clean — it is a CI gate. E2e specs may use only `getByRole`/`getByText`/`getByTestId`/`[data-*]` locator patterns (the a11y gate runs in `--deny` mode). **Pre-existing a11y-gate red (binding):** `npm run test:e2e:a11y-gate:deny` ALREADY exits 1 at the branch point with 11 novel violations in 5 spec files this run never touches (receipt: run-1 ledger, reproduced at origin/main). No task expects a clean exit. The requirement is ZERO violations naming this branch's specs — verify with `npm run test:e2e:a11y-gate:deny 2>&1 | grep -c "transcript-minimap"` → expect 0.
 - **No IntersectionObserver** — it is neither used nor stubbed anywhere in this repo. The visible-region band is computed from `scrollTop`/`scrollHeight`/`clientHeight`.
 - **Tick completeness (binding contract):** every user prompt keeps a tick in a DISTINCT, non-overlapping slot. No tick is ever dropped, capped, sampled, or virtualized — the whole-branch Nit 2 "cap/sampling" remedy is explicitly barred by this run's constraints. Task 3's cluster affordance is purely ADDITIVE (one extra button over a dense cluster); all per-prompt ticks stay in the DOM with unchanged keyboard/screen-reader access.
 - **jsdom geometry:** jsdom has no layout. Tests mock `clientHeight`/`scrollHeight` with `Object.defineProperty` getters, set `scrollTop` directly, replace `getBoundingClientRect` per element, and assign `el.scrollIntoView = vi.fn()` per element. `ResizeObserver` is globally stubbed as a no-op (`test/setup/dom.ts:46-54`); tests that need firing use the suite-local `CapturingResizeObserver` (per-target callback map). Any unexpected `console.error` fails the test (`test/setup/dom.ts:127-144`) — no React key warnings, no act() warnings. For that reason all measurement work is **synchronous, not rAF-throttled**: a rAF callback would land `setState` outside `fireEvent`'s act() wrapper and fail the suite. (The `ContextMenu` primitive's internal rAF focus call is pre-existing, portal-rendered, and proven safe by its own jsdom suites.)
@@ -104,9 +104,12 @@ Carried forward from the prior plan (binding unless explicitly amended here):
 1c. In `test/e2e-browser/specs/transcript-minimap.spec.ts`: add next to `tallBody` at the top of the file:
 
 ```ts
-/** One 213-char unbroken token: no spaces, so whitespace wrapping alone
- * cannot keep it inside the 16rem tooltip box — only overflow-wrap can. */
-const LONG_UNBROKEN_TOKEN = `https://freshell.example.com/releases/${'v1.2.3-rc'.repeat(20)}`
+/** One 200-char unbreakable token: no spaces AND no line-break opportunities
+ * (no hyphens, slashes, or punctuation — CSS creates break opportunities at
+ * those even without overflow-wrap, which load-bearing validation proved
+ * empirically in headless Chromium), so only overflow-wrap can keep it
+ * inside the 16rem tooltip box. */
+const LONG_UNBROKEN_TOKEN = 'B'.repeat(200)
 ```
 
 Replace the FIRST seeded turn line of test 1:
@@ -124,10 +127,12 @@ with:
 and insert this block into test 1 immediately after the existing middle-tick hover assertions (`await expect(page.getByRole('tooltip')).toHaveText('Now add the upgrade guide')`, mouse-move-away, `toHaveCount(0)`):
 
 ```ts
-    // Word-break: hovering the unbroken-token prompt must keep the rendered
+    // Word-break: hovering the unbreakable-token prompt must keep the rendered
     // text inside the tooltip box (break-words). Without overflow-wrap the
-    // 120-char token paints as one ~750px line spilling past the 16rem box.
-    const first = freshPane.getByRole('button', { name: /^Jump to prompt: https:\/\// })
+    // 120-char truncated token paints as one ~840px line spilling past the
+    // 16rem box (verified: a plain-alphanumeric token has no CSS break
+    // opportunities, so it genuinely cannot wrap without overflow-wrap).
+    const first = freshPane.getByRole('button', { name: /^Jump to prompt: B/ })
     await first.hover()
     const tooltip = page.getByRole('tooltip')
     await expect(tooltip).toBeVisible()
@@ -203,7 +208,7 @@ npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentTra
 bash -lc 'npm run test:e2e:cloud -- --project=chromium test/e2e-browser/specs/transcript-minimap.spec.ts'
 ```
 
-Expected: PASS — both unit files fully green (16 layout tests + 16 component tests), both e2e tests green, including `textFitsBox === true`.
+Expected: PASS — both unit files fully green (16 layout tests + 15 component tests), both e2e tests green, including `textFitsBox === true`.
 
 - [ ] **Step 5: Refactor while green**
 
@@ -215,11 +220,11 @@ No refactor needed: the changes are one utility class, one binding keyword, one 
 npm run test:vitest -- run test/unit/client/components/fresh-agent/ --config config/vitest/vitest.config.ts
 npm run typecheck:client
 npm run lint
-npm run test:e2e:a11y-gate:deny
+npm run test:e2e:a11y-gate:deny 2>&1 | grep -c "transcript-minimap" || true   # expect 0 violations naming our spec (gate itself is pre-existing red — Global Constraints)
 git grep -n "transcript-minimap" test/e2e-browser/playwright.cloud.config.ts || echo "not skipped"
 ```
 
-Expected: PASS / clean. The a11y deny gate must report no new violations (the spec uses only permitted locator patterns).
+Expected: PASS / clean. The spec uses only permitted locator patterns and adds zero a11y-gate violations.
 
 - [ ] **Step 7: Commit the task**
 
@@ -239,7 +244,7 @@ Commit contents: the `break-words` class (+ its unit pin and e2e text-overflow a
 - Create: `test/unit/client/components/fresh-agent/transcript-measurement.test.ts`
 - Modify: `src/components/fresh-agent/FreshAgentTranscript.tsx` (state :1066; glom recompute :1132-1155; signature effect :1242-1244; onScroll :1277-1281; minimap render :1390-1394; one import)
 - Modify: `src/components/fresh-agent/FreshAgentTranscriptMinimap.tsx` (full internal rewrite; props interface change)
-- Modify: `test/unit/client/components/fresh-agent/FreshAgentTranscriptMinimap.test.tsx` (add the one-sweep spy test; the 16 existing tests are NOT edited)
+- Modify: `test/unit/client/components/fresh-agent/FreshAgentTranscriptMinimap.test.tsx` (add the one-sweep spy test; the 15 existing tests are NOT edited)
 
 **Interfaces:**
 - Produces (new module `shared/transcript-measurement.ts`):
@@ -703,7 +708,7 @@ Implementer notes: the removed pieces are the local `useState`/`recompute`/scrol
 npm run test:vitest -- run test/unit/client/components/fresh-agent/transcript-measurement.test.ts test/unit/client/components/fresh-agent/FreshAgentTranscriptMinimap.test.tsx test/unit/client/components/fresh-agent/FreshAgentTranscript.test.tsx --config config/vitest/vitest.config.ts
 ```
 
-Expected: PASS — the new module tests (5), the component suite (17, including the one-sweep spy test now counting exactly 1), and the full transcript suite (including the untouched glom block at :1800-1930: last-above-viewport target, no-chip-when-none-above, click-jump, full-text aria-label/title, signature recompute — all preserved by construction: same landmarks, same strictness, same trigger set).
+Expected: PASS — the new module tests (5), the component suite (16, including the one-sweep spy test now counting exactly 1), and the full transcript suite (including the untouched glom block at :1800-1930: last-above-viewport target, no-chip-when-none-above, click-jump, full-text aria-label/title, signature recompute — all preserved by construction: same landmarks, same strictness, same trigger set).
 
 - [ ] **Step 5: Refactor while green**
 
@@ -1129,7 +1134,7 @@ npm run test:vitest -- run test/unit/client/components/fresh-agent/transcript-mi
 bash -lc 'npm run test:e2e:cloud -- --project=chromium test/e2e-browser/specs/transcript-minimap.spec.ts'
 ```
 
-Expected: PASS — 20 layout tests, 20 component tests (16 pre-existing + the Task-2 spy test + the 3 cluster tests), and all 4 e2e tests including the dense-cluster flow with its density guard satisfied.
+Expected: PASS — 20 layout tests, 19 component tests (15 post-Task-1 pre-existing + the Task-2 spy test + the 3 cluster tests), and all 4 e2e tests including the dense-cluster flow with its density guard satisfied.
 
 - [ ] **Step 5: Refactor while green**
 
@@ -1141,11 +1146,11 @@ No refactor needed. The cluster exposure is three additive lines inside the exis
 npm run test:vitest -- run test/unit/client/components/fresh-agent/ --config config/vitest/vitest.config.ts
 npm run typecheck:client
 npm run lint
-npm run test:e2e:a11y-gate:deny
+npm run test:e2e:a11y-gate:deny 2>&1 | grep -c "transcript-minimap" || true   # expect 0 violations naming our spec (gate itself is pre-existing red — Global Constraints)
 git grep -n "transcript-minimap" test/e2e-browser/playwright.cloud.config.ts || echo "not skipped"
 ```
 
-Expected: PASS / clean. A11y: the new button carries a real role + aria-label + aria-haspopup; the menu is the repo's own role="menu"/menuitem primitive; all spec locators stay in the permitted set. No `docs/index.html` change for this task: the cluster target is an extreme-density-only affordance, not part of the default experience the mock depicts (AGENTS.md's "only major changes" rule).
+Expected: PASS / clean. A11y: the new button carries a real role + aria-label + aria-haspopup; the menu is the repo's own role="menu"/menuitem primitive; all spec locators stay in the permitted set, and zero gate violations name transcript-minimap.spec.ts. No `docs/index.html` change for this task: the cluster target is an extreme-density-only affordance, not part of the default experience the mock depicts (AGENTS.md's "only major changes" rule).
 
 - [ ] **Step 7: Commit the task**
 
@@ -1652,12 +1657,12 @@ No refactor needed. The wiring is the family's established 8-point pattern copie
 npm run test:vitest -- run test/unit/shared/ test/unit/client/store/ test/unit/client/components/fresh-agent/ test/unit/client/components/SettingsView.agent-chat.test.tsx --config config/vitest/vitest.config.ts
 npm run typecheck:client
 npm run lint
-npm run test:e2e:a11y-gate:deny
+npm run test:e2e:a11y-gate:deny 2>&1 | grep -c "transcript-minimap" || true   # expect 0 violations naming our spec (gate itself is pre-existing red — Global Constraints)
 git grep -n "transcript-minimap" test/e2e-browser/playwright.cloud.config.ts || echo "not skipped"
-grep -c 'Show transcript minimap' docs/index.html   # expect >= 3 (label title, aria-label)
+grep -c 'Show transcript minimap' docs/index.html   # expect 2 (label title, aria-label)
 ```
 
-Expected: PASS / clean. The broader unit sweep (all of `test/unit/shared/` + `test/unit/client/store/`) catches any other consumer of the freshAgent local shape the plan's scan may have missed — if any fails on the new key, fix the assertion by adding `showTranscriptMinimap` to its expected shape only if the test asserts defaults; never delete the assertion (record any such edit in the task report).
+Expected: PASS / clean, with zero a11y-gate violations naming transcript-minimap.spec.ts (the gate itself stays pre-existing red). The broader unit sweep (all of `test/unit/shared/` + `test/unit/client/store/`) catches any other consumer of the freshAgent local shape the plan's scan may have missed — if any fails on the new key, fix the assertion by adding `showTranscriptMinimap` to its expected shape only if the test asserts defaults; never delete the assertion (record any such edit in the task report).
 
 - [ ] **Step 7: Commit the task**
 
@@ -1671,7 +1676,7 @@ git commit -m "feat(fresh-agent): add Show transcript minimap setting (default o
 ## Recorded residuals (carry into the recap verbatim)
 
 1. **Extreme-density physical limits** (accepted by the User Request): dense-cluster per-prompt ticks remain visually sub-4px — the one-tick-per-prompt contract forbids merging their paint. The reliable pointer path at extreme density is the cluster's open-list menu; a LONE sub-4px tick gets no cluster target (its own button is the same size a cluster target would be). Keyboard/screen-reader access to every prompt is unchanged.
-2. **Stale measurement while the rail is unmounted**: with the setting OFF (or the rail hidden by fits-viewport), a content-only resize (disclosure toggle) leaves the stored shared measurement stale until the next scroll/signature trigger; when the rail remounts, real browsers self-heal within a frame (ResizeObserver fires on initial observe). The glom chip — the only consumer live at that moment — does not depend on article-resize freshness.
+2. **Stale measurement while the rail is unmounted**: with the setting OFF, a content-only resize (disclosure toggle) leaves the stored shared measurement stale until the next scroll/signature trigger; when the rail remounts, real browsers self-heal within a frame (ResizeObserver fires on initial observe). (The fits-viewport-hidden mode is NOT stale: the component stays mounted with live observers there, so content-only resizes still re-sweep.) The glom chip — the only consumer live at that moment — does not depend on article-resize freshness.
 3. **Local-only setting**: `showTranscriptMinimap` persists per-browser (localStorage diff-vs-defaults blob) and does not roam across devices — identical to its `expandThinking`/`expandTools`/`showTimecodes` siblings. The server track exists (settings report §3) if roaming is ever wanted; it is out of scope here.
 4. **Mount-cost note**: the initial transcript mount runs the shared sweep once (parent signature effect); the rail's own ResizeObservers no longer trigger a second sweep on mount — per-SCROLL cost is the finding's subject and is exactly one sweep.
 
