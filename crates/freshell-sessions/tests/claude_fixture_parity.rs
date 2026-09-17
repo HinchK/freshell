@@ -138,6 +138,10 @@ fn real_corrupted_extracts_full_metadata_and_token_usage() {
         // Both provenance surfaces agree (`claude.rs` computes them from the
         // same predicate): the generated-summary title is provider-authored.
         title_provider_generated: true,
+        // Unified agent names (Task 3): the summary record's generated title
+        // is now RETAINED as its own automatic native observation (the
+        // display chain above is unchanged by the retention).
+        summary_title: Some("Test Session 1".to_string()),
         message_count: 6,
         is_non_interactive: Some(true),
         token_usage: Some(TokenSummary {

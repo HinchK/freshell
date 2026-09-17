@@ -3490,6 +3490,7 @@ impl FreshOpencodeState {
         turn_errored: Arc<AtomicBool>,
     ) -> tokio::task::JoinHandle<()> {
         let fresh_agent = self.fresh_agent.clone();
+        let state = self.clone();
         let mut rx = manager.subscribe(&real_id);
         tokio::spawn(async move {
             loop {
@@ -3523,6 +3524,27 @@ impl FreshOpencodeState {
                                 // send task's completion gating once idle resolves.
                                 turn_errored.store(true, Ordering::SeqCst);
                                 error_event(session_id, message)
+                            }
+                            SdkProviderEvent::TitleObserved { session_id, title } => {
+                                // Unified agent names (Task 3): a native title
+                                // observation is automatic provider metadata —
+                                // folded at the store's current location
+                                // revision, never promoted to manual, and
+                                // never a wire frame of its own.
+                                let sink = state.naming();
+                                let _ = crate::naming::observe_native_live(
+                                    &sink,
+                                    freshell_protocol::session_names::SessionNameRef::Session {
+                                        provider:
+                                            freshell_protocol::session_names::NamedProvider::Opencode,
+                                        session_id: session_id.clone(),
+                                    },
+                                    title,
+                                    crate::naming::NativeNameOrigin::Snapshot,
+                                    None,
+                                )
+                                .await;
+                                continue;
                             }
                         };
                         fresh_agent.broadcast(&event_frame(&real_id, inner));

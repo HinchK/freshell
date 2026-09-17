@@ -1497,6 +1497,7 @@ mod tests {
                 cwd: Some("/repo/beta".to_string()),
                 title: Some("beta".to_string()),
                 last_activity_at: Some(1234),
+                database: None,
             }))
         }));
         let (status, body) = post(st, serde_json::json!({ "input": unknown }), true).await;
@@ -2012,6 +2013,7 @@ mod tests {
                 cwd: Some("/repo/delta".to_string()),
                 title: None,
                 last_activity_at: None,
+                database: None,
             }))
         }));
         let (status, body) = post(st, serde_json::json!({ "input": SES_ID }), true).await;

@@ -59,6 +59,22 @@ function createSourceFixture(root: string): {
   writeFileSync(path.join(claudeSidecarDir, 'permission-channel.mjs'), 'export {}\n')
   writeFileSync(path.join(claudeSidecarDir, 'session-settings.mjs'), 'export const configureSession = () => ({ staged: true })\n')
   writeFileSync(path.join(claudeSidecarDir, 'model-catalog.mjs'), 'export const probeModelCatalog = () => [{ value: "staged-model" }]\n')
+  // The standalone session-names helper (unified-agent-names Task 3): one
+  // JSON line in, one structured line out — executed below against a
+  // staged fake SDK to prove the staged copy RUNS, not just copies.
+  writeFileSync(path.join(claudeSidecarDir, 'session-names.mjs'), [
+    "const sdk = await import(process.env.FRESHELL_CLAUDE_SDK_SESSION_NAMES_MODULE)",
+    "const { getSessionInfo } = sdk",
+    "import { createInterface } from 'node:readline'",
+    "const lines = createInterface({ input: process.stdin })",
+    "lines.once('line', async (line) => {",
+    "  const request = JSON.parse(line)",
+    "  const info = await getSessionInfo(request.sessionId, { dir: request.dir })",
+    "  process.stdout.write(JSON.stringify({ ok: true, op: request.op, staged: info.summary }) + '\\n')",
+    "  process.exit(0)",
+    "})",
+  ].join('\n') + '\n')
+
   writeFileSync(path.join(claudeSidecarDir, 'package.json'), JSON.stringify({ name: 'freshell-claude-sidecar', version: '0.1.0' }))
   writeFileSync(path.join(claudeSidecarDir, 'package-lock.json'), JSON.stringify({
     lockfileVersion: 3,
@@ -180,8 +196,33 @@ describe('prepare-electron-runtime staging', () => {
     expect(readFileSync(path.join(outputRoot, 'claude-sidecar', 'model-catalog.mjs'), 'utf8')).toContain('staged-model')
     expect(receipt.files).toEqual(expect.arrayContaining([
       'claude-sidecar/session-settings.mjs',
+      'claude-sidecar/session-names.mjs',
       'claude-sidecar/model-catalog.mjs',
     ]))
+    // Unified agent names (Task 3): the staged session-names helper EXECUTES
+    // from the staged runtime — one JSON line in, one structured line out,
+    // with the staged SDK boundary injected. (The fixture's fake SDK lives
+    // outside the required-file list's exhaustive naming only through the
+    // claude-sidecar recursive directory, which the allowlist already
+    // admits.)
+    // The staged helper's SDK boundary is injected from a test-local fake
+    // module written INTO the staged runtime (the production copy list stays
+    // exactly the sidecar's real files).
+    const stagedFakeSdk = path.join(outputRoot, 'node-client-runtime', '.staged-session-names-sdk.mjs')
+    writeFileSync(stagedFakeSdk, [
+      'export async function getSessionInfo(sessionId, options) {',
+      "  return { sessionId, summary: 'staged helper ran', customTitle: null }",
+      '}',
+    ].join('\n') + '\n')
+    const stagedHelper = execFileSync('node', [path.join(outputRoot, 'claude-sidecar', 'session-names.mjs')], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        FRESHELL_CLAUDE_SDK_SESSION_NAMES_MODULE: stagedFakeSdk,
+      },
+      input: JSON.stringify({ op: 'read', sessionId: 'staged-session', dir: '/work/project' }) + '\n',
+    })
+    expect(JSON.parse(stagedHelper)).toEqual({ ok: true, op: 'read', staged: 'staged helper ran' })
     expect(readFileSync(path.join(outputRoot, 'mcp', 'server.js'), 'utf8')).toContain('modelcontextprotocol')
     expect(readFileSync(path.join(outputRoot, 'node-client-runtime', 'keys.js'), 'utf8')).toContain('export')
     expect(receipt).toMatchObject({ severity: 'info', event: 'electron_runtime_prepared' })

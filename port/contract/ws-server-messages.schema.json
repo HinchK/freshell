@@ -2934,6 +2934,38 @@
         "documentGeneration": {
           "type": "number"
         },
+        "nativeSync": {
+          "additionalProperties": false,
+          "properties": {
+            "desiredRevision": {
+              "type": "number"
+            },
+            "locationRevision": {
+              "type": "number"
+            },
+            "observedCurrent": {
+              "type": "boolean"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "pending",
+                "synced",
+                "unsynced",
+                "unsupported"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "desiredRevision",
+            "locationRevision",
+            "status"
+          ],
+          "type": "object"
+        },
         "record": {
           "additionalProperties": false,
           "properties": {

@@ -18,6 +18,7 @@ use std::sync::Arc;
 use freshell_protocol::native_location::NativeAcquisition;
 use freshell_protocol::session_names::{
     NameIntent, NameRevision, NamedProvider, SessionNameRecord, SessionNameRef, SessionNameUpdate,
+    MAX_NAME_REVISION,
 };
 
 /// Every naming operation's completion future.
@@ -58,6 +59,17 @@ pub trait SessionNaming: Send + Sync {
         target: SessionNameRef,
         acquisition: NativeAcquisition,
     ) -> NameFuture<SessionNameUpdate>;
+
+    /// Unified agent names (Task 3): the store's CURRENT verified location
+    /// revision for `target` (0 when none exists). Live provider lanes stamp
+    /// their observations with this revision before folding them, so an
+    /// old-location observation can never masquerade as current. Defaulted to
+    /// the ceiling so test fakes answer "always current" (the default's 0
+    /// would read as stale against a real location revision); the real store
+    /// reads its adopted document.
+    fn current_location_revision(&self, _target: &SessionNameRef) -> NameFuture<NameRevision> {
+        Box::pin(async move { Ok(MAX_NAME_REVISION) })
+    }
 }
 
 /// `ensure_pending` input: the pre-durable handle plus provider/cwd used for
@@ -455,6 +467,39 @@ pub async fn session_projection(
         .map(|update| (update.record.name_ref.clone(), update.record))
 }
 
+/// Fold a native title observation originating from the LIVE provider
+/// connection this runtime owns (unified-agent-names Task 3): the lane
+/// itself cannot know the store's location-revision counter, so the helper
+/// stamps the observation with the store's CURRENT verified location
+/// revision for the target before folding it — a genuinely stale observation
+/// (from a superseded route) is then provenance-only, exactly the plan's
+/// old-location rule. `None` when no authority is wired or the fold failed —
+/// an observation never blocks or fails the provider lane.
+pub async fn observe_native_live(
+    sink: &Option<Arc<dyn SessionNaming>>,
+    target: SessionNameRef,
+    title: &str,
+    origin: NativeNameOrigin,
+    event_id: Option<String>,
+) -> Option<SessionNameUpdate> {
+    let sink = sink.as_ref()?;
+    let location_revision = sink
+        .current_location_revision(&target)
+        .await
+        .inspect_err(|error| log_name_error("current_location_revision", &target, error))
+        .ok()?;
+    sink.observe_native(NativeNameObservation {
+        target: target.clone(),
+        title: title.to_string(),
+        origin,
+        location_revision,
+        event_id,
+    })
+    .await
+    .inspect_err(|error| log_name_error("observe_native", &target, error))
+    .ok()
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     //! The in-crate naming sink for route/unit tests — a small store-like
@@ -541,6 +586,7 @@ pub(crate) mod test_support {
                 record,
                 document_generation,
                 changed,
+                native_sync: None,
             }
         }
 

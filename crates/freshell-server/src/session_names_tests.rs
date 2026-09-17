@@ -2030,6 +2030,7 @@ async fn publisher_recovers_a_lagged_subscription_by_re_diffing_every_record() {
         },
         document_generation: 1,
         changed: true,
+        native_sync: None,
     };
     tx.send(dummy("buried-1")).expect("send 1");
     tx.send(dummy("buried-2")).expect("send 2");

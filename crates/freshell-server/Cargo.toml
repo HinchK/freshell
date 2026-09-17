@@ -32,6 +32,7 @@ freshell-freshagent = { path = "../freshell-freshagent" }
 # server/index.ts:981-1049). real-transport is already enabled transitively via
 # freshell-freshagent; declared so main.rs can name the launch_lifecycle path.
 freshell-codex = { path = "../freshell-codex", features = ["real-transport"] }
+freshell-opencode = { path = "../freshell-opencode", features = ["real-transport"] }
 # Platform detection (`/proc/version` → platform string) for the SPA boot payload.
 freshell-platform = { path = "../freshell-platform" }
 # Read-only coding-CLI transcript parsers, reused to back `GET /api/session-directory`

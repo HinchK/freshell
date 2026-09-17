@@ -1376,6 +1376,7 @@ dependencies = [
  "freshell-codex",
  "freshell-extensions",
  "freshell-freshagent",
+ "freshell-opencode",
  "freshell-platform",
  "freshell-protocol",
  "freshell-sessions",

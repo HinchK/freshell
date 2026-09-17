@@ -863,6 +863,14 @@ impl FreshAgentState {
         *self.opencode.lock().await = Some(manager);
     }
 
+    /// Unified agent names (Task 3): the shared opencode serve manager when
+    /// one is already running (`None` before the first ensure — the native
+    /// title adapter pauses rather than spawning a serve just to check a
+    /// name). Read-only peek; `ensure_manager` remains the only spawner.
+    pub async fn opencode_manager(&self) -> Option<OpencodeServeManager> {
+        self.opencode.lock().await.clone()
+    }
+
     /// Task 4 test seam: bound the REST resume probe's `get_session` budget
     /// WITHOUT touching the process-global `FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS`
     /// env var — an existing opencode_ws.rs test already sets/removes that var

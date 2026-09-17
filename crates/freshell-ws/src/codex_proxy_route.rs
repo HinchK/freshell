@@ -110,6 +110,38 @@ async fn route_proxy_event(state: &WsState, tagged: TerminalProxyEvent) {
                 hub.note_codex_approval(&terminal_id, None, &request_id, false);
             }
         }
+        RemoteProxyEvent::NativeNameObserved { thread_id, name } => {
+            // Unified agent names (Task 3): a native thread rename the CLI
+            // performed (TUI `/rename` or a tool) is an AUTOMATIC observation
+            // — the public request carries no reliable human provenance. It
+            // targets the terminal's naming record (durable or pending) and
+            // never blocks the relay, which already happened.
+            let sink = state.identity.naming();
+            let target = state
+                .identity
+                .named_session_ref_of("codex", &thread_id)
+                .or_else(|| state.identity.name_ref_for(&terminal_id));
+            if let Some(target) = target {
+                let _ = freshell_freshagent::naming::observe_native_live(
+                    &sink,
+                    target,
+                    &name,
+                    freshell_freshagent::naming::NativeNameOrigin::Snapshot,
+                    None,
+                )
+                .await;
+            }
+        }
+        RemoteProxyEvent::UpstreamInitialized {
+            conn_id: _,
+            codex_home,
+        } => {
+            // T2-M6 (Task 3): capture the proxied connection's initialized
+            // root BEFORE any candidate can adopt — the naming bind lane's
+            // rollout walk and the native-name adapter correlate against this
+            // captured home instead of ambient env.
+            state.identity.record_codex_home(&terminal_id, &codex_home);
+        }
     }
 }
 

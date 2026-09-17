@@ -165,6 +165,23 @@ pub struct FreshAgentBindingUpsert {
     /// out-of-scope lanes, or a provider that drives naming at another
     /// site); when present, the server-side composition folds it into the
     /// naming store alongside the ledger write.
+    ///
+    /// T2-M5 DISPOSITION (Task 3, recorded): this field remains declared
+    /// without a production writer through Task 3 by an EXPLICIT re-scope
+    /// to Task 4. Task 3's native lanes (observation/read/write adapters and
+    /// the finite writeback worker) operate on already-resolved naming refs
+    /// through the store's own seams; every pending→durable bind they
+    /// influence (the proxied codex initialize correlation feeding
+    /// `bind_pending`/`record_acquisition`) flows through the CLI lanes'
+    /// direct sink calls, which classify their transitions inline — no
+    /// `record_binding` call site gains a naming fact in Task 3. Task 4
+    /// owns the shared accepted-input/open/resume callback redesign of
+    /// these same runtime lanes (`claude.rs`/`codex.rs`/`opencode_ws.rs`),
+    /// making it the first genuine consumer of the classification
+    /// (`Opened`/`Resumed` arming and the InitialRecovery retention rule);
+    /// populating it there avoids a Task-3-only write path Task 4 would
+    /// immediately reshape. No declared-but-unwired contract surface
+    /// remains: this field's only reader is the Task 4 fold.
     pub name_transition: Option<crate::naming::NameTransition>,
     /// D8 provenance write policy (see [`ProvenanceUpdate`]; the ledger's
     /// atomic apply/preserve/clear merge lives in `freshell-ws`'s pane

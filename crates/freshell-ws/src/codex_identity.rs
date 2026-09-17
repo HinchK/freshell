@@ -205,11 +205,20 @@ async fn apply_codex_identity(
     // advance. A pathless adoption keeps the handle pending for a later
     // located edge.
     if let Some(rollout) = rollout_path {
+        // T2-M6 (Task 3): the rollout walk's root prefers the PROXIED
+        // initialize's captured home (the app-server itself reported where
+        // these rollouts live) over ambient env.
+        let codex_home = state
+            .identity
+            .codex_home_of(terminal_id)
+            .or_else(|| {
+                codex_sessions_root()
+                    .and_then(|root| root.parent().map(|home| home.display().to_string()))
+            })
+            .unwrap_or_default();
         let acquisition = freshell_protocol::native_location::NativeAcquisition {
             location: freshell_protocol::native_location::NativeLocation::Codex {
-                codex_home: codex_sessions_root()
-                    .and_then(|root| root.parent().map(|home| home.display().to_string()))
-                    .unwrap_or_default(),
+                codex_home,
                 native_thread_id: Some(thread_id.to_string()),
                 rollout_path: Some(rollout.display().to_string()),
                 persistence_evidence: Some(rollout.display().to_string()),

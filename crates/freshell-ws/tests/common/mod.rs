@@ -370,6 +370,7 @@ impl NamingProbeSink {
             record,
             document_generation: 1,
             changed,
+            native_sync: None,
         }
     }
 }

@@ -160,12 +160,33 @@ export const SessionNameRedirectSchema = z.object({
 })
 export type SessionNameRedirect = z.infer<typeof SessionNameRedirectSchema>
 
+/** Native writeback status (Task 3): display/status data, never a name authority. */
+export const NativeSyncStatusSchema = z.enum(['pending', 'synced', 'unsynced', 'unsupported'])
+export type NativeSyncStatus = z.infer<typeof NativeSyncStatusSchema>
+
+/**
+ * The native writeback status projected alongside a record (Task 3).
+ * `synced` requires a current-revision readback of the exact desired name at
+ * the attempted location; `unsynced` retains the uncertainty/exhaustion
+ * reason; `unsupported` is a diagnosed capability failure. Status-only
+ * updates fold on the client by `documentGeneration`, not name revision.
+ */
+export const NativeSyncSchema = z.object({
+  status: NativeSyncStatusSchema,
+  desiredRevision: NameRevisionSchema,
+  locationRevision: NameRevisionSchema,
+  observedCurrent: z.boolean().optional(),
+  reason: z.string().optional(),
+})
+export type NativeSync = z.infer<typeof NativeSyncSchema>
+
 /** The common response/broadcast shape for every naming operation. */
 export const SessionNameUpdateSchema = z.object({
   record: SessionNameRecordSchema,
   documentGeneration: NameRevisionSchema,
   redirects: z.array(SessionNameRedirectSchema),
   changed: z.boolean(),
+  nativeSync: NativeSyncSchema.optional(),
 })
 export type SessionNameUpdate = z.infer<typeof SessionNameUpdateSchema>
 

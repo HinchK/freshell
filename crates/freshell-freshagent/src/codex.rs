@@ -726,6 +726,28 @@ impl FreshCodexState {
             .map(|update| (update.record.name_ref.clone(), update.record))
     }
 
+    /// Unified agent names (Task 3): a LIVE app-server client whose
+    /// initialized root matches `codex_home` — the root-matched management
+    /// connection the native-name adapter addresses metadata through. This
+    /// queries the live session clients DIRECTLY (never the cold
+    /// `get_snapshot`, never a resume/unarchive, never a conversation
+    /// lease); `None` when no live connection reports that root.
+    pub async fn management_client_for_root(
+        &self,
+        codex_home: &str,
+    ) -> Option<Arc<CodexAppServerClient>> {
+        if codex_home.is_empty() {
+            return None;
+        }
+        let sessions = self.sessions.lock().await;
+        for session in sessions.values() {
+            if session.client.codex_home().await.as_deref() == Some(codex_home) {
+                return Some(session.client.clone());
+            }
+        }
+        None
+    }
+
     /// Unified agent names (Task 2): the durability-driven pending bind. A
     /// freshcodex thread is verified ONLY once its rollout exists under the
     /// initialized `codexHome` sessions tree (the first line a
@@ -4425,6 +4447,32 @@ impl FreshCodexState {
             state.clear_controls(&thread_id).await;
             let mut subscription = CodexSubscription::new(thread_id.clone());
             while let Some(notification) = notifs.recv().await {
+                // Unified agent names (Task 3): an upstream `thread/name/updated`
+                // is a NATIVE title observation — automatic provider metadata,
+                // folded at the store's current location revision. It emits no
+                // wire frames and never blocks or fails the lane; a rename it
+                // loses (a manual/accepted-AI winner) answers unchanged.
+                if let CodexNotification::ThreadNameUpdated {
+                    thread_id: name_thread,
+                    name,
+                } = &notification
+                {
+                    if name_thread == &thread_id {
+                        let sink = state.naming();
+                        let target = freshell_protocol::session_names::SessionNameRef::Session {
+                            provider: freshell_protocol::session_names::NamedProvider::Codex,
+                            session_id: name_thread.clone(),
+                        };
+                        let _ = crate::naming::observe_native_live(
+                            &sink,
+                            target,
+                            name,
+                            crate::naming::NativeNameOrigin::Snapshot,
+                            None,
+                        )
+                        .await;
+                    }
+                }
                 // `turn/started` has no wire output, but establishes state that later
                 // notifications depend on (notably the compact turn's ownership id).
                 // Let it fold while a send holds the emission barrier; otherwise the
@@ -6496,7 +6544,11 @@ fn reduce_notification(
                 .into_iter()
                 .collect()
         }
-        CodexNotification::FsChanged { .. }
+        // Unified agent names (Task 3): the native name observation is folded
+        // by the consumer loop BEFORE `reduce_notification` runs (it needs
+        // the async naming sink); here it emits no wire frames.
+        CodexNotification::ThreadNameUpdated { .. }
+        | CodexNotification::FsChanged { .. }
         | CodexNotification::Other { .. }
         | CodexNotification::ServerRequest { .. } => Vec::new(),
     }

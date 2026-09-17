@@ -222,6 +222,9 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 pub enum HttpMethod {
     Get,
     Post,
+    /// Unified agent names (Task 3): `PATCH /session/:id` — the supported
+    /// `update_session_title` route.
+    Patch,
 }
 
 /// One serve HTTP request. `url` is absolute (the health probe runs before `running`
@@ -259,6 +262,16 @@ impl ServeHttpRequest {
     pub fn post_json(url: impl Into<String>, body: Vec<u8>) -> Self {
         Self {
             method: HttpMethod::Post,
+            url: url.into(),
+            body: Some(body),
+            content_type: Some("application/json".to_string()),
+            timeout: None,
+        }
+    }
+    /// Task 3 native names: a JSON PATCH request.
+    pub fn patch_json(url: impl Into<String>, body: Vec<u8>) -> Self {
+        Self {
+            method: HttpMethod::Patch,
             url: url.into(),
             body: Some(body),
             content_type: Some("application/json".to_string()),
@@ -876,16 +889,27 @@ impl OpencodeServeManager {
         let base = self.require_base().await?;
         let url = format!("{base}{path}");
         let timeout = timeout_override.unwrap_or_else(|| self.config().request_timeout);
+        let method_str = format!("{method:?}").to_uppercase();
         let mut req = match (method, &body) {
             (HttpMethod::Get, _) => ServeHttpRequest::get(&url),
             (HttpMethod::Post, Some(value)) => {
                 ServeHttpRequest::post_json(&url, serde_json::to_vec(value).unwrap_or_default())
             }
             (HttpMethod::Post, None) => ServeHttpRequest::post(&url),
+            (HttpMethod::Patch, Some(value)) => {
+                ServeHttpRequest::patch_json(&url, serde_json::to_vec(value).unwrap_or_default())
+            }
+            (HttpMethod::Patch, None) => {
+                return Err(ServeError::Http {
+                    method: method_str,
+                    url,
+                    status: 0,
+                    body: "PATCH requires a JSON body".to_string(),
+                })
+            }
         };
         req = req.with_timeout(timeout);
 
-        let method_str = format!("{method:?}").to_uppercase();
         let resp = match {
             if let Some(witness) = &dispatch_witness {
                 witness.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -971,6 +995,85 @@ impl OpencodeServeManager {
     pub async fn get_session(&self, id: &str, route: &Route) -> Result<Value, ServeError> {
         let path = with_route(&format!("/session/{}", encode_path_segment(id)), route);
         self.json_request(HttpMethod::Get, &path, None, None).await
+    }
+
+    /// Unified agent names (Task 3): `PATCH /session/:id` — the supported
+    /// `update_session_title` metadata route (opencode's documented server
+    /// API; SQLite stays read-only for native discovery — never a database
+    /// write as an alternative). `route` is the session's own
+    /// directory/endpoint (`?directory=<cwd>`); the caller verifies the
+    /// effective-database context FIRST via
+    /// [`Self::check_database_context`]. Transport failure classification
+    /// (Undelivered vs ambiguous) is preserved by `json_request`.
+    pub async fn update_session_title(
+        &self,
+        id: &str,
+        title: &str,
+        route: &Route,
+    ) -> Result<Value, ServeError> {
+        let path = with_route(&format!("/session/{}", encode_path_segment(id)), route);
+        self.json_request(
+            HttpMethod::Patch,
+            &path,
+            Some(json!({ "title": title })),
+            None,
+        )
+        .await
+    }
+
+    /// The OPENCODE_DB override evaluation (Task 3 native names): absolute
+    /// overrides address that file; relative overrides resolve against
+    /// `cwd` (the serve inherits the spawning process's working directory);
+    /// `:memory:` is an in-memory route that can never address an indexed
+    /// file database; absent overrides fall back to the ambient data home's
+    /// `opencode.db` (the same resolution the session index uses). Never a
+    /// store selector derived from the session's directory.
+    pub fn effective_database(&self) -> EffectiveOpencodeDatabase {
+        let override_value = self
+            .config()
+            .env
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "OPENCODE_DB")
+            .map(|(_, value)| value.clone())
+            .or_else(|| std::env::var("OPENCODE_DB").ok().filter(|v| !v.is_empty()));
+        resolve_opencode_database(
+            override_value.as_deref(),
+            default_opencode_database(),
+            &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        )
+    }
+
+    /// Task 3 native names: before dispatching a metadata write, verify the
+    /// selected serve's effective database MATCHES the database the session
+    /// was indexed at — a mismatched serve would write a title into the
+    /// wrong store, and an in-memory route can never address it. Fails
+    /// diagnostically (the caller surfaces it as an unsupported native
+    /// route); never silently uses the directory as a store selector.
+    pub fn check_database_context(
+        &self,
+        indexed_database: &std::path::Path,
+    ) -> Result<(), ServeError> {
+        match self.effective_database() {
+            EffectiveOpencodeDatabase::Memory => Err(ServeError::Transport(
+                "opencode serve runs an in-memory database (:memory:); it can never address an indexed file database"
+                    .to_string(),
+            )),
+            EffectiveOpencodeDatabase::File(effective) => {
+                let canon = |path: &std::path::Path| {
+                    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+                };
+                if canon(&effective) == canon(indexed_database) {
+                    Ok(())
+                } else {
+                    Err(ServeError::Transport(format!(
+                        "opencode serve database mismatch: the serve is pinned to {} but the session is indexed at {}",
+                        effective.display(),
+                        indexed_database.display()
+                    )))
+                }
+            }
+        }
     }
 
     /// `listMessages(id, {}, route)` (`serve-manager.ts:367-393`) — the current session
@@ -1425,6 +1528,75 @@ pub fn is_fatal_serve_stderr(stderr: &str) -> bool {
     lower.contains("serveerror")
         || lower.contains("failed to start server")
         || lower.contains("eaddrinuse")
+}
+
+// ── unified agent names (Task 3): the OPENCODE_DB context evaluation ─────────────
+
+/// The effective database an `opencode serve` process uses, given its
+/// `OPENCODE_DB` override. Never a store selector derived from a session's
+/// directory.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EffectiveOpencodeDatabase {
+    /// The resolved file database (an absolute override, a cwd-resolved
+    /// relative override, or the ambient data-home default).
+    File(std::path::PathBuf),
+    /// `:memory:` — an in-memory route that can never address an indexed
+    /// file database.
+    Memory,
+}
+
+/// Evaluate the `OPENCODE_DB` override: absolute values address that file;
+/// relative values resolve against the serve's working directory;
+/// `:memory:` is in-memory; absent falls back to the ambient data home's
+/// `opencode.db` (the same root the session index's default data home
+/// resolves — mirrored here because this crate shares no dependency with
+/// the index crate).
+pub fn resolve_opencode_database(
+    override_value: Option<&str>,
+    default_database: std::path::PathBuf,
+    cwd: &std::path::Path,
+) -> EffectiveOpencodeDatabase {
+    let Some(value) = override_value.map(str::trim).filter(|v| !v.is_empty()) else {
+        return EffectiveOpencodeDatabase::File(default_database);
+    };
+    if value == ":memory:" {
+        return EffectiveOpencodeDatabase::Memory;
+    }
+    let path = std::path::Path::new(value);
+    if path.is_absolute() {
+        return EffectiveOpencodeDatabase::File(path.to_path_buf());
+    }
+    EffectiveOpencodeDatabase::File(cwd.join(path))
+}
+
+/// The ambient opencode data home's `opencode.db` (XDG_DATA_HOME / the
+/// Windows local-app-data path / `~/.local/share/opencode`), mirroring the
+/// session index's default resolution.
+pub fn default_opencode_database() -> std::path::PathBuf {
+    fn data_home() -> std::path::PathBuf {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+            if !xdg.is_empty() {
+                return std::path::PathBuf::from(xdg).join("opencode");
+            }
+        }
+        #[cfg(windows)]
+        {
+            if let Ok(local) = std::env::var("LOCALAPPDATA") {
+                if !local.is_empty() {
+                    return std::path::PathBuf::from(local).join("opencode");
+                }
+            }
+        }
+        let home = std::env::var("HOME")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| ".".to_string());
+        std::path::PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("opencode")
+    }
+    data_home().join("opencode.db")
 }
 
 /// `withRoute(requestPath, {cwd})` (`serve-manager.ts:72-78`): append `directory=<cwd>`

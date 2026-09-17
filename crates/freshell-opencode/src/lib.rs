@@ -42,16 +42,18 @@ pub mod serve;
 pub mod transport;
 
 pub use events::{
-    is_idle_edge, is_idle_status_event, parse_serve_event, serve_event_to_sdk, ChangedReason,
-    ParsedServeEvent, SdkProviderEvent, SnapshotStatus, SseDecoder,
+    is_idle_edge, is_idle_status_event, parse_serve_event, serve_event_to_sdk,
+    session_title_observation, ChangedReason, ParsedServeEvent, SdkProviderEvent, SnapshotStatus,
+    SseDecoder,
 };
 pub use model::{
     normalize_opencode_effort, normalize_opencode_model, split_opencode_model, OpencodeModel,
     FRESHOPENCODE_DEFAULT_EFFORT,
 };
 pub use serve::{
-    display_error_chain, is_healthy_response, CreatedSession, Endpoint, EventSource,
-    EventStreamHandle, ForkedSession, OpencodeServeManager, PortAllocator, ProcessSpawner, Route,
-    ServeConfig, ServeDeps, ServeError, ServeHttp, ServeHttpError, ServeHttpRequest,
-    ServeHttpResponse, ServeProcess, SessionSignal, SpawnRequest, OPENCODE_SIDECAR_OWNERSHIP_ENV,
+    default_opencode_database, display_error_chain, is_healthy_response, resolve_opencode_database,
+    CreatedSession, EffectiveOpencodeDatabase, Endpoint, EventSource, EventStreamHandle,
+    ForkedSession, OpencodeServeManager, PortAllocator, ProcessSpawner, Route, ServeConfig,
+    ServeDeps, ServeError, ServeHttp, ServeHttpError, ServeHttpRequest, ServeHttpResponse,
+    ServeProcess, SessionSignal, SpawnRequest, OPENCODE_SIDECAR_OWNERSHIP_ENV,
 };

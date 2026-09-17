@@ -112,6 +112,11 @@ pub enum CodexNotification {
     ThreadClosed { thread_id: String },
     /// `thread/status/changed` (`protocol.ts:366-374`).
     ThreadStatusChanged { thread_id: String, status: Value },
+    /// `thread/name/updated` (Task 3 native names): the provider renamed a
+    /// thread — `{ threadId, name }`. Every native name notification is an
+    /// AUTOMATIC observation to the consumer: direction, timing,
+    /// authentication and prior emptiness cannot prove a human asked.
+    ThreadNameUpdated { thread_id: String, name: String },
     /// `fs/changed` (`protocol.ts:382-388`).
     FsChanged {
         watch_id: String,
@@ -311,6 +316,15 @@ pub fn classify_notification(method: &str, params: Option<&Value>) -> CodexNotif
                 }
             }
         }
+        "thread/name/updated" => {
+            if let Some(p) = params_obj {
+                if let (Some(thread_id), Some(name)) =
+                    (required_string(p, "threadId"), required_string(p, "name"))
+                {
+                    return CodexNotification::ThreadNameUpdated { thread_id, name };
+                }
+            }
+        }
         "fs/changed" => {
             if let Some(p) = params_obj {
                 if let Some(watch_id) = required_string(p, "watchId") {
@@ -364,6 +378,18 @@ pub fn turn_status(params: &Map<String, Value>) -> Option<String> {
     params
         .get("status")
         .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Task 3 native names: the `thread.name` a `thread/read`/`thread/resume`/
+/// `thread/fork`-style result carries at `result.thread.name`, when present.
+/// Reads/observes the provider's own name only — never an input.
+pub fn thread_name_from_result(result: &Value) -> Option<String> {
+    result
+        .get("thread")?
+        .get("name")?
+        .as_str()
+        .filter(|name| !name.is_empty())
         .map(str::to_string)
 }
 

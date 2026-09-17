@@ -140,10 +140,50 @@ pub struct SessionNameRedirect {
     pub revision: NameRevision,
 }
 
+/// Native synchronization status for a canonical name's provider writeback
+/// (unified-agent-names plan, Task 3): `pending` (a bounded native series is
+/// armed/underway), `synced` (a current-revision readback confirmed the
+/// provider holds the exact desired name/location), `unsynced` (the finite
+/// allowance is exhausted or an outcome is ambiguous/divergent), and
+/// `unsupported` (a diagnosed capability failure — unsupported/archived/
+/// ephemeral/missing). Display/status data only: never another name
+/// authority, and never a public native path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NativeSyncStatus {
+    Pending,
+    Synced,
+    Unsynced,
+    Unsupported,
+}
+
+/// The native writeback status projected alongside a record in
+/// `SessionNameUpdate`/`SessionNameUpdated`. `desired_revision` is the
+/// canonical record revision the native series is projecting; the provider is
+/// `synced` only with that exact revision. `location_revision` is the routing
+/// evidence revision the series attempted (0 when no verified location
+/// exists). `observed_current` records that a readback observed the desired
+/// name while an ambiguous outcome kept the status `unsynced`. `reason` is a
+/// stable machine-facing diagnostic (never a prompt or native payload).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeSyncProjection {
+    pub status: NativeSyncStatus,
+    pub desired_revision: NameRevision,
+    pub location_revision: NameRevision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_current: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// The common response/broadcast shape for every naming operation. `changed`
 /// is true only when the accepted record (text/source/revision) changed vs
 /// the store's previously established state — losing automatic offers and
 /// pure reads answer `changed: false` with the actual accepted winner.
+/// `native_sync` (Task 3) is the additive writeback status projection;
+/// status-only updates (an unchanged record whose nativeSync moved) publish
+/// with `changed: false` and fold on the client by `documentGeneration`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionNameUpdate {
@@ -151,6 +191,8 @@ pub struct SessionNameUpdate {
     pub document_generation: NameRevision,
     pub redirects: Vec<SessionNameRedirect>,
     pub changed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_sync: Option<NativeSyncProjection>,
 }
 
 /// Rename request body (HTTP `PATCH /api/session-names` and the MCP-bridged
@@ -169,6 +211,7 @@ pub struct RenameSessionNameRequest {
 /// `session.name.updated` server→client broadcast payload. Published only
 /// after a successful store commit/adoption, in local generation order; the
 /// client folds by record and redirect revision, never arrival time.
+/// `native_sync` mirrors the Task 3 status projection on the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionNameUpdated {
@@ -176,4 +219,6 @@ pub struct SessionNameUpdated {
     pub document_generation: NameRevision,
     pub redirects: Vec<SessionNameRedirect>,
     pub changed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub native_sync: Option<NativeSyncProjection>,
 }

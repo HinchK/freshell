@@ -52,6 +52,7 @@ mod screenshots;
 mod serve_client;
 mod session_directory;
 mod session_metadata;
+mod session_name_native;
 mod session_name_routes;
 mod session_names;
 mod sessions;
@@ -600,6 +601,51 @@ async fn main() -> ExitCode {
                 sessions_revision,
             ));
         }
+
+        // Unified agent names (Task 3): the shared serial NATIVE worker — the
+        // finite writeback cycle machine under the `.session-names-worker.lock`
+        // background guard. The dispatch routes each operation to its
+        // provider adapter by the retained location: the Codex app-server
+        // client on a root-matched LIVE connection (never the cold snapshot,
+        // a resume, an unarchive, or a lease), the OpenCode serve PATCH
+        // (gated by the effective-database context), and the Claude
+        // `session-names.mjs` helper (Rust owns its timeout and kill/wait).
+        // An adapter that cannot be wired (no shared serve yet, a missing
+        // helper) degrades to `None` — that provider's native work pauses as
+        // unsupported without affecting the others. Task 4 adds generation to
+        // this same owned loop and selector.
+        {
+            let names = names.clone();
+            let codex_state = fresh_codex_state.clone();
+            let agent_state = fresh_agent_state.clone();
+            let codex_adapter = session_name_native::CodexNativeNameAdapter::new(Arc::new(
+                move |codex_home: String| {
+                    let codex_state = codex_state.clone();
+                    Box::pin(
+                        async move { codex_state.management_client_for_root(&codex_home).await },
+                    )
+                        as std::pin::Pin<
+                            Box<
+                                dyn std::future::Future<
+                                        Output = Option<
+                                            Arc<freshell_codex::app_server::CodexAppServerClient>,
+                                        >,
+                                    > + Send,
+                            >,
+                        >
+                },
+            ));
+            let opencode_adapter = agent_state
+                .opencode_manager()
+                .await
+                .map(session_name_native::OpencodeNativeNameAdapter::new);
+            let dispatch = Arc::new(session_name_native::NativeNameDispatch::new(
+                Some(session_name_native::ClaudeNativeNameAdapter::from_env()),
+                Some(codex_adapter),
+                opencode_adapter,
+            ));
+            session_name_native::SessionNameWorker::start(names, dispatch);
+        }
     }
     // TERM-11 fix: honor `settings.safety.autoKillIdleMinutes` at boot (the
     // Rust registry previously never read it at all, so a config that raised
@@ -974,10 +1020,47 @@ async fn main() -> ExitCode {
     }
     // Task 10: the opencode SSE lane's production IO seams (reqwest impls;
     // fakes in tests). Unset would leave OpencodeAttach retire-only.
+    // Unified agent names (Task 3): the lane's native-title observer folds
+    // `session.updated` titles through the naming authority — the target is
+    // the durable opencode session's record, else the terminal's own
+    // (pending) naming ref. A detached fold never disturbs the activity
+    // lane; no wired store (degraded boot) drops the observation.
+    let opencode_native_title_observer: freshell_ws::opencode_lane::NativeTitleObserver = {
+        let identity = terminal_identity.clone();
+        let names = session_names.clone();
+        std::sync::Arc::new(move |terminal_id: &str, session_id: &str, title: &str| {
+            let Some(names) = names.clone() else {
+                return;
+            };
+            let identity = identity.clone();
+            let terminal_id = terminal_id.to_string();
+            let session_id = session_id.to_string();
+            let title = title.to_string();
+            tokio::spawn(async move {
+                let sink: Option<std::sync::Arc<dyn freshell_freshagent::naming::SessionNaming>> =
+                    Some(names);
+                let target = identity
+                    .named_session_ref_of("opencode", &session_id)
+                    .or_else(|| identity.name_ref_for(&terminal_id));
+                let Some(target) = target else {
+                    return;
+                };
+                let _ = freshell_freshagent::naming::observe_native_live(
+                    &sink,
+                    target,
+                    &title,
+                    freshell_freshagent::naming::NativeNameOrigin::Snapshot,
+                    None,
+                )
+                .await;
+            });
+        })
+    };
     activity_hub.set_opencode_lane_deps(std::sync::Arc::new(
         freshell_ws::opencode_lane::OpencodeLaneDeps {
             http: std::sync::Arc::new(freshell_ws::opencode_lane::ReqwestLaneHttp::new()),
             events: std::sync::Arc::new(freshell_ws::opencode_lane::ReqwestLaneStream::new()),
+            native_title_observer: Some(opencode_native_title_observer),
         },
     ));
     // #606: the claude deadman's session-JSONL truth source (verify-then-
@@ -1962,11 +2045,19 @@ async fn main() -> ExitCode {
                     let data_home = freshell_sessions::parse::default_opencode_data_home();
                     freshell_sessions::parse::opencode_session_row_by_id(&data_home, session_id)
                         .map(|row| {
-                            row.map(|r| freshell_sessions::resume_resolve::OpencodeByIdHit {
-                                session_id: r.session_id,
-                                cwd: r.cwd,
-                                title: r.title,
-                                last_activity_at: r.last_activity_at,
+                            row.map(|r| {
+                                // Unified agent names (Task 3): retain the
+                                // exact-ID DATABASE the row was found in —
+                                // carried from THIS locator's data home, not
+                                // recomputed from the row's directory.
+                                let database = data_home.join("opencode.db");
+                                freshell_sessions::resume_resolve::OpencodeByIdHit {
+                                    session_id: r.session_id,
+                                    cwd: r.cwd,
+                                    title: r.title,
+                                    last_activity_at: r.last_activity_at,
+                                    database: Some(database.display().to_string()),
+                                }
                             })
                         })
                         .map_err(|e| {

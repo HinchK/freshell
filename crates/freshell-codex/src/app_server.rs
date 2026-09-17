@@ -537,6 +537,28 @@ impl CodexAppServerClient {
         .await
     }
 
+    /// Unified agent names (Task 3): `thread/name/set` — set the native name
+    /// of a thread this connection can address (loaded threads and persisted
+    /// rollouts alike — the official API supports name/set for both, so an
+    /// existing management connection can name a CLOSED session without
+    /// resuming it or claiming its execution lease). The CALLER owns the
+    /// root-match policy: only a connection whose initialized `codexHome`
+    /// ([`Self::codex_home`]) matches the retained location may dispatch
+    /// management writes. Errors preserve the caller's pending/durable name —
+    /// this RPC never rolls a canonical name back.
+    pub async fn set_thread_name(
+        &self,
+        thread_id: &str,
+        name: &str,
+    ) -> Result<(), CodexAppServerError> {
+        self.request(
+            "thread/name/set",
+            json!({ "threadId": thread_id, "name": name }),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// `thread/loaded/list` — the ids of threads this app-server currently
     /// has loaded in memory (result shape `{ data: string[], nextCursor? }`,
     /// contract-foundation plan §thread/loaded/list; the committed fixture

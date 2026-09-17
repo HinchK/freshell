@@ -119,6 +119,12 @@ fn minimal_entry(terminal_id: &str) -> TerminalIdentity {
 pub struct TerminalIdentityRegistry {
     inner: Arc<RwLock<HashMap<String, TerminalIdentity>>>,
     naming: NamingSink,
+    /// T2-M6 (Task 3): per-terminal codex homes captured from a PROXIED
+    /// upstream `initialize` response — the initialized root that
+    /// terminal's rollouts live under, preferred over ambient env by the
+    /// naming bind lane's rollout walk and the native-name adapter's
+    /// root-match policy.
+    codex_homes: Arc<RwLock<HashMap<String, String>>>,
 }
 
 /// The durable session name ref for a scoped provider id (the named
@@ -156,6 +162,31 @@ impl TerminalIdentityRegistry {
     /// Whether a naming authority is wired.
     pub fn naming_wired(&self) -> bool {
         self.naming.is_wired()
+    }
+
+    /// T2-M6 (Task 3): capture the `codexHome` a PROXIED upstream
+    /// `initialize` reported for this terminal's connection — the
+    /// initialized root its rollouts live under, never re-derived from
+    /// ambient env. Recorded before any candidate can adopt, so the
+    /// adoption/bind lane correlates the rollout walk against it.
+    pub fn record_codex_home(&self, terminal_id: &str, codex_home: &str) {
+        if codex_home.is_empty() {
+            return;
+        }
+        self.codex_homes
+            .write()
+            .expect("identity registry lock poisoned")
+            .insert(terminal_id.to_string(), codex_home.to_string());
+    }
+
+    /// T2-M6 (Task 3): the captured proxied initialize root for this
+    /// terminal, when one was observed.
+    pub fn codex_home_of(&self, terminal_id: &str) -> Option<String> {
+        self.codex_homes
+            .read()
+            .expect("identity registry lock poisoned")
+            .get(terminal_id)
+            .cloned()
     }
 
     /// Unified agent names: write a terminal's naming binding directly
@@ -365,14 +396,25 @@ impl TerminalIdentityRegistry {
     /// (`terminal-metadata-service.ts:207-208`). `false` for an unknown id (no-op,
     /// matching the original's `if (!entry) return false`).
     pub fn retire(&self, terminal_id: &str) -> bool {
-        let mut map = self.inner.write().expect("identity registry lock poisoned");
-        match map.get_mut(terminal_id) {
-            Some(entry) => {
-                entry.retired = true;
-                true
+        let retired = {
+            let mut map = self.inner.write().expect("identity registry lock poisoned");
+            match map.get_mut(terminal_id) {
+                Some(entry) => {
+                    entry.retired = true;
+                    true
+                }
+                None => false,
             }
-            None => false,
+        };
+        if retired {
+            // T2-M6 (Task 3): a retired pane's captured proxied codex home is
+            // no longer addressable — drop it with the row.
+            self.codex_homes
+                .write()
+                .expect("identity registry lock poisoned")
+                .remove(terminal_id);
         }
+        retired
     }
 
     /// `TerminalMetadataService.get` (`terminal-metadata-service.ts:134-136`):
@@ -885,6 +927,7 @@ mod tests {
                         },
                         document_generation: 1,
                         changed: false,
+                        native_sync: None,
                     },
                 )
                 .collect();
@@ -929,6 +972,7 @@ mod tests {
                     record,
                     document_generation: 1,
                     changed: true,
+                    native_sync: None,
                 })
             })
         }

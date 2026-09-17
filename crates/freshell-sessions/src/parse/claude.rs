@@ -286,6 +286,10 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
     let mut title: Option<String> = None;
     let mut custom_title: Option<String> = None;
     let mut agent_name: Option<String> = None;
+    // Unified agent names (Task 3): Claude's own AI-generated title record
+    // (`type:'ai-title'`) — previously IGNORED; now retained as its own
+    // automatic native observation (never part of the display chain).
+    let mut ai_title: Option<String> = None;
     let mut generated_summary_title: Option<String> = None;
     let mut summary: Option<String> = None;
     let mut first_user_message: Option<String> = None;
@@ -392,6 +396,16 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
         if obj.get("type").and_then(Value::as_str) == Some("agent-name") {
             if let Some(an) = obj.get("agentName").and_then(as_trimmed_nonempty) {
                 agent_name = Some(slice_chars(an, 200));
+            }
+        }
+        if obj.get("type").and_then(Value::as_str) == Some("ai-title") {
+            // The record's title lives under whichever key the writer used
+            // (`title`, `aiTitle`, or `customTitle`); parsed defensively.
+            let candidate = ["title", "aiTitle", "customTitle"]
+                .into_iter()
+                .find_map(|key| obj.get(key).and_then(as_trimmed_nonempty));
+            if let Some(ai) = candidate {
+                ai_title = Some(slice_chars(ai, 200));
             }
         }
         // Extract generated summary title from `type:'summary'` records (additive work item 1).
@@ -563,6 +577,15 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
     // so all three Node inputs participate. `title_provider_generated` (bool,
     // read by the resolve endpoint's suppression check) and `title_source`
     // (string rung, read by the auto-title ladder) express the SAME predicate.
+    //
+    // Unified agent names (Task 3): the four native observations are retained
+    // SEPARATELY (custom/ai/agent/summary) — every one of them is an
+    // automatic observation downstream; the display chain is unchanged.
+    let display_title = custom_title
+        .clone()
+        .or_else(|| agent_name.clone())
+        .or_else(|| generated_summary_title.clone())
+        .or(title);
     let title_provider_generated =
         custom_title.is_some() || agent_name.is_some() || generated_summary_title.is_some();
     let title_source = if title_provider_generated {
@@ -576,11 +599,12 @@ pub fn parse_session_content(content: &str, options: &ParseSessionOptions) -> Pa
         cwd,
         created_at,
         last_activity_at,
-        title: custom_title
-            .or(agent_name)
-            .or(generated_summary_title)
-            .or(title),
+        title: display_title,
         title_provider_generated,
+        custom_title,
+        ai_title,
+        agent_name_title: agent_name,
+        summary_title: generated_summary_title,
         summary,
         first_user_message,
         title_source,

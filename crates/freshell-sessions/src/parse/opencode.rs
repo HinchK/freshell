@@ -345,6 +345,29 @@ fn first_user_message_for_session(conn: &Connection, session_id: &str) -> Option
         .and_then(crate::text::normalize_first_user_message)
 }
 
+/// Unified agent names (Task 3): the TARGETED first-user-message lookup for
+/// an already-named opencode session — OpenCode names parent sessions itself
+/// after the first exchange, so the bounded listing only carries first
+/// messages for placeholder-titled rows. This reads the single named
+/// session's first real user message on demand (read-only, the same
+/// SQL/normalization the listing path uses), never a full-history scan.
+pub fn opencode_first_user_message_by_id(
+    data_home: &Path,
+    session_id: &str,
+) -> Result<Option<String>, OpencodeByIdError> {
+    let db_path = data_home.join("opencode.db");
+    let conn = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(by_id_err)?;
+    conn.busy_timeout(std::time::Duration::from_millis(
+        OPENCODE_BYID_BUSY_TIMEOUT_MS,
+    ))
+    .map_err(by_id_err)?;
+    Ok(first_user_message_for_session(&conn, session_id))
+}
+
 /// Assistant messages of a session, newest-first — the usage walk's cursor.
 /// EXPLAIN (live, read-only): `SEARCH m USING INDEX
 /// message_session_time_created_id_idx (session_id=?)` — pure index walk.
