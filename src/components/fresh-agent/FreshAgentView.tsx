@@ -942,6 +942,33 @@ export function FreshAgentView({
   ])
   const restoreTimeoutRef = useRef<number | null>(null)
   const createSentRef = useRef(false)
+  // b8ke ext r35 F2: the PER-REQUEST create fence capture — the observed
+  // (epoch, generation) pair the create request FIRST observed, REUSED by
+  // every automatic re-send of the SAME createRequestId (the retryable
+  // SESSION_RESERVED redrive's effect re-arm, the reconnect resend, the
+  // hidden rebind-queue execution). An automatic retry must never
+  // substitute a current fence for the original observation (pre-r35 the
+  // redrive re-armed the create effect, which re-captured the LATEST
+  // record — so a queued create whose original pair was superseded by
+  // another device's start/stop cycle was presented as current and could
+  // resume the Fresh Agent runtime without a new user lifecycle decision,
+  // defeating the server-side stale-generation safety net). The ORIGINAL
+  // pair flows either way honestly: still current → the retry proceeds;
+  // stale → the r28 vacant-generation-advanced suppression holds it
+  // (the earlier observation IS preserved now) or the server refuses it
+  // typed. A NEW createRequestId (a genuinely new create decision)
+  // captures fresh.
+  const createFenceRef = useRef<{
+    createRequestId: string
+    fence: ObservedOwnerFence | undefined
+  } | null>(null)
+  // b8ke ext r35 F2: the PER-SESSION attach fence capture (the attach
+  // producer's twin of the create capture above — keyed by the session
+  // identity the attach names, reused by every automatic re-attach).
+  const attachFenceRef = useRef<{
+    sessionKey: string
+    fence: ObservedOwnerFence | undefined
+  } | null>(null)
   // Pre-verdict create wait (fresh-agent leg of Task 8's pattern): a pane
   // named in an outgoing pane.reconcile request defers its mount-time create
   // until its verdict folds -- bounded by RECONCILE_VERDICT_WAIT_MS, then the
@@ -1106,8 +1133,24 @@ export function FreshAgentView({
     // observe the same store snapshot — nothing dispatches in between.
     const state = appStore.getState()
     if (isLifecycleStartSuperseded(state, 'fresh-agent', content, undefined)) return false
+    // b8ke ext r35 F2 (the same class, the attach producer): the fence is
+    // captured PER SESSION IDENTITY — the FIRST attach send for this
+    // session observes, and every AUTOMATIC re-attach (the SESSION_
+    // RESERVED redrive's attach-loser arm, the reconnect re-attach, the
+    // pane-refresh reaction, the lost-session retry) carries the ORIGINAL
+    // pair, never a re-read of the record at execution time. The
+    // server-side stale fence then refuses a superseded attach typed —
+    // the automatic path can never present the old attach as current.
+    const sessionKey = content.sessionRef?.sessionId ?? content.sessionId
+    let fence: ObservedOwnerFence | undefined
+    if (attachFenceRef.current?.sessionKey === sessionKey) {
+      fence = attachFenceRef.current.fence
+    } else {
+      fence = selectPaneOwnerFence(state, content)
+      attachFenceRef.current = { sessionKey, fence }
+    }
     const cwd = getFreshOpenCodeRouteCwd(content, { sessionCwd: freshOpenCodeRouteCwdRef.current })
-    sendFreshAgentMessage(buildFreshAgentAttachMessage(content, cwd, selectPaneOwnerFence(state, content)))
+    sendFreshAgentMessage(buildFreshAgentAttachMessage(content, cwd, fence))
     return true
   }, [appStore, sendFreshAgentMessage])
 
@@ -1773,12 +1816,26 @@ export function FreshAgentView({
     }
     if (createSentRef.current) return
     createSentRef.current = true
-    // kata b8ke: the observed fence — the (epoch, generation) pair from the
-    // runtime-owner record at effect time (the decision moment). Carried on
-    // the create so the server stale-rejects a delayed create naming
-    // superseded ownership; undefined means no owner is known
-    // (legacy-unfenced).
-    const observedFence = selectPaneOwnerFence(appStore.getState(), paneContent)
+    // kata b8ke: the observed fence — the (epoch, generation) pair from
+    // the runtime-owner record at the CREATE REQUEST's first send (the
+    // decision moment). Carried on the create so the server stale-rejects
+    // a delayed create naming superseded ownership; undefined means no
+    // owner is known (legacy-unfenced). b8ke ext r35 F2: the capture is
+    // PER-REQUEST (keyed by createRequestId) — the SESSION_RESERVED
+    // redrive's effect re-arm re-runs this effect but MUST reuse the
+    // ORIGINAL pair, never re-read the record (the r28
+    // vacant-generation-advanced suppression then protects the retry,
+    // because the earlier observation is preserved through it).
+    let observedFence: ObservedOwnerFence | undefined
+    if (createFenceRef.current?.createRequestId === paneContent.createRequestId) {
+      observedFence = createFenceRef.current.fence
+    } else {
+      observedFence = selectPaneOwnerFence(appStore.getState(), paneContent)
+      createFenceRef.current = {
+        createRequestId: paneContent.createRequestId,
+        fence: observedFence,
+      }
+    }
     const runCreate = (release?: () => void) => {
       if (!isMountedRef.current) {
         // Pane closed while this job sat in the queue: creating the session
@@ -1860,8 +1917,23 @@ export function FreshAgentView({
           return
         }
         // kata b8ke: reconnect resends are stale-callback lifecycle starts —
-        // capture the fence at the resend decision, suppress on divergence.
-        const observedFence = selectPaneOwnerFence(appStore.getState(), latest)
+        // they carry the create request's ORIGINAL captured pair, suppress
+        // on divergence. b8ke ext r35 F2: the pair comes from the
+        // PER-REQUEST capture (keyed by createRequestId), captured at the
+        // request's first send — the reconnect execution time never
+        // re-reads the record (a silent refresh here would present a
+        // long-queued create as current over a newer lifecycle).
+        let reconnectFence: ObservedOwnerFence | undefined
+        if (createFenceRef.current?.createRequestId === latest.createRequestId) {
+          reconnectFence = createFenceRef.current.fence
+        } else {
+          reconnectFence = selectPaneOwnerFence(appStore.getState(), latest)
+          createFenceRef.current = {
+            createRequestId: latest.createRequestId,
+            fence: reconnectFence,
+          }
+        }
+        const observedFence = reconnectFence
         if (isLifecycleStartSuperseded(appStore.getState(), 'fresh-agent', latest, observedFence)) {
           release?.()
           return

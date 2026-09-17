@@ -9721,6 +9721,104 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
   // queued BEFORE the divergence is HELD (never flushed) until the pane
   // is no longer diverged. Pre-r32 all three affordances stayed live on
   // the diverged pane.
+  // b8ke ext r35 F2: an AUTOMATIC re-drive of the same create request
+  // carries the request's ORIGINAL observed pair — never a refreshed one.
+  // Pre-r35 the retryable SESSION_RESERVED answer re-armed the create
+  // effect, which re-captured the LATEST record: a queued create whose
+  // original (1,5) observation was superseded by another device's
+  // start/stop cycle (the record left Vacant at gen 9) was resent with
+  // the refreshed (1,9) pair — presented as current, the runtime could
+  // resume without a new user lifecycle decision, defeating the
+  // server-side stale-generation safety net. The honest automatic
+  // contract: the ORIGINAL pair flows to the server, which refuses it
+  // typed (option (a) of the class contract — the safety net working).
+  it('the SESSION_RESERVED create redrive carries the ORIGINAL observed pair — never a refreshed one', async () => {
+    const listeners: Array<(message: any) => void> = []
+    wsMock.onMessage.mockImplementation((listener) => {
+      listeners.push(listener)
+      return () => {}
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: divergencePaneContent({
+        status: 'creating',
+        // sessionRef WITHOUT sessionId — the durable-restored create shape
+        // (a pane WITH sessionId attaches instead of creating).
+        sessionId: undefined,
+        sessionRef: { provider: 'codex', sessionId: 'ses-r35-redrive' },
+        createRequestId: 'req-r35-redrive',
+      }),
+    }))
+    // The ORIGINAL ownership observation: a fresh-agent owner at (1, 5).
+    act(() => store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'ses-r35-redrive',
+      epoch: 1,
+      generation: 5,
+      ownerKind: 'fresh-agent',
+      transition: 'handoff-committed',
+      operationId: 'op-r35-orig',
+    })))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // The mount create carried the ORIGINAL pair (1, 5).
+    await waitFor(() => {
+      const creates = sentFreshAgentMessages('freshAgent.create')
+      expect(creates).toHaveLength(1)
+      expect(creates[0]).toMatchObject({
+        requestId: 'req-r35-redrive',
+        observedEpoch: 1,
+        observedGeneration: 5,
+      })
+    })
+
+    // The retryable SESSION_RESERVED answer re-drives the SAME create.
+    act(() => {
+      for (const listener of listeners) {
+        listener({
+          type: 'freshAgent.create.failed',
+          requestId: 'req-r35-redrive',
+          code: 'SESSION_RESERVED',
+          retryable: true,
+        })
+      }
+    })
+    // Meanwhile another device's start/stop cycle leaves the record
+    // VACANT at generation 9 — the original observation is now stale.
+    act(() => store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'ses-r35-redrive',
+      epoch: 1,
+      generation: 9,
+      ownerKind: 'vacant',
+      transition: 'released',
+      operationId: 'op-r35-cycle',
+    })))
+
+    // After the 1s floor the redrive fires: the resent create carries the
+    // ORIGINAL (1, 5) pair — the server's stale-generation fence refuses
+    // it typed; NEVER the refreshed (1, 9) pair presenting the old
+    // request as current (pre-r35 the resent frame carried gen 9).
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(2)
+    }, { timeout: 5_000 })
+    const redriven = sentFreshAgentMessages('freshAgent.create')[1]
+    expect(redriven).toMatchObject({
+      requestId: 'req-r35-redrive',
+      observedEpoch: 1,
+      observedGeneration: 5,
+    })
+    expect(redriven.observedGeneration).not.toBe(9)
+  })
+
   it('a diverged pane is a pure observer: composer disabled, queued text held, no interrupt affordance', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
