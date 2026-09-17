@@ -11,7 +11,7 @@ import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
-import { initLayout, requestPaneRefresh, setActivePane, setPaneHandoffError, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
+import { initLayout, requestPaneRefresh, resetFreshAgentPaneForReconcileCreate, setActivePane, setPaneHandoffError, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
 import { useAppSelector } from '@/store/hooks'
 import { updateTab } from '@/store/tabsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
@@ -9817,6 +9817,135 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
       observedGeneration: 5,
     })
     expect(redriven.observedGeneration).not.toBe(9)
+  })
+
+  // b8ke ext r37 F1: a NEW authoritative recovery round captures the
+  // CURRENT fence. The create-fence cache is keyed by
+  // (createRequestId, reconcileEpoch) — the terminal cache's key shape —
+  // because a pane-reconcile respawn/fresh verdict PRESERVES the
+  // createRequestId and bumps the epoch as its ONLY re-fire signal: that
+  // is a NEW recovery decision (server restart, crash recovery, another
+  // device's transition), not an automatic retry, and it may observe
+  // fresh. Pre-r37 the epoch-bumped re-arm reused the OLD N fence: the
+  // server refused SESSION_RESERVED, the client retried the stale pair,
+  // the bounded re-reconcile drained the respawn cap, and a recoverable
+  // durable session was falsely classified dead. Within-round automatic
+  // retries keep the round-35 contract: the ROUND's original pair.
+  it('a new authoritative recovery round captures the CURRENT fence; within-round retries keep the round pair', async () => {
+    const listeners: Array<(message: any) => void> = []
+    wsMock.onMessage.mockImplementation((listener) => {
+      listeners.push(listener)
+      return () => {}
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: divergencePaneContent({
+        status: 'creating',
+        sessionId: undefined,
+        sessionRef: { provider: 'codex', sessionId: 'ses-r37-recovery' },
+        createRequestId: 'req-r37-recovery',
+      }),
+    }))
+    // The round-1 world: a fresh-agent owner at (1, 5).
+    act(() => store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'ses-r37-recovery',
+      epoch: 1,
+      generation: 5,
+      ownerKind: 'fresh-agent',
+      transition: 'handoff-committed',
+      operationId: 'op-r37-orig',
+    })))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // Round 1's create carried the observed pair (1, 5).
+    await waitFor(() => {
+      const creates = sentFreshAgentMessages('freshAgent.create')
+      expect(creates).toHaveLength(1)
+      expect(creates[0]).toMatchObject({
+        requestId: 'req-r37-recovery',
+        observedEpoch: 1,
+        observedGeneration: 5,
+      })
+    })
+
+    // Ownership advances on another device (generation 9) and the
+    // authoritative recovery round begins: the respawn verdict PRESERVES
+    // the createRequestId and bumps the reconcileEpoch.
+    act(() => store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'ses-r37-recovery',
+      epoch: 1,
+      generation: 9,
+      ownerKind: 'vacant',
+      transition: 'released',
+      operationId: 'op-r37-advance',
+    })))
+    act(() => store.dispatch(resetFreshAgentPaneForReconcileCreate({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      intent: 'respawn',
+      sessionRef: { provider: 'codex', sessionId: 'ses-r37-recovery' },
+    })))
+
+    // THE NEW ROUND CAPTURES THE CURRENT FENCE: the re-armed create
+    // carries (1, 9) — the recovery round proceeds (pre-r37 the OLD
+    // (1, 5) pair was reused, refused SESSION_RESERVED, and the cycle
+    // drained the respawn cap against a recoverable session).
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(2)
+    }, { timeout: 5_000 })
+    const recoveryRound = sentFreshAgentMessages('freshAgent.create')[1]
+    expect(recoveryRound).toMatchObject({
+      requestId: 'req-r37-recovery',
+      observedEpoch: 1,
+      observedGeneration: 9,
+    })
+    expect(recoveryRound.observedGeneration).not.toBe(5)
+
+    // WITHIN-ROUND: a retryable SESSION_RESERVED on the recovery round's
+    // create retries with the ROUND's ORIGINAL pair (1, 9) — never a
+    // refresh (the round-35 contract holds inside the new round).
+    act(() => {
+      for (const listener of listeners) {
+        listener({
+          type: 'freshAgent.create.failed',
+          requestId: 'req-r37-recovery',
+          code: 'SESSION_RESERVED',
+          retryable: true,
+        })
+      }
+    })
+    // Ownership advances AGAIN mid-window — the within-round retry must
+    // STILL carry the round's (1, 9) pair, never the newer (1, 11).
+    act(() => store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'ses-r37-recovery',
+      epoch: 1,
+      generation: 11,
+      ownerKind: 'vacant',
+      transition: 'released',
+      operationId: 'op-r37-advance-2',
+    })))
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(3)
+    }, { timeout: 5_000 })
+    const withinRoundRetry = sentFreshAgentMessages('freshAgent.create')[2]
+    expect(withinRoundRetry).toMatchObject({
+      requestId: 'req-r37-recovery',
+      observedEpoch: 1,
+      observedGeneration: 9,
+    })
+    expect(withinRoundRetry.observedGeneration).not.toBe(11)
   })
 
   it('a diverged pane is a pure observer: composer disabled, queued text held, no interrupt affordance', async () => {

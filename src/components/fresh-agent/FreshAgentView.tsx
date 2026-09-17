@@ -960,6 +960,7 @@ export function FreshAgentView({
   // captures fresh.
   const createFenceRef = useRef<{
     createRequestId: string
+    reconcileEpoch: number
     fence: ObservedOwnerFence | undefined
   } | null>(null)
   // b8ke ext r35 F2: the PER-SESSION attach fence capture (the attach
@@ -1821,18 +1822,34 @@ export function FreshAgentView({
     // decision moment). Carried on the create so the server stale-rejects
     // a delayed create naming superseded ownership; undefined means no
     // owner is known (legacy-unfenced). b8ke ext r35 F2: the capture is
-    // PER-REQUEST (keyed by createRequestId) — the SESSION_RESERVED
-    // redrive's effect re-arm re-runs this effect but MUST reuse the
-    // ORIGINAL pair, never re-read the record (the r28
-    // vacant-generation-advanced suppression then protects the retry,
-    // because the earlier observation is preserved through it).
+    // PER-REQUEST — the SESSION_RESERVED redrive's effect re-arm re-runs
+    // this effect but MUST reuse the ORIGINAL pair, never re-read the
+    // record (the r28 vacant-generation-advanced suppression then
+    // protects the retry, because the earlier observation is preserved
+    // through it). b8ke ext r37 F1: the cache key includes the pane's
+    // reconcileEpoch — the SAME shape as the terminal cache — because an
+    // authoritative pane-reconcile recovery deliberately PRESERVES the
+    // createRequestId and bumps the epoch to begin a NEW create round: a
+    // respawn/fresh verdict after ownership advanced N→N+1 must capture
+    // the CURRENT fence (a new recovery decision, not an automatic
+    // retry). Pre-r37 the epoch-bumped re-arm reused the OLD N fence,
+    // the server refused it SESSION_RESERVED, the client retried the
+    // stale pair, and the bounded re-reconcile could drain the respawn
+    // cap and falsely classify a recoverable durable session as dead.
+    // Automatic retries WITHIN a round (no epoch bump) keep the
+    // round-35 contract: the original pair.
     let observedFence: ObservedOwnerFence | undefined
-    if (createFenceRef.current?.createRequestId === paneContent.createRequestId) {
+    const fenceArmEpoch = paneContent.reconcileEpoch ?? 0
+    if (
+      createFenceRef.current?.createRequestId === paneContent.createRequestId
+      && createFenceRef.current.reconcileEpoch === fenceArmEpoch
+    ) {
       observedFence = createFenceRef.current.fence
     } else {
       observedFence = selectPaneOwnerFence(appStore.getState(), paneContent)
       createFenceRef.current = {
         createRequestId: paneContent.createRequestId,
+        reconcileEpoch: fenceArmEpoch,
         fence: observedFence,
       }
     }
@@ -1924,12 +1941,17 @@ export function FreshAgentView({
         // re-reads the record (a silent refresh here would present a
         // long-queued create as current over a newer lifecycle).
         let reconnectFence: ObservedOwnerFence | undefined
-        if (createFenceRef.current?.createRequestId === latest.createRequestId) {
+        const reconnectArmEpoch = latest.reconcileEpoch ?? 0
+        if (
+          createFenceRef.current?.createRequestId === latest.createRequestId
+          && createFenceRef.current.reconcileEpoch === reconnectArmEpoch
+        ) {
           reconnectFence = createFenceRef.current.fence
         } else {
           reconnectFence = selectPaneOwnerFence(appStore.getState(), latest)
           createFenceRef.current = {
             createRequestId: latest.createRequestId,
+            reconcileEpoch: reconnectArmEpoch,
             fence: reconnectFence,
           }
         }
