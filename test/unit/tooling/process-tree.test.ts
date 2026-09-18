@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -44,29 +44,46 @@ describe('process tree ownership', () => {
 })
 
 /**
- * POSIX read resilience (kata qesq, corrected diagnosis — fresh-eyes review
- * of b2bbded15): the recorded `spawnSync ps ENOBUFS` failures were NOT
- * "WSL2 AF_UNIX socketpair exhaustion". They were Node's spawnSync default
- * 1 MiB maxBuffer overflowing when the full-table ps output grows past the
- * limit under process churn: spawnSync reports exactly `spawnSync <cmd>
- * ENOBUFS` (status null, child SIGTERM'd) on output overflow — reproduced
- * with `spawnSync head -c 2000000 /dev/zero` → "spawnSync head ENOBUFS".
- * runCommand now passes a 16 MiB maxBuffer, the retry loop retries only
- * genuinely transient spawn errors (never ENOENT-class), and the Linux
- * spawn-free /proc fallback stays as defense-in-depth — observable via a
- * stderr warning. The final error must distinguish "ps failed AND /proc
- * failed".
+ * POSIX read resilience (kata qesq — fresh-eyes review of b2bbded15): the
+ * recorded `spawnSync ps ENOBUFS` failures are best explained by Node's
+ * spawnSync default 1 MiB maxBuffer overflowing when the full-table ps
+ * output grows past the limit under process churn (spawnSync reports
+ * exactly `spawnSync <cmd> ENOBUFS`, status null, child SIGTERM'd, on
+ * output overflow — reproduced with `spawnSync head -c 2000000
+ * /dev/zero` → "spawnSync head ENOBUFS"; this host's typical full table
+ * is ~250 KB, so 1 MiB is ~4x normal growth, which cargo churn's many
+ * long rustc command lines could supply). That is the leading candidate,
+ * not a settled cause — the ENOBUFS message alone cannot rule out a
+ * spawn-side failure (same message, signal null), and the fallback
+ * warning reports the signal/status/output-size fields that discriminate
+ * the two on a recurrence. runCommand now passes a 16 MiB maxBuffer, the
+ * retry loop retries only genuinely transient spawn errors (never
+ * ENOENT-class, never nonzero exits), and the Linux spawn-free /proc
+ * fallback stays as defense-in-depth for both classes — observable via
+ * the JSONL stderr warning. The final error must distinguish "ps failed
+ * AND /proc failed".
  */
-describe('readProcessSnapshot POSIX resilience (ps output over spawnSync 1 MiB maxBuffer)', () => {
+describe('readProcessSnapshot POSIX resilience (ps ENOBUFS failure classes, /proc fallback)', () => {
   let tmpRoot = ''
   let procRoot = ''
+  let stderrWrites: string[] = []
+  let stderrSpy: MockInstance<typeof process.stderr.write>
 
   beforeEach(() => {
     tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'process-tree-proc-'))
     procRoot = path.join(tmpRoot, 'proc')
+    // Capture (and swallow) stderr for the whole block: the fallback-path
+    // tests would otherwise print real JSONL warning lines into test
+    // output. Tests that care about the warning assert on `stderrWrites`.
+    stderrWrites = []
+    stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      stderrWrites.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'))
+      return true
+    })
   })
 
   afterEach(() => {
+    stderrSpy.mockRestore()
     fs.rmSync(tmpRoot, { recursive: true, force: true })
   })
 
@@ -103,16 +120,23 @@ describe('readProcessSnapshot POSIX resilience (ps output over spawnSync 1 MiB m
 
   /**
    * ENOBUFS-shaped spawn failure — the exact error spawnSync reports when
-   * output exceeds maxBuffer (the recorded real-world failure mode).
+   * output exceeds maxBuffer (the leading candidate for the recorded
+   * real-world failure mode): the child is SIGTERM'd, so signal is
+   * 'SIGTERM'.
    */
   const enoBufferResult = (): CommandResult => ({
     status: null,
+    signal: 'SIGTERM',
     error: Object.assign(new Error('spawnSync ps ENOBUFS'), { code: 'ENOBUFS' }),
   })
 
-  /** ENOENT-shaped spawn failure — `ps` is not installed; permanent, never retried. */
+  /**
+   * ENOENT-shaped spawn failure — `ps` is not installed; permanent, never
+   * retried. The child never ran, so signal is null.
+   */
   const enoentResult = (): CommandResult => ({
     status: null,
+    signal: null,
     error: Object.assign(new Error('spawnSync ps ENOENT'), { code: 'ENOENT' }),
   })
 
@@ -188,32 +212,66 @@ describe('readProcessSnapshot POSIX resilience (ps output over spawnSync 1 MiB m
     expect(records).toEqual(expectedTreeRecords)
   })
 
-  it('warns on stderr (with the ps failure) when the /proc fallback rescues a failed ps read', () => {
+  it('warns on stderr (structured JSONL, with the ps failure) when the /proc fallback rescues a failed ps read', () => {
     for (const entry of treeEntries) writeProcEntry(entry.pid, entry.comm, entry.ppid, entry.argv)
-    const writes: string[] = []
-    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
-      writes.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'))
-      return true
+
+    // A healthy ps read never warns.
+    const healthy = readProcessSnapshot('linux', () => ({ status: 0, stdout: psStdoutForTree }), {
+      procRoot,
+      sleep: () => {},
     })
+    expect(healthy).toEqual(expectedTreeRecords)
+    expect(stderrWrites).toEqual([])
 
-    try {
-      // A healthy ps read never warns.
-      const healthy = readProcessSnapshot('linux', () => ({ status: 0, stdout: psStdoutForTree }), {
-        procRoot,
-        sleep: () => {},
-      })
-      expect(healthy).toEqual(expectedTreeRecords)
-      expect(writes).toEqual([])
+    // A rescued read warns exactly once: a single JSONL line (severity/
+    // event/timestamp like the sibling testing scripts) carrying the last
+    // ps failure and its discriminating fields.
+    const rescued = readProcessSnapshot('linux', () => enoentResult(), { procRoot, sleep: () => {} })
+    expect(rescued).toEqual(expectedTreeRecords)
+    expect(stderrWrites).toHaveLength(1)
+    const warning = JSON.parse(stderrWrites[0]) as Record<string, unknown>
+    expect(warning).toMatchObject({
+      severity: 'warning',
+      event: 'ps_fallback_used',
+      attempts: 1,
+      failure: 'spawnSync ps ENOENT',
+      signal: null,
+      status: null,
+    })
+    expect(typeof warning.timestamp).toBe('string')
+  })
 
-      // A rescued read warns exactly once, carrying the last ps failure.
-      const rescued = readProcessSnapshot('linux', () => enoentResult(), { procRoot, sleep: () => {} })
-      expect(rescued).toEqual(expectedTreeRecords)
-      expect(writes).toHaveLength(1)
-      expect(writes[0]).toContain('spawnSync ps ENOENT')
-      expect(writes[0]).toContain('/proc fallback')
-    } finally {
-      stderrSpy.mockRestore()
-    }
+  it('does not retry a nonzero ps exit (no spawn error); the failure description uses trimmed stderr or falls back to exit N', () => {
+    for (const entry of treeEntries) writeProcEntry(entry.pid, entry.comm, entry.ppid, entry.argv)
+
+    // Nonzero exit with stderr: permanent, so one attempt and no sleep; the
+    // warning's failure description is the trimmed stderr.
+    const calls: Array<{ command: string; args: string }> = []
+    const sleeps: number[] = []
+    const records = readProcessSnapshot('linux', (command, args) => {
+      calls.push({ command, args: args.join(' ') })
+      return { status: 1, signal: null, stderr: 'ps: unknown option w\n' }
+    }, { procRoot, sleep: (ms) => sleeps.push(ms) })
+
+    expect(calls).toHaveLength(1)
+    expect(sleeps).toEqual([])
+    expect(records).toEqual(expectedTreeRecords)
+    expect(stderrWrites).toHaveLength(1)
+    const stderrWarning = JSON.parse(stderrWrites[0]) as Record<string, unknown>
+    expect(stderrWarning.failure).toBe('ps: unknown option w')
+    expect(stderrWarning.status).toBe(1)
+
+    // Nonzero exit with only whitespace stderr: the description falls back
+    // to the bare exit status.
+    stderrWrites.length = 0
+    const exitOnly = readProcessSnapshot('linux', () => ({ status: 3, signal: null, stderr: '   \n' }), {
+      procRoot,
+      sleep: () => {},
+    })
+    expect(exitOnly).toEqual(expectedTreeRecords)
+    expect(stderrWrites).toHaveLength(1)
+    const exitWarning = JSON.parse(stderrWrites[0]) as Record<string, unknown>
+    expect(exitWarning.failure).toBe('exit 3')
   })
 
   it('skips pids that vanish mid-scan (missing stat or cmdline file)', () => {

@@ -195,18 +195,17 @@ async function attachArtifact(
 }
 
 test.describe('HARNESS-12 leak/resource measurements', () => {
-  // 180s body deadline (the config default is 60s, and the config explicitly
-  // permits a spec to declare its own larger deadline — pane-ledger and
-  // wave-A already do). The 30s captureStableBaseline settle bound below can
-  // consume half the default under exactly the co-tenant load it was raised
-  // for, leaving too little room for the 6 create/kill iterations (each with
-  // a 10s during-poll) plus the 15s stray-settle poll: a generic 60s timeout
-  // would hide the diagnosable captureStableBaseline/settle errors and skip
-  // the catch blocks that retain the process-tree artifacts.
-  test.setTimeout(180_000)
-
   test('create/send/close loop returns to a bounded resource baseline', async ({ testServer, serverInfo }, testInfo) => {
     test.skip(externalTargetConfigured(), 'leak metrics require an owned server pid (external target is not ours)')
+    // 180s body deadline (the config default is 60s, and the config explicitly
+    // permits a spec to declare its own larger deadline — pane-ledger and
+    // wave-A already do). The 30s captureStableBaseline settle bound below can
+    // consume half the default under exactly the co-tenant load it was raised
+    // for, leaving too little room for the 6 create/kill iterations (each with
+    // a 10s during-poll) plus the 15s stray-settle poll: a generic 60s timeout
+    // would hide the diagnosable captureStableBaseline/settle errors and skip
+    // the catch blocks that retain the process-tree artifacts.
+    test.setTimeout(180_000)
     const { baseUrl, token, wsUrl, port } = serverInfo
     const pid = testServer.info.pid
     expect(pid).toBeGreaterThan(0)

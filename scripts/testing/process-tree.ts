@@ -10,6 +10,14 @@ export interface ProcessRecord {
 
 export interface CommandResult {
   status: number | null
+  /**
+   * Signal that killed the child, or null after a normal exit. Optional so
+   * injected test runners can omit it; runCommand always reports it. It is
+   * the only reliable discriminator between the two ENOBUFS shapes: a
+   * maxBuffer overflow SIGTERMs the child, while a spawn-side failure (pipe
+   * or socketpair creation) never starts the child and reports null.
+   */
+  signal?: NodeJS.Signals | null
   stdout?: string
   stderr?: string
   error?: Error
@@ -42,9 +50,12 @@ export interface ReadProcessSnapshotOptions {
  * '2000000', '/dev/zero'])` returns status null / SIGTERM with "spawnSync
  * head ENOBUFS". A full-table `ps -eo pid=,ppid=,args=` can exceed 1 MiB on
  * busy hosts (thousands of processes with very long command lines under
- * process churn), which is the real mechanism behind the recorded
- * `spawnSync ps ENOBUFS` snapshot failures. 16 MiB restores ample headroom
- * for the shared POSIX and Windows runners alike.
+ * process churn) — the leading candidate for the recorded `spawnSync ps
+ * ENOBUFS` snapshot failures (this host's typical table is ~250 KB, so 1 MiB
+ * is ~4x normal growth, which cargo churn's many long rustc command lines
+ * could supply), though the ENOBUFS message alone cannot rule out a
+ * spawn-side failure (same message, signal null). 16 MiB restores ample
+ * headroom for the shared POSIX and Windows runners alike.
  */
 const SPAWN_MAX_BUFFER_BYTES = 16 * 1024 * 1024
 
@@ -77,6 +88,7 @@ export function runCommand(command: string, args: readonly string[]): CommandRes
   const result = spawnSync(command, [...args], { encoding: 'utf8', maxBuffer: SPAWN_MAX_BUFFER_BYTES })
   return {
     status: result.status,
+    signal: result.signal,
     stdout: result.stdout,
     stderr: result.stderr,
     error: result.error,
@@ -195,20 +207,27 @@ function parseWindowsSnapshot(stdout: string): ProcessRecord[] {
  * injectable so parsing and Windows behavior remain unit-testable without
  * spawning a shell or depending on a particular CI host.
  *
- * POSIX resilience (kata qesq, corrected diagnosis — fresh-eyes review of
- * b2bbded15): the recorded `spawnSync ps ENOBUFS` failures were NOT "WSL2
- * AF_UNIX socketpair exhaustion" — they were Node's spawnSync default 1 MiB
- * maxBuffer overflowing when the full-table ps output grows past the limit
- * under process churn (spawnSync reports exactly `spawnSync <cmd> ENOBUFS`,
- * status null / SIGTERM, on output overflow; reproduced with `spawnSync
- * head -c 2000000 /dev/zero` → "spawnSync head ENOBUFS"). The read
- * therefore (a) gives spawnSync a 16 MiB maxBuffer, (b) retries only
- * genuinely transient spawn errors once (ENOBUFS is near-impossible with
- * the larger buffer; permanent shapes such as ENOENT never retry), and
- * (c) keeps the Linux spawn-free `/proc` fallback (same `ProcessRecord[]`
- * shape) as defense-in-depth when `ps` still fails — with a one-line stderr
- * warning so a rescued read stays observable. The final error distinguishes
- * "ps failed AND the /proc fallback failed" from a plain failure.
+ * POSIX resilience (kata qesq — fresh-eyes review of b2bbded15): the
+ * recorded `spawnSync ps ENOBUFS` failures are best explained by Node's
+ * spawnSync default 1 MiB maxBuffer overflowing when the full-table ps
+ * output grows past the limit under process churn (spawnSync reports
+ * exactly `spawnSync <cmd> ENOBUFS`, status null / SIGTERM, on output
+ * overflow; reproduced with `spawnSync head -c 2000000 /dev/zero` →
+ * "spawnSync head ENOBUFS"; this host's typical full table is ~250 KB, so
+ * 1 MiB is ~4x normal growth, which cargo churn's many long rustc command
+ * lines could supply). That is the leading candidate, NOT a settled cause:
+ * the ENOBUFS message alone cannot rule out a spawn-side pipe failure
+ * (same message, signal null), and the fallback warning now reports the
+ * signal/status/output-size fields that tell the two apart on a
+ * recurrence. The read therefore (a) gives spawnSync a 16 MiB maxBuffer,
+ * (b) retries only genuinely transient spawn errors once (ENOBUFS is
+ * near-impossible with the larger buffer; permanent shapes such as ENOENT
+ * never retry), and (c) keeps the Linux spawn-free `/proc` fallback
+ * (shape-compatible for findReleaseServerPid's use) as defense-in-depth
+ * covering both classes when `ps` still fails — with a structured stderr
+ * warning so a rescued read stays observable. The final error
+ * distinguishes "ps failed AND the /proc fallback failed" from a plain
+ * failure.
  */
 export function readProcessSnapshot(
   platform: NodeJS.Platform = process.platform,
@@ -232,6 +251,7 @@ export function readProcessSnapshot(
   const retryDelayMs = opts.retryDelayMs ?? PS_RETRY_DELAY_MS
 
   let lastPsFailure = ''
+  let lastPsResult: CommandResult | undefined
   let attempts = 0
   while (attempts <= PS_TRANSIENT_RETRIES) {
     attempts += 1
@@ -239,6 +259,7 @@ export function readProcessSnapshot(
     if (!result.error && result.status === 0) {
       return parsePosixSnapshot(result.stdout ?? '')
     }
+    lastPsResult = result
     lastPsFailure = describeFailure(result)
     // Retry only genuinely transient spawn errors; permanent shapes (no `ps`
     // installed, nonzero exit) fail fast to the fallback / final error.
@@ -252,10 +273,12 @@ export function readProcessSnapshot(
     try {
       const records = readProcSnapshot(opts.procRoot ?? '/proc')
       // Observability: a silent fallback would hide the ps failure that
-      // caused it (the condition needed to correct the original diagnosis).
-      process.stderr.write(
-        `process-tree: ps failed after ${attempts} ${attemptsWord} (${lastPsFailure}); using spawn-free /proc fallback snapshot\n`,
-      )
+      // caused it. The warning carries the discriminating fields — signal
+      // (SIGTERM = the child was killed, the maxBuffer-overflow shape;
+      // null = the child never ran, a spawn-side failure), status, and the
+      // captured output sizes — so a recurrence can be classified instead
+      // of re-guessed.
+      writePsFallbackWarning({ attempts, failure: lastPsFailure, result: lastPsResult })
       return records
     } catch (procError) {
       throw new Error(
@@ -283,6 +306,39 @@ function describeFailure(result: CommandResult): string {
   const stderr = (result.stderr ?? '').trim()
   if (stderr) return stderr
   return `exit ${result.status}`
+}
+
+function capturedByteLength(value: string | undefined): number | undefined {
+  return typeof value === 'string' ? Buffer.byteLength(value) : undefined
+}
+
+/**
+ * Structured JSONL warning — the `{severity, event, timestamp, ...}` shape
+ * the sibling testing scripts use (see run-source-runtime-tests.ts) — so a
+ * rescued read stays observable and severity/event-filterable like the rest
+ * of the tooling output. Carries the ps failure's discriminating fields:
+ * `signal` (SIGTERM = the child was killed, e.g. maxBuffer overflow; null =
+ * the child never ran, a spawn-side failure), `status`, and the captured
+ * output sizes (absent when the runner captured no such stream).
+ */
+function writePsFallbackWarning(detail: {
+  attempts: number
+  failure: string
+  result: CommandResult | undefined
+}): void {
+  process.stderr.write(
+    `${JSON.stringify({
+      severity: 'warning',
+      event: 'ps_fallback_used',
+      timestamp: new Date().toISOString(),
+      attempts: detail.attempts,
+      failure: detail.failure,
+      signal: detail.result?.signal,
+      status: detail.result?.status,
+      stdoutBytes: capturedByteLength(detail.result?.stdout),
+      stderrBytes: capturedByteLength(detail.result?.stderr),
+    })}\n`,
+  )
 }
 
 function errorMessage(error: unknown): string {
@@ -320,12 +376,15 @@ function parseCmdline(content: string): string {
 
 /**
  * Spawn-free /proc snapshot (Linux fallback): `<pid>/stat` supplies the
- * parent pid, `<pid>/cmdline` the arguments. Produces the same
- * `ProcessRecord[]` shape as the `ps` read — including the ps parser's
- * positive-pid filtering, so the two paths stay interchangeable. A pid
- * whose `stat` or `cmdline` disappears mid-scan (it exited and was reaped
- * between reads) is skipped; a present-but-empty `cmdline` (kernel thread)
- * yields an empty command line.
+ * parent pid, `<pid>/cmdline` the arguments. Produces a `ProcessRecord[]`
+ * compatible with the `ps` read for findReleaseServerPid's use (same field
+ * shape, including the ps parser's positive-pid filtering) — though not
+ * identical output: `ps args=` renders kernel threads as `[kworker/0:1]`
+ * and zombies as `[name] <defunct>`, while this fallback yields an empty
+ * command line for both (neither is a real executable match target). A
+ * pid whose `stat` or `cmdline` disappears mid-scan (it exited and was
+ * reaped between reads) is skipped; a present-but-empty `cmdline` (kernel
+ * thread) yields an empty command line.
  */
 function readProcSnapshot(procRoot: string): ProcessRecord[] {
   let entries: string[]
