@@ -1023,6 +1023,160 @@ async fn restart_preserves_consumed_starts_and_recovers_an_interrupted_dispatch_
     clear_test_hooks(dir.path());
 }
 
+/// Review I1: an interrupted series that is the ONLY dispatchable work
+/// still recovers. `generation_work_snapshot` filters `InFlight`, so the
+/// worker selects NOTHING — the idle path itself must check for
+/// interrupted starts, acquire the guard, and fold them once as failed
+/// (the dispatch branches' recovery piggyback cannot fire when there is
+/// no other work to dispatch).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_worker_recovers_an_interrupted_series_that_is_the_only_work() {
+    let dir = temp_data_dir();
+    set_test_hooks(dir.path(), vec![TestHook::ClockOffsetMs(0)]);
+    let store = open_store(dir.path());
+    let target = pending("h-only-work");
+    ensure_pending(
+        &store,
+        "h-only-work",
+        NamedProvider::Claude,
+        Some("/w/only"),
+    )
+    .await
+    .expect("ensure");
+    arm_with_message(
+        &store,
+        target.clone(),
+        "freshclaude",
+        "Only interrupted message",
+    )
+    .await;
+    store
+        .claim_generation_start(target.clone(), "attempt-only-interrupted".to_string())
+        .await
+        .expect("claim runs")
+        .expect("the series is claimable");
+    assert_eq!(store.interrupted_generation_count(), 1);
+
+    // The interrupted series is the ONLY work: nothing is selectable, so
+    // only the idle path's recovery check can schedule the retry within
+    // the bounded window.
+    let transport = CountingTransport::new("Never dispatched");
+    let generator = generator_with(dir.path(), Some("gen-key"), transport.clone());
+    let worker = SessionNameWorker::start(Arc::clone(&store), Arc::new(NoRouteNative), generator);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let doc = document_json(dir.path());
+        if generation_status(&doc, &target).as_deref() == Some("eligible") {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the idle path must recover the interrupted series that is the only work"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    worker.abort();
+    let doc = document_json(dir.path());
+    assert_eq!(
+        generation_consumed(&doc, &target),
+        1,
+        "recovery consumes nothing"
+    );
+    let due = generation_next_due(&doc, &target).expect("the retry is scheduled");
+    assert!(
+        due > decision_now(dir.path()),
+        "the remaining 30s delay is scheduled from the recovery fold"
+    );
+    assert_eq!(
+        store.interrupted_generation_count(),
+        0,
+        "recovery happened exactly once"
+    );
+    assert_eq!(
+        transport.calls(),
+        0,
+        "recovery never dispatches a provider request"
+    );
+    clear_test_hooks(dir.path());
+}
+
+/// Review I2: an AI answer that fails `validate_name` — the Gemini
+/// transport trims and caps at 80 chars but never strips control
+/// characters, so a reply with an internal newline or tab reaches the
+/// fold — consumes the already-charged attempt and schedules the
+/// bounded retry. The fold must never error the transaction: an error
+/// strands the series `InFlight` with `nextDue: None` (exactly the
+/// interrupted-start shape, permanently when it is the only work).
+#[tokio::test]
+async fn an_invalid_answer_consumes_the_attempt_and_schedules_the_retry() {
+    let dir = temp_data_dir();
+    set_test_hooks(dir.path(), vec![TestHook::ClockOffsetMs(0)]);
+    let store = open_store(dir.path());
+    let target = pending("h-invalid-answer");
+    ensure_pending(
+        &store,
+        "h-invalid-answer",
+        NamedProvider::Claude,
+        Some("/w/invalid"),
+    )
+    .await
+    .expect("ensure");
+    let armed = arm_with_message(
+        &store,
+        target.clone(),
+        "freshclaude",
+        "Invalid answer message",
+    )
+    .await;
+    assert_eq!(armed.record.name, "Invalid answer message");
+    let claim = store
+        .claim_generation_start(target.clone(), "attempt-invalid".to_string())
+        .await
+        .expect("claim runs")
+        .expect("the series is claimable");
+    let before = decision_now(dir.path());
+
+    // A control character inside the reply fails validate_name (names
+    // reject control characters) — the fold treats it as an empty
+    // answer: consume the charged attempt, schedule the retry.
+    store
+        .fold_generation_outcome(
+            target.clone(),
+            claim.series_id.clone(),
+            claim.input_fingerprint.clone(),
+            GenerationOutcome::Answer("Bad\nname".to_string()),
+        )
+        .await
+        .expect("an invalid answer folds, never errors the transaction");
+    let after = decision_now(dir.path());
+
+    let doc = document_json(dir.path());
+    assert_eq!(
+        generation_consumed(&doc, &target),
+        1,
+        "the attempt is consumed exactly once"
+    );
+    assert_eq!(
+        generation_status(&doc, &target).as_deref(),
+        Some("eligible"),
+        "no stranded InFlight: the series is retry-eligible"
+    );
+    let due = generation_next_due(&doc, &target).expect("the bounded retry is scheduled");
+    assert!(
+        due >= before + GENERATION_RETRY_1_MS && due <= after + GENERATION_RETRY_1_MS,
+        "the 30s delay is scheduled from the fold (due {due}, window {before}..{after}+30s)"
+    );
+    // The fallback name stands — the invalid answer never publishes.
+    let record = get_one(&store, target.clone()).await.expect("record");
+    assert_eq!(record.record.name, "Invalid answer message");
+    assert_eq!(
+        store.interrupted_generation_count(),
+        0,
+        "the fold left nothing for interrupt recovery"
+    );
+    clear_test_hooks(dir.path());
+}
+
 /// A capability pause (no Gemini key) consumes nothing and does not
 /// monopolize the worker: native work behind the paused generation series
 /// still converges, and the capability wake resumes the remaining work.
@@ -1754,8 +1908,12 @@ async fn the_targeted_opencode_lookup_serves_eligibility_and_is_bounded() {
         "a missing session answers None"
     );
 
-    // The store-side bound: a fresh record needs input; an exhausted or
-    // protected one does not.
+    // The store-side bound: a fresh record needs input; a series that has
+    // already CAPTURED its input fingerprint does not (review M4: first
+    // messages are immutable, so the targeted sqlite lookup serves only
+    // INITIAL eligibility — an armed-unexhausted named session with a
+    // captured fingerprint never pays the spawn_blocking query again);
+    // an exhausted or protected record does not either.
     let dir = temp_data_dir();
     let store = open_store(dir.path());
     let fresh = session(NamedProvider::Opencode, "ses_lookup");
@@ -1777,8 +1935,8 @@ async fn the_targeted_opencode_lookup_serves_eligibility_and_is_bounded() {
         .await
         .expect("hydrate");
     assert!(
-        store.needs_generation_input(&fresh),
-        "an armed-eligible record still needs input"
+        !store.needs_generation_input(&fresh),
+        "an absorbed series already carries its input fingerprint — the lookup has no remaining eligibility value"
     );
     let handle = pending("h-lookup-open");
     ensure_pending(
@@ -1802,6 +1960,10 @@ async fn the_targeted_opencode_lookup_serves_eligibility_and_is_bounded() {
         })
         .await
         .expect("the explicit open binds");
+    assert!(
+        !store.needs_generation_input(&fresh),
+        "an ARMED series carries its captured fingerprint — the targeted lookup never runs again for it"
+    );
     set_test_hooks(dir.path(), vec![TestHook::ClockOffsetMs(0)]);
     for (index, attempt) in ["a1", "a2", "a3"].into_iter().enumerate() {
         if index > 0 {
@@ -1918,7 +2080,7 @@ fn the_selector_orders_generation_by_due_then_key_and_alternates_classes() {
     };
     let mut backoff = std::collections::HashMap::new();
     let picked = crate::session_name_native::select_work(
-        &[native_item.clone()],
+        std::slice::from_ref(&native_item),
         &[item("g", None)],
         None,
         &mut backoff,
@@ -1928,7 +2090,7 @@ fn the_selector_orders_generation_by_due_then_key_and_alternates_classes() {
         Some(crate::session_name_native::WorkSelection::Native(_))
     ));
     let picked = crate::session_name_native::select_work(
-        &[native_item.clone()],
+        std::slice::from_ref(&native_item),
         &[item("g", None)],
         Some("native"),
         &mut backoff,
@@ -1938,7 +2100,7 @@ fn the_selector_orders_generation_by_due_then_key_and_alternates_classes() {
         Some(crate::session_name_native::WorkSelection::Generation(_))
     ));
     let picked = crate::session_name_native::select_work(
-        &[native_item.clone()],
+        std::slice::from_ref(&native_item),
         &[item("g", None)],
         Some("generation"),
         &mut backoff,

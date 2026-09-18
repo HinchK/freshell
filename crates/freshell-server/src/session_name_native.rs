@@ -376,6 +376,23 @@ async fn run(
             &mut probe_backoff,
         );
         let Some(work) = selection else {
+            // Review I1: an interrupted series is INVISIBLE to selection
+            // (InFlight is filtered from `generation_work_snapshot`), so
+            // when it is the only naming/native work the dispatch
+            // branches below never run and their piggybacked recovery
+            // never fires. The idle path checks for interrupted starts
+            // itself: acquire the guard (the holder exclusivity keeps
+            // "InFlight under the guard is provably dead" true), fold
+            // them once as failed, and re-poll. A recovery fold consumes
+            // nothing, so this runs regardless of capability — and a
+            // guard held by a cooperating process simply retries next
+            // poll.
+            if names.interrupted_generation_count() > 0 {
+                if let Some(guard) = acquire_worker_guard(&names, "-") {
+                    recover_interrupted_starts(&names).await;
+                    drop(guard);
+                }
+            }
             tokio::select! {
                 _ = tokio::time::sleep(WORKER_POLL_INTERVAL) => {}
                 // A settings/key capability change wakes the poll
@@ -396,17 +413,7 @@ async fn run(
                 freshell_freshagent::naming::name_ref_debug_key(&item.target)
             }
         };
-        let Some(guard) = names.try_background_guard().unwrap_or_else(|error| {
-            tracing::warn!(
-                target: "freshell_server::session_name_native",
-                op = "try_background_guard",
-                name_ref = %item_key,
-                revision = 0,
-                class = %error.code(),
-                "session_names.operation_failed: {error}"
-            );
-            None
-        }) else {
+        let Some(guard) = acquire_worker_guard(&names, &item_key) else {
             tokio::time::sleep(WORKER_POLL_INTERVAL).await;
             continue;
         };
@@ -448,31 +455,7 @@ async fn run(
                 // Recover any interrupted generation start while holding the
                 // guard (only a guard-holder dispatches, so an InFlight series
                 // seen here is provably dead).
-                if names.interrupted_generation_count() > 0 {
-                    match names.recover_interrupted_generation().await {
-                        Ok(count) if count > 0 => {
-                            tracing::info!(
-                                target: "freshell_server::session_name_generation",
-                                op = "recover_interrupted",
-                                name_ref = "-",
-                                revision = 0,
-                                class = "recovered",
-                                "session_names.generation_recovered: {count} interrupted start(s) folded as failed"
-                            );
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                target: "freshell_server::session_name_generation",
-                                op = "recover_interrupted",
-                                name_ref = "-",
-                                revision = 0,
-                                class = %error.code(),
-                                "session_names.operation_failed: {error}"
-                            );
-                        }
-                        _ => {}
-                    }
-                }
+                recover_interrupted_starts(&names).await;
                 // The guard is retained through the cycle's actual local work
                 // (the provider calls and any owned-helper cleanup) and
                 // released right after the fold — external ambiguity never
@@ -499,35 +482,69 @@ async fn run(
                     tokio::time::sleep(WORKER_POLL_INTERVAL).await;
                     continue;
                 }
-                if names.interrupted_generation_count() > 0 {
-                    match names.recover_interrupted_generation().await {
-                        Ok(count) if count > 0 => {
-                            tracing::info!(
-                                target: "freshell_server::session_name_generation",
-                                op = "recover_interrupted",
-                                name_ref = "-",
-                                revision = 0,
-                                class = "recovered",
-                                "session_names.generation_recovered: {count} interrupted start(s) folded as failed"
-                            );
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                target: "freshell_server::session_name_generation",
-                                op = "recover_interrupted",
-                                name_ref = "-",
-                                revision = 0,
-                                class = %error.code(),
-                                "session_names.operation_failed: {error}"
-                            );
-                        }
-                        _ => {}
-                    }
-                }
+                recover_interrupted_starts(&names).await;
                 generator.run_due_attempt(&names, &item).await;
                 drop(guard);
             }
         }
+    }
+}
+
+/// Acquire the shared background worker guard, logging the structured
+/// failure when the guard machinery itself errors (a plain `None` —
+/// another cooperating process holds it — stays silent: that process's
+/// worker drives the work and ours simply polls again).
+fn acquire_worker_guard(
+    names: &Arc<SessionNames>,
+    item_key: &str,
+) -> Option<crate::session_names::BackgroundGuard> {
+    names.try_background_guard().unwrap_or_else(|error| {
+        tracing::warn!(
+            target: "freshell_server::session_name_native",
+            op = "try_background_guard",
+            name_ref = %item_key,
+            revision = 0,
+            class = %error.code(),
+            "session_names.operation_failed: {error}"
+        );
+        None
+    })
+}
+
+/// Recover any interrupted generation starts while holding the shared
+/// background guard (only a guard-holder ever dispatches, so an InFlight
+/// series seen under the guard is provably dead). A recovery fold
+/// consumes nothing — the claim already charged the attempt; the fold
+/// schedules the remaining retry delay from recovery time. Runs from
+/// every dispatch arm AND the idle path (review I1: an interrupted
+/// series is invisible to selection, so when it is the only work the
+/// idle path is the sole trigger).
+async fn recover_interrupted_starts(names: &Arc<SessionNames>) {
+    if names.interrupted_generation_count() == 0 {
+        return;
+    }
+    match names.recover_interrupted_generation().await {
+        Ok(count) if count > 0 => {
+            tracing::info!(
+                target: "freshell_server::session_name_generation",
+                op = "recover_interrupted",
+                name_ref = "-",
+                revision = 0,
+                class = "recovered",
+                "session_names.generation_recovered: {count} interrupted start(s) folded as failed"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "freshell_server::session_name_generation",
+                op = "recover_interrupted",
+                name_ref = "-",
+                revision = 0,
+                class = %error.code(),
+                "session_names.operation_failed: {error}"
+            );
+        }
+        _ => {}
     }
 }
 

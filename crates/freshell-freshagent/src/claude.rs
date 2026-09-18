@@ -2235,9 +2235,14 @@ impl FreshClaudeState {
         // Unified agent names (Task 4): the shared accepted-input callback —
         // the send reached the sidecar, so the user input is ACCEPTED. The
         // naming target is the stashed pre-durable handle when one exists
-        // (it redirects to the bound durable record once adopted), else the
-        // adopted durable claude session. Kilroy is out of scope; a failed
-        // feed never blocks the turn.
+        // (it redirects to the bound durable record once adopted), else
+        // the adopted durable claude session, else — review N1 — the
+        // pending ref for the ADDRESSED id itself: a send racing the init
+        // adoption (the stash entry just consumed by the bound cleanup,
+        // the addressed id still the placeholder) must never silently
+        // drop the feed; the store's redirect resolution decides, and
+        // the next send addresses the adopted id anyway. Kilroy is out
+        // of scope; a failed feed never blocks the turn.
         let naming_target = self
             .naming_handles
             .lock()
@@ -2251,6 +2256,11 @@ impl FreshClaudeState {
                         provider: freshell_protocol::session_names::NamedProvider::Claude,
                         session_id: session_id.clone(),
                     }
+                })
+            })
+            .or_else(|| {
+                Some(freshell_protocol::session_names::SessionNameRef::Pending {
+                    id: session_id.clone(),
                 })
             });
         if session_type != "kilroy" {
@@ -4559,9 +4569,7 @@ impl FreshClaudeState {
         if session_type == "kilroy" {
             return None;
         }
-        let Some(handle) = self.naming_handles.lock().await.get(placeholder).cloned() else {
-            return None;
-        };
+        let handle = self.naming_handles.lock().await.get(placeholder).cloned()?;
         // Existing provider durability evidence: the claude CLI writes the
         // session transcript at startup, so a located transcript file
         // verifies the durable identity (`claude_snapshot::locate_transcript_selected`
@@ -7476,6 +7484,57 @@ rl.on('line', (line) => {
         assert_eq!(
             activities[0].reason,
             crate::naming::NameActivityReason::AcceptedUserMessage
+        );
+    }
+
+    /// Unified agent names (Task 4, review N1): a send RACING the init
+    /// adoption — the stash entry already consumed by the adoption's
+    /// bound cleanup, the addressed id still the placeholder (the
+    /// client has not yet learned the adopted id) — must still feed the
+    /// authority instead of silently dropping the activity. The feed
+    /// falls back to the pending ref for the addressed id itself (the
+    /// store's redirect resolution decides); the next send addresses the
+    /// adopted id anyway.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_send_racing_the_init_adoption_still_feeds_the_naming_authority() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut rx) = state_with_bus();
+        let sink = crate::naming::test_support::RecordingSink::new();
+        state.set_session_naming(sink.clone());
+        let mut create = dedup_create_msg("naming-race");
+        create.naming_handle = Some("handle-naming-race".into());
+        state.handle_create(create, None).await;
+        let created = await_claude_created(&mut rx, "naming-race").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        // The adoption's bound cleanup consumed the stash entry
+        // (`bind_naming_handle_at_init` removes it once the handle is
+        // redirected to the durable record) — this send is still
+        // addressed to the placeholder and is not a canonical UUID.
+        state.naming_handles.lock().await.remove(&session_id);
+
+        state
+            .handle_send(send_msg(&session_id, "Race the adoption"))
+            .await;
+        let _ = env.respond_log_frames(1).await;
+
+        let activities = sink.activities.lock().unwrap();
+        assert_eq!(
+            activities.len(),
+            1,
+            "the racing send must not silently drop the activity feed: {activities:?}"
+        );
+        assert_eq!(
+            activities[0].target,
+            freshell_protocol::session_names::SessionNameRef::Pending {
+                id: session_id.clone()
+            }
+        );
+        assert_eq!(activities[0].mode, "freshclaude");
+        assert_eq!(
+            activities[0].first_user_message.as_deref(),
+            Some("Race the adoption")
         );
     }
 

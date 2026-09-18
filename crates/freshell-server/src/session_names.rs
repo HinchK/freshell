@@ -744,9 +744,14 @@ impl SessionNames {
 
     /// Task 4: whether a scoped session's record can still use generation
     /// input — true when no record exists yet (hydration needs the message)
-    /// or the record's accepted source is below protection and its series is
-    /// not exhausted. Bounds the targeted first-message lookups: an
-    /// exhausted or protected session never pays a transcript read again.
+    /// or the record's accepted source is below protection and its series
+    /// is not exhausted AND has not yet captured an input fingerprint
+    /// (review M4: first messages are immutable, so once a series carries
+    /// its input fingerprint the targeted first-message lookup has no
+    /// remaining eligibility value — an armed-unexhausted named opencode
+    /// session never pays the transcript read again on every pass).
+    /// Bounds the targeted first-message lookups: an input-carrying,
+    /// exhausted, or protected session never pays a transcript read.
     pub(crate) fn needs_generation_input(&self, target: &SessionNameRef) -> bool {
         let view = self.core.current_view();
         let document = &view.document;
@@ -760,7 +765,9 @@ impl SessionNames {
         }
         match document.generation.get(&key) {
             None => true,
-            Some(series) => series.status != GenerationStatus::Exhausted,
+            Some(series) => {
+                series.status != GenerationStatus::Exhausted && series.input_fingerprint.is_none()
+            }
         }
     }
 
@@ -2662,6 +2669,20 @@ fn fold_generation_outcome_decision(
         series.excerpt = None;
         return Ok(commit_decision(document, &key, false));
     }
+    // An INVALID answer — a control character inside the reply (the
+    // transport trims and caps but never strips them), an oversize or
+    // empty-after-trim candidate — consumes the already-charged attempt
+    // and schedules the bounded retry exactly like an empty answer
+    // (review I2). Propagating `Err` here would error the transaction and
+    // strand the series `InFlight` with no retry — the interrupted-start
+    // shape, permanently when the series is the only work.
+    let outcome = match outcome {
+        GenerationOutcome::Answer(answer) => match validate_name(&answer) {
+            Ok(_) => GenerationOutcome::Answer(answer),
+            Err(_) => GenerationOutcome::Empty,
+        },
+        other => other,
+    };
     match outcome {
         GenerationOutcome::Answer(answer) => {
             let name = validate_name(&answer)?;
@@ -2754,7 +2775,7 @@ fn hydrate_indexed_decision(
         provider_title,
     } = input;
     let target = SessionNameRef::Session {
-        provider: provider.clone(),
+        provider,
         session_id,
     };
     let key = name_ref_key(&target);

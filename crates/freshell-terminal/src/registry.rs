@@ -2020,6 +2020,25 @@ impl TerminalRegistry {
         shared.map(|s| s.lock().expect("terminal lock").title.clone())
     }
 
+    /// Single-id read of a terminal's launch MODE — the same field the
+    /// create path stamps onto the record (`"shell"`, a scoped CLI mode, or
+    /// a fresh session type); `None` for an unknown terminal id. Added for
+    /// the auto-title sweep's kilroy-only discrimination (unified agent
+    /// names Task 4, review I3): a metadata-typed kilroy session whose live
+    /// matches hold no scoped mode keeps the legacy ladder, while a live
+    /// scoped-mode terminal means the durable session is also open through
+    /// a supported mode (the singular-record rule).
+    pub fn mode_of(&self, terminal_id: &str) -> Option<String> {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
+        };
+        shared.map(|s| s.lock().expect("terminal lock").mode.clone())
+    }
+
     /// `registry.updateDescription()` — the PATCH write-through for
     /// `descriptionOverride` (`terminals-router.ts:304`).
     pub fn update_description(&self, terminal_id: &str, description: &str) {

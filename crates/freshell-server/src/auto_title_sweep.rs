@@ -52,6 +52,15 @@ pub struct AutoTitleSweepState {
     /// policy as everywhere else); the legacy ladder below then still
     /// EXCLUDES scoped providers (never a competing settings title).
     pub names: Option<Arc<crate::session_names::SessionNames>>,
+    /// Unified agent names (Task 4, review I3): the server's session
+    /// metadata store (`session-metadata.json`) — the discriminator the
+    /// naming plan names: a listing row whose known type is `kilroy` is a
+    /// Kilroy-only session (kilroy shares the Claude runtime, so its
+    /// transcripts list under provider `claude`) and never enters the
+    /// naming authority or the generator merely because its provider is
+    /// claude; it KEEPS the legacy ladder below. Cheap Arc/Mutex JSON —
+    /// the pass batch-reads the scoped rows' types once.
+    pub metadata: crate::session_metadata::SessionMetadataStore,
     /// Task 4: the shared session index, consulted for the targeted
     /// opencode first-message lookup (already-named opencode sessions carry
     /// no first message in the bounded listing).
@@ -217,6 +226,71 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The sweep's session key (`provider:sessionId`) — the same shape the
+/// metadata store's `get_all()` flattens to.
+fn sweep_session_key(provider: &str, session_id: &str) -> String {
+    format!("{provider}:{session_id}")
+}
+
+/// Unified agent names (Task 4, review I3): the pass's KILROY-ONLY
+/// sessions — listing rows whose known metadata type is `kilroy` (kilroy
+/// shares the Claude runtime, so its transcripts list under provider
+/// `claude`) and whose live terminal matches hold NO scoped mode. A
+/// kilroy-only session never enters the naming authority or the
+/// generator merely because its provider is claude — it KEEPS the legacy
+/// ladder (the Global Constraint: kilroy retains its existing UI and
+/// generation behavior). The singular-record exception: a live terminal
+/// in a SUPPORTED mode (a resumed claude/codex/opencode CLI pane, a
+/// fresh scoped pane) means the identical durable session is also open
+/// through a supported mode, so its one canonical record stays with the
+/// authority — never a competing kilroy record.
+async fn kilroy_only_session_keys(
+    state: &AutoTitleSweepState,
+    sessions: &[SweepSession],
+) -> HashSet<String> {
+    let has_scoped = sessions.iter().any(|s| {
+        freshell_freshagent::naming::named_provider_for(Some(&s.provider), None).is_some()
+    });
+    if !has_scoped {
+        return HashSet::new();
+    }
+    // Batch-read the store's session types once per pass (cheap Arc/Mutex
+    // JSON — cached after the first load, shared with the POST route).
+    let types = state.metadata.get_all().await;
+    let mut keys = HashSet::new();
+    for s in sessions {
+        if freshell_freshagent::naming::named_provider_for(Some(&s.provider), None).is_none() {
+            continue;
+        }
+        let key = sweep_session_key(&s.provider, &s.session_id);
+        let kilroy_typed = types
+            .get(&key)
+            .and_then(|entry| entry.get("sessionType"))
+            .and_then(serde_json::Value::as_str)
+            == Some("kilroy");
+        if !kilroy_typed {
+            continue;
+        }
+        let live_scoped_terminal = state
+            .identity
+            .find_all_by_session(&s.provider, &s.session_id, s.cwd.as_deref())
+            .iter()
+            .any(|identity| {
+                state
+                    .registry
+                    .mode_of(&identity.terminal_id)
+                    .map(|mode| {
+                        freshell_freshagent::naming::is_unified_agent_mode(Some(&mode), None)
+                    })
+                    .unwrap_or(false)
+            });
+        if !live_scoped_terminal {
+            keys.insert(key);
+        }
+    }
+    keys
+}
+
 /// Task 18: the sweep-time terminal-metadata refresh — Node's
 /// `applySessionMetadata` pass (`server/index.ts:854-866` ->
 /// `terminal-metadata-service.ts:183-201`), redesigned per validator-A7 (see
@@ -320,6 +394,12 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
     let overrides = state.settings.session_overrides(); // freshness-reloading read
     let mut changed = false;
 
+    // Unified agent names (Task 4, review I3): the kilroy-only rows for
+    // this pass — computed once, consulted by BOTH the scoped branch
+    // below (never hydrate/arm them) and the legacy-ladder gate (never
+    // strip their ladder).
+    let kilroy_only = kilroy_only_session_keys(state, sessions).await;
+
     // Unified agent names (Task 4): scoped coding-agent sessions (the six
     // unified modes' CLI half — claude/codex/opencode, which is also where
     // resumed fresh sessions' transcripts surface) route to the ONE naming
@@ -340,6 +420,12 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
             else {
                 continue;
             };
+            if kilroy_only.contains(&sweep_session_key(&s.provider, &s.session_id)) {
+                // A kilroy-only session keeps kilroy's existing UI and
+                // generation behavior: no naming-authority record, no
+                // generator arming — the legacy ladder below serves it.
+                continue;
+            }
             let target = freshell_protocol::SessionNameRef::Session {
                 provider,
                 session_id: s.session_id.clone(),
@@ -459,13 +545,17 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
     );
 
     for (s, matching) in &meta_work {
+        let key = format!("{}:{}", s.provider, s.session_id);
         // The legacy title ladder is the EXCLUDED-provider path: scoped
         // coding-agent sessions never write a competing settings title
-        // (their naming lives in the authority above).
-        if freshell_freshagent::naming::named_provider_for(Some(&s.provider), None).is_some() {
+        // (their naming lives in the authority above) — EXCEPT the
+        // kilroy-only rows, which keep kilroy's existing ladder (review
+        // I3: the metadata-blind sweep here is what stripped it).
+        if freshell_freshagent::naming::named_provider_for(Some(&s.provider), None).is_some()
+            && !kilroy_only.contains(&key)
+        {
             continue;
         }
-        let key = format!("{}:{}", s.provider, s.session_id);
         let row = overrides.get(&key).and_then(|v| v.as_object());
         let override_title = row
             .and_then(|r| r.get("titleOverride"))
@@ -713,10 +803,22 @@ mod tests {
     /// (`registry.update_title`) has an actual entry to mutate. Copied from
     /// `sessions.rs`'s module-private helper of the same name (its doc
     /// explains why a minimal `sleep` child substitutes for the
-    /// crate-private `insert_headless`).
+    /// crate-private `insert_headless`). The registry row's MODE defaults
+    /// to `"shell"`; [`spawn_headless_terminal_with_mode_for_test`] stamps
+    /// a different one (review I3's scoped-mode proxy).
     fn spawn_headless_terminal_for_test(
         registry: &freshell_terminal::TerminalRegistry,
         terminal_id: &str,
+    ) {
+        spawn_headless_terminal_with_mode_for_test(registry, terminal_id, "shell");
+    }
+
+    /// The mode-stamping variant of [`spawn_headless_terminal_for_test`] —
+    /// review I3's singular-record proxy reads the live terminal's mode.
+    fn spawn_headless_terminal_with_mode_for_test(
+        registry: &freshell_terminal::TerminalRegistry,
+        terminal_id: &str,
+        mode: &str,
     ) {
         use freshell_platform::spawn::{SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
         let spec = SpawnSpec {
@@ -733,7 +835,7 @@ mod tests {
                 &std::collections::BTreeMap::new(),
                 terminal_id.to_string(),
                 "stream-test".to_string(),
-                "shell",
+                mode,
                 None,
                 None,
                 None,
@@ -775,6 +877,7 @@ mod tests {
             terminal_meta: Default::default(),
             git_meta_cache: Default::default(),
             names,
+            metadata: crate::session_metadata::SessionMetadataStore::new(dir),
             index,
             index_hydrated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
@@ -1715,6 +1818,219 @@ mod tests {
         assert!(
             names.refresh_current().await.unwrap().is_empty(),
             "excluded providers never enter the naming authority"
+        );
+    }
+
+    // -- Unified agent names (Task 4, review I3): kilroy-only sessions ----
+    // Kilroy shares the Claude runtime, so its transcripts are listed by
+    // the claude source under provider "claude". The metadata store's
+    // known `kilroy` type is the discriminator the plan names: a
+    // kilroy-only session never enters the naming authority or the
+    // generator merely because its provider is claude — it KEEPS the
+    // legacy ladder (the Global Constraint: kilroy retains its existing
+    // UI and generation behavior).
+
+    /// Shared setup: a sweep state with the naming authority wired, one
+    /// live terminal matching the session (provider `claude`), and the
+    /// metadata store's kilroy tag applied (or not, per `tag_kilroy`).
+    async fn kilroy_sweep_state(
+        tag_kilroy: bool,
+    ) -> (
+        tempfile::TempDir,
+        Arc<crate::session_names::SessionNames>,
+        AutoTitleSweepState,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let names = crate::session_names::SessionNames::open(dir.path().to_path_buf()).unwrap();
+        let (state, _rx) = sweep_state_with(dir.path(), None, Some(names.clone()), None);
+        if tag_kilroy {
+            state
+                .metadata
+                .set("claude", "s-kilroy", "kilroy", Some("explicit"))
+                .await
+                .unwrap();
+        }
+        let tid = "term-kilroy";
+        spawn_headless_terminal_for_test(&state.registry, tid);
+        state
+            .identity
+            .upsert(tid, Some("claude"), Some("s-kilroy"), Some("/x/proj"), 1);
+        (dir, names, state)
+    }
+
+    /// A provider-`claude` listing row the metadata store types as kilroy
+    /// (with only a non-scoped live terminal) never hydrates a
+    /// naming-authority record and never arms the generator — the boot
+    /// pass keeps kilroy's legacy ladder exactly (the first-message
+    /// heuristic through the settings override row).
+    #[tokio::test]
+    async fn a_kilroy_typed_claude_row_never_hydrates_and_keeps_the_ladder() {
+        let (_dir, names, state) = kilroy_sweep_state(true).await;
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "claude",
+                "s-kilroy",
+                "/x/proj",
+                Some("Fix the flux capacitor"),
+            )],
+        )
+        .await;
+
+        // KEEPS the legacy ladder: the first-message heuristic finalizes
+        // through the settings override row (no AI key configured).
+        let row = state
+            .settings
+            .session_overrides()
+            .get("claude:s-kilroy")
+            .cloned()
+            .expect("the legacy ladder still serves the kilroy-only session");
+        assert_eq!(row["titleOverride"], "Fix the flux capacitor");
+        assert_eq!(row["titleSource"], "first-message");
+        // Never enters the naming authority — no record, no armed series.
+        assert!(
+            naming_record(&names, scoped_session_ref("claude", "s-kilroy"))
+                .await
+                .is_none(),
+            "a kilroy-only session never acquires a naming record"
+        );
+        assert!(
+            names.generation_work_snapshot().is_empty(),
+            "a kilroy-only session never arms the generator"
+        );
+    }
+
+    /// The same row AFTER boot: a live terminal at boot is the
+    /// explicit-open signal that would ARM the generator on a
+    /// metadata-blind sweep — a kilroy-only session still never arms, and
+    /// the ladder still writes.
+    #[tokio::test]
+    async fn a_kilroy_typed_claude_row_never_arms_generation_post_boot() {
+        let (_dir, names, state) = kilroy_sweep_state(true).await;
+        state
+            .index_hydrated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "claude",
+                "s-kilroy",
+                "/x/proj",
+                Some("Open the flux capacitor"),
+            )],
+        )
+        .await;
+        assert!(
+            names.generation_work_snapshot().is_empty(),
+            "a kilroy-only session never arms the generator, post-boot or not"
+        );
+        assert!(
+            naming_record(&names, scoped_session_ref("claude", "s-kilroy"))
+                .await
+                .is_none(),
+            "a kilroy-only session never acquires a naming record"
+        );
+        let row = state
+            .settings
+            .session_overrides()
+            .get("claude:s-kilroy")
+            .cloned()
+            .expect("the legacy ladder still serves the kilroy-only session");
+        assert_eq!(row["titleOverride"], "Open the flux capacitor");
+        assert_eq!(row["titleSource"], "first-message");
+    }
+
+    /// The same row WITHOUT the kilroy metadata entry behaves scoped: the
+    /// naming authority owns it (first-message fallback record, armed
+    /// generation) and the settings ladder never acquires a competing
+    /// title — the metadata consultation is the only discriminator.
+    #[tokio::test]
+    async fn the_same_row_without_the_kilroy_entry_behaves_scoped() {
+        let (_dir, names, state) = kilroy_sweep_state(false).await;
+        state
+            .index_hydrated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "claude",
+                "s-kilroy",
+                "/x/proj",
+                Some("Scoped session message"),
+            )],
+        )
+        .await;
+        let record = naming_record(&names, scoped_session_ref("claude", "s-kilroy"))
+            .await
+            .expect("the untagged claude session hydrates like any scoped row");
+        assert_eq!(record.record.name, "Scoped session message");
+        assert!(
+            names
+                .generation_work_snapshot()
+                .iter()
+                .any(|item| item.target == scoped_session_ref("claude", "s-kilroy")),
+            "the untagged claude session arms generation (explicitly open)"
+        );
+        assert!(
+            state
+                .settings
+                .session_overrides()
+                .get("claude:s-kilroy")
+                .is_none(),
+            "a scoped session never acquires a settings title"
+        );
+    }
+
+    /// The singular-record rule: a kilroy-typed row whose identical durable
+    /// session is ALSO open through a supported mode (a live terminal in
+    /// a scoped mode — here a `claude` CLI pane) still participates in
+    /// the naming authority: one canonical saved name, never a competing
+    /// kilroy record, and the ladder still excludes it.
+    #[tokio::test]
+    async fn a_kilroy_typed_row_with_a_live_scoped_terminal_participates_singularly() {
+        let (_dir, names, state) = kilroy_sweep_state(true).await;
+        // A SECOND live terminal in a scoped mode (a resumed claude CLI
+        // pane holding the same durable session) — the singular-record
+        // proxy that outvotes the kilroy-only skip.
+        spawn_headless_terminal_with_mode_for_test(&state.registry, "term-scoped", "claude");
+        state.identity.upsert(
+            "term-scoped",
+            Some("claude"),
+            Some("s-kilroy"),
+            Some("/x/proj"),
+            1,
+        );
+        state
+            .index_hydrated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "claude",
+                "s-kilroy",
+                "/x/proj",
+                Some("Dual mode session message"),
+            )],
+        )
+        .await;
+        let record = naming_record(&names, scoped_session_ref("claude", "s-kilroy"))
+            .await
+            .expect("the singular record serves the session also open through a supported mode");
+        assert_eq!(record.record.name, "Dual mode session message");
+        assert!(
+            names
+                .generation_work_snapshot()
+                .iter()
+                .any(|item| item.target == scoped_session_ref("claude", "s-kilroy")),
+            "the session also open through a supported mode arms generation"
+        );
+        assert!(
+            state
+                .settings
+                .session_overrides()
+                .get("claude:s-kilroy")
+                .is_none(),
+            "the singular scoped record keeps the ladder excluded"
         );
     }
 }

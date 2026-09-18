@@ -464,6 +464,16 @@ pub async fn report_accepted_input(
 ///   recovery remint and only its acquisition evidence is retained.
 /// * `Resume` / `Switch` / `NewConversation` never transfer a name: the pane
 ///   ADOPTS the durable session's own record (the caller projects it).
+///
+/// Production declarers today (T2-M5 truthful trim): claude's init lane
+/// (`InitialMaterialization` / `InternalContinuation`) and codex's
+/// rollout-verified bind (`InitialMaterialization`) classify through this
+/// fold; opencode's bind lane is behaviorally identical (verified
+/// persistence at materialization) through its direct `bind_pending` call.
+/// `InitialRecovery`, `Resume`, `Switch`, and `NewConversation` currently
+/// have NO production declarer — those behaviors are implemented by the
+/// Task 2 lanes through direct sink calls; these arms carry the shared
+/// policy for when a lane begins declaring them.
 pub async fn fold_identity_transition(
     sink: &Option<Arc<dyn SessionNaming>>,
     transition: &NameTransition,

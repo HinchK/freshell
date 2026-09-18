@@ -26,11 +26,14 @@
 //! document (short current-document transactions; the Gemini call itself
 //! happens OUTSIDE them); clock injection for the document's retry
 //! arithmetic is the store's data-dir-keyed test hook. A disabled naming
-//! toggle or a missing key pauses the work without consumption, and a
-//! settings/key capability change wakes it immediately
-//! ([`Self::notify_capability_change`] — the shared key cell notifies on
-//! every successful settings save, which also covers the
-//! `sidebar.autoGenerateTitles` toggle).
+//! toggle or a missing key pauses the work without consumption — the
+//! worker's ≤500ms poll re-evaluates capability, so a pause is discovered
+//! and resumed within one poll of the capability arriving. The ONE
+//! explicit wake caller today is the scoped compatibility route
+//! ([`Self::notify_capability_change`], `sessions.rs`'s generate-title
+//! arm); the settings PATCH path does NOT wake (the key cell is a bare
+//! RwLock with no notify), and `Notify::notify_waiters` is lossy (no
+//! permit) — the wake is a latency hint, never a correctness mechanism.
 //!
 //! Jobs capture the target, series id and input fingerprint; before folding
 //! a completion the store compares the captured fingerprint against the
@@ -127,10 +130,13 @@ pub(crate) struct IndexedNameInput {
 /// already-held background guard. Capability (the naming toggle and the
 /// Gemini key) is checked by the worker BEFORE selection, so disabled
 /// naming or a missing key pauses the work without consuming anything and
-/// without monopolizing the worker; [`Self::notify_capability_change`]
-/// wakes the worker immediately on a settings/key change (the shared key
-/// cell notifies on every successful settings save, which also covers the
-/// `sidebar.autoGenerateTitles` toggle).
+/// without monopolizing the worker; the worker's ≤500ms poll re-evaluates
+/// capability, so a pause is discovered and resumed within one poll of the
+/// capability arriving. The ONE explicit wake caller today is the scoped
+/// compatibility route (`sessions.rs`'s generate-title arm calls
+/// [`Self::notify_capability_change`]); the settings PATCH path does NOT
+/// wake, and the wake itself is a lossy latency hint, never a correctness
+/// mechanism.
 pub struct SessionNameGenerator {
     settings: SettingsStore,
     ai_key: AiKeyCell,
@@ -200,7 +206,6 @@ impl SessionNameGenerator {
                 op = "generation_claim",
                 name_ref = %freshell_freshagent::naming::name_ref_debug_key(&item.target),
                 series = %item.series_id,
-                revision = 0,
                 class = "stale",
                 "session_names.generation_stale: the series moved before the claim"
             );
@@ -212,7 +217,7 @@ impl SessionNameGenerator {
             name_ref = %freshell_freshagent::naming::name_ref_debug_key(&claim.target),
             series = %claim.series_id,
             attempt = %claim.attempt_id,
-            revision = claim.consumed,
+            consumed = claim.consumed,
             class = "started",
             "session_names.generation_started: attempt {} of the bounded series",
             claim.consumed
@@ -245,7 +250,7 @@ impl SessionNameGenerator {
                 name_ref = %freshell_freshagent::naming::name_ref_debug_key(&claim.target),
                 series = %claim.series_id,
                 attempt = %claim.attempt_id,
-                revision = claim.consumed,
+                consumed = claim.consumed,
                 class = "failed",
                 "session_names.generation_failed: {reason}"
             );

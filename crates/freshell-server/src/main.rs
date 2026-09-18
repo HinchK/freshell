@@ -1584,6 +1584,20 @@ async fn main() -> ExitCode {
         }),
     };
 
+    // SESSION-06 store (`session-metadata.json`), created here (before the
+    // sweeps and the directory state) because the `POST /api/session-metadata`
+    // write route below, Task 20's session-directory read-join, AND the
+    // auto-title sweep's kilroy-only discrimination (unified agent names
+    // Task 4, review I3) all share it. Same isolated-home `.freshell`
+    // directory the settings store resolves (`settings_store.rs:246`), so a
+    // real deployment's existing `session-metadata.json` is discovered
+    // exactly like the legacy server discovers it.
+    let session_metadata_dir = home
+        .as_deref()
+        .map(|h| h.join(".freshell"))
+        .unwrap_or_else(|| PathBuf::from(".freshell"));
+    let session_metadata_store = session_metadata::SessionMetadataStore::new(session_metadata_dir);
+
     // The History read model (`GET /api/session-directory`, Follow-up 3.19): list
     // the coding-CLI sessions from the isolated home's provider transcript dirs,
     // reusing `freshell-sessions` parsers. Replaces the earlier empty-page stub.
@@ -1656,6 +1670,11 @@ async fn main() -> ExitCode {
                 // scoped branch to nothing; excluded providers keep the
                 // legacy ladder either way.
                 names: session_names.clone(),
+                // Unified agent names (Task 4, review I3): the sweep
+                // consults the SAME session-metadata store the POST route
+                // and the directory read-join share — the kilroy-only
+                // discrimination for provider-claude listing rows.
+                metadata: session_metadata_store.clone(),
                 // The shared index serves the targeted opencode
                 // first-message lookup for already-named sessions.
                 index: Some(Arc::clone(index)),
@@ -1765,18 +1784,9 @@ async fn main() -> ExitCode {
     // Task 6: the sessions router's provider-generated short-circuit reads
     // the SAME session index (another clone before the move below).
     let sessions_state_index = session_index.clone();
-    // SESSION-06 store (`session-metadata.json`), created here (before the
-    // directory state) because BOTH the `POST /api/session-metadata` write
-    // route below and Task 20's session-directory read-join share it. Same
-    // isolated-home `.freshell` directory the settings store resolves
-    // (`settings_store.rs:246`), so a real deployment's existing
-    // `session-metadata.json` is discovered exactly like the legacy server
-    // discovers it.
-    let session_metadata_dir = home
-        .as_deref()
-        .map(|h| h.join(".freshell"))
-        .unwrap_or_else(|| PathBuf::from(".freshell"));
-    let session_metadata_store = session_metadata::SessionMetadataStore::new(session_metadata_dir);
+    // The session-metadata store was created above (before the sweeps) —
+    // both the `POST /api/session-metadata` write route below and Task
+    // 20's session-directory read-join share that instance.
     let session_directory_state = session_directory::SessionDirectoryState {
         auth_token: Arc::clone(&auth_token),
         settings: settings_store.clone(),
@@ -1857,7 +1867,7 @@ async fn main() -> ExitCode {
     // `POST /api/session-metadata` (`server/sessions-router.ts:220-244` +
     // `session-metadata-store.ts`): persists sidebar/fresh-agent `sessionType` tags to
     // `<home>/.freshell/session-metadata.json` through the SAME store instance Task 20's
-    // session-directory read-join reads (created above, before the directory state).
+    // session-directory read-join reads (created above, before the sweeps).
     let session_metadata_state = session_metadata::SessionMetadataApiState {
         auth_token: Arc::clone(&auth_token),
         store: session_metadata_store.clone(),

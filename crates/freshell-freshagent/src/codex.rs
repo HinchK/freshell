@@ -762,12 +762,10 @@ impl FreshCodexState {
         thread_id: &str,
         codex_home: Option<&str>,
     ) -> Option<crate::naming::NameTransition> {
-        let Some(handle) = self.naming_handles.lock().await.get(thread_id).cloned() else {
-            return None;
-        };
-        let Some(home) = codex_home.map(str::to_string).or_else(codex_home_from_env) else {
-            return None;
-        };
+        let handle = self.naming_handles.lock().await.get(thread_id).cloned()?;
+        let home = codex_home
+            .map(str::to_string)
+            .or_else(codex_home_from_env)?;
         let sessions_root = std::path::Path::new(&home).join("sessions");
         let Some(rollout) = locate_thread_rollout(&sessions_root, thread_id) else {
             return None; // still prospective: the tick retries the transition visibly
@@ -798,11 +796,12 @@ impl FreshCodexState {
         match crate::naming::fold_identity_transition(&self.naming(), &transition, target.clone())
             .await
         {
-            Some(update) => {
-                if update.record.name_ref == target {
-                    self.naming_handles.lock().await.remove(thread_id);
-                }
+            // Bound: the stash entry is consumed once the handle is
+            // redirected to the durable record.
+            Some(update) if update.record.name_ref == target => {
+                self.naming_handles.lock().await.remove(thread_id);
             }
+            Some(_) => {}
             None => {
                 // Unwired, or a failed bind: "on failed bind retain the
                 // handle" — the stash survives for the next visible retry.
@@ -1852,10 +1851,23 @@ impl FreshCodexState {
         // A resumed thread's rollout already exists — bind the just-admitted
         // handle immediately (verified persistence); a fresh thread's rollout
         // has not materialized, so this is a no-op until the turn-completed
-        // edge / the main.rs naming tick observes it.
+        // edge / the main.rs naming tick observes it. The declared
+        // transition is consumed as provenance (T2-M5 truthful trim: the
+        // identity-event upsert below deliberately carries `None` — the
+        // durable-before-answer ledger write precedes the rollout-driven
+        // bind, so the classification is not yet verified at upsert time).
         if claim.is_some() {
-            self.try_bind_pending_naming(&thread_id, codex_home.as_deref())
-                .await;
+            if let Some(transition) = self
+                .try_bind_pending_naming(&thread_id, codex_home.as_deref())
+                .await
+            {
+                tracing::debug!(
+                    provider = PROVIDER,
+                    session_id = %thread_id,
+                    reason = ?transition.reason,
+                    "freshagent.codex.naming_transition_declared"
+                );
+            }
         }
         let name_ref = naming_projection.as_ref().map(|(r, _)| r.clone());
         let session_name = naming_projection.map(|(_, record)| record);
@@ -4608,7 +4620,11 @@ impl FreshCodexState {
                         // the durability-driven pending bind fires here (a
                         // no-op once bound: the stash was consumed). The
                         // initialized `codexHome` comes from the live
-                        // session's app-server client.
+                        // session's app-server client. The declared transition
+                        // is consumed as provenance (the ledger edge for this
+                        // same turn deliberately carries `None`: the
+                        // durable-before-answer write precedes the
+                        // rollout-driven bind).
                         let codex_home = state
                             .sessions
                             .lock()
@@ -4619,9 +4635,17 @@ impl FreshCodexState {
                             Some(client) => client.codex_home().await,
                             None => None,
                         };
-                        state
+                        if let Some(transition) = state
                             .try_bind_pending_naming(session_id, codex_home.as_deref())
-                            .await;
+                            .await
+                        {
+                            tracing::debug!(
+                                provider = PROVIDER,
+                                session_id = %session_id,
+                                reason = ?transition.reason,
+                                "freshagent.codex.naming_transition_declared"
+                            );
+                        }
                     }
                     let frame = adapter_event_to_frame(&event, &thread_id);
                     if let Some(frame) = frame {

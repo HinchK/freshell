@@ -163,19 +163,28 @@ pub struct FreshAgentBindingUpsert {
     /// rollback fork from a crash-recovery mint-new from a deliberate new
     /// conversation). `None` = the write carries no naming fact (kilroy,
     /// out-of-scope lanes, or a provider that drives naming at another
-    /// site); when present, the server-side composition folds it into the
-    /// naming store alongside the ledger write.
+    /// site).
     ///
-    /// T2-M5 WIRED (Task 4): the runtime lanes that know WHY an identity
-    /// edge happened now declare the classification here (claude's init
-    /// lane — InitialMaterialization/InternalContinuation with the
-    /// transcript-verified acquisition; codex's rollout-verified create
-    /// tail; opencode's materialization), and the shared
+    /// T2-M5 disposition (Task 4, truthful trim): the classification is
+    /// consumed at the RUNTIME LANES THAT DECLARE IT, through the shared
     /// classification-driven fold (`crate::naming::fold_identity_transition`)
-    /// — the same transitions' one consumer — applies each class's policy:
-    /// verified persistence binds, prospective/InitialRecovery evidence
-    /// retains the handle, Resume/Switch/NewConversation adopt without
-    /// transfer. Edges without a naming fact stay `None`.
+    /// — claude's init lane (InitialMaterialization for a verified
+    /// materialization, InternalContinuation for a rollback fork;
+    /// prospective evidence retains the handle) and opencode's
+    /// materialization upsert. The SERVER's `record_binding`
+    /// (freshell-server's identity_sink) does NOT fold this field — it
+    /// builds the pane-ledger write without it; the field rides the wire
+    /// shape for the declaring lanes and any future server-side
+    /// composition. Codex's identity-event upserts declare `None`
+    /// deliberately: the durable-before-answer ledger write precedes the
+    /// rollout-driven bind, so the classification is not yet verified at
+    /// upsert time (codex's rollout bind classifies through the shared
+    /// fold directly, and its callers log the declared transition as
+    /// provenance). The remaining reasons (InitialRecovery, Resume,
+    /// Switch, NewConversation) currently have no production declarer —
+    /// those behaviors are implemented by the Task 2 lanes through
+    /// direct sink calls; the fold's arms carry the shared policy for
+    /// when a lane does declare them.
     pub name_transition: Option<crate::naming::NameTransition>,
     /// D8 provenance write policy (see [`ProvenanceUpdate`]; the ledger's
     /// atomic apply/preserve/clear merge lives in `freshell-ws`'s pane
