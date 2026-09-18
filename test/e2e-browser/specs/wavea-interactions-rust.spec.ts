@@ -136,14 +136,37 @@ async function listFiles(dir: string): Promise<string[]> {
   }
 }
 
-/** Donor: pane-ledger-restart-rust.spec.ts:101 (5s durability wall). */
-async function within5s(check: () => Promise<boolean>, what: string): Promise<void> {
-  const deadline = Date.now() + 5_000
+/**
+ * Durability wall (donor: pane-ledger-restart-rust.spec.ts — the same-named
+ * wall there): poll `check()` until it holds, with a 30s ENFORCEMENT bound and
+ * a 200ms poll cadence.
+ *
+ * Sizing evidence (kata pw80, wall-family load-tolerance pass): the previous
+ * 5s wall breached under co-tenant load in the gate receipts —
+ * gate-e2e-local-1.log frame 6 and gate3-e2e-local-1.log frame 7 (wall at
+ * :216, "claude binding row on disk") and gate3-e2e-local-1.log frame 8 (wall
+ * at :323, "claude terminal binding row on disk") at the 36fbc18f7/fe33b9d9f
+ * lanes — while co-tenant cargo package-cache lock contention stalls the
+ * ledger flush; green in every unloaded run. Per the campaign ladder the
+ * enforcement bound is 30s.
+ *
+ * This wall asserts a REAL product promptness property — the binding row
+ * must be on disk BEFORE the test proceeds to its imminent SIGKILL. A 30s
+ * bound still enforces on-disk-before-kill and bounds promptness; ~5s is the
+ * nominal (unloaded-host) figure, no longer the enforced bound.
+ */
+const DURABILITY_WALL_ENFORCEMENT_MS = 30_000
+const DURABILITY_WALL_POLL_MS = 200
+
+async function withinDurabilityWall(check: () => Promise<boolean>, what: string): Promise<void> {
+  const deadline = Date.now() + DURABILITY_WALL_ENFORCEMENT_MS
   while (Date.now() < deadline) {
     if (await check()) return
-    await new Promise((r) => setTimeout(r, 200))
+    await new Promise((r) => setTimeout(r, DURABILITY_WALL_POLL_MS))
   }
-  throw new Error(`5s durability wall breached: ${what}`)
+  throw new Error(
+    `durability wall breached (${DURABILITY_WALL_ENFORCEMENT_MS / 1000}s enforcement, ~5s nominal): ${what}`,
+  )
 }
 
 /** Generic layout-leaf finder (donor shape: findFreshAgentLeaf). */
@@ -211,20 +234,25 @@ test.describe('wave-A cross-lane interactions', () => {
 
         // Claude terminal pane: identity pre-allocated at create — the binding
         // row (WITH the advisory createRequestId, terminal.rs create path)
-        // must hit disk within the 5s wall.
+        // must hit disk within the durability wall (30s enforcement).
         await openCliPane(page, /^Claude CLI$/i)
-        await within5s(
+        await withinDurabilityWall(
           async () => (await readClaudeBindingRows(ledgerDir)).length > 0,
           'claude binding row on disk',
         )
 
         // The pane's key and the ledger row's advisory key must already agree.
         let keyBefore = ''
+        // 30s bound (was 15s): this exact poll timed out under co-tenant
+        // cloud load (kata pw80 receipt: hoststats-freshellpage-flake
+        // gate-e2e-lane-1.md item 1 — expect.poll Timeout 15000ms at this
+        // poll, recovered retry at d254f996c), the same ambient load
+        // population that breaches the durability walls above.
         await expect
           .poll(async () => {
             keyBefore = claudeTerminalLeaf(await harness.getPaneLayout(tabId))?.content?.createRequestId ?? ''
             return keyBefore
-          }, { timeout: 15_000 })
+          }, { timeout: 30_000 })
           .not.toBe('')
         const rowsAtCreate = await readClaudeBindingRows(ledgerDir)
         expect(rowsAtCreate.some((r) => r.createRequestId === keyBefore)).toBe(true)
@@ -320,7 +348,7 @@ test.describe('wave-A cross-lane interactions', () => {
 
         // Identity store 1 (A3): claude TERMINAL pane -> ledger binding row.
         await openCliPane(page, /^Claude CLI$/i)
-        await within5s(
+        await withinDurabilityWall(
           async () => (await readClaudeBindingRows(ledgerDir)).length > 0,
           'claude terminal binding row on disk',
         )
