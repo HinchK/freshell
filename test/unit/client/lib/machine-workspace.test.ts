@@ -587,3 +587,33 @@ describe('restoreMachineWorkspace', () => {
     },
   )
 })
+
+describe('restoreMachineWorkspace — unified agent names (Task 6)', () => {
+  it('threads the recovered plan nameSource into the restored tab', async () => {
+    const store = createStore()
+    const inventory = inventoryFor(MACHINE_ID)
+    inventory.device!.tabs[0] = {
+      tabKey: `${MACHINE_ID}:recovered-tab`,
+      tabName: 'Recovered workspace',
+      nameSource: { kind: 'session', paneId: 'recovered-pane' },
+      panes: [{
+        paneId: 'recovered-pane',
+        kind: 'terminal',
+        mode: 'claude',
+        shell: null,
+        cwd: '/work',
+        payload: { createRequestId: 'crid-agent' },
+        sessionRef: { provider: 'claude', sessionId: 'sess-agent' },
+        ledgerState: 'unknown',
+        live: false,
+      }],
+    }
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventory)
+
+    await restoreMachineWorkspace(store, MACHINE_ID)
+
+    const tab = store.getState().tabs.tabs.find((t) => t.id === 'recovered-tab')
+    expect(tab).toBeTruthy()
+    expect(tab?.nameSource).toEqual({ kind: 'session', paneId: 'recovered-pane' })
+  })
+})

@@ -522,6 +522,15 @@ pub struct UiLayoutTab {
     pub fallback_session_ref: Option<SessionLocator>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Unified agent names (Task 6): the client's stable naming-source
+    /// relationship for this tab (`session` names the source pane's canonical
+    /// session; `legacy` keeps the existing non-agent derivation). Absent on
+    /// pre-Task-6 clients — the server then keeps its previous pointer for
+    /// the tab and only derives for genuinely new tabs, so an old mirror can
+    /// never erase an initialized pointer. A tab carries the RELATIONSHIP,
+    /// never a second name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name_source: Option<crate::session_names::TabNameSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

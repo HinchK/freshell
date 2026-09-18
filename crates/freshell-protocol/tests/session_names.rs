@@ -323,3 +323,47 @@ fn legacy_frame_shapes_still_parse_after_the_naming_frame_addition() {
     .unwrap();
     assert!(matches!(changed, ServerMessage::SessionsChanged(_)));
 }
+
+#[test]
+fn ui_layout_sync_roundtrips_tab_name_source() {
+    use freshell_protocol::client_messages::UiLayoutSync;
+
+    let wire = json!({
+        "type": "ui.layout.sync",
+        "tabs": [
+            { "id": "t1", "title": "Owned", "nameSource": { "kind": "session", "paneId": "p-agent" } },
+            { "id": "t2", "title": "Legacy", "nameSource": { "kind": "legacy" } },
+            { "id": "t3", "title": "Unresolved" },
+        ],
+        "activeTabId": "t1",
+        "layouts": {},
+        "activePane": {},
+        "timestamp": 1,
+    });
+    let sync: UiLayoutSync = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(sync.tabs.len(), 3);
+    assert_eq!(
+        sync.tabs[0].name_source,
+        Some(TabNameSource::Session {
+            pane_id: "p-agent".into()
+        })
+    );
+    assert_eq!(sync.tabs[1].name_source, Some(TabNameSource::Legacy));
+    assert_eq!(sync.tabs[2].name_source, None, "absent stays absent");
+
+    // Re-serialization keeps the field and elides it when absent (the mirror
+    // payload stays byte-compatible for pre-Task-6 clients).
+    let roundtripped = serde_json::to_value(&sync).unwrap();
+    assert_eq!(
+        roundtripped["tabs"][0]["nameSource"],
+        json!({ "kind": "session", "paneId": "p-agent" })
+    );
+    assert_eq!(
+        roundtripped["tabs"][1]["nameSource"],
+        json!({ "kind": "legacy" })
+    );
+    assert!(
+        roundtripped["tabs"][2].get("nameSource").is_none(),
+        "an absent pointer must be omitted, never null: {roundtripped}"
+    );
+}

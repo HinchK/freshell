@@ -14,6 +14,8 @@ import {
 } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState } from '@shared/fresh-agent'
+import { TabNameSourceSchema } from '@shared/session-names'
+import { parsePaneNamingIdentityInput } from '@/lib/tab-name-source'
 import { normalizeFreshAgentPaneModelSelection } from './paneTypes'
 import { createLogger } from '@/lib/client-logger'
 import { isValidMachineIdStamp } from '@/lib/machine-identity'
@@ -184,6 +186,7 @@ function normalizePersistedTab(tab: Record<string, unknown>): PersistedTab {
     sessionRef: _legacySessionRef,
     codingCliSessionId: _codingCliSessionId,
     claudeSessionId: _claudeSessionId,
+    nameSource: _unvalidatedNameSource,
     ...rest
   } = tab
 
@@ -191,6 +194,11 @@ function normalizePersistedTab(tab: Record<string, unknown>): PersistedTab {
     ...rest,
     ...(durableState.sessionRef ? { sessionRef: durableState.sessionRef } : {}),
     ...(codexDurability ? { codexDurability } : {}),
+    // Unified agent names (Task 6): a valid tab nameSource survives the
+    // persisted parse; a malformed one drops (never a corrupt relationship).
+    ...(TabNameSourceSchema.safeParse(tab.nameSource).success
+      ? { nameSource: tab.nameSource }
+      : {}),
   } as PersistedTab
 }
 
@@ -238,6 +246,23 @@ export type ParsedPersistedPanes = {
   activePane: Record<string, string>
   paneTitles: Record<string, Record<string, string>>
   paneTitleSetByUser: Record<string, Record<string, boolean>>
+}
+
+/**
+ * Unified agent names (Task 6): validate a persisted pane content's naming
+ * identity — the SHARED parse point (`parsePaneNamingIdentityInput`) keeps
+ * only a schema-valid `nameRef` and a non-empty `namingHandle`; malformed
+ * values drop so a corrupt persisted/hydrated identity never enters pane
+ * content (the transient runtime id strip elsewhere never touches these
+ * fields).
+ */
+function sanitizePaneNamingIdentity(content: Record<string, unknown>): Record<string, unknown> {
+  if (content.kind !== 'terminal' && content.kind !== 'fresh-agent') return content
+  const { nameRef: _nameRef, namingHandle: _namingHandle, ...rest } = content
+  return {
+    ...rest,
+    ...parsePaneNamingIdentityInput(content),
+  }
 }
 
 function normalizeTerminalContent(content: Record<string, unknown>): Record<string, unknown> {
@@ -361,9 +386,9 @@ function normalizePersistedNode(node: unknown): unknown {
     const content = migrateLegacyFreshAgentContent(candidate.content as Record<string, unknown>) as Record<string, unknown>
     let nextContent = content
     if (content.kind === 'terminal') {
-      nextContent = normalizeTerminalContent(content)
+      nextContent = sanitizePaneNamingIdentity(normalizeTerminalContent(content))
     } else if (content.kind === 'fresh-agent') {
-      nextContent = normalizeFreshAgentContent(content)
+      nextContent = sanitizePaneNamingIdentity(normalizeFreshAgentContent(content))
     } else if ('sessionRef' in content) {
       const sanitizedSessionRef = sanitizeSessionRef(content.sessionRef)
       const { sessionRef: _legacySessionRef, ...rest } = content

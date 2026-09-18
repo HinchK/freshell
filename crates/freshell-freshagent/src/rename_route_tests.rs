@@ -791,3 +791,62 @@ async fn naming_zero_turn_initial_recovery_resolves_the_retained_handle() {
     );
     drop(renames);
 }
+
+/// Unified agent names (Task 6): the client's SYNCED nameSource pointer is
+/// authoritative on the server mirror — a tab whose adopted pointer names a
+/// NON-first leaf (e.g. after a content swap moved the source off the first
+/// slot) routes its tab rename through THAT pane's session, never the
+/// derived first leaf.
+#[tokio::test]
+async fn rename_tab_routes_through_the_adopted_synced_name_source_not_the_derived_first_leaf() {
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+    let state = state_with(tx.clone());
+    let sink = wire_recording_sink(&state);
+    seed_durable_record(&sink, "handle-adopted", "sess-adopted-source").await;
+
+    // Tab t1: first leaf is a shell (derivation would say legacy), second
+    // leaf is the scoped claude pane the client's pointer names.
+    seed_layout(
+        &state,
+        json!({
+            "tabs": [{ "id": "t1", "title": "First", "nameSource": { "kind": "session", "paneId": "p-agent" } }],
+            "activeTabId": "t1",
+            "layouts": { "t1": {
+                "type": "split", "id": "s1", "direction": "horizontal", "sizes": [50, 50],
+                "children": [
+                    { "type": "leaf", "id": "p-shell", "content": {
+                        "kind": "terminal", "mode": "shell",
+                    } },
+                    { "type": "leaf", "id": "p-agent", "content": {
+                        "kind": "terminal", "mode": "claude",
+                        "sessionRef": { "provider": "claude", "sessionId": "sess-adopted-source" },
+                    } },
+                ],
+            } },
+            "activePane": { "t1": "p-shell" },
+            "paneTitles": {},
+            "paneTitleSetByUser": {},
+            "timestamp": 1,
+        }),
+    );
+
+    let (status, body) = patch_tab(
+        crate::router(state.clone()),
+        "t1",
+        json!({ "name": "Adopted Pointer Rename" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let renames = sink.renames.lock().unwrap();
+    assert_eq!(renames.len(), 1, "{renames:?}");
+    assert_eq!(
+        renames[0].target,
+        SessionNameRef::Session {
+            provider: NamedProvider::Claude,
+            session_id: "sess-adopted-source".into(),
+        },
+        "the tab rename must route through the ADOPTED synced pointer's session, never the derived first leaf"
+    );
+    assert_eq!(renames[0].name, "Adopted Pointer Rename");
+}

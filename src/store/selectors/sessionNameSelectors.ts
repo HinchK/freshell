@@ -235,6 +235,24 @@ export function selectSessionDisplayName(state: RootState, ref: SessionNameRef, 
   return record?.name ?? fallback
 }
 
+/**
+ * The shared durable-key row projection (T5-N5): the canonical cache record
+ * for a directory/history/sidebar session ROW, keyed by the row's durable
+ * provider/session identity. One helper — HistoryView and the sidebar
+ * selectors consume THIS, never a second inline `sessionNameRefKey` build.
+ * Not redirect-resolved by design: durable-keyed directory rows address the
+ * final identity already; pending-handle resolution belongs to pane content
+ * (`resolvePaneNameRef`), never to rows.
+ */
+export function selectSessionRowRecord(
+  sessionNames: SessionNamesCache | undefined,
+  provider: string,
+  sessionId: string,
+): SessionNameRecord | undefined {
+  if (!sessionNames || !isNamedProvider(provider)) return undefined
+  return sessionNames.records?.[sessionNameRefKey({ kind: 'session', provider, sessionId })]
+}
+
 /** The rename capture (stale-input protection): the pane's naming target and
  * its last-known revision at edit start. `ref` is undefined when nothing
  * resolves — callers then send no capture guards and the server's own

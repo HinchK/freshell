@@ -80,6 +80,7 @@ import {
 import { isTerminalPasteShortcut } from '@/lib/terminal-input-policy'
 import { terminalFollowsOscTitle } from '@/lib/terminal-title-policy'
 import { isUnifiedAgentMode } from '@shared/session-names'
+import { selectTabNameSourcePaneId } from '@/store/selectors/sessionNameSelectors'
 import { recordTerminalTitleForReplay } from '@/lib/terminal-inventory-titles'
 import {
   clearTerminalCursor,
@@ -4789,9 +4790,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             // unrevisioned registry title never rewrites its pane, and it
             // can never name a session-owned tab (only the tab's stable
             // source pane's session owns that tab's display).
+            // Task 6 (T5-M7 gate): the tab-write gate is tab-ownership-scoped,
+            // not just pane-scoped — a non-agent sibling (a shell) in a
+            // session-OWNED tab cannot churn that tab's stored fallback
+            // title either. Legacy and mixed tabs (pointer legacy/undefined)
+            // keep the existing shell OSC/exit write behavior verbatim.
             const scopedPane = isUnifiedAgentMode(contentRef.current?.mode, undefined)
             const titleTab = tabRef.current
-            if (!scopedPane && titleTab && !titleTab.titleSetByUser) {
+            const sessionOwnedTab = titleTab
+              ? selectTabNameSourcePaneId(appStore.getState() as never, titleTab.id) != null
+              : false
+            if (!scopedPane && !sessionOwnedTab && titleTab && !titleTab.titleSetByUser) {
               dispatch(updateTab({ id: titleTab.id, updates: { title: msg.title } }))
             }
             if (!scopedPane) {

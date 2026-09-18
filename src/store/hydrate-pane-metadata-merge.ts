@@ -1,4 +1,5 @@
-import type { PanesState, PaneNode } from './paneTypes'
+import type { PanesState, PaneContent, PaneNode } from './paneTypes'
+import { isScopedNameSourceContent } from '@/lib/tab-name-source'
 
 export type HydratePanesMeta = {
   localLayoutPersistedAt?: number
@@ -213,6 +214,37 @@ export function paneTitleMetadataEquals(
     && paneTitleRecordsEqual(a.paneTitleSetByUser, b.paneTitleSetByUser)
 }
 
+/**
+ * Unified agent names (Task 6): the local scoped pane ids of one tab — the
+ * panes whose display/name is owned by the canonical session-names authority.
+ * A stale foreign-window envelope's user-set flags (a pre-Task-5 rename)
+ * must never freeze those panes' names, so the title-only cross-window merge
+ * delivers nothing to them.
+ */
+function localScopedPaneIds(localLayout: unknown): Set<string> {
+  const ids = new Set<string>()
+  const visit = (candidate: unknown): void => {
+    if (!candidate || typeof candidate !== 'object') return
+    const record = candidate as { type?: unknown; id?: unknown; content?: unknown; children?: unknown }
+    if (record.type === 'leaf') {
+      if (
+        typeof record.id === 'string'
+        && record.content
+        && typeof record.content === 'object'
+        && isScopedNameSourceContent(record.content as PaneContent)
+      ) {
+        ids.add(record.id)
+      }
+      return
+    }
+    if (record.type === 'split' && Array.isArray(record.children)) {
+      for (const child of record.children) visit(child)
+    }
+  }
+  visit(localLayout)
+  return ids
+}
+
 /** TITLE-ONLY cross-window reconciliation (e3r1 finding 4): another
  * window's layout event may never adopt tabs, trees, content, active
  * panes, or ephemeral pane state — only pane TITLES flow across windows,
@@ -222,7 +254,9 @@ export function paneTitleMetadataEquals(
  * a shared pane delivers nothing (the local entry stands verbatim — the
  * path delivers titles, it never erases them). The incoming base applies
  * only when the incoming layout is STRICTLY newer (layout persistedAt
- * meta); unknown-age incoming is never the base. */
+ * meta); unknown-age incoming is never the base. A scoped agent pane
+ * receives NOTHING from a foreign window (Task 6): its user-set flags and
+ * titles are stale aliases of a canonical name, never a live freeze. */
 export function mergeCrossWindowPaneTitles(
   state: PanesState,
   incoming: Pick<PanesState, 'paneTitles' | 'paneTitleSetByUser'>,
@@ -243,6 +277,7 @@ export function mergeCrossWindowPaneTitles(
   for (const [tabId, localLayout] of Object.entries(state.layouts)) {
     const localPaneIds = collectLeafPaneIds(localLayout)
     const paneIdSet = new Set(localPaneIds)
+    const scopedPaneIds = localScopedPaneIds(localLayout)
     const incomingLayout = incomingLayouts[tabId]
     const incomingPaneIdSet = incomingLayout !== undefined && incomingLayout !== null
       ? new Set(collectLeafPaneIdsSafe(incomingLayout))
@@ -269,8 +304,9 @@ export function mergeCrossWindowPaneTitles(
       const incomingFlag = sharedWithIncoming && incomingTabFlags !== undefined && paneId in incomingTabFlags
         ? incomingTabFlags[paneId]
         : undefined
-      if (incomingTitle === undefined) {
-        // No delivery for this pane: the local entry stands verbatim.
+      if (incomingTitle === undefined || scopedPaneIds.has(paneId)) {
+        // No delivery for this pane — or a scoped pane, whose title/flags a
+        // foreign window may never freeze: the local entry stands verbatim.
         if (localTitle !== undefined) nextTabTitles[paneId] = localTitle
         if (localFlag !== undefined) nextTabFlags[paneId] = localFlag
         continue

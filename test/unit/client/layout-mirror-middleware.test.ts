@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
-import tabsReducer, { addTab } from '../../../src/store/tabsSlice'
+import tabsReducer, { addTab, setTabNameSource } from '../../../src/store/tabsSlice'
 import panesReducer, { initLayout, mergePaneContent, updatePaneTitle } from '../../../src/store/panesSlice'
 import { layoutMirrorMiddleware } from '../../../src/store/layoutMirrorMiddleware'
 
@@ -171,6 +171,58 @@ describe('layoutMirrorMiddleware', () => {
       },
     }))
 
+    vi.useRealTimers()
+  })
+})
+
+describe('unified agent names (Task 6): ui.layout.sync carries the tab nameSource', () => {
+  it('mirrors a session-owned tab nameSource through the sync payload', () => {
+    mockSend.mockClear()
+    vi.useFakeTimers()
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: (g) => g().concat(layoutMirrorMiddleware),
+    })
+
+    store.dispatch(addTab({ id: 'tab-owned', title: 'alpha' }))
+    store.dispatch(initLayout({
+      tabId: 'tab-owned',
+      paneId: 'p-agent',
+      content: { kind: 'terminal', mode: 'claude' },
+    }))
+    store.dispatch(setTabNameSource({
+      tabId: 'tab-owned',
+      nameSource: { kind: 'session', paneId: 'p-agent' },
+    }))
+    mockSend.mockClear()
+    // Any subsequent action re-serializes the payload with the pointer.
+    store.dispatch(initLayout({
+      tabId: 'tab-owned-2',
+      paneId: 'p2',
+      content: { kind: 'terminal', mode: 'shell' },
+    }))
+    vi.runOnlyPendingTimers()
+
+    const payload = mockSend.mock.calls[0]?.[0] as { tabs?: Array<{ id: string; nameSource?: unknown }> }
+    const owned = payload?.tabs?.find((t) => t.id === 'tab-owned')
+    expect(owned?.nameSource).toEqual({ kind: 'session', paneId: 'p-agent' })
+    vi.useRealTimers()
+  })
+
+  it('omits nameSource for tabs without a resolved pointer', () => {
+    mockSend.mockClear()
+    vi.useFakeTimers()
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: (g) => g().concat(layoutMirrorMiddleware),
+    })
+    store.dispatch(addTab({ id: 'tab-plain', title: 'alpha' }))
+    vi.runOnlyPendingTimers()
+
+    const payload = mockSend.mock.calls[0]?.[0] as { tabs?: Array<Record<string, unknown>> }
+    const plain = payload?.tabs?.find((t) => t.id === 'tab-plain')
+    expect(plain).toBeTruthy()
+    expect(plain).not.toHaveProperty('nameSource')
     vi.useRealTimers()
   })
 })

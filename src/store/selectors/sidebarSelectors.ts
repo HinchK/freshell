@@ -12,7 +12,7 @@ import { deriveTabRecencyAt } from '@/lib/tab-recency'
 import type { CodexDurabilityRef, CodexDurabilityStateName } from '../../../shared/codex-durability.js'
 import { sessionStatusTierRank, type SessionStatusTier } from '@/store/selectors/sessionStatusTiers'
 import { makeSelectSessionStatusTiers } from '@/store/selectors/sessionStatusTiers'
-import { isScopedSessionRow } from '@/store/selectors/sessionNameSelectors'
+import { isScopedSessionRow, selectSessionRowRecord } from '@/store/selectors/sessionNameSelectors'
 
 /**
  * Module-scope instance of the status-tier selector, shared by every
@@ -192,8 +192,9 @@ export function buildSessionItems(
    */
   const scopedCanonicalTitle = (provider: string, sessionId: string, sessionType?: string): string | undefined => {
     if (!sessionNames || !isScopedSessionRow(provider, sessionType)) return undefined
-    const record = sessionNames.records?.[JSON.stringify(['session', provider, sessionId])]
-    return record?.name
+    // T5-N5: the shared durable-key row projection — never an inline
+    // `sessionNameRefKey` build.
+    return selectSessionRowRecord(sessionNames, provider, sessionId)?.name
   }
 
   for (const terminal of terminals || []) {

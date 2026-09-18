@@ -47,10 +47,13 @@ pub struct TabRow {
     pub name_source: Option<freshell_protocol::session_names::TabNameSource>,
 }
 
-/// Unified agent names (Task 2): derive one tab's name source from its
+/// Unified agent names (Task 2/6): derive one tab's name source from its
 /// layout — depth-first first-leaf order. A scoped agent leaf owns the tab
-/// (`session` with that pane id); any other content leaf is `legacy`; a
-/// tab with no resolvable leaf keeps `None` (the initial-picker state).
+/// (`session` with that pane id); any other real content leaf is `legacy`;
+/// a tab with no resolvable leaf — or whose FIRST leaf is still the initial
+/// picker — keeps `None` (the unresolved initial-picker state: the picker's
+/// first actual content choice resolves ownership, and a later mixed-tab
+/// agent addition never claims it).
 fn derive_name_source(
     snapshot: &UiSnapshot,
     tab_id: &str,
@@ -63,6 +66,11 @@ fn derive_name_source(
         if crate::naming::is_unified_agent_mode(mode, session_type) {
             return Some(freshell_protocol::session_names::TabNameSource::Session { pane_id });
         }
+        // A picker leaf is NOT an actual content choice: the tab stays
+        // unresolved until the picker is replaced.
+        if kind == Some("picker") {
+            return None;
+        }
         // Any other real content leaf (shell/browser/editor/terminal/
         // excluded providers): the existing non-agent derivation owns it.
         if kind.is_some() {
@@ -70,6 +78,27 @@ fn derive_name_source(
         }
     }
     None
+}
+
+/// Unified agent names (Task 6): the removal rule — the first remaining
+/// SCOPED leaf in depth-first left-to-right order (optionally excluding the
+/// pane the source lost), else the existing non-agent derivation.
+fn next_name_source_after_source_loss(
+    snapshot: &UiSnapshot,
+    tab_id: &str,
+    exclude_pane_id: Option<&str>,
+) -> freshell_protocol::session_names::TabNameSource {
+    for (pane_id, content) in leaves_of(snapshot, tab_id) {
+        if Some(pane_id.as_str()) == exclude_pane_id {
+            continue;
+        }
+        let mode = content.get("mode").and_then(Value::as_str);
+        let session_type = content.get("sessionType").and_then(Value::as_str);
+        if crate::naming::is_unified_agent_mode(mode, session_type) {
+            return freshell_protocol::session_names::TabNameSource::Session { pane_id };
+        }
+    }
+    freshell_protocol::session_names::TabNameSource::Legacy
 }
 
 /// The server-side mirror of the client's layout snapshot
@@ -272,6 +301,26 @@ impl LayoutStore {
         sync: &freshell_protocol::UiLayoutSync,
         source_connection_id: &str,
     ) {
+        // Unified agent names (Task 6): the replaced entry's per-tab
+        // pointers, captured BEFORE the replacement so a sync that omits
+        // the field (an old mirror) can never erase an initialized pointer.
+        let previous_sources: HashMap<
+            String,
+            Option<freshell_protocol::session_names::TabNameSource>,
+        > = self
+            .lock()
+            .clients
+            .iter()
+            .find(|entry| entry.key == source_connection_id)
+            .map(|entry| {
+                entry
+                    .snapshot
+                    .tabs
+                    .iter()
+                    .map(|t| (t.id.clone(), t.name_source.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut snapshot = UiSnapshot {
             tabs: sync
                 .tabs
@@ -283,9 +332,15 @@ impl LayoutStore {
                         .fallback_session_ref
                         .as_ref()
                         .and_then(|locator| serde_json::to_value(locator).ok()),
-                    // Unified agent names: derived after the layouts parse
-                    // (the loop below).
-                    name_source: None,
+                    // Unified agent names (Task 6): adopted from the client's
+                    // synced pointer, carried over from this client's previous
+                    // entry when the sync omits it, or derived (first-leaf
+                    // rule) for genuinely new tabs — resolved after the
+                    // layouts parse (the loop below).
+                    name_source: tab
+                        .name_source
+                        .clone()
+                        .or_else(|| previous_sources.get(&tab.id).cloned().flatten()),
                 })
                 .collect(),
             active_tab_id: sync.active_tab_id.clone().flatten(),
@@ -309,10 +364,12 @@ impl LayoutStore {
         }
         // Seed derived titles per leaf, in tab order (`layout-store.ts:175-180`).
         let tab_ids: Vec<String> = snapshot.tabs.iter().map(|t| t.id.clone()).collect();
-        // Unified agent names (Task 2): deterministic per-tab name-source
-        // derivation (see `derive_name_source` — the snapshot's first leaf
-        // decides, so a legacy tab that later gains an agent pane keeps its
-        // legacy naming).
+        // Unified agent names (Task 6): resolve the still-UNSET pointers —
+        // adopted/carried pointers stay authoritative; a tab new to this
+        // client (no synced pointer, no previous pointer) derives
+        // deterministically from its first leaf (see `derive_name_source` —
+        // a legacy tab that later gains an agent pane keeps its legacy
+        // naming; an initial picker stays unresolved).
         {
             let sources: Vec<(
                 String,
@@ -324,7 +381,9 @@ impl LayoutStore {
                 .collect();
             for (id, name_source) in sources {
                 if let Some(tab) = snapshot.tabs.iter_mut().find(|t| t.id == id) {
-                    tab.name_source = name_source;
+                    if tab.name_source.is_none() {
+                        tab.name_source = name_source;
+                    }
                 }
             }
         }
@@ -560,11 +619,12 @@ impl LayoutStore {
         found
     }
 
-    /// Unified agent names (Task 2): the source-pane remap after a pane
+    /// Unified agent names (Task 2/6): the source-pane remap after a pane
     /// close/move — when the closed pane WAS the tab's naming source, the
-    /// tab follows the first remaining scoped leaf (depth-first
-    /// left-to-right), else falls back to legacy; a tab with no scoped leaf
-    /// left returns to the existing non-agent derivation.
+    /// tab follows the first remaining SCOPED leaf (depth-first
+    /// left-to-right, never the first leaf of any kind), else falls back to
+    /// legacy; a tab with no scoped leaf left returns to the existing
+    /// non-agent derivation.
     pub fn remap_name_source_after_close(&self, tab_id: &str, closed_pane_id: &str) {
         let mut inner = self.lock();
         for snapshot in inner.snapshots_mut() {
@@ -583,9 +643,9 @@ impl LayoutStore {
             if !matches_closed {
                 continue;
             }
-            let name_source = derive_name_source(snapshot, tab_id);
+            let name_source = next_name_source_after_source_loss(snapshot, tab_id, None);
             if let Some(tab) = snapshot.tabs.iter_mut().find(|t| t.id == tab_id) {
-                tab.name_source = name_source;
+                tab.name_source = Some(name_source);
             }
         }
     }
@@ -899,13 +959,43 @@ impl LayoutStore {
             // reports `{tabId, paneId}` — mirrored here (return value ignored).
             root.replace_leaf_content(pane_id, normalized.clone());
             seed_pane_title(snapshot, tab_id, pane_id, &normalized);
-            // Unified agent names (Task 2): the content attach IS the
-            // initial-content-choice moment — re-derive this tab's name
-            // source (first-leaf rule; an agent attached to a legacy tab
-            // never flips it because the FIRST leaf decides).
-            let name_source = derive_name_source(snapshot, tab_id);
+            // Unified agent names (Task 2/6): the content attach is the
+            // initial-content-choice moment ONLY for an unresolved tab (a
+            // picker resolving to its first scoped content). A resolved
+            // pointer never re-derives — a legacy tab attaching an agent
+            // keeps its naming, and a session-owned tab whose SOURCE pane's
+            // content became non-agent follows the removal rule.
+            let current_source = snapshot
+                .tabs
+                .iter()
+                .find(|t| t.id == tab_id)
+                .and_then(|t| t.name_source.clone());
+            let next_source = match current_source {
+                None => derive_name_source(snapshot, tab_id),
+                Some(freshell_protocol::session_names::TabNameSource::Session {
+                    pane_id: source_pane_id,
+                }) if source_pane_id == pane_id => {
+                    let still_scoped = {
+                        let mode = normalized.get("mode").and_then(Value::as_str);
+                        let session_type = normalized.get("sessionType").and_then(Value::as_str);
+                        crate::naming::is_unified_agent_mode(mode, session_type)
+                    };
+                    if still_scoped {
+                        Some(freshell_protocol::session_names::TabNameSource::Session {
+                            pane_id: source_pane_id,
+                        })
+                    } else {
+                        Some(next_name_source_after_source_loss(
+                            snapshot,
+                            tab_id,
+                            Some(&source_pane_id),
+                        ))
+                    }
+                }
+                other => other,
+            };
             if let Some(tab) = snapshot.tabs.iter_mut().find(|t| t.id == tab_id) {
-                tab.name_source = name_source;
+                tab.name_source = next_source;
             }
             found = true;
         }
@@ -1193,6 +1283,15 @@ fn tab_row_value(tab: &TabRow) -> Value {
     }
     if let Some(fallback) = &tab.fallback_session_ref {
         map.insert("fallbackSessionRef".to_string(), fallback.clone());
+    }
+    // Unified agent names (Task 6): the stable naming-source relationship
+    // round-trips the REST/agent-API snapshot read (rename-tab routes resolve
+    // THIS, never the active pane). Omitted when unresolved, matching the
+    // additive wire shape.
+    if let Some(name_source) = &tab.name_source {
+        if let Ok(value) = serde_json::to_value(name_source) {
+            map.insert("nameSource".to_string(), value);
+        }
     }
     Value::Object(map)
 }

@@ -472,3 +472,92 @@ describe('tab registry record name alignment', () => {
     expect(record.tabName).toBe(getTabDisplayTitle(tab, layout, paneTitles))
   })
 })
+
+describe('unified agent names registry round-trip (Task 6)', () => {
+  it('carries the pane naming identity (namingHandle/nameRef) in terminal pane payloads', () => {
+    const node: PaneNode = {
+      type: 'leaf',
+      id: 'pane-named',
+      content: {
+        kind: 'terminal',
+        createRequestId: 'req-named',
+        status: 'running',
+        mode: 'claude',
+        shell: 'system',
+        namingHandle: 'nh-reg-1',
+        nameRef: { kind: 'pending', id: 'nh-reg-1' },
+      },
+    }
+
+    const snapshots = collectPaneSnapshots(node, 'srv')
+
+    expect(snapshots[0].payload).toMatchObject({
+      namingHandle: 'nh-reg-1',
+      nameRef: { kind: 'pending', id: 'nh-reg-1' },
+    })
+  })
+
+  it('carries the pane naming identity in fresh-agent pane payloads', () => {
+    const node: PaneNode = {
+      type: 'leaf',
+      id: 'pane-fa-named',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshclaude',
+        provider: 'claude',
+        createRequestId: 'req-fa-named',
+        status: 'idle',
+        namingHandle: 'nh-fa-1',
+        nameRef: { kind: 'session', provider: 'claude', sessionId: 'sess-fa' },
+      } as any,
+    }
+
+    const snapshots = collectPaneSnapshots(node, 'srv')
+
+    expect(snapshots[0].payload).toMatchObject({
+      namingHandle: 'nh-fa-1',
+      nameRef: { kind: 'session', provider: 'claude', sessionId: 'sess-fa' },
+    })
+  })
+
+  it('stamps the tab nameSource onto open and closed records, and omits it when absent', () => {
+    const layout: PaneNode = {
+      type: 'leaf',
+      id: 'p1',
+      content: { kind: 'terminal', mode: 'claude', status: 'running', createRequestId: 'r' },
+    }
+
+    const openRecord = buildOpenTabRegistryRecord({
+      tab: { id: 't1', createRequestId: 'r', title: 'T', status: 'running', mode: 'claude', createdAt: 1, nameSource: { kind: 'session', paneId: 'p1' } } as never,
+      layout,
+      serverInstanceId: 'srv',
+      deviceId: 'd',
+      deviceLabel: 'D',
+      updatedAt: 1,
+      revision: 0,
+    })
+    expect(openRecord.nameSource).toEqual({ kind: 'session', paneId: 'p1' })
+
+    const closedRecord = buildClosedTabRegistryRecord({
+      tab: { id: 't1', createRequestId: 'r', title: 'T', status: 'running', mode: 'claude', createdAt: 1, nameSource: { kind: 'legacy' } } as never,
+      layout,
+      serverInstanceId: 'srv',
+      deviceId: 'd',
+      deviceLabel: 'D',
+      updatedAt: 1,
+      revision: 0,
+    })
+    expect(closedRecord.nameSource).toEqual({ kind: 'legacy' })
+
+    const unownedRecord = buildOpenTabRegistryRecord({
+      tab: { id: 't1', createRequestId: 'r', title: 'T', status: 'running', mode: 'claude', createdAt: 1 } as never,
+      layout,
+      serverInstanceId: 'srv',
+      deviceId: 'd',
+      deviceLabel: 'D',
+      updatedAt: 1,
+      revision: 0,
+    })
+    expect(unownedRecord).not.toHaveProperty('nameSource')
+  })
+})

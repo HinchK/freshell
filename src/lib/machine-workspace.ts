@@ -186,7 +186,14 @@ export async function restoreMachineWorkspace(
   store.dispatch(clearTabRegistryLocalClosed())
 
   for (const plan of plans) {
-    store.dispatch(addTab({ id: plan.tabId, title: plan.title }))
+    store.dispatch(addTab({
+      id: plan.tabId,
+      title: plan.title,
+      // Unified agent names (Task 6): the recovered tab keeps its stable
+      // naming-source relationship (the plan remapped it through the
+      // old→new pane-id map; machine bootstrap preserves ids verbatim).
+      ...(plan.nameSource ? { nameSource: plan.nameSource } : {}),
+    }))
     store.dispatch(restoreLayout({
       tabId: plan.tabId,
       layout: plan.layout,

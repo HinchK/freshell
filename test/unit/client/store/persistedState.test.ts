@@ -577,3 +577,90 @@ describe('persistedState parsers', () => {
     })
   })
 })
+
+  describe('unified agent names (Task 6): naming identity round-trip', () => {
+    it('keeps a valid tab nameSource through the persisted-tabs parse and drops a malformed one', () => {
+      const raw = JSON.stringify({
+        version: TABS_SCHEMA_VERSION,
+        tabs: {
+          activeTabId: 't1',
+          tabs: [
+            {
+              id: 't1',
+              title: 'Owned',
+              createdAt: 1,
+              nameSource: { kind: 'session', paneId: 'p-agent' },
+            },
+            {
+              id: 't2',
+              title: 'Corrupt',
+              createdAt: 1,
+              nameSource: { kind: 'session' },
+            },
+          ],
+        },
+      })
+
+      const parsed = parsePersistedTabsRaw(raw)
+      expect(parsed?.tabs.tabs[0].nameSource).toEqual({ kind: 'session', paneId: 'p-agent' })
+      expect(parsed?.tabs.tabs[1].nameSource).toBeUndefined()
+    })
+
+    it('keeps pane namingHandle/nameRef on terminal pane content through the panes parse', () => {
+      const raw = JSON.stringify({
+        version: PANES_SCHEMA_VERSION,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-1',
+              status: 'creating',
+              mode: 'claude',
+              shell: 'system',
+              namingHandle: 'nh-persist-1',
+              nameRef: { kind: 'pending', id: 'nh-persist-1' },
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      })
+
+      const parsed = parsePersistedPanesRaw(raw)
+      const content = (parsed!.layouts['tab-1'] as any).content
+      expect(content.namingHandle).toBe('nh-persist-1')
+      expect(content.nameRef).toEqual({ kind: 'pending', id: 'nh-persist-1' })
+    })
+
+    it('drops a malformed pane nameRef instead of retaining a corrupt naming identity', () => {
+      const raw = JSON.stringify({
+        version: PANES_SCHEMA_VERSION,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              createRequestId: 'req-1',
+              status: 'creating',
+              mode: 'claude',
+              shell: 'system',
+              nameRef: { kind: 'bogus' },
+              namingHandle: 17,
+            },
+          },
+        },
+        activePane: { 'tab-1': 'pane-1' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      })
+
+      const parsed = parsePersistedPanesRaw(raw)
+      const content = (parsed!.layouts['tab-1'] as any).content
+      expect(content.nameRef).toBeUndefined()
+      expect(content.namingHandle).toBeUndefined()
+    })
+  })

@@ -13,6 +13,7 @@ import type { ServerSettings } from './settings.js'
 import { LiveTerminalHandleSchema, SessionRefSchema, type RestoreError } from './session-contract.js'
 import { CodexDurabilityRefSchema, type CodexDurabilityRef } from './codex-durability.js'
 import type { SessionNameRecord, SessionNameRef, SessionNameUpdate } from './session-names.js'
+import { TabNameSourceSchema } from './session-names.js'
 
 // ──────────────────────────────────────────────────────────────
 // Shared enums and helpers
@@ -704,6 +705,10 @@ export const UiLayoutSyncSchema = z.object({
     id: z.string(),
     title: z.string().optional(),
     fallbackSessionRef: SessionLocatorSchema.optional(),
+    /** Unified agent names (Task 6): the tab's stable naming-source
+     * relationship — a mirror of client `Tab.nameSource`. Absent until
+     * initial content or migration resolves ownership. Additive optional. */
+    nameSource: TabNameSourceSchema.optional(),
   })),
   activeTabId: z.string().nullable().optional(),
   layouts: z.record(z.string(), z.unknown()),

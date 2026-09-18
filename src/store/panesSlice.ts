@@ -31,6 +31,7 @@ import { sanitizeRestoreError, sanitizeCrashTrace, sanitizeSessionRef, type Rest
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState, preservedDurableFreshAgentIdentity } from '@shared/fresh-agent'
 import { normalizeFreshAgentStyleOverride } from '@shared/settings'
+import { parsePaneNamingIdentityInput } from '@/lib/tab-name-source'
 
 
 const log = createLogger('PanesSlice')
@@ -59,6 +60,12 @@ function normalizePaneContent(
   options?: { inheritCreateRequestId?: boolean },
 ): PaneContent {
   const input = migrateLegacyFreshAgentContent(rawInput as Record<string, unknown>) as LivePaneContentInput | PaneContent
+  // Unified agent names (Task 1/6): the pane's naming identity — a parsed
+  // `nameRef` and a non-empty `namingHandle` — must survive this whitelist
+  // on create/reconcile/restore/cold adoption even when transient runtime
+  // ids (sessionId/terminalId) are stripped elsewhere. The shared parse
+  // point is `parsePaneNamingIdentityInput` (one algorithm, every surface).
+  const paneNamingIdentity = parsePaneNamingIdentityInput(input as { nameRef?: unknown; namingHandle?: unknown })
   if (input.kind === 'terminal') {
     const mode = typeof input.mode === 'string' ? input.mode : 'shell'
     const previousCreateRequestId =
@@ -100,6 +107,9 @@ function normalizePaneContent(
         ? input.pendingReconcile
         : undefined,
       reconcileEpoch: typeof input.reconcileEpoch === 'number' ? input.reconcileEpoch : undefined,
+      // Unified agent names (Task 6): the naming identity rides the
+      // whitelist — see the paneNamingIdentity derivation above.
+      ...paneNamingIdentity,
       // znhn item 1: the persistent crash trace must survive the hydrate
       // normalize (this function is a whitelist — without this line the
       // "survives reload" property silently dies here even though the
@@ -202,6 +212,9 @@ function normalizePaneContent(
             ? { pendingReconcile: input.pendingReconcile }
             : {}),
           ...(typeof input.reconcileEpoch === 'number' ? { reconcileEpoch: input.reconcileEpoch } : {}),
+          // Unified agent names (Task 6): the naming identity rides the
+          // whitelist on every fresh-agent fold path.
+          ...paneNamingIdentity,
         }
       }
     }
@@ -280,6 +293,9 @@ function normalizePaneContent(
         ? { pendingReconcile: input.pendingReconcile }
         : {}),
       ...(typeof input.reconcileEpoch === 'number' ? { reconcileEpoch: input.reconcileEpoch } : {}),
+      // Unified agent names (Task 6): the naming identity rides the
+      // whitelist on every fresh-agent fold path.
+      ...paneNamingIdentity,
     }
   }
   if (input.kind === 'extension') {
@@ -1239,9 +1255,13 @@ export const panesSlice = createSlice({
       action: PayloadAction<{
         tabId: string
         newContent: PaneContentInput
+        /** Unified agent names (Task 6): an explicit new pane id lets
+         * copy/recovery callers build the old→new pane-ID map they remap the
+         * tab's nameSource through. Absent ⇒ minted as before. */
+        newPaneId?: string
       }>
     ) => {
-      const { tabId, newContent } = action.payload
+      const { tabId, newContent, newPaneId: providedPaneId } = action.payload
       const root = state.layouts[tabId]
       if (!root) return
       if (refuseMutationWhileClosing(state, tabId, 'addPane')) return
@@ -1254,7 +1274,7 @@ export const panesSlice = createSlice({
       if (!activeLeaf) return
 
       // Create new leaf
-      const newPaneId = nanoid()
+      const newPaneId = providedPaneId ?? nanoid()
       const normalizedContent = normalizePaneContent(newContent)
       const newLeaf: PaneNode = {
         type: 'leaf',

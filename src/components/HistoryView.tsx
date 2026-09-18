@@ -9,7 +9,7 @@ import { openSessionTab } from '@/store/tabsSlice'
 import { applySessionRenameCascade } from '@/store/titleSync'
 import { receiveSessionNames } from '@/store/sessionNamesSlice'
 import { renameSessionName, parseSessionNameUpdate } from '@/lib/session-names'
-import { isScopedSessionRow, selectSessionNameRecord, selectSessionNativeSync } from '@/store/selectors/sessionNameSelectors'
+import { isScopedSessionRow, selectSessionNameRecord, selectSessionNativeSync, selectSessionRowRecord } from '@/store/selectors/sessionNameSelectors'
 import type { SessionNameRef } from '@shared/session-names'
 import { cn } from '@/lib/utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
@@ -46,7 +46,9 @@ function getProjectName(path: string): string {
  */
 function sessionDisplayName(session: CodingCliSession, sessionNames?: RootState['sessionNames']): string {
   if (isScopedSessionRow(session.provider, session.sessionType)) {
-    const record = sessionNames?.records?.[JSON.stringify(['session', session.provider, session.sessionId])]
+    // T5-N5: the shared durable-key row projection — never an inline
+    // `sessionNameRefKey` build.
+    const record = selectSessionRowRecord(sessionNames, session.provider, session.sessionId)
     if (record) return record.name
     if (session.sessionName) return session.sessionName
   }

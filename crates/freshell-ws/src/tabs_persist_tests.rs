@@ -1687,3 +1687,30 @@ fn union_source_order_is_deterministic_when_captured_at_and_revision_tie() {
         .collect();
     assert_eq!(keys, vec!["dev:m3", "dev:z1", "dev:a2"]);
 }
+
+#[test]
+fn persisted_generation_written_with_name_source_and_naming_identity_preserved() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = TabsRegistry::with_persist_dir(dir.path().to_path_buf());
+    let mut record = codex_pane_record("dev-a:tab-1", "sess-owned", 1000);
+    record["nameSource"] = json!({ "kind": "session", "paneId": "pane-1" });
+    record["panes"][0]["payload"]["namingHandle"] = json!("nh-persist-1");
+    record["panes"][0]["payload"]["nameRef"] = json!({ "kind": "pending", "id": "nh-persist-1" });
+    reg.replace_client_snapshot("srv-1", "dev-a", "Device A", "client-a", 7, vec![record])
+        .unwrap();
+
+    let snap = gen_n(dir.path(), "dev-a", 0).unwrap();
+    assert_eq!(
+        snap["records"][0]["nameSource"],
+        json!({ "kind": "session", "paneId": "pane-1" }),
+        "the durable generation keeps the tab's stable naming-source relationship"
+    );
+    assert_eq!(
+        snap["records"][0]["panes"][0]["payload"]["namingHandle"],
+        json!("nh-persist-1")
+    );
+    assert_eq!(
+        snap["records"][0]["panes"][0]["payload"]["nameRef"],
+        json!({ "kind": "pending", "id": "nh-persist-1" })
+    );
+}

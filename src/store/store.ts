@@ -35,6 +35,7 @@ import { layoutMirrorMiddleware } from './layoutMirrorMiddleware'
 import { sessionTitleMirrorMiddleware } from './sessionTitleMirror'
 import { terminalInventoryTitleReplayMiddleware } from '@/lib/terminal-inventory-titles'
 import { sessionNamesIngestMiddleware } from './sessionNamesSlice'
+import { sessionNameLifecycleMiddleware } from './sessionNameLifecycleMiddleware'
 import { subagentInterestMiddleware } from './subagentInterestMiddleware'
 import { terminalDetachMiddleware } from './terminalDetachMiddleware'
 import { serverSettingsSaveStateMiddleware } from './settingsThunks'
@@ -95,7 +96,7 @@ export const store = configureStore({
       serializableCheck: {
         ignoredPaths: ['sessions.expandedProjects'],
       },
-    }).concat(
+    }    ).concat(
       paneSelectionMiddleware,
       perfMiddleware,
       tabFallbackIdentityMiddleware,
@@ -110,6 +111,13 @@ export const store = configureStore({
       subagentInterestMiddleware,
       terminalDetachMiddleware,
       sessionActivityPersistMiddleware,
+      // Unified agent names (Task 6): the source-pointer coordinator sits
+      // INNER to the persistence/mirror subscribers — its post-`next`
+      // reconciliation runs before either subscriber reads state, and its
+      // own follow-up dispatches flow back through the whole chain, so
+      // every persisted envelope and ui.layout.sync payload carries the
+      // already-reconciled pointer.
+      sessionNameLifecycleMiddleware,
     ),
 })
 
