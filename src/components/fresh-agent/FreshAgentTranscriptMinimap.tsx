@@ -4,7 +4,10 @@ import { ContextMenu } from '@/components/context-menu/ContextMenu'
 import type { MenuItem } from '@/components/context-menu/context-menu-types'
 import {
   computeMinimapLayout,
+  computeTickHitBox,
   MINIMAP_RAIL_BOTTOM_INSET_PX,
+  MINIMAP_TICK_HIT_LEFT_PX,
+  MINIMAP_TICK_HIT_WIDTH_PX,
   MINIMAP_TICK_MIN_CLICKABLE_PX,
   type MinimapCluster,
   type MinimapLayout,
@@ -34,9 +37,13 @@ export type FreshAgentTranscriptMinimapProps = {
 
 /**
  * ChatGPT-style scroll minimap for the fresh-agent transcript: one tick per
- * user prompt (proportional to transcript length), a hover/focus prompt
- * preview, click-to-jump, and a band marking the visible region. Presentational
- * on top of the transcript's shared landmark sweep: geometry arrives via the
+ * user prompt, evenly spaced (each prompt gets an equal slot in the rail;
+ * the line's height stays proportional to its turn's size), a hover/focus
+ * prompt preview, click-to-jump, and a band marking the visible region.
+ * Every tick's hover/click hit box is bigger than its painted line — 2x the
+ * line height and 1.5x the rail width, centered on the line and clamped to
+ * the uniform slot so adjacent hit boxes never overlap. Presentational on
+ * top of the transcript's shared landmark sweep: geometry arrives via the
  * `measurement` prop; the only work this component owns is its two
  * ResizeObserver subscriptions, which request re-measurement through
  * `onRemeasure` — so unmounting it (the show/hide setting, pane teardown)
@@ -175,9 +182,9 @@ export function FreshAgentTranscriptMinimap({
   if (!layout || !measurement) return null
 
   // Dense-singleton clusters are lone sub-4px ticks: their OWN buttons get
-  // the expanded-hit treatment (dense multi-member clusters get the
-  // open-list button below instead). Keyed by the member tick's landmark
-  // index (tick.index), which is unique across the rail.
+  // the loneDense hit floor inside computeTickHitBox (dense multi-member
+  // clusters get the open-list button below instead). Keyed by the member
+  // tick's landmark index (tick.index), which is unique across the rail.
   const loneDenseTickIndexes = new Set(
     layout.clusters
       .filter((cluster) => cluster.dense && cluster.startIndex === cluster.endIndex)
@@ -200,35 +207,42 @@ export function FreshAgentTranscriptMinimap({
       {layout.ticks.map((tick) => {
         const firstLine = tick.label.split('\n')[0]
         // LONE sub-4px tick (dense-singleton run member): it never joined a
-        // clickability run, so it has >= 4px pitch on both sides — expanding
-        // the button's hit height to the clickable floor can never overlap a
-        // neighbor (clamped to the rail bottom). The paint moves to an inner
-        // aria-hidden span at the tick's visual height; the button keeps its
-        // aria-label and jumps DIRECTLY on click (no menu — one tick, one
-        // unambiguous target).
+        // clickability run, so it has >= 4px pitch on both sides — its hit
+        // box floors at the clickable minimum (computeTickHitBox's
+        // loneDense path) and still cannot overlap a neighbor. Every tick —
+        // lone dense or not — renders the same universal shape: a
+        // hit-box-sized button (2x the line height, 1.5x the rail width,
+        // centered on the line, slot-clamped) carrying an inner aria-hidden
+        // paint span at the LINE rect; the button keeps its aria-label and
+        // jumps DIRECTLY on click (no menu — one tick, one unambiguous
+        // target), and the hover/focus tint covers the whole hit box.
         const loneSubFloorTick = loneDenseTickIndexes.has(tick.index)
-        const hitHeight = loneSubFloorTick
-          ? Math.min(MINIMAP_TICK_MIN_CLICKABLE_PX, layout.railHeight - tick.top)
-          : tick.height
+        const hitBox = computeTickHitBox(tick, layout.slotHeight, layout.railHeight, loneSubFloorTick)
         return (
           <Tooltip key={tick.index}>
             <TooltipTrigger asChild>
               <button
                 type="button"
-                className={loneSubFloorTick
-                  ? 'fresh-agent-minimap-tick pointer-events-auto absolute left-0 w-full rounded-sm transition-colors hover:bg-primary/15 focus-visible:bg-primary/15'
-                  : 'fresh-agent-minimap-tick pointer-events-auto absolute left-0 w-full rounded-sm bg-muted-foreground/40 transition-colors hover:bg-primary focus-visible:bg-primary'}
-                style={{ top: tick.top, height: hitHeight }}
+                className="fresh-agent-minimap-tick pointer-events-auto absolute rounded-sm transition-colors hover:bg-primary/15 focus-visible:bg-primary/15"
+                style={{
+                  top: hitBox.top,
+                  height: hitBox.height,
+                  left: MINIMAP_TICK_HIT_LEFT_PX,
+                  width: MINIMAP_TICK_HIT_WIDTH_PX,
+                }}
                 aria-label={`Jump to prompt: ${truncatePrompt(firstLine, ARIA_LABEL_MAX_LENGTH)}`}
                 onClick={() => handleTickClick(tick.index)}
               >
-                {loneSubFloorTick ? (
-                  <span
-                    aria-hidden="true"
-                    className="absolute inset-x-0 top-0 rounded-sm bg-muted-foreground/40"
-                    style={{ height: tick.height }}
-                  />
-                ) : null}
+                <span
+                  aria-hidden="true"
+                  className="absolute rounded-sm bg-muted-foreground/40"
+                  style={{
+                    top: tick.top - hitBox.top,
+                    height: tick.height,
+                    left: 0 - MINIMAP_TICK_HIT_LEFT_PX,
+                    right: 0 - MINIMAP_TICK_HIT_LEFT_PX,
+                  }}
+                />
               </button>
             </TooltipTrigger>
             <TooltipContent
@@ -258,13 +272,15 @@ export function FreshAgentTranscriptMinimap({
               <TooltipTrigger asChild>
                 <button
                   type="button"
-                  className="pointer-events-auto absolute left-0 z-10 w-full rounded-sm bg-transparent transition-colors hover:bg-primary/15 focus-visible:bg-primary/15"
+                  className="pointer-events-auto absolute z-10 rounded-sm bg-transparent transition-colors hover:bg-primary/15 focus-visible:bg-primary/15"
                   style={{
                     top: cluster.top,
                     height: Math.min(
                       Math.max(cluster.height, MINIMAP_TICK_MIN_CLICKABLE_PX),
                       layout.railHeight - cluster.top,
                     ),
+                    left: MINIMAP_TICK_HIT_LEFT_PX,
+                    width: MINIMAP_TICK_HIT_WIDTH_PX,
                   }}
                   aria-haspopup="menu"
                   aria-expanded={clusterMenu !== null && clusterMenu.key === clusterKey}

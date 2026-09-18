@@ -4,6 +4,15 @@
 // user-turn landmarks (content coordinates) onto tick rects inside the rail,
 // plus the band marking the currently visible region. Kept free of DOM and
 // React so it is exhaustively unit-testable without jsdom geometry mocks.
+//
+// Placement is EVENLY SPACED: every prompt gets one uniform slot
+// (railHeight / prompt count) regardless of where it sits in the
+// transcript — the content offsets only order the prompts. A prompt's LINE
+// height stays proportional to its turn's size (scale =
+// railHeight / scrollHeight, floored at the density-thinned minimum, capped
+// one pixel below the slot so adjacent lines keep a gap) and centers in its
+// slot. Only the viewport band remains proportional to scroll position —
+// it marks the real visible region of the content.
 
 /** Minimum rendered tick height, px — keeps every prompt clickable at sane
  * densities; under density the effective minimum thins below it (sub-pixel
@@ -17,14 +26,22 @@ export const MINIMAP_RAIL_BOTTOM_INSET_PX = 48
 /** Tick heights at or above this remain individually pointer-clickable;
  *  below it, individual hits are physically unreliable on a 1× display, so
  *  the component layer adds one open-list hit target over each dense
- *  multi-member clickability run and expands a lone sub-4px tick's own hit
- *  height (every per-prompt tick still renders — never dropped or capped). */
+ *  multi-member clickability run and gives a lone sub-4px tick's own hit
+ *  box the 4px floor via computeTickHitBox's loneDense path (every
+ *  per-prompt tick still renders — never dropped or capped). */
 export const MINIMAP_TICK_MIN_CLICKABLE_PX = 4
+/** Hit box horizontal growth: the rail is 12px (w-3); hit boxes are 18px
+ *  wide, centered on it (50% of the rail width padding on each side). */
+export const MINIMAP_TICK_HIT_WIDTH_PX = 18
+/** Hit-box left offset inside the rail: -3 centers the 18px hit box on the
+ *  12px rail column (the painted line keeps the 12px extent). */
+export const MINIMAP_TICK_HIT_LEFT_PX = -3
 
 export type MinimapLandmark = {
   /** Index into the transcript's displayTurns (the article's data-turn-index). */
   index: number
-  /** Distance from the top of the scrollable content, px. */
+  /** Distance from the top of the scrollable content, px. Orders the
+   *  prompts; never places them (placement is uniform-slot). */
   offsetTop: number
   /** Rendered height of the turn article, px. */
   height: number
@@ -35,9 +52,11 @@ export type MinimapLandmark = {
 export type MinimapTick = {
   index: number
   label: string
-  /** Distance from the rail top, px. */
+  /** Distance from the rail top, px — the LINE rect's top (the line
+   *  centers in its uniform slot; the button's hit box is bigger —
+   *  computeTickHitBox). */
   top: number
-  /** Tick height, px (>= the density-thinned minimum). */
+  /** Line height, px (>= the density-thinned minimum). */
   height: number
 }
 
@@ -57,7 +76,7 @@ export type MinimapCluster = {
   endIndex: number
   /** True when at least one member tick's height is strictly below the
    *  clickable floor: dense multi-member runs get the open-list hit target;
-   *  dense singletons (lone sub-4px ticks) get the expanded-hit treatment
+   *  dense singletons (lone sub-4px ticks) get the loneDense hit floor
    *  in the component. */
   dense: boolean
 }
@@ -70,6 +89,11 @@ export type MinimapLayout = {
   clusters: MinimapCluster[]
   /** Echoes the input railHeight for consumers (e.g. the tooltip side rule). */
   railHeight: number
+  /** The uniform slot per prompt: railHeight / landmark count (0 when
+   *  there are no prompts or the input is degenerate). Adjacent lines'
+   *  centers sit exactly one slot apart, so computeTickHitBox's slot clamp
+   *  is the non-overlap guarantee for hit boxes. */
+  slotHeight: number
 }
 
 export function computeMinimapLayout(input: {
@@ -80,83 +104,44 @@ export function computeMinimapLayout(input: {
   landmarks: readonly MinimapLandmark[]
 }): MinimapLayout {
   if (input.scrollHeight <= 0 || input.railHeight <= 0) {
-    return { ticks: [], viewport: { top: 0, height: 0 }, clusters: [], railHeight: 0 }
+    return { ticks: [], viewport: { top: 0, height: 0 }, clusters: [], railHeight: 0, slotHeight: 0 }
   }
   const scale = input.railHeight / input.scrollHeight
-  // Under density the minimum tick height thins — sub-pixel allowed, no pixel
-  // floor — so every prompt keeps a DISTINCT slot: two ticks never share a
-  // y-range, so no tick ever occludes another's paint or hit-test.
-  const effectiveMinTickHeight = Math.min(
-    MINIMAP_MIN_TICK_HEIGHT_PX,
-    input.railHeight / Math.max(1, input.landmarks.length),
-  )
-
   const sorted = [...input.landmarks].sort((a, b) => a.offsetTop - b.offsetTop || a.index - b.index)
-  const heights = sorted.map((mark) => Math.min(
-    input.railHeight,
-    Math.max(effectiveMinTickHeight, mark.height * scale),
-  ))
-  const proportionalTops = sorted.map((mark) => mark.offsetTop * scale)
+  // One uniform slot per prompt, independent of offsetTop. No prompts ->
+  // no slots: 0 keeps the field finite (never NaN/Infinity).
+  const slotHeight = sorted.length > 0 ? input.railHeight / sorted.length : 0
+  // Under density the minimum line height thins — sub-pixel allowed, no
+  // pixel floor — so every prompt keeps a DISTINCT slot: two lines never
+  // share a y-range, so no line ever occludes another's paint or hit-test.
+  const effectiveMinTickHeight = slotHeight > 0
+    ? Math.min(MINIMAP_MIN_TICK_HEIGHT_PX, slotHeight)
+    : MINIMAP_MIN_TICK_HEIGHT_PX
 
-  // Cluster layout: a tick with room keeps its EXACT proportional top;
-  // colliding ticks form groups packed by abut from the group's anchor
-  // (first member's proportional top, raised to the previous group's end,
-  // clamped to railHeight - height). A later tick joins the group when it
-  // cannot start at or after the group's packed end — it overlaps
-  // proportionally, or the rail-bottom clamp would push it back into the
-  // group. Non-final groups provably fit before the next group's anchor;
-  // only the final group may overflow, and it scales its member heights to
-  // end exactly at the rail bottom while keeping its anchor — late prompts
-  // stay near the rail bottom, never reset to the top. Every tick keeps a
-  // distinct slot; no two ticks ever share a y-range.
-  const tops: number[] = new Array(sorted.length)
-  let i = 0
-  while (i < sorted.length) {
-    const anchor = Math.min(
-      Math.max(proportionalTops[i], i === 0 ? 0 : tops[i - 1] + heights[i - 1]),
-      Math.max(0, input.railHeight - heights[i]),
+  // Line rect per prompt: height proportional to the turn's size
+  // (landmark.height * scale), floored at the density-thinned minimum and
+  // capped one pixel below the slot so a >= 1px gap remains between
+  // adjacent lines whenever the floor allows it (h == slot only when the
+  // thinned floor already fills the slot). The line centers in its slot.
+  const ticks = sorted.map((mark, i) => {
+    const height = Math.min(
+      Math.max(slotHeight - 1, effectiveMinTickHeight),
+      Math.max(effectiveMinTickHeight, mark.height * scale),
     )
-    const group: number[] = [i]
-    let packed = heights[i]
-    while (i + group.length < sorted.length) {
-      const next = i + group.length
-      const nextStart = Math.min(
-        proportionalTops[next],
-        Math.max(0, input.railHeight - heights[next]),
-      )
-      if (nextStart >= anchor + packed - 1e-9) break
-      group.push(next)
-      packed += heights[next]
-    }
-    let groupHeights = group.map((k) => heights[k])
-    const span = input.railHeight - anchor
-    if (packed > span + 1e-9) {
-      const factor = span / packed
-      groupHeights = groupHeights.map((h) => h * factor)
-      group.forEach((k, j) => { heights[k] = groupHeights[j] })
-    }
-    let cursor = anchor
-    group.forEach((k, j) => {
-      tops[k] = cursor
-      cursor += groupHeights[j]
-    })
-    i += group.length
-  }
+    const top = i * slotHeight + (slotHeight - height) / 2
+    return { index: mark.index, label: mark.label, top, height }
+  })
 
-  const ticks = sorted.map((mark, k) => ({
-    index: mark.index,
-    label: mark.label,
-    top: tops[k],
-    height: heights[k],
-  }))
-
-  // Clickability pass — a SECOND pass over the final laid-out ticks, NOT
-  // the packing loop's groups: a cluster is a maximal run of consecutive
-  // ticks where each next tick begins within its predecessor's minimum
-  // click row (ticks[i + 1].top < ticks[i].top + MINIMAP_TICK_MIN_CLICKABLE_PX).
-  // Packed-but-clickable ticks stay separate runs; sub-4px-pitched ticks
-  // merge even when the packer kept every proportional top. ALL runs are
-  // listed (singletons included); `dense` marks any sub-clickable member.
+  // Clickability pass — a SECOND pass over the final laid-out ticks: a
+  // cluster is a maximal run of consecutive ticks where each next tick
+  // begins within its predecessor's minimum click row
+  // (ticks[i + 1].top < ticks[i].top + MINIMAP_TICK_MIN_CLICKABLE_PX).
+  // Under even spacing the line-center pitch is exactly one slot, so a
+  // sub-4px slot joins EVERY consecutive pair — dense transcripts
+  // naturally form one all-prompts mega-run whose bounded 60vh open-list
+  // menu handles any count — while a slot >= 4 joins nothing. ALL runs
+  // are listed (singletons included); `dense` marks any sub-clickable
+  // member.
   const clusters: MinimapCluster[] = []
   for (let k = 0; k < ticks.length; k++) {
     const runStart = k
@@ -184,5 +169,38 @@ export function computeMinimapLayout(input: {
   const fraction = maxScroll > 0 ? clampedScrollTop / maxScroll : 0
   const bandTop = fraction * (input.railHeight - bandHeight)
 
-  return { ticks, clusters, viewport: { top: bandTop, height: bandHeight }, railHeight: input.railHeight }
+  return {
+    ticks,
+    clusters,
+    viewport: { top: bandTop, height: bandHeight },
+    railHeight: input.railHeight,
+    slotHeight,
+  }
+}
+
+/** Vertical hit box for a tick: 2x the line height, centered on the line's
+ *  center, so the line gets 50% of its height as padding on each side.
+ *  Clamped so a hit never overlaps a neighbor's: each box's half-span stays
+ *  within its uniform slot (adjacent centers are slot apart). A lone dense
+ *  tick (clickability-run singleton with a sub-4px line) floors at the
+ *  4px clickable minimum instead — isolation guarantees >= 4px pitch to both
+ *  neighbors, so the floor still cannot overlap. Edges shrink (rail bounds). */
+export function computeTickHitBox(
+  tick: MinimapTick,
+  slotHeight: number,
+  railHeight: number,
+  loneDense: boolean,
+): { top: number; height: number } {
+  const lineCenter = tick.top + tick.height / 2
+  const grown = loneDense
+    ? Math.max(2 * tick.height, MINIMAP_TICK_MIN_CLICKABLE_PX)
+    : 2 * tick.height
+  // The non-overlap guarantee: a hit can never exceed its uniform slot
+  // (for loneDense the 4px floor already respects the pitch, but keep the
+  // slot clamp too — the min only matters for pathological slots < 4
+  // where isolation cannot exist anyway).
+  const hitHeight = Math.min(grown, slotHeight)
+  if (railHeight - hitHeight < 0) return { top: 0, height: railHeight }
+  const top = Math.max(0, Math.min(lineCenter - hitHeight / 2, railHeight - hitHeight))
+  return { top, height: hitHeight }
 }

@@ -199,13 +199,17 @@ test.describe('Transcript minimap', () => {
         items: [{ id: `item-dense-a${i}`, kind: 'text', text: veryTallBody(`Body${i}`) }],
       })
     }
-    // Round 3 scales the bunched seed from 12 to 40 prompts: at this
-    // density the whole bunch joins into ONE dense cluster whose 40-item
-    // menu genuinely overflows the bounded 60vh surface (a 12-item menu
-    // never overflows, so "every prompt is reachable in the bounded list"
-    // was unproven). Keep the prompts consecutive one-liners — tiny
-    // offsets, one bunched cluster, exactly as the 12-prompt seed did.
-    for (let i = 0; i < 40; i++) {
+    // Even spacing needs COUNT-driven density: every prompt gets an equal
+    // slot (railHeight / prompt count), so a dense mega-cluster forms when
+    // the slot pitch drops below the 4px clickable floor — the prompt
+    // offsets are irrelevant. The Desktop Chrome viewport is 1280x720, so
+    // the transcript scroller (and the rail at scroller height - 48) is
+    // under 720px; 200 prompts pins the slot below 720/200 = 3.6px < 4 on
+    // any geometry this lane can produce, joining the whole bunch into
+    // ONE dense cluster whose 200-item menu genuinely overflows the
+    // bounded 60vh surface. Keep the prompts consecutive one-liners — one
+    // bunched mega-cluster, exactly as the 40-prompt proportional seed did.
+    for (let i = 0; i < 200; i++) {
       turns.push({
         id: `turn-dense-u${i}`, turnId: `turn-dense-u${i}`, role: 'user', summary: `Dense prompt ${i + 1}`,
         items: [{ id: `item-dense-u${i}`, kind: 'text', text: `Dense prompt ${i + 1}` }],
@@ -225,7 +229,7 @@ test.describe('Transcript minimap', () => {
     const freshPane = page.locator('[data-context="fresh-agent"]')
     // The load pins to the bottom, and the trailing tail body now ENDS the
     // content — the initially visible text is the tail body's last line,
-    // not the final bunched prompt (prompt 40 sits a full tall body above
+    // not the final bunched prompt (prompt 200 sits a full tall body above
     // the bottom). Wait on the tail line; the tick-count assertion below
     // proves the prompts rendered.
     await expect(freshPane.getByText('Tail line 240', { exact: false })).toBeVisible({ timeout: 20_000 })
@@ -234,18 +238,20 @@ test.describe('Transcript minimap', () => {
 
     // Every prompt keeps its tick (one-tick-per-prompt contract).
     const ticks = freshPane.getByRole('button', { name: /Jump to prompt:/ })
-    await expect(ticks).toHaveCount(40)
+    await expect(ticks).toHaveCount(200)
 
-    // Self-verifying density guard: the first prompt tick must be under the
-    // 4px clickable floor in THIS pane geometry — otherwise the cluster
-    // affordance is not in play and the test proves nothing. If this fails
-    // on cloud geometry, grow veryTallBody's paragraph count — do not
+    // Self-verifying density guard: the first prompt tick's HIT BOX must
+    // be under the 4px clickable floor in THIS pane geometry — otherwise
+    // the cluster affordance is not in play and the test proves nothing.
+    // Under even spacing the button's height is its slot-clamped hit box
+    // (min(2 * lineHeight, slot)); the 200-prompt slot pinned it sub-4px.
+    // If this fails on cloud geometry, grow the prompt count — do not
     // delete the guard.
     const firstTickHeight = await ticks.first().evaluate((el: HTMLElement) => el.getBoundingClientRect().height)
     expect(firstTickHeight).toBeLessThan(4)
 
     // One open-list target covers the bunched cluster — EXACTLY one: the
-    // whole 40-prompt bunch must join into a single dense run. Clicking it
+    // whole 200-prompt bunch must join into a single dense run. Clicking it
     // opens a menu listing every prompt in the run.
     const clusterTargets = freshPane.getByRole('button', { name: /— open list/ })
     await expect(clusterTargets).toHaveCount(1)
@@ -253,10 +259,10 @@ test.describe('Transcript minimap', () => {
     const menu = page.getByRole('menu')
     await expect(menu).toBeVisible()
     const itemCount = await page.getByRole('menuitem').count()
-    expect(itemCount).toBe(40)
+    expect(itemCount).toBe(200)
 
     // The menu is BOUNDED and genuinely overflows in a real browser:
-    // max-h-[60vh] caps the list's box below its 40-item content.
+    // max-h-[60vh] caps the list's box below its 200-item content.
     const menuOverflows = await menu.evaluate((el: HTMLElement) => el.scrollHeight > el.clientHeight)
     expect(menuOverflows).toBe(true)
 
@@ -270,7 +276,7 @@ test.describe('Transcript minimap', () => {
     await expect(menu).toHaveCount(0)
     // The transcript jumped to the final bunched prompt: scrollTop drops
     // (the load starts pinned to the bottom; the trailing tail body keeps
-    // prompt 40 far above it) and the prompt lands at the scrollport top
+    // prompt 200 far above it) and the prompt lands at the scrollport top
     // (block: 'start') — the same landing assertion as the tick-click jump
     // in test 1.
     await expect.poll(
@@ -282,7 +288,7 @@ test.describe('Transcript minimap', () => {
       .evaluate((el: HTMLElement) => el.getBoundingClientRect().top)
     expect(Math.abs(targetTop - scrollerTop)).toBeLessThan(60)
     // The ticks never went anywhere.
-    await expect(ticks).toHaveCount(40)
+    await expect(ticks).toHaveCount(200)
   })
 
   test('the Show transcript minimap setting defaults on and hides the rail when toggled off', async ({ freshellPage: _freshellPage, page, terminal, harness, serverInfo }) => {
