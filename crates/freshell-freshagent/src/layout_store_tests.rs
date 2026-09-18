@@ -1659,6 +1659,53 @@ fn attach_pane_content_resolves_only_unresolved_tabs_and_follows_the_removal_rul
 }
 
 #[test]
+fn attach_pane_content_keeps_the_same_pane_scoped_conversation_source() {
+    let store = LayoutStore::default();
+    store.update_from_ui(
+        &sync_from(json!({
+            "tabs": [{ "id": "t1", "title": "T", "nameSource": { "kind": "session", "paneId": "p-src" } }],
+            "activeTabId": "t1",
+            "layouts": { "t1": split("s1", "horizontal", [50, 50],
+                leaf("p-src", json!({ "kind": "terminal", "mode": "claude" })),
+                leaf("p-other", json!({ "kind": "terminal", "mode": "codex" }))) },
+            "activePane": { "t1": "p-src" },
+            "timestamp": 1,
+        })),
+        "conn",
+    );
+
+    // A same-pane conversation replacement (scoped → scoped) keeps the
+    // logical source: the pane switched sessions, but it is still the pane
+    // the tab names.
+    store.attach_pane_content(
+        "t1",
+        "p-src",
+        json!({ "kind": "terminal", "mode": "opencode" }),
+    );
+    assert_eq!(
+        store.tab_name_source("t1"),
+        Some(freshell_protocol::session_names::TabNameSource::Session {
+            pane_id: "p-src".into(),
+        }),
+        "a same-pane scoped→scoped conversation replacement keeps the logical source"
+    );
+
+    // Sanity: attaching to a NON-source pane never moves the pointer either.
+    store.attach_pane_content(
+        "t1",
+        "p-other",
+        json!({ "kind": "terminal", "mode": "shell" }),
+    );
+    assert_eq!(
+        store.tab_name_source("t1"),
+        Some(freshell_protocol::session_names::TabNameSource::Session {
+            pane_id: "p-src".into(),
+        }),
+        "attaching non-agent content to a non-source pane leaves the pointer alone"
+    );
+}
+
+#[test]
 fn tab_rows_expose_the_adopted_name_source_in_normalized_snapshots() {
     let store = LayoutStore::default();
     store.update_from_ui(

@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, {
   addTab,
+  hydrateTabs,
   removeTab,
   setTabNameSource,
   type Tab,
@@ -19,6 +20,7 @@ import panesReducer, {
   removeLayout,
   mergePaneContent,
   restoreLayout,
+  hydratePanes,
 } from '@/store/panesSlice'
 import sessionNamesReducer, { receiveSessionNames } from '@/store/sessionNamesSlice'
 import tabRegistryReducer from '@/store/tabRegistrySlice'
@@ -443,5 +445,159 @@ describe('sessionNameLifecycleMiddleware — naming identity survives store fold
     const content = (store.getState().panes.layouts['t-restore'] as { content: PaneContent }).content
     expect(content).toMatchObject({ namingHandle: 'nh-restore-1' })
     expect((content as { terminalId?: string }).terminalId).toBeUndefined()
+  })
+})
+
+describe('sessionNameLifecycleMiddleware — hydrate-delivered swaps', () => {
+  // The own-key full hydrate (crossTabSync.dispatchHydrateLayoutFromPersisted)
+  // is TWO folds: hydrateTabs adopts the envelope's tabs (pointer included),
+  // then hydratePanes applies the envelope's layout. A pane whose identity has
+  // not bound a durable session yet (pending naming handle, no sessionRef,
+  // status past 'creating') takes the incoming payload, so a swap delivered
+  // by the envelope really lands in the layout.
+  function pendingAgentTerminal(handle: string, createRequestId: string): PaneContent {
+    return {
+      kind: 'terminal',
+      mode: 'claude',
+      createRequestId,
+      status: 'running',
+      namingHandle: handle,
+      nameRef: { kind: 'pending', id: handle },
+    } as PaneContent
+  }
+
+  /** Tab with A (nh-a) at p-a plus B (nh-b) split in at p-b; pointer p-a. */
+  function createPendingAgentTab(store: Store, tabId = 'tab-1') {
+    store.dispatch(addTab({ id: tabId, title: 'Original' }))
+    store.dispatch(initLayout({
+      tabId,
+      paneId: 'p-a',
+      content: pendingAgentTerminal('nh-a', 'crid-a'),
+    }))
+    store.dispatch(splitPane({
+      tabId,
+      paneId: 'p-a',
+      direction: 'horizontal',
+      newContent: pendingAgentTerminal('nh-b', 'crid-b'),
+      newPaneId: 'p-b',
+    }))
+    return tabId
+  }
+
+  /** The envelope of a window that swapped A↔B and reconciled p-a→p-b. */
+  function swappedEnvelope(store: Store, tabId: string): { tab: Tab; layouts: Record<string, unknown> } {
+    const tab = { ...(tabOf(store, tabId) as Tab), nameSource: { kind: 'session', paneId: 'p-b' } as Tab['nameSource'] }
+    const layouts = {
+      [tabId]: {
+        type: 'split',
+        id: 'split-h',
+        direction: 'horizontal',
+        sizes: [50, 50],
+        children: [
+          { type: 'leaf', id: 'p-a', content: pendingAgentTerminal('nh-b', 'crid-b') },
+          { type: 'leaf', id: 'p-b', content: pendingAgentTerminal('nh-a', 'crid-a') },
+        ],
+      },
+    }
+    return { tab, layouts }
+  }
+
+  function dispatchFullHydrate(
+    store: Store,
+    tabId: string,
+    meta: { localLayoutPersistedAt: number; remoteLayoutPersistedAt: number },
+  ) {
+    const { tab, layouts } = swappedEnvelope(store, tabId)
+    store.dispatch({
+      ...hydrateTabs({
+        tabs: [tab],
+        activeTabId: tabId,
+        renameRequestTabId: null,
+        tombstones: [],
+      } as never),
+      meta,
+    })
+    store.dispatch({
+      ...hydratePanes({
+        layouts,
+        activePane: { [tabId]: 'p-b' },
+        paneTitles: {},
+        paneTitleSetByUser: {},
+      } as never),
+      meta,
+    })
+  }
+
+  it('a hydrate-delivered swap (remote wins recency) keeps the ALREADY-CORRECT delivered pointer', () => {
+    const store = buildStore()
+    const tabId = createPendingAgentTab(store)
+    expect(tabOf(store, tabId)?.nameSource).toEqual({ kind: 'session', paneId: 'p-a' })
+
+    // The envelope is newer: hydrateTabs adopts its reconciled pointer p-b,
+    // hydratePanes applies its swapped layout (A now at p-b, B at p-a).
+    dispatchFullHydrate(store, tabId, { localLayoutPersistedAt: 1_000, remoteLayoutPersistedAt: 2_000 })
+
+    // p-b IS the correct pointer for the delivered layout — A, the original
+    // source content, lives there now. The middleware must not read the
+    // delivered pointer against the STALE pre-hydrate layout and flip the
+    // tab to p-a (which now holds B).
+    expect(tabOf(store, tabId)?.nameSource).toEqual({ kind: 'session', paneId: 'p-b' })
+
+    store.dispatch(receiveSessionNames([
+      nameUpdate({ kind: 'pending', id: 'nh-a' }, 'Alpha from A', 3),
+      nameUpdate({ kind: 'pending', id: 'nh-b' }, 'Beta from B', 4),
+    ]))
+    expect(display(store, tabId)).toBe('Alpha from A')
+  })
+
+  it('a hydrate-delivered swap keeps a pointer delivered over a LEGACY local pointer (no session origin to follow)', () => {
+    const store = buildStore()
+    // A shell-first tab: the initial content choice resolved it legacy.
+    const tabId = 'tab-1'
+    store.dispatch(addTab({ id: tabId, title: 'Original' }))
+    store.dispatch(initLayout({
+      tabId,
+      paneId: 'p-a',
+      content: { kind: 'terminal', mode: 'shell', createRequestId: 'crid-shell', status: 'running' } as PaneContent,
+    }))
+    store.dispatch(splitPane({
+      tabId,
+      paneId: 'p-a',
+      direction: 'horizontal',
+      newContent: pendingAgentTerminal('nh-b', 'crid-b'),
+      newPaneId: 'p-b',
+    }))
+    expect(tabOf(store, tabId)?.nameSource).toEqual({ kind: 'legacy' })
+
+    // The envelope (remote wins recency) carries session ownership at p-b
+    // plus the swapped layout; the delivered pointer must stand, not be
+    // flipped to p-a (which now holds B).
+    dispatchFullHydrate(store, tabId, { localLayoutPersistedAt: 1_000, remoteLayoutPersistedAt: 2_000 })
+
+    expect(tabOf(store, tabId)?.nameSource).toEqual({ kind: 'session', paneId: 'p-b' })
+    store.dispatch(receiveSessionNames([
+      nameUpdate({ kind: 'pending', id: 'nh-a' }, 'Alpha from A', 3),
+      nameUpdate({ kind: 'pending', id: 'nh-b' }, 'Beta from B', 4),
+    ]))
+    expect(display(store, tabId)).toBe('Alpha from A')
+  })
+
+  it('the local-wins recency variant still FOLLOWS a carried pointer through a delivered swap (old-mirror shape)', () => {
+    const store = buildStore()
+    const tabId = createPendingAgentTab(store)
+    expect(tabOf(store, tabId)?.nameSource).toEqual({ kind: 'session', paneId: 'p-a' })
+
+    // The local tab wins recency, so hydrateTabs keeps the local pointer
+    // p-a; the envelope's swapped layout still applies — this is the
+    // pre-Task-6 old-mirror shape, and the pointer must follow A's content
+    // to p-b exactly like a live swap.
+    dispatchFullHydrate(store, tabId, { localLayoutPersistedAt: 2_000, remoteLayoutPersistedAt: 1_000 })
+
+    expect(tabOf(store, tabId)?.nameSource).toEqual({ kind: 'session', paneId: 'p-b' })
+    store.dispatch(receiveSessionNames([
+      nameUpdate({ kind: 'pending', id: 'nh-a' }, 'Alpha from A', 3),
+      nameUpdate({ kind: 'pending', id: 'nh-b' }, 'Beta from B', 4),
+    ]))
+    expect(display(store, tabId)).toBe('Alpha from A')
   })
 })

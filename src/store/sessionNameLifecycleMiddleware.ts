@@ -1,5 +1,5 @@
 import type { Middleware } from '@reduxjs/toolkit'
-import { setTabNameSource } from './tabsSlice.js'
+import { hydrateTabs, setTabNameSource } from './tabsSlice.js'
 import {
   collectNameSourceLeaves,
   isScopedNameSourceContent,
@@ -15,6 +15,17 @@ import { createLogger } from '@/lib/client-logger'
 const log = createLogger('SessionNameLifecycle')
 
 type TabLike = { id: string; nameSource?: TabNameSource }
+
+/**
+ * A tab pointer displaced by a tabs-hydrate, pending that hydrate's layout
+ * fold: `origin` is the pointer that existed BEFORE the hydrate — the only
+ * pointer the pre-hydrate layout can answer the identity-follow question
+ * for — and `adopted` is the envelope's pointer that is now in place.
+ */
+type DisplacedHydrateOrigin = {
+  origin: TabNameSource | undefined
+  adopted: TabNameSource
+}
 
 /**
  * Unified agent names (Task 6) — the guarded cross-slice source-pointer
@@ -43,16 +54,26 @@ type TabLike = { id: string; nameSource?: TabNameSource }
  * action chain, and is registered INNER to the persistence/mirror
  * subscribers, so every flush reads an already-reconciled pointer.
  */
-export const sessionNameLifecycleMiddleware: Middleware = (store) => (next) => (action) => {
-  const previousState = store.getState() as RootState
-  const result = next(action)
-  const state = store.getState() as RootState
+export const sessionNameLifecycleMiddleware: Middleware = (store) => {
+  // Per-store: pre-hydrate pointers whose envelope layouts have not landed
+  // yet (consumed by the tab's next layout-changing fold).
+  const displacedHydrateOrigins = new Map<string, DisplacedHydrateOrigin>()
+  return (next) => (action) => {
+    const previousState = store.getState() as RootState
+    const result = next(action)
+    const state = store.getState() as RootState
 
-  const updates = reconcileTabNameSources(previousState, state)
-  for (const update of updates) {
-    store.dispatch(setTabNameSource(update))
+    const actionType = (action as { type?: unknown }).type
+    if (actionType === hydrateTabs.type) {
+      noteDisplacedHydrateOrigins(displacedHydrateOrigins, previousState, state)
+    }
+
+    const updates = reconcileTabNameSources(previousState, state, displacedHydrateOrigins)
+    for (const update of updates) {
+      store.dispatch(setTabNameSource(update))
+    }
+    return result
   }
-  return result
 }
 
 /** Name-source equality without importing deep-equal machinery. */
@@ -68,6 +89,47 @@ function sameNameSource(
 type ReconcileUpdate = { tabId: string; nameSource: TabNameSource }
 
 /**
+ * An own-key full hydrate (crossTabSync.dispatchHydrateLayoutFromPersisted)
+ * is TWO folds: `hydrateTabs` adopts the envelope's tab records — pointer
+ * included — and `hydratePanes` then applies the envelope's layout. Record,
+ * per tab whose pointer the envelope displaced, the pointer that existed
+ * BEFORE the hydrate: the envelope's adopted pointer already reflects the
+ * ENVELOPE's layout, so the pre-hydrate layout can never answer for it —
+ * keying the identity-follow off the adopted pointer is exactly what flips
+ * an already-correct pointer through a hydrate-delivered swap (T6-R1). The
+ * note is consumed by the tab's next layout-changing fold, and superseded
+ * whenever the pointer moves on past the adoption.
+ */
+function noteDisplacedHydrateOrigins(
+  notes: Map<string, DisplacedHydrateOrigin>,
+  previousState: RootState,
+  state: RootState,
+): void {
+  const previousById = new Map(
+    ((previousState.tabs?.tabs ?? []) as TabLike[]).map((tab) => [tab.id, tab]),
+  )
+  const nextIds = new Set<string>()
+  for (const tab of ((state.tabs?.tabs ?? []) as TabLike[])) {
+    nextIds.add(tab.id)
+    const previousTab = previousById.get(tab.id)
+    if (!previousTab) continue
+    const previousPointer = previousTab.nameSource
+    if (sameNameSource(previousPointer, tab.nameSource)) continue
+    if (tab.nameSource?.kind !== 'session') {
+      notes.delete(tab.id)
+      continue
+    }
+    const existing = notes.get(tab.id)
+    notes.set(tab.id, existing
+      ? { ...existing, adopted: tab.nameSource }
+      : { origin: previousPointer, adopted: tab.nameSource })
+  }
+  for (const tabId of notes.keys()) {
+    if (!nextIds.has(tabId)) notes.delete(tabId)
+  }
+}
+
+/**
  * Compare actual before/after layout state for every surviving tab and
  * derive the pointer transitions the contract requires. Tabs whose layout
  * reference did not change are skipped — that single gate is what makes a
@@ -76,17 +138,30 @@ type ReconcileUpdate = { tabId: string; nameSource: TabNameSource }
 function reconcileTabNameSources(
   previousState: RootState,
   state: RootState,
+  notes: Map<string, DisplacedHydrateOrigin>,
 ): ReconcileUpdate[] {
   const previousLayouts = (previousState.panes?.layouts ?? {}) as Record<string, PaneNode>
   const layouts = (state.panes?.layouts ?? {}) as Record<string, PaneNode>
   if (previousLayouts === layouts) return []
 
   const updates: ReconcileUpdate[] = []
+  const previousById = new Map(
+    ((previousState.tabs?.tabs ?? []) as TabLike[]).map((tab) => [tab.id, tab]),
+  )
   for (const tab of ((state.tabs?.tabs ?? []) as TabLike[])) {
     const previousLayout = previousLayouts[tab.id]
     const layout = layouts[tab.id]
     if (previousLayout === layout) continue
-    const next = reconcileOne(tab.nameSource, previousLayout, layout)
+    const note = notes.get(tab.id)
+    if (note) notes.delete(tab.id)
+    // The identity origin: the pointer that existed before this observed
+    // transition. For local mutations and carried pointers it IS the
+    // in-place pointer; for a pointer delivered by the same hydrate as the
+    // layout it is the pre-hydrate pointer the note preserved.
+    const originPointer = note && sameNameSource(tab.nameSource, note.adopted)
+      ? note.origin
+      : previousById.get(tab.id)?.nameSource
+    const next = reconcileOne(tab.nameSource, originPointer, previousLayout, layout)
     if (next !== undefined && !sameNameSource(next, tab.nameSource)) {
       updates.push({ tabId: tab.id, nameSource: next })
     }
@@ -99,9 +174,21 @@ function reconcileTabNameSources(
   return updates
 }
 
-/** One tab's pointer transition, from its previous pointer + layouts. */
+/**
+ * One tab's pointer transition. `pointer` is the pointer now in place — it
+ * drives the terminal checks (legacy, whole-layout loss, initial
+ * resolution) and the caller's update comparison. `originPointer` is the
+ * pointer the IDENTITY-FOLLOW keys off: the pointer that existed before
+ * this observed transition. For local mutations and carried pointers they
+ * are the same; for a pointer DELIVERED by the same fold as the layout
+ * (own-key full hydrate) the origin is the pre-transition pointer — the
+ * only pointer the pre-transition layout can answer for — or absent, in
+ * which case nothing ever followed that layout for this tab and the
+ * delivered pointer is only validated, never re-derived from it (T6-R1).
+ */
 function reconcileOne(
   pointer: TabNameSource | undefined,
+  originPointer: TabNameSource | undefined,
   previousLayout: PaneNode | undefined,
   layout: PaneNode | undefined,
 ): TabNameSource | undefined {
@@ -120,8 +207,22 @@ function reconcileOne(
     return resolveInitialTabNameSource(layout)
   }
 
-  const sourceId = pointer.paneId
   const leaves = collectNameSourceLeaves(layout)
+
+  if (originPointer?.kind !== 'session') {
+    // The pointer was delivered by this same fold with no pre-transition
+    // session pointer to follow: accept it, validating it against the
+    // layout — an unresolvable delivered pointer still applies the
+    // removal rule, but the stale pre-transition layout can never answer
+    // a swap-follow question for it.
+    const atSource = leaves.find((leaf) => leaf.paneId === pointer.paneId)
+    if (!atSource || !isScopedNameSourceContent(atSource.content)) {
+      return nextTabNameSourceAfterSourceLoss(layout, atSource ? pointer.paneId : undefined)
+    }
+    return undefined
+  }
+
+  const sourceId = originPointer.paneId
   const atSource = leaves.find((leaf) => leaf.paneId === sourceId)
 
   if (!atSource || !isScopedNameSourceContent(atSource.content)) {

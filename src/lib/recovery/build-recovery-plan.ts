@@ -121,7 +121,8 @@ function paneContent(p: RecoveryPane, preserveSnapshotCreateRequestId = false): 
       createRequestId: createRequestId ?? nanoid(),
       ...(p.sessionRef ? { sessionRef: p.sessionRef } : {}),
     } as PaneContent
-  }  return { ...p.payload, kind: p.kind } as PaneContent
+  }
+  return { ...p.payload, kind: p.kind } as PaneContent
 }
 
 function leaf(content: PaneContent, paneId?: string): PaneNode {
