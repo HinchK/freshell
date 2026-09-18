@@ -1196,7 +1196,7 @@ async fn apply_naming_projection(
     Vec<DirItem>,
     std::collections::HashMap<String, (String, freshell_protocol::SessionNameRef)>,
 ) {
-    use freshell_protocol::session_names::{NameSource, SessionNameRef};
+    use freshell_protocol::session_names::SessionNameRef;
     let Some(sink) = naming else {
         return (items, Default::default());
     };
@@ -1253,10 +1253,7 @@ async fn apply_naming_projection(
             }
             let key = item.key();
             if let Some(update) = by_key.get(&key) {
-                if matches!(
-                    update.record.source,
-                    NameSource::Manual | NameSource::LegacyProtected
-                ) {
+                if crate::session_names::overrides_directory_title(update.record.source) {
                     // The durable manual name wins the displayed title. The
                     // pre-naming title (provider-native, or a legacy
                     // override's) is captured into `provider_title` for the

@@ -2133,3 +2133,90 @@ async fn publisher_recovers_a_lagged_subscription_by_re_diffing_every_record() {
         "every pushed update (recovery + buffered tail) bumps the revision"
     );
 }
+
+/// G2 (session09's content-identical-rewrite quiet window is the live pin):
+/// the publisher invalidates the session directory (`sessions.changed`) ONLY
+/// for commits that can move a served row's `title` — the manual and
+/// migration-protected override class, the same rule the read-side
+/// projection (`apply_naming_projection`) applies. Automatic installs
+/// (directory/first-message/provider fallbacks, Freshell AI names) and
+/// status-only updates never move the served title — every client surface
+/// converges them through the canonical `session.name.updated` push (the
+/// sidebar reads the canonical cache first, then the row's string
+/// projection) — so a `sessions.changed` for them is refetch churn. The
+/// live case session09 catches: the auto-title sweep hydrates a freshly
+/// created session up to one tick AFTER the sessions sweep already
+/// invalidated the create, and that hydration publish used to land in the
+/// quiet window as a spurious directory invalidation.
+#[tokio::test]
+async fn publisher_directory_invalidation_tracks_title_overriding_changes() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let registry = freshell_terminal::TerminalRegistry::new();
+    let (tx, rx) = tokio::sync::broadcast::channel::<SessionNameUpdate>(16);
+    let (broadcast_tx, mut client) = tokio::sync::broadcast::channel::<String>(64);
+    let sessions_revision = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+
+    let publisher = tokio::spawn(run_naming_publisher(
+        store.clone(),
+        rx,
+        registry,
+        std::sync::Arc::new(broadcast_tx),
+        sessions_revision.clone(),
+    ));
+
+    let frame = |id: &str, source: NameSource, changed: bool| SessionNameUpdate {
+        redirects: Vec::new(),
+        record: SessionNameRecord {
+            name_ref: session(NamedProvider::Claude, id),
+            name: format!("name-{id}"),
+            source,
+            revision: 1,
+            manual_revision: None,
+            renamed_at: None,
+            legacy_origin: None,
+        },
+        document_generation: 1,
+        changed,
+        native_sync: None,
+    };
+
+    // An automatic first-message install (changed: true) and a status-only
+    // update (changed: false) reach clients as canonical frames but never
+    // invalidate the directory; a manual rename (changed: true) does both.
+    tx.send(frame("auto-install", NameSource::FirstMessage, true))
+        .expect("send automatic install");
+    tx.send(frame("status-only", NameSource::Manual, false))
+        .expect("send status-only update");
+    tx.send(frame("manual-rename", NameSource::Manual, true))
+        .expect("send manual rename");
+    drop(tx);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), publisher)
+        .await
+        .expect("the publisher must end on a closed channel")
+        .expect("publisher task join");
+
+    let mut name_frames = 0;
+    let mut changed_frames = 0;
+    while let Ok(frame) = client.try_recv() {
+        if frame.contains("session.name.updated") {
+            name_frames += 1;
+        }
+        if frame.contains("sessions.changed") {
+            changed_frames += 1;
+        }
+    }
+    assert_eq!(
+        name_frames, 3,
+        "every push reaches clients as the canonical session.name.updated frame"
+    );
+    assert_eq!(
+        changed_frames, 1,
+        "only the title-overriding (manual/legacy-protected) rename invalidates the directory"
+    );
+    assert!(
+        sessions_revision.load(std::sync::atomic::Ordering::SeqCst) >= 3,
+        "every pushed update still bumps the unified revision"
+    );
+}

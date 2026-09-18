@@ -1008,8 +1008,18 @@ impl SessionNaming for SessionNames {
 /// reaches WS clients as the canonical `session.name.updated` frame, refreshes
 /// the registry display caches of every terminal bound to the record (title
 /// write-through), and invalidates the session directory (`sessions.changed`)
-/// so renamed rows re-read immediately. Extracted from `main`'s spawned
-/// block so the subscription-lag recovery is testable against the real store.
+/// for title-overriding changes — manual and migration-protected renames, the
+/// only commit class that moves a served row's `title` (see
+/// [`overrides_directory_title`]) — so renamed rows re-read immediately.
+/// Automatic installs and status-only updates never invalidate the directory:
+/// they never move a served title, and every client surface converges them
+/// through the canonical frame itself (the sidebar reads the canonical cache
+/// before the row's string projection), so an invalidation there would be
+/// refetch churn — session09's content-identical-rewrite quiet window pins
+/// the live case (a freshly created session's hydration commit lands up to
+/// one auto-title tick after the sweep already invalidated the create).
+/// Extracted from `main`'s spawned block so the subscription-lag recovery is
+/// testable against the real store.
 ///
 /// Subscription-lag recovery (plan rule 8): a `Lagged` recv — a burst of
 /// commits overran the broadcast history while this task was slow —
@@ -1046,10 +1056,20 @@ pub(crate) async fn run_naming_publisher(
         if let Ok(serialized) = serde_json::to_string(&frame) {
             let _ = broadcast_tx.send(serialized);
         }
+        // The unified revision advances for EVERY push (the lag-recovery
+        // pin: a recovered burst re-diffs every record through this same
+        // path, and a skipped token is harmless — frame revisions only
+        // need to be strictly monotonic).
         let revision = sessions_revision.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        let _ = broadcast_tx.send(
-            serde_json::json!({ "type": "sessions.changed", "revision": revision }).to_string(),
-        );
+        // Directory invalidation rides ONLY on a commit that can move a
+        // served row's `title` — the same override rule the read-side
+        // projection applies. The canonical frame above already converges
+        // every client surface for the remaining commit classes.
+        if update.changed && overrides_directory_title(update.record.source) {
+            let _ = broadcast_tx.send(
+                serde_json::json!({ "type": "sessions.changed", "revision": revision }).to_string(),
+            );
+        }
     }
 
     loop {
@@ -1070,8 +1090,32 @@ pub(crate) async fn run_naming_publisher(
                 );
                 match names.refresh_current().await {
                     Ok(recovered) => {
+                        // The recovery re-pushes every record (bootstrap
+                        // shape: `changed` is false for all of them), so the
+                        // per-push gate above cannot fire — the publisher
+                        // decides the invalidation for the WHOLE re-diff:
+                        // one `sessions.changed` iff any recovered record is
+                        // title-overriding, so a missed manual rename still
+                        // invalidates the directory. An automatic-only
+                        // document never does — its canonical frames above
+                        // already converge every client surface.
+                        let directory_visible = recovered
+                            .iter()
+                            .any(|update| overrides_directory_title(update.record.source));
                         for update in recovered {
                             push(&registry, &broadcast_tx, &sessions_revision, update).await;
+                        }
+                        if directory_visible {
+                            let revision = sessions_revision
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                                + 1;
+                            let _ = broadcast_tx.send(
+                                serde_json::json!({
+                                    "type": "sessions.changed",
+                                    "revision": revision
+                                })
+                                .to_string(),
+                            );
                         }
                     }
                     Err(error) => {
@@ -1718,6 +1762,18 @@ fn source_is_protected(source: NameSource) -> bool {
         source,
         NameSource::Manual | NameSource::LegacyProtected | NameSource::FreshellAi
     )
+}
+
+/// The directory-title override rule, ONE source of truth for both the
+/// read-side projection (`session_directory::apply_naming_projection`) and
+/// the naming publisher's `sessions.changed` gate: only a manual or
+/// migration-protected record replaces a served row's `title`. Every
+/// lower-rank name (directory/first-message/provider fallbacks, Freshell
+/// AI) never shadows the provider-native title, so a commit carrying only
+/// those sources cannot change what the directory serves — invalidating it
+/// would be refetch churn.
+pub(crate) fn overrides_directory_title(source: NameSource) -> bool {
+    matches!(source, NameSource::Manual | NameSource::LegacyProtected)
 }
 
 /// Trim surrounding whitespace; reject an empty/control-bearing name or one
