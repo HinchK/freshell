@@ -25,7 +25,7 @@ The approved pane-header redesign is implemented in Freshell: desktop (viewport 
 
 **Goal:** Pane headers look identical on desktop (except icons spreading 4px) while every action button's clickable zone becomes a full-height square that touches its neighbors; mobile headers grow ×1.5 with the same square zones; fonts and desktop glyph/icon sizes are untouched; the change is proven by unit tests and a new browser e2e spec plus regenerated screenshot goldens.
 
-**Architecture:** PaneHeader.tsx is the only pane-header renderer (zoomed panes reuse it; the deck is canvas-only). Zones are implemented by making the button box itself the zone — `h-full` plus fixed rem widths, actions `gap-0` — rather than pseudo-element overlays, so zones abut exactly with no overlap and hover/focus naturally fill the zone. Because the gear and refresh buttons sit inside auto-height wrapper divs, the wrappers (and FreshAgentSettingsButton's root) get an explicit full-height chain so `h-full` resolves all the way down. The `@container` tiers in index.css keep their space-saving hides (≤480px meta, ≤280px optional actions) and their `gap: 0`, but the ≤180px button/svg shrink overrides are deleted: a square full-height zone cannot compress without violating the square constraint, so the proportional update to that fallback is the removal of the shrink mechanism — ultra-narrow space saving comes from the hides alone. All nominal sizes stay in the current rem/px regime (rem where today's classes are rem, px where today's are px) so `--ui-scale` behavior is unchanged; mobile pane icons use rem (`h-[1.3125rem]` = 21px at the default 16px root) to preserve today's rem-based icon scaling, and mobile glyphs stay px (`h-[27px]`) matching today's `h-[18px]` px glyphs.
+**Architecture:** PaneHeader.tsx is the only pane-header renderer (zoomed panes reuse it; the deck is canvas-only). Zones are implemented by making the button box itself the zone — `h-full aspect-square`, actions `gap-0` — rather than pseudo-element overlays, so zones abut exactly with no overlap and hover/focus naturally fill the zone. Because the header's 1px `border-b` lives inside its border-box height (Tailwind preflight), `h-full` reaches the content box, and `aspect-square` derives the zone's width from that height — so zones are true squares by construction (verified live in Chromium: 27×27 desktop / 62×62 mobile at a 16px root, delta 0, gap 0), immune to border or height changes; the approved 28px/63px numbers are the header's outer heights including that border. Because the gear and refresh buttons sit inside auto-height wrapper divs, the wrappers (and FreshAgentSettingsButton's root) get an explicit full-height chain so `h-full` resolves all the way down. The `@container` tiers in index.css keep their space-saving hides (≤480px meta, ≤280px optional actions) and their `gap: 0`, but the ≤180px button/svg shrink overrides are deleted: a square full-height zone cannot compress without violating the square constraint, so the proportional update to that fallback is the removal of the shrink mechanism — ultra-narrow space saving comes from the hides alone. All nominal sizes stay in the current rem/px regime (rem where today's classes are rem, px where today's are px) so `--ui-scale` behavior is unchanged; mobile pane icons use rem (`h-[1.3125rem]` = 21px at the default 16px root) to preserve today's rem-based icon scaling, and mobile glyphs stay px (`h-[27px]`) matching today's `h-[18px]` px glyphs.
 
 **Tech Stack:** React 18 + TypeScript, Tailwind CSS (JIT arbitrary values), Vitest + Testing Library (jsdom, className-string assertions per house style), Playwright e2e (test/e2e-browser).
 
@@ -33,7 +33,7 @@ The approved pane-header redesign is implemented in Freshell: desktop (viewport 
 
 - Font class strings never change on the header root (`text-sm`), title, meta (`text-xs`), or the rename input.
 - Desktop visual classes stay: `sm:h-7`, `sm:h-3 sm:w-3` (glyphs), `sm:h-3.5 sm:w-3.5` (pane icons).
-- Zone contract: buttons `h-full` with `w-[3.9375rem]` base / `sm:w-[1.75rem]`, actions container `gap-0`; zones touch edge-to-edge and never overlap (flex siblings abut exactly).
+- Zone contract: buttons `h-full aspect-square` (square by construction at the header's content height — 27px desktop / 62px mobile at the default 16px root, since the 1px `border-b` is inside the border-box header height), actions container `gap-0`; zones touch edge-to-edge and never overlap (flex siblings abut exactly).
 - Mobile-only ×1.5: header `h-[3.9375rem]`, glyphs `h-[27px] w-[27px]`, pane icons `h-[1.3125rem] w-[1.3125rem]` (all with `sm:` desktop overrides that keep today's sizes).
 - The terminal meta span gains `mr-2` when the actions gap goes to zero; the fresh-agent meta lives in the title area and is untouched.
 - Never global-replace class tokens: `h-6 w-6` also matches a TerminalView spinner (src/components/terminal/TerminalView.tsx:5673) and `h-3.5 w-3.5` has 37 non-header uses. Edits are scoped to PaneHeader.tsx and FreshAgentSettingsButton.tsx only.
@@ -55,7 +55,7 @@ The approved pane-header redesign is implemented in Freshell: desktop (viewport 
 
 **Interfaces:**
 - Consumes: none (first task).
-- Produces: the zone geometry contract that Task 2's gear button must match exactly (`h-full w-[3.9375rem] ... sm:w-[1.75rem]` zone classes; `h-[27px] w-[27px] sm:h-3 sm:w-3` glyph classes) and that Task 3's e2e asserts as computed geometry.
+- Produces: the zone geometry contract that Task 2's gear button must match exactly (`h-full aspect-square` zone classes; `h-[27px] w-[27px] sm:h-3 sm:w-3` glyph classes) and that Task 3's e2e asserts as computed geometry.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -74,8 +74,7 @@ describe('pane header hit zones', () => {
 
     const close = screen.getByTitle('Close pane')
     expect(close.className).toContain('h-full')
-    expect(close.className).toContain('w-[3.9375rem]')
-    expect(close.className).toContain('sm:w-[1.75rem]')
+    expect(close.className).toContain('aspect-square')
     expect(close.className).not.toContain('sm:h-4')
     expect(close.className).not.toContain('sm:w-4')
 
@@ -121,7 +120,7 @@ Adapt helper names (`renderPaneHeader`, prop-passing shape) to the file's existi
 
 Run: `npm run test:vitest -- run test/unit/client/components/panes/PaneHeader.test.tsx`
 
-Expected: FAIL — the new zone-class assertions miss (`h-[3.9375rem]`, `h-full`, `w-[3.9375rem]`, `sm:w-[1.75rem]`, `gap-0`, `mr-2`, `h-[27px]` are absent today) and the updated icon assertions at 758/782 expect `h-[1.3125rem] w-[1.3125rem]` which today renders as `h-3.5 w-3.5`.
+Expected: FAIL — the new zone-class assertions miss (`h-[3.9375rem]`, `h-full`, `aspect-square`, `gap-0`, `mr-2`, `h-[27px]` are absent today) and the updated icon assertions at 758/782 expect `h-[1.3125rem] w-[1.3125rem]` which today renders as `h-3.5 w-3.5`.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -142,23 +141,23 @@ Meta span (line 266) — explicit margin preserving today's 8px gap-2 spacing:
 'mr-2 max-w-[18rem] truncate text-xs text-muted-foreground text-right'
 ```
 
-Every action button swaps its size classes for the full-height zone (keep all other classes exactly as-is per button):
+Every action button swaps its size classes for the full-height square zone — one class string serves both breakpoints (no width utility, no `sm:` size variant; keep all other classes exactly as-is per button):
 
 Refresh (line 148):
 ```tsx
-'inline-flex h-full w-[3.9375rem] shrink-0 items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity sm:w-[1.75rem]'
+'inline-flex h-full aspect-square shrink-0 items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity'
 ```
 Search (line 279):
 ```tsx
-'inline-flex h-full w-[3.9375rem] items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity sm:w-[1.75rem]'
+'inline-flex h-full aspect-square items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity'
 ```
 Zoom (lines 311-314):
 ```tsx
-'inline-flex h-full w-[3.9375rem] shrink-0 items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity sm:w-[1.75rem]'
+'inline-flex h-full aspect-square shrink-0 items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity'
 ```
 Close (line 330):
 ```tsx
-'inline-flex h-full w-[3.9375rem] shrink-0 items-center justify-center rounded opacity-60 hover:opacity-100 hover:bg-background/50 transition-opacity sm:w-[1.75rem]'
+'inline-flex h-full aspect-square shrink-0 items-center justify-center rounded opacity-60 hover:opacity-100 hover:bg-background/50 transition-opacity'
 ```
 
 Glyph sizes — mobile grows, desktop unchanged (all four spots; refresh at 152, search 283, zoom 318-320, close 334):
@@ -187,7 +186,7 @@ In `src/index.css`, ≤280px rule (lines 48-50) — zones always touch, also ult
   gap: 0;
 }
 ```
-Delete the ≤180px button and svg override rules entirely (lines 70-78: the `.pane-header--fresh-agent .pane-header-actions button { height: 1rem; width: 1rem; }` rule and the `.pane-header--fresh-agent .pane-header-actions svg { height: 0.75rem; width: 0.75rem; }` rule). Square full-height zones cannot shrink without violating the square constraint, so the shrink mechanism itself goes away; ultra-narrow space saving comes from the kept ≤280px optional-action hide and ≤480px meta hide. The neighboring ≤180px title-gap and detail-font-size rules in that block stay unchanged.
+Delete the ≤180px button and svg override rules entirely (lines 70-78: the `.pane-header--fresh-agent .pane-header-actions button { height: 1rem; width: 1rem; }` rule and the `.pane-header--fresh-agent .pane-header-actions svg { height: 0.75rem; width: 0.75rem; }` rule). Square full-height zones cannot shrink without violating the square constraint, so the shrink mechanism itself goes away; ultra-narrow space saving comes from the kept ≤280px optional-action hide and ≤480px meta hide. The neighboring ≤180px title-gap and detail-font-size rules in that block stay unchanged — including the pre-existing `.pane-header-fresh-agent-detail { font-size: 13px }` ultra-narrow override, which predates this change and is deliberately untouched: the font-size constraint governs what this change may alter, and this change alters nothing about fonts.
 
 - [ ] **Step 4: Run the focused test**
 
@@ -221,7 +220,7 @@ git commit -m "feat(panes): full-height square hit zones; mobile-only 1.5x heade
 - Test: `test/unit/client/components/fresh-agent/FreshAgentSettingsButton.test.tsx` (extend the existing popover suite around lines 709-731)
 
 **Interfaces:**
-- Consumes: Task 1's zone geometry contract (`h-full w-[3.9375rem] ... sm:w-[1.75rem]` zone; `h-[27px] w-[27px] sm:h-3 sm:w-3` glyph).
+- Consumes: Task 1's zone geometry contract (`h-full aspect-square` zone; `h-[27px] w-[27px] sm:h-3 sm:w-3` glyph).
 - Produces: gear zone + popover anchored to the glyph element; Task 3's e2e does not cover the popover (no fresh-agent provider in the e2e env), so this unit test is the popover's behavioral coverage.
 
 - [ ] **Step 1: Write the failing behavioral test**
@@ -247,14 +246,17 @@ it('anchors the popover to the gear glyph, not the button box', async () => {
 })
 ```
 
-Also assert the gear button's zone classes and the root chain in the same test:
+Also assert the gear button's zone classes, the root chain, and the gear glyph's lockstep sizing in the same test:
 ```tsx
   const settingsRoot = gearButton.parentElement
   expect(settingsRoot?.className).toContain('h-full')
   expect(gearButton.className).toContain('h-full')
-  expect(gearButton.className).toContain('w-[3.9375rem]')
-  expect(gearButton.className).toContain('sm:w-[1.75rem]')
+  expect(gearButton.className).toContain('aspect-square')
+  const gearGlyph = gearButton.querySelector('svg')
+  expect(gearGlyph?.getAttribute('class') ?? '').toContain('h-[27px]')
+  expect(gearGlyph?.getAttribute('class') ?? '').toContain('sm:h-3')
 ```
+For the glyph assertion, mirror the file's icon-rendering convention (if lucide is mocked in that suite, assert the className the mock receives, as the file already does elsewhere).
 Implement `findPortaledPopover()` by copying the popover-locating query the existing portal-escape test at FreshAgentSettingsButton.test.tsx:709-731 already uses — do not invent a new selector. Adapt `freshAgentPaneContent` and the click mechanism to that suite's existing fixtures and helpers (it already opens the popover). jsdom's default rects are all-zero, so with the current button-box anchoring `popover.style.top` is `'4px'` — the assertion fails before the fix for the intended reason.
 
 - [ ] **Step 2: Run the test and verify the intended failure**
@@ -279,7 +281,7 @@ const glyphRef = useRef<SVGSVGElement | null>(null)
 
 Button classes (line 278):
 ```tsx
-'inline-flex h-full w-[3.9375rem] items-center justify-center rounded opacity-60 transition-opacity hover:opacity-100 sm:w-[1.75rem]',
+'inline-flex h-full aspect-square items-center justify-center rounded opacity-60 transition-opacity hover:opacity-100',
 ```
 
 Glyph (line 300):
@@ -330,89 +332,105 @@ git commit -m "feat(fresh-agent): gear zone in lockstep; popover anchors to glyp
 
 - [ ] **Step 1: Write the spec**
 
-Create `test/e2e-browser/specs/pane-header-hit-zones.spec.ts` with the same fixtures import as `pane-system.spec.ts`. The spec creates one terminal pane (mirroring pane-system.spec.ts's tab/pane creation), then measures. All expected values are derived from the live root font-size so the spec is robust under any `--ui-scale`:
+Create `test/e2e-browser/specs/pane-header-hit-zones.spec.ts`. Its first import line copies `pane-system.spec.ts`'s exact `test`/`expect` import (module specifier included) and extends it with the page types:
+
+```ts
+import { test, expect, type Page, type Locator } from '<pane-system.spec.ts\'s exact module specifier>'
+```
+
+Every test requests `{ freshellPage, page }` exactly as pane-system.spec.ts's tests do — Freshell navigation and initialization live in the non-auto `freshellPage` fixture (helpers/fixtures.ts:279-335), so `{ page }` alone yields an unnavigated page. All expected values are derived from the live root font-size and the live header border so the spec is robust under any `--ui-scale`:
 
 ```ts
 const rootFontSize = (page: Page) =>
   page.evaluate(() => parseFloat(getComputedStyle(document.documentElement).fontSize))
 
+const headerZoneHeight = async (page: Page, header: Locator) => {
+  const box = (await header.boundingBox())!
+  const borderH = await header.evaluate((el) => parseFloat(getComputedStyle(el).borderBottomWidth))
+  return box.height - borderH
+}
+
 const closeWithin = (actual: number, expected: number) =>
   expect(Math.abs(actual - expected)).toBeLessThanOrEqual(1)
 
+const expectSquareZone = (box: { width: number; height: number }, zoneHeight: number) => {
+  expect(Math.abs(box.width - box.height)).toBeLessThanOrEqual(0.5)
+  expect(Math.abs(box.height - zoneHeight)).toBeLessThanOrEqual(0.5)
+}
+
+const expectTouching = (boxes: { x: number; width: number }[]) => {
+  for (let i = 1; i < boxes.length; i++) {
+    expect(Math.abs(boxes[i].x - (boxes[i - 1].x + boxes[i - 1].width))).toBeLessThanOrEqual(0.1)
+  }
+}
+
 test.describe('desktop pane header hit zones (>= 640px viewport)', () => {
-  test('zones are full-height squares that touch; visuals unchanged', async ({ page }) => {
+  test('zones are full-height squares that touch; visuals unchanged', async ({ freshellPage, page }) => {
     await createTerminalPane(page)
     const root = await rootFontSize(page)
     const header = page.getByRole('banner', { name: /Pane:/ })
     await expect(header).toBeVisible()
     const headerBox = (await header.boundingBox())!
     closeWithin(headerBox.height, 1.75 * root)
+    const zoneH = await headerZoneHeight(page, header)
+    closeWithin(zoneH, 1.75 * root - 1)
 
     const buttons = await header.getByRole('button').all()
     expect(buttons.length).toBeGreaterThanOrEqual(2)
     const boxes: { x: number; width: number; height: number }[] = []
     for (const b of buttons) boxes.push((await b.boundingBox())!)
     boxes.sort((a, b) => a.x - b.x)
-    for (const box of boxes) {
-      closeWithin(box.width, 1.75 * root)
-      closeWithin(box.height, 1.75 * root)
-    }
-    for (let i = 1; i < boxes.length; i++) {
-      closeWithin(boxes[i].x, boxes[i - 1].x + boxes[i - 1].width)
-    }
+    for (const box of boxes) expectSquareZone(box, zoneH)
+    expectTouching(boxes)
     const closeSvg = header.getByTitle('Close pane').locator('svg')
     closeWithin((await closeSvg.boundingBox())!.width, 0.75 * root)
     const paneIcon = header.locator('svg').first()
     closeWithin((await paneIcon.boundingBox())!.width, 0.875 * root)
   })
 
-  test('fresh-agent gear zone is a full-height square at normal width', async ({ page }) => {
+  test('fresh-agent gear zone is a full-height square at normal width', async ({ freshellPage, page }) => {
     await createFreshAgentPane(page)
     const root = await rootFontSize(page)
     const header = page.getByRole('banner', { name: /Pane:/ })
     await expect(header).toBeVisible()
+    const zoneH = await headerZoneHeight(page, header)
+    closeWithin(zoneH, 1.75 * root - 1)
     const gear = header.getByTitle('Agent settings')
-    const box = (await gear.boundingBox())!
-    closeWithin(box.width, 1.75 * root)
-    closeWithin(box.height, 1.75 * root)
+    expectSquareZone((await gear.boundingBox())!, zoneH)
   })
 
-  test('ultra-narrow fresh-agent panes hide optional actions and keep square full-height zones', async ({ page }) => {
+  test('ultra-narrow fresh-agent panes hide optional actions and keep square full-height zones', async ({ freshellPage, page }) => {
     await createFreshAgentPane(page)
     await splitFreshAgentPaneThreeTimes(page)
     const header = page.getByRole('banner', { name: /Pane:/ }).last()
     await expect(header).toBeVisible()
     await expect(header.getByTitle('Agent settings')).toBeHidden()
-    const headerBox = (await header.boundingBox())!
-    const zoom = header.getByTitle('Maximize pane')
-    const zoomBox = (await zoom.boundingBox())!
-    closeWithin(zoomBox.height, headerBox.height)
-    closeWithin(zoomBox.width, zoomBox.height)
+    await expect(header.getByTitle('Maximize pane')).toBeHidden()
+    const zoneH = await headerZoneHeight(page, header)
+    const close = header.getByTitle('Close pane')
+    expectSquareZone((await close.boundingBox())!, zoneH)
   })
 })
 
 test.describe('mobile pane header hit zones (390px viewport)', () => {
   test.use({ viewport: { width: 390, height: 844 } })
-  test('size increase is mobile-only; zones are 63px squares that touch', async ({ page }) => {
+  test('size increase is mobile-only; zones are full-height squares that touch', async ({ freshellPage, page }) => {
     await createTerminalPane(page)
     const root = await rootFontSize(page)
     const header = page.getByRole('banner', { name: /Pane:/ })
     await expect(header).toBeVisible()
     const headerBox = (await header.boundingBox())!
     closeWithin(headerBox.height, 3.9375 * root)
+    const zoneH = await headerZoneHeight(page, header)
+    closeWithin(zoneH, 3.9375 * root - 1)
 
     const buttons = await header.getByRole('button').all()
     expect(buttons.length).toBeGreaterThanOrEqual(2)
     const boxes: { x: number; width: number; height: number }[] = []
     for (const b of buttons) boxes.push((await b.boundingBox())!)
     boxes.sort((a, b) => a.x - b.x)
-    for (const box of boxes) {
-      closeWithin(box.width, 3.9375 * root)
-      closeWithin(box.height, 3.9375 * root)
-    }
-    for (let i = 1; i < boxes.length; i++) {
-      closeWithin(boxes[i].x, boxes[i - 1].x + boxes[i - 1].width)
-    }
+    for (const box of boxes) expectSquareZone(box, zoneH)
+    expectTouching(boxes)
     const close = header.getByTitle('Close pane')
     const closeSvg = close.locator('svg')
     closeWithin((await closeSvg.boundingBox())!.width, 27)
@@ -422,7 +440,7 @@ test.describe('mobile pane header hit zones (390px viewport)', () => {
 })
 ```
 
-Implement `createTerminalPane(page)`, `createFreshAgentPane(page)`, and `splitFreshAgentPaneThreeTimes(page)` (split the fresh-agent pane horizontally until its container is under 180px on the default 1280px-wide viewport — three splits of the same pane: 640 → 320 → 160) by mirroring the pane-creation and split flows in `pane-system.spec.ts` and the fresh-agent pane creation in `fresh-agent.spec.ts`; import the fixtures exactly as those specs do and do not invent a new helper mechanism. Keep all locators role/title-based. Do not add this spec to `CLOUD_SKIP_SPECS` in `test/e2e-browser/playwright.cloud.config.ts` — that would make it non-coverage per repo rules.
+Implement `createTerminalPane(page)`, `createFreshAgentPane(page)`, and `splitFreshAgentPaneThreeTimes(page)` (split the fresh-agent pane horizontally until its container is under 180px on the default 1280px-wide viewport — three splits of the same pane: 640 → 320 → 160) by mirroring the pane-creation and split flows in `pane-system.spec.ts` and the fresh-agent pane creation in `fresh-agent.spec.ts`; do not invent a new helper mechanism. Note that in fresh-agent panes the Maximize button also carries the `pane-header-fresh-agent-optional-action` class, so at ≤280px only the Close button remains visible — the narrow-tier test measures Close for exactly that reason. Keep all locators role/title-based. Do not add this spec to `CLOUD_SKIP_SPECS` in `test/e2e-browser/playwright.cloud.config.ts` — that would make it non-coverage per repo rules.
 
 - [ ] **Step 2: Run the affected visual specs and verify the intended failure**
 
