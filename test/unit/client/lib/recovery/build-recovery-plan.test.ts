@@ -887,3 +887,38 @@ describe('unified agent names (Task 6): recovery preserves naming identity', () 
     return leavesOf(node).map((l) => l.id)
   }
 })
+
+describe('unified agent names (Task 7): recovery carries no scoped title aliases', () => {
+  const agentPane = (paneId: string, payloadOver: Record<string, unknown> = {}) => pane({
+    paneId,
+    kind: 'terminal',
+    mode: 'claude',
+    payload: {
+      createRequestId: `crid-${paneId}`,
+      nameRef: { kind: 'session', provider: 'claude', sessionId: `sess-${paneId}` },
+      namingHandle: `handle-${paneId}`,
+      ...payloadOver,
+    },
+    sessionRef: { provider: 'claude', sessionId: `sess-${paneId}` },
+    ledgerState: 'bound' as const,
+  })
+
+  it('plans never carry pane-title aliases — an old server snapshot cannot smuggle a scoped label back in', () => {
+    const inventory = inv([agentPane('p-agent')])
+    inventory.device!.tabs[0].tabKey = 'd:tab-1'
+    inventory.device!.tabs[0].nameSource = { kind: 'session', paneId: 'p-agent' }
+
+    const [plan] = buildRecoveryPlan(inventory, { preserveIdsForMachine: 'd' })
+
+    expect(plan.paneTitles).toEqual({})
+    // The pane's canonical identity (which carries the migrated name)
+    // survives the rebuild.
+    const walk = (node: typeof plan.layout): unknown => {
+      if (node.type === 'leaf') return node.content
+      return walk(node.children[0]) ?? walk(node.children[1])
+    }
+    const content = walk(plan.layout) as Record<string, unknown>
+    expect(content.nameRef).toEqual({ kind: 'session', provider: 'claude', sessionId: 'sess-p-agent' })
+    expect(content.namingHandle).toBe('handle-p-agent')
+  })
+})

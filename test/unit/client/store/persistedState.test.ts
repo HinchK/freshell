@@ -664,3 +664,67 @@ describe('persistedState parsers', () => {
       expect(content.namingHandle).toBeUndefined()
     })
   })
+
+// ── unified agent names (Task 7): the parse-level sanitizer gate ─────────────
+
+describe('persistedState parsers — unified agent names (Task 7)', () => {
+  const scopedLayout = {
+    type: 'leaf',
+    id: 'p-agent',
+    content: {
+      kind: 'terminal',
+      mode: 'claude',
+      createRequestId: 'req-1',
+      sessionRef: { provider: 'claude', sessionId: 'sess-1' },
+      namingHandle: 'h-1',
+    },
+  } as const
+
+  it('parsePersistedPanesRaw strips a scoped pane title/flag while preserving the pane identity and out-of-scope titles', () => {
+    const raw = JSON.stringify({
+      version: 7,
+      layouts: {
+        'tab-1': scopedLayout,
+        'tab-shell': {
+          type: 'leaf',
+          id: 'p-shell',
+          content: { kind: 'terminal', mode: 'shell', createRequestId: 'req-2' },
+        },
+      },
+      activePane: { 'tab-1': 'p-agent' },
+      paneTitles: { 'tab-1': { 'p-agent': 'Scoped Alias' }, 'tab-shell': { 'p-shell': 'Shell Title' } },
+      paneTitleSetByUser: { 'tab-1': { 'p-agent': true }, 'tab-shell': { 'p-shell': true } },
+    })
+    const parsed = parsePersistedPanesRaw(raw)
+    expect(parsed).not.toBeNull()
+    expect(parsed!.paneTitles).toEqual({ 'tab-shell': { 'p-shell': 'Shell Title' } })
+    expect(parsed!.paneTitleSetByUser).toEqual({ 'tab-shell': { 'p-shell': true } })
+    // The pane identity survives the sanitizer untouched.
+    const content = (parsed!.layouts['tab-1'] as { content: Record<string, unknown> }).content
+    expect(content.sessionRef).toEqual({ provider: 'claude', sessionId: 'sess-1' })
+    expect(content.namingHandle).toBe('h-1')
+  })
+
+  it('parsePersistedTabsRaw drops a session-owned tab freeze flag and keeps legacy tabs verbatim', () => {
+    const raw = JSON.stringify({
+      version: 2,
+      tabs: {
+        activeTabId: 't1',
+        tabs: [
+          { id: 't1', title: 'Session Named', titleSetByUser: true, nameSource: { kind: 'session', paneId: 'p1' } },
+          { id: 't2', title: 'Legacy', titleSetByUser: true },
+        ],
+      },
+      tombstones: [],
+    })
+    const parsed = parsePersistedTabsRaw(raw)
+    expect(parsed).not.toBeNull()
+    const sessionOwned = parsed!.tabs.tabs.find((t) => t.id === 't1')!
+    expect(sessionOwned.titleSetByUser).toBeUndefined()
+    // The last-known title projection and the source pointer survive.
+    expect(sessionOwned.title).toBe('Session Named')
+    expect(sessionOwned.nameSource).toEqual({ kind: 'session', paneId: 'p1' })
+    const legacy = parsed!.tabs.tabs.find((t) => t.id === 't2')!
+    expect(legacy.titleSetByUser).toBe(true)
+  })
+})

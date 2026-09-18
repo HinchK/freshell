@@ -12,6 +12,10 @@ import {
   parsePersistedLayoutRaw,
   readRecoverablePersistedLayoutRaw,
 } from './persistedState.js'
+import {
+  stripScopedPaneTitleMetadata,
+  stripSessionOwnedTabFreezeFlags,
+} from '@/lib/session-name-migration'
 import { PANES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY, TURN_COMPLETION_STORAGE_KEY } from './storage-keys'
 import {
   getWindowFreshAgentBackupKey,
@@ -434,18 +438,24 @@ function migratePanesData(parsed: any): any | null {
           droppedTabIds.add(tabId)
         }
       }
-      // Already up to date, but ensure paneTitles/paneTitleSetByUser exist
+      // Already up to date, but ensure paneTitles/paneTitleSetByUser exist.
+      // Unified agent names (Task 7): the legacy v2 load path passes the ONE
+      // client sanitizer — a scoped agent pane's title/user-flag never
+      // re-enters state from a legacy envelope.
       return {
         ...parsed,
         layouts: sanitizedLayouts,
         activePane: Object.fromEntries(
           Object.entries(parsed.activePane || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
         ),
-        paneTitles: Object.fromEntries(
-          Object.entries(parsed.paneTitles || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
-        ),
-        paneTitleSetByUser: Object.fromEntries(
-          Object.entries(parsed.paneTitleSetByUser || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+        ...stripScopedPaneTitleMetadata(
+          sanitizedLayouts,
+          Object.fromEntries(
+            Object.entries(parsed.paneTitles || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+          ) as Record<string, Record<string, string>>,
+          Object.fromEntries(
+            Object.entries(parsed.paneTitleSetByUser || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+          ) as Record<string, Record<string, boolean>>,
         ),
       }
     }
@@ -509,11 +519,16 @@ function migratePanesData(parsed: any): any | null {
       activePane: Object.fromEntries(
         Object.entries(parsed.activePane || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
       ),
-      paneTitles: Object.fromEntries(
-        Object.entries(paneTitles).filter(([tabId]) => !droppedTabIds.has(tabId)),
-      ),
-      paneTitleSetByUser: Object.fromEntries(
-        Object.entries(parsed.paneTitleSetByUser || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+      // Unified agent names (Task 7): the migrated legacy load passes the
+      // ONE client sanitizer (see the already-current exit above).
+      ...stripScopedPaneTitleMetadata(
+        sanitizedLayouts,
+        Object.fromEntries(
+          Object.entries(paneTitles).filter(([tabId]) => !droppedTabIds.has(tabId)),
+        ) as Record<string, Record<string, string>>,
+        Object.fromEntries(
+          Object.entries(parsed.paneTitleSetByUser || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+        ) as Record<string, Record<string, boolean>>,
       ),
       version: PANES_SCHEMA_VERSION,
     }
@@ -670,15 +685,27 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
           }
         }
 
+        const sanitizedPaneMetadata = stripScopedPaneTitleMetadata(
+          sanitizedLayouts,
+          (persistablePanesSection as Record<string, any>).paneTitles ?? {},
+          (persistablePanesSection as Record<string, any>).paneTitleSetByUser ?? {},
+        )
         const layoutPayload = {
           persistedAt: Date.now(),
           version: LAYOUT_SCHEMA_VERSION,
           machineId: selectStampMachineId(state),
           tabs: {
             activeTabId: state.tabs?.activeTabId ?? null,
-            tabs: (state.tabs?.tabs ?? []).map(stripTabVolatileFields),
+            // Unified agent names (Task 7): the flush gate — a session-owned
+            // tab's freeze flag is a retired alias and never flushes.
+            tabs: stripSessionOwnedTabFreezeFlags(
+              (state.tabs?.tabs ?? []).map(stripTabVolatileFields),
+            ) as Array<Record<string, unknown>>,
           },
-          panes: persistablePanesSection,
+          panes: {
+            ...persistablePanesSection,
+            ...sanitizedPaneMetadata,
+          },
           tombstones,
         }
 

@@ -2066,6 +2066,45 @@ export const panesSlice = createSlice({
       state.paneTitleSetByUser = merged.paneTitleSetByUser
     },
 
+    // Unified agent names (Task 7): stamp the derived legacy-pending naming
+    // handles onto the hydrated panes they were derived from — the pane's
+    // pre-durable identity so its migrated name follows the pane (and, once
+    // sender-stamping lands, its later create/bind). Idempotent: a pane
+    // that already holds a namingHandle, a durable sessionRef, or a
+    // canonical nameRef is never overwritten; the assignment's
+    // createRequestId must match, so a reminted pane never adopts a stale
+    // handle.
+    stampLegacyMigrationHandles: (
+      state,
+      action: PayloadAction<
+        Array<{
+          storageKey: string
+          windowId: string | null
+          tabId: string
+          paneId: string
+          createRequestId: string
+          namingHandle: string
+        }>
+      >,
+    ) => {
+      for (const assignment of action.payload) {
+        const layout = state.layouts[assignment.tabId]
+        const findPane = (node: PaneNode | undefined): PaneContent | undefined => {
+          if (!node) return undefined
+          if (node.type === 'leaf') {
+            return node.id === assignment.paneId ? node.content : undefined
+          }
+          return findPane(node.children[0]) ?? findPane(node.children[1])
+        }
+        const content = findPane(layout)
+        if (!content) continue
+        if (content.kind !== 'terminal' && content.kind !== 'fresh-agent') continue
+        if (content.createRequestId !== assignment.createRequestId) continue
+        if (content.sessionRef || content.nameRef || content.namingHandle) continue
+        content.namingHandle = assignment.namingHandle
+      }
+    },
+
     updatePaneTitle: (
       state,
       action: PayloadAction<{ tabId: string; paneId: string; title: string; setByUser?: boolean }>
@@ -2667,6 +2706,7 @@ export const {
   clearPaneClosing,
   hydratePanes,
   hydratePaneTitles,
+  stampLegacyMigrationHandles,
   updatePaneTitle,
   updatePaneTitleByTerminalId,
   reconcileTerminalSessionRefByTerminalId,

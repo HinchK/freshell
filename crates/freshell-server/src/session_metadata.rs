@@ -241,6 +241,46 @@ impl SessionMetadataStore {
         Ok(true)
     }
 
+    /// Unified agent names (Task 7): scope-only migration cleanup — remove
+    /// one entry's `derivedTitle` field while preserving every other field
+    /// (the same lossless copy-forward discipline as `set`). Returns
+    /// `Ok(true)` iff the field was present and removed. The canonical
+    /// session-names authority owns scoped titles once the consolidation
+    /// receipt commits; a stale derived title must never remain a competing
+    /// alias.
+    pub async fn clear_derived_title(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> std::io::Result<bool> {
+        let mut guard = self.inner.lock().await;
+        let mut data = Self::load_locked(&mut guard, &self.path).await;
+
+        let root = data
+            .as_object_mut()
+            .expect("metadata file root is always loaded as an object (see load_locked)");
+        let Some(sessions_obj) = root.get_mut("sessions").and_then(Value::as_object_mut) else {
+            return Ok(false);
+        };
+        let Some(provider_obj) = sessions_obj
+            .get_mut(provider)
+            .and_then(Value::as_object_mut)
+        else {
+            return Ok(false);
+        };
+        let Some(entry) = provider_obj
+            .get_mut(session_id)
+            .and_then(Value::as_object_mut)
+        else {
+            return Ok(false);
+        };
+        if entry.remove("derivedTitle").is_none() {
+            return Ok(false);
+        }
+        self.persist(&mut guard, data).await?;
+        Ok(true)
+    }
+
     /// `save()` (`session-metadata-store.ts:90-100`): write to a pid+timestamp-scoped temp
     /// file, then atomically rename over the real path, then best-effort clean up the temp
     /// file (a no-op if the rename already consumed it — mirrors `fsp.rm(tmp, {force:true})`).

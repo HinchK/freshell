@@ -1,5 +1,6 @@
 import type { PanesState, PaneContent, PaneNode } from './paneTypes'
 import { isScopedNameSourceContent } from '@/lib/tab-name-source'
+import { stripScopedPaneTitleMetadata } from '@/lib/session-name-migration'
 
 export type HydratePanesMeta = {
   localLayoutPersistedAt?: number
@@ -170,7 +171,12 @@ export function mergeHydratedPaneMetadata(
     }
   }
 
-  return { activePane, paneTitles, paneTitleSetByUser }
+  // Unified agent names (Task 7): the merge output passes the ONE client
+  // sanitizer — a scoped agent pane's title/flag is a retired legacy alias
+  // (the canonical server record owns the name), so no hydrate path may
+  // ever install or retain one.
+  const sanitized = stripScopedPaneTitleMetadata(layouts, paneTitles, paneTitleSetByUser)
+  return { activePane, ...sanitized }
 }
 
 /** Deep-equality for one pane-title metadata record (primitive leaves):
@@ -305,8 +311,11 @@ export function mergeCrossWindowPaneTitles(
         ? incomingTabFlags[paneId]
         : undefined
       if (incomingTitle === undefined || scopedPaneIds.has(paneId)) {
-        // No delivery for this pane — or a scoped pane, whose title/flags a
-        // foreign window may never freeze: the local entry stands verbatim.
+        // No delivery for this pane — or a scoped agent pane (Task 7): a
+        // foreign window may never freeze its title/flags AND the local
+        // entry is a retired legacy alias (the canonical server record
+        // owns the name) — it contributes nothing either way.
+        if (scopedPaneIds.has(paneId)) continue
         if (localTitle !== undefined) nextTabTitles[paneId] = localTitle
         if (localFlag !== undefined) nextTabFlags[paneId] = localFlag
         continue

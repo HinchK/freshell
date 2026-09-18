@@ -11,6 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::SessionLocator;
+
 /// Monotonically allocated name revision — JS-safe on the wire.
 pub type NameRevision = u64;
 
@@ -221,4 +223,215 @@ pub struct SessionNameUpdated {
     pub changed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_sync: Option<NativeSyncProjection>,
+}
+
+// ---------------------------------------------------------------------------
+// Task 7 — legacy-name migration envelope
+// ---------------------------------------------------------------------------
+
+/// Where a legacy candidate's label lived. The scope breaks total-order ties:
+/// `session > pane > source_tab > terminal > derived`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyCandidateScope {
+    Session,
+    Pane,
+    SourceTab,
+    Terminal,
+    Derived,
+}
+
+/// What protection the raw evidence claims for a legacy candidate.
+/// `explicit_rename` is reliable explicit-rename evidence (only the old
+/// durable session-rename ladder could produce it, and only server-side boot
+/// evidence honors it); `legacy_flag` is an old manual/protected flag whose
+/// human origin is UNRECOVERABLE (pane/tab user-set booleans, unsourced
+/// title overrides); `none` is an unprotected label with a known automatic
+/// origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyProtectionEvidence {
+    ExplicitRename,
+    LegacyFlag,
+    None,
+}
+
+/// A migration candidate's target: the canonical naming ref, or a legacy
+/// identity that the server resolves through the existing canonical
+/// identity/ledger — never a new key. `legacy_session` reuses the structured
+/// provider/session restore identity (with the optional codex durability
+/// evidence and original cwd); `legacy_terminal` names a terminal +
+/// server instance for ledger resolution. The untagged representation
+/// matches the TS `z.union`: the canonical ref carries its own `kind` tag
+/// (`pending`/`session`) and the legacy variants carry `legacy_session`/
+/// `legacy_terminal` through the flattened marker below. (The wire shape
+/// is fixed by the plan's TS union — boxing the optional codex durability
+/// evidence would buy nothing at this enum's call frequency.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
+pub enum LegacyNameTarget {
+    Canonical(SessionNameRef),
+    #[serde(rename_all = "camelCase")]
+    LegacySession {
+        #[serde(flatten)]
+        kind: LegacySessionKind,
+        session_ref: SessionLocator,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        codex_durability: Option<crate::common::CodexDurability>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    LegacyTerminal {
+        #[serde(flatten)]
+        kind: LegacyTerminalKind,
+        terminal_id: String,
+        server_instance_id: String,
+    },
+}
+
+/// The `kind: "legacy_session"` discriminant (its own unit type so the
+/// untagged variant above stays self-describing on the wire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacySessionKind {
+    #[serde(rename = "kind")]
+    pub kind: LegacySessionKindTag,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacySessionKindTag {
+    LegacySession,
+}
+
+/// The `kind: "legacy_terminal"` discriminant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyTerminalKind {
+    #[serde(rename = "kind")]
+    pub kind: LegacyTerminalKindTag,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacyTerminalKindTag {
+    LegacyTerminal,
+}
+
+impl LegacyNameTarget {
+    /// Convenience constructors matching the TS discriminated shapes.
+    pub fn legacy_session(session_ref: SessionLocator) -> Self {
+        Self::LegacySession {
+            kind: LegacySessionKind {
+                kind: LegacySessionKindTag::LegacySession,
+            },
+            session_ref,
+            codex_durability: None,
+            cwd: None,
+        }
+    }
+
+    pub fn legacy_terminal(
+        terminal_id: impl Into<String>,
+        server_instance_id: impl Into<String>,
+    ) -> Self {
+        Self::LegacyTerminal {
+            kind: LegacyTerminalKind {
+                kind: LegacyTerminalKindTag::LegacyTerminal,
+            },
+            terminal_id: terminal_id.into(),
+            server_instance_id: server_instance_id.into(),
+        }
+    }
+}
+
+/// The stable legacy-candidate id: the JSON encoding of the tuple
+/// `[storageKey,deviceId,tabId,paneId,scope,provider,sessionId,name,source,
+/// protectionEvidence,explicitRenameAt]` with absent entries `null`. Every
+/// imported time must have evidence — never receipt/import time — so
+/// `explicit_rename_at` is `None` unless the evidence carries a trustworthy
+/// explicit-rename timestamp.
+pub fn legacy_name_candidate_id(input: LegacyCandidateIdInput<'_>) -> String {
+    let json = serde_json::json!([
+        input.storage_key,
+        input.device_id,
+        input.tab_id,
+        input.pane_id,
+        input.scope,
+        input.provider,
+        input.session_id,
+        input.name,
+        input.source,
+        input.protection_evidence,
+        input.explicit_rename_at,
+    ]);
+    serde_json::to_string(&json).expect("the candidate id tuple serializes")
+}
+
+/// The identity fields of one legacy candidate for
+/// [`legacy_name_candidate_id`].
+#[derive(Debug, Clone, Copy)]
+pub struct LegacyCandidateIdInput<'a> {
+    pub storage_key: &'a str,
+    pub device_id: Option<&'a str>,
+    pub tab_id: Option<&'a str>,
+    pub pane_id: Option<&'a str>,
+    pub scope: LegacyCandidateScope,
+    pub provider: Option<&'a str>,
+    pub session_id: Option<&'a str>,
+    pub name: &'a str,
+    pub source: NameSource,
+    pub protection_evidence: LegacyProtectionEvidence,
+    pub explicit_rename_at: Option<i64>,
+}
+
+/// One legacy-name candidate. The stable candidate `id` is the JSON tuple
+/// `[storageKey,deviceId,tabId,paneId,scope,provider,sessionId,name,source,
+/// protectionEvidence,explicitRenameAt]` with absent entries `null`;
+/// `explicit_rename_at` must carry evidence (never receipt/import time) and
+/// is absent when no trustworthy explicit-rename time exists.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyNameCandidate {
+    pub id: String,
+    pub target: LegacyNameTarget,
+    pub name: String,
+    pub source: NameSource,
+    pub scope: LegacyCandidateScope,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explicit_rename_at: Option<i64>,
+    pub evidence_key: String,
+    pub protection_evidence: LegacyProtectionEvidence,
+}
+
+/// One immutable raw evidence envelope: the bytes of one legacy storage
+/// payload, preserved verbatim before any sanitization could clear it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyEvidenceEnvelope {
+    pub storage_key: String,
+    pub raw: String,
+}
+
+/// The Task 7 import envelope. `version` is fixed at 1; `import_id` is the
+/// persisted retry-stable id of one captured raw envelope (the server derives
+/// its immutable per-import backup filename from it). Clients batch at most
+/// 100 candidates per import.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyNameImport {
+    pub version: u32,
+    pub import_id: String,
+    pub evidence: Vec<LegacyEvidenceEnvelope>,
+    pub candidates: Vec<LegacyNameCandidate>,
+}
+
+/// The import result: every acknowledged candidate id (per-candidate
+/// acknowledgment, never an early whole-import shortcut) plus the updates for
+/// the records the import touched (winners and unchanged winners alike).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LegacyImportResult {
+    pub acknowledged: Vec<String>,
+    pub names: Vec<SessionNameUpdate>,
 }

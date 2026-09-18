@@ -53,6 +53,7 @@ mod serve_client;
 mod session_directory;
 mod session_metadata;
 mod session_name_generation;
+mod session_name_migration;
 mod session_name_native;
 mod session_name_routes;
 mod session_names;
@@ -1598,6 +1599,29 @@ async fn main() -> ExitCode {
         .unwrap_or_else(|| PathBuf::from(".freshell"));
     let session_metadata_store = session_metadata::SessionMetadataStore::new(session_metadata_dir);
 
+    // Unified agent names (Task 7): the ONE-TIME legacy-name consolidation,
+    // awaited INLINE before any naming read is served — it commits winners,
+    // winning migration evidence, acknowledged candidate ids and the
+    // completion receipt in ONE strict name transaction (the same
+    // `.session-names.lock` discipline every participant uses), then runs
+    // the scope-only cleanup of the migrated config/metadata title fields.
+    // A committed receipt skips straight to the idempotent cleanup retry.
+    // A `None` store (no home) or a failed open leaves the legacy fields
+    // live — naming stays on its degraded path and the next boot retries.
+    if let (Some(names), Some(user_home)) = (session_names.clone(), home.clone()) {
+        session_name_migration::run_session_name_consolidation(
+            session_name_migration::SessionNameConsolidationInputs {
+                names,
+                settings: std::sync::Arc::new(settings_store.clone()),
+                metadata: std::sync::Arc::new(session_metadata_store.clone()),
+                identity: terminal_identity.clone(),
+                data_dir: user_home.join(".freshell"),
+                snapshots_dir: snapshots_dir.clone(),
+            },
+        )
+        .await;
+    }
+
     // The History read model (`GET /api/session-directory`, Follow-up 3.19): list
     // the coding-CLI sessions from the isolated home's provider transcript dirs,
     // reusing `freshell-sessions` parsers. Replaces the earlier empty-page stub.
@@ -2027,9 +2051,10 @@ async fn main() -> ExitCode {
         }))
         // Unified agent names (Task 2): the canonical session-name HTTP
         // surface — `POST /api/session-names/read` + `PATCH
-        // /api/session-names`. Mounted ONLY when the authority opened; a
-        // degraded (no-home) boot exposes no canonical route, and the
-        // convenience surfaces answer their 503 unavailable.
+        // /api/session-names` + Task 7's `POST /api/session-names/import`.
+        // Mounted ONLY when the authority opened; a degraded (no-home) boot
+        // exposes no canonical route, and the convenience surfaces answer
+        // their 503 unavailable.
         .merge(
             session_names
                 .clone()
@@ -2037,6 +2062,10 @@ async fn main() -> ExitCode {
                     session_name_routes::router(session_name_routes::SessionNamesState {
                         auth_token: Arc::clone(&auth_token),
                         names,
+                        // Task 7: the identity ledger resolving legacy
+                        // terminal import targets (the same registry every
+                        // rename surface reads).
+                        identity: terminal_identity.clone(),
                     })
                 })
                 .unwrap_or_default(),

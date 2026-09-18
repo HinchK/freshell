@@ -63,6 +63,7 @@ fn names_state(home: &std::path::Path) -> SessionNamesState {
     SessionNamesState {
         auth_token: Arc::new("tok".to_string()),
         names,
+        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
     }
 }
 
@@ -956,5 +957,174 @@ async fn verified_relocation_retains_the_name_and_leaves_non_targets_untouched()
         other.record.name, "other",
         "the non-target copy is untouched"
     );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// ── Task 7: the legacy-name import endpoint ─────────────────────────────────
+
+async fn post_import(router: Router, body: Value) -> (StatusCode, Value) {
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/session-names/import")
+                .header("x-auth-token", "tok")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
+#[tokio::test]
+async fn import_endpoint_acknowledges_per_candidate_and_resolves_terminals() {
+    let home = temp_home();
+    let state = names_state(&home);
+    let router = super::router(state.clone());
+    // Seed a live scoped terminal identity so its legacy_terminal target
+    // resolves through the ledger.
+    state
+        .identity
+        .upsert("t-1", Some("claude"), Some("sess-1"), None, 1);
+
+    let body = json!({
+        "version": 1,
+        "importId": "browser-import-1",
+        "evidence": [
+            { "storageKey": "freshell.layout.v3.w1", "raw": "{\"version\":4}" }
+        ],
+        "candidates": [
+            {
+                "id": "c-1",
+                "target": { "kind": "legacy_terminal", "terminalId": "t-1", "serverInstanceId": "srv" },
+                "name": "Resolved Terminal Label",
+                "source": "legacy_protected",
+                "scope": "terminal",
+                "evidenceKey": "envelope#t-1",
+                "protectionEvidence": "legacy_flag"
+            },
+            {
+                "id": "c-2",
+                "target": { "kind": "legacy_terminal", "terminalId": "t-gone", "serverInstanceId": "srv" },
+                "name": "Ghost Terminal",
+                "source": "legacy_protected",
+                "scope": "terminal",
+                "evidenceKey": "envelope#t-gone",
+                "protectionEvidence": "legacy_flag"
+            },
+            {
+                "id": "c-3",
+                "target": { "kind": "session", "provider": "claude", "sessionId": "sess-2" },
+                "name": "Claimed Human Rename",
+                "source": "manual",
+                "scope": "session",
+                "evidenceKey": "envelope#sess-2",
+                "protectionEvidence": "explicit_rename"
+            },
+        ],
+    });
+    let (status, body) = post_import(router, body).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Per-candidate acknowledgment — all three, including the unresolved
+    // terminal (recovery-only) and the downgraded explicit claim.
+    assert_eq!(body["acknowledged"], json!(["c-1", "c-2", "c-3"]), "{body}");
+    // The resolved terminal's candidate installed as legacy-protected.
+    let sess1 = body["names"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["record"]["ref"]["sessionId"] == json!("sess-1"))
+        .unwrap();
+    assert_eq!(sess1["record"]["name"], json!("Resolved Terminal Label"));
+    assert_eq!(sess1["record"]["source"], json!("legacy_protected"));
+    assert_eq!(sess1["record"]["legacyOrigin"], json!("unknown"));
+    // The HTTP lane never honors an explicit-rename claim: the candidate is
+    // downgraded to legacy-protected with unknown origin.
+    let sess2 = body["names"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["record"]["ref"]["sessionId"] == json!("sess-2"))
+        .unwrap();
+    assert_eq!(sess2["record"]["source"], json!("legacy_protected"));
+    assert_eq!(sess2["record"]["legacyOrigin"], json!("unknown"));
+    assert!(sess2["record"].get("renamedAt").is_none());
+    assert!(sess2["record"].get("manualRevision").is_none());
+    // The immutable per-import backup landed before the acknowledgment.
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"browser-import-1");
+        format!("{:x}", hasher.finalize())
+    };
+    let backup = home
+        .join(".freshell")
+        .join("name-migration-v1")
+        .join("imports")
+        .join(format!("{digest}.json"));
+    assert!(backup.exists(), "the per-import backup precedes the ack");
+
+    // The reserved boot import id is refused from the HTTP lane.
+    let state2 = names_state(&home);
+    let router2 = super::router(state2);
+    let (status, body) = post_import(
+        router2,
+        json!({ "version": 1, "importId": "server-boot-v1", "evidence": [], "candidates": [] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["details"],
+        json!("the server-boot import id is reserved")
+    );
+
+    // An oversized envelope is refused.
+    let state3 = names_state(&home);
+    let router3 = super::router(state3);
+    let mut oversized = Vec::new();
+    for index in 0..101 {
+        oversized.push(json!({
+            "id": format!("o-{index}"),
+            "target": { "kind": "session", "provider": "claude", "sessionId": format!("s{index}") },
+            "name": "L",
+            "source": "provider_ai",
+            "scope": "pane",
+            "evidenceKey": format!("e#{index}"),
+            "protectionEvidence": "none"
+        }));
+    }
+    let (status, body) = post_import(
+        router3,
+        json!({ "version": 1, "importId": "big", "evidence": [], "candidates": oversized }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[tokio::test]
+async fn import_endpoint_requires_auth() {
+    let home = temp_home();
+    let state = names_state(&home);
+    let router = super::router(state);
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/session-names/import")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "version": 1, "importId": "x", "evidence": [], "candidates": [] })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     std::fs::remove_dir_all(&home).ok();
 }

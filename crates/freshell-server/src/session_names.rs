@@ -62,8 +62,10 @@ use freshell_freshagent::naming::{
 };
 use freshell_protocol::native_location::{NativeAcquisition, NativeLocation, NativePersistence};
 use freshell_protocol::session_names::{
-    NameIntent, NameRevision, NameSource, NamedProvider, SessionNameRecord, SessionNameRedirect,
-    SessionNameRef, SessionNameUpdate, MAX_NAME_REVISION,
+    LegacyCandidateScope, LegacyImportResult, LegacyNameCandidate, LegacyNameImport,
+    LegacyNameTarget, LegacyProtectionEvidence, NameIntent, NameRevision, NameSource,
+    NamedProvider, SessionNameRecord, SessionNameRedirect, SessionNameRef, SessionNameUpdate,
+    MAX_NAME_REVISION,
 };
 use freshell_ws::tabs_persist::atomic_write_durable;
 use serde::{Deserialize, Serialize};
@@ -111,6 +113,20 @@ const NATIVE_CYCLE_RETRY_1_MS: i64 = 5_000;
 const NATIVE_CYCLE_RETRY_2_MS: i64 = 30_000;
 /// Broadcast history retained for slow subscribers (lag recovers by refresh).
 const NAME_BROADCAST_CAPACITY: usize = 4096;
+/// Task 7: the one-time consolidation's evidence/backup directory under the
+/// Freshell data directory.
+pub(crate) const NAME_MIGRATION_DIR_NAME: &str = "name-migration-v1";
+/// Task 7: the immutable per-import backup subdirectory
+/// (`name-migration-v1/imports/<SHA-256 of importId>.json`).
+pub(crate) const NAME_MIGRATION_IMPORTS_DIR_NAME: &str = "imports";
+/// Task 7: the reserved import id of the trusted server-boot evidence
+/// import. Only this lane may carry `explicit_rename` (manual) and
+/// accepted-Freshell-AI classifications; the HTTP route rejects the id so
+/// arbitrary callers can never assert them.
+pub(crate) const NAME_MIGRATION_BOOT_IMPORT_ID: &str = "server-boot-v1";
+/// Task 7: an import batches at most this many candidates (the client
+/// chunks; the server refuses oversized envelopes).
+pub(crate) const NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Document schema (version 1)
@@ -267,8 +283,14 @@ struct SchedulingCursor {
     last_class: Option<String>,
 }
 
-/// Migration receipts (Task 7 fills; the schema exists from day one so the
-/// document never needs a destructive reshape).
+/// Migration receipts (Task 7). `completed` is set in the SAME commit that
+/// installs the boot winners: once committed, canonical readers stop
+/// consulting migrated legacy fields even if physical cleanup is still
+/// pending (cleanup is idempotently retried at boot). `winning_evidence`
+/// retains, per record key, the winning migration candidate — while a record
+/// is migration-owned, a later previously-offline import compares against
+/// this retained evidence with the same deterministic total order, so import
+/// arrival order can never pick a different winner.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MigrationReceipts {
@@ -276,6 +298,26 @@ struct MigrationReceipts {
     completed: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     acknowledged_candidate_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    winning_evidence: BTreeMap<String, StoredMigrationEvidence>,
+}
+
+/// The retained winning migration evidence for one record: the candidate
+/// core the total order compares against, plus the revision the migration
+/// installed (a later revision means the record moved post-migration — a
+/// post-migration explicit rename or accepted Freshell AI name protects it
+/// from every later legacy candidate).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredMigrationEvidence {
+    candidate_id: String,
+    name: String,
+    source: NameSource,
+    scope: LegacyCandidateScope,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    explicit_rename_at: Option<i64>,
+    evidence_key: String,
+    installed_revision: NameRevision,
 }
 
 /// Retained losing evidence (bind collisions, migration losers). A recovery
@@ -616,6 +658,36 @@ impl SessionNames {
                 .filter_map(|key| update_for_key(doc, key, false, RedirectScope::All))
                 .collect();
             Ok(Decision::Read(updates))
+        }))
+    }
+
+    /// Task 7: whether the one-time legacy-name consolidation receipt has
+    /// committed. Once true, canonical readers stop consulting the migrated
+    /// legacy title fields even while physical cleanup is still pending
+    /// (boot retries the cleanup idempotently).
+    pub(crate) fn migration_completed(&self) -> bool {
+        self.core.current_view().document.migration.completed
+    }
+
+    /// Task 7: import one captured legacy-evidence envelope. Every raw
+    /// envelope gets its own immutable per-import backup
+    /// (`name-migration-v1/imports/<SHA-256 of importId>.json`, create-once)
+    /// BEFORE anything is acknowledged; the result acknowledges candidates
+    /// one at a time (never an early whole-import shortcut) and carries the
+    /// updates for the records the import touched — only after the backup
+    /// and the canonical commit. The reserved
+    /// [`NAME_MIGRATION_BOOT_IMPORT_ID`] is the trusted server-boot lane:
+    /// only it may honor `explicit_rename` (manual) and accepted-Freshell-AI
+    /// classifications; the HTTP route rejects that id, so an arbitrary
+    /// caller can never assert them.
+    pub(crate) fn import_legacy(&self, input: LegacyNameImport) -> NameFuture<LegacyImportResult> {
+        let core = Arc::clone(&self.core);
+        let backup_dir = core
+            .data_dir
+            .join(NAME_MIGRATION_DIR_NAME)
+            .join(NAME_MIGRATION_IMPORTS_DIR_NAME);
+        Box::pin(spawn_txn(core, move |doc, meta| {
+            import_legacy_decision(doc, meta, &backup_dir, input)
         }))
     }
 
@@ -3222,4 +3294,467 @@ fn fold_native_outcome_decision(
     } else {
         Ok(commit_decision(document, &key, false))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Task 7 — legacy-name import
+// ---------------------------------------------------------------------------
+
+/// The server-authoritative classification of one legacy candidate: the
+/// effective name source, protection evidence, scope and trustworthy
+/// explicit-rename time the total order compares against. Raw-evidence
+/// classification is authoritative — a legacy flag establishes protection
+/// with UNKNOWN historic origin (never recovered human intent), and only
+/// the trusted server-boot lane may honor `explicit_rename` (manual) or an
+/// accepted-Freshell-AI source; an imported claim is capped below both.
+#[derive(Debug, Clone, PartialEq)]
+struct ClassifiedLegacyCandidate {
+    name: String,
+    source: NameSource,
+    scope: LegacyCandidateScope,
+    protection: LegacyProtectionEvidence,
+    explicit_rename_at: Option<i64>,
+    evidence_key: String,
+    candidate_id: String,
+}
+
+fn classify_legacy_candidate(
+    trusted_boot: bool,
+    candidate: &LegacyNameCandidate,
+) -> ClassifiedLegacyCandidate {
+    let (source, protection) = match candidate.protection_evidence {
+        LegacyProtectionEvidence::ExplicitRename => {
+            if trusted_boot {
+                // The one reliable explicit-rename evidence: the old durable
+                // session-rename ladder (`titleSource:"user"`), which only
+                // the user-facing session Rename could write.
+                (NameSource::Manual, LegacyProtectionEvidence::ExplicitRename)
+            } else {
+                // Browser evidence can never prove a human author: the old
+                // automation→manual-flag path wrote the same flags. The
+                // claim keeps the label protected, with unknown origin.
+                (
+                    NameSource::LegacyProtected,
+                    LegacyProtectionEvidence::LegacyFlag,
+                )
+            }
+        }
+        LegacyProtectionEvidence::LegacyFlag => (
+            NameSource::LegacyProtected,
+            LegacyProtectionEvidence::LegacyFlag,
+        ),
+        LegacyProtectionEvidence::None => {
+            // A known automatic origin keeps its rank — except that an
+            // untrusted import can never assert accepted Freshell AI (a
+            // display mirror is not an accepted generation result), and a
+            // claimed manual/protected source without protection evidence
+            // degrades to the strongest automatic evidence it can carry.
+            let source = match candidate.source {
+                NameSource::Manual | NameSource::LegacyProtected => NameSource::ProviderAi,
+                NameSource::FreshellAi if !trusted_boot => NameSource::ProviderAi,
+                other => other,
+            };
+            (source, LegacyProtectionEvidence::None)
+        }
+    };
+    ClassifiedLegacyCandidate {
+        name: candidate.name.trim().to_string(),
+        source,
+        scope: candidate.scope,
+        protection,
+        explicit_rename_at: candidate.explicit_rename_at,
+        evidence_key: candidate.evidence_key.clone(),
+        candidate_id: candidate.id.clone(),
+    }
+}
+
+/// The core the deterministic total order compares. `Less` means `a` wins.
+///
+/// Order: source rank (manual > legacy_protected > freshell_ai >
+/// provider_ai > first_message > directory), then — within proven manual —
+/// trustworthy explicit-rename recency (later first, dated ahead of
+/// undated), then scope (session > pane > source_tab > terminal >
+/// derived), then ascending evidence key and candidate id. Generic
+/// updatedAt/mtime/layout timestamps never reach `explicit_rename_at`, so
+/// they can never order here.
+fn compare_classified_candidates(
+    a: &ClassifiedLegacyCandidate,
+    b: &ClassifiedLegacyCandidate,
+) -> std::cmp::Ordering {
+    let rank = source_rank(b.source).cmp(&source_rank(a.source));
+    if rank != std::cmp::Ordering::Equal {
+        return rank;
+    }
+    if a.source == NameSource::Manual && b.source == NameSource::Manual {
+        match (a.explicit_rename_at, b.explicit_rename_at) {
+            (Some(x), Some(y)) => {
+                let recency = y.cmp(&x);
+                if recency != std::cmp::Ordering::Equal {
+                    return recency;
+                }
+            }
+            (Some(_), None) => return std::cmp::Ordering::Less,
+            (None, Some(_)) => return std::cmp::Ordering::Greater,
+            (None, None) => {}
+        }
+    }
+    let scope = legacy_scope_rank(b.scope).cmp(&legacy_scope_rank(a.scope));
+    if scope != std::cmp::Ordering::Equal {
+        return scope;
+    }
+    let evidence = a.evidence_key.cmp(&b.evidence_key);
+    if evidence != std::cmp::Ordering::Equal {
+        return evidence;
+    }
+    a.candidate_id.cmp(&b.candidate_id)
+}
+
+/// Scope tie-break: session > pane > source_tab > terminal > derived.
+fn legacy_scope_rank(scope: LegacyCandidateScope) -> u8 {
+    match scope {
+        LegacyCandidateScope::Session => 4,
+        LegacyCandidateScope::Pane => 3,
+        LegacyCandidateScope::SourceTab => 2,
+        LegacyCandidateScope::Terminal => 1,
+        LegacyCandidateScope::Derived => 0,
+    }
+}
+
+/// Write one import's immutable backup (create-once): the raw evidence
+/// envelopes verbatim plus the candidates as received. A present file is
+/// never rewritten — the first receipt of an import id owns the copy. The
+/// write happens BEFORE anything is acknowledged, so a later commit failure
+/// leaves the backup (and the retry reuses it) without any ack.
+fn write_import_backup_once(
+    backup_dir: &Path,
+    input: &LegacyNameImport,
+    received_at: i64,
+) -> Result<(), NameError> {
+    let digest = digest_bytes(input.import_id.as_bytes());
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let path = backup_dir.join(format!("{hex}.json"));
+    if path.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(backup_dir).map_err(|e| {
+        NameError::Persistence(format!(
+            "cannot create legacy import backup dir {}: {e}",
+            backup_dir.display()
+        ))
+    })?;
+    let body = serde_json::json!({
+        "version": 1,
+        "importId": input.import_id,
+        "receivedAt": received_at,
+        "evidence": input.evidence,
+        "candidates": input.candidates,
+    });
+    let bytes = serde_json::to_vec(&body).map_err(|e| {
+        NameError::Persistence(format!("cannot serialize legacy import backup: {e}"))
+    })?;
+    let tmp = backup_dir.join(format!(".{hex}.json.tmp"));
+    atomic_write_durable(&path, &tmp, &bytes).map_err(|e| {
+        NameError::Persistence(format!(
+            "legacy import backup write failed (originals retained, nothing acknowledged): {e}"
+        ))
+    })
+}
+
+/// What applying one candidate did.
+struct LegacyCandidateOutcome {
+    /// The canonical record key the candidate targeted — `None` means the
+    /// evidence was unresolved/ambiguous/invalid and stays recovery-only
+    /// (its immutable backup retains it).
+    key: Option<String>,
+    changed: bool,
+}
+
+/// Resolve a legacy target to the canonical ref the store applies it
+/// through. Canonical refs resolve through pending→durable redirects;
+/// `legacy_session` maps through the structured provider/session identity
+/// for the three scoped providers (a non-scoped provider is out of
+/// migration scope — recovery-only); `legacy_terminal` is resolved at the
+/// composition boundary (route/boot identity ledger) — what reaches the
+/// store unresolved stays recovery-only.
+fn resolve_legacy_target(
+    document: &StoredDocument,
+    target: &LegacyNameTarget,
+) -> Option<SessionNameRef> {
+    match target {
+        LegacyNameTarget::Canonical(reference) => {
+            let (resolved, _) = document.resolve_ref(reference);
+            Some(resolved)
+        }
+        LegacyNameTarget::LegacySession { session_ref, .. } => {
+            let named =
+                freshell_freshagent::naming::named_provider_for(Some(&session_ref.provider), None)?;
+            let reference = SessionNameRef::Session {
+                provider: named,
+                session_id: session_ref.session_id.clone(),
+            };
+            let (resolved, _) = document.resolve_ref(&reference);
+            Some(resolved)
+        }
+        LegacyNameTarget::LegacyTerminal { .. } => None,
+    }
+}
+
+/// Apply one classified candidate against the current document state:
+/// install a missing record, or compare against the existing record /
+/// retained winning migration evidence with the deterministic total order.
+/// Post-migration protection: a record whose accepted source is manual,
+/// legacy-protected or accepted Freshell AI (or which moved after the
+/// migration installed it through a protected decision) can never be
+/// replaced by a later legacy candidate.
+fn apply_legacy_candidate(
+    document: &mut StoredDocument,
+    resolved: SessionNameRef,
+    classified: &ClassifiedLegacyCandidate,
+) -> Result<LegacyCandidateOutcome, NameError> {
+    let key = name_ref_key(&resolved);
+    let Some(current) = document.records.get(&key).cloned() else {
+        // No record yet: install the migrated record (and its evidence).
+        install_migration_record(document, resolved, classified)?;
+        return Ok(LegacyCandidateOutcome {
+            key: Some(key),
+            changed: true,
+        });
+    };
+
+    // An equal-or-losing candidate never disturbs the current winner.
+    let candidate_wins = match document.migration.winning_evidence.get(&key) {
+        Some(evidence) if current.revision == evidence.installed_revision => {
+            // Still migration-owned: compare against the retained winning
+            // evidence with the same total order — import arrival order
+            // can never pick a different winner.
+            let retained = ClassifiedLegacyCandidate {
+                name: evidence.name.clone(),
+                source: evidence.source,
+                scope: evidence.scope,
+                protection: LegacyProtectionEvidence::LegacyFlag,
+                explicit_rename_at: evidence.explicit_rename_at,
+                evidence_key: evidence.evidence_key.clone(),
+                candidate_id: evidence.candidate_id.clone(),
+            };
+            compare_classified_candidates(classified, &retained) == std::cmp::Ordering::Less
+        }
+        Some(_) => {
+            // The record moved after the migration installed it. A
+            // post-migration explicit rename or accepted Freshell AI name
+            // is protected; otherwise the rank order still decides.
+            if source_is_protected(current.source) {
+                false
+            } else {
+                candidate_beats_current(classified, &current)
+            }
+        }
+        None => {
+            // No migration evidence: a record created by the normal flows.
+            if source_is_protected(current.source) {
+                false
+            } else {
+                candidate_beats_current(classified, &current)
+            }
+        }
+    };
+    if !candidate_wins {
+        return Ok(LegacyCandidateOutcome {
+            key: Some(key),
+            changed: false,
+        });
+    }
+
+    install_migration_record(document, resolved, classified)?;
+    Ok(LegacyCandidateOutcome {
+        key: Some(key),
+        changed: true,
+    })
+}
+
+/// The one install path: allocate the record revision, install the record,
+/// arm native writeback for a writable accepted source, and retain the
+/// winning migration evidence for later previously-offline imports.
+fn install_migration_record(
+    document: &mut StoredDocument,
+    resolved: SessionNameRef,
+    classified: &ClassifiedLegacyCandidate,
+) -> Result<(), NameError> {
+    let key = name_ref_key(&resolved);
+    let revision = document.allocate_revision()?;
+    let record = migration_record(&resolved, classified, revision);
+    document.records.insert(key.clone(), record.clone());
+    if source_is_writable(record.source) {
+        reset_native_series(document, &key, &record);
+    }
+    retain_migration_evidence(document, &key, classified, revision);
+    Ok(())
+}
+
+/// Rank comparison against a current (unprotected, post-migration) record.
+fn candidate_beats_current(
+    classified: &ClassifiedLegacyCandidate,
+    current: &SessionNameRecord,
+) -> bool {
+    // Equal automatic ranks preserve the accepted value; a candidate only
+    // ever RAISES rank (the same rule as `offer_mut`).
+    source_rank(classified.source) > source_rank(current.source)
+}
+
+/// Build the record a migration installs. Unknown-origin candidates get no
+/// fabricated renamedAt/manualRevision — only a proven manual rename
+/// carries manual_revision (the revision of this manual decision); a
+/// trustworthy historical rename time would be retained as evidence, never
+/// fabricated from activity/layout timestamps (none of the legacy sources
+/// carry one, so `renamed_at` is never set here).
+fn migration_record(
+    resolved: &SessionNameRef,
+    classified: &ClassifiedLegacyCandidate,
+    revision: NameRevision,
+) -> SessionNameRecord {
+    SessionNameRecord {
+        name_ref: resolved.clone(),
+        name: classified.name.clone(),
+        source: classified.source,
+        revision,
+        manual_revision: (classified.source == NameSource::Manual).then_some(revision),
+        renamed_at: None,
+        legacy_origin: (classified.source == NameSource::LegacyProtected)
+            .then_some(freshell_protocol::session_names::LegacyOrigin::Unknown),
+    }
+}
+
+fn retain_migration_evidence(
+    document: &mut StoredDocument,
+    key: &str,
+    classified: &ClassifiedLegacyCandidate,
+    installed_revision: NameRevision,
+) {
+    document.migration.winning_evidence.insert(
+        key.to_string(),
+        StoredMigrationEvidence {
+            candidate_id: classified.candidate_id.clone(),
+            name: classified.name.clone(),
+            source: classified.source,
+            scope: classified.scope,
+            explicit_rename_at: classified.explicit_rename_at,
+            evidence_key: classified.evidence_key.clone(),
+            installed_revision,
+        },
+    );
+}
+
+/// The Task 7 import transaction body: immutable per-import backup first,
+/// then per-candidate classification/resolution/application — each candidate
+/// is acknowledged individually (never an early whole-import shortcut), and
+/// winners, winning migration evidence and acknowledged candidate ids commit
+/// in the SAME document transaction. The trusted boot lane additionally sets
+/// `migration.completed` in this commit, so canonical readers stop
+/// consulting migrated legacy fields even if the physical cleanup that
+/// follows never lands (it is idempotently retried at boot).
+fn import_legacy_decision(
+    document: &mut StoredDocument,
+    meta: &TxnMeta,
+    backup_dir: &Path,
+    input: LegacyNameImport,
+) -> Result<Decision<LegacyImportResult>, NameError> {
+    if input.version != 1 {
+        return Err(NameError::InvalidName(
+            "unsupported legacy-name import version".into(),
+        ));
+    }
+    if input.import_id.trim().is_empty() {
+        return Err(NameError::InvalidName(
+            "a legacy-name import must carry its retry-stable importId".into(),
+        ));
+    }
+    if input.candidates.len() > NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT {
+        return Err(NameError::InvalidName(format!(
+            "a legacy-name import batches at most {} candidates",
+            NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT
+        )));
+    }
+
+    // Immutable create-once backup BEFORE any acknowledgment: a failure
+    // here retains every original and acknowledges nothing.
+    write_import_backup_once(backup_dir, &input, meta.now_ms)?;
+
+    let trusted_boot = input.import_id == NAME_MIGRATION_BOOT_IMPORT_ID;
+    let mut acknowledged: Vec<String> = Vec::with_capacity(input.candidates.len());
+    let mut newly_acknowledged = false;
+    let mut publish: Vec<PublishSpec> = Vec::new();
+    let mut names: Vec<SessionNameUpdate> = Vec::new();
+
+    for candidate in &input.candidates {
+        if candidate.id.trim().is_empty() {
+            return Err(NameError::InvalidName(
+                "a legacy-name candidate must carry its stable id".into(),
+            ));
+        }
+        // Per-candidate idempotency: an already-acknowledged candidate id is
+        // re-acknowledged without re-application.
+        if document
+            .migration
+            .acknowledged_candidate_ids
+            .contains(&candidate.id)
+        {
+            acknowledged.push(candidate.id.clone());
+            continue;
+        }
+        document
+            .migration
+            .acknowledged_candidate_ids
+            .push(candidate.id.clone());
+        newly_acknowledged = true;
+        acknowledged.push(candidate.id.clone());
+
+        // An invalid/oversize/control-bearing name is retained by the
+        // immutable backup and acknowledged, never applied.
+        if validate_name(&candidate.name).is_err() {
+            continue;
+        }
+        let Some(resolved) = resolve_legacy_target(document, &candidate.target) else {
+            // Unresolved/ambiguous evidence remains recovery-only.
+            continue;
+        };
+        let classified = classify_legacy_candidate(trusted_boot, candidate);
+        let outcome = apply_legacy_candidate(document, resolved, &classified)?;
+        if let Some(key) = outcome.key {
+            if outcome.changed {
+                publish.push(PublishSpec {
+                    key: key.clone(),
+                    changed: true,
+                });
+                names.push(
+                    update_after_commit(document, &key, true, RedirectScope::ToRecord)
+                        .expect("the winning record resolves"),
+                );
+            } else {
+                names.push(
+                    update_for_key(document, &key, false, RedirectScope::ToRecord)
+                        .expect("the standing record resolves"),
+                );
+            }
+        }
+    }
+
+    let completed_boot = trusted_boot && !document.migration.completed;
+    if completed_boot {
+        document.migration.completed = true;
+    }
+
+    if !newly_acknowledged && !completed_boot && publish.is_empty() {
+        // A fully idempotent re-delivery: nothing persisted, nothing
+        // published.
+        return Ok(Decision::Read(LegacyImportResult {
+            acknowledged,
+            names,
+        }));
+    }
+    Ok(Decision::Write {
+        value: LegacyImportResult {
+            acknowledged,
+            names,
+        },
+        publish,
+    })
 }

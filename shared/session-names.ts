@@ -230,3 +230,147 @@ export function sessionNameRefKey(ref: SessionNameRef): string {
     ? JSON.stringify(['pending', ref.id])
     : JSON.stringify(['session', ref.provider, ref.sessionId])
 }
+
+// ---------------------------------------------------------------------------
+// Task 7 — legacy-name migration envelope
+// ---------------------------------------------------------------------------
+
+/**
+ * Where a legacy candidate's label lived. Scope breaks total-order ties:
+ * session > pane > source_tab > terminal > derived.
+ */
+export const LegacyCandidateScopeSchema = z.enum([
+  'session',
+  'pane',
+  'source_tab',
+  'terminal',
+  'derived',
+])
+export type LegacyCandidateScope = z.infer<typeof LegacyCandidateScopeSchema>
+
+/**
+ * What protection the raw evidence claims for a legacy candidate.
+ * `explicit_rename` is reliable explicit-rename evidence (honored only from
+ * server-side boot evidence — the old durable session-rename ladder);
+ * `legacy_flag` is an old manual/protected flag whose human origin is
+ * unrecoverable (pane/tab user-set booleans, unsourced title overrides);
+ * `none` is an unprotected label with a known automatic origin.
+ */
+export const LegacyProtectionEvidenceSchema = z.enum(['explicit_rename', 'legacy_flag', 'none'])
+export type LegacyProtectionEvidence = z.infer<typeof LegacyProtectionEvidenceSchema>
+
+/**
+ * A migration candidate's target: the canonical naming ref, or a legacy
+ * identity the server resolves through the existing canonical
+ * identity/ledger — never a new key.
+ */
+export const LegacyNameTargetSchema = z.union([
+  SessionNameRefSchema,
+  z.object({
+    kind: z.literal('legacy_session'),
+    sessionRef: z.object({ provider: z.string().min(1), sessionId: z.string().min(1) }).strict(),
+    codexDurability: z
+      .object({
+        schemaVersion: z.literal(1),
+        state: z.string().min(1),
+        durableThreadId: z.string().min(1).optional(),
+      })
+      .passthrough()
+      .optional(),
+    cwd: z.string().optional(),
+  }),
+  z.object({
+    kind: z.literal('legacy_terminal'),
+    terminalId: z.string().min(1),
+    serverInstanceId: z.string().min(1),
+  }),
+])
+export type LegacyNameTarget = z.infer<typeof LegacyNameTargetSchema>
+
+/**
+ * One legacy-name candidate. The stable candidate `id` is the JSON tuple
+ * `[storageKey,deviceId,tabId,paneId,scope,provider,sessionId,name,source,
+ * protectionEvidence,explicitRenameAt]` with absent entries null;
+ * `explicitRenameAt` must carry evidence (never receipt/import time) and is
+ * absent when no trustworthy explicit-rename time exists.
+ */
+export const LegacyNameCandidateSchema = z.object({
+  id: z.string().min(1),
+  target: LegacyNameTargetSchema,
+  name: z.string(),
+  source: NameSourceSchema,
+  scope: LegacyCandidateScopeSchema,
+  explicitRenameAt: z.number().int().nonnegative().optional(),
+  evidenceKey: z.string(),
+  protectionEvidence: LegacyProtectionEvidenceSchema,
+})
+export type LegacyNameCandidate = z.infer<typeof LegacyNameCandidateSchema>
+
+/**
+ * One immutable raw evidence envelope: the bytes of one legacy storage
+ * payload, preserved verbatim before any sanitization could clear it.
+ */
+export const LegacyEvidenceEnvelopeSchema = z.object({
+  storageKey: z.string().min(1),
+  raw: z.string(),
+})
+export type LegacyEvidenceEnvelope = z.infer<typeof LegacyEvidenceEnvelopeSchema>
+
+/**
+ * The Task 7 import envelope (fixed at version 1). `importId` is the
+ * persisted retry-stable id of one captured raw envelope; the server derives
+ * its immutable per-import backup filename from it. At most 100 candidates
+ * per import.
+ */
+export const LegacyNameImportSchema = z.object({
+  version: z.literal(1),
+  importId: z.string().min(1),
+  evidence: z.array(LegacyEvidenceEnvelopeSchema),
+  candidates: z.array(LegacyNameCandidateSchema),
+})
+export type LegacyNameImport = z.infer<typeof LegacyNameImportSchema>
+
+/**
+ * The import result: every acknowledged candidate id (per-candidate
+ * acknowledgment, never an early whole-import shortcut) plus the updates for
+ * the records the import touched.
+ */
+export const LegacyImportResultSchema = z.object({
+  acknowledged: z.array(z.string()),
+  names: z.array(SessionNameUpdateSchema),
+})
+export type LegacyImportResult = z.infer<typeof LegacyImportResultSchema>
+
+/**
+ * The stable legacy-candidate id: the JSON tuple
+ * `[storageKey,deviceId,tabId,paneId,scope,provider,sessionId,name,source,
+ * protectionEvidence,explicitRenameAt]` with absent entries null. Never
+ * receipt/import time; every entry that exists must come from evidence.
+ */
+export function legacyNameCandidateId(input: {
+  storageKey: string
+  deviceId?: string
+  tabId?: string
+  paneId?: string
+  scope: LegacyCandidateScope
+  provider?: string
+  sessionId?: string
+  name: string
+  source: NameSource
+  protectionEvidence: LegacyProtectionEvidence
+  explicitRenameAt?: number
+}): string {
+  return JSON.stringify([
+    input.storageKey,
+    input.deviceId ?? null,
+    input.tabId ?? null,
+    input.paneId ?? null,
+    input.scope,
+    input.provider ?? null,
+    input.sessionId ?? null,
+    input.name,
+    input.source,
+    input.protectionEvidence,
+    input.explicitRenameAt ?? null,
+  ])
+}

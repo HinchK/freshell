@@ -15,6 +15,7 @@ vi.mock('@/lib/recovery/boot-state', () => ({
 import { getRecoveryInventory } from '@/lib/api'
 import { MACHINE_WORKSPACE_ORIGIN_STORAGE_KEY } from '@/lib/machine-identity'
 import { restoreMachineWorkspace } from '@/lib/machine-workspace'
+import { listCapturedMigrationEnvelopes } from '@/lib/session-name-migration'
 import tabsReducer, { addTab, setActiveTab } from '@/store/tabsSlice'
 import panesReducer, { initLayout, splitPane } from '@/store/panesSlice'
 import tabRegistryReducer from '@/store/tabRegistrySlice'
@@ -615,5 +616,91 @@ describe('restoreMachineWorkspace — unified agent names (Task 6)', () => {
     const tab = store.getState().tabs.tabs.find((t) => t.id === 'recovered-tab')
     expect(tab).toBeTruthy()
     expect(tab?.nameSource).toEqual({ kind: 'session', paneId: 'recovered-pane' })
+  })
+})
+
+// ── unified agent names (Task 7) ─────────────────────────────────────────────
+
+describe('restoreMachineWorkspace — unified agent names (Task 7)', () => {
+  beforeEach(() => {
+    vi.mocked(getRecoveryInventory).mockReset()
+    localStorage.clear()
+  })
+
+  it('captures raw legacy layout evidence BEFORE the rebuild clears the local cache', async () => {
+    const store = createStore()
+    addForeignWorkspace(store)
+    const legacyRaw = JSON.stringify({
+      version: 4,
+      persistedAt: 9,
+      tabs: {
+        activeTabId: 'tab-1',
+        tabs: [{ id: 'tab-1', title: 'Old Agent Tab', titleSetByUser: true }],
+      },
+      panes: {
+        version: 7,
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'p-1',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              createRequestId: 'req-1',
+              sessionRef: { provider: 'claude', sessionId: 'sess-legacy' },
+            },
+          },
+        },
+        activePane: { 'tab-1': 'p-1' },
+        paneTitles: { 'tab-1': { 'p-1': 'Old User Pane Name' } },
+        paneTitleSetByUser: { 'tab-1': { 'p-1': true } },
+      },
+    })
+    localStorage.setItem('freshell.layout.v3', legacyRaw)
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventoryFor(MACHINE_ID))
+
+    await restoreMachineWorkspace(store, MACHINE_ID)
+
+    // The rebuild replaced the local layout, but the raw legacy bytes were
+    // preserved as an immutable per-importId envelope first — the
+    // consolidation import can still recover the old user labels.
+    const envelopes = listCapturedMigrationEnvelopes(localStorage)
+    const captured = envelopes.find((envelope) => envelope.storageKey === 'freshell.layout.v3')
+    expect(captured).toBeTruthy()
+    expect(captured?.raw).toBe(legacyRaw)
+  })
+
+  it('restores scoped recovery panes with no scoped pane-title aliases and intact identity', async () => {
+    const store = createStore()
+    addForeignWorkspace(store)
+    const inventory = inventoryFor(MACHINE_ID)
+    inventory.device!.tabs[0].panes = [{
+      paneId: 'recovered-pane',
+      kind: 'terminal',
+      mode: 'claude',
+      shell: null,
+      cwd: '/work',
+      payload: {
+        createRequestId: 'crid-agent',
+        nameRef: { kind: 'session', provider: 'claude', sessionId: 'sess-agent' },
+        namingHandle: 'handle-agent',
+      },
+      sessionRef: { provider: 'claude', sessionId: 'sess-agent' },
+      ledgerState: 'unknown',
+      live: false,
+    }]
+    vi.mocked(getRecoveryInventory).mockResolvedValue(inventory)
+
+    await restoreMachineWorkspace(store, MACHINE_ID)
+
+    // The scoped pane restored with its canonical identity (the migrated
+    // name follows the pane), and NO pane-title alias was installed.
+    const content = terminalContentAt(store, 'recovered-tab', 'recovered-pane')
+    expect(content.nameRef).toEqual({
+      kind: 'session', provider: 'claude', sessionId: 'sess-agent',
+    })
+    expect(content.namingHandle).toBe('handle-agent')
+    expect(store.getState().panes.paneTitles['recovered-tab'] ?? {}).toEqual({})
+    expect(store.getState().panes.paneTitleSetByUser['recovered-tab'] ?? {}).toEqual({})
   })
 })

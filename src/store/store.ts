@@ -36,6 +36,12 @@ import { sessionTitleMirrorMiddleware } from './sessionTitleMirror'
 import { terminalInventoryTitleReplayMiddleware } from '@/lib/terminal-inventory-titles'
 import { sessionNamesIngestMiddleware } from './sessionNamesSlice'
 import { sessionNameLifecycleMiddleware } from './sessionNameLifecycleMiddleware'
+import {
+  collectLegacyPendingHandleAssignments,
+  registerLegacyNameSubmitGate,
+  submitPendingLegacyNameImports,
+} from '@/lib/session-name-migration'
+import { stampLegacyMigrationHandles } from './panesSlice'
 import { subagentInterestMiddleware } from './subagentInterestMiddleware'
 import { terminalDetachMiddleware } from './terminalDetachMiddleware'
 import { serverSettingsSaveStateMiddleware } from './settingsThunks'
@@ -130,6 +136,54 @@ pruneTabRecencyToCurrentLayout(store)
 // close-time record. Removal-time records intentionally linger (LRU-bounded)
 // because React's teardown re-record lands after the store update.
 wirePaneFocusOwnershipInvalidation(store)
+
+// Unified agent names (Task 7): the client side of the one-time legacy-name
+// consolidation.
+//
+// (1) Stamp the derived legacy-pending naming handles onto the hydrated
+//     panes they were derived from (the capture already ran — the migration
+//     module is imported first in main.tsx — so the assignments are
+//     available without re-reading any source). Idempotent per pane.
+// (2) Submit the still-pending captured imports ONCE per server
+//     connection-ready edge: the server acknowledges candidates one at a
+//     time (repeated submits are idempotent), acknowledged evidence is
+//     retained for recovery, and a failed submit stays pending for the
+//     next ready edge.
+try {
+  const assignments = collectLegacyPendingHandleAssignments()
+  if (assignments.length > 0) {
+    store.dispatch(stampLegacyMigrationHandles(assignments))
+  }
+} catch (error) {
+  log.error('failed to stamp legacy migration naming handles', { error })
+}
+wireLegacyNameImportSubmission(store)
+
+function wireLegacyNameImportSubmission(appStore: typeof store): void {
+  let submitting = false
+  let wasReady = false
+  // The readiness gate for mid-session captures (crossTabSync deliveries):
+  // a capture while ready submits immediately; otherwise it waits for the
+  // next ready edge below.
+  registerLegacyNameSubmitGate(() => appStore.getState().connection?.status === 'ready')
+  appStore.subscribe(() => {
+    // Fire on TRANSITIONS to ready only — the server's per-candidate
+    // acknowledgments make repeated submits idempotent, but a per-dispatch
+    // resubmit would enumerate the captured evidence on every state change.
+    const nowReady = appStore.getState().connection?.status === 'ready'
+    const becameReady = nowReady && !wasReady
+    wasReady = nowReady
+    if (!becameReady || submitting) return
+    submitting = true
+    void submitPendingLegacyNameImports()
+      .catch((error) => {
+        log.error('legacy-name import submission failed; retrying on the next ready edge', { error })
+      })
+      .finally(() => {
+        submitting = false
+      })
+  })
+}
 
 // Note: Tabs and Panes are now loaded from localStorage directly in their slice
 // initial states (see tabsSlice.ts and panesSlice.ts). This ensures the state

@@ -31,11 +31,15 @@ use freshell_freshagent::naming::{
     name_ref_debug_key, NameError, RenameNameInput, SessionNaming, NAME_RESET_UNSUPPORTED,
 };
 use freshell_protocol::session_names::{
-    NameIntent, RenameSessionNameRequest, SessionNameRef, MAX_NAME_REVISION,
+    LegacyNameImport, NameIntent, RenameSessionNameRequest, SessionNameRef, MAX_NAME_REVISION,
 };
+use freshell_ws::identity::TerminalIdentityRegistry;
 
 use crate::boot::{is_authed, unauthorized};
-use crate::session_names::SessionNames;
+use crate::session_name_migration::resolve_terminal_identity;
+use crate::session_names::{
+    SessionNames, NAME_MIGRATION_BOOT_IMPORT_ID, NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT,
+};
 
 /// Client batch reads are chunked to this many references per request (plan
 /// rule 9 / the route contract).
@@ -48,14 +52,19 @@ pub struct SessionNamesState {
     /// The ONE durable name authority, constructed in `main.rs` before
     /// publication and shared with every other surface's wiring.
     pub names: Arc<SessionNames>,
+    /// Task 7: the identity ledger resolves `legacy_terminal` import targets
+    /// (live and retired entries) before the store sees them; unresolved
+    /// ones stay recovery-only.
+    pub identity: TerminalIdentityRegistry,
 }
 
 /// The session-names sub-router (`POST /api/session-names/read` +
-/// `PATCH /api/session-names`).
+/// `PATCH /api/session-names` + Task 7's `POST /api/session-names/import`).
 pub fn router(state: SessionNamesState) -> Router {
     Router::new()
         .route("/api/session-names/read", post(read_session_names))
         .route("/api/session-names", patch(rename_session_name))
+        .route("/api/session-names/import", post(import_legacy_names))
         .with_state(state)
 }
 
@@ -264,6 +273,87 @@ async fn rename_session_name(
     match rename_through_authority(&*state.names, target, name, intent, request.if_revision).await {
         Ok(update) => Json(serde_json::to_value(&update).unwrap_or(Value::Null)).into_response(),
         Err(response) => response,
+    }
+}
+
+/// Task 7: `POST /api/session-names/import` with the migration envelope →
+/// `{acknowledged: string[], names: SessionNameUpdate[]}`. Per-candidate
+/// acknowledgment only after the import's immutable backup and the canonical
+/// commit (never an early whole-import shortcut). The reserved boot import
+/// id is refused here — the untrusted HTTP lane can never honor
+/// `explicit_rename` (manual) or accepted-Freshell-AI classifications.
+/// `legacy_terminal` targets resolve through the identity ledger first;
+/// unresolved ones stay recovery-only.
+async fn import_legacy_names(
+    State(state): State<SessionNamesState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if !is_authed(&headers, &state.auth_token) {
+        return unauthorized();
+    }
+    let mut import: LegacyNameImport = match serde_json::from_value(body) {
+        Ok(import) => import,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "Invalid request",
+                    "details": format!("invalid LegacyNameImport: {error}")
+                })),
+            )
+                .into_response();
+        }
+    };
+    if import.import_id == NAME_MIGRATION_BOOT_IMPORT_ID {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Invalid request",
+                "details": "the server-boot import id is reserved"
+            })),
+        )
+            .into_response();
+    }
+    if import.candidates.len() > NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Invalid request",
+                "details": format!(
+                    "a legacy-name import batches at most {NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT} candidates"
+                )
+            })),
+        )
+            .into_response();
+    }
+    // Resolve legacy terminal targets through the identity ledger (the
+    // composition boundary); the unresolved stay recovery-only in the store.
+    for candidate in &mut import.candidates {
+        if let freshell_protocol::session_names::LegacyNameTarget::LegacyTerminal {
+            terminal_id,
+            ..
+        } = &candidate.target
+        {
+            if let Some(resolved) = resolve_terminal_identity(&state.identity, terminal_id) {
+                candidate.target =
+                    freshell_protocol::session_names::LegacyNameTarget::Canonical(resolved);
+            }
+        }
+    }
+    match state.names.import_legacy(import).await {
+        Ok(result) => Json(serde_json::to_value(&result).unwrap_or(Value::Null)).into_response(),
+        Err(error) => {
+            tracing::warn!(
+                target: "freshell_server::session_names",
+                op = "import_legacy",
+                name_ref = "-",
+                revision = 0,
+                class = %error.code(),
+                "session_names.operation_failed: {error}"
+            );
+            name_error_response(&error, &SessionNameRef::Pending { id: "-".into() })
+        }
     }
 }
 
