@@ -25,7 +25,7 @@ The approved pane-header redesign is implemented in Freshell: desktop (viewport 
 
 **Goal:** Pane headers look identical on desktop (except icons spreading 4px) while every action button's clickable zone becomes a full-height square that touches its neighbors; mobile headers grow ×1.5 with the same square zones; fonts and desktop glyph/icon sizes are untouched; the change is proven by unit tests and a new browser e2e spec plus regenerated screenshot goldens.
 
-**Architecture:** PaneHeader.tsx is the only pane-header renderer (zoomed panes reuse it; the deck is canvas-only). Zones are implemented by making the button box itself the zone — `h-full aspect-square`, actions `gap-0` — rather than pseudo-element overlays, so zones abut exactly with no overlap and hover/focus naturally fill the zone. Because the header's 1px `border-b` lives inside its border-box height (Tailwind preflight), `h-full` reaches the content box, and `aspect-square` derives the zone's width from that height — so zones are true squares by construction (verified live in Chromium: 27×27 desktop / 62×62 mobile at a 16px root, delta 0, gap 0), immune to border or height changes; the approved 28px/63px numbers are the header's outer heights including that border. Because the gear and refresh buttons sit inside auto-height wrapper divs, the wrappers (and FreshAgentSettingsButton's root) get an explicit full-height chain so `h-full` resolves all the way down. The `@container` tiers in index.css keep their space-saving hides (≤480px meta, ≤280px optional actions) and their `gap: 0`, but the ≤180px button/svg shrink overrides are deleted: a square full-height zone cannot compress without violating the square constraint, so the proportional update to that fallback is the removal of the shrink mechanism — ultra-narrow space saving comes from the hides alone. All nominal sizes stay in the current rem/px regime (rem where today's classes are rem, px where today's are px) so `--ui-scale` behavior is unchanged; mobile pane icons use rem (`h-[1.3125rem]` = 21px at the default 16px root) to preserve today's rem-based icon scaling, and mobile glyphs stay px (`h-[27px]`) matching today's `h-[18px]` px glyphs.
+**Architecture:** PaneHeader.tsx is the only pane-header renderer (zoomed panes reuse it; the deck is canvas-only). Zones are implemented by making the button box itself the zone — `h-full aspect-square`, actions `gap-0` — rather than pseudo-element overlays, so zones abut exactly with no overlap and hover/focus naturally fill the zone. Because the header's 1px `border-b` lives inside its border-box height (Tailwind preflight), `h-full` reaches the content box, and `aspect-square` derives the zone's width from that height — so zones are true squares by construction (verified live in Chromium: 27×27 desktop / 62×62 mobile at a 16px root, delta 0, gap 0), immune to border or height changes. This one-pixel deviation from the nominal 28px/63px numbers is a recorded design decision, surfaced to the user at the recap: the nominals are the header's outer heights including the border, and honoring them literally would require either non-square zones or shifting every pane's layout by 1px — both of which violate harder constraints (square zones; desktop visuals unchanged). Because the gear and refresh buttons sit inside auto-height wrapper divs, the wrappers (and FreshAgentSettingsButton's root) get an explicit full-height chain so `h-full` resolves all the way down. The `@container` tiers in index.css keep their space-saving hides (≤480px meta, ≤280px optional actions) and their `gap: 0`, but the ≤180px button/svg shrink overrides are deleted: a square full-height zone cannot compress without violating the square constraint, so the proportional update to that fallback is the removal of the shrink mechanism — ultra-narrow space saving comes from the hides alone. All nominal sizes stay in the current rem/px regime (rem where today's classes are rem, px where today's are px) so `--ui-scale` behavior is unchanged; mobile pane icons use rem (`h-[1.3125rem]` = 21px at the default 16px root) to preserve today's rem-based icon scaling, and mobile glyphs stay px (`h-[27px]`) matching today's `h-[18px]` px glyphs. docs/index.html's static pane-header mock is updated alongside so the documented mock reflects the new geometry.
 
 **Tech Stack:** React 18 + TypeScript, Tailwind CSS (JIT arbitrary values), Vitest + Testing Library (jsdom, className-string assertions per house style), Playwright e2e (test/e2e-browser).
 
@@ -50,7 +50,8 @@ The approved pane-header redesign is implemented in Freshell: desktop (viewport 
 
 **Files:**
 - Modify: `src/components/panes/PaneHeader.tsx:166` (header root), `:148,152` (refresh), `:180,187` (terminal icons), `:200,210` (fresh-agent icons), `:261-263` (actions container), `:264-271` (meta span), `:279,283` (search), `:311-320` (zoom), `:330,334` (close)
-- Modify: `src/index.css:48-50` (≤280px rule), `:70-73` (≤180px rule)
+- Modify: `src/index.css:48-50` (≤280px rule), `:70-78` (≤180px rules)
+- Modify: `docs/index.html` (static pane-header mock CSS — gapless square zone buttons, mobile 63px header height; the mock documents the default experience)
 - Test: `test/unit/client/components/panes/PaneHeader.test.tsx` (update assertions at lines 758 and 782; add one new describe block)
 
 **Interfaces:**
@@ -186,7 +187,9 @@ In `src/index.css`, ≤280px rule (lines 48-50) — zones always touch, also ult
   gap: 0;
 }
 ```
-Delete the ≤180px button and svg override rules entirely (lines 70-78: the `.pane-header--fresh-agent .pane-header-actions button { height: 1rem; width: 1rem; }` rule and the `.pane-header--fresh-agent .pane-header-actions svg { height: 0.75rem; width: 0.75rem; }` rule). Square full-height zones cannot shrink without violating the square constraint, so the shrink mechanism itself goes away; ultra-narrow space saving comes from the kept ≤280px optional-action hide and ≤480px meta hide. The neighboring ≤180px title-gap and detail-font-size rules in that block stay unchanged — including the pre-existing `.pane-header-fresh-agent-detail { font-size: 13px }` ultra-narrow override, which predates this change and is deliberately untouched: the font-size constraint governs what this change may alter, and this change alters nothing about fonts.
+Delete the ≤180px button and svg override rules entirely (lines 70-78: the `.pane-header--fresh-agent .pane-header-actions button { height: 1rem; width: 1rem; }` rule and the `.pane-header--fresh-agent .pane-header-actions svg { height: 0.75rem; width: 0.75rem; }` rule). Square full-height zones cannot shrink without violating the square constraint, so the shrink mechanism itself goes away; ultra-narrow space saving comes from the kept ≤280px optional-action hide and ≤480px meta hide. A proportional glyph-only narrow tier (18px at ≤180px) was considered and rejected: the tier's original purpose — fitting four large buttons into a tiny pane — is structurally eliminated by the ≤280px hide, and no reachable layout benefits from a narrower glyph while zones must stay full-height squares; this disposition is recorded for the user to veto at the recap. The neighboring ≤180px title-gap and detail-font-size rules in that block stay unchanged — including the pre-existing `.pane-header-fresh-agent-detail { font-size: 13px }` ultra-narrow override, which predates this change and is deliberately untouched: the font-size constraint governs what this change may alter, and this change alters nothing about fonts.
+
+Also in this step, update the static pane-header mock in `docs/index.html` to the new geometry: its pane-header action buttons become gapless full-height squares (its own CSS — height matching the mock header strip, `aspect-ratio: 1` or equal width/height, `gap: 0` in the actions row), and its mobile pane-header height moves from 42px to 63px. Mirror the mock's existing CSS idiom; this is a nonfunctional static document, so no test covers it.
 
 - [ ] **Step 4: Run the focused test**
 
@@ -209,7 +212,7 @@ Expected: PASS.
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/components/panes/PaneHeader.tsx src/index.css test/unit/client/components/panes/PaneHeader.test.tsx
+git add src/components/panes/PaneHeader.tsx src/index.css docs/index.html test/unit/client/components/panes/PaneHeader.test.tsx
 git commit -m "feat(panes): full-height square hit zones; mobile-only 1.5x header sizing"
 ```
 
@@ -335,8 +338,11 @@ git commit -m "feat(fresh-agent): gear zone in lockstep; popover anchors to glyp
 Create `test/e2e-browser/specs/pane-header-hit-zones.spec.ts`. Its first import line copies `pane-system.spec.ts`'s exact `test`/`expect` import (module specifier included) and extends it with the page types:
 
 ```ts
-import { test, expect, type Page, type Locator } from '<pane-system.spec.ts\'s exact module specifier>'
+import { test, expect } from '<pane-system.spec.ts\'s exact module specifier>'
+import type { Page, Locator } from '@playwright/test'
 ```
+
+(helpers/fixtures.ts exports `test`/`expect` but not the page types — the types come from `@playwright/test`.)
 
 Every test requests `{ freshellPage, page }` exactly as pane-system.spec.ts's tests do — Freshell navigation and initialization live in the non-auto `freshellPage` fixture (helpers/fixtures.ts:279-335), so `{ page }` alone yields an unnavigated page. All expected values are derived from the live root font-size and the live header border so the spec is robust under any `--ui-scale`:
 
@@ -452,7 +458,9 @@ Expected: FAIL on visual diffs in the affected snapshots — this is the intende
 
 - [ ] **Step 3: Regenerate the goldens**
 
-Run: `npm run test:e2e:update-snapshots` (then confirm with `git status` that only the expected `*-snapshots/` PNGs changed).
+Run: `npx playwright test --config test/e2e-browser/playwright.config.ts --update-snapshots=all`
+
+The explicit `=all` matters: bare `--update-snapshots` means `changed` in the installed Playwright (1.58), which rewrites only comparisons exceeding the existing 5% tolerance and can silently leave stale goldens — a failure mode this repo has already documented. Confirm with `git status` that only the expected `*-snapshots/` PNGs changed: the screenshot-baselines goldens (mobile and desktop layouts, including `sidebar-collapsed-chromium-linux.png`, whose capture contains the pane header) and the editor-pane goldens.
 
 - [ ] **Step 4: Run the new spec and the regenerated specs**
 
