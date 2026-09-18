@@ -143,6 +143,7 @@ export function buildLocalSettingsPatch(
   assignChangedScalar(freshAgent, localSettings.freshAgent, defaultLocalSettings.freshAgent, 'expandThinking')
   assignChangedScalar(freshAgent, localSettings.freshAgent, defaultLocalSettings.freshAgent, 'expandTools')
   assignChangedScalar(freshAgent, localSettings.freshAgent, defaultLocalSettings.freshAgent, 'showTimecodes')
+  assignChangedScalar(freshAgent, localSettings.freshAgent, defaultLocalSettings.freshAgent, 'showTranscriptMinimap')
   if (Object.keys(freshAgent).length > 0) {
     patch.freshAgent = freshAgent
   }

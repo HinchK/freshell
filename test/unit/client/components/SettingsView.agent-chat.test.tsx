@@ -70,6 +70,25 @@ describe('SettingsView coding agents settings', () => {
     expect(api.patch).not.toHaveBeenCalled()
   })
 
+  it('toggles the transcript minimap locally, default on, without calling the server', () => {
+    const store = createSettingsViewStore()
+    renderSettingsView(store)
+    switchSettingsTab('Coding Agents')
+
+    const minimapToggle = screen.getByRole('switch', { name: 'Show transcript minimap' })
+    // Default ON — the first default-true switch in this family.
+    expect(minimapToggle).toHaveAttribute('aria-checked', 'true')
+    expect(store.getState().settings.settings.freshAgent.showTranscriptMinimap).toBe(true)
+
+    fireEvent.click(minimapToggle)
+    expect(store.getState().settings.settings.freshAgent.showTranscriptMinimap).toBe(false)
+    expect(api.patch).not.toHaveBeenCalled()
+
+    fireEvent.click(minimapToggle)
+    expect(store.getState().settings.settings.freshAgent.showTranscriptMinimap).toBe(true)
+    expect(api.patch).not.toHaveBeenCalled()
+  })
+
   it('hides unavailable CLI agents and their Fresh variants', () => {
     const store = createSettingsViewStore({
       settings: {

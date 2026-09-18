@@ -906,6 +906,82 @@ describe('FreshAgentView', () => {
     unmount()
   })
 
+  it('hides and shows the transcript minimap rail live when the setting changes', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'idle',
+      summary: 'Display summary',
+      capabilities: { send: true, interrupt: true, fork: false },
+      turns: [
+        { id: 'mm-v-u1', turnId: 'mm-v-u1', role: 'user', summary: 'First minimap prompt', items: [{ id: 'mm-v-i1', kind: 'text', text: 'First minimap prompt' }] },
+        { id: 'mm-v-a1', turnId: 'mm-v-a1', role: 'assistant', summary: 'r1', items: [{ id: 'mm-v-i2', kind: 'text', text: 'A'.repeat(400) }] },
+        { id: 'mm-v-u2', turnId: 'mm-v-u2', role: 'user', summary: 'Second minimap prompt', items: [{ id: 'mm-v-i3', kind: 'text', text: 'Second minimap prompt' }] },
+        { id: 'mm-v-a2', turnId: 'mm-v-a2', role: 'assistant', summary: 'r2', items: [{ id: 'mm-v-i4', kind: 'text', text: 'B'.repeat(400) }] },
+      ],
+    })
+
+    const { container } = render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent', sessionType: 'freshclaude', provider: 'claude',
+            createRequestId: 'req-minimap-setting', sessionId: CLAUDE_THREAD_ID, status: 'connected',
+          }}
+        />
+      </Provider>,
+    )
+
+    await waitFor(() => {
+      expect(screen.getByText('Second minimap prompt')).toBeInTheDocument()
+    })
+
+    // Scrollable-geometry mocks (the minimap suite's canonical numbers) so
+    // the rail would render under the default-ON setting.
+    const scroller = container.querySelector('[data-context="fresh-agent-transcript"]') as HTMLDivElement
+    Object.defineProperty(scroller, 'clientHeight', { configurable: true, get: () => 248 })
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, get: () => 1000 })
+    scroller.scrollTop = 376
+    const userTurns = container.querySelectorAll('[data-turn-role="user"]')
+    const mockRect = (el: Element, top: number, height = 50) => {
+      el.getBoundingClientRect = () => ({
+        top,
+        bottom: top + height,
+        left: 0,
+        right: 800,
+        width: 800,
+        height,
+        x: 0,
+        y: top,
+        toJSON: () => ({}),
+      })
+    }
+    mockRect(scroller, 0)
+    mockRect(userTurns[0], -376)
+    mockRect(userTurns[1], 74)
+    fireEvent.scroll(scroller)
+
+    // Default ON: the rail renders.
+    await waitFor(() => {
+      expect(screen.getAllByRole('button', { name: /Jump to prompt:/ })).toHaveLength(2)
+    })
+
+    // Flip the setting off through the live store (the reducer path the
+    // Settings toggle drives): the transcript re-renders and the rail unmounts.
+    act(() => {
+      store.dispatch(updateSettingsLocal({ freshAgent: { showTranscriptMinimap: false } }))
+    })
+    expect(screen.queryByRole('button', { name: /Jump to prompt:/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('group', { name: 'Transcript minimap' })).not.toBeInTheDocument()
+
+    // Flip back on: the rail returns.
+    act(() => {
+      store.dispatch(updateSettingsLocal({ freshAgent: { showTranscriptMinimap: true } }))
+    })
+    expect(screen.getAllByRole('button', { name: /Jump to prompt:/ })).toHaveLength(2)
+  })
+
   it('does not pin the provider snapshot summary above the transcript', async () => {
     const store = createStore()
     apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
