@@ -1146,6 +1146,7 @@ describe('requestSessionHandoff()', () => {
       'HANDOFF_IN_PROGRESS',
       'REAP_TIMEOUT',
       'PLATFORM_LIMITED',
+      'PLATFORM_LIMITED_PRECHECK',
       'PLATFORM_LIMITED_FENCED',
       'TARGET_SPAWN_FAILED',
       'SESSION_METADATA_WRITE_FAILED',

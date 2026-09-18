@@ -410,6 +410,13 @@ struct CodexSession {
     provenance: Option<crate::BindProvenance>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexTeardownSettlement {
+    Confirmed,
+    Pending,
+    PlatformLimited,
+}
+
 /// Per-session state of the wedged-sidecar quiet deadman: while a turn is in flight
 /// (`active_turn` set), a window is armed; if no lane-visible push notification feeds it
 /// before the deadline elapses, the pane is flagged `stuck` (via a `freshAgent.status`
@@ -756,12 +763,9 @@ impl FreshCodexState {
             crate::session_handoff::StopResult::Reaped
                 | crate::session_handoff::StopResult::AlreadyGone
         ) {
-            self.leases.clear_binding(PROVIDER, session_id);
-            // Death confirmed — the condemned-prior record clears with it.
-            self.condemned_priors
-                .lock()
-                .expect("condemned priors lock")
-                .remove(session_id);
+            // The requested exit watcher owns lease/stamp/condemned-prior
+            // cleanup. This caller only reports the confirmed reap to the
+            // handoff runner, avoiding a second unscoped cleanup.
         } else {
             tracing::warn!(target: "freshell_freshagent::codex",
                 session_id = %session_id,
@@ -800,10 +804,17 @@ impl FreshCodexState {
             )
             .await;
             if confirmed {
-                self.condemned_priors
-                    .lock()
-                    .expect("condemned priors lock")
-                    .remove(session_id);
+                let ownership = self
+                    .ownership_watch()
+                    .map(|watch| watch.for_runtime(session_id, Some(condemned.pid)));
+                cleanup_confirmed_codex_teardown(
+                    &self.leases,
+                    ownership.as_ref(),
+                    &self.condemned_priors,
+                    session_id,
+                    &condemned.ownership_id,
+                    true,
+                );
             }
             return confirmed;
         }
@@ -954,13 +965,134 @@ impl FreshCodexState {
     /// kata b8ke Task 3: the exit watchers' ownership release handle (the
     /// registry + this lane's retained stamps). `None` when unwired.
     fn ownership_watch(&self) -> Option<crate::ownership_lane::OwnershipWatch> {
-        self.ownership
-            .as_ref()
-            .map(|registry| crate::ownership_lane::OwnershipWatch {
-                registry: Arc::clone(registry),
-                stamps: Arc::clone(&self.ownership_stamps),
-                provider: PROVIDER,
-            })
+        self.ownership.as_ref().map(|registry| {
+            crate::ownership_lane::OwnershipWatch::new(
+                Arc::clone(registry),
+                Arc::clone(&self.ownership_stamps),
+                PROVIDER,
+            )
+        })
+    }
+
+    /// Record the sidecar identity before removing a session from the map.
+    ///
+    /// A bounded stop can return before the complete writer tree is confirmed
+    /// dead.  Keeping the recorded identity lets a later confirmation probe
+    /// finish the exact runtime teardown without trusting a recycled pid or an
+    /// empty post-exit process scan.
+    async fn record_condemned_prior(&self, session_id: &str) -> Option<String> {
+        let identity = self
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .and_then(|session| {
+                session
+                    .sidecar_pid
+                    .map(|pid| (pid, session.sidecar_ownership_id.clone()))
+            });
+        if let Some((pid, ownership_id)) = identity {
+            let recorded = crate::session_lease::record_condemned_runtime_identity(
+                pid,
+                CODEX_SIDECAR_OWNERSHIP_ENV,
+                &ownership_id,
+            );
+            self.condemned_priors
+                .lock()
+                .expect("condemned priors lock")
+                .insert(session_id.to_string(), recorded);
+            Some(ownership_id)
+        } else {
+            None
+        }
+    }
+
+    fn clear_condemned_prior_if_matching(&self, session_id: &str, ownership_id: &str) {
+        clear_codex_condemned_prior_if_matching(&self.condemned_priors, session_id, ownership_id);
+    }
+
+    /// Finish teardown for a session removed by a create/resume/fork recovery
+    /// path.  The caller must not release a lease or coordinator ticket until
+    /// this watcher settles: `NotConfirmed` and `PlatformLimited` retain the
+    /// handles in a detached task so an unverified writer cannot be replaced.
+    async fn settle_removed_session(
+        &self,
+        session_id: &str,
+        session: CodexSession,
+        own_ticket: Option<freshell_ownership::OperationTicket>,
+        lease_guard: Option<crate::FreshSessionLeaseGuard>,
+    ) -> CodexTeardownSettlement {
+        let ownership_id = session.sidecar_ownership_id.clone();
+        session.consumer.abort();
+        session.client.close().await;
+        if let Some(kill_tx) = session.kill_tx {
+            let _ = kill_tx.send(());
+        }
+        let result = match session.watcher.await {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::error!(target: "freshell_freshagent::codex",
+                    session_id = %session_id,
+                    error = %error,
+                    "freshagent.codex.teardown_watcher_failed: writer shutdown is unconfirmed"
+                );
+                watcher_stop_not_confirmed()
+            }
+        };
+        match result {
+            crate::session_handoff::StopResult::Reaped
+            | crate::session_handoff::StopResult::AlreadyGone => {
+                if let Some(mut guard) = lease_guard {
+                    guard.fail();
+                }
+                drop(own_ticket);
+                CodexTeardownSettlement::Confirmed
+            }
+            crate::session_handoff::StopResult::NotConfirmed { confirmation } => {
+                let session_id = session_id.to_string();
+                tokio::spawn(async move {
+                    if confirmation.await {
+                        if let Some(mut guard) = lease_guard {
+                            guard.fail();
+                        }
+                        drop(own_ticket);
+                    } else {
+                        // An incomplete identity is deliberately held closed.
+                        // Keeping the ticket/lease alive prevents a second
+                        // writer until an operator or watchdog can recover it.
+                        tracing::error!(target: "invariant",
+                            provider = PROVIDER,
+                            session_id = %session_id,
+                            "freshagent.codex.teardown_escalation_lost: retaining coordinator and lease ownership"
+                        );
+                        std::future::pending::<()>().await;
+                        drop(lease_guard);
+                        drop(own_ticket);
+                    }
+                });
+                CodexTeardownSettlement::Pending
+            }
+            crate::session_handoff::StopResult::PlatformLimited => {
+                // Discard a stale completed binding while retaining any
+                // active lease and the coordinator ticket below.  The
+                // coordinator remains fenced because descendants are not
+                // verifiably dead on this platform.
+                self.leases.clear_binding_if_matches(
+                    PROVIDER,
+                    session_id,
+                    session_id,
+                    &ownership_id,
+                );
+                if own_ticket.is_some() || lease_guard.is_some() {
+                    tokio::spawn(async move {
+                        std::future::pending::<()>().await;
+                        drop(lease_guard);
+                        drop(own_ticket);
+                    });
+                }
+                CodexTeardownSettlement::PlatformLimited
+            }
+        }
     }
 
     /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).
@@ -1226,19 +1358,18 @@ impl FreshCodexState {
     /// Reap every owned codex app-server sidecar (SIGKILL child + `/proc` ownership sweep)
     /// and abort the consumer tasks. Called on server shutdown so no sidecar leaks.
     pub async fn shutdown(&self) {
-        let drained: Vec<CodexSession> = {
+        let drained: Vec<(String, CodexSession)> = {
             let mut guard = self.sessions.lock().await;
-            guard.drain().map(|(_, s)| s).collect()
+            guard.drain().collect()
         };
-        for session in drained {
+        for (session_id, session) in drained {
             session.consumer.abort();
             session.client.close().await;
-            if let Some(kill_tx) = session.kill_tx {
-                let _ = kill_tx.send(());
-            }
-            // The exit-watcher performs start_kill + reap_owned_codex_sidecars on this
-            // requested-kill path; wait for it so shutdown() only returns once torn down.
-            let _ = session.watcher.await;
+            // Keep an unconfirmed watcher continuation alive during shutdown;
+            // dropping it would abandon the only complete-tree kill proof.
+            let _ = self
+                .settle_removed_session(&session_id, session, None, None)
+                .await;
         }
     }
 
@@ -2170,6 +2301,7 @@ impl FreshCodexState {
             exited.clone(),
             Arc::clone(&self.leases),
             quiet_deadman.clone(),
+            Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
         );
 
@@ -2218,12 +2350,14 @@ impl FreshCodexState {
                      claim's commit and its registration; the registered orphan is torn down"
                 );
                 if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
-                    session.consumer.abort();
-                    session.client.close().await;
-                    if let Some(kill_tx) = session.kill_tx {
-                        let _ = kill_tx.send(());
-                    }
-                    let _ = session.watcher.await;
+                    let _ = self
+                        .settle_removed_session(
+                            &thread_id,
+                            session,
+                            own_ticket.take(),
+                            lease_guard.take(),
+                        )
+                        .await;
                 }
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
@@ -2245,12 +2379,12 @@ impl FreshCodexState {
         if let Some(mut g) = lease_guard.take() {
             if !g.complete(&thread_id) {
                 if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
-                    session.consumer.abort();
-                    session.client.close().await;
-                    if let Some(kill_tx) = session.kill_tx {
-                        let _ = kill_tx.send(());
-                    }
-                    let _ = session.watcher.await;
+                    let _ = self
+                        .settle_removed_session(&thread_id, session, own_ticket.take(), Some(g))
+                        .await;
+                } else {
+                    g.fail();
+                    drop(own_ticket.take());
                 }
                 // Finding 5's re-raise: a committed claim (the resume lane)
                 // that gets torn down here dies again — restore the close's
@@ -2259,7 +2393,6 @@ impl FreshCodexState {
                 if let Some((claim_id, _)) = claim {
                     self.rollback_session_claim(claim_id).await;
                 }
-                g.fail(); // own tree torn down -- reopen the key
                 self.fail_create(
                     &request_id,
                     "FRESH_AGENT_CREATE_FAILED",
@@ -2327,12 +2460,9 @@ impl FreshCodexState {
                  fails typed, never a committed Live (kata b8ke ext r27 F4)"
             );
             if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
-                session.consumer.abort();
-                session.client.close().await;
-                if let Some(kill_tx) = session.kill_tx {
-                    let _ = kill_tx.send(());
-                }
-                let _ = session.watcher.await;
+                let _ = self
+                    .settle_removed_session(&thread_id, session, own_ticket.take(), None)
+                    .await;
             }
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
@@ -2354,12 +2484,9 @@ impl FreshCodexState {
                  create registered; the uncommitted session is torn down"
             );
             if let Some(session) = self.sessions.lock().await.remove(&thread_id) {
-                session.consumer.abort();
-                session.client.close().await;
-                if let Some(kill_tx) = session.kill_tx {
-                    let _ = kill_tx.send(());
-                }
-                let _ = session.watcher.await;
+                let _ = self
+                    .settle_removed_session(&thread_id, session, own_ticket.take(), None)
+                    .await;
             }
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
@@ -4108,12 +4235,9 @@ impl FreshCodexState {
                  fork child registered; the uncommitted child is torn down"
             );
             if let Some(session) = self.sessions.lock().await.remove(&child_id) {
-                session.consumer.abort();
-                session.client.close().await;
-                if let Some(kill_tx) = session.kill_tx {
-                    let _ = kill_tx.send(());
-                }
-                let _ = session.watcher.await;
+                let _ = self
+                    .settle_removed_session(&child_id, session, own_ticket.take(), None)
+                    .await;
             }
             let _ = parent_client.unarchive_thread(&child_id).await;
             reply_sink(fork_error_frame(
@@ -4522,6 +4646,11 @@ impl FreshCodexState {
             }
         }
 
+        // Record the sidecar identity before the first teardown await. If the
+        // bounded watcher window cannot prove the complete writer tree dead,
+        // the deferred confirmation keeps this exact identity fenced.
+        let condemned_ownership_id = self.record_condemned_prior(&session_id).await;
+
         // Durable close first (see the comment block above): retire the
         // pane-ledger row before any teardown; a Failed close fails the kill
         // and runs nothing below.
@@ -4588,6 +4717,9 @@ impl FreshCodexState {
                     }
                 }
             }
+            if let Some(ownership_id) = condemned_ownership_id.as_deref() {
+                self.clear_condemned_prior_if_matching(&session_id, ownership_id);
+            }
             self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
                 provider: PROVIDER.to_string(),
                 session_id,
@@ -4604,54 +4736,158 @@ impl FreshCodexState {
 
         self.clear_controls(&session_id).await;
 
-        // Task 12: an explicitly-killed session must reopen its durable id (the watcher
-        // also clears it; idempotent -- this covers watcher-less test sessions too).
-        self.leases.clear_binding(PROVIDER, &session_id);
-
         let removed = self.sessions.lock().await.remove(&session_id);
-        if let Some(session) = removed {
+        let removed_ownership_id = removed
+            .as_ref()
+            .map(|session| session.sidecar_ownership_id.clone());
+        let teardown = if let Some(session) = removed {
             session.consumer.abort();
             session.client.close().await;
             if let Some(kill_tx) = session.kill_tx {
                 let _ = kill_tx.send(());
             }
-            // The exit-watcher performs start_kill + reap on this requested-kill path; wait
-            // for it so the sidecar is actually gone before we broadcast success.
-            let _ = session.watcher.await;
-        }
+            // The exit-watcher performs start_kill + reap on this requested-kill path. Its
+            // typed result is the only evidence that permits the coordinator stop commit.
+            match session.watcher.await {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::error!(target: "freshell_freshagent::codex",
+                        session_id = %session_id,
+                        error = %error,
+                        "fresh_agent_kill_watcher_failed: writer shutdown is unconfirmed"
+                    );
+                    crate::session_handoff::StopResult::NotConfirmed {
+                        confirmation: Box::pin(async { false }),
+                    }
+                }
+            }
+        } else {
+            crate::session_handoff::StopResult::AlreadyGone
+        };
 
-        // kata b8ke Task 3: the awaited, confirmed reap is done — commit the
-        // stop (Stopping → Vacant). NEVER before the reap (round-1 review).
+        // kata b8ke Task 3 + focused review F2: the coordinator remains fenced until the
+        // complete writer tree is confirmed dead. A direct-child exit, an incomplete
+        // watcher result, or a platform without descendant evidence never earns Vacant.
+        let mut kill_failure: Option<(&'static str, String)> = None;
         if let (Some(registry), Some(generation), Some(op_id)) = (
             self.ownership.as_ref(),
             stop_generation,
             stop_op_id.as_deref(),
         ) {
-            let outcome = crate::ownership_lane::commit_fresh_agent_stop(
-                registry,
-                PROVIDER,
-                &session_id,
-                op_id,
-                generation,
-            );
-            // b8ke ext r18 F1: a SUCCESSFUL commit-to-Vacant BROADCASTS the
-            // release frame — connected panes (and the kill → immediate
-            // recreate "Restart sidecar" sequence) converge on the vacant
-            // owner and the NEW generation (pre-r18 the commit changed the
-            // coordinator with no broadcast, so the recreate carried the
-            // stale observed generation and the fence refused it).
-            if matches!(outcome, freshell_ownership::CommitOutcome::Committed) {
-                if let Some(frame) = crate::ownership_lane::released_owner_frame(
-                    &self.ownership,
-                    PROVIDER,
-                    &session_id,
-                    op_id,
-                    // b8ke ext r32 F2: the COMMITTED transition's own
-                    // pair — never a re-observed generation.
-                    self.ownership.as_ref().map(|r| r.boot_epoch()).unwrap_or(0),
-                    generation,
-                ) {
-                    self.broadcast(&frame);
+            match teardown {
+                crate::session_handoff::StopResult::Reaped
+                | crate::session_handoff::StopResult::AlreadyGone => {
+                    if removed_ownership_id.is_none() {
+                        if let Some(ownership_id) = condemned_ownership_id.as_deref() {
+                            self.leases.force_release_after_confirmed_kill_if_matches(
+                                PROVIDER,
+                                &session_id,
+                                &session_id,
+                                ownership_id,
+                            );
+                            self.clear_condemned_prior_if_matching(&session_id, ownership_id);
+                        }
+                    }
+                    let outcome = crate::ownership_lane::commit_fresh_agent_stop(
+                        registry,
+                        PROVIDER,
+                        &session_id,
+                        op_id,
+                        generation,
+                    );
+                    // A successful commit-to-Vacant broadcasts the release frame so every
+                    // connected pane observes the new generation before an immediate
+                    // recreate attempt.
+                    if matches!(outcome, freshell_ownership::CommitOutcome::Committed) {
+                        if let Some(frame) = crate::ownership_lane::released_owner_frame(
+                            &self.ownership,
+                            PROVIDER,
+                            &session_id,
+                            op_id,
+                            registry.boot_epoch(),
+                            generation,
+                        ) {
+                            self.broadcast(&frame);
+                        }
+                    }
+                }
+                crate::session_handoff::StopResult::NotConfirmed { confirmation } => {
+                    // The bounded watcher window expired. Keep Stopping fenced while its
+                    // detached confirmation continues; only a later positive death proof
+                    // may commit the stop.
+                    kill_failure = Some((
+                        "TEARDOWN_NOT_CONFIRMED",
+                        "the session runtime could not be fully confirmed stopped yet; the key stays fenced until shutdown is confirmed — retry after it settles".to_string(),
+                    ));
+                    let registry = Arc::clone(registry);
+                    let session_id = session_id.clone();
+                    let op_id = op_id.to_string();
+                    let broadcast_tx = Arc::clone(&self.broadcast_tx);
+                    tokio::spawn(async move {
+                        if confirmation.await {
+                            let outcome = crate::ownership_lane::commit_fresh_agent_stop(
+                                &registry,
+                                PROVIDER,
+                                &session_id,
+                                &op_id,
+                                generation,
+                            );
+                            if matches!(outcome, freshell_ownership::CommitOutcome::Committed) {
+                                if let Some(frame) = crate::ownership_lane::released_owner_frame(
+                                    &Some(Arc::clone(&registry)),
+                                    PROVIDER,
+                                    &session_id,
+                                    &op_id,
+                                    registry.boot_epoch(),
+                                    generation,
+                                ) {
+                                    if let Ok(frame) = serde_json::to_string(&frame) {
+                                        let _ = broadcast_tx.send(frame);
+                                    }
+                                }
+                            }
+                        } else {
+                            tracing::error!(target: "freshell_ownership",
+                                event = "ownership.stop.deferred_commit",
+                                provider = PROVIDER,
+                                session_id = %session_id,
+                                operation_id = %op_id,
+                                generation,
+                                outcome = "escalation_lost",
+                                failure_reason = "TEARDOWN_ESCALATION_LOST",
+                                "the Codex writer shutdown continuation was lost — the key stays fenced");
+                        }
+                    });
+                }
+                crate::session_handoff::StopResult::PlatformLimited => {
+                    // The direct child exited, but this platform cannot verify descendants.
+                    // Preserve the typed fence rather than releasing a key an owned writer
+                    // may still hold.
+                    let _ = registry.fence_unconfirmed_stop(
+                        PROVIDER,
+                        &session_id,
+                        op_id,
+                        generation,
+                        freshell_ownership::FenceReason::PlatformLimited,
+                    );
+                    // A direct child exit is enough to discard the stale
+                    // completed binding, but not enough to release the
+                    // coordinator fence or scrub the condemned identity.
+                    if let Some(ownership_id) = removed_ownership_id
+                        .as_deref()
+                        .or(condemned_ownership_id.as_deref())
+                    {
+                        self.leases.clear_binding_if_matches(
+                            PROVIDER,
+                            &session_id,
+                            &session_id,
+                            ownership_id,
+                        );
+                    }
+                    kill_failure = Some((
+                        "TEARDOWN_PLATFORM_LIMITED",
+                        "the session runtime stopped its direct process, but this platform cannot verify the complete writer tree; the key stays fenced and remains recoverable".to_string(),
+                    ));
                 }
             }
         }
@@ -4673,9 +4909,9 @@ impl FreshCodexState {
             // A persisted-despite-error close ends the session (consistent
             // with the durable close) but the kill visibly fails
             // (delta-r6-r4, focused-episode-6 round 3 Finding 3).
-            success: !close_reported_failure,
-            code: None,
-            message: None,
+            success: !close_reported_failure && kill_failure.is_none(),
+            code: kill_failure.as_ref().map(|(code, _)| code.to_string()),
+            message: kill_failure.map(|(_, message)| message),
         }));
     }
 
@@ -5058,6 +5294,21 @@ impl FreshCodexState {
         // recreation.
         observed: Option<freshell_ownership::ObservedFence>,
     ) -> Result<EnsureAliveOutcome, EnsureAliveError> {
+        // A natural exit whose writer tree was not yet confirmed leaves a
+        // condemned identity and a typed coordinator fence. Finish that
+        // exact recovery before attempting any respawn; otherwise a stale
+        // map entry could recreate beside the unverified writer.
+        let has_condemned_prior = self
+            .condemned_priors
+            .lock()
+            .expect("condemned priors lock")
+            .contains_key(session_id);
+        if has_condemned_prior && !self.confirm_fenced_prior_dead(session_id).await {
+            tracing::warn!(target: "freshell_freshagent::codex",
+                session_id = %session_id,
+                "fresh_agent_respawn_refused: a prior natural exit remains unconfirmed");
+            return Err(EnsureAliveError::Reserved);
+        }
         let (
             cwd,
             session_model,
@@ -5468,6 +5719,7 @@ impl FreshCodexState {
             exited.clone(),
             Arc::clone(&self.leases),
             quiet_deadman.clone(),
+            Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
         );
 
@@ -5566,12 +5818,9 @@ impl FreshCodexState {
                  the crash recovery registered; the uncommitted session is torn down"
             );
             if let Some(session) = self.sessions.lock().await.remove(session_id) {
-                session.consumer.abort();
-                session.client.close().await;
-                if let Some(kill_tx) = session.kill_tx {
-                    let _ = kill_tx.send(());
-                }
-                let _ = session.watcher.await;
+                let _ = self
+                    .settle_removed_session(session_id, session, own_ticket.take(), None)
+                    .await;
             }
             return Err(EnsureAliveError::RespawnFailed(
                 "session ownership changed during crash recovery; torn down".to_string(),
@@ -5756,6 +6005,7 @@ impl FreshCodexState {
             exited.clone(),
             Arc::clone(&self.leases),
             quiet_deadman.clone(),
+            Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
         );
 
@@ -5815,12 +6065,9 @@ impl FreshCodexState {
                  crash respawn registered; the uncommitted session is torn down"
             );
             if let Some(session) = self.sessions.lock().await.remove(&new_thread_id) {
-                session.consumer.abort();
-                session.client.close().await;
-                if let Some(kill_tx) = session.kill_tx {
-                    let _ = kill_tx.send(());
-                }
-                let _ = session.watcher.await;
+                let _ = self
+                    .settle_removed_session(&new_thread_id, session, own_ticket.take(), None)
+                    .await;
             }
             return Err(EnsureAliveError::RespawnFailed(
                 "session ownership changed during crash respawn; torn down".to_string(),
@@ -7024,12 +7271,14 @@ impl FreshCodexState {
                  claim's commit and its registration; the registered orphan is torn down"
             );
             if let Some(session) = self.sessions.lock().await.remove(thread_id) {
-                session.consumer.abort();
-                session.client.close().await;
-                if let Some(kill_tx) = session.kill_tx {
-                    let _ = kill_tx.send(());
-                }
-                let _ = session.watcher.await;
+                let _ = self
+                    .settle_removed_session(
+                        thread_id,
+                        session,
+                        own_ticket.take(),
+                        lease_guard.take(),
+                    )
+                    .await;
             }
             if let Some(mut g) = lease_guard.take() {
                 g.fail();
@@ -7045,18 +7294,17 @@ impl FreshCodexState {
                 // Revoked mid-resume (expired holder): tear our own session down and
                 // reopen the key -- never keep a session a contender may replace.
                 if let Some(session) = self.sessions.lock().await.remove(thread_id) {
-                    session.consumer.abort();
-                    session.client.close().await;
-                    if let Some(kill_tx) = session.kill_tx {
-                        let _ = kill_tx.send(());
-                    }
-                    let _ = session.watcher.await;
+                    let _ = self
+                        .settle_removed_session(thread_id, session, own_ticket.take(), Some(g))
+                        .await;
+                } else {
+                    g.fail();
+                    drop(own_ticket.take());
                 }
                 // Finding 5's re-raise: the ONE post-commit failure arm — the
                 // close the commit undid is durable again (fence re-raised,
                 // the revived row re-retired).
                 self.rollback_session_claim(thread_id).await;
-                g.fail();
                 return Err(ResumeSessionError::Transient(
                     "session lease revoked during attach-resume; torn down".to_string(),
                 ));
@@ -7132,12 +7380,9 @@ impl FreshCodexState {
                      b8ke ext r27 F4)"
                 );
                 if let Some(session) = self.sessions.lock().await.remove(thread_id) {
-                    session.consumer.abort();
-                    session.client.close().await;
-                    if let Some(kill_tx) = session.kill_tx {
-                        let _ = kill_tx.send(());
-                    }
-                    let _ = session.watcher.await;
+                    let _ = self
+                        .settle_removed_session(thread_id, session, own_ticket.take(), None)
+                        .await;
                 }
                 if let Some(mut g) = lease_guard.take() {
                     g.fail();
@@ -7172,12 +7417,9 @@ impl FreshCodexState {
                          while the resume registered; the uncommitted session is torn down"
                     );
                     if let Some(session) = self.sessions.lock().await.remove(thread_id) {
-                        session.consumer.abort();
-                        session.client.close().await;
-                        if let Some(kill_tx) = session.kill_tx {
-                            let _ = kill_tx.send(());
-                        }
-                        let _ = session.watcher.await;
+                        let _ = self
+                            .settle_removed_session(thread_id, session, own_ticket.take(), None)
+                            .await;
                     }
                     if let Some(mut g) = lease_guard.take() {
                         g.fail();
@@ -7257,6 +7499,7 @@ impl FreshCodexState {
             exited.clone(),
             Arc::clone(&self.leases),
             quiet_deadman.clone(),
+            Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
         );
         self.sessions.lock().await.insert(
@@ -7332,6 +7575,7 @@ impl FreshCodexState {
             exited.clone(),
             Arc::clone(&self.leases),
             quiet_deadman.clone(),
+            Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
         );
         self.sessions.lock().await.insert(
@@ -8181,6 +8425,148 @@ fn watcher_stop_not_confirmed() -> crate::session_handoff::StopResult {
     }
 }
 
+/// Continue an incomplete Codex tree reap after the bounded watcher window. The first
+/// watcher pass has already stopped the direct child; this continuation keeps probing the
+/// recorded incarnation and tagged descendants until the complete writer tree is confirmed
+/// gone. An incomplete identity capture cannot be repaired safely, so it stays fail-closed.
+fn codex_tree_death_escalation(
+    recorded: crate::session_lease::CondemnedRuntimeIdentity,
+    ownership_id: String,
+    thread_id: String,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>> {
+    Box::pin(async move {
+        if !recorded.capture_complete {
+            tracing::error!(target: "freshell_freshagent::codex",
+                session_id = %thread_id,
+                ownership_id = %ownership_id,
+                "freshagent.codex.teardown_escalation_unavailable: the recorded writer identity was incomplete; keeping ownership fenced");
+            return false;
+        }
+        loop {
+            if crate::session_lease::kill_and_confirm_recorded_tree_dead(
+                &recorded,
+                CODEX_SIDECAR_OWNERSHIP_ENV,
+            )
+            .await
+            {
+                return true;
+            }
+            tracing::warn!(target: "freshell_freshagent::codex",
+                session_id = %thread_id,
+                ownership_id = %ownership_id,
+                "freshagent.codex.teardown_escalation_continues: the detached writer-tree confirmation is still unresolved");
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+}
+
+fn clear_codex_condemned_prior_if_matching(
+    condemned_priors: &Arc<
+        StdMutex<HashMap<String, crate::session_lease::CondemnedRuntimeIdentity>>,
+    >,
+    thread_id: &str,
+    ownership_id: &str,
+) {
+    let mut condemned = condemned_priors.lock().expect("condemned priors lock");
+    if condemned
+        .get(thread_id)
+        .is_some_and(|recorded| recorded.ownership_id == ownership_id)
+    {
+        condemned.remove(thread_id);
+    }
+}
+
+fn retain_codex_condemned_prior_if_current(
+    condemned_priors: &Arc<
+        StdMutex<HashMap<String, crate::session_lease::CondemnedRuntimeIdentity>>,
+    >,
+    thread_id: &str,
+    recorded: crate::session_lease::CondemnedRuntimeIdentity,
+) {
+    let mut condemned = condemned_priors.lock().expect("condemned priors lock");
+    match condemned.get(thread_id) {
+        Some(current) if current.ownership_id != recorded.ownership_id => {
+            // A newer explicit teardown owns the key. A natural watcher from
+            // an older runtime must not replace its recovery evidence.
+        }
+        _ => {
+            condemned.insert(thread_id.to_string(), recorded);
+        }
+    }
+}
+
+fn cleanup_confirmed_codex_teardown(
+    leases: &crate::session_lease::FreshAgentSessionLeases,
+    ownership: Option<&crate::ownership_lane::OwnershipWatch>,
+    condemned_priors: &Arc<
+        StdMutex<HashMap<String, crate::session_lease::CondemnedRuntimeIdentity>>,
+    >,
+    thread_id: &str,
+    ownership_id: &str,
+    force_release: bool,
+) {
+    crate::codex_sidecar_tracking::scrub_sidecar_record(ownership_id);
+    // The complete writer tree is confirmed dead, so clear both a completed
+    // binding and any still-armed create/resume lease left by an unwind.
+    if force_release {
+        leases.force_release_after_confirmed_kill_if_matches(
+            PROVIDER,
+            thread_id,
+            thread_id,
+            ownership_id,
+        );
+    } else {
+        // A natural exit can race the create tail before its lease guard calls
+        // `complete`. Clearing only the durable binding preserves that active
+        // lease long enough for the tail to settle it normally.
+        leases.clear_binding_if_matches(PROVIDER, thread_id, thread_id, ownership_id);
+    }
+    clear_codex_condemned_prior_if_matching(condemned_priors, thread_id, ownership_id);
+    if let Some(ownership) = ownership {
+        ownership.release_confirmed(thread_id, "freshcodex/watcher-confirmed-teardown");
+    }
+}
+
+fn wrap_codex_confirmation_with_cleanup(
+    confirmation: std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>>,
+    ownership_id: String,
+    thread_id: String,
+    leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
+    ownership: Option<crate::ownership_lane::OwnershipWatch>,
+    condemned_priors: Arc<
+        StdMutex<HashMap<String, crate::session_lease::CondemnedRuntimeIdentity>>,
+    >,
+    force_release: bool,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>> {
+    Box::pin(async move {
+        let confirmed = confirmation.await;
+        if confirmed {
+            cleanup_confirmed_codex_teardown(
+                &leases,
+                ownership.as_ref(),
+                &condemned_priors,
+                &thread_id,
+                &ownership_id,
+                force_release,
+            );
+        }
+        confirmed
+    })
+}
+
+/// Natural exits have no lifecycle caller waiting on the watcher result.  Run
+/// their continuation independently, while still returning a future that a
+/// replacement caller can await if it happens to consume the watcher handle.
+fn detach_codex_confirmation(
+    confirmation: std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>> {
+    let (settled_tx, settled_rx) = oneshot::channel();
+    tokio::spawn(async move {
+        let _ = settled_tx.send(confirmation.await);
+    });
+    Box::pin(async move { settled_rx.await.unwrap_or(false) })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_exit_watcher(
     mut child: tokio::process::Child,
@@ -8191,6 +8577,9 @@ pub(crate) fn spawn_exit_watcher(
     exited: Arc<AtomicBool>,
     leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
     quiet_deadman: Arc<StdMutex<QuietDeadman>>,
+    condemned_priors: Arc<
+        StdMutex<HashMap<String, crate::session_lease::CondemnedRuntimeIdentity>>,
+    >,
     // kata b8ke Task 3: release the retained coordinator stamp on exit with
     // its fenced claim (None when the lane is unwired — pre-existing tests).
     ownership: Option<crate::ownership_lane::OwnershipWatch>,
@@ -8207,6 +8596,7 @@ pub(crate) fn spawn_exit_watcher(
             &ownership_id,
         )
     });
+    let ownership = ownership.map(|watch| watch.for_runtime(&thread_id, child.id()));
     tokio::spawn(async move {
         // `biased` + the REQUESTED-kill arm listed FIRST: a `freshAgent.kill` signals
         // `kill_tx` right before `start_kill()`s the child, so `child.wait()` can become
@@ -8238,26 +8628,64 @@ pub(crate) fn spawn_exit_watcher(
                     false
                 };
                 if confirmed {
-                    crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                    // Task 12: the bound session is gone -- reopen its durable id.
-                    leases.clear_binding(PROVIDER, &thread_id);
-                    // kata b8ke Task 3: the requested-kill path's coordinator
-                    // transition is the kill flow's own `commit_stop` (the
-                    // release here is fenced and no-ops during `Stopping`).
-                    if let Some(watch) = &ownership {
-                        watch.release(&thread_id, "freshcodex/watcher-requested-kill");
-                    }
+                    cleanup_confirmed_codex_teardown(
+                        &leases,
+                        ownership.as_ref(),
+                        &condemned_priors,
+                        &thread_id,
+                        &ownership_id,
+                        true,
+                    );
                     tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.sidecar.reaped");
                     crate::session_handoff::StopResult::Reaped
                 } else if !cfg!(target_os = "linux") && wait_result.is_ok() {
                     tracing::warn!(provider = PROVIDER, session_id = %thread_id,
                         "freshagent.sidecar.platform_limited: direct child exited but descendant tree is unverified");
+                    // A natural exit has no lifecycle caller waiting to
+                    // convert this typed result into a coordinator fence.
+                    // Retain the exact incarnation and fence the live owner
+                    // here so a later recovery cannot recreate beside an
+                    // unverified descendant on platforms without whole-tree
+                    // confirmation.
+                    if let Some(recorded) = recorded.clone() {
+                        retain_codex_condemned_prior_if_current(
+                            &condemned_priors,
+                            &thread_id,
+                            recorded,
+                        );
+                    }
+                    if let Some(ownership) = ownership.as_ref() {
+                        let _ = ownership.fence_unconfirmed(
+                            &thread_id,
+                            freshell_ownership::FenceReason::PlatformLimited,
+                        );
+                    }
                     crate::session_handoff::StopResult::PlatformLimited
                 } else {
                     tracing::warn!(provider = PROVIDER, session_id = %thread_id,
                         wait_error = ?wait_result.as_ref().err(),
                         "freshagent.sidecar.reap_unconfirmed: owned writer shutdown could not be confirmed");
-                    watcher_stop_not_confirmed()
+                    let confirmation = recorded
+                        .clone()
+                        .map(|recorded| {
+                            codex_tree_death_escalation(
+                                recorded,
+                                ownership_id.clone(),
+                                thread_id.clone(),
+                            )
+                        })
+                        .unwrap_or_else(|| Box::pin(async { false }));
+                    crate::session_handoff::StopResult::NotConfirmed {
+                        confirmation: wrap_codex_confirmation_with_cleanup(
+                            confirmation,
+                            ownership_id.clone(),
+                            thread_id.clone(),
+                            Arc::clone(&leases),
+                            ownership.clone(),
+                            Arc::clone(&condemned_priors),
+                            true,
+                        ),
+                    }
                 }
             }
             wait_result = child.wait() => {
@@ -8280,27 +8708,69 @@ pub(crate) fn spawn_exit_watcher(
                     false
                 };
                 let stop_result = if confirmed {
-                    crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                    // Task 12: a crashed sidecar is no longer a live writer -- reopen the
-                    // durable id (the entry stays mapped for PR-4 lazy respawn, which
-                    // re-claims through the attach/send seams).
-                    leases.clear_binding(PROVIDER, &thread_id);
-                    // kata b8ke Task 3: an UNREQUESTED exit releases the retained
-                    // coordinator stamp with its fenced claim.
-                    if let Some(watch) = &ownership {
-                        watch.release(&thread_id, "freshcodex/watcher-exit");
-                    }
+                    cleanup_confirmed_codex_teardown(
+                        &leases,
+                        ownership.as_ref(),
+                        &condemned_priors,
+                        &thread_id,
+                        &ownership_id,
+                        false,
+                    );
                     tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.sidecar.reaped");
                     crate::session_handoff::StopResult::Reaped
                 } else if !cfg!(target_os = "linux") && wait_result.is_ok() {
                     tracing::warn!(provider = PROVIDER, session_id = %thread_id,
                         "freshagent.sidecar.platform_limited: direct child exited but descendant tree is unverified");
+                    if let Some(ownership) = ownership.as_ref() {
+                        let _ = ownership.fence_unconfirmed(
+                            &thread_id,
+                            freshell_ownership::FenceReason::PlatformLimited,
+                        );
+                    }
                     crate::session_handoff::StopResult::PlatformLimited
                 } else {
                     tracing::warn!(provider = PROVIDER, session_id = %thread_id,
                         wait_error = ?wait_result.as_ref().err(),
                         "freshagent.sidecar.reap_unconfirmed: owned writer shutdown could not be confirmed");
-                    watcher_stop_not_confirmed()
+                    // Natural exits have no lifecycle caller waiting on this
+                    // result. Retain the exact condemned identity so a later
+                    // attach/send can retry confirmation instead of
+                    // respawning beside an unverified writer.
+                    if let Some(recorded) = recorded.clone() {
+                        retain_codex_condemned_prior_if_current(
+                            &condemned_priors,
+                            &thread_id,
+                            recorded,
+                        );
+                    }
+                    if let Some(ownership) = ownership.as_ref() {
+                        let _ = ownership.fence_unconfirmed(
+                            &thread_id,
+                            freshell_ownership::FenceReason::WatcherFailed,
+                        );
+                    }
+                    let confirmation = recorded
+                        .clone()
+                        .map(|recorded| {
+                            codex_tree_death_escalation(
+                                recorded,
+                                ownership_id.clone(),
+                                thread_id.clone(),
+                            )
+                        })
+                        .unwrap_or_else(|| Box::pin(async { false }));
+                    let confirmation = wrap_codex_confirmation_with_cleanup(
+                        confirmation,
+                        ownership_id.clone(),
+                        thread_id.clone(),
+                        Arc::clone(&leases),
+                        ownership.clone(),
+                        Arc::clone(&condemned_priors),
+                        false,
+                    );
+                    crate::session_handoff::StopResult::NotConfirmed {
+                        confirmation: detach_codex_confirmation(confirmation),
+                    }
                 };
                 // DIAG-01: an UNREQUESTED exit -- the crash/disconnect self-heal
                 // edge (`kill_rx` firing instead would mean a requested kill,
@@ -9562,6 +10032,7 @@ pub(crate) mod tests {
             exited.clone(),
             Arc::clone(&state.leases),
             quiet_deadman.clone(),
+            Arc::clone(&state.condemned_priors),
             None,
         );
         state.sessions.lock().await.insert(
@@ -9645,6 +10116,7 @@ pub(crate) mod tests {
             exited.clone(),
             Arc::clone(&state.leases),
             quiet_deadman.clone(),
+            Arc::clone(&state.condemned_priors),
             None,
         );
         state.sessions.lock().await.insert(
@@ -10821,6 +11293,7 @@ pub(crate) mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             QuietDeadman::new_shared(),
+            Arc::new(StdMutex::new(HashMap::new())),
             None,
         );
         kill_tx.send(()).expect("request watcher teardown");
@@ -10830,6 +11303,60 @@ pub(crate) mod tests {
             matches!(result, crate::session_handoff::StopResult::Reaped),
             "requested teardown must expose its confirmation result: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn deferred_codex_confirmation_clears_binding_and_condemned_identity() {
+        let leases = Arc::new(crate::session_lease::FreshAgentSessionLeases::new());
+        let session_id = "codex-deferred-cleanup";
+        let ownership_id = "codex-deferred-cleanup-owner";
+        assert!(matches!(
+            leases.claim(PROVIDER, session_id, "create", 0),
+            crate::session_lease::FreshSessionClaim::Acquired
+        ));
+        leases.set_kill_handle(PROVIDER, session_id, "create", 4242, ownership_id);
+        assert!(leases.complete_with_identity(
+            PROVIDER,
+            session_id,
+            "create",
+            session_id,
+            Some(ownership_id),
+        ));
+
+        let condemned_priors = Arc::new(StdMutex::new(HashMap::from([(
+            session_id.to_string(),
+            crate::session_lease::CondemnedRuntimeIdentity {
+                pid: 1,
+                start_time: None,
+                tree: Vec::new(),
+                ownership_id: ownership_id.to_string(),
+                capture_complete: false,
+            },
+        )])));
+        let confirmation: std::pin::Pin<
+            Box<dyn std::future::Future<Output = bool> + Send + 'static>,
+        > = Box::pin(async { true });
+
+        assert!(
+            wrap_codex_confirmation_with_cleanup(
+                confirmation,
+                ownership_id.to_string(),
+                session_id.to_string(),
+                Arc::clone(&leases),
+                None,
+                Arc::clone(&condemned_priors),
+                true,
+            )
+            .await
+        );
+        assert!(matches!(
+            leases.claim(PROVIDER, session_id, "replacement", 1),
+            crate::session_lease::FreshSessionClaim::Acquired
+        ));
+        assert!(!condemned_priors
+            .lock()
+            .expect("condemned priors lock")
+            .contains_key(session_id));
     }
 
     /// b8ke focused review FR9: the half-fenced kill refusal carries the

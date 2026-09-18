@@ -67,16 +67,16 @@ describe('SessionHandoffErrorBanner (kata b8ke R4-4 force-clear action)', () => 
     })
   })
 
-  it('renders the Force clear action for the original PLATFORM_LIMITED failure', () => {
+  it('does not offer Force clear when the platform preflight left the owner live', () => {
     render(
       <SessionHandoffErrorBanner
-        error={errorWith({ code: 'PLATFORM_LIMITED' })}
+        error={errorWith({ code: 'PLATFORM_LIMITED_PRECHECK' })}
         appStore={store}
         tabId="tab-1"
         paneId="pane-1"
       />,
     )
-    expect(screen.getByRole('button', { name: /force clear/i })).toBeDefined()
+    expect(screen.queryByRole('button', { name: /force clear/i })).toBeNull()
   })
 
   // b8ke ext r28 F2: the r25 server change made the acknowledged

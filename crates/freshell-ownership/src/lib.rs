@@ -2939,6 +2939,68 @@ impl RuntimeOwnershipRegistry {
         }
     }
 
+    /// Fence a runtime whose natural exit was observed but whose complete
+    /// process tree could not be confirmed. This is the natural-exit twin of
+    /// [`Self::fence_unconfirmed_stop`]: it matches the retained runtime
+    /// identity and commit operation exactly, then moves `Live` directly to a
+    /// typed `Fenced` record so recovery cannot recreate beside an
+    /// unverified writer.
+    pub fn fence_unconfirmed_live(
+        &self,
+        provider: &str,
+        session_id: &str,
+        operation_id: &str,
+        generation: u64,
+        expected_runtime: &OwnerIdentity,
+        reason: FenceReason,
+    ) -> FenceOutcome {
+        let mut inner = self.inner.lock().expect("ownership lock poisoned");
+        let key = SessionKey::new(provider, session_id);
+        let Some(record) = inner.get_mut(&key) else {
+            return FenceOutcome::ForeignOperation;
+        };
+        if generation != record.generation {
+            return FenceOutcome::ForeignOperation;
+        }
+        let initiator = record.state.initiator().unwrap_or_default();
+        match record.state.clone() {
+            OwnershipState::Live {
+                owner,
+                generation: live_generation,
+                since_ms,
+            } if live_generation == generation
+                && owner.kind == expected_runtime.kind
+                && owner.terminal_id == expected_runtime.terminal_id
+                && owner.live_session_key == expected_runtime.live_session_key
+                && owner.pid == expected_runtime.pid
+                && owner.ownership_id.as_deref() == Some(operation_id) =>
+            {
+                let duration_ms = now_epoch_ms().saturating_sub(since_ms);
+                record.state = OwnershipState::Fenced {
+                    prior: Some((owner.clone(), generation)),
+                    reason,
+                    operation_id: operation_id.to_string(),
+                    generation,
+                    initiator: initiator.clone(),
+                    since_ms: now_epoch_ms(),
+                };
+                tracing::error!(target: "freshell_ownership",
+                    event = "ownership.live.fenced_unconfirmed", operation_id, provider, session_id,
+                    initiator,
+                    from_kind = ?Some(owner.kind),
+                    to_kind = ?Option::<RuntimeOwnerKind>::None,
+                    runtime_id = ?owner.terminal_id,
+                    pid = ?owner.pid,
+                    epoch = self.epoch, generation, duration_ms,
+                    fence_reason = ?reason, outcome = "fenced",
+                    failure_reason = "UNCONFIRMED_PRIOR_DEATH",
+                    "a natural runtime exit could not confirm the complete writer tree; the key stays fenced until confirmed death");
+                FenceOutcome::Fenced
+            }
+            _ => FenceOutcome::ForeignOperation,
+        }
+    }
+
     /// b8ke focused round-2 review: `Fenced{op}` → `Vacant` (generation
     /// preserved). The caller MUST have CONFIRMED the fenced prior's death
     /// (a bounded identity/pid probe or a watcher event) before invoking —
@@ -3446,7 +3508,13 @@ impl RuntimeOwnershipRegistry {
     /// a different generation, or an in-flight handoff makes this a typed
     /// no-op (the handoff runner folds exit events itself — its awaited
     /// kill/reap is the single fold point).
-    pub fn release(&self, provider: &str, session_id: &str, claim: &ReleaseClaim, initiator: &str) {
+    pub fn release(
+        &self,
+        provider: &str,
+        session_id: &str,
+        claim: &ReleaseClaim,
+        initiator: &str,
+    ) -> bool {
         let mut inner = self.inner.lock().expect("ownership lock poisoned");
         let key = SessionKey::new(provider, session_id);
         if let Some(record) = inner.get_mut(&key) {
@@ -3486,6 +3554,7 @@ impl RuntimeOwnershipRegistry {
                         runtime_id = ?owner.terminal_id, pid = ?owner.pid,
                         epoch = self.epoch, generation, duration_ms,
                         outcome = "released", failure_reason = "");
+                    return true;
                 } else {
                     // b8ke ext r7 F4: the UNIFORM transition schema —
                     // the noop names both kinds (no transition:
@@ -3504,6 +3573,7 @@ impl RuntimeOwnershipRegistry {
                 }
             }
         }
+        false
     }
 
     /// Only after the holder's entire process tree death was confirmed

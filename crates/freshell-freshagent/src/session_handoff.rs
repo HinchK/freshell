@@ -671,7 +671,7 @@ impl SessionHandoffRunner {
                 failure_reason = "PLATFORM_LIMITED",
                 "atomic session handoff refused before mutation: the platform cannot confirm the complete prior writer tree");
             return typed_failure(
-                "PLATFORM_LIMITED",
+                "PLATFORM_LIMITED_PRECHECK",
                 "atomic session handoff is unavailable because the server cannot confirm the complete prior writer tree; the existing session was left running",
                 true,
                 generation,

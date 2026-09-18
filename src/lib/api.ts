@@ -648,6 +648,10 @@ export const SessionHandoffErrorCodeSchema = z.enum([
    *  it to generic HANDOFF_REQUEST_FAILED — the Banner's Force-clear
    *  action was unreachable through the real API path). */
   'PLATFORM_LIMITED',
+  /** b8ke stabilization: the capability preflight refused before entering
+   * Handoff, so the existing owner is still live and there is no stale fence
+   * for the operator to clear. */
+  'PLATFORM_LIMITED_PRECHECK',
   /** b8ke delta round-3 F5: an ordinary retry against a StaleStart
    *  fence (the unconfirmed stale-start residue) — the acknowledged
    *  force-clear accepts StaleStart with the same typed risk. */

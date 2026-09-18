@@ -214,19 +214,116 @@ pub mod ownership_lane {
         pub registry: Arc<RuntimeOwnershipRegistry>,
         pub stamps: OwnershipStamps,
         pub provider: &'static str,
+        /// Runtime identity captured when the watcher takes ownership of a
+        /// sidecar. A watcher without this identity must not consume a
+        /// retained stamp: a replacement may already use the same session id.
+        expected_runtime: Option<OwnerIdentity>,
     }
 
     impl OwnershipWatch {
+        pub fn new(
+            registry: Arc<RuntimeOwnershipRegistry>,
+            stamps: OwnershipStamps,
+            provider: &'static str,
+        ) -> Self {
+            Self {
+                registry,
+                stamps,
+                provider,
+                expected_runtime: None,
+            }
+        }
+
+        /// Bind this watch to the child runtime it observes. The coordinator
+        /// stamp is created at the registration tail, after the watcher is
+        /// constructed, so the watcher fills in the concrete pid here before
+        /// either exit branch can run.
+        pub fn for_runtime(mut self, session_id: &str, pid: Option<u32>) -> Self {
+            self.expected_runtime = Some(OwnerIdentity {
+                kind: RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some(session_id.to_string()),
+                pid,
+                ownership_id: None,
+            });
+            self
+        }
+
         /// Take the retained stamp (if any) and release it — the exit
         /// watcher's natural-death hook.
-        pub fn release(&self, session_id: &str, initiator: &str) {
-            release_retained_stamp(
+        pub fn release(&self, session_id: &str, initiator: &str) -> bool {
+            release_retained_stamp_if_matches(
                 &Some(Arc::clone(&self.registry)),
                 &self.stamps,
                 self.provider,
                 session_id,
                 initiator,
-            );
+                self.expected_runtime.as_ref(),
+            )
+        }
+
+        /// Record a natural exit whose complete writer tree is not yet
+        /// confirmed. The retained stamp supplies the exact coordinator
+        /// operation/generation; a mismatched replacement is ignored.
+        pub fn fence_unconfirmed(
+            &self,
+            session_id: &str,
+            reason: freshell_ownership::FenceReason,
+        ) -> freshell_ownership::FenceOutcome {
+            let Some(expected_runtime) = self.expected_runtime.as_ref() else {
+                return freshell_ownership::FenceOutcome::ForeignOperation;
+            };
+            let Some(stamp) = peek_retained_stamp(&self.stamps, session_id) else {
+                return freshell_ownership::FenceOutcome::ForeignOperation;
+            };
+            if stamp.owner.kind != expected_runtime.kind
+                || stamp.owner.terminal_id != expected_runtime.terminal_id
+                || stamp.owner.live_session_key != expected_runtime.live_session_key
+                || stamp.owner.pid != expected_runtime.pid
+            {
+                return freshell_ownership::FenceOutcome::ForeignOperation;
+            }
+            self.registry.fence_unconfirmed_live(
+                self.provider,
+                session_id,
+                &stamp.operation_id,
+                stamp.generation,
+                &stamp.owner,
+                reason,
+            )
+        }
+
+        /// Release a confirmed runtime from either `Live` or the typed
+        /// `Fenced` state. The latter is the natural-exit recovery path;
+        /// `release` alone intentionally no-ops while fenced.
+        pub fn release_confirmed(&self, session_id: &str, initiator: &str) {
+            if self.release(session_id, initiator) {
+                return;
+            }
+            let Some(expected_runtime) = self.expected_runtime.as_ref() else {
+                return;
+            };
+            let Some(stamp) = peek_retained_stamp(&self.stamps, session_id) else {
+                return;
+            };
+            if stamp.owner.kind != expected_runtime.kind
+                || stamp.owner.terminal_id != expected_runtime.terminal_id
+                || stamp.owner.live_session_key != expected_runtime.live_session_key
+                || stamp.owner.pid != expected_runtime.pid
+            {
+                return;
+            }
+            if matches!(
+                self.registry.release_fenced(
+                    self.provider,
+                    session_id,
+                    &stamp.operation_id,
+                    stamp.generation,
+                ),
+                CommitOutcome::Committed
+            ) {
+                let _ = take_retained_stamp_if_matches(&self.stamps, session_id, expected_runtime);
+            }
         }
     }
 
@@ -632,8 +729,8 @@ pub mod ownership_lane {
         session_id: &str,
         claim: &ReleaseClaim,
         initiator: &str,
-    ) {
-        registry.release(provider, session_id, claim, initiator);
+    ) -> bool {
+        registry.release(provider, session_id, claim, initiator)
     }
 
     // ── lane bindings: the per-state plumbing every provider shares ────────
@@ -1249,6 +1346,67 @@ pub mod ownership_lane {
         };
         let claim = stamp.release_claim();
         release_fresh_agent_ownership(registry, provider, session_id, &claim, initiator);
+    }
+
+    /// Identity-scoped exit-watcher release. The stamp remains in place when
+    /// the observed runtime no longer matches, allowing the replacement owner
+    /// to retain its own release evidence instead of losing it to a stale
+    /// watcher.
+    pub fn release_retained_stamp_if_matches(
+        registry: &Option<Arc<RuntimeOwnershipRegistry>>,
+        stamps: &OwnershipStamps,
+        provider: &str,
+        session_id: &str,
+        initiator: &str,
+        expected_runtime: Option<&OwnerIdentity>,
+    ) -> bool {
+        let Some(registry) = registry.as_ref() else {
+            return false;
+        };
+        let Some(expected_runtime) = expected_runtime else {
+            tracing::warn!(target: "invariant", provider, session_id,
+                event = "freshagent.ownership_release_missing_runtime_identity",
+                "the exit watcher had no runtime identity; retaining the stamp");
+            return false;
+        };
+        let Some(stamp) = peek_retained_stamp(stamps, session_id) else {
+            return false;
+        };
+        let owner_matches = stamp.owner.kind == expected_runtime.kind
+            && stamp.owner.terminal_id == expected_runtime.terminal_id
+            && stamp.owner.live_session_key == expected_runtime.live_session_key
+            && stamp.owner.pid == expected_runtime.pid;
+        if !owner_matches {
+            tracing::warn!(target: "invariant", provider, session_id,
+                event = "freshagent.ownership_release_identity_mismatch",
+                watched_pid = ?expected_runtime.pid,
+                current_pid = ?stamp.owner.pid,
+                "the exit watcher is stale; retaining the current ownership stamp");
+            return false;
+        }
+        let claim = stamp.release_claim();
+        if release_fresh_agent_ownership(registry, provider, session_id, &claim, initiator) {
+            // Remove only after the coordinator accepted the exact release.
+            // A concurrent replacement can win between the peek and take;
+            // the identity re-check then leaves its stamp intact.
+            return take_retained_stamp_if_matches(stamps, session_id, expected_runtime).is_some();
+        }
+        false
+    }
+
+    fn take_retained_stamp_if_matches(
+        stamps: &OwnershipStamps,
+        session_id: &str,
+        expected_runtime: &OwnerIdentity,
+    ) -> Option<OwnershipStamp> {
+        let mut guard = stamps.lock().expect("ownership stamps lock");
+        let matches = guard.get(session_id).is_some_and(|stamp| {
+            stamp.owner.kind == expected_runtime.kind
+                && stamp.owner.terminal_id == expected_runtime.terminal_id
+                && stamp.owner.live_session_key == expected_runtime.live_session_key
+                && stamp.owner.pid == expected_runtime.pid
+        });
+        matches.then(|| guard.remove(session_id).expect("matching stamp exists"))
     }
 
     // ── terminal lane (kata b8ke Task 4) ────────────────────────────────────
@@ -6029,6 +6187,7 @@ pub struct FreshSessionLeaseGuard {
     request_id: String,
     armed: bool,
     kill_handle_set: bool,
+    kill_handle_ownership_id: Option<String>,
 }
 
 impl FreshSessionLeaseGuard {
@@ -6046,6 +6205,7 @@ impl FreshSessionLeaseGuard {
             request_id: request_id.to_string(),
             armed: true,
             kill_handle_set: false,
+            kill_handle_ownership_id: None,
         }
     }
 
@@ -6060,17 +6220,19 @@ impl FreshSessionLeaseGuard {
             ownership_id,
         );
         self.kill_handle_set = true;
+        self.kill_handle_ownership_id = Some(ownership_id.to_string());
     }
 
     /// Winner registered its session: bind + release in one lock scope. Returns `false`
     /// when the lease was revoked/foreign — the caller must tear down its own child and
     /// then call [`Self::fail`] (the guard stays armed).
     pub fn complete(&mut self, live_session_key: &str) -> bool {
-        let ok = self.leases.complete(
+        let ok = self.leases.complete_with_identity(
             self.provider,
             &self.session_id,
             &self.request_id,
             live_session_key,
+            self.kill_handle_ownership_id.as_deref(),
         );
         if ok {
             self.armed = false;
@@ -6390,6 +6552,195 @@ mod spawn_gate_seam_tests {
         state.set_spawn_gate(other, Duration::from_millis(1));
         let still = state.spawn_gate().expect("still wired");
         assert!(Arc::ptr_eq(&still.gate, &gate), "first wiring wins");
+    }
+}
+
+#[cfg(test)]
+mod ownership_watch_tests {
+    use super::ownership_lane::{OwnershipStamp, OwnershipWatch};
+    use freshell_ownership::{BeginOutcome, CommitOutcome, OwnerIdentity, RuntimeOwnerKind};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn stale_watcher_keeps_the_replacement_stamp_and_owner() {
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let stamps = Arc::new(Mutex::new(HashMap::new()));
+        let session_id = "codex-watch-replacement";
+        let old_owner = OwnerIdentity {
+            kind: RuntimeOwnerKind::FreshAgent,
+            terminal_id: None,
+            live_session_key: Some(session_id.to_string()),
+            pid: Some(101),
+            ownership_id: Some("op-old".to_string()),
+        };
+        let BeginOutcome::Granted { generation } = registry.begin_start(
+            "codex",
+            session_id,
+            RuntimeOwnerKind::FreshAgent,
+            "op-old",
+            None,
+            "test",
+            1,
+        ) else {
+            panic!("old claim must grant")
+        };
+        assert_eq!(
+            registry.commit_live("codex", session_id, "op-old", generation, old_owner.clone()),
+            CommitOutcome::Committed
+        );
+        stamps.lock().unwrap().insert(
+            session_id.to_string(),
+            OwnershipStamp {
+                epoch: registry.boot_epoch(),
+                generation,
+                operation_id: "op-old".to_string(),
+                owner: old_owner.clone(),
+            },
+        );
+
+        let BeginOutcome::AdoptLive { .. } = registry.begin_start(
+            "codex",
+            session_id,
+            RuntimeOwnerKind::FreshAgent,
+            "op-adopt-check",
+            None,
+            "test",
+            2,
+        ) else {
+            // The old owner is deliberately transitioned through the normal
+            // stop path below; this arm only documents that a live owner
+            // cannot be replaced without first settling it.
+            panic!("the live old owner must be adopt-only")
+        };
+        let stop_gen = match registry.begin_stop(
+            "codex",
+            session_id,
+            "op-stop",
+            &freshell_ownership::StopClaim {
+                expected_kind: RuntimeOwnerKind::FreshAgent,
+                expected_runtime: Some(old_owner.clone()),
+                observed: freshell_ownership::ObservedFence {
+                    epoch: registry.boot_epoch(),
+                    generation,
+                },
+            },
+            "test",
+            3,
+        ) {
+            freshell_ownership::StopOutcome::Granted { generation } => generation,
+            other => panic!("old stop must grant: {other:?}"),
+        };
+        assert_eq!(
+            registry.commit_stop("codex", session_id, "op-stop", stop_gen),
+            CommitOutcome::Committed
+        );
+
+        let BeginOutcome::Granted {
+            generation: new_generation,
+        } = registry.begin_start(
+            "codex",
+            session_id,
+            RuntimeOwnerKind::FreshAgent,
+            "op-new",
+            None,
+            "test",
+            4,
+        )
+        else {
+            panic!("replacement claim must grant")
+        };
+        let new_owner = OwnerIdentity {
+            pid: Some(202),
+            ownership_id: Some("op-new".to_string()),
+            ..old_owner.clone()
+        };
+        assert_eq!(
+            registry.commit_live(
+                "codex",
+                session_id,
+                "op-new",
+                new_generation,
+                new_owner.clone(),
+            ),
+            CommitOutcome::Committed
+        );
+        stamps.lock().unwrap().insert(
+            session_id.to_string(),
+            OwnershipStamp {
+                epoch: registry.boot_epoch(),
+                generation: new_generation,
+                operation_id: "op-new".to_string(),
+                owner: new_owner,
+            },
+        );
+
+        OwnershipWatch::new(Arc::clone(&registry), Arc::clone(&stamps), "codex")
+            .for_runtime(session_id, Some(101))
+            .release(session_id, "stale-watcher");
+
+        assert_eq!(
+            stamps.lock().unwrap().get(session_id).unwrap().operation_id,
+            "op-new"
+        );
+        assert!(matches!(
+            registry.observe("codex", session_id).state,
+            freshell_ownership::OwnershipState::Live { owner, .. } if owner.pid == Some(202)
+        ));
+    }
+
+    #[test]
+    fn natural_unconfirmed_exit_has_a_typed_fence_and_confirmed_release() {
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let stamps = Arc::new(Mutex::new(HashMap::new()));
+        let session_id = "codex-watch-fenced";
+        let owner = OwnerIdentity {
+            kind: RuntimeOwnerKind::FreshAgent,
+            terminal_id: None,
+            live_session_key: Some(session_id.to_string()),
+            pid: Some(303),
+            ownership_id: Some("op-fenced".to_string()),
+        };
+        let BeginOutcome::Granted { generation } = registry.begin_start(
+            "codex",
+            session_id,
+            RuntimeOwnerKind::FreshAgent,
+            "op-fenced",
+            None,
+            "test",
+            1,
+        ) else {
+            panic!("claim must grant")
+        };
+        assert_eq!(
+            registry.commit_live("codex", session_id, "op-fenced", generation, owner.clone()),
+            CommitOutcome::Committed
+        );
+        stamps.lock().unwrap().insert(
+            session_id.to_string(),
+            OwnershipStamp {
+                epoch: registry.boot_epoch(),
+                generation,
+                operation_id: "op-fenced".to_string(),
+                owner,
+            },
+        );
+        let watch = OwnershipWatch::new(Arc::clone(&registry), Arc::clone(&stamps), "codex")
+            .for_runtime(session_id, Some(303));
+        assert_eq!(
+            watch.fence_unconfirmed(session_id, freshell_ownership::FenceReason::WatcherFailed,),
+            freshell_ownership::FenceOutcome::Fenced
+        );
+        assert!(matches!(
+            registry.observe("codex", session_id).state,
+            freshell_ownership::OwnershipState::Fenced { .. }
+        ));
+        watch.release_confirmed(session_id, "confirmed-recovery");
+        assert!(matches!(
+            registry.observe("codex", session_id).state,
+            freshell_ownership::OwnershipState::Vacant
+        ));
+        assert!(stamps.lock().unwrap().get(session_id).is_none());
     }
 }
 

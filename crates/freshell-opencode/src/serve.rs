@@ -2088,7 +2088,7 @@ mod tests {
         };
         let mgr = started_recording_manager_with_config(http.clone(), config).await;
 
-        mgr.compact("ses_9", "prov-a", "mdl-x", &None, None)
+        mgr.compact("ses_9", "prov-a", "mdl-x", &None, None, None)
             .await
             .expect("200 summarize succeeds");
         // A non-compact call in the SAME manager keeps the generic bound.

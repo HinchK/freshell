@@ -735,7 +735,7 @@ async fn unsupported_atomic_handoff_refuses_before_mutation_and_clear_bypasses_p
         .unwrap();
 
     assert_eq!(result["ok"], json!(false), "unsupported handoff: {result}");
-    assert_eq!(result["error"]["code"], json!("PLATFORM_LIMITED"));
+    assert_eq!(result["error"]["code"], json!("PLATFORM_LIMITED_PRECHECK"));
     assert_eq!(result["error"]["retryable"], json!(true));
     assert_eq!(rig.ownership.observe("claude", &sid), before);
     assert_eq!(

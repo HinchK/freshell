@@ -56,7 +56,7 @@ export function SessionHandoffErrorBanner({ error, appStore, tabId, paneId }: {
 
   // R4-4: the force-clear action surfaces for the fence shapes the
   // server's acknowledged clear ACCEPTS — the PlatformLimited shapes
-  // (the original PLATFORM_LIMITED failure and the ordinary retry's
+  // (the post-stop PLATFORM_LIMITED failure and the ordinary retry's
   // PLATFORM_LIMITED_FENCED refusal) and, since the r25 server repair,
   // the STALE-reason refusals (STALE_START_FENCED / STALE_STOP_FENCED):
   // their recovery was the confirmed-death probe ONLY, so a stale fence

@@ -809,13 +809,22 @@ struct LeaseEntry {
     revoked: bool,
 }
 
+/// A completed lease binding carries the runtime incarnation that won it.
+/// Keeping the ownership tag beside the live-session key lets a delayed
+/// teardown prove it still owns the binding before reopening the durable id.
+#[derive(Clone, Debug)]
+struct Binding {
+    live_session_key: String,
+    ownership_id: Option<String>,
+}
+
 #[derive(Default)]
 struct Inner {
     leases: HashMap<String, LeaseEntry>,
     /// durable key -> live sessions-map key, recorded by `complete()` UNDER THE SAME
     /// LOCK as the lease removal (registry.rs:1931-1940: releasing first and binding
     /// under a separate lock opens a no-lease/no-binding window -> a second spawn).
-    bindings: HashMap<String, String>,
+    bindings: HashMap<String, Binding>,
 }
 
 fn lease_key(provider: &str, session_id: &str) -> String {
@@ -850,9 +859,9 @@ impl FreshAgentSessionLeases {
         let key = lease_key(provider, session_id);
         // TOCTOU closure (registry.rs:1819-1844): a loser arriving after the winner's
         // complete() removed the lease sees the BINDING instead of an empty map.
-        if let Some(live) = inner.bindings.get(&key) {
+        if let Some(binding) = inner.bindings.get(&key) {
             return FreshSessionClaim::BoundLive {
-                live_session_key: live.clone(),
+                live_session_key: binding.live_session_key.clone(),
             };
         }
         match inner.leases.get_mut(&key) {
@@ -931,12 +940,38 @@ impl FreshAgentSessionLeases {
         holder_request_id: &str,
         live_session_key: &str,
     ) -> bool {
+        self.complete_with_identity(
+            provider,
+            session_id,
+            holder_request_id,
+            live_session_key,
+            None,
+        )
+    }
+
+    /// Complete a lease while retaining the sidecar incarnation that owns
+    /// the binding. Teardown paths use this identity-scoped form so a stale
+    /// watcher cannot clear a replacement binding for the same durable id.
+    pub fn complete_with_identity(
+        &self,
+        provider: &str,
+        session_id: &str,
+        holder_request_id: &str,
+        live_session_key: &str,
+        ownership_id: Option<&str>,
+    ) -> bool {
         let mut inner = self.inner.lock().expect("fresh-agent lease lock poisoned");
         let key = lease_key(provider, session_id);
         match inner.leases.get(&key) {
             Some(lease) if lease.holder_request_id == holder_request_id && !lease.revoked => {
                 inner.leases.remove(&key);
-                inner.bindings.insert(key, live_session_key.to_string());
+                inner.bindings.insert(
+                    key,
+                    Binding {
+                        live_session_key: live_session_key.to_string(),
+                        ownership_id: ownership_id.map(str::to_string),
+                    },
+                );
                 true
             }
             _ => false,
@@ -962,6 +997,28 @@ impl FreshAgentSessionLeases {
         inner.bindings.remove(&lease_key(provider, session_id));
     }
 
+    /// Clear a completed binding only when it still names the watched
+    /// runtime. A missing or different ownership tag is a deliberate no-op:
+    /// the caller is stale or cannot prove it owns the binding.
+    pub fn clear_binding_if_matches(
+        &self,
+        provider: &str,
+        session_id: &str,
+        live_session_key: &str,
+        ownership_id: &str,
+    ) -> bool {
+        let mut inner = self.inner.lock().expect("fresh-agent lease lock poisoned");
+        let key = lease_key(provider, session_id);
+        let matches = inner.bindings.get(&key).is_some_and(|binding| {
+            binding.live_session_key == live_session_key
+                && binding.ownership_id.as_deref() == Some(ownership_id)
+        });
+        if matches {
+            inner.bindings.remove(&key);
+        }
+        matches
+    }
+
     /// Only legal after the holder's ENTIRE process tree death was confirmed
     /// (child kill + ownership sweep empty). Also clears any binding — the whole
     /// tree is confirmed dead.
@@ -970,6 +1027,39 @@ impl FreshAgentSessionLeases {
         let key = lease_key(provider, session_id);
         inner.leases.remove(&key);
         inner.bindings.remove(&key);
+    }
+
+    /// Release a confirmed Codex runtime only when the current binding or
+    /// in-flight lease belongs to that same sidecar incarnation. This is the
+    /// single-owner cleanup path used by delayed/stale teardown continuations.
+    /// It intentionally refuses to remove an untagged or replacement lease.
+    pub fn force_release_after_confirmed_kill_if_matches(
+        &self,
+        provider: &str,
+        session_id: &str,
+        live_session_key: &str,
+        ownership_id: &str,
+    ) -> bool {
+        let mut inner = self.inner.lock().expect("fresh-agent lease lock poisoned");
+        let key = lease_key(provider, session_id);
+        let binding_matches = inner.bindings.get(&key).is_some_and(|binding| {
+            binding.live_session_key == live_session_key
+                && binding.ownership_id.as_deref() == Some(ownership_id)
+        });
+        let lease_matches = inner.leases.get(&key).is_some_and(|lease| {
+            lease
+                .kill_handle
+                .as_ref()
+                .is_some_and(|(_, tag)| tag == ownership_id)
+        });
+        let matched = binding_matches || lease_matches;
+        if binding_matches {
+            inner.bindings.remove(&key);
+        }
+        if lease_matches {
+            inner.leases.remove(&key);
+        }
+        matched
     }
 
     /// kata b8ke Task 3: the CURRENT holder's armed kill handle, if any —
@@ -1060,6 +1150,47 @@ mod tests {
         assert_eq!(
             leases.claim("codex", "sid-1", "req-b", 20),
             FreshSessionClaim::Acquired
+        );
+    }
+
+    #[test]
+    fn stale_confirmed_teardown_cannot_remove_a_replacement_binding() {
+        let leases = FreshAgentSessionLeases::new();
+        leases.claim("codex", "sid-identity", "req-old", 0);
+        leases.set_kill_handle("codex", "sid-identity", "req-old", 100, "owner-old");
+        assert!(leases.complete_with_identity(
+            "codex",
+            "sid-identity",
+            "req-old",
+            "live-old",
+            Some("owner-old"),
+        ));
+
+        // The old watcher legitimately reopens the key first; a replacement
+        // then wins and publishes its own binding before the old detached
+        // confirmation runs again.
+        assert!(leases.clear_binding_if_matches("codex", "sid-identity", "live-old", "owner-old",));
+        leases.claim("codex", "sid-identity", "req-new", 1);
+        leases.set_kill_handle("codex", "sid-identity", "req-new", 200, "owner-new");
+        assert!(leases.complete_with_identity(
+            "codex",
+            "sid-identity",
+            "req-new",
+            "live-new",
+            Some("owner-new"),
+        ));
+
+        assert!(!leases.force_release_after_confirmed_kill_if_matches(
+            "codex",
+            "sid-identity",
+            "live-old",
+            "owner-old",
+        ));
+        assert_eq!(
+            leases.claim("codex", "sid-identity", "req-third", 2),
+            FreshSessionClaim::BoundLive {
+                live_session_key: "live-new".into()
+            }
         );
     }
 
