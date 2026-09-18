@@ -842,6 +842,16 @@
               "default": "shell",
               "type": "string"
             },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
             "paneId": {
               "minLength": 1,
               "type": "string"
@@ -984,6 +994,16 @@
             "maxReplayBytes": {
               "exclusiveMinimum": 0,
               "maximum": 9007199254740991,
+              "type": "integer"
+            },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
               "type": "integer"
             },
             "priority": {
@@ -1289,6 +1309,16 @@
             "createRequestId": {
               "minLength": 1,
               "type": "string"
+            },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
             },
             "requestId": {
               "minLength": 1,
@@ -1756,6 +1786,16 @@
                 }
               ]
             },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
             "permissionMode": {
               "type": "string"
             },
@@ -1837,6 +1877,16 @@
             "cwd": {
               "type": "string"
             },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
             "provider": {
               "enum": [
                 "claude",
@@ -1916,6 +1966,16 @@
                 "type": "object"
               },
               "type": "array"
+            },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
             },
             "provider": {
               "enum": [
@@ -2115,6 +2175,16 @@
               "minLength": 1,
               "type": "string"
             },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
             "provider": {
               "enum": [
                 "claude",
@@ -2281,6 +2351,16 @@
             "cwd": {
               "type": "string"
             },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
             "provider": {
               "enum": [
                 "claude",
@@ -2327,6 +2407,16 @@
                 "type": "string"
               },
               "type": "object"
+            },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
             },
             "provider": {
               "enum": [
@@ -2383,6 +2473,16 @@
               ],
               "type": "string"
             },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
             "provider": {
               "enum": [
                 "claude",
@@ -2438,6 +2538,16 @@
                 "toTurn"
               ],
               "type": "string"
+            },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
             },
             "provider": {
               "enum": [
@@ -2921,7 +3031,8 @@
         "SESSION_RESERVED",
         "FRESH_AGENT_LOST_SESSION",
         "FRESH_AGENT_CREATE_FAILED",
-        "RECONCILE_NOT_NEGOTIATED"
+        "RECONCILE_NOT_NEGOTIATED",
+        "SESSION_MISSING"
       ],
       "type": "string"
     },
@@ -2994,6 +3105,16 @@
       "properties": {
         "cwd": {
           "type": "string"
+        },
+        "observedEpoch": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "observedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
         },
         "provider": {
           "enum": [
@@ -3107,6 +3228,16 @@
                 }
               ]
             },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
             "permissionMode": {
               "type": "string"
             },
@@ -3188,6 +3319,16 @@
             "cwd": {
               "type": "string"
             },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
             "provider": {
               "enum": [
                 "claude",
@@ -3267,6 +3408,16 @@
                 "type": "object"
               },
               "type": "array"
+            },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
             },
             "provider": {
               "enum": [
@@ -3466,6 +3617,16 @@
               "minLength": 1,
               "type": "string"
             },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
             "provider": {
               "enum": [
                 "claude",
@@ -3632,6 +3793,16 @@
             "cwd": {
               "type": "string"
             },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
             "provider": {
               "enum": [
                 "claude",
@@ -3678,6 +3849,16 @@
                 "type": "string"
               },
               "type": "object"
+            },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
             },
             "provider": {
               "enum": [
@@ -3733,6 +3914,16 @@
                 "toTurn"
               ],
               "type": "string"
+            },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
             },
             "provider": {
               "enum": [
@@ -3790,6 +3981,16 @@
               ],
               "type": "string"
             },
+            "observedEpoch": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observedGeneration": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
             "provider": {
               "enum": [
                 "claude",
@@ -3845,6 +4046,16 @@
         "instructions": {
           "minLength": 1,
           "type": "string"
+        },
+        "observedEpoch": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "observedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
         },
         "provider": {
           "enum": [
@@ -4011,6 +4222,16 @@
             }
           ]
         },
+        "observedEpoch": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "observedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
         "permissionMode": {
           "type": "string"
         },
@@ -4099,6 +4320,16 @@
             "type": "string"
           },
           "type": "object"
+        },
+        "observedEpoch": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "observedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
         },
         "provider": {
           "enum": [
@@ -4189,6 +4420,16 @@
       "properties": {
         "cwd": {
           "type": "string"
+        },
+        "observedEpoch": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "observedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
         },
         "provider": {
           "enum": [
@@ -4303,6 +4544,16 @@
           ],
           "type": "string"
         },
+        "observedEpoch": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "observedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
         "provider": {
           "enum": [
             "claude",
@@ -4371,6 +4622,16 @@
             "type": "object"
           },
           "type": "array"
+        },
+        "observedEpoch": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "observedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
         },
         "provider": {
           "enum": [
@@ -4458,6 +4719,16 @@
             "toTurn"
           ],
           "type": "string"
+        },
+        "observedEpoch": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "observedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
         },
         "provider": {
           "enum": [
@@ -7700,6 +7971,16 @@
           "maximum": 9007199254740991,
           "type": "integer"
         },
+        "observedEpoch": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "observedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
         "priority": {
           "enum": [
             "foreground",
@@ -7943,6 +8224,16 @@
           "default": "shell",
           "type": "string"
         },
+        "observedEpoch": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "observedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
         "paneId": {
           "minLength": 1,
           "type": "string"
@@ -8148,6 +8439,16 @@
         "createRequestId": {
           "minLength": 1,
           "type": "string"
+        },
+        "observedEpoch": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "observedGeneration": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
         },
         "requestId": {
           "minLength": 1,

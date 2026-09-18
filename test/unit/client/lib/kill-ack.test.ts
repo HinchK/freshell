@@ -150,6 +150,25 @@ describe('kill-ack', () => {
       emit({ type: 'terminal.killed', requestId: sent.requestId, terminalId: 'term-6', success: true })
       await expect(pending).resolves.toEqual({ ok: true })
     })
+
+    it('forwards the observed (epoch, generation) fence on the kill (kata b8ke)', async () => {
+      const pending = sendTerminalKillAndAwait('term-fence', {
+        createRequestId: 'cr-fence',
+        observedEpoch: 3,
+        observedGeneration: 8,
+      })
+      expect(mockSend).toHaveBeenCalledTimes(1)
+      const sent = mockSend.mock.calls[0][0]
+      expect(sent).toMatchObject({
+        type: 'terminal.kill',
+        terminalId: 'term-fence',
+        createRequestId: 'cr-fence',
+        observedEpoch: 3,
+        observedGeneration: 8,
+      })
+      emit({ type: 'terminal.killed', requestId: sent.requestId, terminalId: 'term-fence', success: true })
+      await expect(pending).resolves.toEqual({ ok: true })
+    })
   })
 
   describe('sendFreshAgentKillAndAwait', () => {
@@ -229,6 +248,26 @@ describe('kill-ack', () => {
       })
       await vi.advanceTimersByTimeAsync(KILL_ACK_TIMEOUT_MS + 10)
       await expect(pending).resolves.toEqual({ ok: false, timedOut: true })
+    })
+
+    it('forwards the observed (epoch, generation) fence on the kill (kata b8ke)', async () => {
+      const pending = sendFreshAgentKillAndAwait({
+        sessionId: 'ses-fence',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        observedEpoch: 5,
+        observedGeneration: 2,
+      })
+      expect(mockSend).toHaveBeenCalledWith({
+        type: 'freshAgent.kill',
+        sessionId: 'ses-fence',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        observedEpoch: 5,
+        observedGeneration: 2,
+      })
+      emit({ type: 'freshAgent.killed', sessionId: 'ses-fence', sessionType: 'freshopencode', provider: 'opencode', success: true })
+      await expect(pending).resolves.toEqual({ ok: true })
     })
   })
 

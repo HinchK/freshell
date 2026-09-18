@@ -317,6 +317,8 @@ fn seed_bound_row(ledger: &PaneLedger, provider: &str, session_id: &str) {
             create_request_id: None,
             origin_create_request_id: None,
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: now_ms(),
         })
         .expect("seed bound ledger row");
@@ -418,6 +420,7 @@ fn respawn_state_with_probe(
         session_existence: probe,
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
+        ownership: None,
     };
 
     (registry, pane_ledger, state)

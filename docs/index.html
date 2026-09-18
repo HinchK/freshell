@@ -456,6 +456,9 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
 }
 .fresh-diffs { color: hsl(var(--foreground)); font-family: 'JetBrains Mono', monospace; font-size: 11px; }
 .fresh-diffs-title, .fresh-rail-title { font-size: 10px; letter-spacing: .16em; text-transform: uppercase; color: hsl(var(--muted-foreground)); margin-bottom: 8px; font-family: inherit; }
+/* kata b8ke: the "opened as CLI elsewhere" divergence card (amber alert + attach action) */
+.fresh-divergence { margin: 12px 12px 0; border: 1px solid hsl(38 92% 50% / .5); border-radius: 6px; background: hsl(38 92% 50% / .1); padding: 8px 12px; font-size: 13px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.fresh-divergence-action { border: 1px solid hsl(var(--border) / .7); border-radius: 6px; background: transparent; color: hsl(var(--foreground)); font: inherit; font-size: 12px; padding: 4px 10px; white-space: nowrap; cursor: pointer; }
 .fresh-transcript { min-height: 0; flex: 1; overflow-x: hidden; overflow-y: auto; padding: 14px 12px; }
 .fresh-turn { border-left: 2px solid hsl(var(--border)); padding-left: 10px; margin-bottom: 14px; }
 .fresh-turn.user { border-left-color: hsl(var(--foreground)); }
@@ -903,6 +906,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
           <div class="fresh-mock">
             <div class="fresh-main">
               <div class="fresh-summary">Freshcodex and Freshclaude share model selection, attachments, questions, and approvals. Model and thinking changes apply to your next message. /undo rolls conversation turns back without changing your files; Freshclaude and Freshopencode also support /redo.</div>
+              <div class="fresh-divergence" role="alert" aria-label="Session open as a terminal on another device"><span>This conversation is open as a terminal on another device.</span><button type="button" class="fresh-divergence-action" aria-label="Attach the terminal here">Attach here</button></div>
               <div class="fresh-diffs"><div class="fresh-diffs-title">Diffs</div>src/components/fresh-agent/FreshAgentView.tsx</div>
               <div class="fresh-transcript">
                 <div class="fresh-turn user"><div class="fresh-role">You</div><div class="fresh-copy">What layout should Fresh clients use on desktop and phone?</div></div>

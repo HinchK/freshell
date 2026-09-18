@@ -248,6 +248,7 @@ async fn spawn_server_with_probe(probe: Arc<StubProbe>) -> Server {
         session_existence: probe,
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Arc::clone(&respawn_counts),
+        ownership: None,
     };
 
     let router = freshell_ws::router(state);
@@ -723,6 +724,10 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
             effort: None,
             supersedes: None,
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             now_ms: now,
         })
         .unwrap();
@@ -740,6 +745,10 @@ async fn old_thread_claim_after_crash_respawn_answers_the_new_terminus() {
             effort: None,
             supersedes: Some("old-t"),
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             now_ms: now + 1,
         })
         .unwrap();

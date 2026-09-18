@@ -36,6 +36,8 @@ import {
   paneKeyFor,
   setFreshAgentReconcileActive,
 } from '@/lib/pane-reconcile'
+import { selectPaneOwnerDivergence } from '@/store/selectors/runtimeOwner'
+import type { RuntimeOwnerRecord } from '@/store/freshAgentTypes'
 import type { UnknownAction } from '@reduxjs/toolkit'
 
 const FA_CREATE_REQUEST_ID = 'fa-cr-p9'
@@ -374,5 +376,128 @@ describe('foldVerdicts fresh-agent routing', () => {
     const outcome = foldVerdicts(rec.dispatch, req, resultFor(req, []), { onVerdictFolded: hook2 })
     expect(outcome.cardinalityViolation).toBe(true)
     expect(hook2).not.toHaveBeenCalled()
+  })
+})
+
+describe('foldVerdicts runtime-owner divergence gate (kata b8ke, T1 rec A5)', () => {
+  function ownerRecord(overrides: Partial<RuntimeOwnerRecord> = {}): RuntimeOwnerRecord {
+    return {
+      provider: 'claude',
+      sessionId: DURABLE,
+      epoch: 5,
+      generation: 4,
+      ownerKind: 'terminal',
+      terminalId: 't-owned',
+      transition: 'handoff-committed',
+      updatedAt: Date.now(),
+      ...overrides,
+    }
+  }
+
+  function stateWithOwnerRecord(panes: PanesState, record: RuntimeOwnerRecord | null): RootState {
+    const freshAgent = record
+      ? { runtimeOwners: { [`${record.provider}:${record.sessionId}`]: record } }
+      : { runtimeOwners: {} }
+    return { panes, freshAgent } as unknown as RootState
+  }
+
+  function divergenceGate(state: RootState) {
+    return (pane: { mode?: string; sessionRef?: { provider: string; sessionId: string } }) => (
+      selectPaneOwnerDivergence(state, {
+        paneKind: 'fresh-agent',
+        provider: pane.mode,
+        sessionRef: pane.sessionRef,
+      })
+    )
+  }
+
+  function respawnHarness(sessionRef: { provider: string; sessionId: string }) {
+    let panes = emptyPanesState()
+    panes = addFreshAgentPane(panes, 'tab1', 'p1', {
+      createRequestId: 'fa-cr-div',
+      sessionRef,
+      sessionId: sessionRef.sessionId,
+    })
+    const req = buildReconcileRequest(asRootState(panes), { includeFreshAgent: true })
+    if (!req) throw new Error('respawnHarness: expected a request')
+    const verdicts: PaneVerdict[] = [{
+      paneKey: req.panes[0].paneKey,
+      verdict: 'respawn',
+      sessionRef,
+    }]
+    return { panes, req, verdicts }
+  }
+
+  it('reconcile respawn verdict does not reset a divergent pane', () => {
+    const { panes, req, verdicts } = respawnHarness({ provider: 'claude', sessionId: DURABLE })
+    // The canonical session is TERMINAL-owned (generation 4): the pane must
+    // keep its identity and render the divergence state instead of re-arming
+    // a stale-kind freshAgent.create.
+    const state = stateWithOwnerRecord(panes, ownerRecord({ ownerKind: 'terminal', generation: 4 }))
+    const { dispatch, dispatched } = recordingDispatch()
+    const onVerdictFolded = vi.fn()
+    const outcome = foldVerdicts(dispatch, req, resultFor(req, verdicts), {
+      onVerdictFolded,
+      getOwnerDivergence: divergenceGate(state),
+    })
+    expect(outcome.respawned).toBe(1)
+    expect(dispatched.countOf(resetFreshAgentPaneForReconcileCreate.type)).toBe(0)
+    // Handled WITHOUT the reset: the held create is retracted (ws.cancelCreate
+    // via onVerdictFolded), never flushed at the RECONCILE_VERDICT_WAIT_MS bound.
+    expect(onVerdictFolded).toHaveBeenCalledWith(req.panes[0].createRequestId)
+  })
+
+  it('reconcile fresh verdict does not reset a divergent pane either', () => {
+    const { panes, req } = respawnHarness({ provider: 'claude', sessionId: DURABLE })
+    const state = stateWithOwnerRecord(panes, ownerRecord({ ownerKind: 'terminal' }))
+    const { dispatch, dispatched } = recordingDispatch()
+    const verdicts: PaneVerdict[] = [{
+      paneKey: req.panes[0].paneKey,
+      verdict: 'fresh',
+      reason: 'identity_never_observed',
+    }]
+    const outcome = foldVerdicts(dispatch, req, resultFor(req, verdicts), {
+      getOwnerDivergence: divergenceGate(state),
+    })
+    expect(outcome.fresh).toBe(1)
+    expect(dispatched.countOf(resetFreshAgentPaneForReconcileCreate.type)).toBe(0)
+  })
+
+  it('respawn verdict still resets when the owner kind matches (same-kind owner)', () => {
+    const { panes, req, verdicts } = respawnHarness({ provider: 'claude', sessionId: DURABLE })
+    const state = stateWithOwnerRecord(panes, ownerRecord({ ownerKind: 'fresh-agent' }))
+    const { dispatch, dispatched } = recordingDispatch()
+    const outcome = foldVerdicts(dispatch, req, resultFor(req, verdicts), {
+      getOwnerDivergence: divergenceGate(state),
+    })
+    expect(outcome.respawned).toBe(1)
+    expect(dispatched.countOf(resetFreshAgentPaneForReconcileCreate.type)).toBe(1)
+  })
+
+  it('respawn verdict still resets when no runtimeOwners record exists (legacy behavior preserved)', () => {
+    const { panes, req, verdicts } = respawnHarness({ provider: 'claude', sessionId: DURABLE })
+    const state = stateWithOwnerRecord(panes, null)
+    const { dispatch, dispatched } = recordingDispatch()
+    const outcome = foldVerdicts(dispatch, req, resultFor(req, verdicts), {
+      getOwnerDivergence: divergenceGate(state),
+    })
+    expect(outcome.respawned).toBe(1)
+    expect(dispatched.countOf(resetFreshAgentPaneForReconcileCreate.type)).toBe(1)
+  })
+
+  it('a divergent pane with a matching sessionRef but a foreign owner record is not gated', () => {
+    const { panes, req, verdicts } = respawnHarness({ provider: 'claude', sessionId: DURABLE })
+    // A record for a DIFFERENT session must not gate this pane's respawn.
+    const state = stateWithOwnerRecord(panes, ownerRecord({
+      provider: 'claude',
+      sessionId: 'some-other-session',
+      ownerKind: 'terminal',
+    }))
+    const { dispatch, dispatched } = recordingDispatch()
+    const outcome = foldVerdicts(dispatch, req, resultFor(req, verdicts), {
+      getOwnerDivergence: divergenceGate(state),
+    })
+    expect(outcome.respawned).toBe(1)
+    expect(dispatched.countOf(resetFreshAgentPaneForReconcileCreate.type)).toBe(1)
   })
 })

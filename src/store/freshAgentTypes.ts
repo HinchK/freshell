@@ -9,6 +9,7 @@ import type {
   FreshAgentSnapshot,
   FreshAgentTurn,
 } from '@shared/fresh-agent-contract'
+import type { SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 
 export type { FreshAgentRequestId }
 export type FreshAgentPermissionRequest = FreshAgentPendingApproval
@@ -38,6 +39,45 @@ export type PendingCreateFailure = {
   code: string
   message: string
   retryable?: boolean
+  /** kata b8ke: ownership-conflict refusals carry the owning kind, its
+   *  generation, and the emitting server's boot epoch (preserved from the
+   *  freshAgent.create.failed frame so the typed-conflict recovery UI can
+   *  refresh its observed fence from the refusal itself). */
+  ownerKind?: 'terminal' | 'fresh-agent'
+  ownerGeneration?: number
+  ownerEpoch?: number
+}
+
+/**
+ * kata b8ke: the client-side runtime-owner record — one per canonical
+ * (provider, sessionId), folded from `session.runtimeOwner` broadcasts and
+ * the ready handshake's owner replay. The record KEEPS the transition state
+ * (round-2 review: handoff-in-progress renders from it) until superseded by
+ * a same-or-newer (epoch, generation) frame; a `handoff-failed` at
+ * generation G supersedes a `handoff-started` at G.
+ */
+export type RuntimeOwnerRecord = {
+  provider: string
+  sessionId: string
+  epoch: number
+  generation: number
+  ownerKind: 'terminal' | 'fresh-agent' | 'vacant'
+  previousKind?: 'terminal' | 'fresh-agent'
+  terminalId?: string
+  transition: SessionRuntimeOwnerMessage['transition']
+  reason?: string
+  /** b8ke R3-5: the record is FENCED (the ownerKind names the fenced
+   *  prior, not a live owner) — every pane holding the sessionRef shows
+   *  the typed recovery state. */
+  fenced?: boolean
+  /** b8ke focused episode-2 post-cap F5: this key was RE-KEYED — the
+   *  record's owner state is the CANONICAL key's (the server resolved the
+   *  fixpoint) and `aliasOf` names the canonical id. A pane holding the
+   *  pre-rekey sessionRef folds the authoritative owner state through
+   *  this record and navigates future lifecycle operations to the
+   *  canonical key. */
+  aliasOf?: string
+  updatedAt: number
 }
 
 export type FreshAgentPendingCreate = {
@@ -100,4 +140,6 @@ export type FreshAgentState = {
   pendingCreates: Record<string, FreshAgentPendingCreate>
   pendingCreateFailures: Record<string, PendingCreateFailure>
   availableModels: Array<{ value: string; displayName: string; description: string }>
+  /** kata b8ke: runtime-owner records keyed `${provider}:${sessionId}`. */
+  runtimeOwners: Record<string, RuntimeOwnerRecord>
 }

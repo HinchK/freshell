@@ -132,6 +132,9 @@ pub enum DedupeDecision {
 /// the retry proceeds as a fresh create).
 fn waiter_error(request_id: &str) -> ServerMessage {
     ServerMessage::Error(ErrorMsg {
+        owner_kind: None,
+        owner_generation: None,
+        owner_epoch: None,
         code: ErrorCode::PtySpawnFailed,
         message: "terminal.create did not complete; retry".to_string(),
         timestamp: crate::now_iso(),
@@ -427,6 +430,23 @@ impl CreateDedupe {
         }
     }
 
+    /// Is a create with this requestId currently in flight — its
+    /// `terminal.created` reply not yet sent? The auto-resume hub's
+    /// create-answer ordering guard (Gate 1) holds a terminal's crash
+    /// lifecycle while this is true, so no terminal-scoped crash broadcast
+    /// can precede the created reply that names the terminal on the
+    /// creating connection. Settled entries are NOT in flight: the reply
+    /// has been admitted.
+    pub fn is_in_flight(&self, request_id: &str) -> bool {
+        matches!(
+            self.entries
+                .lock()
+                .expect("create_dedupe lock")
+                .get(request_id),
+            Some(Entry::InFlight { .. })
+        )
+    }
+
     /// A completed worker must not clear a newer attempt which began after
     /// its settle (e.g. the same requestId with a changed restore flag).
     pub(crate) fn clear_matching_generation(&self, request_id: &str, generation: &Arc<Instant>) {
@@ -485,6 +505,28 @@ mod tests {
             recorder.lock().expect("frames lock").push(msg);
         });
         (sink, frames)
+    }
+
+    #[test]
+    fn is_in_flight_tracks_the_sentinel_lifecycle() {
+        let d = CreateDedupe::default();
+        let (s, _f) = recording_sink();
+        assert!(!d.is_in_flight("r1"), "unknown id is never in flight");
+        let _ = d.begin("r1", &s, None, |_| true, 9);
+        assert!(
+            d.is_in_flight("r1"),
+            "the auto-resume hub's create-answer hold keys on this: true until the reply is sent"
+        );
+        d.settle("r1", "t1", &created_frame(), None, |_| true);
+        assert!(!d.is_in_flight("r1"), "settled means the reply went out");
+        // The failure path releases the hold the same way.
+        let _ = d.begin("r2", &s, None, |_| true, 9);
+        assert!(d.is_in_flight("r2"));
+        d.clear_if_in_flight("r2");
+        assert!(
+            !d.is_in_flight("r2"),
+            "a failed create must not hold crashes forever"
+        );
     }
 
     #[test]

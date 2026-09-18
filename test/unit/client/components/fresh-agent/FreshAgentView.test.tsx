@@ -5,12 +5,21 @@ import { configureStore, type Middleware } from '@reduxjs/toolkit'
 import panesReducer from '@/store/panesSlice'
 import settingsReducer, { previewServerSettingsPatch, updateSettingsLocal } from '@/store/settingsSlice'
 import sessionsReducer, { applySessionsPatch, applyContextUsageExtras } from '@/store/sessionsSlice'
-import freshAgentReducer, { sessionError, sessionExited, sessionInit, sessionMetadataReceived, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
+import freshAgentReducer, { applyRuntimeOwner, sessionError, sessionExited, sessionInit, sessionMetadataReceived, setSessionStatus, markSessionLost } from '@/store/freshAgentSlice'
+import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
 import tabsReducer from '@/store/tabsSlice'
 import connectionReducer from '@/store/connectionSlice'
-import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES } from '@/components/fresh-agent/FreshAgentView'
+import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from '@/components/fresh-agent/FreshAgentView'
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
-import { initLayout, requestPaneRefresh, setActivePane, updatePaneContent, updatePaneTitle } from '@/store/panesSlice'
+import {
+  initLayout,
+  requestPaneRefresh,
+  resetFreshAgentPaneForReconcileCreate,
+  setActivePane,
+  setPaneHandoffError,
+  updatePaneContent,
+  updatePaneTitle,
+} from '@/store/panesSlice'
 import { useAppSelector } from '@/store/hooks'
 import { updateTab } from '@/store/tabsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
@@ -62,6 +71,7 @@ const apiMock = vi.hoisted(() => ({
   getFreshAgentThreadSnapshot: vi.fn(),
   getFreshAgentModelCapabilities: vi.fn(),
   post: vi.fn(),
+  requestSessionHandoff: vi.fn(),
   setSessionMetadata: vi.fn().mockResolvedValue(undefined),
 }))
 
@@ -81,6 +91,7 @@ vi.mock('@/lib/api', async () => {
     api: { ...actual.api, post: apiMock.post },
     getFreshAgentThreadSnapshot: apiMock.getFreshAgentThreadSnapshot,
     getFreshAgentModelCapabilities: apiMock.getFreshAgentModelCapabilities,
+    requestSessionHandoff: apiMock.requestSessionHandoff,
     setSessionMetadata: apiMock.setSessionMetadata,
   }
 })
@@ -261,8 +272,15 @@ beforeEach(() => {
   apiMock.getFreshAgentThreadSnapshot.mockReset()
   apiMock.getFreshAgentModelCapabilities.mockReset()
   apiMock.post.mockReset()
+  apiMock.requestSessionHandoff.mockReset()
   apiMock.setSessionMetadata.mockReset()
   apiMock.post.mockResolvedValue({ title: null, source: 'none' })
+  apiMock.requestSessionHandoff.mockResolvedValue({
+    ok: true,
+    operationId: 'handoff-default',
+    generation: 1,
+    owner: { kind: 'terminal', terminalId: 't-default', mode: 'codex' },
+  })
   apiMock.setSessionMetadata.mockResolvedValue(undefined)
   saveServerSettingsPatchSpy.mockClear()
   window.localStorage.removeItem('freshopencode.modelMru.v2')
@@ -9297,6 +9315,1117 @@ describe('FreshAgentView provider-advertised session commands', () => {
     expect(within(menu).getByRole('menuitem', { name: /\/review/ })).toBeInTheDocument()
   })
 })
+
+// ── kata b8ke Task 9: opened-as-CLI-elsewhere divergence card + the typed
+// handoff-failure banner with Retry ──
+describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
+  const DIV_SESSION_ID = 'ses_divergence_1'
+
+  beforeEach(() => {
+    apiMock.requestSessionHandoff.mockClear()
+    apiMock.requestSessionHandoff.mockResolvedValue({
+      ok: true,
+      operationId: 'handoff-default',
+      generation: 1,
+      owner: { kind: 'terminal', terminalId: 't-default', mode: 'codex' },
+    })
+  })
+
+  function divergencePaneContent(overrides: Record<string, unknown> = {}) {
+    return {
+      kind: 'fresh-agent',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      createRequestId: 'req-divergence',
+      sessionId: DIV_SESSION_ID,
+      sessionRef: { provider: 'codex', sessionId: DIV_SESSION_ID },
+      status: 'idle',
+      ...overrides,
+    } as const
+  }
+
+  function terminalOwnerFrame(overrides: Record<string, unknown> = {}) {
+    return {
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: DIV_SESSION_ID,
+      epoch: 1,
+      generation: 2,
+      ownerKind: 'terminal',
+      terminalId: 't-5',
+      operationId: 'handoff-div',
+      transition: 'handoff-committed',
+      ...overrides,
+    }
+  }
+
+  it('divergent pane renders the opened-as-CLI-elsewhere card with a direct attach action', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent() }))
+    // Prop-rendered (the wedged-sidecar harness shape): the attach action
+    // swaps the pane to a TERMINAL pane in the store — a store-backed
+    // wrapper would throw on the kind change mid-assertion.
+    render(
+      <Provider store={store}>
+        <FreshAgentView tabId="tab-1" paneId="pane-1" paneContent={divergencePaneContent()} />
+      </Provider>,
+    )
+
+    // Install the spy BEFORE the divergence fold re-renders: the click
+    // closure captures `dispatch` at render time (react-redux).
+    const dispatchSpy = vi.spyOn(store, 'dispatch')
+
+    act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame())))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(/open as a terminal on another device/i)
+    const attach = within(alert).getByRole('button', { name: /attach the terminal here/i })
+
+    // The attach action swaps THIS pane to a terminal pane bound to the
+    // owner's terminal id, keeping the same sessionRef.
+    fireEvent.click(attach)
+    const swap = dispatchSpy.mock.calls
+      .map(([action]) => action as { type?: string; payload?: { tabId?: string; paneId?: string; content?: { kind?: string } } })
+      .find((action) => action?.type === 'panes/updatePaneContent' && action.payload?.content?.kind === 'terminal')
+    expect(swap?.payload).toMatchObject({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'terminal',
+        mode: 'codex',
+        terminalId: 't-5',
+        status: 'running',
+        sessionRef: { provider: 'codex', sessionId: DIV_SESSION_ID },
+      },
+    })
+  })
+
+  it('handoff-started is not a live target: the card renders waiting copy with NO attach action', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent() }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame({
+      transition: 'handoff-started',
+      terminalId: undefined,
+      generation: 3,
+    }))))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(/being reopened/i)
+    // Round-3 F15: no Attach action until the committed owner event.
+    expect(within(alert).queryByRole('button')).toBeNull()
+  })
+
+  // b8ke ext r34 F2: the attach-here path CANONICALIZES at the write — a
+  // cross-device pane holding a PRE-REKEY provisional id discovers the
+  // terminal owner through the alias chain, and the pane write must anchor
+  // to the CANONICAL session ref (the reverse terminal→fresh-agent action
+  // has the same discipline at TerminalView). Pre-r34 the write kept the
+  // pane's raw superseded sessionRef: the attach worked for the current
+  // process but the pane stayed durably anchored to the retired id, which
+  // later restoration/lifecycle recovery could no longer identify once
+  // the alias records reset on reconnect and the registry reconstitutes
+  // in memory at server start.
+  it('the attach-here action writes the CANONICAL session ref for an aliased provisional id', async () => {
+    const OLD_ID = 'old-thread-r34'
+    const CANONICAL_ID = 'ses-canonical-r34'
+    const store = createStore()
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent({
+      sessionRef: { provider: 'codex', sessionId: OLD_ID },
+      sessionId: OLD_ID,
+    }) }))
+    // Prop-rendered (the wedged-sidecar harness shape): the attach action
+    // swaps the pane to a TERMINAL pane in the store — a store-backed
+    // wrapper would throw on the kind change mid-assertion.
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={divergencePaneContent({
+            sessionRef: { provider: 'codex', sessionId: OLD_ID },
+            sessionId: OLD_ID,
+          })}
+        />
+      </Provider>,
+    )
+
+    const dispatchSpy = vi.spyOn(store, 'dispatch')
+
+    // The alias chain: the OLD (pre-rebind) id's runtime-owner record
+    // carries aliasOf naming the canonical thread id (the r31-F2 rebind
+    // old-key frame shape), and the CANONICAL record names the committed
+    // terminal owner.
+    act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame({
+      sessionId: OLD_ID,
+      aliasOf: CANONICAL_ID,
+      transition: 'released',
+      generation: 4,
+      terminalId: 't-r34-alias',
+    }))))
+    act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame({
+      sessionId: CANONICAL_ID,
+      transition: 'handoff-committed',
+      generation: 5,
+      terminalId: 't-r34-alias',
+    }))))
+
+    // The divergence card renders through the alias chain (the pane's
+    // canonical session resolves OLD → CANONICAL → the terminal owner).
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent(/open as a terminal on another device/i)
+    const attach = within(alert).getByRole('button', { name: /attach the terminal here/i })
+    fireEvent.click(attach)
+
+    // THE PANE WRITE IS CANONICAL: the swap's sessionRef is the canonical
+    // thread id, never the pane's retired provisional one (pre-r34 this
+    // payload kept OLD_ID).
+    const swap = dispatchSpy.mock.calls
+      .map(([action]) => action as { type?: string; payload?: { tabId?: string; paneId?: string; content?: { kind?: string; sessionRef?: { sessionId?: string } } } })
+      .find((action) => action?.type === 'panes/updatePaneContent' && action.payload?.content?.kind === 'terminal')
+    expect(swap?.payload).toMatchObject({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'terminal',
+        mode: 'codex',
+        terminalId: 't-r34-alias',
+        sessionRef: { provider: 'codex', sessionId: CANONICAL_ID },
+      },
+    })
+    expect(swap?.payload?.content?.sessionRef?.sessionId).not.toBe(OLD_ID)
+  })
+
+  // b8ke focused round-5 R5-3: a SAME-KIND in-progress lifecycle transition
+  // (the ready-replay fold of starting/handoff/stopping naming THIS pane's
+  // kind) is transition-blocked: the pane shows the transition card (never
+  // a silent same-kind "all clear") and offers no actions.
+  it('a same-kind in-progress owner record renders the transition card with no actions', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent() }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // SAME-KIND: the pane is fresh-agent (freshcodex) and the record's
+    // ownerKind is fresh-agent with an in-progress transition — pre-fix
+    // this folded as no divergence at all (polling resumed mid-lifecycle).
+    act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame({
+      ownerKind: 'fresh-agent',
+      transition: 'handoff-started',
+      terminalId: undefined,
+      generation: 4,
+    }))))
+
+    const card = await screen.findByTestId('fresh-agent-owner-transition-card')
+    expect(card).toHaveTextContent(/being reopened/i)
+    expect(within(card).queryByRole('button')).toBeNull()
+    // Not the cross-kind divergence card, not the fenced recovery card.
+    expect(screen.queryByTestId('session-handoff-error-banner')).toBeNull()
+  })
+
+  // b8ke ext r32 F3: a DIVERGED pane is a PURE OBSERVER while it still
+  // renders the fresh-agent view — the composer is disabled (no submit,
+  // no local echo, no old-kind send the server's generation fence would
+  // refuse as a misleading failed interaction), the interrupt affordance
+  // is gone (the runtime-owner state owns the writer), and a message
+  // queued BEFORE the divergence is HELD (never flushed) until the pane
+  // is no longer diverged. Pre-r32 all three affordances stayed live on
+  // the diverged pane.
+  // b8ke ext r35 F2: an AUTOMATIC re-drive of the same create request
+  // carries the request's ORIGINAL observed pair — never a refreshed one.
+  // Pre-r35 the retryable SESSION_RESERVED answer re-armed the create
+  // effect, which re-captured the LATEST record: a queued create whose
+  // original (1,5) observation was superseded by another device's
+  // start/stop cycle (the record left Vacant at gen 9) was resent with
+  // the refreshed (1,9) pair — presented as current, the runtime could
+  // resume without a new user lifecycle decision, defeating the
+  // server-side stale-generation safety net. The honest automatic
+  // contract: the ORIGINAL pair flows to the server, which refuses it
+  // typed (option (a) of the class contract — the safety net working).
+  it('the SESSION_RESERVED create redrive carries the ORIGINAL observed pair — never a refreshed one', async () => {
+    const listeners: Array<(message: any) => void> = []
+    wsMock.onMessage.mockImplementation((listener) => {
+      listeners.push(listener)
+      return () => {}
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: divergencePaneContent({
+        status: 'creating',
+        // sessionRef WITHOUT sessionId — the durable-restored create shape
+        // (a pane WITH sessionId attaches instead of creating).
+        sessionId: undefined,
+        sessionRef: { provider: 'codex', sessionId: 'ses-r35-redrive' },
+        createRequestId: 'req-r35-redrive',
+      }),
+    }))
+    // The ORIGINAL ownership observation: a fresh-agent owner at (1, 5).
+    act(() => store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'ses-r35-redrive',
+      epoch: 1,
+      generation: 5,
+      ownerKind: 'fresh-agent',
+      transition: 'handoff-committed',
+      operationId: 'op-r35-orig',
+    })))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // The mount create carried the ORIGINAL pair (1, 5).
+    await waitFor(() => {
+      const creates = sentFreshAgentMessages('freshAgent.create')
+      expect(creates).toHaveLength(1)
+      expect(creates[0]).toMatchObject({
+        requestId: 'req-r35-redrive',
+        observedEpoch: 1,
+        observedGeneration: 5,
+      })
+    })
+
+    // The retryable SESSION_RESERVED answer re-drives the SAME create.
+    act(() => {
+      for (const listener of listeners) {
+        listener({
+          type: 'freshAgent.create.failed',
+          requestId: 'req-r35-redrive',
+          code: 'SESSION_RESERVED',
+          retryable: true,
+        })
+      }
+    })
+    // Meanwhile another device's start/stop cycle leaves the record
+    // VACANT at generation 9 — the original observation is now stale.
+    act(() => store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'ses-r35-redrive',
+      epoch: 1,
+      generation: 9,
+      ownerKind: 'vacant',
+      transition: 'released',
+      operationId: 'op-r35-cycle',
+    })))
+
+    // After the 1s floor the redrive fires: the resent create carries the
+    // ORIGINAL (1, 5) pair — the server's stale-generation fence refuses
+    // it typed; NEVER the refreshed (1, 9) pair presenting the old
+    // request as current (pre-r35 the resent frame carried gen 9).
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(2)
+    }, { timeout: 5_000 })
+    const redriven = sentFreshAgentMessages('freshAgent.create')[1]
+    expect(redriven).toMatchObject({
+      requestId: 'req-r35-redrive',
+      observedEpoch: 1,
+      observedGeneration: 5,
+    })
+    expect(redriven.observedGeneration).not.toBe(9)
+  })
+
+  // b8ke ext r37 F1: a NEW authoritative recovery round captures the
+  // CURRENT fence. The create-fence cache is keyed by
+  // (createRequestId, reconcileEpoch) — the terminal cache's key shape —
+  // because a pane-reconcile respawn/fresh verdict PRESERVES the
+  // createRequestId and bumps the epoch as its ONLY re-fire signal: that
+  // is a NEW recovery decision (server restart, crash recovery, another
+  // device's transition), not an automatic retry, and it may observe
+  // fresh. Pre-r37 the epoch-bumped re-arm reused the OLD N fence: the
+  // server refused SESSION_RESERVED, the client retried the stale pair,
+  // the bounded re-reconcile drained the respawn cap, and a recoverable
+  // durable session was falsely classified dead. Within-round automatic
+  // retries keep the round-35 contract: the ROUND's original pair.
+  it('a new authoritative recovery round captures the CURRENT fence; within-round retries keep the round pair', async () => {
+    const listeners: Array<(message: any) => void> = []
+    wsMock.onMessage.mockImplementation((listener) => {
+      listeners.push(listener)
+      return () => {}
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: divergencePaneContent({
+        status: 'creating',
+        sessionId: undefined,
+        sessionRef: { provider: 'codex', sessionId: 'ses-r37-recovery' },
+        createRequestId: 'req-r37-recovery',
+      }),
+    }))
+    // The round-1 world: a fresh-agent owner at (1, 5).
+    act(() => store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'ses-r37-recovery',
+      epoch: 1,
+      generation: 5,
+      ownerKind: 'fresh-agent',
+      transition: 'handoff-committed',
+      operationId: 'op-r37-orig',
+    })))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // Round 1's create carried the observed pair (1, 5).
+    await waitFor(() => {
+      const creates = sentFreshAgentMessages('freshAgent.create')
+      expect(creates).toHaveLength(1)
+      expect(creates[0]).toMatchObject({
+        requestId: 'req-r37-recovery',
+        observedEpoch: 1,
+        observedGeneration: 5,
+      })
+    })
+
+    // Ownership advances on another device (generation 9) and the
+    // authoritative recovery round begins: the respawn verdict PRESERVES
+    // the createRequestId and bumps the reconcileEpoch.
+    act(() => store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'ses-r37-recovery',
+      epoch: 1,
+      generation: 9,
+      ownerKind: 'vacant',
+      transition: 'released',
+      operationId: 'op-r37-advance',
+    })))
+    act(() => store.dispatch(resetFreshAgentPaneForReconcileCreate({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      intent: 'respawn',
+      sessionRef: { provider: 'codex', sessionId: 'ses-r37-recovery' },
+    })))
+
+    // THE NEW ROUND CAPTURES THE CURRENT FENCE: the re-armed create
+    // carries (1, 9) — the recovery round proceeds (pre-r37 the OLD
+    // (1, 5) pair was reused, refused SESSION_RESERVED, and the cycle
+    // drained the respawn cap against a recoverable session).
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(2)
+    }, { timeout: 5_000 })
+    const recoveryRound = sentFreshAgentMessages('freshAgent.create')[1]
+    expect(recoveryRound).toMatchObject({
+      requestId: 'req-r37-recovery',
+      observedEpoch: 1,
+      observedGeneration: 9,
+    })
+    expect(recoveryRound.observedGeneration).not.toBe(5)
+
+    // WITHIN-ROUND: a retryable SESSION_RESERVED on the recovery round's
+    // create retries with the ROUND's ORIGINAL pair (1, 9) — never a
+    // refresh (the round-35 contract holds inside the new round).
+    act(() => {
+      for (const listener of listeners) {
+        listener({
+          type: 'freshAgent.create.failed',
+          requestId: 'req-r37-recovery',
+          code: 'SESSION_RESERVED',
+          retryable: true,
+        })
+      }
+    })
+    // Ownership advances AGAIN mid-window — the within-round retry must
+    // STILL carry the round's (1, 9) pair, never the newer (1, 11).
+    act(() => store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'ses-r37-recovery',
+      epoch: 1,
+      generation: 11,
+      ownerKind: 'vacant',
+      transition: 'released',
+      operationId: 'op-r37-advance-2',
+    })))
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(3)
+    }, { timeout: 5_000 })
+    const withinRoundRetry = sentFreshAgentMessages('freshAgent.create')[2]
+    expect(withinRoundRetry).toMatchObject({
+      requestId: 'req-r37-recovery',
+      observedEpoch: 1,
+      observedGeneration: 9,
+    })
+    expect(withinRoundRetry.observedGeneration).not.toBe(11)
+  })
+
+  it('a diverged pane is a pure observer: composer disabled, queued text held, no interrupt affordance', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'running',
+      capabilities: { send: true, interrupt: true, fork: false },
+      turns: [],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: divergencePaneContent({ status: 'running' }),
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    // PRE-DIVERGENCE: busy + interruptible — the stop affordance renders
+    // and the composer accepts typing.
+    expect(await screen.findByRole('button', { name: 'Stop' })).toBeEnabled()
+    expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeEnabled()
+
+    // Queue a follow-up while busy (one active turn — the queue holds it).
+    fireEvent.change(screen.getByRole('textbox', { name: 'Chat message input' }), { target: { value: 'Held follow-up' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+    expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+
+    // THE DIVERGENCE: the session is handed to a terminal runtime while
+    // the pane is busy with a queued message.
+    act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame())))
+    await screen.findByRole('alert')
+
+    // The composer is DISABLED — a pure observer with the attach action.
+    expect(screen.getByRole('textbox', { name: 'Chat message input' })).toBeDisabled()
+    // The interrupt affordance is GONE while diverged (pre-r32 the busy
+    // pane kept its Stop button over a writer it no longer owns).
+    expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument()
+
+    // The session goes idle while STILL diverged: the queued message must
+    // NOT flush (pre-r32 the freed composer flushed the queue and issued
+    // an old-kind send the fence refused).
+    act(() => store.dispatch(setSessionStatus({
+      sessionId: DIV_SESSION_ID,
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      status: 'idle',
+    })))
+    await act(async () => { await Promise.resolve() })
+    expect(sentFreshAgentMessages('freshAgent.send')).toHaveLength(0)
+    expect(screen.getByRole('status', { name: 'Queued messages' })).toHaveTextContent('1 queued')
+  })
+
+  it('handoff-failure banner renders the typed code with a Retry that re-invokes the same handoff identity', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent() }))
+    store.dispatch(setPaneHandoffError({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      error: {
+        code: 'TARGET_SPAWN_FAILED',
+        message: 'the target runtime failed to start',
+        retryable: true,
+        generation: 4,
+      },
+    }))
+    // The retry's handoff FAILS again (retryable) — the pane must STAY a
+    // fresh-agent pane wearing the banner; only the invocation is asserted.
+    apiMock.requestSessionHandoff.mockResolvedValue({
+      ok: false,
+      error: { code: 'TARGET_SPAWN_FAILED', message: 'still failing', retryable: true, ownerGeneration: 5 },
+    })
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    const banner = await screen.findByRole('alert')
+    expect(banner).toHaveTextContent(/target runtime failed to start/i)
+    const retry = within(banner).getByRole('button', { name: /retry reopening/i })
+
+    fireEvent.click(retry)
+    // Retry is scheduled after a short backoff — never an immediate
+    // tight loop.
+    expect(apiMock.requestSessionHandoff).not.toHaveBeenCalled()
+    await waitFor(() => {
+      expect(apiMock.requestSessionHandoff).toHaveBeenCalledTimes(1)
+    }, { timeout: 5_000 })
+
+    expect(apiMock.requestSessionHandoff).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'codex',
+      sessionId: DIV_SESSION_ID,
+      targetKind: 'terminal',
+      mode: 'codex',
+    }))
+  })
+
+  // b8ke ext r34 F1: `retryable: true` below is the SERVER's REAL shape —
+  // the handler emits it (pinned server-side in
+  // session_handoff::tests::a_stale_generation_answer_is_retryable_from_the_handler_output);
+  // pre-r34 the server emitted false while client tests fabricated true,
+  // so the banner's Retry action never rendered for a real server answer.
+  it('STALE_GENERATION retry refreshes the observed (epoch, generation) pair from the runtime-owner record', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent() }))
+    store.dispatch(setPaneHandoffError({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      error: {
+        code: 'STALE_GENERATION',
+        message: 'observed ownership fence is stale; refresh and retry',
+        retryable: true,
+        generation: 3,
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    const banner = await screen.findByRole('alert')
+    const retry = within(banner).getByRole('button', { name: /retry reopening/i })
+
+    // The retry's handoff fails again — the pane stays; only the body is
+    // asserted (the REFRESHED fence pair).
+    apiMock.requestSessionHandoff.mockResolvedValue({
+      ok: false,
+      error: { code: 'STALE_GENERATION', message: 'still stale', retryable: true, ownerGeneration: 9 },
+    })
+
+    // The owner record has since moved to (epoch 2, generation 9) — the
+    // retry must carry the REFRESHED pair, never the stale one (round-2).
+    act(() => store.dispatch(applyRuntimeOwner(terminalOwnerFrame({
+      epoch: 2,
+      generation: 9,
+      ownerKind: 'vacant',
+      terminalId: undefined,
+      transition: 'released',
+    }))))
+
+    fireEvent.click(retry)
+    await waitFor(() => {
+      expect(apiMock.requestSessionHandoff).toHaveBeenCalledTimes(1)
+    }, { timeout: 5_000 })
+
+    expect(apiMock.requestSessionHandoff).toHaveBeenCalledWith(expect.objectContaining({
+      provider: 'codex',
+      sessionId: DIV_SESSION_ID,
+      observedEpoch: 2,
+      observedGeneration: 9,
+    }))
+  })
+
+  it('HANDOFF_IN_PROGRESS retry waits out the backoff before re-invoking (never an immediate tight loop)', async () => {
+    const store = createStore()
+    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent() }))
+    store.dispatch(setPaneHandoffError({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      error: {
+        code: 'HANDOFF_IN_PROGRESS',
+        message: 'a lifecycle operation is in flight; retry after it settles',
+        retryable: true,
+        generation: 2,
+      },
+    }))
+    // The retry's handoff fails again — the pane stays; only the timing of
+    // the single re-invocation is asserted.
+    apiMock.requestSessionHandoff.mockResolvedValue({
+      ok: false,
+      error: { code: 'HANDOFF_IN_PROGRESS', message: 'still in flight', retryable: true, ownerGeneration: 2 },
+    })
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    const banner = await screen.findByRole('alert')
+    const retry = within(banner).getByRole('button', { name: /retry reopening/i })
+    fireEvent.click(retry)
+
+    // Synchronous and mid-backoff: nothing sent yet. The backoff (750ms)
+    // cannot have elapsed at 350ms wall-clock.
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 350)) })
+    expect(apiMock.requestSessionHandoff).not.toHaveBeenCalled()
+
+    // After the backoff the single re-invocation leaves.
+    await waitFor(() => {
+      expect(apiMock.requestSessionHandoff).toHaveBeenCalledTimes(1)
+    }, { timeout: 5_000 })
+    expect(apiMock.requestSessionHandoff).toHaveBeenCalledTimes(1)
+  })
+
+  it('every typed handoff-failure code composes: the banner renders the typed message with a Retry that re-invokes the same identity', async () => {
+    // Task-009 review Minor 1: the per-code fold matrix lives in the
+    // ContextMenu suite; this loop gives EVERY typed code — including
+    // REAP_TIMEOUT — the composed banner-render + Retry assertion.
+    // b8ke ext r34 F1: `retryable: true` is the SERVER's REAL shape for
+    // STALE_GENERATION (pinned server-side); the matrix keeps the
+    // banner-render assertion per code honest against it.
+    const typedFailures: Array<{ code: string; message: string }> = [
+      { code: 'REAP_TIMEOUT', message: 'the prior runtime did not confirm its exit in time' },
+      { code: 'TARGET_SPAWN_FAILED', message: 'the target runtime failed to start' },
+      { code: 'STALE_GENERATION', message: 'observed ownership fence is stale; refresh and retry' },
+      { code: 'HANDOFF_IN_PROGRESS', message: 'a lifecycle operation is in flight; retry after it settles' },
+    ]
+
+    for (const failure of typedFailures) {
+      apiMock.requestSessionHandoff.mockClear()
+      const store = createStore()
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent() }))
+      store.dispatch(setPaneHandoffError({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        error: {
+          code: failure.code,
+          message: failure.message,
+          retryable: true,
+          generation: 4,
+        },
+      }))
+      // The retry's handoff fails again (retryable) — the pane must STAY a
+      // fresh-agent pane wearing the banner; only the invocation is asserted.
+      apiMock.requestSessionHandoff.mockResolvedValue({
+        ok: false,
+        error: { code: failure.code, message: 'still failing', retryable: true, ownerGeneration: 5 },
+      })
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+
+      const banner = await screen.findByRole('alert')
+      expect(banner).toHaveTextContent(new RegExp(failure.message, 'i'))
+      const retry = within(banner).getByRole('button', { name: /retry reopening/i })
+
+      fireEvent.click(retry)
+      await waitFor(() => {
+        expect(apiMock.requestSessionHandoff).toHaveBeenCalledTimes(1)
+      }, { timeout: 5_000 })
+
+      expect(apiMock.requestSessionHandoff).toHaveBeenCalledWith(expect.objectContaining({
+        provider: 'codex',
+        sessionId: DIV_SESSION_ID,
+        targetKind: 'terminal',
+        mode: 'codex',
+      }))
+      cleanup()
+    }
+  })
+})
+
+describe('b8ke ext F2: sessionRef-only panes kill the old runtime on replacement/restart', () => {
+  // The restored-pane shape: persistence strips content.sessionId, leaving
+  // ONLY the durable sessionRef — BOTH kill paths must use
+  // sessionRef.sessionId (pre-ext the `content.sessionId` gate skipped the
+  // awaited kill entirely, clearing the durable reference and starting a
+  // blank conversation while the prior runtime stayed live and
+  // unrepresented).
+
+  it('startNewConversation kills the sessionRef session before starting the new one', async () => {
+    const handlers: Array<(msg: Record<string, unknown>) => void> = []
+    wsMock.onMessage.mockReset()
+    wsMock.onMessage.mockImplementation((listener: (msg: Record<string, unknown>) => void) => {
+      handlers.push(listener)
+      return () => {}
+    })
+    const store = createStore()
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        createRequestId: 'req-ref-only-new',
+        sessionRef: { provider: 'codex', sessionId: 'thread-ref-only' },
+        status: 'stuck',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            createRequestId: 'req-ref-only-new',
+            sessionRef: { provider: 'codex', sessionId: 'thread-ref-only' },
+            status: 'stuck',
+          }}
+        />
+      </Provider>,
+    )
+
+    await screen.findByRole('alert')
+    wsMock.send.mockClear()
+
+    // The stuck card's Start-new action (the same startNewConversation
+    // callback the /new command and the context menu drive).
+    fireEvent.click(screen.getByRole('button', { name: 'Start new conversation' }))
+
+    // THE F2 CONTRACT: the awaited kill targets the durable sessionRef
+    // session — pre-ext a sessionRef-only pane sent NO kill at all and the
+    // pane swapped straight to a blank conversation over the live runtime.
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.kill',
+      sessionId: 'thread-ref-only',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    }))
+    // Ungated before the ack: the pane keeps its durable reference.
+    const before = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+    expect(before.content).toMatchObject({ status: 'idle' })
+
+    for (const handler of handlers) {
+      handler({
+        type: 'freshAgent.killed',
+        sessionId: 'thread-ref-only',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        success: true,
+      })
+    }
+    await waitFor(() => {
+      const after = store.getState().panes.layouts['tab-1'] as Extract<PaneNode, { type: 'leaf' }>
+      expect(after.content).toMatchObject({ status: 'creating' })
+      expect((after.content as { sessionId?: string }).sessionId).toBeUndefined()
+      expect((after.content as { sessionRef?: { sessionId: string } }).sessionRef).toBeUndefined()
+    })
+  })
+
+  it('restartStuckSidecar kills the sessionRef session before re-driving creation', async () => {
+    const store = createStore()
+    const dispatchSpy = vi.spyOn(store, 'dispatch')
+
+    render(
+      <Provider store={store}>
+        <FreshAgentView
+          tabId="tab-1"
+          paneId="pane-1"
+          paneContent={{
+            kind: 'fresh-agent',
+            sessionType: 'freshcodex',
+            provider: 'codex',
+            createRequestId: 'req-ref-stuck',
+            sessionRef: { provider: 'codex', sessionId: 'thread-ref-stuck' },
+            status: 'stuck',
+          }}
+        />
+      </Provider>,
+    )
+
+    await screen.findByRole('alert')
+    wsMock.send.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: /restart sidecar and resume session/i }))
+
+    // THE F2 CONTRACT: the restart's kill targets the durable sessionRef
+    // session — pre-ext a sessionRef-only pane sent NO kill and the
+    // recovery re-drove creation over the live wedged runtime.
+    expect(wsMock.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.kill',
+      sessionId: 'thread-ref-stuck',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    }))
+    const remints = dispatchSpy.mock.calls
+      .map(([action]) => action)
+      .filter((action: any) => action?.type === 'panes/updatePaneContent'
+        && action.payload?.content?.status === 'creating')
+    expect(remints).toHaveLength(1)
+  })
+})
+
+describe('b8ke ext F1: locatorMatchesPane accepts canonical-session events for an old-key pane', () => {
+  // The rekey mirror pair: the old key's record carries aliasOf naming the
+  // canonical id. A pane holding the pre-rekey sessionRef must accept
+  // CANONICAL-session events (its resolved key) — pre-ext the locator's
+  // valid-id set only held the pane's raw ids, so canonical-session events
+  // were rejected and the old-key pane never converged.
+  const OLD_SESSION_ID = '11111111-2222-4333-8444-555555555555'
+  const NEW_SESSION_ID = '66666666-7777-4888-8999-aaaaaaaaaaaa'
+  const runtimeOwners = {
+    [`claude:${OLD_SESSION_ID}`]: {
+      provider: 'claude',
+      sessionId: OLD_SESSION_ID,
+      epoch: 3,
+      generation: 2,
+      ownerKind: 'fresh-agent',
+      operationId: 'rekey-1',
+      transition: 'handoff-committed',
+      aliasOf: NEW_SESSION_ID,
+      updatedAt: 1,
+    },
+  } as Record<string, import('@/store/freshAgentTypes').RuntimeOwnerRecord>
+  const oldKeyPaneContent = {
+    kind: 'fresh-agent',
+    sessionType: 'freshclaude',
+    provider: 'claude',
+    createRequestId: 'req-locator',
+    sessionRef: { provider: 'claude', sessionId: OLD_SESSION_ID },
+    status: 'idle',
+  } as Parameters<typeof locatorMatchesPane>[1]
+
+  it('accepts the canonical session id for a pane holding the pre-rekey id', () => {
+    expect(locatorMatchesPane(
+      { sessionId: NEW_SESSION_ID, provider: 'claude' },
+      oldKeyPaneContent,
+      undefined,
+      runtimeOwners,
+    )).toBe(true)
+    // The pane's own (old) id still matches, and unrelated ids still do not.
+    expect(locatorMatchesPane(
+      { sessionId: OLD_SESSION_ID, provider: 'claude' },
+      oldKeyPaneContent,
+      undefined,
+      runtimeOwners,
+    )).toBe(true)
+    expect(locatorMatchesPane(
+      { sessionId: 'unrelated-session', provider: 'claude' },
+      oldKeyPaneContent,
+      undefined,
+      runtimeOwners,
+    )).toBe(false)
+  })
+
+  it('a foreign provider is never a valid canonical target (the chain is per-provider)', () => {
+    expect(locatorMatchesPane(
+      { sessionId: NEW_SESSION_ID, provider: 'codex' },
+      oldKeyPaneContent,
+      undefined,
+      runtimeOwners,
+    )).toBe(false)
+  })
+})
+
+// ── b8ke ext r21 F2: the compact/undo/fork frames carry the observed fence ──
+
+describe('b8ke ext r21 F2: the compact/undo/fork senders carry the observed fence', () => {
+  function seedOwnerRecord(
+    store: ReturnType<typeof createStore>,
+    sessionId: string,
+    epoch: number,
+    generation: number,
+  ) {
+    store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'opencode',
+      sessionId,
+      epoch,
+      generation,
+      ownerKind: 'fresh-agent',
+      operationId: `handoff-r21-${sessionId}`,
+      transition: 'handoff-committed',
+    }))
+  }
+
+  function getComposer() {
+    return screen.getByRole('textbox', { name: 'Chat message input' }) as HTMLTextAreaElement
+  }
+
+  it('/compact carries the session-owner fence on the wire', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'r21 compact',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+    })
+    // The pane's session carries an owner record: (epoch 12, generation 34).
+    seedOwnerRecord(store, 'ses-r21-compact', 12, 34)
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-r21-compact',
+        sessionId: 'ses-r21-compact',
+        initialCwd: '/repo/r21',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(getComposer()).not.toBeDisabled())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/compact' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    // The queued frame carries the observed pair — the server's stale-pair
+    // rejection can refuse a reconnect-replayed stale compact, never an
+    // unfenced recreation.
+    expect(wsMock.send).toHaveBeenCalledWith({
+      type: 'freshAgent.compact',
+      sessionId: 'ses-r21-compact',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: '/repo/r21',
+      observedEpoch: 12,
+      observedGeneration: 34,
+    })
+  })
+
+  it('/compact with NO owner record sends no pair (the legacy-unfenced shape)', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'r21 no-fence',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [],
+    })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-r21-nofence',
+        sessionId: 'ses-r21-nofence',
+        initialCwd: '/repo/r21',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(getComposer()).not.toBeDisabled())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/compact' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+    const frame = sentFreshAgentMessages('freshAgent.compact').at(-1)
+    expect(frame).toMatchObject({ type: 'freshAgent.compact', sessionId: 'ses-r21-nofence' })
+    expect(frame).not.toHaveProperty('observedEpoch')
+    expect(frame).not.toHaveProperty('observedGeneration')
+  })
+
+  it('/undo carries the session-owner fence on the wire', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValue({
+      status: 'idle',
+      summary: 'r21 undo',
+      capabilities: { send: true, interrupt: true, fork: true, undo: true, redo: true },
+      rollback: { canRedo: true, undoneDepth: 1 },
+      rolledBackTurns: [
+        { id: 'u9', turnId: 'u9', role: 'user', summary: 'rolled prompt', items: [{ id: 'u9-i', kind: 'text', text: 'rolled prompt' }], rolledBack: true },
+      ],
+      turns: [
+        { id: 'u1', turnId: 'u1', role: 'user', summary: 'first prompt', items: [{ id: 'u1-i', kind: 'text', text: 'first prompt' }] },
+      ],
+    })
+    seedOwnerRecord(store, 'ses-r21-undo', 5, 9)
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-r21-undo',
+        sessionId: 'ses-r21-undo',
+        initialCwd: '/repo/r21',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(screen.getByText('first prompt')).toBeInTheDocument())
+    wsMock.send.mockClear()
+
+    fireEvent.change(getComposer(), { target: { value: '/undo' } })
+    fireEvent.keyDown(getComposer(), { key: 'Enter' })
+
+    const frame = sentFreshAgentMessages('freshAgent.undo').at(-1)
+    expect(frame).toMatchObject({
+      type: 'freshAgent.undo',
+      sessionId: 'ses-r21-undo',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      mode: 'step',
+      observedEpoch: 5,
+      observedGeneration: 9,
+    })
+  })
+
+  it('the Fork button carries the session-owner fence on the wire', async () => {
+    const store = createStore()
+    apiMock.getFreshAgentThreadSnapshot.mockResolvedValueOnce({
+      status: 'idle',
+      summary: 'r21 fork',
+      capabilities: { send: true, interrupt: true, fork: true },
+      turns: [
+        {
+          id: 'turn-r21-fork',
+          turnId: 'turn-r21-fork',
+          role: 'assistant',
+          summary: 'Ready to fork',
+          items: [{ id: 'item-r21-fork', kind: 'text', text: 'Ready to fork' }],
+        },
+      ],
+    })
+    seedOwnerRecord(store, 'ses-r21-fork', 8, 21)
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-r21-fork',
+        sessionId: 'ses-r21-fork',
+        initialCwd: '/repo/r21',
+        status: 'idle',
+      },
+    }))
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Fork conversation from here' }))
+
+    // The fork frame carries the observed pair of the PARENT's session.
+    expect(wsMock.send).toHaveBeenCalledWith({
+      type: 'freshAgent.fork',
+      requestId: 'req-r21-fork',
+      sessionId: 'ses-r21-fork',
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      tabId: 'tab-1',
+      cwd: '/repo/r21',
+      input: { atTurnId: 'turn-r21-fork' },
+      observedEpoch: 8,
+      observedGeneration: 21,
+    })
+  })
+})
+
 
 describe('!command shell escape (exec route)', () => {
   function renderShellEscapePane(store: ReturnType<typeof createStore>) {

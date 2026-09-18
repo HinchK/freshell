@@ -97,6 +97,10 @@ export function buildTerminalAttachMessage(input: {
   priority: 'foreground' | 'background'
   maxReplayBytes?: number
   surfaceReset?: boolean
+  /** b8ke ext r8 F2: the pane's observed ownership fence — terminal.attach
+   *  participates in the coordinator (a queued cross-device attach is
+   *  generation-fenced server-side). */
+  ownerFence?: { epoch: number; generation: number }
 }): {
   type: 'terminal.attach'
   terminalId: string
@@ -111,6 +115,8 @@ export function buildTerminalAttachMessage(input: {
   surfaceReset?: boolean
   createRequestId?: string
   tabId?: string
+  observedEpoch?: number
+  observedGeneration?: number
 } {
   const expectedSessionRef = getExpectedSessionRefForTerminalOperation(input.content)
   // Delta-r7-r2 (Finding F3): the attach carries the attaching pane's
@@ -130,6 +136,7 @@ export function buildTerminalAttachMessage(input: {
     sinceSeq: input.sinceSeq,
     attachRequestId: input.attachRequestId,
     priority: input.priority,
+    ...(input.ownerFence ? { observedEpoch: input.ownerFence.epoch, observedGeneration: input.ownerFence.generation } : {}),
     ...(input.maxReplayBytes ? { maxReplayBytes: input.maxReplayBytes } : {}),
     ...(input.surfaceReset ? { surfaceReset: true } : {}),
     ...(expectedSessionRef ? { expectedSessionRef } : {}),

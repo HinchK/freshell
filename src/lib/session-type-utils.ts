@@ -9,8 +9,7 @@ import type { FreshAgentPaneInput, TerminalPaneInput } from '@/store/paneTypes'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import {
   getPairedPublicSessionType,
-  resolveSessionTypeRuntimeProvider,
-  type PublicSessionType,
+  isPublicSessionType,
 } from '@shared/session-flavor'
 
 export interface SessionTypeConfig {
@@ -52,11 +51,18 @@ export function resolveSessionTypeConfig(sessionType: string, extensions?: Clien
 }
 
 export type PairedSessionTypeTarget = {
-  sourceSessionType: PublicSessionType
-  targetSessionType: PublicSessionType
+  sourceSessionType: string
+  targetSessionType: string
   runtimeProvider: CodingCliProviderName
   label: string
   targetKind: 'terminal' | 'fresh-agent'
+  /**
+   * The session flavor the metadata legs record for this reopen. Equals
+   * the target EXCEPT when a hidden flavor (kilroy) rides the target CLI —
+   * the runtime-kind change must not orphan it, so it keeps recording
+   * itself. Public types record the target exactly as they always have.
+   */
+  metadataSessionType: string
 }
 
 function cliProviderLabel(provider: CodingCliProviderName): string {
@@ -64,22 +70,112 @@ function cliProviderLabel(provider: CodingCliProviderName): string {
   return `${getProviderLabel(provider)} CLI`
 }
 
+/**
+ * kata b8ke (round-2 R2-10): FLAVOR-AWARE paired-target derivation. The
+ * fresh-agent side of a pair derives from the session's FLAVOR, never the
+ * provider alone:
+ * - A fresh-agent SOURCE (public types AND the hidden kilroy flavor) pairs
+ *   with its runtime CLI — a kilroy pane offers "Reopen as Claude CLI"
+ *   (kilroy rides the claude lane; the public CLI_TO_FRESH map has no
+ *   kilroy entry, so the pre-b8ke derivation returned null and a kilroy
+ *   pane had NO reopen action at all).
+ * - A CLI source pairs with the session's RECORDED flavor first (the
+ *   `flavor` option — a tab's sessionMetadataByKey sessionType): a
+ *   claude-mode pane whose session is recorded kilroy maps BACK to kilroy,
+ *   never to the provider-alone `freshclaude` (which would orphan the
+ *   identity). Unknown/unmatching flavors fall back to the public map.
+ */
 export function getPairedSessionTypeTarget(
   sessionType: string | undefined,
+  options: { flavor?: string | undefined } = {},
 ): PairedSessionTypeTarget | null {
-  const targetSessionType = getPairedPublicSessionType(sessionType)
-  if (!targetSessionType || !sessionType) return null
-  const runtimeProvider = resolveSessionTypeRuntimeProvider(targetSessionType)
-  if (!runtimeProvider) return null
-  const targetKind = targetSessionType.startsWith('fresh') ? 'fresh-agent' : 'terminal'
+  if (!sessionType) return null
+
+  const freshSource = resolveFreshAgentType(sessionType)
+  if (freshSource) {
+    const runtimeProvider = freshSource.runtimeProvider
+    if (!isNonShellMode(runtimeProvider)) return null
+    return {
+      sourceSessionType: sessionType,
+      targetSessionType: runtimeProvider,
+      runtimeProvider,
+      targetKind: 'terminal',
+      // A hidden flavor (kilroy) keeps recording itself across the
+      // runtime-kind change; public fresh types record the CLI target.
+      metadataSessionType: isPublicSessionType(sessionType) ? runtimeProvider : sessionType,
+      label: `Reopen as ${cliProviderLabel(runtimeProvider)}`,
+    }
+  }
+
+  if (!isNonShellMode(sessionType)) return null
+  const flavor = options.flavor !== undefined ? resolveFreshAgentType(options.flavor) : undefined
+  const targetSessionType = flavor && flavor.runtimeProvider === sessionType
+    ? flavor.sessionType
+    : getPairedPublicSessionType(sessionType)
+  if (!targetSessionType) return null
   return {
-    sourceSessionType: sessionType as PublicSessionType,
+    sourceSessionType: sessionType,
     targetSessionType,
-    runtimeProvider,
-    targetKind,
-    label: targetKind === 'fresh-agent'
-      ? `Reopen as ${targetSessionType}`
-      : `Reopen as ${cliProviderLabel(runtimeProvider)}`,
+    runtimeProvider: sessionType as CodingCliProviderName,
+    targetKind: 'fresh-agent',
+    metadataSessionType: targetSessionType,
+    label: `Reopen as ${targetSessionType}`,
+  }
+}
+
+/**
+ * The flavor-first fresh-agent session type for a TERMINAL pane's session:
+ * the tab's recorded sessionMetadataByKey sessionType when it names a
+ * fresh-agent type riding the pane's CLI provider (kilroy when recorded),
+ * the provider→public-type map only as fallback (claude→freshclaude — the
+ * provider alone would lose the kilroy identity).
+ */
+export function freshSessionTypeForPaneFlavor(
+  tab: { sessionMetadataByKey?: Record<string, { sessionType?: string }> } | undefined,
+  content: { kind: string; mode?: string; sessionRef?: { provider: string; sessionId: string } },
+): string | undefined {
+  if (content.kind !== 'terminal') return undefined
+  const sessionRef = content.sessionRef
+  if (sessionRef) {
+    const recorded = tab?.sessionMetadataByKey?.[`${sessionRef.provider}:${sessionRef.sessionId}`]?.sessionType
+    if (recorded !== undefined) {
+      const recordedFreshType = resolveFreshAgentType(recorded)
+      if (recordedFreshType && recordedFreshType.runtimeProvider === sessionRef.provider) {
+        return recordedFreshType.sessionType
+      }
+    }
+  }
+  const mode = content.mode !== undefined && isNonShellMode(content.mode) ? content.mode : undefined
+  return mode !== undefined ? getPairedPublicSessionType(mode) : undefined
+}
+
+/**
+ * The terminal pane content for a pane ADOPTING an already-committed
+ * terminal owner (the atomic handoff's success path and the
+ * opened-as-CLI-elsewhere attach action): the pane keeps its
+ * createRequestId and sessionRef, points at the live terminal id, and
+ * enters `running` so TerminalView's mount effect attaches instead of
+ * creating a second process.
+ */
+export function buildTerminalAttachContent(opts: {
+  createRequestId: string
+  mode: string
+  provider: string
+  sessionId: string
+  terminalId: string
+  cwd?: string
+}): TerminalPaneInput {
+  return {
+    kind: 'terminal',
+    createRequestId: opts.createRequestId,
+    mode: opts.mode as TerminalPaneInput['mode'],
+    status: 'running',
+    terminalId: opts.terminalId,
+    sessionRef: {
+      provider: opts.provider,
+      sessionId: opts.sessionId,
+    },
+    ...(opts.cwd ? { initialCwd: opts.cwd } : {}),
   }
 }
 

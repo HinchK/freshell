@@ -94,6 +94,8 @@ async fn create_tracked_session_with_resume(
 ) -> String {
     st.handle_create(
         FreshAgentCreate {
+            observed_epoch: None,
+            observed_generation: None,
             request_id: request_id.to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
             provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -222,6 +224,8 @@ async fn failed_spawn_leaves_no_record() {
 
     st.handle_create(
         FreshAgentCreate {
+            observed_epoch: None,
+            observed_generation: None,
             request_id: "req-wfah-t2-fail".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
             provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -287,6 +291,7 @@ async fn build_recorded_watch(
         Arc::new(AtomicBool::new(false)),
         Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
         crate::codex::QuietDeadman::new_shared(),
+        None,
     );
     (watcher, kill_tx, pid)
 }
@@ -337,6 +342,7 @@ async fn unrequested_exit_arm_removes_the_record() {
         exited.clone(),
         Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
         crate::codex::QuietDeadman::new_shared(),
+        None,
     );
     watcher.await.expect("watcher completes");
 
@@ -364,6 +370,8 @@ async fn handle_kill_leaves_no_record() {
         session_id,
         session_type: freshell_protocol::SessionType::Freshcodex,
         cwd: None,
+        observed_epoch: None,
+        observed_generation: None,
     })
     .await;
 
@@ -424,6 +432,8 @@ async fn create_bail_after_spawn_leaves_no_record() {
 
     st.handle_create(
         FreshAgentCreate {
+            observed_epoch: None,
+            observed_generation: None,
             request_id: "req-wfah-t3-bail".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
             provider: Some(freshell_protocol::AgentProvider::Codex),

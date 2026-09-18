@@ -47,7 +47,12 @@ fn unique_temp_dir(label: &str) -> std::path::PathBuf {
 /// construction folded in, returning the extra handles named in `Harness`.
 /// ONE `TerminalIdentityRegistry` and ONE `Arc<PaneLedger>` shared by
 /// `WsState` and the `LedgerPaneIdentityBinder` handed to `FreshAgentState`
-/// — mirroring `freshell-server/src/main.rs`'s wiring.
+/// — mirroring `freshell-server/src/main.rs`'s wiring. kata b8ke Task 10:
+/// also mints the ONE ownership coordinator (registry release side,
+/// WsState, and the fresh-agent states — including `fresh_claude`'s lane)
+/// and the ONE shared `LayoutStore` (WsState's `ui.layout.sync` ingestion
+/// and the REST pane-ops surface resolve the same store), exactly like
+/// `main.rs`.
 async fn spawn_merged_server() -> Harness {
     let _ = common::isolate_amplifier_home();
     let ledger_dir = unique_temp_dir("ledger");
@@ -58,15 +63,30 @@ async fn spawn_merged_server() -> Harness {
     let settings = Arc::new(
         serde_json::from_value(common::test_settings_value()).expect("valid settings fixture"),
     );
-    let registry = freshell_terminal::TerminalRegistry::new();
+    // kata b8ke Tasks 3/4: the ONE coordinator, wired into every lane.
+    let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    let registry =
+        freshell_terminal::TerminalRegistry::new().with_ownership(Arc::clone(&ownership));
     let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
     let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
         ledger_dir.clone(),
     )));
     let cli_commands = Arc::new(vec![common::sleeper_cli_spec("claude")]);
+    // kata b8ke Task 10: the shared layout store (WS ingestion + REST reads).
+    let layout_store = freshell_freshagent::layout_store::LayoutStore::default();
+
+    let mut fresh_claude = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+    fresh_claude.set_ownership(Arc::clone(&ownership));
+    let fresh_agent_state = freshell_freshagent::FreshAgentState::new(
+        Arc::clone(&auth_token),
+        Arc::clone(&broadcast_tx),
+    );
+    let mut fresh_opencode =
+        freshell_freshagent::FreshOpencodeState::new(fresh_agent_state.clone());
+    fresh_opencode.set_ownership(Arc::clone(&ownership));
 
     let state = WsState {
-        layout: Default::default(),
+        layout: layout_store.clone(),
         terminal_meta: Default::default(),
         pane_ledger: Arc::clone(&ledger),
         identity: identity.clone(),
@@ -81,15 +101,15 @@ async fn spawn_merged_server() -> Harness {
         fresh_codex: freshell_freshagent::FreshCodexState::new(
             Arc::clone(&auth_token),
             Arc::clone(&broadcast_tx),
-            serde_json::json!({ "freshAgent": { "enabled": false } }),
+            // kata b8ke Task 10: the freshAgent.create dispatch gate is the
+            // SHARED `settings.freshAgent.enabled` flag
+            // (freshell-ws/src/terminal.rs's `fresh_codex.is_enabled()`) —
+            // enabled here so the parity test's freshclaude owner
+            // establishes over WS.
+            serde_json::json!({ "freshAgent": { "enabled": true } }),
         ),
-        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
-        fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
-            freshell_freshagent::FreshAgentState::new(
-                Arc::clone(&auth_token),
-                Arc::clone(&broadcast_tx),
-            ),
-        ),
+        fresh_claude,
+        fresh_opencode,
         registry: registry.clone(),
         tabs: freshell_ws::tabs::TabsRegistry::new(),
         screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
@@ -115,26 +135,28 @@ async fn spawn_merged_server() -> Harness {
         session_existence: Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
+        ownership: Some(Arc::clone(&ownership)),
     };
 
     // The REST door: same auth token + broadcast bus + terminal registry as
     // the WS door, with the read-side identity lookup AND the write-side
     // pane-identity binder wired over the SAME identity/ledger instances
-    // (main.rs:297-310's shape).
-    let fresh_agent_state = freshell_freshagent::FreshAgentState::new(
-        Arc::clone(&auth_token),
-        Arc::clone(&broadcast_tx),
-    )
-    .with_cli_commands(Arc::clone(&cli_commands))
-    .with_terminal_registry(registry.clone())
-    .with_session_identity(Arc::new(identity.clone()))
-    .with_pane_identity_binder(Arc::new(
-        freshell_ws::pane_identity_binder::LedgerPaneIdentityBinder::new(
-            identity.clone(),
-            Arc::clone(&ledger),
-            None,
-        ),
-    ));
+    // (main.rs:297-310's shape), the SAME coordinator, and the SAME layout
+    // store (kata b8ke Task 10: browser-shaped panes synced over WS resolve
+    // for the REST pane-ops routes).
+    let fresh_agent_state = fresh_agent_state
+        .with_cli_commands(Arc::clone(&cli_commands))
+        .with_terminal_registry(registry.clone())
+        .with_session_identity(Arc::new(identity.clone()))
+        .with_layout(layout_store.clone())
+        .with_ownership(Arc::clone(&ownership))
+        .with_pane_identity_binder(Arc::new(
+            freshell_ws::pane_identity_binder::LedgerPaneIdentityBinder::new(
+                identity.clone(),
+                Arc::clone(&ledger),
+                None,
+            ),
+        ));
 
     let app =
         freshell_ws::router(state.clone()).merge(freshell_freshagent::router(fresh_agent_state));
@@ -168,14 +190,16 @@ struct RestResponse {
 }
 
 /// Minimal hand-rolled HTTP/1.1 POST over a raw `TcpStream` (ported verbatim
-/// from `rest_ws_shared_gate.rs::reqwest_like_post`, body parameterized).
-async fn raw_post_tabs(base_url: &str, body_json: &serde_json::Value) -> RestResponse {
+/// from `rest_ws_shared_gate.rs::reqwest_like_post`, body parameterized; kata
+/// b8ke Task 10 additionally parameterizes the PATH so pane-ops routes can
+/// share it).
+async fn raw_post(base_url: &str, path: &str, body_json: &serde_json::Value) -> RestResponse {
     let host = base_url
         .strip_prefix("http://")
         .expect("base_url is http://{addr}");
     let body = body_json.to_string();
     let request = format!(
-        "POST /api/tabs HTTP/1.1\r\n\
+        "POST {path} HTTP/1.1\r\n\
          Host: {host}\r\n\
          x-auth-token: {token}\r\n\
          Content-Type: application/json\r\n\
@@ -223,7 +247,7 @@ async fn raw_post_tabs(base_url: &str, body_json: &serde_json::Value) -> RestRes
 /// harness's registry row (`identity_probe_rows` -> `resume_session_id`).
 /// Panics with the full body / row set on any miss.
 async fn rest_create_claude_with_body(h: &Harness, body: serde_json::Value) -> (String, String) {
-    let resp = raw_post_tabs(&h.base_url, &body).await;
+    let resp = raw_post(&h.base_url, "/api/tabs", &body).await;
     assert_eq!(resp.status, 200, "REST create failed: {}", resp.body);
     let tid = resp.json["data"]["terminalId"]
         .as_str()
@@ -536,5 +560,260 @@ async fn rest_claude_resume_create_writes_identity_row_and_ledger_binding() {
     assert_eq!(binding.live_terminal_id.as_deref(), Some(tid2.as_str()));
 
     h.registry.kill(&tid2);
+    cleanup(&h);
+}
+
+// ── kata b8ke Task 10: REST + WS + browser-shaped parity on ONE coordinator ──
+
+// The lease-suite fake claude sidecar (request-log knob), duplicated
+// per-file per the cross_kind_liveness.rs convention: sets
+// FRESHELL_CLAUDE_SIDECAR/FRESHELL_CLAUDE_NODE so a `freshAgent.create`
+// over WS genuinely establishes a live freshclaude owner, and logs every
+// sidecar request for the no-second-runtime assertions.
+const FAKE_CLAUDE_SIDECAR_SOURCE: &str = r#"
+import readline from 'node:readline'
+import fs from 'node:fs'
+
+const logPath = process.env.FAKE_SIDECAR_REQUEST_LOG || ''
+function logReq(msg) {
+  if (!logPath) return
+  try { fs.appendFileSync(logPath, JSON.stringify({ pid: process.pid, msg }) + '\n') } catch {}
+}
+
+let counter = 0
+const rl = readline.createInterface({ input: process.stdin, terminal: false })
+rl.on('line', (line) => {
+  const trimmed = line.trim()
+  if (!trimmed) return
+  let msg
+  try { msg = JSON.parse(trimmed) } catch { return }
+  logReq(msg)
+  if (msg.type === 'create') {
+    counter += 1
+    const sessionId = `fake-claude-session-${process.pid}-${counter}`
+    process.stdout.write(JSON.stringify({ type: 'created', requestId: msg.requestId, sessionId }) + '\n')
+    const cliSessionId = msg.resumeSessionId || 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+    process.stdout.write(JSON.stringify({ type: 'sdk.session.init', sessionId, cliSessionId, model: 'fake-model', cwd: '/tmp', tools: [] }) + '\n')
+    process.stdout.write(JSON.stringify({ type: 'sdk.status', sessionId, status: 'idle' }) + '\n')
+  } else if (msg.type === 'shutdown') {
+    process.exit(0)
+  }
+})
+"#;
+
+/// The fake sidecar env (cross_kind_liveness.rs's `FakeSidecarEnv`, copied
+/// per the per-file convention). Only the Task 10 parity test below reads
+/// the env vars, so no cross-test env locking is needed within THIS file.
+struct FakeSidecarEnv {
+    dir: std::path::PathBuf,
+}
+
+impl FakeSidecarEnv {
+    fn install() -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "rest-claude-identity-r10-sidecar-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("create fake sidecar temp dir");
+        let script = dir.join("fake-claude-sidecar.mjs");
+        std::fs::write(&script, FAKE_CLAUDE_SIDECAR_SOURCE).expect("write fake sidecar");
+        std::env::set_var("FRESHELL_CLAUDE_SIDECAR", &script);
+        std::env::set_var("FRESHELL_CLAUDE_NODE", "node");
+        std::env::set_var("FAKE_SIDECAR_REQUEST_LOG", dir.join("requests.jsonl"));
+        Self { dir }
+    }
+
+    fn create_rows(&self) -> Vec<serde_json::Value> {
+        let Ok(raw) = std::fs::read_to_string(self.dir.join("requests.jsonl")) else {
+            return Vec::new();
+        };
+        raw.lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("request log row parses"))
+            .filter(|r| r["msg"]["type"] == "create")
+            .collect()
+    }
+}
+
+impl Drop for FakeSidecarEnv {
+    fn drop(&mut self) {
+        for var in [
+            "FRESHELL_CLAUDE_SIDECAR",
+            "FRESHELL_CLAUDE_NODE",
+            "FAKE_SIDECAR_REQUEST_LOG",
+        ] {
+            std::env::remove_var(var);
+        }
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Read text frames until one with `type == wanted` arrives (bounded).
+async fn next_frame_of_type(ws: &mut common::TestWs, wanted: &str) -> serde_json::Value {
+    let mut seen: Vec<String> = Vec::new();
+    for _ in 0..40u8 {
+        let msg = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("timed out waiting for a {wanted} frame; frames seen so far: {seen:?}")
+            })
+            .expect("stream not ended")
+            .expect("no ws error");
+        if let WsMessage::Text(text) = &msg {
+            let value: serde_json::Value = serde_json::from_str(text).expect("json frame");
+            seen.push(text.chars().take(400).collect());
+            if value["type"] == json!(wanted) {
+                return value;
+            }
+        }
+    }
+    panic!("no {wanted} frame within 40 messages; frames seen: {seen:?}");
+}
+
+/// kata b8ke Task 10: REST, WS, and browser-shaped creation all consult the
+/// ONE coordinator — a fresh-agent owner established via WS makes BOTH the
+/// REST `POST /api/tabs` terminal spawn AND a respawn of a browser-created
+/// pane (synced over WS `ui.layout.sync`, resolvable only through the
+/// shared LayoutStore) answer the SAME typed conflict, and neither spawns a
+/// second runtime.
+#[tokio::test(flavor = "multi_thread")]
+async fn rest_ws_and_browser_paths_share_the_one_coordinator() {
+    let sidecar = FakeSidecarEnv::install();
+    let mut h = spawn_merged_server().await;
+    let sid = format!("r10-parity-{}", uuid::Uuid::new_v4());
+
+    // 1. A live freshclaude owner for (claude, sid), established over WS.
+    h.ws.send(WsMessage::Text(
+        json!({
+            "type": "freshAgent.create", "requestId": "req-r10-parity-1",
+            "sessionType": "freshclaude", "provider": "claude",
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let _created = next_frame_of_type(&mut h.ws, "freshAgent.created").await;
+
+    // 2. The REST terminal door: POST /api/tabs for the same sessionRef is
+    //    the typed 409 carrying the fresh-agent owner fields.
+    let resp = raw_post(
+        &h.base_url,
+        "/api/tabs",
+        &json!({
+            "mode": "claude",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    assert_eq!(resp.status, 409, "REST create: {}", resp.body);
+    assert_eq!(
+        resp.json["code"],
+        json!("RESTORE_UNAVAILABLE"),
+        "{}",
+        resp.body
+    );
+    assert_eq!(
+        resp.json["ownerKind"],
+        json!("fresh-agent"),
+        "{}",
+        resp.body
+    );
+    let owner_generation = resp.json["ownerGeneration"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("ownerGeneration present: {}", resp.body));
+
+    // 3. The browser-shaped door: a client-minted pane synced over WS
+    //    (ui.layout.sync) exists ONLY in the shared LayoutStore; its
+    //    respawn resolves through that store and answers the SAME typed
+    //    conflict with the SAME owner generation.
+    h.ws.send(WsMessage::Text(
+        json!({
+            "type": "ui.layout.sync",
+            "tabs": [{ "id": "t-r10-parity", "title": "Task 10 parity" }],
+            "activeTabId": "t-r10-parity",
+            "layouts": { "t-r10-parity": { "type": "leaf", "id": "p-r10-parity", "content": {
+                "kind": "terminal", "mode": "claude", "status": "running",
+                "createRequestId": "r-r10-parity"
+            }}},
+            "activePane": { "t-r10-parity": "p-r10-parity" },
+            "paneTitles": {},
+            "paneTitleSetByUser": {},
+            "timestamp": 1
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    // Ordering barrier: this connection's frames dispatch sequentially, so
+    // the pong proves the layout sync was ingested.
+    h.ws.send(WsMessage::Text(json!({ "type": "ping" }).to_string()))
+        .await
+        .unwrap();
+    let _pong = next_frame_of_type(&mut h.ws, "pong").await;
+
+    let resp = raw_post(
+        &h.base_url,
+        "/api/panes/p-r10-parity/respawn",
+        &json!({
+            "mode": "claude",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    assert_eq!(resp.status, 409, "browser-shaped respawn: {}", resp.body);
+    assert_eq!(
+        resp.json["code"],
+        json!("RESTORE_UNAVAILABLE"),
+        "{}",
+        resp.body
+    );
+    assert_eq!(
+        resp.json["ownerKind"],
+        json!("fresh-agent"),
+        "{}",
+        resp.body
+    );
+    assert_eq!(
+        resp.json["ownerGeneration"],
+        json!(owner_generation),
+        "both doors name the SAME owner generation: {}",
+        resp.body
+    );
+
+    // 4. Neither door spawned a second runtime: zero PTY rows for sid and
+    //    exactly the one sidecar create the WS freshclaude owner made.
+    let ptys_for_sid = h
+        .registry
+        .identity_probe_rows()
+        .iter()
+        .filter(|r| r.resume_session_id.as_deref() == Some(sid.as_str()))
+        .count();
+    assert_eq!(ptys_for_sid, 0, "no second writer for {sid}");
+    let sidecar_creates = sidecar
+        .create_rows()
+        .iter()
+        .filter(|r| r["msg"]["resumeSessionId"].as_str() == Some(sid.as_str()))
+        .count();
+    assert_eq!(sidecar_creates, 1, "exactly the one freshclaude owner");
+
+    // Tear the freshclaude owner down through its own lane so the sidecar
+    // child does not outlive the harness.
+    h.ws.send(WsMessage::Text(
+        json!({
+            "type": "freshAgent.kill", "sessionId": sid,
+            "sessionType": "freshclaude", "provider": "claude",
+        })
+        .to_string(),
+    ))
+    .await
+    .unwrap();
+    let _killed = next_frame_of_type(&mut h.ws, "freshAgent.killed").await;
     cleanup(&h);
 }

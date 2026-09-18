@@ -50,6 +50,7 @@ pub mod existence;
 pub mod host_stats_collector;
 pub mod host_stats_interest;
 pub mod identity;
+pub(crate) mod identity_ownership;
 pub mod invariants;
 pub mod opencode_association;
 pub mod opencode_lane;
@@ -366,6 +367,14 @@ pub struct WsState {
     /// storms. In-memory only: a server restart intentionally resets it.
     pub fresh_agent_respawn_counts:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<(String, String), u32>>>,
+    /// kata b8ke Task 4: the ONE server-wide runtime-ownership coordinator
+    /// (the same instance `freshell-server::main` injects into every
+    /// fresh-agent state and the terminal registry). `None` (every hand-built
+    /// test `WsState`) keeps the terminal lane's coordinator bookkeeping off —
+    /// legacy behavior byte-for-byte. The terminal create/kill paths and the
+    /// ready-frame owner replay consult this; Task 6's WS probes and Task 7's
+    /// pause hook live beside it.
+    pub ownership: Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
     /// The opencode terminal-pane session locator (restore-across-restart fix,
     /// `docs/plans/2026-07-18-opencode-terminal-restore-spec.md`): correlates a
     /// fresh opencode PTY's first Enter/submit (or a row written at spawn) with
@@ -559,8 +568,51 @@ pub async fn build_handshake_with_capabilities(
     terminal_interest_v1: bool,
 ) -> Vec<ServerMessage> {
     let boot_id = state.boot_id.as_ref().clone();
+    // kata b8ke Task 4 (reconnect-owner discovery, T1 rec A3): replay current
+    // runtime-owner state on EVERY handshake — a device that missed a
+    // handoff broadcast (offline during handoff, lag-4008 disconnect, page
+    // reload) learns the authoritative owner from ready alone. Omitted when
+    // the coordinator is not injected, keeping hand-built test states (no
+    // registry) byte-identical.
+    let runtime_owners: Option<Vec<freshell_protocol::RuntimeOwnerReplay>> =
+        state.ownership.as_ref().map(|ownership| {
+            ownership
+                .snapshot_records()
+                .into_iter()
+                .map(|rec| freshell_protocol::RuntimeOwnerReplay {
+                    provider: rec.provider,
+                    session_id: rec.session_id,
+                    epoch: rec.epoch,
+                    generation: rec.generation,
+                    owner_kind: rec.owner_kind,
+                    // b8ke focused round-3 review R3-5 + round-4 R4-6:
+                    // the replayed state's truth — a fenced record folds as
+                    // the typed recovery state on the client, never as a
+                    // committed owner; the in-progress lifecycle states
+                    // (starting/handoff/stopping) fold as transition-in-
+                    // progress, never as committed live ownership.
+                    state: match rec.state {
+                        freshell_ownership::ReplayOwnerState::Live => "live",
+                        freshell_ownership::ReplayOwnerState::Fenced => "fenced",
+                        freshell_ownership::ReplayOwnerState::Starting => "starting",
+                        freshell_ownership::ReplayOwnerState::Handoff => "handoff",
+                        freshell_ownership::ReplayOwnerState::Stopping => "stopping",
+                    }
+                    .to_string(),
+                    reason: rec.reason,
+                    terminal_id: rec.terminal_id,
+                    // b8ke focused episode-2 post-cap F5 (wire-additive):
+                    // the canonical id an ALIASED (re-keyed) key resolved
+                    // to — the record's owner/state/generation are the
+                    // CANONICAL record's truth, so an old-key pane folds
+                    // the authoritative owner and can navigate.
+                    alias_of: rec.alias_of,
+                })
+                .collect()
+        });
     let mut messages = vec![
         ServerMessage::Ready(Ready {
+            runtime_owners,
             timestamp: now_iso(),
             boot_id: Some(boot_id.clone()),
             server_instance_id: Some(state.server_instance_id.as_ref().clone()),
@@ -903,6 +955,9 @@ async fn send_error(
     message: &str,
 ) -> Result<(), axum::Error> {
     let msg = ServerMessage::Error(ErrorMsg {
+        owner_kind: None,
+        owner_generation: None,
+        owner_epoch: None,
         code,
         message: message.to_string(),
         timestamp: now_iso(),
@@ -971,6 +1026,7 @@ pub(crate) fn test_ws_state() -> WsState {
         session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
+        ownership: None,
     }
 }
 

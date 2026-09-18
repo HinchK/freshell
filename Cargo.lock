@@ -1316,6 +1316,7 @@ dependencies = [
  "fancy-regex",
  "freshell-codex",
  "freshell-opencode",
+ "freshell-ownership",
  "freshell-platform",
  "freshell-protocol",
  "freshell-sessions",
@@ -1344,6 +1345,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "freshell-ownership"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tracing",
 ]
 
 [[package]]
@@ -1376,6 +1385,7 @@ dependencies = [
  "freshell-codex",
  "freshell-extensions",
  "freshell-freshagent",
+ "freshell-ownership",
  "freshell-platform",
  "freshell-protocol",
  "freshell-sessions",
@@ -1443,6 +1453,7 @@ dependencies = [
 name = "freshell-terminal"
 version = "0.1.0"
 dependencies = [
+ "freshell-ownership",
  "freshell-platform",
  "freshell-protocol",
  "indexmap 2.14.0",
@@ -1465,6 +1476,7 @@ dependencies = [
  "freshell-codex",
  "freshell-freshagent",
  "freshell-opencode",
+ "freshell-ownership",
  "freshell-platform",
  "freshell-protocol",
  "freshell-sessions",

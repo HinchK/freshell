@@ -115,7 +115,18 @@ function awaitCloseFrame(
  */
 export function sendTerminalKillAndAwait(
   terminalId: string,
-  opts?: { createRequestId?: string | null; timeoutMs?: number; send?: (msg: unknown) => void },
+  opts?: {
+    createRequestId?: string | null
+    timeoutMs?: number
+    send?: (msg: unknown) => void
+    /** kata b8ke delayed-request fence: the (epoch, generation) pair the
+     *  client observed when it decided to kill — a delayed kill naming
+     *  superseded ownership is typed-refused instead of killing the wrong
+     *  runtime. A pair sent together is the fence; neither-sent is
+     *  legacy-unfenced. */
+    observedEpoch?: number
+    observedGeneration?: number
+  },
 ): Promise<KillAck> {
   const requestId = nanoid()
   const send = opts?.send ?? ((m: unknown) => getWsClient().send(m))
@@ -124,6 +135,9 @@ export function sendTerminalKillAndAwait(
     terminalId,
     requestId,
     ...(opts?.createRequestId ? { createRequestId: opts.createRequestId } : {}),
+    ...(opts?.observedEpoch !== undefined && opts?.observedGeneration !== undefined
+      ? { observedEpoch: opts.observedEpoch, observedGeneration: opts.observedGeneration }
+      : {}),
   })
   const wait = awaitCloseFrame((msg) => {
     const m = msg as Record<string, unknown>
@@ -505,6 +519,13 @@ export interface FreshAgentKillRequest {
   sessionType: string
   provider: string
   cwd?: string
+  /** kata b8ke delayed-request fence: the (epoch, generation) pair the
+   *  client observed when it decided to kill — feeds the fenced stop claim
+   *  (a delayed kill naming superseded ownership is typed-refused instead
+   *  of killing the wrong runtime). A pair sent together is the fence;
+   *  neither-sent is legacy-unfenced. */
+  observedEpoch?: number
+  observedGeneration?: number
 }
 
 /**
@@ -526,6 +547,9 @@ export function sendFreshAgentKillAndAwait(
     sessionType: req.sessionType,
     provider: req.provider,
     ...(req.cwd ? { cwd: req.cwd } : {}),
+    ...(req.observedEpoch !== undefined && req.observedGeneration !== undefined
+      ? { observedEpoch: req.observedEpoch, observedGeneration: req.observedGeneration }
+      : {}),
   })
   return awaitCloseFrame((msg) => {
     const m = msg as Record<string, unknown>
