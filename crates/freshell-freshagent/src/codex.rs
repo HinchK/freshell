@@ -364,7 +364,7 @@ struct CodexSession {
     /// and does NOT remove the session (stays mapped, matching the reference's "lazy restart
     /// on next send" invariant \u2014 PR-4 implements the actual restart, see
     /// [`FreshCodexState::ensure_session_alive`]).
-    watcher: tokio::task::JoinHandle<()>,
+    watcher: tokio::task::JoinHandle<crate::session_handoff::StopResult>,
     /// PR-4: flipped `true` by the exit-watcher's self-heal (UNREQUESTED-exit) branch;
     /// consulted by [`FreshCodexState::ensure_session_alive`] on the next `freshAgent.send`/
     /// `freshAgent.attach` to decide whether a transparent respawn is needed (the
@@ -720,10 +720,18 @@ impl FreshCodexState {
             }
         }
         self.clear_controls(session_id).await;
-        self.leases.clear_binding(PROVIDER, session_id);
         let removed = self.sessions.lock().await.remove(session_id);
         let Some(session) = removed else {
-            return crate::session_handoff::StopResult::AlreadyGone;
+            let prior_recorded = self
+                .condemned_priors
+                .lock()
+                .expect("condemned priors lock")
+                .contains_key(session_id);
+            return if prior_recorded {
+                watcher_stop_not_confirmed()
+            } else {
+                crate::session_handoff::StopResult::AlreadyGone
+            };
         };
         session.consumer.abort();
         session.client.close().await;
@@ -731,14 +739,37 @@ impl FreshCodexState {
             let _ = kill_tx.send(());
         }
         // The exit-watcher performs start_kill + reap on this requested-kill
-        // path; awaiting it is the CONFIRMED reap.
-        let _ = session.watcher.await;
-        // Death confirmed — the condemned-prior record clears with it.
-        self.condemned_priors
-            .lock()
-            .expect("condemned priors lock")
-            .remove(session_id);
-        crate::session_handoff::StopResult::Reaped
+        // path; its result is the only confirmation this handoff accepts.
+        let stop_result = match session.watcher.await {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::error!(target: "freshell_freshagent::codex",
+                    session_id = %session_id,
+                    error = %error,
+                    "freshagent.codex.handoff_stop_watcher_failed: writer shutdown is unconfirmed"
+                );
+                watcher_stop_not_confirmed()
+            }
+        };
+        if matches!(
+            stop_result,
+            crate::session_handoff::StopResult::Reaped
+                | crate::session_handoff::StopResult::AlreadyGone
+        ) {
+            self.leases.clear_binding(PROVIDER, session_id);
+            // Death confirmed — the condemned-prior record clears with it.
+            self.condemned_priors
+                .lock()
+                .expect("condemned priors lock")
+                .remove(session_id);
+        } else {
+            tracing::warn!(target: "freshell_freshagent::codex",
+                session_id = %session_id,
+                result = ?stop_result,
+                "freshagent.codex.handoff_stop_unconfirmed: retaining condemned identity"
+            );
+        }
+        stop_result
     }
 
     /// b8ke focused round-2 review R2-1 (widened round-3 R3-7): the bounded
@@ -8144,6 +8175,12 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
 ///   the reference's "leave the runtime mapped for lazy restart" invariant.
 /// - A `freshAgent.kill` REQUESTS teardown via `kill_rx`: gracefully `start_kill` + reap, with
 ///   NO self-heal event (the caller broadcasts its own `freshAgent.killed`).
+fn watcher_stop_not_confirmed() -> crate::session_handoff::StopResult {
+    crate::session_handoff::StopResult::NotConfirmed {
+        confirmation: Box::pin(async { false }),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_exit_watcher(
     mut child: tokio::process::Child,
@@ -8157,10 +8194,19 @@ pub(crate) fn spawn_exit_watcher(
     // kata b8ke Task 3: release the retained coordinator stamp on exit with
     // its fenced claim (None when the lane is unwired — pre-existing tests).
     ownership: Option<crate::ownership_lane::OwnershipWatch>,
-) -> tokio::task::JoinHandle<()> {
+) -> tokio::task::JoinHandle<crate::session_handoff::StopResult> {
     // wfah: the thread id is fixed by the time the watcher is constructed at
     // every successful spawn site; enrich the durable record once, here.
     crate::codex_sidecar_tracking::enrich_record_session_id(&ownership_id, &thread_id);
+    // Capture the child's identity before either branch can await. An
+    // incomplete observation is never proof that an owned writer is gone.
+    let recorded = child.id().map(|pid| {
+        crate::session_lease::record_condemned_runtime_identity(
+            pid,
+            CODEX_SIDECAR_OWNERSHIP_ENV,
+            &ownership_id,
+        )
+    });
     tokio::spawn(async move {
         // `biased` + the REQUESTED-kill arm listed FIRST: a `freshAgent.kill` signals
         // `kill_tx` right before `start_kill()`s the child, so `child.wait()` can become
@@ -8176,38 +8222,86 @@ pub(crate) fn spawn_exit_watcher(
                 // session that is going away (resolves a flagged stuck state).
                 disarm_codex_quiet(&quiet_deadman, &thread_id, "kill");
                 let _ = child.start_kill();
-                let _ = child.wait().await;
-                reap_owned_codex_sidecars(&ownership_id);
-                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                // Task 12: the bound session is gone -- reopen its durable id.
-                leases.clear_binding(PROVIDER, &thread_id);
-                // kata b8ke Task 3: the requested-kill path's coordinator
-                // transition is the kill flow's own `commit_stop` (the
-                // release here is fenced and no-ops during `Stopping`); the
-                // stamp is consumed either way.
-                if let Some(watch) = &ownership {
-                    watch.release(&thread_id, "freshcodex/watcher-requested-kill");
+                let wait_result = child.wait().await;
+                let confirmed = if cfg!(target_os = "linux") {
+                    match recorded.as_ref() {
+                        Some(recorded) => {
+                            crate::session_lease::kill_and_confirm_recorded_tree_dead(
+                                recorded,
+                                CODEX_SIDECAR_OWNERSHIP_ENV,
+                            )
+                            .await
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                if confirmed {
+                    crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+                    // Task 12: the bound session is gone -- reopen its durable id.
+                    leases.clear_binding(PROVIDER, &thread_id);
+                    // kata b8ke Task 3: the requested-kill path's coordinator
+                    // transition is the kill flow's own `commit_stop` (the
+                    // release here is fenced and no-ops during `Stopping`).
+                    if let Some(watch) = &ownership {
+                        watch.release(&thread_id, "freshcodex/watcher-requested-kill");
+                    }
+                    tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.sidecar.reaped");
+                    crate::session_handoff::StopResult::Reaped
+                } else if !cfg!(target_os = "linux") && wait_result.is_ok() {
+                    tracing::warn!(provider = PROVIDER, session_id = %thread_id,
+                        "freshagent.sidecar.platform_limited: direct child exited but descendant tree is unverified");
+                    crate::session_handoff::StopResult::PlatformLimited
+                } else {
+                    tracing::warn!(provider = PROVIDER, session_id = %thread_id,
+                        wait_error = ?wait_result.as_ref().err(),
+                        "freshagent.sidecar.reap_unconfirmed: owned writer shutdown could not be confirmed");
+                    watcher_stop_not_confirmed()
                 }
-                tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.sidecar.reaped");
             }
-            _ = child.wait() => {
+            wait_result = child.wait() => {
                 // A crashed sidecar ends any in-flight turn: disarm the deadman -- a
                 // dead process is surfaced via the `exited` self-heal below, never via
                 // the wedged-ALIVE `stuck` flag.
                 disarm_codex_quiet(&quiet_deadman, &thread_id, "exit");
-                reap_owned_codex_sidecars(&ownership_id);
-                crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
-                // Task 12: a crashed sidecar is no longer a live writer -- reopen the
-                // durable id (the entry stays mapped for PR-4 lazy respawn, which
-                // re-claims through the attach/send seams).
-                leases.clear_binding(PROVIDER, &thread_id);
-                // kata b8ke Task 3: an UNREQUESTED exit releases the retained
-                // coordinator stamp with its fenced claim (round-1 review) —
-                // the key reopens for the next claimant.
-                if let Some(watch) = &ownership {
-                    watch.release(&thread_id, "freshcodex/watcher-exit");
-                }
-                tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.sidecar.reaped");
+                let confirmed = if cfg!(target_os = "linux") {
+                    match recorded.as_ref() {
+                        Some(recorded) => {
+                            crate::session_lease::kill_and_confirm_recorded_tree_dead(
+                                recorded,
+                                CODEX_SIDECAR_OWNERSHIP_ENV,
+                            )
+                            .await
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                let stop_result = if confirmed {
+                    crate::codex_sidecar_tracking::scrub_sidecar_record(&ownership_id);
+                    // Task 12: a crashed sidecar is no longer a live writer -- reopen the
+                    // durable id (the entry stays mapped for PR-4 lazy respawn, which
+                    // re-claims through the attach/send seams).
+                    leases.clear_binding(PROVIDER, &thread_id);
+                    // kata b8ke Task 3: an UNREQUESTED exit releases the retained
+                    // coordinator stamp with its fenced claim.
+                    if let Some(watch) = &ownership {
+                        watch.release(&thread_id, "freshcodex/watcher-exit");
+                    }
+                    tracing::info!(provider = PROVIDER, session_id = %thread_id, "freshagent.sidecar.reaped");
+                    crate::session_handoff::StopResult::Reaped
+                } else if !cfg!(target_os = "linux") && wait_result.is_ok() {
+                    tracing::warn!(provider = PROVIDER, session_id = %thread_id,
+                        "freshagent.sidecar.platform_limited: direct child exited but descendant tree is unverified");
+                    crate::session_handoff::StopResult::PlatformLimited
+                } else {
+                    tracing::warn!(provider = PROVIDER, session_id = %thread_id,
+                        wait_error = ?wait_result.as_ref().err(),
+                        "freshagent.sidecar.reap_unconfirmed: owned writer shutdown could not be confirmed");
+                    watcher_stop_not_confirmed()
+                };
                 // DIAG-01: an UNREQUESTED exit -- the crash/disconnect self-heal
                 // edge (`kill_rx` firing instead would mean a requested kill,
                 // handled in the sibling arm above with no event here).
@@ -8223,6 +8317,7 @@ pub(crate) fn spawn_exit_watcher(
                 if let Some(frame) = adapter_event_to_frame(&event, &thread_id) {
                     let _ = broadcast_tx.send(frame);
                 }
+                stop_result
             }
         }
     })
@@ -10712,6 +10807,31 @@ pub(crate) mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn requested_exit_watcher_reports_confirmed_reap() {
+        let (broadcast_tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
+        let (kill_tx, kill_rx) = oneshot::channel();
+        let child = spawn_sleeper();
+        let watcher = spawn_exit_watcher(
+            child,
+            "codex-watcher-result-test".to_string(),
+            "thread-watcher-result-test".to_string(),
+            Arc::new(broadcast_tx),
+            kill_rx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
+            QuietDeadman::new_shared(),
+            None,
+        );
+        kill_tx.send(()).expect("request watcher teardown");
+
+        let result = watcher.await.expect("watcher task completed");
+        assert!(
+            matches!(result, crate::session_handoff::StopResult::Reaped),
+            "requested teardown must expose its confirmation result: {result:?}"
+        );
+    }
+
     /// b8ke focused review FR9: the half-fenced kill refusal carries the
     /// typed INVALID_FENCE code in the `freshAgent.killed` answer — clients
     /// reduce the code instead of the generic KILL_FAILED default.
@@ -10987,7 +11107,7 @@ pub(crate) mod tests {
         // whose kill_tx is absent — the teardown block parks on the watcher
         // join forever.
         let consumer = tokio::spawn(async {});
-        let watcher = tokio::spawn(std::future::pending::<()>());
+        let watcher = tokio::spawn(std::future::pending::<crate::session_handoff::StopResult>());
         let exited = Arc::new(AtomicBool::new(false));
         st.sessions.lock().await.insert(
             "thread-stall".to_string(),

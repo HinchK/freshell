@@ -22873,6 +22873,7 @@ rl.on('line', (line) => {
             start_time: Some(u64::MAX / 2),
             tree: Vec::new(),
             ownership_id: sid.clone(),
+            capture_complete: true,
         };
         st.condemned_priors
             .lock()

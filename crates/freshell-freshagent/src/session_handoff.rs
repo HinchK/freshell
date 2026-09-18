@@ -71,6 +71,10 @@ pub struct HandoffTestHooks {
     pub force_reap_timeout_fenced_skip: std::sync::atomic::AtomicUsize,
     pub force_platform_limited: std::sync::atomic::AtomicBool,
     pub force_platform_limited_skip: std::sync::atomic::AtomicUsize,
+    /// Force the atomic handoff capability preflight to refuse. This is a
+    /// deterministic test seam for unsupported-platform behavior and is
+    /// intentionally separate from the post-stop platform-limited seam.
+    pub force_unsupported_preflight: std::sync::atomic::AtomicBool,
     /// b8ke focused review FR6: abort the detached reap-confirmation task
     /// at the NEXT watcher spawn — the injected REAL JoinError (cancelled)
     /// the watcher's fail-open typed release is tested against. Atomic so
@@ -122,6 +126,7 @@ impl Default for HandoffTestHooks {
             force_reap_timeout_fenced_skip: std::sync::atomic::AtomicUsize::new(0),
             force_platform_limited: std::sync::atomic::AtomicBool::new(false),
             force_platform_limited_skip: std::sync::atomic::AtomicUsize::new(0),
+            force_unsupported_preflight: std::sync::atomic::AtomicBool::new(false),
             abort_reap_confirmation_once: std::sync::atomic::AtomicBool::new(false),
             drop_abort_target_confirmation_once: std::sync::atomic::AtomicBool::new(false),
             fail_target_spawn_once: std::sync::atomic::AtomicBool::new(false),
@@ -639,6 +644,38 @@ impl SessionHandoffRunner {
             return self
                 .clear_stale_bookkeeping(&req, &operation_id, &initiator)
                 .await;
+        }
+        // An atomic handoff needs a platform capability that can positively
+        // confirm the complete prior writer tree is gone. Refuse before
+        // `begin_handoff` on platforms without that capability, so this
+        // typed limitation cannot strand a new Handoff state or mutate the
+        // prior owner. Clear-only intentionally bypasses this preflight above:
+        // it only repairs already fenced bookkeeping and never starts a writer.
+        let forced_unsupported = self.test_hooks.as_ref().is_some_and(|hooks| {
+            hooks
+                .force_unsupported_preflight
+                .load(std::sync::atomic::Ordering::SeqCst)
+        });
+        if !cfg!(target_os = "linux") || forced_unsupported {
+            let generation = self
+                .ownership
+                .observe(&req.provider, &req.session_id)
+                .generation;
+            tracing::warn!(target: "freshell_ownership",
+                event = "ownership.handoff.refused_pre_stop",
+                provider = %req.provider,
+                session_id = %req.session_id,
+                epoch = self.ownership.boot_epoch(),
+                generation,
+                outcome = "unsupported_platform",
+                failure_reason = "PLATFORM_LIMITED",
+                "atomic session handoff refused before mutation: the platform cannot confirm the complete prior writer tree");
+            return typed_failure(
+                "PLATFORM_LIMITED",
+                "atomic session handoff is unavailable because the server cannot confirm the complete prior writer tree; the existing session was left running",
+                true,
+                generation,
+            );
         }
         let began = std::time::Instant::now();
         // 1. Atomically enter Handoff (+generation). The fence pair is

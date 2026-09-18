@@ -701,6 +701,60 @@ fn handoff_action_contract_defaults_legacy_ack_only_to_clear() {
     .is_err());
 }
 
+/// Task 3/F2: unsupported atomic handoff capability is refused before the
+/// coordinator enters Handoff. The clear-only action still bypasses this
+/// capability check because it never stops or starts a writer.
+#[tokio::test]
+async fn unsupported_atomic_handoff_refuses_before_mutation_and_clear_bypasses_preflight() {
+    let _guard = ENV_LOCK.lock().await;
+    let _claude_env = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+    let env = FakeSidecarEnv::install();
+    let hooks = Arc::new(HandoffTestHooks::default());
+    hooks
+        .force_unsupported_preflight
+        .store(true, Ordering::SeqCst);
+    let sid = uuid::Uuid::new_v4().to_string();
+    let mut rig = build_rig(Some(Arc::clone(&hooks)));
+
+    let mut clear = handoff_req_terminal("claude", &sid, "claude");
+    clear.action = HandoffAction::ClearStaleBookkeeping;
+    let clear_result = rig.runner.spawn_handoff(clear).completion.await.unwrap();
+    assert_eq!(clear_result["error"]["code"], json!("SESSION_NOT_FOUND"));
+
+    establish_fresh_claude_owner(&mut rig, &sid).await;
+    let before = rig.ownership.observe("claude", &sid);
+    let before_flavor_writes = rig.flavor_log.lock().unwrap().len();
+    let before_create_rows = env.create_rows().len();
+    let before_events = hooks.events.lock().unwrap().clone();
+
+    let result = rig
+        .runner
+        .spawn_handoff(handoff_req_terminal("claude", &sid, "claude"))
+        .completion
+        .await
+        .unwrap();
+
+    assert_eq!(result["ok"], json!(false), "unsupported handoff: {result}");
+    assert_eq!(result["error"]["code"], json!("PLATFORM_LIMITED"));
+    assert_eq!(result["error"]["retryable"], json!(true));
+    assert_eq!(rig.ownership.observe("claude", &sid), before);
+    assert_eq!(
+        rig.flavor_log.lock().unwrap().len(),
+        before_flavor_writes,
+        "preflight must precede durable flavor writes"
+    );
+    assert_eq!(
+        env.create_rows().len(),
+        before_create_rows,
+        "preflight must not tear down or recreate the prior runtime"
+    );
+    assert_eq!(
+        *hooks.events.lock().unwrap(),
+        before_events,
+        "preflight must not enter target-start hooks"
+    );
+}
+
 fn create_msg(sid: &str) -> FreshAgentCreate {
     FreshAgentCreate {
         request_id: format!("handoff-create-{}", uuid::Uuid::new_v4()),

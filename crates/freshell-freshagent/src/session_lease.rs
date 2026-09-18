@@ -74,11 +74,22 @@ pub async fn kill_and_confirm_tree_dead(pid: u32, ownership_env: &str, ownership
     // The direct child's recorded start time — captured BEFORE any signal
     // so the grace wait and the escalation both revalidate the incarnation
     // (b8ke focused round-4 R4-8: a pid recycled mid-wait is never signaled).
-    let child_start = proc_starttime(pid as i32);
-    let mut tree: Vec<(i32, u64)> = scan_tagged_pids(ownership_env, ownership_id)
-        .into_iter()
-        .filter_map(|p| proc_starttime(p).map(|st| (p, st)))
-        .collect();
+    let child_start = match proc_starttime_observation(pid as i32) {
+        Ok(start) => start,
+        Err(_) => return false,
+    };
+    let scan = scan_tagged_pids(ownership_env, ownership_id, Some(pid as i32));
+    if !scan.complete {
+        return false;
+    }
+    let mut tree = Vec::new();
+    for p in scan.pids {
+        match proc_starttime_observation(p) {
+            Ok(Some(st)) => tree.push((p, st)),
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+    }
     if !tree.iter().any(|(p, _)| *p == pid as i32) {
         if let Some(st) = child_start {
             tree.push((pid as i32, st));
@@ -95,7 +106,7 @@ pub async fn kill_and_confirm_tree_dead(pid: u32, ownership_env: &str, ownership
     // escalation after 20 SIGTERM rounds). Re-scan folds in still-readable
     // tagged newcomers (covers the YAMA=0 case and children spawned after
     // the initial capture).
-    sweep_captured_tree_until_dead(tree, ownership_env, ownership_id).await
+    sweep_captured_tree_until_dead(tree, ownership_env, ownership_id, Some(pid as i32)).await
 }
 
 /// The sweep behind [`kill_and_confirm_tree_dead`]'s step 3: poll the
@@ -110,13 +121,31 @@ async fn sweep_captured_tree_until_dead(
     mut tree: Vec<(i32, u64)>,
     ownership_env: &str,
     ownership_id: &str,
+    owned_root_pid: Option<i32>,
 ) -> bool {
     for round in 0..24u8 {
-        tree.retain(|(p, st)| proc_starttime(*p) == Some(*st));
-        for p in scan_tagged_pids(ownership_env, ownership_id) {
+        let mut observation_complete = true;
+        tree.retain(|(p, st)| match proc_starttime_observation(*p) {
+            Ok(Some(actual)) => actual == *st,
+            Ok(None) => false,
+            Err(_) => {
+                observation_complete = false;
+                true
+            }
+        });
+        if !observation_complete {
+            return false;
+        }
+        let scan = scan_tagged_pids(ownership_env, ownership_id, owned_root_pid);
+        if !scan.complete {
+            return false;
+        }
+        for p in scan.pids {
             if !tree.iter().any(|(q, _)| *q == p) {
-                if let Some(st) = proc_starttime(p) {
-                    tree.push((p, st));
+                match proc_starttime_observation(p) {
+                    Ok(Some(st)) => tree.push((p, st)),
+                    Ok(None) => {}
+                    Err(_) => return false,
                 }
             }
         }
@@ -133,8 +162,16 @@ async fn sweep_captured_tree_until_dead(
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    tree.retain(|(p, st)| proc_starttime(*p) == Some(*st));
-    tree.is_empty()
+    let mut observation_complete = true;
+    tree.retain(|(p, st)| match proc_starttime_observation(*p) {
+        Ok(Some(actual)) => actual == *st,
+        Ok(None) => false,
+        Err(_) => {
+            observation_complete = false;
+            true
+        }
+    });
+    observation_complete && tree.is_empty()
 }
 
 /// b8ke focused round-3 review R3-7: the recorded identity of a condemned
@@ -158,6 +195,20 @@ pub struct CondemnedRuntimeIdentity {
     pub tree: Vec<(i32, u64)>,
     /// The ownership tag the tree was discovered under.
     pub ownership_id: String,
+    /// Whether the owned-process observation completed without losing the
+    /// direct runtime identity. An incomplete capture is never proof that
+    /// the recorded writer set is gone.
+    pub capture_complete: bool,
+}
+
+/// Evidence for one recorded process candidate. A missing process or a
+/// readable different incarnation proves the recorded process is gone;
+/// read/parse/permission failures remain explicitly unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordedProcessEvidence {
+    SameIncarnation,
+    Gone,
+    Unavailable,
 }
 
 /// Capture a condemned runtime's identity NOW (kill time): the tagged tree
@@ -168,20 +219,30 @@ pub fn record_condemned_runtime_identity(
     ownership_env: &str,
     ownership_id: &str,
 ) -> CondemnedRuntimeIdentity {
-    let mut tree: Vec<(i32, u64)> = scan_tagged_pids(ownership_env, ownership_id)
-        .into_iter()
-        .filter_map(|p| proc_starttime(p).map(|st| (p, st)))
-        .collect();
+    let child_observation = proc_starttime_observation(pid as i32);
+    let mut capture_complete = child_observation.is_ok();
+    let child_start = child_observation.ok().flatten();
+    let scan = scan_tagged_pids(ownership_env, ownership_id, Some(pid as i32));
+    capture_complete &= scan.complete;
+    let mut tree = Vec::new();
+    for p in scan.pids {
+        match proc_starttime_observation(p) {
+            Ok(Some(st)) => tree.push((p, st)),
+            Ok(None) => {}
+            Err(_) => capture_complete = false,
+        }
+    }
     if !tree.iter().any(|(p, _)| *p == pid as i32) {
-        if let Some(st) = proc_starttime(pid as i32) {
+        if let Some(st) = child_start {
             tree.push((pid as i32, st));
         }
     }
     CondemnedRuntimeIdentity {
         pid,
-        start_time: proc_starttime(pid as i32),
+        start_time: child_start,
         tree,
         ownership_id: ownership_id.to_string(),
+        capture_complete,
     }
 }
 
@@ -198,6 +259,7 @@ pub fn record_condemned_runtime_identity(
         start_time: None,
         tree: Vec::new(),
         ownership_id: ownership_id.to_string(),
+        capture_complete: false,
     }
 }
 
@@ -223,19 +285,42 @@ pub async fn kill_and_confirm_recorded_tree_dead(
     recorded: &CondemnedRuntimeIdentity,
     ownership_env: &str,
 ) -> bool {
+    if !recorded.capture_complete {
+        tracing::warn!(target: "freshell_freshagent::session_lease",
+            pid = recorded.pid,
+            ownership_id = %recorded.ownership_id,
+            "session_lease.recorded_tree_incomplete: owned-process evidence is unavailable; \
+             the reap remains unconfirmed"
+        );
+        return false;
+    }
     // The recorded start time is the identity license: the direct child's
     // signals ride the pidfd-pinned incarnation only (R5-4). No recorded
     // start time (the identity says the child was already gone at capture
     // — `proc_starttime` reads None for a dead or zombie process): NOTHING
     // is signaled on the bare pid (an unconfirmable identity never signals
     // its occupant) and the recorded tree alone is confirmed.
-    if recorded.start_time.is_some()
-        && kill_recorded_child_unconfirmed(recorded.pid, recorded.start_time).await
-    {
-        return false;
+    if recorded.start_time.is_some() {
+        match recorded_process_evidence(recorded.pid, recorded.start_time) {
+            RecordedProcessEvidence::SameIncarnation => {
+                let unconfirmed =
+                    kill_recorded_child_unconfirmed(recorded.pid, recorded.start_time).await;
+                if unconfirmed {
+                    return false;
+                }
+            }
+            RecordedProcessEvidence::Gone => {}
+            RecordedProcessEvidence::Unavailable => return false,
+        }
     }
-    sweep_captured_tree_until_dead(recorded.tree.clone(), ownership_env, &recorded.ownership_id)
-        .await
+    let swept = sweep_captured_tree_until_dead(
+        recorded.tree.clone(),
+        ownership_env,
+        &recorded.ownership_id,
+        Some(recorded.pid as i32),
+    )
+    .await;
+    swept
 }
 
 /// Non-Linux: no `/proc` — hold closed (the fence stays held).
@@ -380,12 +465,19 @@ pub(crate) fn signal_recorded_incarnation(
         // the pin there is no identity-safe send — no signal.
         Err(_) => return IncarnationSignal::Unconfirmable,
     };
-    let sent = match proc_starttime(pid as i32) {
+    let sent = match proc_starttime_observation(pid as i32) {
+        Err(_) => {
+            return {
+                unsafe { libc::close(pidfd) };
+                IncarnationSignal::Unconfirmable
+            }
+        }
+        Ok(None) => false,
         // STILL the recorded incarnation at this instant — and the pidfd
         // pins that same occupant, so the send below cannot reach a
         // recycled replacement even if the pid turns over between this
         // verify and the send.
-        Some(actual) if actual == expected => {
+        Ok(Some(actual)) if actual == expected => {
             let sent = pinned_signal::send_signal(pidfd, sig);
             // `false` here is ESRCH: the pinned incarnation exited since
             // the verify — provably gone, never a replacement.
@@ -397,7 +489,7 @@ pub(crate) fn signal_recorded_incarnation(
         // reads None exactly for a gone, zombie, or exited process (the
         // wait discipline's proof of death) — nothing to signal, nothing
         // of ours remains.
-        Some(_) | None => false,
+        Ok(Some(_)) => false,
     };
     unsafe { libc::close(pidfd) };
     if sent {
@@ -455,21 +547,6 @@ async fn kill_recorded_child_unconfirmed(pid: u32, recorded_start: Option<u64>) 
     !wait_recorded_incarnation_gone(pid, recorded_start).await
 }
 
-/// b8ke focused round-4 review R4-8: is `pid` still the RECORDED process
-/// incarnation? With a recorded start time, the pid belongs to the
-/// original process iff `/proc` still shows EXACTLY that start time — a
-/// recycled pid (the original died; an unrelated process took the id)
-/// reads a DIFFERENT start time and is never "ours". Without a recorded
-/// start time (the legacy discipline), pid existence alone is the best
-/// available identity.
-#[cfg(target_os = "linux")]
-pub(crate) fn pid_is_recorded_incarnation(pid: u32, recorded_start: Option<u64>) -> bool {
-    match recorded_start {
-        Some(expected) => matches!(proc_starttime(pid as i32), Some(actual) if actual == expected),
-        None => proc_starttime(pid as i32).is_some(),
-    }
-}
-
 /// b8ke focused episode-2 round-1 F5/F6: the process's recorded start time
 /// for the delayed start-cancellation machinery — the pid-reuse guard the
 /// cancellation signals verify against. `None` when the pid is absent or
@@ -498,12 +575,17 @@ pub(crate) fn recorded_start_time(_pid: Option<u32>) -> Option<u64> {
 #[cfg(target_os = "linux")]
 async fn wait_recorded_incarnation_gone(pid: u32, recorded_start: Option<u64>) -> bool {
     for _ in 0..20u8 {
-        if !pid_is_recorded_incarnation(pid, recorded_start) {
-            return true;
+        match recorded_process_evidence(pid, recorded_start) {
+            RecordedProcessEvidence::Gone => return true,
+            RecordedProcessEvidence::Unavailable => return false,
+            RecordedProcessEvidence::SameIncarnation => {}
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    !pid_is_recorded_incarnation(pid, recorded_start)
+    matches!(
+        recorded_process_evidence(pid, recorded_start),
+        RecordedProcessEvidence::Gone
+    )
 }
 
 /// The process's `starttime` (field 22 of `/proc/<pid>/stat`, world-readable — no
@@ -513,16 +595,53 @@ async fn wait_recorded_incarnation_gone(pid: u32, recorded_start: Option<u64>) -
 /// lane's confirmed-reap capture (b8ke delta review F2).
 #[cfg(target_os = "linux")]
 pub(crate) fn proc_starttime(pid: i32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    proc_starttime_observation(pid).ok().flatten()
+}
+
+/// Read a process start time while preserving unavailable observations as a
+/// distinct result from a process that is gone.
+#[cfg(target_os = "linux")]
+fn proc_starttime_observation(pid: i32) -> Result<Option<u64>, ()> {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
     // comm (field 2) may contain spaces/parens: split at the LAST ')' — the remainder
     // starts at field 3 (state), so starttime (field 22) is index 19 there.
-    let rest = stat.rsplit(')').next()?;
+    let rest = stat.rsplit(')').next().ok_or(())?;
     let fields: Vec<&str> = rest.split_whitespace().collect();
     match fields.first() {
-        Some(&"Z") | Some(&"X") | None => return None,
+        Some(&"Z") | Some(&"X") => return Ok(None),
+        None => return Err(()),
         Some(_) => {}
     }
-    fields.get(19)?.parse().ok()
+    fields.get(19).ok_or(())?.parse().map(Some).map_err(|_| ())
+}
+
+/// Classify the current occupant against the recorded process incarnation.
+#[cfg(target_os = "linux")]
+pub(crate) fn recorded_process_evidence(
+    pid: u32,
+    recorded_start: Option<u64>,
+) -> RecordedProcessEvidence {
+    match proc_starttime_observation(pid as i32) {
+        Err(_) => RecordedProcessEvidence::Unavailable,
+        Ok(None) => RecordedProcessEvidence::Gone,
+        Ok(Some(actual)) => match recorded_start {
+            Some(expected) if expected == actual => RecordedProcessEvidence::SameIncarnation,
+            Some(_) => RecordedProcessEvidence::Gone,
+            None => RecordedProcessEvidence::Unavailable,
+        },
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn recorded_process_evidence(
+    _pid: u32,
+    _recorded_start: Option<u64>,
+) -> RecordedProcessEvidence {
+    RecordedProcessEvidence::Unavailable
 }
 
 /// All live pids whose `/proc/<pid>/environ` carries `{env}={id}` (the ownership tag
@@ -530,27 +649,139 @@ pub(crate) fn proc_starttime(pid: i32) -> Option<u64> {
 /// this process may ptrace (YAMA) — see [`kill_and_confirm_tree_dead`]'s capture-first
 /// design for why that constraint is handled there.
 #[cfg(target_os = "linux")]
-fn scan_tagged_pids(ownership_env: &str, ownership_id: &str) -> Vec<i32> {
+struct TaggedProcessScan {
+    pids: Vec<i32>,
+    complete: bool,
+}
+
+#[cfg(target_os = "linux")]
+fn scan_tagged_pids(
+    ownership_env: &str,
+    ownership_id: &str,
+    owned_root_pid: Option<i32>,
+) -> TaggedProcessScan {
     let needle = format!("{ownership_env}={ownership_id}");
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return out;
+    let entries = match std::fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(_) => {
+            return TaggedProcessScan {
+                pids: out,
+                complete: false,
+            }
+        }
     };
-    for entry in entries.flatten() {
+    let mut complete = true;
+    // `/proc/<pid>/environ` is intentionally unreadable for processes owned by
+    // other users. Those processes cannot be part of this server's normally
+    // inherited sidecar tree, so filter them by the readable ownership record
+    // before treating an environ read failure as unknown evidence.
+    let current_uid = unsafe { libc::geteuid() };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => {
+                // An unreadable directory entry leaves the process identity
+                // unknown, so this capture cannot prove the tree is gone.
+                complete = false;
+                continue;
+            }
+        };
         let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
+        let Some(name) = name.to_str() else {
+            complete = false;
+            continue;
+        };
         let Ok(pid) = name.parse::<i32>() else {
             continue;
         };
-        let environ = std::path::Path::new("/proc").join(name).join("environ");
-        let Ok(bytes) = std::fs::read(environ) else {
+        let status_path = std::path::Path::new("/proc").join(name).join("status");
+        let status = match std::fs::read_to_string(status_path) {
+            Ok(status) => status,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                if process_is_known_owned_process(pid, owned_root_pid) {
+                    complete = false;
+                }
+                continue;
+            }
+        };
+        let Some(uid) = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:")?.split_whitespace().next())
+            .and_then(|uid| uid.parse::<libc::uid_t>().ok())
+        else {
+            if process_is_known_owned_process(pid, owned_root_pid) {
+                complete = false;
+            }
             continue;
+        };
+        if uid != current_uid {
+            continue;
+        }
+        let environ = std::path::Path::new("/proc").join(name).join("environ");
+        let bytes = match std::fs::read(environ) {
+            Ok(bytes) => bytes,
+            // A process disappearing between the directory and environ read
+            // is an expected race, not unknown surviving-writer evidence.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                // Same-user processes can still make environ unreadable (for
+                // example a non-dumpable user service). An unrelated process
+                // cannot be evidence about this sidecar; an unreadable
+                // process in the known sidecar ancestry does.
+                if process_is_known_owned_process(pid, owned_root_pid) {
+                    complete = false;
+                }
+                continue;
+            }
         };
         if bytes.split(|b| *b == 0).any(|kv| kv == needle.as_bytes()) {
             out.push(pid);
         }
     }
-    out
+    TaggedProcessScan {
+        pids: out,
+        complete,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_known_owned_process(pid: i32, owned_root_pid: Option<i32>) -> bool {
+    owned_root_pid.is_some_and(|root| {
+        // The direct root is expected to be a zombie briefly after the
+        // watcher reaps it. Its unreadable `/proc/<pid>/environ` is therefore
+        // evidence of normal exit, not an unknown surviving writer.
+        if pid == root && matches!(proc_starttime_observation(pid), Ok(None)) {
+            return false;
+        }
+        process_is_descendant_of(pid, root).unwrap_or(false)
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_descendant_of(mut pid: i32, root_pid: i32) -> Result<bool, ()> {
+    for _ in 0..128 {
+        if pid == root_pid {
+            return Ok(true);
+        }
+        let status = match std::fs::read_to_string(format!("/proc/{pid}/status")) {
+            Ok(status) => status,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Err(()),
+        };
+        let parent = status
+            .lines()
+            .find_map(|line| line.strip_prefix("PPid:")?.split_whitespace().next())
+            .ok_or(())?
+            .parse::<i32>()
+            .map_err(|_| ())?;
+        if parent <= 1 {
+            return Ok(false);
+        }
+        pid = parent;
+    }
+    Err(())
 }
 
 /// The answer to a [`FreshAgentSessionLeases::claim`].
@@ -980,6 +1211,7 @@ mod tests {
             start_time: Some(proc_starttime(pid as i32).expect("start time") + 1),
             tree: Vec::new(),
             ownership_id: "r48-kill-path".to_string(),
+            capture_complete: true,
         };
 
         let confirmed = kill_and_confirm_recorded_tree_dead(&recorded, "R48_TEST_OWNERSHIP").await;
@@ -1020,6 +1252,7 @@ mod tests {
             start_time: None,
             tree: Vec::new(),
             ownership_id: "r54-unconfirmable".to_string(),
+            capture_complete: true,
         };
 
         let confirmed =
@@ -1055,6 +1288,7 @@ mod tests {
             start_time: proc_starttime(pid as i32),
             tree: Vec::new(),
             ownership_id: "r54-pinned".to_string(),
+            capture_complete: true,
         };
 
         let confirmed = kill_and_confirm_recorded_tree_dead(&recorded, "R54_TEST_OWNERSHIP").await;
@@ -1068,5 +1302,39 @@ mod tests {
             "the recorded child itself was signaled (through the pidfd) and is dead"
         );
         let _ = child.kill().await;
+    }
+
+    /// An owned candidate whose process observation was incomplete is not a
+    /// confirmed reap. The direct pid may already be gone, but the missing
+    /// candidate evidence could still represent a surviving writer.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn incomplete_owned_process_evidence_keeps_the_reap_unconfirmed() {
+        let mut occupant = tokio::process::Command::new("sleep")
+            .arg("300")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the evidence-test occupant");
+        let pid = occupant.id().expect("occupant pid");
+        let recorded = CondemnedRuntimeIdentity {
+            pid,
+            start_time: None,
+            tree: Vec::new(),
+            ownership_id: "r56-incomplete-evidence".to_string(),
+            capture_complete: false,
+        };
+
+        let confirmed =
+            kill_and_confirm_recorded_tree_dead(&recorded, "R56_INCOMPLETE_EVIDENCE").await;
+
+        assert!(
+            !confirmed,
+            "incomplete owned evidence must retain the fence"
+        );
+        assert!(
+            proc_starttime(pid as i32).is_some(),
+            "the unconfirmable occupant must not be signaled"
+        );
+        let _ = occupant.kill().await;
     }
 }

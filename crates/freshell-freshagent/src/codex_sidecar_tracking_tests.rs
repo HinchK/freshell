@@ -273,7 +273,7 @@ async fn failed_spawn_leaves_no_record() {
 async fn build_recorded_watch(
     ownership_id: &str,
 ) -> (
-    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<crate::session_handoff::StopResult>,
     tokio::sync::oneshot::Sender<()>,
     u32,
 ) {
@@ -304,7 +304,11 @@ async fn requested_kill_arm_removes_the_record() {
     assert_eq!(guard.records().len(), 1, "recorded before the kill");
 
     kill_tx.send(()).expect("kill channel open");
-    watcher.await.expect("watcher completes");
+    let result = watcher.await.expect("watcher completes");
+    assert!(
+        matches!(result, crate::session_handoff::StopResult::Reaped),
+        "a requested dead child should expose a confirmed reap: {result:?}"
+    );
 
     assert!(
         guard.records().is_empty(),
@@ -344,7 +348,11 @@ async fn unrequested_exit_arm_removes_the_record() {
         crate::codex::QuietDeadman::new_shared(),
         None,
     );
-    watcher.await.expect("watcher completes");
+    let result = watcher.await.expect("watcher completes");
+    assert!(
+        matches!(result, crate::session_handoff::StopResult::Reaped),
+        "an unrequested dead child should expose a confirmed reap: {result:?}"
+    );
 
     assert!(
         guard.records().is_empty(),

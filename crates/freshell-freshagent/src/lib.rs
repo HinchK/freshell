@@ -923,7 +923,10 @@ pub mod ownership_lane {
     /// `/proc` — never confirmable.
     #[cfg(target_os = "linux")]
     pub fn partial_pid_confirmed_dead(pid: u32) -> bool {
-        crate::session_lease::proc_starttime(pid as i32).is_none()
+        matches!(
+            crate::session_lease::recorded_process_evidence(pid, None),
+            crate::session_lease::RecordedProcessEvidence::Gone
+        )
     }
 
     /// Non-Linux (F5): no `/proc` — a partial pid can never be confirmed
