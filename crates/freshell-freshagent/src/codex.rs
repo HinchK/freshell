@@ -12531,6 +12531,8 @@ pub(crate) mod tests {
                     images: None,
                     cwd: None,
                     settings: None,
+                    observed_epoch: None,
+                    observed_generation: None,
                 })
                 .await;
             })
@@ -21678,6 +21680,8 @@ pub(crate) mod tests {
                 sandbox: None,
                 effort: Some(effort.to_string()),
             }),
+            observed_epoch: None,
+            observed_generation: None,
         };
 
         // First send carries the initial pair.

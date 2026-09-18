@@ -17807,6 +17807,8 @@ mod tests {
                 sandbox: None,
                 effort: effort.map(|e| e.to_string()),
             }),
+            observed_epoch: None,
+            observed_generation: None,
         }
     }
 
