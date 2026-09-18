@@ -153,7 +153,7 @@ export default function CodingAgentsSettings({
       </SettingsSection>
       <SettingsSection
         title="Fresh agent display"
-        description="Whether fresh-agent panes start with thinking rows and the tool activity line expanded"
+        description="Starting expansion of thinking rows and the tool activity line, and whether the transcript minimap rail is shown"
       >
         <SettingsRow
           label="Expand thinking"
@@ -177,6 +177,18 @@ export default function CodingAgentsSettings({
               applyLocalSetting({ freshAgent: { expandTools: checked } })
             }}
             aria-label="Expand tools"
+          />
+        </SettingsRow>
+        <SettingsRow
+          label="Show transcript minimap"
+          description="The transcript minimap is the prompt-tick rail beside fresh-agent transcripts; turn this off to hide it."
+        >
+          <Toggle
+            checked={settings.freshAgent?.showTranscriptMinimap ?? true}
+            onChange={(checked) => {
+              applyLocalSetting({ freshAgent: { showTranscriptMinimap: checked } })
+            }}
+            aria-label="Show transcript minimap"
           />
         </SettingsRow>
       </SettingsSection>

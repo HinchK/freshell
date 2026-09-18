@@ -127,13 +127,33 @@ test.describe('Truly-idle alerting (terminal.idle)', () => {
       const terminalId = findTerminalLeaf(layout)!.content.terminalId as string
 
       const claudeTab = page.locator(`[data-context="tab"][data-tab-id="${claudeTabId}"]`)
-      const claudeTabIcon = claudeTab.locator('svg').first()
+      // Busy/blue is a PANE-ICON property: repo identity icons render LEFT of
+      // the pane icons (TabItem.renderIcons, commit 6b1137d4c) and the close
+      // button after them, so `svg.first()` resolves the repo letter-avatar —
+      // a decorative element that NEVER carries text-blue-500 — whenever repo
+      // info resolves for the pane's cwd. That is the exact element the kata
+      // k81d receipts captured (received class "shrink-0 h-3 w-3 shrink-0",
+      // viewBox "0 0 16 16": the RepoIcon avatar), and a 2026-09-17 control
+      // run at the original 10s bound reproduced the identical 14-sample
+      // frame while the pane icon itself went blue on time
+      // (svg.text-blue-500 visible within 10s). Scope to the busy-blue pane
+      // icon itself — the suite's established "blue" definition
+      // (terminal-activity-rust.spec.ts tabBlueIcons).
+      const claudeTabBusyIcon = claudeTab.locator('svg.text-blue-500')
 
       // Submit a prompt: PTY submit -> tracker busy -> BLUE.
       await page.locator('.xterm').first().click()
       await page.keyboard.type('hello fake claude')
       await page.keyboard.press('Enter')
-      await expect(claudeTabIcon).toHaveClass(/text-blue-500/, { timeout: 10_000 })
+      // 10s bound (the original): the 2026-09-17 control run at this bound
+      // showed the pane icon going blue well within 10s once the locator
+      // defect above was fixed — the kata k81d receipts' failures at this
+      // frame were entirely that stale-locator artifact (no bound could pass
+      // them), so the interim 30s raise had no evidence behind it and would
+      // only slow a real busy-blue regression. The busy window is only
+      // FAKE_TURN_MS (4s) wide once the turn starts; FAKE_TURN_MS and the
+      // busy-clear margin below are untouched.
+      await expect(claudeTabBusyIcon).not.toHaveCount(0, { timeout: 10_000 })
 
       // Move away so the claude tab is a background tab when the turn ends.
       await page.getByRole('button', { name: 'New shell tab' }).click()
@@ -142,7 +162,7 @@ test.describe('Truly-idle alerting (terminal.idle)', () => {
       expect(shellTabId).not.toBe(claudeTabId)
 
       // Turn end (BEL) clears busy well before the truly-idle edge: blue off.
-      await expect(claudeTabIcon).not.toHaveClass(/text-blue-500/, { timeout: FAKE_TURN_MS + 10_000 })
+      await expect(claudeTabBusyIcon).toHaveCount(0, { timeout: FAKE_TURN_MS + 10_000 })
 
       // After the quiet 2s grace the server broadcasts terminal.idle: exactly
       // one alert edge lands (bell + shade pipeline), keyed to this terminal.

@@ -274,11 +274,21 @@ describe('shared settings contract', () => {
     expect(schema.safeParse({ freshAgent: { expandThinking: true } }).success).toBe(false)
     expect(schema.safeParse({ freshAgent: { expandTools: true } }).success).toBe(false)
     expect(schema.safeParse({ freshAgent: { showTimecodes: true } }).success).toBe(false)
+    expect(schema.safeParse({ freshAgent: { showTranscriptMinimap: true } }).success).toBe(false)
     expect(schema.safeParse({ agentChat: { defaultPlugins: ['fs'] } }).success).toBe(false)
   })
 
   it('defaults local sort mode to activity', () => {
     expect(resolveLocalSettings(undefined).sidebar.sortMode).toBe('activity')
+  })
+
+  it('defaults the transcript minimap setting on', () => {
+    expect(resolveLocalSettings(undefined).freshAgent.showTranscriptMinimap).toBe(true)
+  })
+
+  it('round-trips the transcript minimap setting and drops non-boolean values', () => {
+    expect(resolveLocalSettings({ freshAgent: { showTranscriptMinimap: false } }).freshAgent.showTranscriptMinimap).toBe(false)
+    expect(resolveLocalSettings({ freshAgent: { showTranscriptMinimap: 'yes' } } as never).freshAgent.showTranscriptMinimap).toBe(true)
   })
 
   it('migrates hybrid local sort mode to activity', () => {
@@ -824,6 +834,7 @@ describe('shared settings contract', () => {
         expandThinking: false,
         expandTools: false,
         showTimecodes: false,
+        showTranscriptMinimap: true,
       })
     })
 
@@ -833,6 +844,7 @@ describe('shared settings contract', () => {
           expandThinking: false,
           expandTools: false,
           showTimecodes: false,
+          showTranscriptMinimap: true,
         })
       }
     })

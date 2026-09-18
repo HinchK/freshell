@@ -1,10 +1,13 @@
 /**
  * P1.8 pane-identity ledger — SIGKILL durability walls (spec §4.2).
  *
- * Wall 1 (`SIGKILL-within-5s-of-pane-creation`): by the time a pane exists,
- * its identity row (or pending marker) is on disk — an abrupt SIGKILL
- * moments after creation loses nothing, and the restarted server's boot
- * scan preserves (never quarantines, never sweeps) the evidence.
+ * Wall 1 (`SIGKILL-within-5s-of-pane-creation` — the design-gate NAME from
+ * docs/plans/2026-07-24-restart-resilience-architecture-analysis.md, not this
+ * spec's enforcement bound; see withinDurabilityWall below for the 30s
+ * enforcement): by the time a pane exists, its identity row (or pending
+ * marker) is on disk — an abrupt SIGKILL moments after creation loses
+ * nothing, and the restarted server's boot scan preserves (never
+ * quarantines, never sweeps) the evidence.
  *
  * Wall 2 (`SIGKILL-between-spawn-and-identity-resolution`): in the managed
  * codex topology, identity resolves at the first managed handshake
@@ -98,14 +101,38 @@ async function listFiles(dir: string): Promise<string[]> {
   }
 }
 
-/** Poll (5s wall) for a predicate over the ledger dir. */
-async function within5s(check: () => Promise<boolean>, what: string): Promise<void> {
-  const deadline = Date.now() + 5_000
+/**
+ * Durability wall: poll `check()` until it holds, with a 30s ENFORCEMENT
+ * bound and a 200ms poll cadence. (The wavea-interactions-rust.spec.ts copy
+ * of this wall names this file as its donor.)
+ *
+ * Sizing evidence (kata pw80, wall-family load-tolerance pass): the previous
+ * 5s wall breached under co-tenant load in the gate receipts —
+ * gate-e2e-local-1.log frames 3+4 (walls at :153 "claude binding row on
+ * disk" and :291 "codex pending marker on disk") and gate3-e2e-local-1.log
+ * frames 3+4+5 (walls at :237 "opencode pending marker on disk", :153, and
+ * :291) at the 36fbc18f7/fe33b9d9f lanes — co-tenant cargo package-cache lock
+ * contention stalls the ledger writes; green in every unloaded run. Per the
+ * campaign ladder the enforcement bound is 30s.
+ *
+ * This wall asserts a REAL product promptness property — the identity row /
+ * pending marker must be on disk BEFORE the test proceeds to its imminent
+ * SIGKILL. A 30s bound still enforces on-disk-before-kill and bounds
+ * promptness; ~5s is the nominal (unloaded-host) figure, no longer the
+ * enforced bound.
+ */
+const DURABILITY_WALL_ENFORCEMENT_MS = 30_000
+const DURABILITY_WALL_POLL_MS = 200
+
+async function withinDurabilityWall(check: () => Promise<boolean>, what: string): Promise<void> {
+  const deadline = Date.now() + DURABILITY_WALL_ENFORCEMENT_MS
   while (Date.now() < deadline) {
     if (await check()) return
-    await new Promise((r) => setTimeout(r, 200))
+    await new Promise((r) => setTimeout(r, DURABILITY_WALL_POLL_MS))
   }
-  throw new Error(`5s durability wall breached: ${what}`)
+  throw new Error(
+    `durability wall breached (${DURABILITY_WALL_ENFORCEMENT_MS / 1000}s enforcement, ~5s nominal): ${what}`,
+  )
 }
 
 // The walls below assert RAW ledger file state after SIGKILL; the harness
@@ -146,11 +173,11 @@ test.describe('pane-identity ledger restart durability', () => {
         const ledgerDir = path.join(capturedHome, '.freshell', 'pane-ledger')
 
         // Claude pane: identity is pre-allocated at create — the binding
-        // row must hit disk within the 5s wall. Button label is the
-        // extension manifest's "Claude CLI" (extensions/claude-code/
-        // freshell.json; /^Claude$/ matches nothing).
+        // row must hit disk within the durability wall (30s enforcement).
+        // Button label is the extension manifest's "Claude CLI"
+        // (extensions/claude-code/freshell.json; /^Claude$/ matches nothing).
         await openCliPane(page, /^Claude CLI$/i)
-        await within5s(
+        await withinDurabilityWall(
           async () => (await listFiles(path.join(ledgerDir, 'bindings', 'claude'))).some((f) => f.endsWith('.json')),
           'claude binding row on disk',
         )
@@ -159,7 +186,7 @@ test.describe('pane-identity ledger restart durability', () => {
         // disk within the same wall. Manifest label is "Codex CLI"
         // (extensions/codex-cli/freshell.json).
         await openCliPane(page, /^Codex CLI$/i)
-        await within5s(
+        await withinDurabilityWall(
           async () => (await listFiles(path.join(ledgerDir, 'pending'))).some((f) => f.endsWith('.json')),
           'codex pending marker on disk',
         )
@@ -234,7 +261,7 @@ test.describe('pane-identity ledger restart durability', () => {
         const picker = await openPanePicker(page)
         await picker.getByRole('button', { name: /^OpenCode$/i }).click({ force: true })
         await page.getByRole('combobox', { name: /Starting directory for OpenCode/i }).press('Enter')
-        await within5s(
+        await withinDurabilityWall(
           async () => (await listFiles(path.join(ledgerDir, 'pending'))).some((f) => f.endsWith('.json')),
           'opencode pending marker on disk',
         )
@@ -288,7 +315,7 @@ test.describe('pane-identity ledger restart durability', () => {
 
         const ledgerDir = path.join(capturedHome, '.freshell', 'pane-ledger')
         await openCliPane(page, /^Codex CLI$/i)
-        await within5s(
+        await withinDurabilityWall(
           async () => (await listFiles(path.join(ledgerDir, 'pending'))).some((f) => f.endsWith('.json')),
           'codex pending marker on disk',
         )

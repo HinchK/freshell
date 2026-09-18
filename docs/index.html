@@ -460,6 +460,10 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
 .fresh-divergence { margin: 12px 12px 0; border: 1px solid hsl(38 92% 50% / .5); border-radius: 6px; background: hsl(38 92% 50% / .1); padding: 8px 12px; font-size: 13px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .fresh-divergence-action { border: 1px solid hsl(var(--border) / .7); border-radius: 6px; background: transparent; color: hsl(var(--foreground)); font: inherit; font-size: 12px; padding: 4px 10px; white-space: nowrap; cursor: pointer; }
 .fresh-transcript { min-height: 0; flex: 1; overflow-x: hidden; overflow-y: auto; padding: 14px 12px; }
+.fresh-transcript { position: relative; }
+.fresh-minimap { position: absolute; top: 0; right: 8px; bottom: 48px; width: 12px; }
+.fresh-minimap-viewport { position: absolute; left: 0; right: 0; border-radius: 2px; background: rgba(127, 127, 127, 0.18); }
+.fresh-minimap-tick { position: absolute; left: 0; right: 0; height: 3px; border-radius: 2px; background: rgba(127, 127, 127, 0.45); }
 .fresh-turn { border-left: 2px solid hsl(var(--border)); padding-left: 10px; margin-bottom: 14px; }
 .fresh-turn.user { border-left-color: hsl(var(--foreground)); }
 .fresh-role { font-size: 11px; text-transform: uppercase; color: hsl(var(--muted-foreground)); margin-bottom: 6px; }
@@ -911,6 +915,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
               <div class="fresh-transcript">
                 <div class="fresh-turn user"><div class="fresh-role">You</div><div class="fresh-copy">What layout should Fresh clients use on desktop and phone?</div></div>
                 <div class="fresh-turn"><div class="fresh-role">Assistant</div><div class="fresh-activity">thought · 1 tool used</div><div class="fresh-copy">The pane keeps real geometry. Transcript text follows the terminal font size; metadata becomes a rail only when the pane has enough width.</div></div>
+                <div class="fresh-minimap" aria-hidden="true"><span class="fresh-minimap-viewport" style="top: 52%; height: 34%"></span><span class="fresh-minimap-tick" style="top: 25%"></span><span class="fresh-minimap-tick" style="top: 75%"></span></div>
               </div>
               <div class="fresh-strip">
                 <button type="button" class="fresh-strip-chip" title="gpt-6-astra · effort max">GPT-6 Astra<i data-lucide="chevron-down" class="icon-xs"></i></button>
@@ -1098,7 +1103,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
             </div>
             <div class="settings-section">
               <h2>Fresh agent display</h2>
-              <p class="settings-section-desc">Whether fresh-agent panes start with thinking rows and the tool activity line expanded</p>
+              <p class="settings-section-desc">Starting expansion of thinking rows and the tool activity line, and whether the transcript minimap rail is shown</p>
               <div class="settings-list">
                 <div class="settings-row">
                   <div class="settings-label"><div class="settings-label-title">Expand thinking</div><div class="settings-label-desc">Thinking rows render under thinking-only lines and inside expanded activity lines; this sets whether they start expanded. Expanding or collapsing in a pane is temporary and never saved.</div></div>
@@ -1110,6 +1115,12 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
                   <div class="settings-label"><div class="settings-label-title">Expand tools</div><div class="settings-label-desc">The tool activity line is always present in fresh-agent panes; this sets whether it starts expanded. Expanding or collapsing in a pane is temporary and never saved.</div></div>
                   <div class="settings-control settings-switch-wrap">
                     <button class="settings-switch" type="button" role="switch" aria-checked="false" aria-label="Expand tools"></button>
+                  </div>
+                </div>
+                <div class="settings-row">
+                  <div class="settings-label"><div class="settings-label-title">Show transcript minimap</div><div class="settings-label-desc">The transcript minimap is the prompt-tick rail beside fresh-agent transcripts; turn this off to hide it.</div></div>
+                  <div class="settings-control settings-switch-wrap">
+                    <button class="settings-switch on" type="button" role="switch" aria-checked="true" aria-label="Show transcript minimap"></button>
                   </div>
                 </div>
               </div>
