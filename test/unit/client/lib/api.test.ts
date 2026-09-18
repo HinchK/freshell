@@ -15,6 +15,9 @@ import {
   searchSessions,
   searchTerminalView,
   setSessionMetadata,
+  requestSessionHandoff,
+  SessionHandoffErrorCodeSchema,
+  SessionHandoffResultSchema,
 } from '@/lib/api'
 import {
   RestoreStaleRevisionResponseSchema,
@@ -1003,5 +1006,406 @@ describe('api error mapping', () => {
       status: 404,
       message: 'Not found',
     })
+  })
+})
+
+describe('requestSessionHandoff()', () => {
+  beforeEach(() => {
+    mockFetch.mockReset()
+    localStorage.setItem('freshell.auth-token', 'test-token')
+  })
+
+  afterEach(() => {
+    localStorage.clear()
+  })
+
+  it('posts the handoff body and parses a committed terminal owner', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      ok: true,
+      operationId: 'handoff-1',
+      generation: 2,
+      owner: { kind: 'terminal', terminalId: 't-77', mode: 'codex' },
+    }))
+
+    const result = await requestSessionHandoff({
+      provider: 'codex',
+      sessionId: '019ec8c9-2b12-7001-a11d-e2e089860320',
+      targetKind: 'terminal',
+      mode: 'codex',
+      cwd: '/repo',
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      observedEpoch: 1,
+      observedGeneration: 1,
+      deviceId: 'device-a',
+    })
+
+    expect(result).toEqual({
+      ok: true,
+      operationId: 'handoff-1',
+      generation: 2,
+      owner: { kind: 'terminal', terminalId: 't-77', mode: 'codex' },
+    })
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/api/sessions/handoff',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          provider: 'codex',
+          sessionId: '019ec8c9-2b12-7001-a11d-e2e089860320',
+          targetKind: 'terminal',
+          mode: 'codex',
+          cwd: '/repo',
+          tabId: 'tab-1',
+          paneId: 'pane-1',
+          observedEpoch: 1,
+          observedGeneration: 1,
+          deviceId: 'device-a',
+        }),
+      }),
+    )
+  })
+
+  it('parses a committed fresh-agent owner', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({
+      ok: true,
+      operationId: 'handoff-2',
+      generation: 3,
+      owner: { kind: 'fresh-agent', sessionId: 'sid-k', sessionType: 'kilroy', provider: 'claude' },
+    }))
+
+    const result = await requestSessionHandoff({
+      provider: 'claude',
+      sessionId: 'sid-k',
+      targetKind: 'fresh-agent',
+      sessionType: 'kilroy',
+    })
+
+    expect(result).toEqual({
+      ok: true,
+      operationId: 'handoff-2',
+      generation: 3,
+      owner: { kind: 'fresh-agent', sessionId: 'sid-k', sessionType: 'kilroy', provider: 'claude' },
+    })
+  })
+
+  // b8ke delta round-3 F4: the REAL server frame for the INITIAL
+  // PLATFORM_LIMITED reap failure (session_handoff.rs's typed_failure
+  // serializes exactly this shape) must PARSE — pre-fix the schema
+  // rejected the code, requestSessionHandoff rethrew, and the caller
+  // converted it to generic HANDOFF_REQUEST_FAILED, making the Banner's
+  // Force-clear action unreachable through the real API path. This is
+  // the integration path (the emitted frame body through the schema),
+  // not a directly-constructed enum value.
+  it('parses the server-emitted initial PLATFORM_LIMITED failure frame (the integration path)', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(409, {
+      ok: false,
+      error: {
+        code: 'PLATFORM_LIMITED',
+        message: "the prior runtime's teardown cannot confirm the descendant tree on this platform; the session stays fenced (no new writer can start) and remains recoverable",
+        retryable: true,
+        ownerGeneration: 6,
+      },
+    }))
+
+    const result = await requestSessionHandoff({
+      provider: 'claude',
+      sessionId: 'sid-pl',
+      targetKind: 'terminal',
+      mode: 'claude',
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'PLATFORM_LIMITED',
+        message: "the prior runtime's teardown cannot confirm the descendant tree on this platform; the session stays fenced (no new writer can start) and remains recoverable",
+        retryable: true,
+        ownerGeneration: 6,
+      },
+    })
+  })
+
+  // b8ke delta round-3 F5: the StaleStart-fence ordinary-retry refusal
+  // (the acknowledged force-clear is the only recovery) parses through
+  // the same integration path.
+  // b8ke e3r3 F5/F6 — THE PARSER-BOUNDARY CLASS-KILLER: every failure
+  // code and cleared value the SERVER can emit MUST be accepted by the
+  // client schemas. This enumeration is the LOCKED CONTRACT LIST —
+  // mirroring session_handoff.rs's complete typed_failure + cleared-label
+  // set. Adding a server-emitted code or label REQUIRES updating this list
+  // and the schemas in the SAME commit; a miss fails here loudly (the
+  // pre-e3r3 class: SESSION_METADATA_WRITE_FAILED rejected by the schema
+  // and the cleared 'stale-start-fence' threw during parse — the typed
+  // recoverable results were lost at the parser boundary).
+  it('accepts EVERY server-emitted handoff failure code (the locked contract list)', () => {
+    const SERVER_EMITTED_FAILURE_CODES = [
+      'BAD_REQUEST',
+      'STALE_GENERATION',
+      'SESSION_FENCED',
+      'HANDOFF_IN_PROGRESS',
+      'REAP_TIMEOUT',
+      'PLATFORM_LIMITED',
+      'PLATFORM_LIMITED_PRECHECK',
+      'PLATFORM_LIMITED_FENCED',
+      'TARGET_SPAWN_FAILED',
+      'SESSION_METADATA_WRITE_FAILED',
+      'STALE_START_FENCED',
+      'STALE_STOP_FENCED',
+      // b8ke ext r28 F2: the unacknowledged start against a
+      // CLEARED-UNVERIFIED key (the r16-F4 clear's typed refusal after an
+      // ordinary retry on the cleared fence).
+      'CLEARED_UNVERIFIED_FENCED',
+      // b8ke ext r34 F3: the typed 400 for a half-supplied observed
+      // (epoch, generation) fence pair — the server's documented
+      // wire_fence refusal (session_handoff.rs), parsed as the typed
+      // error instead of the generic HANDOFF_REQUEST_FAILED.
+      'INVALID_FENCE',
+    ] as const
+    for (const code of SERVER_EMITTED_FAILURE_CODES) {
+      expect(SessionHandoffErrorCodeSchema.safeParse(code).success, code).toBe(true)
+    }
+    // The failure frame with each code parses through the RESULT schema.
+    for (const code of SERVER_EMITTED_FAILURE_CODES) {
+      const parsed = SessionHandoffResultSchema.safeParse({
+        ok: false,
+        error: {
+          code,
+          message: `typed ${code}`,
+          retryable: true,
+          ownerGeneration: 2,
+        },
+      })
+      expect(parsed.success, code).toBe(true)
+    }
+  })
+
+  it('accepts EVERY server-emitted cleared label (the force-clear result)', () => {
+    // b8ke ext r28 F2: the r25 server change made the acknowledged
+    // force-clear accept the STALE-reason fences — the server now emits
+    // all three typed cleared labels (the pre-r28 closed literal was the
+    // e3r4 DESIGN RECONCILIATION's PlatformLimited-only set, which the
+    // r25 repair made stale: a successful stale-fence clear failed the
+    // client parse and downgraded to a generic handoff failure).
+    const SERVER_EMITTED_CLEARED_LABELS = [
+      'platform-limited-fence',
+      'stale-start-fence',
+      'stale-stop-fence',
+    ] as const
+    for (const cleared of SERVER_EMITTED_CLEARED_LABELS) {
+      const parsed = SessionHandoffResultSchema.safeParse({
+        ok: true,
+        cleared,
+        operationId: 'op-clear',
+        generation: 3,
+      })
+      expect(parsed.success, cleared).toBe(true)
+    }
+  })
+
+  // b8ke ext r34 F3: the typed 400 for a HALF-SUPPLIED observed fence
+  // pair parses as the typed INVALID_FENCE error — never the generic
+  // HANDOFF_REQUEST_FAILED ("could not reach the server") diagnostic
+  // the malformed-caller conversion produced pre-r34.
+  it('parses the server-emitted INVALID_FENCE 400 as the typed error', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(400, {
+      ok: false,
+      error: {
+        code: 'INVALID_FENCE',
+        message: 'observedEpoch and observedGeneration must be sent together — a half-fence is invalid',
+        retryable: false,
+      },
+    }))
+
+    const result = await requestSessionHandoff({
+      provider: 'codex',
+      sessionId: 'sid-half-fence',
+      targetKind: 'terminal',
+      mode: 'codex',
+      observedEpoch: 3,
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'INVALID_FENCE',
+        message: 'observedEpoch and observedGeneration must be sent together — a half-fence is invalid',
+        retryable: false,
+      },
+    })
+  })
+
+  it('parses the server-emitted STALE_START_FENCED refusal frame', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(409, {
+      ok: false,
+      error: {
+        code: 'STALE_START_FENCED',
+        message: 'the session is fenced pending recovery: the prior runtime\u0027s death could not be confirmed (a stale start left it unconfirmable). Retry with the acknowledged force-clear (acknowledgePlatformLimitedRisk: true) to release the fence, accepting that the unconfirmed runtime\u0027s processes may remain.',
+        retryable: true,
+        ownerGeneration: 9,
+      },
+    }))
+
+    const result = await requestSessionHandoff({
+      provider: 'claude',
+      sessionId: 'sid-ss',
+      targetKind: 'terminal',
+      mode: 'claude',
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'STALE_START_FENCED',
+        message: 'the session is fenced pending recovery: the prior runtime\u0027s death could not be confirmed (a stale start left it unconfirmable). Retry with the acknowledged force-clear (acknowledgePlatformLimitedRisk: true) to release the fence, accepting that the unconfirmed runtime\u0027s processes may remain.',
+        retryable: true,
+        ownerGeneration: 9,
+      },
+    })
+  })
+
+  // b8ke ext r28 F2: the r25 server's stale-fence acknowledged force-clear
+  // answers the TYPED clear with the stale-reason labels — pre-r28 the
+  // closed literal rejected them, requestSessionHandoff THREW, and the
+  // caller downgraded the successful clear to HANDOFF_REQUEST_FAILED.
+  it('parses the server-emitted stale-stop-fence cleared result (the acknowledged force-clear)', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(200, {
+      ok: true,
+      cleared: 'stale-stop-fence',
+      operationId: 'op-clear-ss',
+      generation: 7,
+    }))
+
+    const result = await requestSessionHandoff({
+      provider: 'claude',
+      sessionId: 'sid-clear',
+      targetKind: 'terminal',
+      mode: 'claude',
+      acknowledgePlatformLimitedRisk: true,
+    })
+
+    expect(result).toEqual({
+      ok: true,
+      cleared: 'stale-stop-fence',
+      operationId: 'op-clear-ss',
+      generation: 7,
+      shutdownConfirmed: false,
+    })
+  })
+
+  // b8ke ext r28 F2: the unacknowledged start against a CLEARED-UNVERIFIED
+  // key answers the typed refusal — the browser's acknowledged-start flow
+  // depends on the code parsing.
+  it('parses the server-emitted CLEARED_UNVERIFIED_FENCED refusal frame', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(409, {
+      ok: false,
+      error: {
+        code: 'CLEARED_UNVERIFIED_FENCED',
+        message: 'the session sits in the cleared-unverified state: the prior runtime\'s descendant processes were never confirmed dead. The prior clear is not permission to start a writer — retry with the acknowledged risk (acknowledgePlatformLimitedRisk: true; the pane\'s start-again action carries it).',
+        retryable: true,
+        ownerGeneration: 4,
+      },
+    }))
+
+    const result = await requestSessionHandoff({
+      provider: 'claude',
+      sessionId: 'sid-cu',
+      targetKind: 'terminal',
+      mode: 'claude',
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'CLEARED_UNVERIFIED_FENCED',
+        message: 'the session sits in the cleared-unverified state: the prior runtime\'s descendant processes were never confirmed dead. The prior clear is not permission to start a writer — retry with the acknowledged risk (acknowledgePlatformLimitedRisk: true; the pane\'s start-again action carries it).',
+        retryable: true,
+        ownerGeneration: 4,
+      },
+    })
+  })
+
+  it('surfaces the typed failure body of a 409 conflict as the failure arm instead of throwing', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(409, {
+      ok: false,
+      error: {
+        code: 'REAP_TIMEOUT',
+        message: 'the prior runtime did not confirm its exit in time',
+        retryable: true,
+        ownerGeneration: 4,
+      },
+    }))
+
+    const result = await requestSessionHandoff({
+      provider: 'codex',
+      sessionId: 'sid-x',
+      targetKind: 'terminal',
+      mode: 'codex',
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'REAP_TIMEOUT',
+        message: 'the prior runtime did not confirm its exit in time',
+        retryable: true,
+        ownerGeneration: 4,
+      },
+    })
+  })
+
+  it('parses the stale-generation failure with its owner generation', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(409, {
+      ok: false,
+      error: {
+        code: 'STALE_GENERATION',
+        message: 'observed ownership fence is stale; refresh and retry',
+        retryable: false,
+        ownerKind: 'terminal',
+        ownerGeneration: 9,
+      },
+    }))
+
+    const result = await requestSessionHandoff({
+      provider: 'claude',
+      sessionId: 'sid-s',
+      targetKind: 'fresh-agent',
+      sessionType: 'freshclaude',
+      observedEpoch: 1,
+      observedGeneration: 5,
+    })
+
+    expect(result).toEqual({
+      ok: false,
+      error: {
+        code: 'STALE_GENERATION',
+        message: 'observed ownership fence is stale; refresh and retry',
+        retryable: false,
+        ownerKind: 'terminal',
+        ownerGeneration: 9,
+      },
+    })
+  })
+
+  it('rejects when a non-2xx body is not the typed failure shape', async () => {
+    mockFetch.mockResolvedValueOnce(mockJsonResponse(500, { error: 'boom' }))
+
+    await expect(requestSessionHandoff({
+      provider: 'codex',
+      sessionId: 'sid-x',
+      targetKind: 'terminal',
+      mode: 'codex',
+    })).rejects.toMatchObject({ status: 500 })
+  })
+
+  it('rejects a 2xx body that matches neither arm of the result union', async () => {
+    mockFetch.mockResolvedValueOnce(mockJson({ hello: 'world' }))
+
+    await expect(requestSessionHandoff({
+      provider: 'codex',
+      sessionId: 'sid-x',
+      targetKind: 'terminal',
+      mode: 'codex',
+    })).rejects.toThrow()
   })
 })

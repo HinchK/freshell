@@ -519,7 +519,11 @@ impl PaneLedger {
             let ikey = (k.provider.clone(), k.session_id.clone());
             let row_view = index.bindings.get(&ikey).map(|r| (r.state, r.updated_at));
             // The fence stamp readers see (max across sources) governs.
-            let stamp = index.kill_tombstones.get(&ikey).copied().unwrap_or(k.at_ms);
+            let stamp = index
+                .kill_tombstones
+                .get(&ikey)
+                .map(|entry| entry.at_ms)
+                .unwrap_or(k.at_ms);
             classify_kill_tombstone(stamp, row_view, now_ms) == KillTombstoneVerdict::Dominant
         });
         if still_dominant {
@@ -607,7 +611,7 @@ impl PaneLedger {
         now_ms: i64,
         report: &mut BootScanReport,
     ) {
-        let Some(killed_at) = index.kill_tombstones.get(key).copied() else {
+        let Some(killed_at) = index.kill_tombstones.get(key).map(|entry| entry.at_ms) else {
             return; // cleared since the snapshot — no longer qualifies
         };
         // Delta-r6-r4: a fence a standing close-envelope journal record feeds
@@ -851,7 +855,8 @@ impl PaneLedger {
                     .kill_tombstones
                     .get(key)
                     .copied()
-                    .is_some_and(|killed_at| {
+                    .is_some_and(|entry| {
+                        let killed_at = entry.at_ms;
                         classify_kill_tombstone(
                             killed_at,
                             Some((row.state, row.updated_at)),
@@ -859,7 +864,11 @@ impl PaneLedger {
                         ) == KillTombstoneVerdict::Dominant
                     });
                 if dominant {
-                    let killed_at = index.kill_tombstones.get(key).copied().unwrap_or_default();
+                    let killed_at = index
+                        .kill_tombstones
+                        .get(key)
+                        .map(|entry| entry.at_ms)
+                        .unwrap_or_default();
                     row.state = RowState::Retired;
                     row.retired_reason = Some(RetiredReason::Closed);
                     row.updated_at = now_ms;

@@ -273,6 +273,7 @@ mod tests {
     use crate::terminal::now_ms;
     use crate::WsState;
     use freshell_sessions::codex_locator::CodexLocator;
+    use serde_json::json;
     use std::sync::Arc as StdArc;
 
     fn state_with_locator(
@@ -328,6 +329,7 @@ mod tests {
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
+            ownership: None,
         };
         (state, rx)
     }
@@ -345,6 +347,16 @@ mod tests {
             ledger_dir.to_path_buf(),
         )));
         (state, rx)
+    }
+
+    /// b8ke ext r11 F1: wire the shared coordinator into a locator fixture
+    /// (both the WsState and the registry — the commit path reads both).
+    fn wire_ownership(state: &mut WsState) -> StdArc<freshell_ownership::RuntimeOwnershipRegistry> {
+        let ownership = StdArc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        state.registry =
+            freshell_terminal::TerminalRegistry::new().with_ownership(StdArc::clone(&ownership));
+        state.ownership = Some(StdArc::clone(&ownership));
+        ownership
     }
 
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
@@ -778,6 +790,10 @@ mod tests {
                 effort: None,
                 supersedes: None,
                 provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
+                observed_epoch: None,
+                observed_generation: None,
+
+                authoritative: false,
                 now_ms: now_ms(),
             })
             .expect("seed fresh-agent ledger row");
@@ -847,5 +863,648 @@ mod tests {
         state.registry.kill("t1");
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&ledger_dir);
+    }
+
+    /// b8ke ext r11 F1: the codex ADOPTION (a canonical thread id learned
+    /// after the CLI starts — the NORMAL path for fresh codex terminals)
+    /// commits Live{Terminal} under the learned canonical key. Pre-r11 the
+    /// adoption only updated the identity homes while the real terminal
+    /// writer ran with a VACANT canonical key — a Fresh Agent lifecycle op
+    /// saw no prior owner and could not stop-and-confirm-reap it.
+    #[tokio::test]
+    async fn codex_adoption_commits_live_terminal_under_the_learned_key() {
+        const TID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let home = unique_temp_dir("r11-adopt");
+        let (mut state, _rx) = state_with_locator(home.clone());
+        let ownership = wire_ownership(&mut state);
+
+        let spec = freshell_platform::build_spawn_spec(
+            freshell_platform::ShellType::System,
+            freshell_platform::detect::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            &freshell_platform::RealEnv,
+            &freshell_platform::RealFileProbe,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+        state
+            .registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                "t1".to_string(),
+                "stream-1".to_string(),
+                "codex",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn a real shell for the test PTY");
+        state
+            .registry
+            .set_meta("t1", None, None, Some("codex".to_string()), None);
+
+        assert!(
+            crate::codex_identity::adopt_codex_identity(
+                &state,
+                crate::codex_identity::CodexAdoption {
+                    terminal_id: "t1",
+                    thread_id: TID,
+                    rollout_path: None,
+                    cwd: Some("/tmp"),
+                },
+            )
+            .await,
+            "the adoption itself succeeds"
+        );
+
+        // THE CONTRACT: the canonical key holds Live{Terminal} naming the
+        // adopting terminal (pre-r11: Vacant).
+        assert!(
+            crate::identity_ownership::holds_live_terminal_owner(&ownership, "codex", TID, "t1"),
+            "the adoption commits Live{{Terminal}} under the learned key — state: {:?}",
+            ownership.observe("codex", TID).state
+        );
+
+        // THE F1 CONTRACT: a Fresh Agent handoff on the canonical key SEES
+        // the prior terminal owner (stop-and-confirm-reap has its target;
+        // pre-r11 it entered from Vacant — no prior runtime to stop).
+        let outcome = ownership.begin_handoff(
+            "codex",
+            TID,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-r11-handoff",
+            None,
+            "test",
+            crate::terminal::now_ms().max(0) as u64,
+        );
+        match outcome {
+            freshell_ownership::BeginOutcome::Granted { .. } => {
+                match ownership.observe("codex", TID).state {
+                    freshell_ownership::OwnershipState::Handoff {
+                        prior: Some((owner, _)),
+                        ..
+                    } => {
+                        assert_eq!(
+                            owner.kind,
+                            freshell_ownership::RuntimeOwnerKind::Terminal,
+                            "the handoff sees the ADOPTED terminal as its prior"
+                        );
+                        assert_eq!(owner.terminal_id.as_deref(), Some("t1"));
+                    }
+                    other => panic!("the handoff must hold the record: {other:?}"),
+                }
+            }
+            other => panic!("the handoff must grant against the adopted prior: {other:?}"),
+        }
+        // Restore the record for cleanup.
+        let _ = ownership.fail("codex", TID, "op-r11-handoff", 1, false);
+        state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// b8ke ext r11 F1: the codex fork REBIND moves the coordinator
+    /// authority in the SAME step as the identity move — the fork child's
+    /// canonical key commits Live{Terminal} AND the superseded old key is
+    /// RELEASED (pre-r11 the old key stayed live after the writer moved —
+    /// a stale-live lie).
+    #[tokio::test]
+    async fn codex_rebind_releases_the_old_canonical_key() {
+        const OLD_TID: &str = "11111111-2222-3333-4444-555555555555";
+        const NEW_TID: &str = "99999999-8888-7777-6666-000000000000";
+        let home = unique_temp_dir("r11-rebind");
+        let (mut state, _rx) = state_with_locator(home.clone());
+        let ownership = wire_ownership(&mut state);
+
+        let spec = freshell_platform::build_spawn_spec(
+            freshell_platform::ShellType::System,
+            freshell_platform::detect::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            &freshell_platform::RealEnv,
+            &freshell_platform::RealFileProbe,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+        state
+            .registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                "t1".to_string(),
+                "stream-1".to_string(),
+                "codex",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn a real shell for the test PTY");
+        state
+            .registry
+            .set_meta("t1", None, None, Some("codex".to_string()), None);
+
+        // The pane first ADOPTS the old identity (the coordinator commit
+        // rides along).
+        assert!(
+            crate::codex_identity::adopt_codex_identity(
+                &state,
+                crate::codex_identity::CodexAdoption {
+                    terminal_id: "t1",
+                    thread_id: OLD_TID,
+                    rollout_path: None,
+                    cwd: Some("/tmp"),
+                },
+            )
+            .await,
+            "the pre-rebind adoption succeeds"
+        );
+        assert!(crate::identity_ownership::holds_live_terminal_owner(
+            &ownership, "codex", OLD_TID, "t1"
+        ));
+
+        // THE REBIND (the in-TUI fork move): old → new.
+        let rollout = std::path::Path::new(&home).join("fork-rollout.jsonl");
+        std::fs::write(&rollout, "{}\n").expect("write the child rollout path target");
+        assert!(
+            crate::codex_identity::rebind_codex_identity(
+                &state,
+                crate::codex_identity::CodexRebind {
+                    terminal_id: "t1",
+                    old_session_id: OLD_TID,
+                    new_session_id: NEW_TID,
+                    rollout_path: rollout.as_path(),
+                    cwd: Some("/tmp"),
+                },
+            )
+            .await,
+            "the rebind itself succeeds"
+        );
+
+        // THE CONTRACT: the new canonical key is the live owner...
+        assert!(
+            crate::identity_ownership::holds_live_terminal_owner(
+                &ownership, "codex", NEW_TID, "t1"
+            ),
+            "the rebind commits Live{{Terminal}} under the fork child's key — state: {:?}",
+            ownership.observe("codex", NEW_TID).state
+        );
+        // ...and the OLD key left NO stale-live record (released in the
+        // same step — pre-r11 it stayed Live{Terminal} over the moved
+        // writer).
+        assert!(
+            !matches!(
+                ownership.observe("codex", OLD_TID).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ),
+            "the rebind releases the old canonical key — state: {:?}",
+            ownership.observe("codex", OLD_TID).state
+        );
+        state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// b8ke ext r32 F2 (the WS-side builder): `broadcast_vacant_frame`
+    /// carries the CALLER's committed pair — the (epoch, generation)
+    /// captured at the release/commit_stop commit — never a re-observed
+    /// current generation. The deterministic probe: a key with NO
+    /// record observes generation 0, while the committed pair says 7 —
+    /// pre-r32 the builder re-observed and the frame carried the
+    /// current 0 instead of the transition's own 7 (the same defect
+    /// that, on an ADVANCED key, folds the vacant frame over a newer
+    /// `handoff-started`/live-owner state because the client accepts
+    /// all same-generation frames).
+    #[tokio::test]
+    async fn broadcast_vacant_frame_carries_the_committed_pair_not_the_current_generation() {
+        let home = unique_temp_dir("r32-f2-ws-frame");
+        let (mut state, mut rx) = state_with_locator(home.clone());
+        let ownership = wire_ownership(&mut state);
+        while rx.try_recv().is_ok() {}
+
+        let sid = "ses-r32-f2-ws-missing";
+        assert_eq!(
+            ownership.observe("codex", sid).generation,
+            0,
+            "fixture: the missing key's observed generation is 0"
+        );
+        crate::identity_ownership::broadcast_vacant_frame(
+            &state,
+            "codex",
+            sid,
+            "op-r32-f2-ws",
+            ownership.boot_epoch(),
+            7,
+        );
+        let mut frame: Option<serde_json::Value> = None;
+        while let Ok(raw) = rx.try_recv() {
+            let parsed: serde_json::Value = serde_json::from_str(&raw).expect("json frame");
+            if parsed["type"] == "session.runtimeOwner" && parsed["sessionId"] == json!(sid) {
+                frame = Some(parsed);
+            }
+        }
+        let frame = frame.expect("the vacant frame was broadcast");
+        assert_eq!(
+            frame["generation"],
+            json!(7),
+            "the vacant frame carries the COMMITTED pair's generation, never \
+             the re-observed current generation: {frame}"
+        );
+        assert_eq!(frame["epoch"], json!(ownership.boot_epoch()));
+        assert_eq!(frame["ownerKind"], json!("vacant"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// b8ke ext r14 F1 (reshaped by ext r39 F2): a durable-binding FAILURE
+    /// installs and announces NOTHING, and the held authority COMMITS.
+    /// The adoption's ledger write fails (a read-only ledger root: every
+    /// write errors) — the adoption returns false, the identity homes
+    /// keep the consistent prior state, no association frame
+    /// broadcasts, and the canonical key names the LIVE terminal as its
+    /// owner: never a Vacant-with-live-writer (pre-r39 the tail
+    /// installed and announced FIRST, and the caller failed the ticket
+    /// to Vacant while the registries and clients still identified the
+    /// terminal as the session writer — a later lifecycle command could
+    /// start a second writer beside it).
+    #[tokio::test]
+    async fn a_binding_failure_installs_nothing_and_keeps_the_live_owner() {
+        const TID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let home = unique_temp_dir("r14-f1-bindfail");
+        let (mut state, mut rx) = state_with_locator(home.clone());
+        let ownership = wire_ownership(&mut state);
+        // A ledger rooted at a READ-ONLY directory: every durable row
+        // write errors (EACCES).
+        let ledger_dir = unique_temp_dir("r14-f1-bindfail-ledger");
+        std::fs::create_dir_all(&ledger_dir).expect("the ledger root dir");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&ledger_dir).unwrap().permissions();
+            perms.set_mode(0o555);
+            std::fs::set_permissions(&ledger_dir, perms).expect("read-only ledger root");
+        }
+        state.pane_ledger = std::sync::Arc::new(crate::pane_ledger::PaneLedger::new(Some(
+            ledger_dir.clone(),
+        )));
+
+        let spec = freshell_platform::build_spawn_spec(
+            freshell_platform::ShellType::System,
+            freshell_platform::detect::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            &freshell_platform::RealEnv,
+            &freshell_platform::RealFileProbe,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+        state
+            .registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                "t1".to_string(),
+                "stream-1".to_string(),
+                "codex",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn a real shell for the test PTY");
+        state
+            .registry
+            .set_meta("t1", None, None, Some("codex".to_string()), None);
+
+        let adopted = crate::codex_identity::adopt_codex_identity(
+            &state,
+            crate::codex_identity::CodexAdoption {
+                terminal_id: "t1",
+                thread_id: TID,
+                rollout_path: None,
+                cwd: Some("/tmp"),
+            },
+        )
+        .await;
+
+        // THE CONTRACT: the binding write failed → the adoption FAILED
+        // (the typed answer)...
+        assert!(!adopted, "the adoption fails on a binding failure");
+        // ...NOTHING installed or announced: no identity row for the
+        // thread (the consistent prior state stands)...
+        assert!(
+            state
+                .identity
+                .find_by_session_including_retired("codex", TID)
+                .is_none(),
+            "no identity row may install on a failed binding"
+        );
+        // ...no association frame broadcast (the runtime-owner truth
+        // frame may broadcast — it is the coordinator's owner fact, not
+        // the identity announcement).
+        while let Ok(frame) = rx.try_recv() {
+            let value: serde_json::Value = serde_json::from_str(&frame).expect("json frame");
+            assert_ne!(
+                value["type"], "terminal.session.associated",
+                "no association frame may broadcast on a failed binding: {value}"
+            );
+        }
+        // ...and the canonical key names the LIVE terminal as its owner
+        // (NEVER a Vacant-with-live-writer — the held authority commits).
+        assert!(
+            matches!(
+                ownership.observe("codex", TID).state,
+                freshell_ownership::OwnershipState::Live { ref owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal
+                        && owner.terminal_id.as_deref() == Some("t1"),
+            ),
+            "the failed binding must keep the live terminal as the named owner: {:?}",
+            ownership.observe("codex", TID).state
+        );
+        // A later lifecycle command CANNOT start a second writer over
+        // the session (the cross-kind begin answers the typed conflict,
+        // never Granted).
+        match ownership.begin_start(
+            "codex",
+            TID,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-r14-f1-bindfail-second-writer",
+            None,
+            "test",
+            3_000,
+        ) {
+            freshell_ownership::BeginOutcome::OwnedByOtherKind { .. } => {}
+            other => {
+                panic!("a second writer must not start over the live terminal owner: {other:?}")
+            }
+        }
+        state.registry.kill("t1");
+        let _ = std::fs::remove_dir_all(&home);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&ledger_dir).unwrap().permissions();
+            perms.set_mode(0o755);
+            let _ = std::fs::set_permissions(&ledger_dir, perms);
+        }
+        let _ = std::fs::remove_dir_all(&ledger_dir);
+    }
+
+    /// b8ke ext r14 F2: the rebind is the ATOMIC coordinator move. After
+    /// the rebind: the OLD key is ALIASED to the new key (the one-lock-
+    /// scope move's signature — pre-r14 the old key was observed and
+    /// released under a SECOND lock, leaving a both-Live interval), the
+    /// registry's retained-claim map holds EXACTLY ONE claim (the new
+    /// key's — pre-r14 the old claim stayed beside the new one, and the
+    /// kill/exit path's unordered selection could pick the stale old
+    /// claim and strand the new key Live), and after the terminal dies
+    /// BOTH keys reach non-Live regardless of iteration order.
+    #[tokio::test]
+    async fn the_rebind_is_atomic_one_scope_one_claim_both_keys_settle() {
+        const OLD_TID: &str = "11111111-2222-3333-4444-555555555555";
+        const NEW_TID: &str = "99999999-8888-7777-6666-000000000000";
+        let home = unique_temp_dir("r14-f2-atomic");
+        let (mut state, mut rx) = state_with_locator(home.clone());
+        let ownership = wire_ownership(&mut state);
+
+        let spec = freshell_platform::build_spawn_spec(
+            freshell_platform::ShellType::System,
+            freshell_platform::detect::HostOs::Linux,
+            false,
+            Some("/tmp"),
+            &freshell_platform::RealEnv,
+            &freshell_platform::RealFileProbe,
+            &std::collections::BTreeMap::new(),
+            None,
+            None,
+        );
+        state
+            .registry
+            .create(
+                &spec,
+                &std::collections::BTreeMap::new(),
+                "t1".to_string(),
+                "stream-1".to_string(),
+                "codex",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn a real shell for the test PTY");
+        state
+            .registry
+            .set_meta("t1", None, None, Some("codex".to_string()), None);
+
+        // Consume the pre-rebind frames so the rebind's owner frames are
+        // isolated.
+        while rx.try_recv().is_ok() {}
+
+        // The pre-rebind adoption (the old key's owner + retained claim).
+        assert!(
+            crate::codex_identity::adopt_codex_identity(
+                &state,
+                crate::codex_identity::CodexAdoption {
+                    terminal_id: "t1",
+                    thread_id: OLD_TID,
+                    rollout_path: None,
+                    cwd: Some("/tmp"),
+                },
+            )
+            .await,
+            "the pre-rebind adoption succeeds"
+        );
+
+        // THE REBIND.
+        let rollout = std::path::Path::new(&home).join("fork-rollout.jsonl");
+        std::fs::write(&rollout, "{}\n").expect("write the child rollout path target");
+        assert!(
+            crate::codex_identity::rebind_codex_identity(
+                &state,
+                crate::codex_identity::CodexRebind {
+                    terminal_id: "t1",
+                    old_session_id: OLD_TID,
+                    new_session_id: NEW_TID,
+                    rollout_path: rollout.as_path(),
+                    cwd: Some("/tmp"),
+                },
+            )
+            .await,
+            "the rebind itself succeeds"
+        );
+
+        // (1) THE ONE-SCOPE MOVE's signature: the old key is ALIASED to the
+        // new key (pre-r14: the old key was separately released to a
+        // plain Vacant — and both keys briefly named the writer).
+        match ownership.observe("codex", OLD_TID).state {
+            freshell_ownership::OwnershipState::Aliased { to, .. } => {
+                assert_eq!(to, NEW_TID, "the alias names the new canonical key");
+            }
+            other => panic!(
+                "the old key must be Aliased to the new key after the atomic rebind — got {other:?}"
+            ),
+        }
+        assert!(matches!(
+            ownership.observe("codex", NEW_TID).state,
+            freshell_ownership::OwnershipState::Live { owner, .. }
+                if owner.terminal_id.as_deref() == Some("t1")
+        ));
+
+        // (1b) b8ke ext r31 F2: the broadcast pair — the NEW key's
+        // handoff-committed frame (ownerKind terminal + the terminal id)
+        // and the OLD key's frame in the ALIASED shape. The old key's
+        // LIVE broadcast and the RECONNECT REPLAY must agree BY
+        // CONSTRUCTION (the frame is derived from snapshot_records()
+        // itself): both carry `aliasOf` naming the new canonical id and
+        // the CANONICAL record's ownerKind/terminalId/generation, so an
+        // online old-sessionRef pane and a reconnecting one converge
+        // IDENTICALLY (pre-r31 the live broadcast said
+        // ownerKind "vacant", aliasOf None while the replay resolved
+        // the same aliased key to the new canonical owner — the
+        // pre-r14 divergence card is now handled by the alias chain:
+        // the pane folds the authoritative owner and navigates to the
+        // canonical key).
+        {
+            let mut new_key_frame: Option<serde_json::Value> = None;
+            let mut old_key_frame: Option<serde_json::Value> = None;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while (new_key_frame.is_none() || old_key_frame.is_none())
+                && std::time::Instant::now() < deadline
+            {
+                while let Ok(raw) = rx.try_recv() {
+                    let frame: serde_json::Value = serde_json::from_str(&raw).expect("json frame");
+                    if frame["type"] != "session.runtimeOwner" {
+                        continue;
+                    }
+                    if frame["sessionId"] == json!(NEW_TID) {
+                        new_key_frame = Some(frame.clone());
+                    }
+                    if frame["sessionId"] == json!(OLD_TID) {
+                        old_key_frame = Some(frame.clone());
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let new_key_frame =
+                new_key_frame.expect("the rebind broadcast the new key's owner frame");
+            assert_eq!(new_key_frame["ownerKind"], json!("terminal"));
+            assert_eq!(new_key_frame["terminalId"], json!("t1"));
+            assert_eq!(new_key_frame["transition"], json!("handoff-committed"));
+            let old_key_frame =
+                old_key_frame.expect("the rebind broadcast the old key's release frame");
+            assert_eq!(
+                old_key_frame["transition"],
+                json!("released"),
+                "the old key's frame is the release transition: {old_key_frame}"
+            );
+            // THE EQUIVALENCE: the live frame matches the replay record
+            // the reconnecting client receives, field for field.
+            let old_key_replay = ownership
+                .snapshot_records()
+                .into_iter()
+                .find(|rec| rec.session_id == OLD_TID && rec.provider == "codex")
+                .expect("the replay resolves the old key's record");
+            assert_eq!(
+                old_key_replay.alias_of.as_deref(),
+                Some(NEW_TID),
+                "the replay record's aliasOf names the new canonical id"
+            );
+            assert_eq!(
+                old_key_frame["aliasOf"],
+                json!(NEW_TID),
+                "the LIVE broadcast carries the same aliasOf as the replay: {old_key_frame}"
+            );
+            assert_eq!(
+                old_key_frame["ownerKind"],
+                json!(old_key_replay.owner_kind),
+                "the live frame's ownerKind is the replay record's (the CANONICAL's): \
+                 {old_key_frame}"
+            );
+            assert_eq!(
+                old_key_frame["ownerKind"],
+                json!("terminal"),
+                "the canonical owner is terminal — the old key folds the authoritative \
+                 owner, never a permanent vacant: {old_key_frame}"
+            );
+            assert_eq!(
+                old_key_frame["terminalId"],
+                json!(old_key_replay.terminal_id),
+                "the live frame's terminalId is the replay record's: {old_key_frame}"
+            );
+            assert_eq!(
+                old_key_frame["terminalId"],
+                json!("t1"),
+                "the canonical terminal's id — the old-key pane navigates to it: \
+                 {old_key_frame}"
+            );
+            assert_eq!(
+                old_key_frame["generation"],
+                json!(old_key_replay.generation),
+                "the live frame's generation is the replay record's (the CANONICAL's): \
+                 {old_key_frame}"
+            );
+            assert_eq!(
+                old_key_frame["epoch"],
+                json!(old_key_replay.epoch),
+                "the live frame's epoch is the replay record's: {old_key_frame}"
+            );
+        }
+
+        // (2) EXACTLY ONE retained claim (the new key's) — the rebind
+        // rekeyed the registry's claim map (pre-r14 the old claim stayed
+        // beside the new one and the unordered kill/exit selection could
+        // strand the new key).
+        let new_claim = state.registry.retained_ownership_claim_by_locator(
+            &freshell_protocol::SessionLocator {
+                provider: "codex".to_string(),
+                session_id: NEW_TID.to_string(),
+            },
+        );
+        assert!(new_claim.is_some(), "the new key's retained claim exists");
+        assert_eq!(
+            new_claim.as_ref().map(|c| c.terminal_id.as_str()),
+            Some("t1")
+        );
+        let old_claim = state.registry.retained_ownership_claim_by_locator(
+            &freshell_protocol::SessionLocator {
+                provider: "codex".to_string(),
+                session_id: OLD_TID.to_string(),
+            },
+        );
+        assert!(
+            old_claim.is_none(),
+            "the rebind REMOVED the old key's retained claim (one claim for one terminal)"
+        );
+
+        // (3) THE TERMINAL DIES: both keys settle non-Live regardless of
+        // any iteration order (the new key's claim releases; the old key
+        // is already Aliased).
+        state.registry.kill("t1");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let new_live = matches!(
+                ownership.observe("codex", NEW_TID).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            );
+            if !new_live {
+                break;
+            }
+            assert!(
+                deadline > std::time::Instant::now(),
+                "the new key never settled after the terminal died — stranded Live"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            !matches!(
+                ownership.observe("codex", OLD_TID).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ),
+            "the old key never names the dead writer"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

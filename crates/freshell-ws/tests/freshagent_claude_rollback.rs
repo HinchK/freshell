@@ -251,6 +251,9 @@ impl PaneIdentitySink for TestLedgerSink {
                     effort: upsert.settings.effort.as_deref(),
                     supersedes: upsert.supersedes.as_deref(),
                     provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+                    observed_epoch: None,
+                    observed_generation: None,
+                    authoritative: upsert.authoritative,
                     now_ms: now,
                 };
                 ledger.record_fresh_agent_binding(&w)?;
@@ -312,6 +315,24 @@ impl PaneIdentitySink for TestLedgerSink {
             tokio::task::spawn_blocking(move || {
                 let payload = serde_json::to_value(&record).map_err(std::io::Error::other)?;
                 ledger.record_rollback_row(&p, &s, &payload, TestLedgerSink::now_ms())
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
+    }
+    fn repair_failed_transition(
+        &self,
+        provider: &str,
+        session_id: &str,
+        epoch: u64,
+        generation: u64,
+    ) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        let now = Self::now_ms();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                ledger.repair_failed_transition_binding(&p, &s, epoch, generation, now)
             })
             .await
             .map_err(std::io::Error::other)?
@@ -608,6 +629,7 @@ async fn spawn_server_with_rollback_rig(
         session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
+        ownership: None,
     };
 
     let fresh_agent = freshell_freshagent::FreshAgentState::new(

@@ -61,6 +61,7 @@ fn ready_capabilities_field_is_omitted_when_none() {
         server_instance_id: Some("srv-1".to_string()),
         build_id: None,
         capabilities: None,
+        runtime_owners: None,
     };
     let wire = serde_json::to_value(ServerMessage::Ready(ready)).expect("serializes");
     assert!(
@@ -81,6 +82,7 @@ fn ready_capabilities_advertise_pane_reconcile_v1_when_negotiated() {
             pane_reconcile_fresh_agent_v1: None,
             terminal_interest_v1: None,
         }),
+        runtime_owners: None,
     };
     let wire = serde_json::to_value(ServerMessage::Ready(ready)).expect("serializes");
     assert_eq!(wire["capabilities"], json!({ "paneReconcileV1": true }));

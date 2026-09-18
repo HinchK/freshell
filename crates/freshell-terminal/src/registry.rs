@@ -554,6 +554,44 @@ fn session_ref_key(locator: &SessionLocator) -> String {
     format!("{}\u{0}{}", locator.provider, locator.session_id)
 }
 
+/// The runtime identity a retained claim commits/releases under (kata b8ke
+/// Task 4): terminal kind, the terminal id, the recorded pid, keyed to the
+/// committing operation (the release fence key).
+fn retained_runtime_identity(
+    claim: &RetainedSessionRefOwnership,
+) -> freshell_ownership::OwnerIdentity {
+    freshell_ownership::OwnerIdentity {
+        kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+        terminal_id: Some(claim.terminal_id.clone()),
+        live_session_key: None,
+        pid: claim.pid,
+        ownership_id: Some(claim.operation_id.clone()),
+    }
+}
+
+/// kata b8ke Task 7: the terminal-create pause hook — a closure returning a
+/// future the WS lane's `handle_create` AWAITS (parked between the
+/// keyed-create precheck and the coordinator claim). Test-only (never set in
+/// production); the `TerminalLivenessProbe` injection idiom, async flavor —
+/// this std-sync-free crate only STORES the future, the WS lane awaits it.
+pub type TerminalCreatePauseHook = std::sync::Arc<
+    dyn Fn(&str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
+
+/// b8ke ext r39 F1: the identity re-adopt PRE-ARM pause hook — the
+/// deterministic-race tests park `coordinator_begin_identity`'s re-adopt
+/// arm between the precheck observation and the atomic adopt (the
+/// vulnerable interval the post-arm pauses cannot reach), to prove a
+/// completed cross-kind handoff in that interval answers the typed
+/// refusal instead of arming the guard on the new owner. Keyed
+/// `(provider, session_id)`. Interior-shared like the create seam. Never
+/// set in production.
+pub type IdentityReadoptPauseHook = std::sync::Arc<
+    dyn Fn(&str, &str) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 #[derive(Clone)]
 pub struct TerminalRegistry {
     inner: Arc<Mutex<RegistryInner>>,
@@ -621,6 +659,57 @@ pub struct TerminalRegistry {
     /// KNOWN dead (registered but not Running) is pruned instead of
     /// answering `BoundElsewhere`, so a dead winner never strands losers.
     session_ref_bindings: Arc<Mutex<HashMap<String, String>>>,
+    /// kata b8ke Task 4: the ONE server-wide runtime-ownership coordinator,
+    /// release-only integration (the registry itself never claims — the WS/
+    /// REST/auto-resume lanes claim; this crate only RELEASES on confirmed
+    /// death: `kill_internal`'s end-of-fn release after the PTY kill, the
+    /// natural-exit release in `finish_pty_exit`, and the force-release twin
+    /// beside [`Self::force_release_after_confirmed_kill`]). `None` (every
+    /// pre-existing construction) keeps all of it a no-op.
+    ownership: Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
+    /// kata b8ke Task 4: the retained coordinator commit per sessionRef key —
+    /// the fenced `ReleaseClaim` source for the exit/kill release paths. A
+    /// terminal that committed `Live{Terminal}` through
+    /// [`Self::commit_session_ref_ownership`] records its claim here; the
+    /// release paths take-if-matches (a newer owner's entry is never taken by
+    /// an older terminal's exit).
+    session_ref_ownership: Arc<Mutex<HashMap<String, RetainedSessionRefOwnership>>>,
+    /// kata b8ke Task 7: the deterministic-race pause seam for
+    /// `terminal.create` — a closure returning a future the WS lane's
+    /// `handle_create` AWAITS between the keyed-create precheck and the
+    /// coordinator claim, so tests can park a create mid-flight and prove the
+    /// cross-kind fencing under a concurrent fresh-agent attach (a
+    /// notify-only closure would not pause anything). `None` (the default,
+    /// never set in production) keeps every create a no-op pass-through.
+    /// Hosted HERE (not on the WS state struct) because the registry is the
+    /// terminal lane's shared, constructor-built state — interior-shared so
+    /// every cloned handle (the WS state's, the REST spawn state's) observes
+    /// a test-set hook (the `activity_observer` injection idiom).
+    terminal_create_pause: Arc<std::sync::RwLock<Option<TerminalCreatePauseHook>>>,
+    /// b8ke ext r12 F2: the ATTACH-path park seam (see
+    /// [`Self::set_terminal_attach_pause_for_tests`]). Never set in
+    /// production.
+    terminal_attach_pause: Arc<std::sync::RwLock<Option<TerminalCreatePauseHook>>>,
+    /// b8ke ext r39 F1: the identity re-adopt PRE-ARM pause hook (see
+    /// [`IdentityReadoptPauseHook`]). Never set in production.
+    identity_readopt_pause: Arc<std::sync::RwLock<Option<IdentityReadoptPauseHook>>>,
+    /// b8ke ext r13 F1: the create POST-CLAIM park seam (see
+    /// [`Self::set_terminal_create_postclaim_pause_for_tests`]). Never set
+    /// in production.
+    terminal_create_postclaim_pause: Arc<std::sync::RwLock<Option<TerminalCreatePauseHook>>>,
+}
+
+/// The retained coordinator claim for one sessionRef-owning terminal (kata
+/// b8ke Task 4): everything the fenced release needs — the locator, the
+/// committing operation, its generation, and the runtime identity the commit
+/// stamped (terminal id + pid).
+#[derive(Debug, Clone)]
+pub struct RetainedSessionRefOwnership {
+    pub locator: SessionLocator,
+    pub terminal_id: String,
+    pub operation_id: String,
+    pub generation: u64,
+    pub pid: Option<u32>,
 }
 
 impl Default for TerminalRegistry {
@@ -759,6 +848,18 @@ pub trait PaneIdentityBinder: Send + Sync + std::fmt::Debug {
     /// (freshell-ws/src/terminal.rs): identity row + durable binding for any
     /// non-shell create with a session id; pending marker for the
     /// locator-resolved providers (codex/opencode/amplifier) without one.
+    /// `observed` (b8ke ext r27 F2): the ownership (epoch, generation) pair
+    /// the spawning lifecycle operation holds — a handoff runner's terminal
+    /// target passes its SUPPLIED handoff pair so the durable row carries
+    /// the handoff's generation (the delayed-write fence baseline); other
+    /// callers pass `None` (legacy-unfenced; the row's prior stamp is
+    /// preserved by the write path).
+    /// b8ke ext r27 F3: the registration is TYPED — the durable write's
+    /// failure propagates as `Err` so a handoff runner's terminal target can
+    /// fail the handoff typed (never a committed Live owner with no
+    /// recoverable registration). `Ok(())` covers every no-op arm (shell,
+    /// marker-less modes) and every successful write; callers without a
+    /// typed channel deliberately keep their documented degradation policy.
     fn register_create_identity(
         &self,
         terminal_id: &str,
@@ -766,7 +867,8 @@ pub trait PaneIdentityBinder: Send + Sync + std::fmt::Debug {
         resume_session_id: Option<&str>,
         cwd: Option<&str>,
         create_request_id: Option<&str>,
-    );
+        observed: Option<(u64, u64)>,
+    ) -> Result<(), std::io::Error>;
     /// Exit-side hygiene (load-bearing ledger A2): mirrors the WS pane
     /// EXIT hook (terminal.rs:1334-1342) EXACTLY — retire the identity row
     /// (in-memory flag flip) and delete any pending marker. Deliberately
@@ -819,7 +921,25 @@ impl TerminalRegistry {
             resume_create_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
             session_ref_leases: Arc::new(Mutex::new(HashMap::new())),
             session_ref_bindings: Arc::new(Mutex::new(HashMap::new())),
+            ownership: None,
+            session_ref_ownership: Arc::new(Mutex::new(HashMap::new())),
+            terminal_create_pause: Arc::new(std::sync::RwLock::new(None)),
+            terminal_attach_pause: Arc::new(std::sync::RwLock::new(None)),
+            identity_readopt_pause: Arc::new(std::sync::RwLock::new(None)),
+            terminal_create_postclaim_pause: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// kata b8ke Task 4: wire the ONE server-wide runtime-ownership
+    /// coordinator (release-only integration — see [`Self::ownership`]'s field
+    /// doc). Builder form, matching the neighboring injection seams
+    /// (`freshell-server::main` calls it right after `TerminalRegistry::new`).
+    pub fn with_ownership(
+        mut self,
+        ownership: Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+    ) -> Self {
+        self.ownership = Some(ownership);
+        self
     }
 
     /// Mint a unique id for one WS connection (used to key its subscriptions so
@@ -849,6 +969,126 @@ impl TerminalRegistry {
             .activity_observer
             .write()
             .expect("activity observer lock") = Some(observer);
+    }
+
+    /// kata b8ke Task 7: install the terminal-create pause hook (the
+    /// deterministic-race tests inject here — see
+    /// [`TerminalCreatePauseHook`]). Interior-shared: every cloned registry
+    /// handle (the WS state's, the REST spawn state's) observes it. Never
+    /// set in production.
+    pub fn set_terminal_create_pause_for_tests(&self, hook: TerminalCreatePauseHook) {
+        *self
+            .terminal_create_pause
+            .write()
+            .expect("terminal create pause lock") = Some(hook);
+    }
+
+    /// b8ke ext r12 F2: install the terminal-ATTACH pause hook — the
+    /// deterministic-race tests park the attach handler INSIDE its
+    /// coordinator window (after the guard arms, before the attach
+    /// completes) to prove a concurrent handoff answers the typed Blocked
+    /// outcome. Interior-shared like the create seam. Never set in
+    /// production.
+    pub fn set_terminal_attach_pause_for_tests(&self, hook: TerminalCreatePauseHook) {
+        *self
+            .terminal_attach_pause
+            .write()
+            .expect("terminal attach pause lock") = Some(hook);
+    }
+
+    /// b8ke ext r12 F2: clear the terminal-attach pause hook.
+    pub fn clear_terminal_attach_pause_for_tests(&self) {
+        *self
+            .terminal_attach_pause
+            .write()
+            .expect("terminal attach pause lock") = None;
+    }
+
+    /// b8ke ext r39 F1: install the identity re-adopt PRE-ARM pause hook —
+    /// the deterministic-race tests park `coordinator_begin_identity`'s
+    /// re-adopt arm between the precheck observation and the atomic adopt.
+    /// Never set in production.
+    pub fn set_identity_readopt_pause_for_tests(&self, hook: IdentityReadoptPauseHook) {
+        *self
+            .identity_readopt_pause
+            .write()
+            .expect("identity re-adopt pause lock") = Some(hook);
+    }
+
+    /// b8ke ext r39 F1: clear the identity re-adopt pause hook.
+    pub fn clear_identity_readopt_pause_for_tests(&self) {
+        *self
+            .identity_readopt_pause
+            .write()
+            .expect("identity re-adopt pause lock") = None;
+    }
+
+    /// b8ke ext r39 F1: read the identity re-adopt pause hook (None in
+    /// production and every test that does not install it).
+    pub fn identity_readopt_pause_hook(&self) -> Option<IdentityReadoptPauseHook> {
+        self.identity_readopt_pause
+            .read()
+            .expect("identity re-adopt pause lock")
+            .clone()
+    }
+
+    /// b8ke ext r13 F1: install the terminal-create POST-CLAIM pause hook —
+    /// the deterministic-race tests park the create handler AFTER the
+    /// coordinator claim (inside its held-authority window) to prove a
+    /// concurrent handoff begin answers the typed Blocked outcome. Interior-
+    /// shared like the create seam. Never set in production.
+    pub fn set_terminal_create_postclaim_pause_for_tests(&self, hook: TerminalCreatePauseHook) {
+        *self
+            .terminal_create_postclaim_pause
+            .write()
+            .expect("terminal create postclaim pause lock") = Some(hook);
+    }
+
+    /// b8ke ext r13 F1: clear the post-claim create pause hook.
+    pub fn clear_terminal_create_postclaim_pause_for_tests(&self) {
+        *self
+            .terminal_create_postclaim_pause
+            .write()
+            .expect("terminal create postclaim pause lock") = None;
+    }
+
+    /// b8ke ext r13 F1: the clone-out read of the post-claim create pause
+    /// hook.
+    pub fn terminal_create_postclaim_pause_hook(&self) -> Option<TerminalCreatePauseHook> {
+        self.terminal_create_postclaim_pause
+            .read()
+            .expect("terminal create postclaim pause lock")
+            .clone()
+    }
+
+    /// b8ke ext r12 F2: the clone-out read of the attach pause hook (the
+    /// caller clones the Arc first, awaits after — never hold a lock
+    /// across an await).
+    pub fn terminal_attach_pause_hook(&self) -> Option<TerminalCreatePauseHook> {
+        self.terminal_attach_pause
+            .read()
+            .expect("terminal attach pause lock")
+            .clone()
+    }
+
+    /// kata b8ke Task 7: clear the terminal-create pause hook (the race
+    /// tests' between-scenarios cleanup).
+    pub fn clear_terminal_create_pause_for_tests(&self) {
+        *self
+            .terminal_create_pause
+            .write()
+            .expect("terminal create pause lock") = None;
+    }
+
+    /// kata b8ke Task 7: the clone-out read of the terminal-create pause
+    /// hook for `handle_create` — the caller clones the `Arc` out FIRST and
+    /// awaits the hook's future AFTER the lock is released (never hold a
+    /// lock across an await). `None` in production.
+    pub fn terminal_create_pause_hook(&self) -> Option<TerminalCreatePauseHook> {
+        self.terminal_create_pause
+            .read()
+            .expect("terminal create pause lock")
+            .clone()
     }
 
     /// Fire the activity tap, if installed. Cheap no-op otherwise.
@@ -1746,6 +1986,17 @@ impl TerminalRegistry {
             }
         }
         tracing::info!(terminal_id = %terminal_id, by = by, "terminal.killed");
+        // kata b8ke Task 4 (round-1 review: NEVER release before the kill +
+        // confirmed reap): the fenced coordinator release runs at the END of
+        // the kill — AFTER the `pty.kill()` block above, whose return point
+        // IS the confirmed reap for this port (an immediate SIGKILL-and-
+        // reap, see `PtyTerminal::kill`'s doc comment). A release any
+        // earlier would mark the key Vacant while the old writer was still
+        // alive. Fenced: a newer owner or an in-flight Handoff no-ops it;
+        // during an explicit kill's Stopping window (the WS `terminal.kill`
+        // sequence begin_stopped first) the `Live`-only release no-ops and
+        // the stop's own `commit_stop` finishes the transition.
+        self.release_session_ref_ownership(terminal_id, by);
         // TERM-15/TERM-16 tap: a kill clears activity too — no stale blue.
         self.notify_activity(ActivityEvent::Exit {
             terminal_id: terminal_id.to_string(),
@@ -1864,6 +2115,13 @@ impl TerminalRegistry {
             }
         }
         tracing::info!(terminal_id = %terminal_id, exit_code = exit_code, "terminal.exited");
+        // kata b8ke Task 4: the natural-exit confirmation — the reader
+        // thread that runs this hook IS the confirmed reap — releases the
+        // terminal's coordinator ownership fenced (a newer owner or an
+        // in-flight handoff no-ops it; the auto-resume crash-recovery claim
+        // that follows carries the retained fence this terminal committed
+        // under).
+        self.release_session_ref_ownership(terminal_id, "registry/natural-exit");
         // TERM-15/TERM-16 tap: natural exit clears activity (the hub removes
         // the record — no stale blue after exit, TERM-18 semantics).
         self.notify_activity(ActivityEvent::Exit {
@@ -2196,6 +2454,19 @@ impl TerminalRegistry {
         })
     }
 
+    /// kata b8ke Task 6: is this terminal's row GONE (the kill path removes
+    /// rows) or no longer `Running` (the natural-exit path RETAINS the row as
+    /// `Exited` via [`Self::finish_pty_exit`], which makes the death
+    /// observable)? The handoff runner's bounded reap loop polls this
+    /// predicate; it stays SYNC because this crate is tokio-free by design —
+    /// the awaitable loop lives in the caller (`session_handoff.rs`).
+    pub fn terminal_is_dead(&self, terminal_id: &str) -> bool {
+        match self.probe(terminal_id) {
+            None => true,
+            Some(row) => row.status != TerminalRunStatus::Running,
+        }
+    }
+
     /// §5.4 single-flight claim: reserve `key` for an in-flight keyed create.
     /// `false` means another create currently holds the reservation — the
     /// caller should re-check for a live terminal (adopt) instead of
@@ -2494,11 +2765,438 @@ impl TerminalRegistry {
 
     /// The caller killed the holder's child via the registry PTY handle and
     /// CONFIRMED death (ESRCH): release the lease so the next claim wins.
+    /// kata b8ke Task 4: also force-release the COORDINATOR with the retained
+    /// claim (fenced — no-op on any mismatch, never fires during a Handoff),
+    /// so a confirmed-kill recovery path reopens BOTH layers.
     pub fn force_release_after_confirmed_kill(&self, locator: &SessionLocator) {
         self.session_ref_leases
             .lock()
             .expect("session-ref lease lock")
             .remove(&session_ref_key(locator));
+        let Some(ownership) = self.ownership.as_ref() else {
+            return;
+        };
+        // Take-if-matches: only an entry whose runtime is CONFIRMED DEAD (no
+        // registry row — every confirmed kill removes it) is taken; a newer
+        // LIVE owner's retained entry (same locator key, replaced at its
+        // commit) is never taken by an older path's force-release.
+        let key = session_ref_key(locator);
+        let dead_runtime = {
+            let claims = self
+                .session_ref_ownership
+                .lock()
+                .expect("session-ref ownership lock");
+            claims
+                .get(&key)
+                .is_some_and(|claim| !self.is_running(&claim.terminal_id))
+        };
+        if dead_runtime {
+            if let Some(claim) = self.take_retained_ownership_claim(&key) {
+                ownership.force_release_for_confirmed_kill(
+                    &locator.provider,
+                    &locator.session_id,
+                    &freshell_ownership::ReleaseClaim {
+                        operation_id: claim.operation_id.clone(),
+                        generation: claim.generation,
+                        runtime: Some(retained_runtime_identity(&claim)),
+                    },
+                    "registry/confirmed-kill",
+                );
+            }
+        }
+    }
+
+    /// kata b8ke Task 4: commit coordinator ownership for a sessionRef-bound
+    /// terminal — `Live{Terminal}` with the runtime identity (terminal id +
+    /// current PTY pid) — and RETAIN the claim so the exit/kill release paths
+    /// can release it fenced. Called by the create lanes (WS / REST /
+    /// auto-resume) at their winner-settle points. Returns the coordinator's
+    /// outcome: `Committed`, or `StaleGeneration`/`ForeignOperation` — the
+    /// caller must tear down its just-spawned child exactly like its
+    /// revoked-lease discipline (the key was never ours to keep).
+    pub fn commit_session_ref_ownership(
+        &self,
+        locator: &SessionLocator,
+        operation_id: &str,
+        generation: u64,
+        terminal_id: &str,
+    ) -> freshell_ownership::CommitOutcome {
+        let Some(ownership) = self.ownership.as_ref() else {
+            return freshell_ownership::CommitOutcome::Committed;
+        };
+        // b8ke ext r9 F2: the commit verifies the spawned PTY is STILL
+        // RUNNING at commit time — a fast-failing exact resume can exit
+        // during the asynchronous binding and registration work BEFORE
+        // this commit, and its natural-exit callback (finding no retained
+        // claim yet) releases NOTHING; pre-r9 the dead terminal was then
+        // recorded Live{Terminal}. The retained-claim lock is the ordering
+        // point for the whole commit: the exit path flips the row's status
+        // FIRST (under the registry's inner lock) and takes/releases the
+        // retained claim second, so whichever observes first wins — the
+        // commit under this lock either sees the still-Running row (it
+        // commits and inserts; the exit callback's take then finds the
+        // claim and releases it) or sees the already-Exited row and
+        // fails typed (a dead runtime NEVER records Live). The nesting is
+        // safe: no code path takes the registry's inner lock and then this
+        // lock, so claims→inner can never invert.
+        let mut claims = self
+            .session_ref_ownership
+            .lock()
+            .expect("session-ref ownership lock");
+        if !self.is_pty_running(terminal_id) {
+            tracing::error!(target: "freshell_terminal",
+                terminal_id = %terminal_id,
+                provider = %locator.provider,
+                session_id = %locator.session_id,
+                operation_id = %operation_id,
+                "session_ref_ownership_commit_refused_dead_pty: the PTY exited \
+                 before the commit — a dead runtime is never recorded Live; the \
+                 natural-exit path owns the release");
+            return freshell_ownership::CommitOutcome::ForeignOperation;
+        }
+        let pid = self.pid_of(terminal_id);
+        let owner = freshell_ownership::OwnerIdentity {
+            kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+            terminal_id: Some(terminal_id.to_string()),
+            live_session_key: None,
+            pid,
+            ownership_id: Some(operation_id.to_string()),
+        };
+        let outcome = ownership.commit_live(
+            &locator.provider,
+            &locator.session_id,
+            operation_id,
+            generation,
+            owner,
+        );
+        if matches!(outcome, freshell_ownership::CommitOutcome::Committed) {
+            claims.insert(
+                session_ref_key(locator),
+                RetainedSessionRefOwnership {
+                    locator: locator.clone(),
+                    terminal_id: terminal_id.to_string(),
+                    operation_id: operation_id.to_string(),
+                    generation,
+                    pid,
+                },
+            );
+        }
+        outcome
+    }
+
+    /// TEST FIXTURE ONLY (b8ke ext r9 F2): stamp a coordinator
+    /// `Live{Terminal}` owner AND the retained claim for a terminal whose
+    /// registry row is ALREADY GONE — the mid-kill-race shape (the commit
+    /// landed while the row was alive; the reaper consumed the row before
+    /// the kill observed it). Pre-r9 the public
+    /// `commit_session_ref_ownership` could construct this shape because it
+    /// verified nothing; it now refuses a dead/gone PTY typed, so the
+    /// wedge-test fixtures seed the state directly. Never call from
+    /// production code.
+    #[doc(hidden)]
+    pub fn seed_live_session_ref_ownership_for_test(
+        &self,
+        locator: &freshell_protocol::SessionLocator,
+        operation_id: &str,
+        generation: u64,
+        terminal_id: &str,
+    ) -> freshell_ownership::CommitOutcome {
+        let Some(ownership) = self.ownership.as_ref() else {
+            return freshell_ownership::CommitOutcome::Committed;
+        };
+        let owner = freshell_ownership::OwnerIdentity {
+            kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+            terminal_id: Some(terminal_id.to_string()),
+            live_session_key: None,
+            pid: None,
+            ownership_id: Some(operation_id.to_string()),
+        };
+        let outcome = ownership.commit_live(
+            &locator.provider,
+            &locator.session_id,
+            operation_id,
+            generation,
+            owner,
+        );
+        if matches!(outcome, freshell_ownership::CommitOutcome::Committed) {
+            self.session_ref_ownership
+                .lock()
+                .expect("session-ref ownership lock")
+                .insert(
+                    session_ref_key(locator),
+                    RetainedSessionRefOwnership {
+                        locator: locator.clone(),
+                        terminal_id: terminal_id.to_string(),
+                        operation_id: operation_id.to_string(),
+                        generation,
+                        pid: None,
+                    },
+                );
+        }
+        outcome
+    }
+
+    /// b8ke ext r14 F2: the identity REBIND's commit — the ext-r9 F2
+    /// liveness contract plus the atomic coordinator move
+    /// ([`freshell_ownership::RuntimeOwnershipRegistry::commit_live_rekey_from_terminal`]:
+    /// the new key's Starting claim commits Live while the OLD key's
+    /// Live{Terminal} record becomes Aliased — ONE coordinator lock scope,
+    /// never the interval where both keys name the writer) and the
+    /// RETAINED CLAIM REKEY in one registry lock scope: the old key's
+    /// retained claim is REMOVED as the new key's is inserted, so the
+    /// kill/exit selection can never pick a stale old claim. The old
+    /// claim is returned to the caller (the release of the old key is the
+    /// caller's broadcast decision, not a second registry step).
+    pub fn commit_session_ref_ownership_rekey(
+        &self,
+        old_locator: &freshell_protocol::SessionLocator,
+        new_locator: &freshell_protocol::SessionLocator,
+        operation_id: &str,
+        generation: u64,
+        terminal_id: &str,
+    ) -> (
+        freshell_ownership::CommitOutcome,
+        Option<RetainedSessionRefOwnership>,
+    ) {
+        let Some(ownership) = self.ownership.as_ref() else {
+            return (freshell_ownership::CommitOutcome::Committed, None);
+        };
+        // b8ke ext r30 F2: the retained-claim lock is the ordering point
+        // for the WHOLE rekey — held across the liveness check, the
+        // old→new coordinator move, AND the claim-map move, exactly the
+        // normal commit's discipline (the template at
+        // [`Self::commit_session_ref_ownership`]). Pre-r30 the rekey
+        // checked liveness and moved the coordinator record BEFORE taking
+        // this lock: a PTY exiting between the coordinator move and the
+        // claim move was consumed by `finish_pty_exit` against the OLD
+        // claim — releasing the now-Aliased old key (a no-op) — and the
+        // rekey then installed a NEW claim for the already-dead terminal,
+        // leaving the new canonical key falsely Live{Terminal} with no
+        // release evidence. Under this lock an exit in the window BLOCKS
+        // and consumes the NEW claim once the rekey completes (releasing
+        // the new key correctly), and an exit that already happened is
+        // seen by the liveness check (a dead PTY never rebinds). The
+        // nesting is the template's own: no code path takes the registry's
+        // inner lock and then this lock, so claims→inner can never invert.
+        let mut claims = self
+            .session_ref_ownership
+            .lock()
+            .expect("session-ref ownership lock");
+        // The ext-r9 F2 commit-time liveness check: a dead/gone PTY never
+        // records Live (the association lanes gate on a Running row, so
+        // this passes).
+        if !self.is_pty_running(terminal_id) {
+            tracing::error!(target: "freshell_terminal",
+                terminal_id = %terminal_id,
+                provider = %new_locator.provider,
+                session_id = %new_locator.session_id,
+                operation_id = %operation_id,
+                "session_ref_ownership_rekey_refused_dead_pty: the PTY exited \
+                 before the rebind commit — a dead runtime is never recorded \
+                 Live; the rebind mutates nothing");
+            return (freshell_ownership::CommitOutcome::ForeignOperation, None);
+        }
+        let pid = self.pid_of(terminal_id);
+        let owner = freshell_ownership::OwnerIdentity {
+            kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+            terminal_id: Some(terminal_id.to_string()),
+            live_session_key: None,
+            pid,
+            ownership_id: Some(operation_id.to_string()),
+        };
+        let outcome = ownership.commit_live_rekey_from_terminal(
+            &new_locator.provider,
+            &new_locator.session_id,
+            operation_id,
+            generation,
+            &old_locator.session_id,
+            terminal_id,
+            owner,
+            "ws-identity-association/rebind",
+        );
+        if !matches!(outcome, freshell_ownership::CommitOutcome::Committed) {
+            return (outcome, None);
+        }
+        // b8ke ext r30 F1's test seam: the deterministic park INSIDE the
+        // critical section — between the coordinator move and the
+        // claim-map move. Never armed in production.
+        #[cfg(test)]
+        REKEY_INTERLOCK.wait_if_targeted(terminal_id);
+        // The retained-claim rekey: remove the old claim + insert the new
+        // — ONE registry lock scope (the map never holds both after the
+        // step) — and now ATOMIC with the coordinator move above (the
+        // same lock scope covers both).
+        let removed_old = claims.remove(&session_ref_key(old_locator));
+        claims.insert(
+            session_ref_key(new_locator),
+            RetainedSessionRefOwnership {
+                locator: new_locator.clone(),
+                terminal_id: terminal_id.to_string(),
+                operation_id: operation_id.to_string(),
+                generation,
+                pid,
+            },
+        );
+        (outcome, removed_old)
+    }
+
+    /// b8ke ext r14 F2 (test probe): the retained ownership claim a
+    /// locator holds, if any — the rebind's claim-rekey assertions read
+    /// the map without depending on HashMap iteration order.
+    pub fn retained_ownership_claim_by_locator(
+        &self,
+        locator: &freshell_protocol::SessionLocator,
+    ) -> Option<RetainedSessionRefOwnership> {
+        self.session_ref_ownership
+            .lock()
+            .expect("session-ref ownership lock")
+            .get(&session_ref_key(locator))
+            .cloned()
+    }
+
+    /// b8ke ext r14 F2: remove a locator's retained ownership claim — the
+    /// rebind's old-key half of the retained-claim rekey (the kill/exit
+    /// selection must never find a superseded claim beside its
+    /// replacement). Returns the removed claim, if any.
+    pub fn remove_retained_session_ref_claim(
+        &self,
+        locator: &freshell_protocol::SessionLocator,
+    ) -> Option<RetainedSessionRefOwnership> {
+        self.session_ref_ownership
+            .lock()
+            .expect("session-ref ownership lock")
+            .remove(&session_ref_key(locator))
+    }
+
+    /// The last-known coordinator `(epoch, generation)` a terminal committed
+    /// under (kata b8ke Task 4) — the auto-resume crash event's observed
+    /// fence pair. `None` when the terminal never committed ownership (a
+    /// pre-coordinator terminal, or one whose locator resolved later).
+    pub fn retained_ownership_fence(&self, terminal_id: &str) -> Option<(u64, u64)> {
+        let ownership = self.ownership.as_ref()?;
+        let claims = self
+            .session_ref_ownership
+            .lock()
+            .expect("session-ref ownership lock");
+        claims
+            .values()
+            .find(|claim| claim.terminal_id == terminal_id)
+            .map(|claim| (ownership.boot_epoch(), claim.generation))
+    }
+
+    /// The retained coordinator claim for a terminal (kata b8ke Task 4) —
+    /// the explicit-kill path's `StopClaim` source (expected runtime
+    /// identity + observed fence).
+    pub fn retained_ownership_claim(
+        &self,
+        terminal_id: &str,
+    ) -> Option<RetainedSessionRefOwnership> {
+        let claims = self
+            .session_ref_ownership
+            .lock()
+            .expect("session-ref ownership lock");
+        claims
+            .values()
+            .find(|claim| claim.terminal_id == terminal_id)
+            .cloned()
+    }
+
+    /// Take the retained claim keyed by the locator key (the force-release
+    /// twin's lookup). Removing the entry hands the release decision to the
+    /// caller; a mismatched Live record still no-ops the fenced release.
+    fn take_retained_ownership_claim(&self, key: &str) -> Option<RetainedSessionRefOwnership> {
+        self.session_ref_ownership
+            .lock()
+            .expect("session-ref ownership lock")
+            .remove(key)
+    }
+
+    /// Take the retained claim belonging to THIS terminal (the exit/kill
+    /// release paths' lookup). Only an entry whose terminal id matches is
+    /// taken — a newer owner's retained entry (same locator key, replaced at
+    /// its commit) is never taken by an older terminal's death.
+    fn take_retained_ownership_claims_for_terminal(
+        &self,
+        terminal_id: &str,
+    ) -> Vec<RetainedSessionRefOwnership> {
+        // b8ke ext r14 F2: take EVERY claim this terminal holds — the
+        // kill/exit owns the TERMINAL, so each of its retained claims
+        // releases its key (a rebind's superseded old claim beside its new
+        // one must never leave the new key stranded by unordered
+        // HashMap selection). Pre-r14 this took exactly ONE matching
+        // claim: a rebind-left pair let the iteration order pick the
+        // stale old claim, releasing the already-vacant old key while the
+        // authoritative new key stayed Live after the terminal died.
+        let mut claims = self
+            .session_ref_ownership
+            .lock()
+            .expect("session-ref ownership lock");
+        let matching: Vec<String> = claims
+            .iter()
+            .filter(|(_, claim)| claim.terminal_id == terminal_id)
+            .map(|(key, _)| key.clone())
+            .collect();
+        matching
+            .into_iter()
+            .filter_map(|key| claims.remove(&key))
+            .collect()
+    }
+
+    /// The failed-handoff restore's claim repair (kata b8ke whole-branch
+    /// review M-1): a prior TERMINAL owner restored as Live carries the
+    /// RECORD's current (handoff-bumped) generation, so the retained claim
+    /// its exit/kill release paths fence with must be bumped to the SAME
+    /// generation — otherwise the fenced `release`/
+    /// `force_release_for_confirmed_kill` (an exact generation match
+    /// against the Live state) would no-op forever and the restored key
+    /// would never vacate when the terminal dies. Only the generation moves:
+    /// the locator, terminal id, committing operation id, and pid stay the
+    /// prior's own (the identity the restored Live record holds). Returns
+    /// whether a claim for this terminal was found and bumped. A restore
+    /// only ever happens while the terminal's row is still Running (a
+    /// killed row fails the liveness re-probe), so the claim is present in
+    /// every reachable shape — unlike the fresh lanes' stamp (which the
+    /// lane kill TAKES while the runtime can stay alive), the terminal
+    /// claim is only ever consumed by paths that remove the row.
+    pub fn repair_restored_prior_ownership(&self, terminal_id: &str, generation: u64) -> bool {
+        let mut claims = self
+            .session_ref_ownership
+            .lock()
+            .expect("session-ref ownership lock");
+        let Some(claim) = claims
+            .values_mut()
+            .find(|claim| claim.terminal_id == terminal_id)
+        else {
+            return false;
+        };
+        claim.generation = generation;
+        true
+    }
+
+    /// The fenced coordinator release for a terminal's confirmed death (kata
+    /// b8ke Task 4): no-ops when unwired, when the terminal never committed,
+    /// or when the retained claim no longer matches the Live record (a newer
+    /// owner took the key — its entry is never taken).
+    fn release_session_ref_ownership(&self, terminal_id: &str, initiator: &str) {
+        let Some(ownership) = self.ownership.as_ref() else {
+            return;
+        };
+        // b8ke ext r14 F2: EVERY retained claim this terminal held
+        // releases its key — a mismatched (already-moved/vacant) key
+        // no-ops per the release-claim discipline, so taking all is
+        // always safe and never strands a key by selection order.
+        for claim in self.take_retained_ownership_claims_for_terminal(terminal_id) {
+            ownership.release(
+                &claim.locator.provider,
+                &claim.locator.session_id,
+                &freshell_ownership::ReleaseClaim {
+                    operation_id: claim.operation_id.clone(),
+                    generation: claim.generation,
+                    runtime: Some(retained_runtime_identity(&claim)),
+                },
+                initiator,
+            );
+        }
     }
 
     /// The terminalId a completed claim bound this sessionRef to
@@ -2835,6 +3533,69 @@ fn deliver_batches(
     }
 }
 
+/// b8ke ext r30 F2 (test-only): the rekey's deterministic INTERLOCK —
+/// parks the rekey's critical section between the old→new coordinator
+/// move and the retained-claim move for ONE targeted terminal id, so a
+/// test can drive the PTY-exit race in that exact window. Targeted by
+/// terminal id so concurrent tests pass through untouched.
+#[cfg(test)]
+pub(crate) static REKEY_INTERLOCK: RekeyInterlock = RekeyInterlock {
+    target: std::sync::Mutex::new(None),
+    reached: std::sync::atomic::AtomicBool::new(false),
+    gate: std::sync::Mutex::new(false),
+    cv: std::sync::Condvar::new(),
+};
+
+#[cfg(test)]
+pub(crate) struct RekeyInterlock {
+    target: std::sync::Mutex<Option<String>>,
+    reached: std::sync::atomic::AtomicBool,
+    gate: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl RekeyInterlock {
+    /// Arm the park for one terminal id — only that id parks. Re-arming
+    /// resets the arrival flag.
+    pub(crate) fn arm(&self, terminal_id: &str) {
+        *self.target.lock().expect("interlock target") = Some(terminal_id.to_string());
+        self.reached
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Has the targeted rekey reached the park?
+    pub(crate) fn reached(&self) -> bool {
+        self.reached.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Release the parked rekey and disarm (idempotent).
+    pub(crate) fn release(&self) {
+        *self.target.lock().expect("interlock target") = None;
+        let mut gate = self.gate.lock().expect("interlock gate");
+        *gate = true;
+        self.cv.notify_all();
+    }
+
+    fn wait_if_targeted(&self, terminal_id: &str) {
+        let targeted = self
+            .target
+            .lock()
+            .expect("interlock target")
+            .as_ref()
+            .is_some_and(|t| t == terminal_id);
+        if !targeted {
+            return;
+        }
+        self.reached
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut gate = self.gate.lock().expect("interlock gate");
+        while !*gate {
+            gate = self.cv.wait(gate).expect("interlock condvar");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3067,6 +3828,131 @@ mod tests {
     /// **RED before implementation**: `TerminalRegistry::finish_pty_exit`
     /// (the NATURAL-exit path) must emit a `terminal.exited` event (fields:
     /// `terminal_id`, `exit_code`).
+    /// b8ke ext r30 F2: the rekey's exit race, driven deterministically
+    /// through the interlock. The rekey parks INSIDE its critical section
+    /// — between the old→new coordinator move and the retained-claim
+    /// move — and the PTY's natural exit (`finish_pty_exit`) fires in
+    /// that exact window. With the claims lock held across the whole
+    /// rekey (the normal commit's template), the exit BLOCKS until the
+    /// rekey completes, then consumes the NEW claim and releases the NEW
+    /// canonical key: the new key is never falsely Live and no claim
+    /// survives for the dead terminal. Pre-r30 the exit consumed the OLD
+    /// claim mid-window (releasing the now-Aliased old key — a no-op),
+    /// and the rekey then installed a NEW claim for the already-dead
+    /// terminal, leaving the new canonical key falsely Live{Terminal}.
+    #[test]
+    fn rekey_exit_racing_the_claim_move_consumes_the_new_claim_and_releases_the_new_key() {
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let reg = TerminalRegistry::new().with_ownership(ownership.clone());
+        reg.insert_headless("T-r30-rekey", "S-r30-rekey");
+
+        let old_locator = SessionLocator {
+            provider: "codex".to_string(),
+            session_id: "ses-r30-old".to_string(),
+        };
+        let new_locator = SessionLocator {
+            provider: "codex".to_string(),
+            session_id: "ses-r30-new".to_string(),
+        };
+
+        // The old key's Live{Terminal} era: a begin + the normal commit
+        // (the template) installs the old retained claim.
+        let freshell_ownership::BeginOutcome::Granted { generation: g1 } = ownership.begin_start(
+            &old_locator.provider,
+            &old_locator.session_id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-r30-old",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("the old-key start must grant")
+        };
+        assert_eq!(
+            reg.commit_session_ref_ownership(&old_locator, "op-r30-old", g1, "T-r30-rekey"),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        assert!(reg
+            .retained_ownership_claim_by_locator(&old_locator)
+            .is_some());
+
+        // The new key's rekey entry: its Starting claim.
+        let freshell_ownership::BeginOutcome::Granted { generation: g2 } = ownership.begin_start(
+            &new_locator.provider,
+            &new_locator.session_id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-r30-new",
+            None,
+            "test",
+            2_000,
+        ) else {
+            panic!("the new-key start must grant")
+        };
+
+        // Arm the interlock and run the rekey to its park — inside the
+        // window, after the coordinator move, before the claim move.
+        REKEY_INTERLOCK.arm("T-r30-rekey");
+        let rekey_reg = reg.clone();
+        let rekey_old = old_locator.clone();
+        let rekey_new = new_locator.clone();
+        let rekey = std::thread::spawn(move || {
+            rekey_reg.commit_session_ref_ownership_rekey(
+                &rekey_old,
+                &rekey_new,
+                "op-r30-new",
+                g2,
+                "T-r30-rekey",
+            )
+        });
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !REKEY_INTERLOCK.reached() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the rekey never reached the interlock park"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        // THE EXIT fires in the parked window. With the claims lock held
+        // (the fix) it blocks mid-consumption; without it (pre-r30) it
+        // consumed the OLD claim and no-op-released the aliased old key.
+        let exit_reg = reg.clone();
+        let exit = std::thread::spawn(move || exit_reg.finish_pty_exit("T-r30-rekey", 0));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Release the rekey: it completes the claim move under the lock,
+        // and the (blocked) exit then consumes the NEW claim.
+        REKEY_INTERLOCK.release();
+        let (outcome, _removed_old) = rekey.join().expect("the rekey joins");
+        assert_eq!(outcome, freshell_ownership::CommitOutcome::Committed);
+        assert!(exit.join().expect("the exit joins"));
+
+        // THE CONVERGENCE: the exit consumed the NEW claim and released
+        // the NEW canonical key — never falsely Live — and no retained
+        // claim survives for the dead terminal.
+        let settled = ownership.observe(&new_locator.provider, &new_locator.session_id);
+        assert!(
+            !matches!(
+                settled.state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ),
+            "the new canonical key is never falsely Live for the dead \
+             terminal: {settled:?}"
+        );
+        assert!(
+            reg.retained_ownership_claim_by_locator(&new_locator)
+                .is_none(),
+            "no retained claim survives the exit (the NEW claim was consumed)"
+        );
+        assert!(
+            reg.retained_ownership_claim_by_locator(&old_locator)
+                .is_none(),
+            "the old claim never survived the rekey either"
+        );
+    }
+
     #[test]
     fn finish_pty_exit_emits_terminal_exited_event_with_exit_code() {
         let (events, _guard) = tracing_capture::capture();
@@ -3087,6 +3973,43 @@ mod tests {
         assert_eq!(
             exited.fields.get("exit_code").map(String::as_str),
             Some("3")
+        );
+    }
+
+    /// kata b8ke Task 6: the handoff runner's terminal-reap probe. A Running
+    /// row is NOT dead; the kill path REMOVES the row (dead); the natural-exit
+    /// path RETAINS it as `Exited` (dead — `finish_pty_exit`'s row retention
+    /// makes the death observable); an unknown id is dead.
+    #[test]
+    fn terminal_is_dead_reports_running_alive_and_both_death_shapes_dead() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T-dead-running", "S-1");
+        reg.insert_headless("T-dead-exited", "S-2");
+        reg.insert_headless("T-dead-killed", "S-3");
+
+        assert!(
+            !reg.terminal_is_dead("T-dead-running"),
+            "a Running row is alive"
+        );
+
+        assert!(
+            reg.finish_pty_exit("T-dead-exited", 0),
+            "natural exit retains the row"
+        );
+        assert!(
+            reg.terminal_is_dead("T-dead-exited"),
+            "a retained Exited row is dead"
+        );
+
+        assert!(reg.kill("T-dead-killed"));
+        assert!(
+            reg.terminal_is_dead("T-dead-killed"),
+            "a killed (removed) row is dead"
+        );
+
+        assert!(
+            reg.terminal_is_dead("T-dead-never-existed"),
+            "an unknown id is dead"
         );
     }
 

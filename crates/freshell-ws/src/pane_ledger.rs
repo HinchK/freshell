@@ -284,6 +284,34 @@ pub struct PaneCloseKill {
     pub provider: String,
     pub session_id: String,
     pub at_ms: i64,
+    /// b8ke focused ep5 r5 F2: the kill's TRANSITION SCOPE — `Some((epoch,
+    /// generation))` ONLY on a failed handoff transition's repair kill
+    /// (the cleanup's fence): the tombstone suppresses/dominates only
+    /// writes and rows at or before that pair; a strictly NEWER binding
+    /// (a later committed owner's write or refresh) is invisible to it.
+    /// `None` on every ordinary kill-lane close (the identity-wide fence).
+    /// Serde-optional under the existing records: pre-r5 records parse to
+    /// `None` (the identity-wide semantics) and old readers ignore the
+    /// field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<(u64, u64)>,
+}
+
+/// b8ke focused ep5 r5 F2: does the tombstone's transition scope LEAVE the
+/// candidate alone? `true` only when the tombstone is SCOPED (a failed
+/// transition's repair fence) and the candidate proves STRICTLY NEWER
+/// than the scope — a later committed owner's binding write or row. The
+/// ordinary kill lanes' tombstones (scope `None`) and every candidate
+/// that cannot prove newer (an unstamped row, an unfenced write) stay
+/// under the fence — fail closed, exactly as before.
+fn tombstone_scope_spares_newer(
+    scope: Option<(u64, u64)>,
+    candidate_pair: Option<(u64, u64)>,
+) -> bool {
+    match (scope, candidate_pair) {
+        (Some(scope), Some(pair)) => pair > scope,
+        _ => false,
+    }
 }
 
 /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3) — the close envelope's
@@ -688,6 +716,36 @@ fn classify_kill_tombstone(
 /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3): feed ONE close-envelope
 /// journal record into the write-through index — the SAME discipline at
 /// persist time and at load. The record's `kills` ARE the close fences: each
+/// b8ke focused ep5 r5 F2: the tombstone index's value — the close's
+/// stamp plus the kill's TRANSITION SCOPE. The merge (max at_ms, and the
+/// STRONGER scope wins: an identity-wide kill — scope `None` — outranks a
+/// scoped one, and the newer stamp carries its own scope) keeps the
+/// feed/recompute/boot-scan folds consistent.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct KillTombstoneEntry {
+    at_ms: i64,
+    scope: Option<(u64, u64)>,
+}
+
+impl KillTombstoneEntry {
+    /// Fold one kill into the entry: the max stamp wins; on a stamp tie
+    /// the IDENTITY-WIDE (unscoped) fence is the stronger claim.
+    fn fold(&mut self, kill: &PaneCloseKill) {
+        match self.at_ms.cmp(&kill.at_ms) {
+            std::cmp::Ordering::Less => {
+                self.at_ms = kill.at_ms;
+                self.scope = kill.scope;
+            }
+            std::cmp::Ordering::Equal => {
+                if kill.scope.is_none() {
+                    self.scope = None;
+                }
+            }
+            std::cmp::Ordering::Greater => {}
+        }
+    }
+}
+
 /// folds into the `kill_tombstones` index, max stamp winning across records
 /// and legacy files (a re-kill re-stamps forward).
 fn feed_close_envelope(index: &mut LedgerIndex, key: String, record: CloseEnvelopeRecord) {
@@ -695,8 +753,11 @@ fn feed_close_envelope(index: &mut LedgerIndex, key: String, record: CloseEnvelo
         index
             .kill_tombstones
             .entry((kill.provider.clone(), kill.session_id.clone()))
-            .and_modify(|stamp| *stamp = (*stamp).max(kill.at_ms))
-            .or_insert(kill.at_ms);
+            .and_modify(|entry| entry.fold(kill))
+            .or_insert(KillTombstoneEntry {
+                at_ms: kill.at_ms,
+                scope: kill.scope,
+            });
     }
     index.close_envelopes.insert(key, record);
 }
@@ -728,6 +789,13 @@ pub enum RetiredReason {
     Closed,
     GcExpired,
     SessionMissing,
+    /// b8ke focused ep5 r4 F1: the failed handoff transition's cleanup
+    /// retired this row — the row is the ORPHANED product of the
+    /// transition's own authoritative binding write (stamped at the
+    /// transition's (epoch, generation) pair), and the transition failed
+    /// (canceled, panicked, or failed typed) with the target reaped, so
+    /// the fresh-agent recovery claim is not authoritative.
+    FailedTransition,
 }
 
 /// A durable identity fact — see the module doc for the schema contract.
@@ -778,6 +846,17 @@ pub struct BindingRow {
     /// "fresh-agent" for fresh-agent rows (P1.13); absent on terminal rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane_kind: Option<String>,
+    /// b8ke ext r22 F2: the ownership (epoch, generation) pair this row was
+    /// last written under — the DELAYED-WRITE FENCE's baseline. A binding
+    /// write carrying an OLDER pair (a pre-teardown in-flight write racing
+    /// a completed handoff that advanced the generation) refuses typed, so
+    /// the newer owner's recovery row survives untouched. `None` on
+    /// pre-r22 rows and legacy-unfenced writes (the fence fires only when
+    /// both the row's stamp and the write's pair exist).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_generation: Option<u64>,
     /// Resume-invocation record (campaign plan §4.2): exactly what the
     /// provider-native resume command needs. Updated when the user changes
     /// them. All optional under LEDGER_VERSION 1 — no version bump.
@@ -1166,6 +1245,14 @@ pub struct BindingWrite<'a> {
     /// ep4-r2 Findings 1+2): the value captured at message receipt flows to
     /// the row unchanged — there is no write-side time override to get wrong.
     pub provenance: ProvenancePolicy<'a>,
+    /// b8ke ext r22 F2: the operation's observed (epoch, generation) pair —
+    /// the DELAYED-WRITE FENCE. The write path refuses typed when the
+    /// existing row's stamp is NEWER (a stale pre-teardown write can never
+    /// overwrite a newer owner's recovery row), and the written row carries
+    /// this pair as its stamp. `None` = legacy-unfenced (accepted; the row's
+    /// prior stamp is preserved).
+    pub observed_epoch: Option<u64>,
+    pub observed_generation: Option<u64>,
     pub now_ms: i64,
 }
 
@@ -1212,6 +1299,21 @@ pub struct FreshAgentBindingWrite<'a> {
     /// per-lane contract (Replace / Inherit / Clear; the Inherit merge falls
     /// back to the superseded parent's stamps on a fork-chain write).
     pub provenance: ProvenancePolicy<'a>,
+    /// b8ke ext r22 F2: the operation's observed (epoch, generation) pair —
+    /// the DELAYED-WRITE FENCE (the fresh-agent binding rows' recovery data
+    /// is generation-fenced: a delayed pre-teardown write carrying an older
+    /// pair refuses typed, so the newer owner's recovery row survives).
+    /// `None` = legacy-unfenced (accepted; the row's prior stamp is
+    /// preserved).
+    pub observed_epoch: Option<u64>,
+    pub observed_generation: Option<u64>,
+    /// b8ke focused ep5 r2 F1: the write is the HANDOFF RUNNER'S OWN
+    /// authoritative target binding (the r27-F2 under-ticket shape — the
+    /// pair is the runner's supplied handoff generation). The
+    /// terminal-row guard accepts an authoritative PAIRED write over an
+    /// UNSTAMPED terminal row (the normal production shape); every
+    /// non-authoritative write keeps the strictly-newer rule.
+    pub authoritative: bool,
     pub now_ms: i64,
 }
 
@@ -1264,7 +1366,7 @@ struct LedgerIndex {
     /// (the suppress arm), the dominance sweep, the claim commit's
     /// conditional, and the recovery inventory's verdict joins — never a
     /// liveness signal.
-    kill_tombstones: std::collections::HashMap<(String, String), i64>,
+    kill_tombstones: std::collections::HashMap<(String, String), KillTombstoneEntry>,
     /// The fence keys backed by a LEGACY `kill-tombstones/` file (the
     /// pre-journal shape). Tracked so the record sweep's un-feed only ever
     /// drops fences no other durable source carries, and the fence sweep's
@@ -1328,9 +1430,34 @@ pub struct PaneLedger {
     /// the held guard while the resolver is provably mid-write.
     #[cfg(test)]
     resolve_gate: Mutex<Option<ResolveGate>>,
+    /// b8ke d4 F3: test-only close-park gate (cross-crate integration
+    /// tests — doc-hidden, production never arms it). When armed, every
+    /// `close_pane` BLOCKS at entry until the test releases — the
+    /// deterministic slow-ledger window the terminal-kill settlement-guard
+    /// test needs.
+    close_pause: Mutex<Option<std::sync::Arc<ClosePauseGate>>>,
+}
+
+/// b8ke d4 F3: the test-only close-park gate — `paused=true` blocks every
+/// `close_pane` at entry; `paused=false` + notify releases them all.
+pub struct ClosePauseGate {
+    pub paused: std::sync::Mutex<bool>,
+    pub release: std::sync::Condvar,
 }
 
 impl PaneLedger {
+    /// b8ke d4 F3: arm the test-only close-park (doc-hidden; production
+    /// never calls). Returns the gate so the test can release it.
+    #[doc(hidden)]
+    pub fn arm_close_pause_for_tests(&self) -> std::sync::Arc<ClosePauseGate> {
+        let gate = std::sync::Arc::new(ClosePauseGate {
+            paused: std::sync::Mutex::new(true),
+            release: std::sync::Condvar::new(),
+        });
+        *self.close_pause.lock().expect("close pause lock") = Some(std::sync::Arc::clone(&gate));
+        gate
+    }
+
     /// Read a scan directory, mapping `NotFound` to "absent" (`Ok(None)`) and
     /// propagating every other error with the faulted path attached. The
     /// `std::io::Error` `Display` already carries the errno text (f3wp lesson:
@@ -1378,6 +1505,7 @@ impl PaneLedger {
                 close_envelope_delete_failures: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 resolve_gate: Mutex::new(None),
+                close_pause: Mutex::new(None),
             };
         };
         match Self::load_index(&r) {
@@ -1396,6 +1524,7 @@ impl PaneLedger {
                 close_envelope_delete_failures: std::sync::atomic::AtomicUsize::new(0),
                 #[cfg(test)]
                 resolve_gate: Mutex::new(None),
+                close_pause: Mutex::new(None),
             },
             Err(err) => {
                 tracing::error!(
@@ -1775,11 +1904,22 @@ impl PaneLedger {
                         if tombstone.ledger_version == LEDGER_VERSION {
                             let key = (tombstone.provider.clone(), tombstone.session_id.clone());
                             index.legacy_tombstone_keys.insert(key.clone());
+                            // Legacy files are identity-wide fences (scope None).
                             index
                                 .kill_tombstones
                                 .entry(key)
-                                .and_modify(|stamp| *stamp = (*stamp).max(tombstone.killed_at_ms))
-                                .or_insert(tombstone.killed_at_ms);
+                                .and_modify(|entry| {
+                                    entry.fold(&PaneCloseKill {
+                                        provider: tombstone.provider.clone(),
+                                        session_id: tombstone.session_id.clone(),
+                                        at_ms: tombstone.killed_at_ms,
+                                        scope: None,
+                                    })
+                                })
+                                .or_insert(KillTombstoneEntry {
+                                    at_ms: tombstone.killed_at_ms,
+                                    scope: None,
+                                });
                         }
                     }
                 }
@@ -1912,6 +2052,41 @@ impl PaneLedger {
             })
             .cloned();
 
+        // b8ke ext r22 F2: the DELAYED-WRITE FENCE (the terminal rows'
+        // twin of the fresh-agent path's gate) — the row's current
+        // ownership stamp vs this write's observed pair. A write carrying
+        // an OLDER pair refuses typed: the newer owner's recovery row
+        // survives. Fires only when both stamps exist.
+        if let (Some((row_epoch, row_gen)), Some((in_epoch, in_gen))) = (
+            index
+                .bindings
+                .get(&(w.provider.to_string(), w.session_id.to_string()))
+                .and_then(|r| match (r.owner_epoch, r.owner_generation) {
+                    (Some(e), Some(g)) => Some((e, g)),
+                    _ => None,
+                }),
+            match (w.observed_epoch, w.observed_generation) {
+                (Some(e), Some(g)) => Some((e, g)),
+                _ => None,
+            },
+        ) {
+            if (in_epoch, in_gen) < (row_epoch, row_gen) {
+                tracing::warn!(target: "freshell_ws::pane_ledger",
+                    provider = %w.provider,
+                    session_id = %w.session_id,
+                    row_epoch, row_generation = row_gen,
+                    observed_epoch = in_epoch, observed_generation = in_gen,
+                    "pane_ledger_binding_refused_stale_pair: the write's observed \
+                     ownership pair predates the row's current owner — the newer \
+                     owner's recovery row survives (kata b8ke ext r22 F2)"
+                );
+                return Err(std::io::Error::other(
+                    "STALE_BINDING_PAIR: the write's observed ownership pair \
+                     predates the row's current owner",
+                ));
+            }
+        }
+
         let key = (w.provider.to_string(), w.session_id.to_string());
         let existing = index.bindings.get(&key);
         let created_at = existing.map(|r| r.created_at).unwrap_or(w.now_ms);
@@ -1970,6 +2145,10 @@ impl PaneLedger {
             retired_reason: None,
             superseded_by: None,
             pane_kind: None,
+            // b8ke ext r22 F2: the write's observed pair becomes the row's
+            // ownership stamp (the delayed-write fence baseline).
+            owner_epoch: w.observed_epoch,
+            owner_generation: w.observed_generation,
             model: None,
             sandbox: None,
             permission_mode: None,
@@ -2119,6 +2298,43 @@ impl PaneLedger {
     /// `resolve_pending`): those own the mode-pane resume paths, which must
     /// rebind after a terminal kill (natural authority split — see the round
     /// 2 report's writer audit).
+    /// b8ke ext r22 F2: stamp the row's ownership (epoch, generation) pair —
+    /// the COMMIT-SIDE refresh. The ownership commits (the terminal identity
+    /// adoption/rebind lanes and the handoff's target commits) know the
+    /// pair at commit time; this carries it onto the row so the
+    /// DELAYED-WRITE FENCE has a current baseline: a delayed pre-teardown
+    /// binding write carrying an OLDER pair then refuses typed and the
+    /// newer owner's recovery row survives. Monotonic: a stamp only ever
+    /// ADVANCES (an older pair never regresses the row's baseline). A
+    /// missing row is a no-op (nothing to fence yet).
+    pub fn stamp_owner_pair(
+        &self,
+        provider: &str,
+        session_id: &str,
+        epoch: u64,
+        generation: u64,
+    ) -> std::io::Result<()> {
+        let Some(root) = &self.root else {
+            return Ok(());
+        };
+        let mut index = self.guard();
+        let key = (provider.to_string(), session_id.to_string());
+        let Some(row) = index.bindings.get(&key) else {
+            return Ok(());
+        };
+        if let (Some(row_epoch), Some(row_gen)) = (row.owner_epoch, row.owner_generation) {
+            if (epoch, generation) <= (row_epoch, row_gen) {
+                // Monotonic: never regress the baseline.
+                return Ok(());
+            }
+        }
+        let mut row = row.clone();
+        row.owner_epoch = Some(epoch);
+        row.owner_generation = Some(generation);
+        row.updated_at = crate::terminal::now_ms();
+        self.write_binding(root, &mut index, &row)
+    }
+
     pub fn record_fresh_agent_binding(
         &self,
         w: &FreshAgentBindingWrite<'_>,
@@ -2149,62 +2365,180 @@ impl PaneLedger {
         // A CLAIM-RESIDUE tombstone (a committed claim's revive visibly
         // outranks its own crashed clear) is inert: the write proceeds and
         // the residue is pruned.
-        if let Some(killed_at) = index.kill_tombstones.get(&key).copied() {
-            let row_view = index.bindings.get(&key).map(|r| (r.state, r.updated_at));
-            match classify_kill_tombstone(killed_at, row_view, w.now_ms) {
-                KillTombstoneVerdict::Dominant | KillTombstoneVerdict::Fresh => {
-                    tracing::info!(
-                        target: "freshell_ws::pane_ledger",
-                        provider = %w.provider,
-                        session_id = %w.session_id,
-                        killed_at_ms = killed_at,
-                        "pane_ledger_binding_suppressed_by_kill_tombstone: a late write \
-                         for an explicitly-closed identity writes nothing (never Bound)"
-                    );
-                    if let Some(mut remnant) = index.bindings.get(&key).cloned() {
-                        if remnant.state == RowState::Bound {
-                            remnant.state = RowState::Retired;
-                            remnant.retired_reason = Some(RetiredReason::Closed);
-                            remnant.updated_at = w.now_ms;
-                            tracing::info!(
-                                target: "freshell_ws::pane_ledger",
-                                provider = %w.provider,
-                                session_id = %w.session_id,
-                                "pane_ledger_tombstoned_remnant_retired: force-retiring the \
-                                 crash-window Bound remnant alongside the suppressed write"
-                            );
-                            self.write_binding(root, &mut index, &remnant)?;
-                        }
-                    }
-                    return Ok(());
-                }
-                // Finding 4: an expired tombstone over a missing/Retired row is
-                // pruned noise — the write proceeds and the consult sweeps it
-                // lazily. Finding 3: a ClaimResidue tombstone (the committed
-                // claim's own clear crashed/failed) is inert by construction
-                // (the Bound row outranks it) — never suppress the claim's own
-                // write; prune the residue instead so it cannot linger.
-                KillTombstoneVerdict::Expired | KillTombstoneVerdict::ClaimResidue => {
-                    if let Err(err) =
-                        Self::clear_kill_fence_locked(root, &mut index, w.provider, w.session_id)
-                    {
-                        // Fail loud, never silent: the sweep prunes at the
-                        // next GC pass regardless (a ClaimResidue fence left
-                        // behind is inert either way — the row outranks it;
-                        // a record-fed fence simply re-derives at the next
-                        // load and dies with its record).
-                        tracing::warn!(
+        if let Some(tombstone) = index.kill_tombstones.get(&key).copied() {
+            let killed_at = tombstone.at_ms;
+            // b8ke focused ep5 r5 F2: the tombstone's TRANSITION SCOPE. A
+            // SCOPED tombstone (a failed handoff transition's repair
+            // fence) suppresses only writes AT OR BEFORE its (epoch,
+            // generation) pair: a binding write carrying a STRICTLY NEWER
+            // pair — a later committed owner's legitimate write or
+            // refresh — is INVISIBLE to it and proceeds untouched
+            // (never suppressed, never the remnant force-retire). The
+            // r4 repair wrote an identity-wide kill timestamp, so a LATE
+            // cleanup of an already-superseded transition stamped its
+            // kill AFTER the newer owner's Bound row — the newer owner's
+            // next refresh classified Dominant, was suppressed, and the
+            // force-retire corrupted its recovery row as Closed.
+            if tombstone_scope_spares_newer(
+                tombstone.scope,
+                w.observed_epoch.zip(w.observed_generation),
+            ) {
+                tracing::info!(
+                    target: "freshell_ws::pane_ledger",
+                    provider = %w.provider,
+                    session_id = %w.session_id,
+                    killed_at_ms = killed_at,
+                    tombstone_scope = ?tombstone.scope,
+                    "pane_ledger_scoped_tombstone_spares_newer_binding: the failed \
+                     transition's fence is INVISIBLE to this strictly-newer write"
+                );
+            } else {
+                let row_view = index.bindings.get(&key).map(|r| (r.state, r.updated_at));
+                match classify_kill_tombstone(killed_at, row_view, w.now_ms) {
+                    KillTombstoneVerdict::Dominant | KillTombstoneVerdict::Fresh => {
+                        tracing::info!(
                             target: "freshell_ws::pane_ledger",
                             provider = %w.provider,
                             session_id = %w.session_id,
-                            error = %err,
-                            "pane_ledger_stale_tombstone_sweep_failed: fence left behind; GC retries"
+                            killed_at_ms = killed_at,
+                            "pane_ledger_binding_suppressed_by_kill_tombstone: a late write \
+                             for an explicitly-closed identity writes nothing (never Bound)"
                         );
+                        if let Some(mut remnant) = index.bindings.get(&key).cloned() {
+                            if remnant.state == RowState::Bound {
+                                remnant.state = RowState::Retired;
+                                remnant.retired_reason = Some(RetiredReason::Closed);
+                                remnant.updated_at = w.now_ms;
+                                tracing::info!(
+                                    target: "freshell_ws::pane_ledger",
+                                    provider = %w.provider,
+                                    session_id = %w.session_id,
+                                    "pane_ledger_tombstoned_remnant_retired: force-retiring the \
+                                     crash-window Bound remnant alongside the suppressed write"
+                                );
+                                self.write_binding(root, &mut index, &remnant)?;
+                            }
+                        }
+                        return Ok(());
+                    }
+                    // Finding 4: an expired tombstone over a missing/Retired row is
+                    // pruned noise — the write proceeds and the consult sweeps it
+                    // lazily. Finding 3: a ClaimResidue tombstone (the committed
+                    // claim's own clear crashed/failed) is inert by construction
+                    // (the Bound row outranks it) — never suppress the claim's own
+                    // write; prune the residue instead so it cannot linger.
+                    KillTombstoneVerdict::Expired | KillTombstoneVerdict::ClaimResidue => {
+                        if let Err(err) = Self::clear_kill_fence_locked(
+                            root,
+                            &mut index,
+                            w.provider,
+                            w.session_id,
+                        ) {
+                            // Fail loud, never silent: the sweep prunes at the
+                            // next GC pass regardless (a ClaimResidue fence left
+                            // behind is inert either way — the row outranks it;
+                            // a record-fed fence simply re-derives at the next
+                            // load and dies with its record).
+                            tracing::warn!(
+                                target: "freshell_ws::pane_ledger",
+                                provider = %w.provider,
+                                session_id = %w.session_id,
+                                error = %err,
+                                "pane_ledger_stale_tombstone_sweep_failed: fence left behind; GC retries"
+                            );
+                        }
                     }
                 }
             }
         }
         let existing = index.bindings.get(&key);
+        // b8ke ext r22 F2: the DELAYED-WRITE FENCE — the row's current
+        // ownership stamp vs this write's carried pair. A write carrying an
+        // OLDER pair (a pre-teardown in-flight write racing a completed
+        // handoff that advanced the generation — the handoff's terminal-side
+        // row write stamped the newer pair) REFUSES typed: the newer
+        // owner's recovery row survives untouched. The refusal is a typed
+        // error the binding lane maps onto its typed failure path — never a
+        // silent overwrite. Fires only when BOTH stamps exist (the row's
+        // and the write's); a legacy-unfenced write or an unstamped row
+        // proceeds (the pre-r22 behavior).
+        if let (Some((row_e, row_g)), Some((w_e, w_g))) = (
+            existing.and_then(|r| r.owner_epoch.zip(r.owner_generation)),
+            w.observed_epoch.zip(w.observed_generation),
+        ) {
+            if (w_e, w_g) < (row_e, row_g) {
+                tracing::warn!(target: "freshell_ws::pane_ledger",
+                    provider = %w.provider,
+                    session_id = %w.session_id,
+                    row_epoch = row_e, row_generation = row_g,
+                    write_epoch = w_e, write_generation = w_g,
+                    "pane_ledger_binding_refused_stale_pair: a delayed \
+                     pre-teardown binding write carries an older ownership \
+                     pair — the newer owner's recovery row survives (kata \
+                     b8ke ext r22 F2)"
+                );
+                return Err(std::io::Error::other(
+                    "STALE_BINDING_PAIR: the row was rebound under a newer ownership \
+                     generation; the delayed write is refused",
+                ));
+            }
+        }
+        // b8ke ext r29 F3 + focused ep5 r1 F2 + focused ep5 r2 F1: the
+        // TERMINAL-ROW guard. A fresh-agent binding write over a Bound row
+        // whose recovery binding belongs to a LIVE TERMINAL:
+        //
+        // * over a STAMPED row (the handoff's terminal-side commit stamped
+        //   it), a paired write must be STRICTLY NEWER — for everyone,
+        //   authoritative or not: every legitimate reclaim advances the
+        //   generation, the ep5-r1 equal-pair trap stays closed, and a
+        //   DELAYED authoritative target write can never clobber a LATER
+        //   handoff's stamped row.
+        // * over an UNSTAMPED row — the NORMAL production shape (ordinary
+        //   WS/REST/MCP terminal binding writes stamp nothing; the
+        //   terminal→fresh-agent handoff kills the terminal directly and
+        //   the exit hook leaves the row Bound) — only the handoff
+        //   runner's OWN authoritative target binding (the r27-F2
+        //   under-ticket shape: the pair is the runner's supplied handoff
+        //   generation, marked `authoritative` at exactly the three
+        //   under-ticket write sites) lands; every non-authoritative
+        //   lane write (a stale refresh carrying a pre-handoff pair, an
+        //   unfenced refresh) refuses typed — the pairs alone cannot
+        //   prove newer against a row with no baseline.
+        if existing.is_some_and(|r| r.state == RowState::Bound && r.live_terminal_id.is_some()) {
+            let write_pair = w.observed_epoch.zip(w.observed_generation);
+            let row_pair = existing.and_then(|r| r.owner_epoch.zip(r.owner_generation));
+            let accepted = match (write_pair, row_pair) {
+                (Some(_), None) if w.authoritative => true,
+                (Some(write_pair), Some(row_pair)) => write_pair > row_pair,
+                _ => false,
+            };
+            if !accepted {
+                let unfenced = write_pair.is_none();
+                tracing::warn!(target: "freshell_ws::pane_ledger",
+                    provider = %w.provider,
+                    session_id = %w.session_id,
+                    live_terminal_id = ?existing.and_then(|r| r.live_terminal_id.clone()),
+                    write_pair = ?write_pair, row_pair = ?row_pair,
+                    authoritative = w.authoritative,
+                    "pane_ledger_binding_refused_over_terminal: a fresh-agent \
+                     binding write would clobber a live terminal's recovery row \
+                     without a strictly newer ownership pair (or, over the row's \
+                     unstamped shape, without the handoff runner's authoritative \
+                     target marker) — the write is refused typed (kata b8ke \
+                     focused ep5 r2 F1)"
+                );
+                return Err(std::io::Error::other(if unfenced {
+                    "UNFENCED_BINDING_OVER_TERMINAL: the row's recovery binding \
+                     belongs to a live terminal; the unfenced fresh-agent write \
+                     is refused"
+                } else {
+                    "NOT_NEWER_BINDING_OVER_TERMINAL: the row's recovery binding \
+                     belongs to a live terminal; the fresh-agent write must carry \
+                     a strictly newer ownership pair (or, over an unstamped row, \
+                     be the handoff runner's authoritative target binding)"
+                }));
+            }
+        }
         let created_at = existing.map(|r| r.created_at).unwrap_or(w.now_ms);
         // Advisory field: keep the existing row's value when the new write
         // has none (latest-observed semantics, D4).
@@ -2330,6 +2664,13 @@ impl PaneLedger {
             retired_reason: None,
             superseded_by: None,
             pane_kind: Some("fresh-agent".into()),
+            // b8ke ext r22 F2: the row's ownership stamp — this write's
+            // carried pair (preserved from the prior row when the write is
+            // legacy-unfenced).
+            owner_epoch: w.observed_epoch.or(existing.and_then(|r| r.owner_epoch)),
+            owner_generation: w
+                .observed_generation
+                .or(existing.and_then(|r| r.owner_generation)),
             model: w.model.map(str::to_string),
             sandbox: w.sandbox.map(str::to_string),
             permission_mode: w.permission_mode.map(str::to_string),
@@ -2552,21 +2893,27 @@ impl PaneLedger {
             }
         }
         // The index fence entry mirrors the durable truth exactly: only the
-        // SURVIVING carriers feed it (re-stamped forward to their max).
-        let recomputed: Option<i64> = index
-            .close_envelopes
-            .values()
-            .flat_map(|record| record.kills.iter())
-            .filter(|k| k.provider == provider && k.session_id == session_id)
-            .map(|k| k.at_ms)
-            .max();
+        // SURVIVING carriers feed it (folded through the entry merge — max
+        // stamp, the stronger scope winning).
+        let mut recomputed: Option<KillTombstoneEntry> = None;
+        for record in index.close_envelopes.values() {
+            for kill in record
+                .kills
+                .iter()
+                .filter(|k| k.provider == provider && k.session_id == session_id)
+            {
+                recomputed
+                    .get_or_insert(KillTombstoneEntry::default())
+                    .fold(kill);
+            }
+        }
         match (legacy_survives, recomputed) {
             (false, None) => {
                 index.kill_tombstones.remove(&key);
             }
             (true, None) => { /* the legacy file outlived its delete: keep its stamp */ }
-            (_, Some(stamp)) => {
-                index.kill_tombstones.insert(key, stamp);
+            (_, Some(entry)) => {
+                index.kill_tombstones.insert(key, entry);
             }
         }
         match first_err {
@@ -2741,7 +3088,7 @@ impl PaneLedger {
         self.guard()
             .kill_tombstones
             .get(&(provider.to_string(), session_id.to_string()))
-            .copied()
+            .map(|entry| entry.at_ms)
     }
 
     /// The identities whose kill tombstone currently DOMINATES a Bound row
@@ -2764,11 +3111,22 @@ impl PaneLedger {
         index
             .kill_tombstones
             .iter()
-            .filter(|(key, killed_at)| {
-                let row_view = index.bindings.get(*key).map(|r| (r.state, r.updated_at));
+            .filter(|(key, tombstone)| {
+                let row = index.bindings.get(*key);
+                // b8ke focused ep5 r5 F2: a SCOPED tombstone does not
+                // dominate a row that proves STRICTLY NEWER than its
+                // transition pair (a later committed owner's row) — the
+                // same scope predicate the write consult applies.
+                if tombstone_scope_spares_newer(
+                    tombstone.scope,
+                    row.and_then(|r| r.owner_epoch.zip(r.owner_generation)),
+                ) {
+                    return false;
+                }
+                let row_view = row.map(|r| (r.state, r.updated_at));
                 // Dominance is TTL-free; `now` only disambiguates the
                 // non-Bound arms, which this filter never selects anyway.
-                classify_kill_tombstone(**killed_at, row_view, i64::MAX)
+                classify_kill_tombstone(tombstone.at_ms, row_view, i64::MAX)
                     == KillTombstoneVerdict::Dominant
             })
             .map(|(key, _)| key.clone())
@@ -2875,7 +3233,11 @@ impl PaneLedger {
         let mut index = self.guard();
         for alias in fence_checked_aliases {
             let alias_key = (provider.to_string(), alias.clone());
-            if let Some(killed_at) = index.kill_tombstones.get(&alias_key).copied() {
+            if let Some(killed_at) = index
+                .kill_tombstones
+                .get(&alias_key)
+                .map(|entry| entry.at_ms)
+            {
                 tracing::info!(
                     target: "freshell_ws::pane_ledger",
                     provider = %provider,
@@ -2889,7 +3251,7 @@ impl PaneLedger {
             }
         }
         let key = (provider.to_string(), session_id.to_string());
-        let current = index.kill_tombstones.get(&key).copied();
+        let current = index.kill_tombstones.get(&key).map(|entry| entry.at_ms);
         let dead_state_advanced = match (current, expect_killed_at_ms) {
             (Some(cur), Some(exp)) => cur > exp,
             (Some(_), None) => true,
@@ -3036,6 +3398,11 @@ impl PaneLedger {
         create_request_id: Option<&str>,
         panes: &[PaneCloseLinkage],
         now_ms: i64,
+        orphan_filter: Option<(u64, u64)>,
+        // b8ke focused ep5 r5 F2: the kills' TRANSITION SCOPE — `None` on
+        // every ordinary close (the identity-wide fence); `Some((epoch,
+        // generation))` ONLY on the failed-transition repair's fence.
+        kill_scope: Option<(u64, u64)>,
     ) -> Result<(), CloseEnvelopeError> {
         let prior = index.close_envelopes.get(key).cloned();
         let mut record = prior.clone().unwrap_or(CloseEnvelopeRecord {
@@ -3055,11 +3422,15 @@ impl PaneLedger {
                 .iter_mut()
                 .find(|k| &k.provider == provider && &k.session_id == session_id)
             {
-                Some(existing) => existing.at_ms = now_ms,
+                Some(existing) => {
+                    existing.at_ms = now_ms;
+                    existing.scope = kill_scope;
+                }
                 None => record.kills.push(PaneCloseKill {
                     provider: provider.clone(),
                     session_id: session_id.clone(),
                     at_ms: now_ms,
+                    scope: kill_scope,
                 }),
             }
         }
@@ -3088,7 +3459,7 @@ impl PaneLedger {
             // never the close: a failed projection leaves a fence-dominated
             // Bound row (reads closed at every boundary) until the sweep
             // converges it durably. Loud, never silent.
-            self.project_row_flips_locked(root, index, identities, now_ms);
+            self.project_row_flips_locked(root, index, identities, now_ms, orphan_filter);
         }
         outcome
     }
@@ -3230,11 +3601,57 @@ impl PaneLedger {
         index: &mut LedgerIndex,
         identities: &[(String, String)],
         now_ms: i64,
+        // b8ke focused ep5 r4 F1: the failed-transition repair's ORPHAN
+        // filter. `None` is every prior caller's discipline: flip every
+        // Bound row for the identities to Retired/Closed. `Some((epoch,
+        // generation))` flips ONLY the failed transition's own orphaned
+        // product — a Bound FRESH-AGENT row stamped at exactly the
+        // transition's (epoch, generation) pair (the authoritative
+        // binding write's stamp; every legitimate later transition carries
+        // a newer pair) — retiring it typed `FailedTransition`. Any other
+        // row (the restored terminal's ordinary recovery row, a later
+        // owner's row, an already-Retired row) is left exactly as it is:
+        // the repair must not demote rows the failed transition never
+        // owned.
+        orphan_filter: Option<(u64, u64)>,
     ) {
         for (provider, session_id) in identities {
             let key = (provider.clone(), session_id.clone());
             if let Some(mut row) = index.bindings.get(&key).cloned() {
                 if row.state != RowState::Bound {
+                    continue;
+                }
+                if let Some((epoch, generation)) = orphan_filter {
+                    let is_orphaned_product = row.pane_kind.as_deref() == Some("fresh-agent")
+                        && row.owner_epoch == Some(epoch)
+                        && row.owner_generation == Some(generation);
+                    if !is_orphaned_product {
+                        continue;
+                    }
+                    row.state = RowState::Retired;
+                    row.retired_reason = Some(RetiredReason::FailedTransition);
+                    row.updated_at = now_ms;
+                    tracing::info!(
+                        target: "freshell_ws::pane_ledger",
+                        provider = %provider,
+                        session_id = %session_id,
+                        epoch, generation,
+                        "pane_ledger_failed_transition_row_repaired: the orphaned \
+                         authoritative fresh-agent row (the failed transition's own \
+                         binding write) is retired — the coordinator and the recovery \
+                         registry re-converge (kata b8ke focused ep5 r4 F1)"
+                    );
+                    if let Err(err) = self.write_binding(root, index, &row) {
+                        tracing::error!(
+                            target: "freshell_ws::pane_ledger",
+                            provider = %provider,
+                            session_id = %session_id,
+                            error = %err,
+                            "pane_ledger_failed_transition_row_repair_write_failed: the \
+                             close IS durable (its journal record stands and its fence \
+                             dominates the row); the next sweep converges the row"
+                        );
+                    }
                     continue;
                 }
                 row.state = RowState::Retired;
@@ -3398,6 +3815,12 @@ impl PaneLedger {
                 None,
                 &[],
                 now_ms,
+                // b8ke focused ep5 r4 F1: no orphan filter — the
+                // close projection is the ordinary retire discipline.
+                None,
+                // b8ke focused ep5 r5 F2: no kill scope — the
+                // identity-wide fence every ordinary close writes.
+                None,
             )?;
         }
         for pending_id in pending_ids {
@@ -3412,6 +3835,84 @@ impl PaneLedger {
             }
         }
         Ok(())
+    }
+
+    /// b8ke focused ep5 r4 F1: the FAILED-TRANSITION REPAIR — the abort /
+    /// typed-failure cleanup's ONE ledger act when it reaps an uncommitted
+    /// fresh-agent handoff target and the coordinator entry fails (restores
+    /// the prior or vacates). Under ONE index-guard hold it lands BOTH
+    /// halves of the re-convergence, in this order:
+    ///
+    /// 1. THE FENCE (durable, SCOPED): the close-envelope journal record
+    ///    for the identity — the same carrier the kill lanes' closes
+    ///    write — feeds the kill-tombstone index carrying the failed
+    ///    transition's (epoch, generation) SCOPE, so any late binding
+    ///    write from the failed transition (an orphaned `spawn_blocking`
+    ///    closure whose ownership consult passed BEFORE the cancel, still
+    ///    in flight) is suppressed wholesale by
+    ///    [`PaneLedger::record_fresh_agent_binding`]'s tombstone consult —
+    ///    no Bound row is created, whichever arrival order the late write
+    ///    takes. The scope (ep5 r5 F2) bounds the fence to writes AT OR
+    ///    BEFORE the failed transition's pair: a LATER committed owner's
+    ///    strictly-newer binding or refresh is invisible to it (the r4
+    ///    identity-wide timestamp stamped a kill after a newer owner's
+    ///    Bound row, so the newer owner's next refresh classified
+    ///    Dominant, was suppressed, and the remnant force-retire corrupted
+    ///    its recovery row as Closed). A LATER legitimate claim still
+    ///    clears the tombstone through its `commit_claim` (the
+    ///    killed-session re-attach machinery), so the fence never wedges
+    ///    the session.
+    /// 2. THE REVERT (conditional): the projection flips ONLY the failed
+    ///    transition's own ORPHANED product — a Bound fresh-agent row
+    ///    stamped at exactly the transition's (epoch, generation) pair —
+    ///    to `Retired/FailedTransition`. The restored prior terminal's
+    ///    ordinary recovery row, a later owner's row, and every
+    ///    already-Retired row are left exactly as they are.
+    ///
+    /// Both halves are idempotent: a retried repair re-derives the same
+    /// envelope merge and re-matches the same orphan filter. Together they
+    /// close the round-3 consult's time-of-check/time-of-use window for
+    /// BOTH real orderings — the write validated then canceled (the fence
+    /// suppresses its late mutation) and the write completed then canceled
+    /// (the revert retires it) — so the recovery registry and the
+    /// coordinator re-converge in every interleaving.
+    pub fn repair_failed_transition_binding(
+        &self,
+        provider: &str,
+        session_id: &str,
+        epoch: u64,
+        generation: u64,
+        now_ms: i64,
+    ) -> std::io::Result<()> {
+        let Some(root) = self.root.clone() else {
+            return Ok(());
+        };
+        let mut index = self.guard();
+        let identities = [(provider.to_string(), session_id.to_string())];
+        self.close_envelope_locked(
+            &root,
+            &mut index,
+            &Self::agent_envelope_key(provider, session_id),
+            &identities,
+            None,
+            None,
+            &[],
+            now_ms,
+            Some((epoch, generation)),
+            // b8ke focused ep5 r5 F2: the repair's fence is SCOPED to the
+            // failed transition's (epoch, generation) — it suppresses only
+            // writes/rows at or before that pair; a strictly newer binding
+            // (a later committed owner's) is invisible to it.
+            Some((epoch, generation)),
+        )
+        .map_err(|err| {
+            std::io::Error::other(match err {
+                CloseEnvelopeError::Clean(e) => format!("FAILED_TRANSITION_REPAIR_CLEAN: {e}"),
+                CloseEnvelopeError::Persisted(e) => {
+                    format!("FAILED_TRANSITION_REPAIR_PERSISTED: {e}")
+                }
+            })
+        })
     }
 
     /// Delta-r6-r2 (focused-episode-6 round 1, Findings 1+2+6) — the terminal
@@ -3444,6 +3945,15 @@ impl PaneLedger {
     /// Every choice is idempotent: a retried kill re-derives the same set,
     /// re-stamps the same record, and re-merges the same fences.
     pub fn close_pane(&self, w: &PaneCloseWrite) -> Result<(), CloseEnvelopeError> {
+        // b8ke d4 F3: the test-only close-park (never armed in
+        // production): the deterministic slow-ledger window.
+        let close_gate = self.close_pause.lock().expect("close pause lock").clone();
+        if let Some(gate) = close_gate {
+            let mut paused = gate.paused.lock().expect("close pause gate lock");
+            while *paused {
+                paused = gate.release.wait(paused).expect("close pause gate condvar");
+            }
+        }
         let Some(root) = self.root.clone() else {
             return Ok(());
         };
@@ -3472,6 +3982,12 @@ impl PaneLedger {
             w.create_request_id.as_deref(),
             &[],
             w.now_ms,
+            // b8ke focused ep5 r4 F1: no orphan filter — the
+            // close projection is the ordinary retire discipline.
+            None,
+            // b8ke focused ep5 r5 F2: no kill scope — the
+            // identity-wide fence every ordinary close writes.
+            None,
         )?;
         // Step 4 — the marker (LAST; warn-only hygiene — the close is
         // durable by now).
@@ -3532,6 +4048,12 @@ impl PaneLedger {
             Some(create_request_id),
             &[],
             now_ms,
+            // b8ke focused ep5 r4 F1: no orphan filter — the
+            // close projection is the ordinary retire discipline.
+            None,
+            // b8ke focused ep5 r5 F2: no kill scope — the
+            // identity-wide fence every ordinary close writes.
+            None,
         )
     }
 
@@ -3566,6 +4088,12 @@ impl PaneLedger {
             None,
             panes,
             now_ms,
+            // b8ke focused ep5 r4 F1: no orphan filter — the
+            // close projection is the ordinary retire discipline.
+            None,
+            // b8ke focused ep5 r5 F2: no kill scope — the
+            // identity-wide fence every ordinary close writes.
+            None,
         )
     }
 
@@ -4249,6 +4777,8 @@ impl PaneLedger {
                     origin_create_request_id: marker_origin_crid
                         .as_deref()
                         .or(w.origin_create_request_id),
+                    observed_epoch: None,
+                    observed_generation: None,
                     ..*w
                 };
                 &effective
@@ -4259,6 +4789,8 @@ impl PaneLedger {
                     origin_create_request_id: marker_origin_crid
                         .as_deref()
                         .or(w.origin_create_request_id),
+                    observed_epoch: None,
+                    observed_generation: None,
                     ..*w
                 };
                 &effective
@@ -4271,6 +4803,8 @@ impl PaneLedger {
                     // because the resolve had its own policy).
                     effective = BindingWrite {
                         origin_create_request_id: marker_origin_crid.as_deref(),
+                        observed_epoch: None,
+                        observed_generation: None,
                         ..*w
                     };
                     &effective
@@ -4309,6 +4843,7 @@ impl PaneLedger {
                     provider: w.provider.to_string(),
                     session_id: w.session_id.to_string(),
                     at_ms: w.now_ms,
+                    scope: None,
                 });
             }
             match self.persist_close_envelope_locked(
@@ -4531,7 +5066,7 @@ pub(crate) async fn ledger_resolve_identity(
     provider: &str,
     session_id: &str,
     cwd: Option<&str>,
-) {
+) -> bool {
     let ledger = std::sync::Arc::clone(&state.pane_ledger);
     let provider_owned = provider.to_string();
     let session_id_owned = session_id.to_string();
@@ -4568,12 +5103,22 @@ pub(crate) async fn ledger_resolve_identity(
             // `asserted_at` when (and only when) the stamps come FROM the
             // marker (focused-ep4 Finding).
             provenance: ProvenancePolicy::Inherit,
+            // b8ke ext r22 F2: legacy-unfenced (this write's lane
+            // predates the ownership pair threading; the row's prior
+            // stamp is preserved by the write path).
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: now,
         })
     })
     .await
     .unwrap_or_else(|join_err| Err(std::io::Error::other(join_err)));
+    let ok = result.is_ok();
     surface_write_failure(state, terminal_id, result);
+    // b8ke ext r14 F1: the durable-binding write's outcome — the identity
+    // association lanes unwind their held coordinator authority on `false`
+    // (a binding failure leaves NO committed owner).
+    ok
 }
 
 /// The inverse of [`encode_segment`], used by the construction-time scan to

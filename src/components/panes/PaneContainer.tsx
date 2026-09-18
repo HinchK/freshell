@@ -1,5 +1,5 @@
 import { Suspense, lazy, useRef, useCallback, useMemo, useState, useEffect } from 'react'
-import { useAppDispatch, useAppSelector } from '@/store/hooks'
+import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { setActivePane, updatePaneContent, clearPaneRenameRequest, toggleZoom, requestPaneRefresh } from '@/store/panesSlice'
 import { closePaneWithCleanup } from '@/store/tabsSlice'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
@@ -23,6 +23,7 @@ import { cn } from '@/lib/utils'
 import { withChunkErrorRecovery } from '@/lib/import-retry'
 import { getWsClient } from '@/lib/ws-client'
 import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait } from '@/lib/kill-ack'
+import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
 import { api } from '@/lib/api'
 import { isTrulyIdleCliMode, resolvePaneActivity, resolvePaneIdleGreen } from '@/lib/pane-activity'
 import { getPaneDisplayTitle } from '@/lib/pane-title'
@@ -196,6 +197,9 @@ function resolveStoredTitleForDisplay(
 
 export default function PaneContainer({ tabId, node, hidden }: PaneContainerProps) {
   const dispatch = useAppDispatch()
+  // b8ke ext r6 F4: the store for at-click fence reads (the close's
+  // observed epoch/generation pair).
+  const appStore = useAppStore()
   const activePane = useAppSelector((s) => s.panes.activePane[tabId])
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
   const paneTitles = useAppSelector((s) => s.panes.paneTitles[tabId] ?? EMPTY_PANE_TITLES)
@@ -350,9 +354,25 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       clearDraft(paneId)
       const pendingCreate = freshAgentPendingCreates[content.createRequestId]
       const pendingSessionId = pendingCreate?.sessionId
-      const sessionId = content.sessionId || pendingSessionId
+      // b8ke ext r6 F3: the kill target is the pane's DURABLE session —
+      // content.sessionId OR the provider-matched sessionRef.sessionId
+      // (pre-r6 a sessionRef-only restored pane skipped the kill and
+      // removed the pane while its runtime kept running — the same
+      // fallback the replacement/restart actions took in ext F2).
+      const sessionId = content.sessionId
+        || pendingSessionId
+        || (content.sessionRef?.provider === content.provider
+          ? content.sessionRef.sessionId
+          : undefined)
       if (sessionId) {
         const cwd = getFreshOpenCodeRouteCwd(content, { freshAgentSessions, sessionId })
+        // b8ke ext r6 F4: the close carries the pane's observed
+        // (epoch, generation) fence so the server's generation fencing
+        // typed-refuses a stale close — the WS client queues across
+        // disconnects, and an old close arriving after a
+        // handoff-away-and-back must never kill the NEWER generation's
+        // runtime.
+        const fence = selectPaneOwnerFence(appStore.getState(), content)
         // Focused-episode-6 round 2 (Finding 6): AWAIT the killed answer
         // before dropping the pane — a close the server did NOT confirm
         // durable is not a close. `success:false` (and the bounded 5s
@@ -365,6 +385,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
           sessionType: content.sessionType,
           provider: content.provider,
           ...(cwd ? { cwd } : {}),
+          ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
         }).then((ack) => {
           if (!ack.ok) {
             // The pane's ordinary session-error banner carries the failure
@@ -397,7 +418,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     // Extension panes: V1 leaves server extensions running until freshell shutdown.
     // Future: stop singleton server when its last pane closes.
     dispatch(closePaneWithCleanup({ tabId, paneId }))
-  }, [dispatch, freshAgentPendingCreates, freshAgentSessions, tabId, ws])
+  }, [appStore, dispatch, freshAgentPendingCreates, freshAgentSessions, tabId, ws])
 
   const handleFocus = useCallback((paneId: string) => {
     // Decision 1: visiting any pane of the tab (a click into it) dismisses the

@@ -1108,6 +1108,7 @@ mod tests {
             session_existence: std::sync::Arc::new(crate::existence::NoIndexProbe::default()),
             reconcile_deferral_budget_ms: crate::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
+            ownership: None,
         }
     }
 
@@ -1325,6 +1326,10 @@ mod tests {
                 supersedes: None,
                 now_ms: 1,
                 provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
+                observed_epoch: None,
+                observed_generation: None,
+
+                authoritative: false,
             })
             .expect("seed fresh-agent ledger row");
 

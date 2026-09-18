@@ -28,6 +28,10 @@ mod content;
 pub use content::{derive_pane_title, is_valid_percent, normalize_pair_to_hundred};
 use content::{migrate_legacy_fresh_agent_content, migrate_legacy_fresh_agent_node};
 
+#[path = "layout_store_persist.rs"]
+mod persist;
+use persist::{load_persisted_clients, persist_locked};
+
 /// One ORDERED tab row (`UiSnapshot.tabs`, `layout-store.ts:7`).
 #[derive(Clone, Debug, Default)]
 pub struct TabRow {
@@ -74,6 +78,19 @@ const MAX_STALE_ENTRIES: usize = 4;
 /// server-created state.
 const SERVER_CLIENT_KEY: &str = "__server__";
 
+/// b8ke ext r25 F2: the per-recovery content-authority stamp — the
+/// pane's PRE-recovery leaf content recorded at the authoritative
+/// write-through (`attach_pane_content`). A reconnecting client's
+/// stale copy re-sends exactly this content (it never saw the
+/// recovery); `update_from_ui` rejects that pane write. ANY other
+/// incoming content (the client observed the recovered state, or edited
+/// past it) RELEASES the stamp — the client is authoritative again, so
+/// a server recovery never permanently blocks legitimate edits.
+#[derive(Clone, Debug, PartialEq)]
+struct RecoveryStamp {
+    pre_recovery_content: Value,
+}
+
 /// INTENTIONAL DIVERGENCE from Node (`server/agent-api/layout-store.ts` —
 /// single-snapshot field `:49`, wholesale-replace `updateFromUi` `:169-181`):
 /// Node keeps ONE shared snapshot, wholesale-replaced by whichever client
@@ -100,6 +117,30 @@ struct LayoutInner {
     /// entry; if only stale entries remain, the most recent stale one
     /// (Node-parity post-disconnect reads).
     clients: Vec<ClientEntry>,
+    /// b8ke ext r25 F2: the server-side CONTENT-AUTHORITY stamps for panes
+    /// mutated through the authoritative recovery paths (the
+    /// `attach_pane_content` write-throughs — the REST/MCP respawn and
+    /// attach materializations). Keyed by pane id; each stamp records the
+    /// pane's PRE-recovery leaf content — the exact stale copy a
+    /// disconnected client still holds and may re-send on reconnect.
+    /// In-memory only (a transient reconnect-reconciliation aid): the
+    /// persist format serializes the client snapshots, not the stamps.
+    recovery_stamps: std::collections::HashMap<String, RecoveryStamp>,
+    /// kata b8ke Task 10 (round-1 review, DURABILITY): `Some` → every
+    /// mutation that changes the snapshot set rewrites the multi-client
+    /// snapshot to this path (atomic temp+rename) and construction loads
+    /// it, so a server restart does not lose the pane registry.
+    persist_path: Option<std::path::PathBuf>,
+    /// kata b8ke Task 10 (round-2 review, M2): `Some` → every persist is
+    /// SERIALIZED under the layout lock and HANDED to the ordered writer
+    /// task (enqueued before the lock is released, so queue order ==
+    /// mutation order); the writer performs each durable write inside
+    /// `spawn_blocking` (the repo's A13 discipline), so the ~15ms fsync
+    /// never pins an async worker and never runs under this mutex.
+    /// `None` (tests, `None`-home runs) → the write runs inline on the
+    /// mutating thread under the lock (the pre-M2 behavior; synchronous
+    /// contexts only).
+    persist_tx: Option<tokio::sync::mpsc::UnboundedSender<persist::PersistMsg>>,
 }
 
 impl LayoutInner {
@@ -218,6 +259,65 @@ impl LayoutStore {
         self.inner.lock().expect("layout store mutex")
     }
 
+    /// kata b8ke Task 10 (round-1 review, DURABILITY): construct the store
+    /// with a persistence path. Every mutation that changes the snapshot
+    /// rewrites the multi-client snapshot to `path` with the atomic
+    /// temp+rename discipline (the `~/.freshell/config.json` writer's
+    /// pattern: write `path.tmp`, fsync, rename, parent-dir fsync), and
+    /// construction LOADS a previously persisted file (best-effort: a
+    /// corrupt/absent file logs a warning and boots empty — never a
+    /// crash). Loaded entries are marked STALE: a restarted server has no
+    /// live connections, and the client mirror is change-gated —
+    /// retention is exactly what the stale-entry design exists for.
+    ///
+    /// Writes run INLINE on the mutating thread (fine for the synchronous
+    /// test contexts that use this constructor); production — where
+    /// mutators run on the async runtime — uses
+    /// [`LayoutStore::with_persistence_offload`] instead, which hands
+    /// every write to an ordered `spawn_blocking` writer (round-2 review
+    /// M2).
+    pub fn with_persistence(path: std::path::PathBuf) -> Self {
+        let store = Self::default();
+        {
+            let mut inner = store.lock();
+            inner.persist_path = Some(path.clone());
+            match std::fs::read(&path) {
+                Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(body) => load_persisted_clients(&mut inner, &body),
+                    Err(error) => tracing::warn!(
+                        target: "freshell_freshagent::layout_store",
+                        %error,
+                        path = %path.display(),
+                        "layout_store_persist_file_corrupt: booting empty"
+                    ),
+                },
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    target: "freshell_freshagent::layout_store",
+                    %error,
+                    path = %path.display(),
+                    "layout_store_persist_file_unreadable: booting empty"
+                ),
+            }
+        }
+        store
+    }
+
+    /// kata b8ke: paneId → owning tabId across per-client snapshots —
+    /// primary-first, most-recent-first (the `resolve_pane_target`
+    /// resolution order). REST-minted panes resolve via `pane_tabs` first;
+    /// this covers browser-created/error panes that live only in layout
+    /// syncs.
+    pub fn find_pane_tab(&self, pane_id: &str) -> Option<String> {
+        let inner = self.lock();
+        for snapshot in inner.snapshots() {
+            if let Some(tab_id) = find_pane_tab(snapshot, pane_id) {
+                return Some(tab_id);
+            }
+        }
+        None
+    }
+
     /// Clones of every client snapshot — primary first, then most-recent-first
     /// — for read-only walkers (target resolver).
     pub(crate) fn snapshots_clone(&self) -> Vec<UiSnapshot> {
@@ -278,6 +378,62 @@ impl LayoutStore {
         }
         let incoming_pane_ids = pane_ids_of(&snapshot);
         let mut inner = self.lock();
+        // b8ke ext r25 F2: THE SERVER RECOVERY'S CONTENT AUTHORITY. A
+        // pane mutated through an authoritative recovery path (an
+        // `attach_pane_content` write-through — the REST/MCP respawn and
+        // attach materializations) carries a recovery stamp holding the
+        // pane's PRE-recovery content. A reconnecting client's STALE
+        // copy re-sends exactly that content (it never saw the recovery —
+        // its pane never received the new sessionRef, so runtime-owner
+        // replay cannot associate or repair an overwrite); that pane's
+        // write is REJECTED: the incoming leaf is overridden with the
+        // store's CURRENT (recovered) content — the server recovery wins,
+        // and the reconnecting client receives/observes the server's
+        // current layout state as usual (its next sync carries the
+        // recovered content and converges).
+        //
+        // THE RELEASE POINT (per-recovery-write, never a permanent
+        // block): ANY other incoming content releases the stamp — the
+        // client either OBSERVED the server's recovered layout (its sync
+        // now carries the recovered content) or EDITED past the
+        // pre-recovery state — and the pane write applies; the client is
+        // authoritative again. Panes without a stamp (ordinary client
+        // layout edits) flow unchanged.
+        if !inner.recovery_stamps.is_empty() {
+            let mut stale_pane_writes: Vec<String> = Vec::new();
+            let mut released_stamps: Vec<String> = Vec::new();
+            for (pane_id, stamp) in inner.recovery_stamps.iter() {
+                let Some(incoming_content) = pane_content_in_snapshot(&snapshot, pane_id) else {
+                    // The pane is not in this sync — the stamp stays (a
+                    // later sync may still carry the stale copy).
+                    continue;
+                };
+                if incoming_content == stamp.pre_recovery_content {
+                    stale_pane_writes.push(pane_id.clone());
+                } else {
+                    released_stamps.push(pane_id.clone());
+                }
+            }
+            for pane_id in stale_pane_writes {
+                if let Some(current) = inner
+                    .snapshots()
+                    .find_map(|s| pane_content_in_snapshot(s, &pane_id))
+                {
+                    let tab_ids: Vec<String> = snapshot.tabs.iter().map(|t| t.id.clone()).collect();
+                    for tab_id in &tab_ids {
+                        let Some(root) = snapshot.layouts.get_mut(tab_id) else {
+                            continue;
+                        };
+                        if root.replace_leaf_content(&pane_id, current.clone()) {
+                            seed_pane_title(&mut snapshot, tab_id, &pane_id, &current);
+                        }
+                    }
+                }
+            }
+            for pane_id in released_stamps {
+                inner.recovery_stamps.remove(&pane_id);
+            }
+        }
         // Re-sync replaces this client's own snapshot; a real client sync also
         // supersedes the server bootstrap entry (old wholesale-replace parity).
         // SUBSET supersede-eviction: a STALE entry is dropped only when EVERY
@@ -306,6 +462,7 @@ impl LayoutStore {
                 stale: false,
             },
         );
+        persist_locked(&inner);
     }
 
     pub fn has_snapshot(&self) -> bool {
@@ -471,6 +628,7 @@ impl LayoutStore {
         }
         snapshot.active_pane.insert(tab_id.clone(), pane_id.clone());
         seed_pane_title(snapshot, &tab_id, &pane_id, &content);
+        persist_locked(&inner);
         (tab_id, pane_id)
     }
 
@@ -512,6 +670,7 @@ impl LayoutStore {
             found = true;
         }
         if found {
+            persist_locked(&inner);
             RenameOutcome::tab(tab_id)
         } else {
             RenameOutcome::failed("tab not found")
@@ -530,6 +689,7 @@ impl LayoutStore {
             }
         }
         if found {
+            persist_locked(&inner);
             RenameOutcome::tab(tab_id)
         } else {
             RenameOutcome::failed("tab not found")
@@ -564,6 +724,7 @@ impl LayoutStore {
             .position(|t| Some(&t.id) == snapshot.active_tab_id.as_ref());
         let tab_id = snapshot.tabs[pick(current, snapshot.tabs.len())].id.clone();
         snapshot.active_tab_id = Some(tab_id.clone());
+        persist_locked(&inner);
         Some(tab_id)
     }
 
@@ -590,6 +751,7 @@ impl LayoutStore {
             found = true;
         }
         if found {
+            persist_locked(&inner);
             RenameOutcome::tab(tab_id)
         } else {
             RenameOutcome::failed("tab not found")
@@ -618,6 +780,9 @@ impl LayoutStore {
                 }
             }
             first.get_or_insert(tab_id);
+        }
+        if first.is_some() {
+            persist_locked(&inner);
         }
         match first {
             Some(tab_id) => RenameOutcome::tab_pane(&tab_id, pane_id),
@@ -756,7 +921,10 @@ impl LayoutStore {
             }
         }
         match first {
-            Some(tab_id) => Ok((tab_id, new_pane_id)),
+            Some(tab_id) => {
+                persist_locked(&inner);
+                Ok((tab_id, new_pane_id))
+            }
             None => Err("pane not found"),
         }
     }
@@ -774,6 +942,14 @@ impl LayoutStore {
             return RenameOutcome::failed("no layout snapshot");
         }
         let normalized = migrate_legacy_fresh_agent_content(&content);
+        // b8ke ext r25 F2: capture the pane's PRE-recovery content (the
+        // first snapshot holding the pane, primary-first) for the
+        // content-authority stamp — a reconnecting client's stale copy of
+        // this pane re-sends exactly this content and must not erase the
+        // recovery.
+        let pre_recovery = inner
+            .snapshots()
+            .find_map(|snapshot| pane_content_in_snapshot(snapshot, pane_id));
         let mut found = false;
         for snapshot in inner.snapshots_mut() {
             let Some(root) = snapshot.layouts.get_mut(tab_id) else {
@@ -786,6 +962,18 @@ impl LayoutStore {
             found = true;
         }
         if found {
+            // b8ke ext r25 F2: record the recovery stamp ONLY when the
+            // write actually changed the pane's content — an idempotent
+            // re-attach (the same content) stamps nothing.
+            if pre_recovery.as_ref().is_some_and(|pre| *pre != normalized) {
+                inner.recovery_stamps.insert(
+                    pane_id.to_string(),
+                    RecoveryStamp {
+                        pre_recovery_content: pre_recovery.expect("checked above"),
+                    },
+                );
+            }
+            persist_locked(&inner);
             RenameOutcome::tab_pane(tab_id, pane_id)
         } else {
             RenameOutcome::failed("tab not found")
@@ -813,6 +1001,12 @@ impl LayoutStore {
                     break;
                 }
             }
+        }
+        if first.as_ref().is_some_and(|result| result.is_ok()) {
+            // b8ke ext r25 F2: a closed pane's recovery stamp is dead
+            // weight — the pane no longer exists to protect.
+            inner.recovery_stamps.remove(pane_id);
+            persist_locked(&inner);
         }
         first.unwrap_or(Err("pane not found"))
     }
@@ -847,6 +1041,9 @@ impl LayoutStore {
                 .insert(target.clone(), pane_id.to_string());
             snapshot.active_tab_id = Some(target.clone());
             first.get_or_insert(target);
+        }
+        if first.is_some() {
+            persist_locked(&inner);
         }
         match first {
             Some(target) => Ok((target, pane_id.to_string())),
@@ -911,6 +1108,9 @@ impl LayoutStore {
                 other_id,
             );
             first.get_or_insert(target);
+        }
+        if first.is_some() {
+            persist_locked(&inner);
         }
         first.ok_or("panes not found")
     }
@@ -977,6 +1177,9 @@ impl LayoutStore {
                 any |= root.set_split_sizes(split_id, sizes);
             }
         }
+        if any {
+            persist_locked(&inner);
+        }
         any
     }
 
@@ -1020,6 +1223,9 @@ impl LayoutStore {
                 .expect("count above cap implies a stale entry exists");
             inner.clients.remove(oldest);
         }
+        // The stale-flag flip and the prune both change the snapshot set —
+        // persist unconditionally (a no-change mark is a cheap no-op write).
+        persist_locked(&inner);
     }
 
     /// Total retained entries (live + stale) — test/diagnostic probe.
@@ -1050,6 +1256,40 @@ impl LayoutStore {
 }
 
 // ── snapshot helpers ─────────────────────────────────────────────────────────
+
+// The durable-persistence half (persist_locked/load + the M2 ordered
+// writer) lives in [`persist`] (`layout_store_persist.rs`).
+
+impl LayoutStore {
+    /// kata b8ke Task 10 (round-2 review, M2): the PRODUCTION construction
+    /// — [`LayoutStore::with_persistence`] plus the ordered offload writer
+    /// on `runtime`. Every snapshot-set mutation serializes its snapshot
+    /// under the layout lock, hands it to the writer, and returns without
+    /// blocking; the writer performs each durable write (atomic
+    /// temp+rename+parent-fsync) inside `spawn_blocking` — the repo's A13
+    /// discipline (`terminal.rs` / pane-ledger writes) — strictly in
+    /// mutation order. [`Self::flush_persistence`] drains the queue
+    /// (graceful shutdown; tests).
+    pub fn with_persistence_offload(
+        path: std::path::PathBuf,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        let store = Self::with_persistence(path);
+        let tx = persist::spawn_offload_writer(&runtime);
+        store.lock().persist_tx = Some(tx);
+        store
+    }
+
+    /// Wait until every persist queued before this call has landed on disk
+    /// (graceful shutdown; tests). No-op without the offload writer — the
+    /// inline path is synchronous by construction.
+    pub async fn flush_persistence(&self) {
+        let tx = self.lock().persist_tx.clone();
+        if let Some(tx) = tx {
+            persist::send_flush_and_wait(&tx).await;
+        }
+    }
+}
 
 fn tab_row_value(tab: &TabRow) -> Value {
     let mut map = Map::new();
@@ -1164,6 +1404,19 @@ fn leaves_of(snapshot: &UiSnapshot, tab_id: &str) -> Vec<(String, Value)> {
             PaneNode::Split { .. } => None,
         })
         .collect()
+}
+
+/// b8ke ext r25 F2: the pane's leaf content within one snapshot (the
+/// first tab layout holding it) — the content-authority stamp's capture
+/// and the reconnecting-stale-copy comparison.
+fn pane_content_in_snapshot(snapshot: &UiSnapshot, pane_id: &str) -> Option<Value> {
+    snapshot
+        .layouts
+        .values()
+        .find_map(|root| match root.find_leaf(pane_id) {
+            Some(PaneNode::Leaf { content, .. }) => Some(content.clone()),
+            _ => None,
+        })
 }
 
 /// `closePane` (`layout-store.ts:501-516`) against ONE snapshot: `None` when

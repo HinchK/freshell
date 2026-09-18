@@ -1,10 +1,11 @@
 import { ChevronLeft, ChevronRight, PanelLeft, Plus } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { useAppDispatch, useAppSelector } from '@/store/hooks'
+import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { addTab, closeTab, setActiveTab, reorderTabs, clearTabRenameRequest } from '@/store/tabsSlice'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { sendTerminalKillAndAwait } from '@/lib/kill-ack'
+import { resolveTerminalKillFence } from '@/lib/terminal-kill'
 import { collectPaneEntries, collectTerminalCloseTargets } from '@/lib/pane-utils'
 import { getBusyPaneIdsForTab } from '@/lib/pane-activity'
 import { resolvePaneRepoCwd, pathBasename, buildRepoIconUrl } from '@/lib/repo-icon'
@@ -203,6 +204,10 @@ interface TabBarProps {
 
 export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProps = {}) {
   const dispatch = useAppDispatch()
+  // b8ke ext r20 F2: the shift-close kills resolve the observed owner
+  // fence — a reconnect-queued stale kill is typed-refused instead of
+  // killing a newer owner.
+  const appStore = useAppStore()
   const tabsState = useAppSelector((s) => s.tabs as any) as
     | { tabs?: Tab[]; activeTabId?: string | null; renameRequestTabId?: string | null }
     | undefined
@@ -406,11 +411,20 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
               // only; the server close stays authoritative.
               void (async () => {
                 const acks = await Promise.all(
-                  targets.map((t) =>
-                    sendTerminalKillAndAwait(t.terminalId, {
+                  targets.map((t) => {
+                    // b8ke ext r20 F2: each close-target kill carries
+                    // the session's observed (epoch, generation) pair —
+                    // the fence resolution consults the runtimeOwners
+                    // record (undefined when the pane holds no owner
+                    // record; those kills legitimately send no pair).
+                    const fence = t.sessionRef
+                      ? resolveTerminalKillFence(appStore, { sessionRef: t.sessionRef })
+                      : undefined
+                    return sendTerminalKillAndAwait(t.terminalId, {
                       createRequestId: t.createRequestId,
-                    }),
-                  ),
+                      ...(fence ?? {}),
+                    })
+                  }),
                 )
                 if (acks.every((ack) => ack.ok)) {
                   dispatch(closeTab(tab.id))

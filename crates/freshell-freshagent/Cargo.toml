@@ -25,6 +25,11 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+# kata b8ke Task 3: the ONE server-wide runtime-ownership coordinator this
+# crate's fresh-agent lanes claim/commit/release through (leaf crate — no
+# workspace deps, tokio-free, so this edge cannot form a cycle with
+# freshell-ws).
+freshell-ownership = { path = "../freshell-ownership" }
 # The frozen wire types the broadcasts emit (ui.command / freshAgent.session.materialized
 # / sessions.changed) — contract-locked shapes.
 freshell-protocol = { path = "../freshell-protocol" }

@@ -8,6 +8,7 @@ import tabsReducer from '../../../../src/store/tabsSlice'
 import panesReducer from '../../../../src/store/panesSlice'
 import settingsReducer from '../../../../src/store/settingsSlice'
 import terminalDirectoryReducer from '../../../../src/store/terminalDirectorySlice'
+import freshAgentReducer, { applyRuntimeOwner } from '../../../../src/store/freshAgentSlice'
 
 const sentMessages: any[] = []
 const mockGetTerminalDirectoryPage = vi.fn()
@@ -37,6 +38,7 @@ function makeStore() {
       panes: panesReducer,
       settings: settingsReducer,
       terminalDirectory: terminalDirectoryReducer,
+      freshAgent: freshAgentReducer,
     },
   })
 }
@@ -159,5 +161,53 @@ describe('BackgroundSessions', () => {
         })
       }
     }
+  })
+
+  // ── b8ke ext r20 F2: the Kill button carries the observed fence ─────────
+
+  it('the Kill button sends the kill with the session-owner fence on the wire (b8ke ext r20 F2)', async () => {
+    const store = makeStore()
+    // The runtimeOwners record for the background terminal's session:
+    // (epoch 12, generation 34) — the observed pair the kill must carry
+    // so a reconnect-queued stale kill is typed-refused instead of
+    // killing a newer owner.
+    store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'codex-sess-abc',
+      epoch: 12,
+      generation: 34,
+      ownerKind: 'terminal',
+      operationId: 'handoff-1',
+      transition: 'handoff-committed',
+    }))
+    const user = userEvent.setup()
+    render(
+      <Provider store={store}>
+        <BackgroundSessions />
+      </Provider>,
+    )
+    const kill = await screen.findByRole('button', { name: /kill/i })
+    await user.click(kill)
+    expect(sentMessages).toContainEqual({
+      type: 'terminal.kill',
+      terminalId: 'term-codex-1',
+      observedEpoch: 12,
+      observedGeneration: 34,
+    })
+  })
+
+  it('a Kill with NO session-owner record sends no pair (the legit no-fence shape)', async () => {
+    const store = makeStore()
+    const user = userEvent.setup()
+    render(
+      <Provider store={store}>
+        <BackgroundSessions />
+      </Provider>,
+    )
+    const kill = await screen.findByRole('button', { name: /kill/i })
+    await user.click(kill)
+    // No owner record for the session → no pair on the wire.
+    expect(sentMessages).toContainEqual({ type: 'terminal.kill', terminalId: 'term-codex-1' })
   })
 })

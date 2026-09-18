@@ -87,6 +87,7 @@ async fn spawn_server_with_default_cwd(
         shutdown_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         create_dedupe: Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
         config_fallback: None,
+        ownership: None,
         opencode_locator: None,
         codex_locator: None,
         activity: None,

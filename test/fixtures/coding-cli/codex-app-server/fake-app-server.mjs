@@ -3,8 +3,46 @@
 import { WebSocketServer } from 'ws'
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
+import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
+
+if (process.argv[2] === 'fake-durable-writer') {
+  const outputPath = process.argv[3]
+  const readyPath = process.argv[4]
+  const portPath = process.argv[5]
+  const intervalMs = Math.max(10, Number(process.argv[6] || 50))
+  const ignoreSigterm = process.env.FAKE_CODEX_WRITER_IGNORE_SIGTERM === '1'
+  let sequence = 0
+
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true })
+  fs.mkdirSync(path.dirname(readyPath), { recursive: true })
+  fs.mkdirSync(path.dirname(portPath), { recursive: true })
+  const appendWitness = () => {
+    fs.appendFileSync(outputPath, `${Date.now()} ${process.pid} ${sequence++}\n`, 'utf8')
+  }
+  appendWitness()
+
+  const server = net.createServer((socket) => {
+    socket.end('fake codex durable writer\n')
+  })
+  server.listen(0, '127.0.0.1', () => {
+    const address = server.address()
+    if (!address || typeof address === 'string') {
+      throw new Error('durable writer did not receive a loopback port')
+    }
+    fs.writeFileSync(portPath, `${address.port}\n`, 'utf8')
+    fs.writeFileSync(readyPath, `${process.pid}\n`, 'utf8')
+  })
+  const timer = setInterval(appendWitness, intervalMs)
+  process.on('SIGTERM', () => {
+    if (ignoreSigterm) return
+    clearInterval(timer)
+    server.close(() => process.exit(0))
+  })
+  process.stdin.resume()
+  await new Promise(() => undefined)
+}
 
 if (process.argv[2] === 'fake-native-child') {
   process.on('SIGTERM', () => {
@@ -488,6 +526,31 @@ if (behavior.spawnNativeChild) {
   }
 }
 
+let durableWriterChild
+if (behavior.spawnDurableWriter) {
+  const outputPath = String(behavior.durableWriterPath || path.join(os.tmpdir(), `fake-codex-writer-${process.pid}.jsonl`))
+  const readyPath = String(behavior.durableWriterReadyPath || `${outputPath}.ready`)
+  const portPath = String(behavior.durableWriterPortPath || `${outputPath}.port`)
+  durableWriterChild = spawn(process.execPath, [
+    new URL(import.meta.url).pathname,
+    'fake-durable-writer',
+    outputPath,
+    readyPath,
+    portPath,
+    String(behavior.durableWriterIntervalMs || 50),
+  ], {
+    env: {
+      ...process.env,
+      FAKE_CODEX_WRITER_IGNORE_SIGTERM: behavior.durableWriterIgnoresSigterm ? '1' : '',
+    },
+    stdio: 'ignore',
+  })
+  durableWriterChild.unref()
+  if (behavior.durableWriterPidPath) {
+    fs.writeFileSync(behavior.durableWriterPidPath, `${durableWriterChild.pid}\n`, 'utf8')
+  }
+}
+
 const wss = new WebSocketServer({ host, port })
 const watches = new Map()
 const activeThreadIds = new Set()
@@ -955,6 +1018,9 @@ process.on('SIGTERM', () => {
   }
   if (!behavior.wrapperLeavesNativeOnSigterm) {
     nativeChild?.kill('SIGTERM')
+  }
+  if (!behavior.wrapperLeavesDurableWriterOnSigterm) {
+    durableWriterChild?.kill('SIGTERM')
   }
   const exit = () => wss.close(() => process.exit(0))
   const delayExitMs = Number(behavior.delayExitOnSigtermMs || 0)

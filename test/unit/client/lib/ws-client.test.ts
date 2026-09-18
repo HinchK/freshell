@@ -479,6 +479,54 @@ describe('WsClient.connect', () => {
     ])
   })
 
+  it('drops queued freshAgent.attach messages on reconnect so recovery observes the new boot', async () => {
+    const c = new WsClient('ws://example/ws')
+    const reconnectHandler = vi.fn(() => {
+      c.send({
+        type: 'freshAgent.attach',
+        sessionId: 'ses-reconnect-attach',
+        sessionType: 'freshcodex',
+        provider: 'codex',
+        observedEpoch: 2,
+        observedGeneration: 1,
+      } as any)
+    })
+    c.onReconnect(reconnectHandler)
+
+    const p1 = c.connect()
+    MockWebSocket.instances[0]._open()
+    MockWebSocket.instances[0]._message({ type: 'ready', bootId: 'boot-1' })
+    await p1
+    MockWebSocket.instances[0]._close(1006, 'drop-before-recovery-attach')
+
+    c.send({
+      type: 'freshAgent.attach',
+      sessionId: 'ses-reconnect-attach',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      observedEpoch: 1,
+      observedGeneration: 5,
+    } as any)
+
+    const p2 = c.connect()
+    MockWebSocket.instances[1]._open()
+    MockWebSocket.instances[1]._message({ type: 'ready', bootId: 'boot-2' })
+    await p2
+
+    expect(reconnectHandler).toHaveBeenCalledTimes(1)
+    const attaches = MockWebSocket.instances[1].sent
+      .map((x) => JSON.parse(x))
+      .filter((m) => m.type === 'freshAgent.attach')
+    expect(attaches).toEqual([
+      expect.objectContaining({
+        type: 'freshAgent.attach',
+        sessionId: 'ses-reconnect-attach',
+        observedEpoch: 2,
+        observedGeneration: 1,
+      }),
+    ])
+  })
+
   it('drops queued terminal.input on reconnect instead of replaying it against a stale terminalId', async () => {
     const c = new WsClient('ws://example/ws')
 

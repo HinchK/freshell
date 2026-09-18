@@ -9,6 +9,7 @@
 // and asserts the copied turns SURVIVE and the new turn APPENDS.
 import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { once } from 'node:events'
 import * as fs from 'node:fs'
 import * as net from 'node:net'
 import * as os from 'node:os'

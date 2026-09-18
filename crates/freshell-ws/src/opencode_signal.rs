@@ -396,6 +396,67 @@ async fn rebind_fanout(
     cwd: Option<&str>,
     previous: Option<String>,
 ) {
+    // b8ke ext r14 F1/F2: the signal rebind acquires its coordinator
+    // authority FIRST (fail-closed: a refusal mutates NO identity home)
+    // and holds it across the identity homes' writes; the commit is the
+    // ATOMIC move (the new key commits Live while the old key's Live
+    // record becomes Aliased in ONE lock scope, the retained claim
+    // rekeyed — never both keys naming the writer). A binding failure
+    // unwinds the held authority with NO committed owner.
+    let Some(authority) = crate::identity_ownership::coordinator_begin_identity(
+        state,
+        "opencode",
+        &sig.terminal_id,
+        &sig.session_id,
+        previous.as_deref(),
+    )
+    .await
+    else {
+        return;
+    };
+    // b8ke ext r39 F2: the binding write GATES THE INSTALL/ANNOUNCE — it
+    // runs FIRST (before the identity homes, the registry meta, the
+    // resume-target classification, the association broadcast, and the
+    // activity hub), so a failure installs and announces NOTHING (the
+    // identity homes keep the consistent prior state) and the held
+    // authority COMMITS (the live CLI process is the new session's
+    // writer — never a Vacant-with-live-writer; a failed ticket would
+    // let a later lifecycle command start a second writer beside it).
+    // Pre-r39 the homes/classification/broadcast/hub all landed BEFORE
+    // the awaited binding write and the failure unwound to a Vacant key
+    // while the registries and clients still identified the terminal as
+    // the session writer.
+    let binding_ok = crate::pane_ledger::ledger_resolve_identity(
+        state,
+        &sig.terminal_id,
+        "opencode",
+        &sig.session_id,
+        cwd,
+    )
+    .await;
+    if !binding_ok {
+        tracing::warn!(target: "freshell_ws::opencode_signal",
+            terminal_id = %sig.terminal_id, session_id = %sig.session_id,
+            event = "opencode_signal.binding_failed",
+            outcome = "committed_owner_kept",
+            failure_reason = "DURABLE_BINDING_WRITE_FAILED",
+            "opencode_signal_binding_failed: the durable binding write failed — \
+             nothing installed/announced; the held authority commits so the \
+             live CLI writer stays the named owner (never a \
+             Vacant-with-live-writer); the next SessionStart signal re-adopts \
+             and retries the binding"
+        );
+        crate::identity_ownership::coordinator_commit_identity(
+            state,
+            authority,
+            "opencode",
+            &sig.terminal_id,
+            &sig.session_id,
+            previous.as_deref(),
+        )
+        .await;
+        return;
+    }
     state.identity.upsert(
         &sig.terminal_id,
         Some("opencode"),
@@ -419,21 +480,13 @@ async fn rebind_fanout(
         "opencode",
         Some(&sig.session_id),
     );
-    crate::pane_ledger::ledger_resolve_identity(
-        state,
-        &sig.terminal_id,
-        "opencode",
-        &sig.session_id,
-        cwd,
-    )
-    .await;
     crate::codex_identity::broadcast_terminal_session_associated(
         state,
         "opencode",
         &sig.terminal_id,
         &sig.session_id,
         cwd.map(str::to_string),
-        previous,
+        previous.clone(),
     );
     // Task 10: feed the identity proof into the activity hub — the in-TUI
     // session-switch (and first-bind) signal rebinds the tracker's owned
@@ -443,6 +496,15 @@ async fn rebind_fanout(
     if let Some(hub) = &state.activity {
         hub.bind_opencode_session(&sig.terminal_id, &sig.session_id);
     }
+    crate::identity_ownership::coordinator_commit_identity(
+        state,
+        authority,
+        "opencode",
+        &sig.terminal_id,
+        &sig.session_id,
+        previous.as_deref(),
+    )
+    .await;
 }
 
 /// Outcome of applying one signal: `Acted` (rebind done), `Retain` (might

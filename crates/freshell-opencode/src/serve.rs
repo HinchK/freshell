@@ -329,14 +329,8 @@ impl std::error::Error for ServeHttpError {}
 
 /// Render `err` plus every `source()` in its chain, `"; caused by: "`-joined.
 ///
-/// A bare `to_string()` drops the diagnostics that pin a failure class:
-/// reqwest's top-level Display is only `"error sending request for url (...)"`
-/// while the TCP-level cause (`"connection reset by peer (os error 104)"`,
-/// `"connection closed before message completed"`) lives in the `source()`
-/// chain. [`ServeHttpError`] strings carry this rendering so WARN logs and
-/// client-visible messages preserve the full cause trail (the 2026-09-11
-/// compact incident's exact gap: the failure trigger was unrecoverable from
-/// the top-level string alone).
+/// A bare `to_string()` drops diagnostics that identify a transport failure's
+/// root cause, so keep the complete error chain in logs and user-facing errors.
 pub fn display_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
     let mut rendered = err.to_string();
     let mut source = err.source();
@@ -347,6 +341,18 @@ pub fn display_error_chain(err: &(dyn std::error::Error + 'static)) -> String {
     }
     rendered
 }
+
+/// Whether a timed-out request over a captured base may discard the running
+/// `opencode serve` sidecar. Read-only calls pass `No` so a slow GET never
+/// kills the shared daemon.
+mod discard_on_timeout {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub enum DiscardOnTimeout {
+        Yes,
+        No,
+    }
+}
+use discard_on_timeout::DiscardOnTimeout;
 
 /// The HTTP transport seam (`fetchFn`). One request/response round-trip. The
 /// `Err` side is a [`ServeHttpError`]: `Undelivered` ONLY for a provable
@@ -851,29 +857,50 @@ impl OpencodeServeManager {
         body: Option<Value>,
         not_found_value: Option<Value>,
     ) -> Result<Value, ServeError> {
-        self.json_request_maybe_witnessed(method, path, body, not_found_value, None, None)
+        self.json_request_maybe_witnessed(method, path, body, not_found_value, &[], None)
             .await
     }
 
-    /// [`json_request`] with an optional dispatch witness and per-call timeout
-    /// override. The witness flips to `true` exactly once the URL exists and
-    /// the HTTP send is issued — after this call's own `require_base` — the
-    /// TRUE dispatch point (ep4-r6 F3: arming the witness between two
-    /// require_base calls misclassifies an abort that lands inside the second
-    /// one's wait as "dispatched"). `timeout_override` replaces the generic
-    /// `request_timeout` for THIS exchange (both the transport-level
-    /// `.timeout()` and the tokio wrapper resolve from it) — `compact()` uses
-    /// it for the LLM-scale `compact_timeout`.
+    /// One request with optional dispatch witnesses and a per-call timeout override.
+    /// Witnesses arm at the actual HTTP-send boundary, after this call's own
+    /// `require_base`; `compact` uses the dedicated LLM-scale timeout.
     async fn json_request_maybe_witnessed(
         &self,
         method: HttpMethod,
         path: &str,
         body: Option<Value>,
         not_found_value: Option<Value>,
-        dispatch_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        dispatch_witnesses: &[std::sync::Arc<std::sync::atomic::AtomicBool>],
         timeout_override: Option<Duration>,
     ) -> Result<Value, ServeError> {
         let base = self.require_base().await?;
+        self.json_request_over_base(
+            method,
+            path,
+            body,
+            not_found_value,
+            base,
+            DiscardOnTimeout::Yes,
+            dispatch_witnesses,
+            timeout_override,
+        )
+        .await
+    }
+
+    /// One JSON request/response against a caller-captured base URL. This core
+    /// never starts a sidecar and can be told not to discard it on timeout.
+    #[allow(clippy::too_many_arguments)]
+    async fn json_request_over_base(
+        &self,
+        method: HttpMethod,
+        path: &str,
+        body: Option<Value>,
+        not_found_value: Option<Value>,
+        base: String,
+        discard_on_timeout: DiscardOnTimeout,
+        dispatch_witnesses: &[std::sync::Arc<std::sync::atomic::AtomicBool>],
+        timeout_override: Option<Duration>,
+    ) -> Result<Value, ServeError> {
         let url = format!("{base}{path}");
         let timeout = timeout_override.unwrap_or_else(|| self.config().request_timeout);
         let mut req = match (method, &body) {
@@ -887,7 +914,7 @@ impl OpencodeServeManager {
 
         let method_str = format!("{method:?}").to_uppercase();
         let resp = match {
-            if let Some(witness) = &dispatch_witness {
+            for witness in dispatch_witnesses {
                 witness.store(true, std::sync::atomic::Ordering::SeqCst);
             }
             tokio::time::timeout(timeout, self.inner.deps.http.request(req))
@@ -895,7 +922,9 @@ impl OpencodeServeManager {
         .await
         {
             Err(_) => {
-                self.discard_running("request_timeout").await;
+                if discard_on_timeout == DiscardOnTimeout::Yes {
+                    self.discard_running("request_timeout").await;
+                }
                 return Err(ServeError::RequestTimeout {
                     method: method_str,
                     url,
@@ -904,8 +933,6 @@ impl OpencodeServeManager {
             }
             Ok(Err(transport)) => {
                 return Err(match transport {
-                    // ep1-r3 F2: keep the delivery truth lossless — a provable
-                    // connect-phase refusal is NOT a generic transport error.
                     ServeHttpError::Undelivered(s) => ServeError::Undelivered(s),
                     ServeHttpError::Ambiguous(s) => ServeError::Transport(s),
                 });
@@ -973,6 +1000,31 @@ impl OpencodeServeManager {
         self.json_request(HttpMethod::Get, &path, None, None).await
     }
 
+    /// `getSession` against a CALLER-CAPTURED base URL (b8ke focused FR2):
+    /// the side-effect-free snapshot GET's transport. Never spawns (no
+    /// `require_base` re-lookup mid-request) and never discards the running
+    /// sidecar on a timeout — the caller degrades to its disk-state answer
+    /// instead of killing the shared daemon.
+    pub async fn get_session_at(
+        &self,
+        id: &str,
+        route: &Route,
+        base: &str,
+    ) -> Result<Value, ServeError> {
+        let path = with_route(&format!("/session/{}", encode_path_segment(id)), route);
+        self.json_request_over_base(
+            HttpMethod::Get,
+            &path,
+            None,
+            None,
+            base.to_string(),
+            DiscardOnTimeout::No,
+            &[],
+            None,
+        )
+        .await
+    }
+
     /// `listMessages(id, {}, route)` (`serve-manager.ts:367-393`) — the current session
     /// message page (`GET /session/:id/message`). Simplified for the transcript-capture
     /// use: returns the raw JSON body the serve responds with (an array of message/part
@@ -987,20 +1039,64 @@ impl OpencodeServeManager {
             .await
     }
 
+    /// `listMessages` against a CALLER-CAPTURED base URL (b8ke focused
+    /// FR2) — the same side-effect-free contract as
+    /// [`Self::get_session_at`].
+    pub async fn list_messages_at(
+        &self,
+        id: &str,
+        route: &Route,
+        base: &str,
+    ) -> Result<Value, ServeError> {
+        let path = with_route(
+            &format!("/session/{}/message", encode_path_segment(id)),
+            route,
+        );
+        self.json_request_over_base(
+            HttpMethod::Get,
+            &path,
+            None,
+            Some(Value::Array(Vec::new())),
+            base.to_string(),
+            DiscardOnTimeout::No,
+            &[],
+            None,
+        )
+        .await
+    }
+
     /// `promptAsync(id, {parts, model?, variant?, agent?}, route)` — the send-turn call
     /// (`serve-manager.ts:355-365`). Returns once the serve accepts the prompt.
+    ///
+    /// `dispatch_witness` (b8ke focused round-2 review R2-4): flips at the
+    /// TRUE dispatch boundary — right where the HTTP send is issued, after
+    /// this call's own `require_base` — NOT when the response is processed.
+    /// The POST-received→response-processed window (and any ambiguous
+    /// response failure) must already count as accepted: the daemon may be
+    /// executing the turn while the local await is still parked on the
+    /// response, so a handoff landing in that window still sees the
+    /// acceptance armed and issues the daemon-side abort.
     pub async fn prompt_async(
         &self,
         id: &str,
         body: Value,
         route: &Route,
+        dispatch_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<(), ServeError> {
         let path = with_route(
             &format!("/session/{}/prompt_async", encode_path_segment(id)),
             route,
         );
-        self.json_request(HttpMethod::Post, &path, Some(body), None)
-            .await?;
+        let witnesses = dispatch_witness.map(|w| vec![w]).unwrap_or_default();
+        self.json_request_maybe_witnessed(
+            HttpMethod::Post,
+            &path,
+            Some(body),
+            None,
+            &witnesses,
+            None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1039,6 +1135,31 @@ impl OpencodeServeManager {
         Ok(())
     }
 
+    /// `abort` against a CALLER-CAPTURED base URL (b8ke focused FR1): the
+    /// stop path's daemon-side turn abort. The stop path must never spawn a
+    /// daemon (a `require_base` re-lookup could `ensure_started` one after
+    /// the running entry disappeared) and never kills the shared daemon —
+    /// the abort is issued at exactly the captured base, and a transport
+    /// failure is surfaced to the caller's bounded retry loop.
+    pub async fn abort_at(&self, id: &str, route: &Route, base: &str) -> Result<(), ServeError> {
+        let path = with_route(
+            &format!("/session/{}/abort", encode_path_segment(id)),
+            route,
+        );
+        self.json_request_over_base(
+            HttpMethod::Post,
+            &path,
+            None,
+            None,
+            base.to_string(),
+            DiscardOnTimeout::No,
+            &[],
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// `GET /config` — the serve's global config, returned verbatim. The fresh-agent
     /// compact path consumes only its `model` key (probed on 1.18.18: present,
     /// string-or-null) as the model-pair fallback when a session carries no splittable
@@ -1061,6 +1182,14 @@ impl OpencodeServeManager {
     /// cold-start leg are still provably no-side-effects) and BEFORE the HTTP
     /// call is issued. An aborted drive past this point is ambiguous-possibly-
     /// mutated and must never be compensated by ledger restore.
+    ///
+    /// `accepted_witness` (b8ke focused round-2 review R2-5): the SAME
+    /// dispatch-boundary arming for the session's accepted-daemon-operation
+    /// flag — a summarize POST the daemon received (even before its response
+    /// is processed) is daemon-side work a handoff must quiesce, exactly like
+    /// an accepted prompt. Both flags flip at the SAME instant, inside the
+    /// request leg at the true send point.
+    #[allow(clippy::too_many_arguments)] // the compact field set (both witnesses ride the one dispatch)
     pub async fn compact(
         &self,
         id: &str,
@@ -1068,27 +1197,34 @@ impl OpencodeServeManager {
         model_id: &str,
         route: &Route,
         dispatched_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        accepted_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<(), ServeError> {
         let path = with_route(
             &format!("/session/{}/summarize", encode_path_segment(id)),
             route,
         );
-        // The witness flips INSIDE the request leg at the true send point —
+        // Both witnesses flip INSIDE the request leg at the true send point —
         // after its own `require_base` (the serve is running; aborts in the
         // cold-start leg are still provably no-side-effects) and right where
         // the HTTP call is issued (an abort inside the request leg's shared
         // lock waits doesn't falsely look dispatched — ep4-r6 F3).
+        let mut witnesses = Vec::with_capacity(
+            dispatched_witness.is_some() as usize + accepted_witness.is_some() as usize,
+        );
+        if let Some(w) = dispatched_witness {
+            witnesses.push(w);
+        }
+        if let Some(w) = accepted_witness {
+            witnesses.push(w);
+        }
         self.json_request_maybe_witnessed(
             HttpMethod::Post,
             &path,
             Some(json!({ "providerID": provider_id, "modelID": model_id })),
             None,
-            dispatched_witness,
-            // The ONLY LLM-in-handler serve call: the sidecar runs the whole
-            // summarize turn before answering, so the generic 30 s request
-            // bound fires mid-summarize on real sessions (the 2026-09-11
-            // compact incident class). Bound it by the dedicated LLM-scale
-            // compact timeout instead.
+            &witnesses,
+            // The summarize handler runs the whole LLM turn before answering;
+            // use its dedicated timeout rather than the generic request bound.
             Some(self.config().compact_timeout),
         )
         .await?;
@@ -1341,6 +1477,17 @@ impl OpencodeServeManager {
     /// (`adapter.ts:355-368`). Subscribes BEFORE prompting so the idle edge cannot be
     /// missed. `model`/`effort` are the already-normalized wire values (normalization is
     /// the adapter's job; see [`crate::model`]).
+    ///
+    /// `accepted_witness` (b8ke focused FR1 + round-2 R2-4): flipped at the
+    /// DISPATCH boundary — the moment the prompt POST is issued onto the
+    /// transport, inside [`Self::prompt_async`] — NOT after it returns.
+    /// Delivery and daemon acceptance happen before the response is
+    /// processed; the POST-received→response-processed window (and any
+    /// ambiguous response failure) must count as accepted, because from
+    /// that moment the turn may execute INSIDE the shared serve while the
+    /// local future can later fail (IdleTimeout) or be cancelled with the
+    /// flag still falsely dark.
+    #[allow(clippy::too_many_arguments)] // the turn field set (the compact precedent carries its witness the same way)
     pub async fn run_turn(
         &self,
         session_id: &str,
@@ -1349,10 +1496,12 @@ impl OpencodeServeManager {
         effort: Option<&str>,
         timeout: Duration,
         route: Route,
+        accepted_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<(), ServeError> {
         let rx = self.subscribe(session_id);
         let body = build_prompt_body(text, model, effort);
-        self.prompt_async(session_id, body, &route).await?;
+        self.prompt_async(session_id, body, &route, accepted_witness)
+            .await?;
         self.await_idle(session_id, rx, timeout, route).await
     }
 
@@ -1388,7 +1537,10 @@ fn dispatch_event_on(inner: &Arc<Inner>, event: ParsedServeEvent) {
 /// Build the `prompt_async` body: `{ parts:[{type:'text',text}], model?, variant? }`
 /// (`adapter.ts:363-367`). `model` is split into `{providerID, modelID}`; a
 /// non-splittable model is omitted so the serve session default applies.
-fn build_prompt_body(text: &str, model: Option<&str>, effort: Option<&str>) -> Value {
+/// `pub` for the fresh-agent REST lane's gate-held drive (b8ke focused
+/// round-4 R4-2: it composes subscribe + prompt_async + await_idle itself
+/// so the prompt POST issues INSIDE its dispatch/condemn critical section).
+pub fn build_prompt_body(text: &str, model: Option<&str>, effort: Option<&str>) -> Value {
     let mut body = Map::new();
     body.insert(
         "parts".into(),
@@ -1465,6 +1617,7 @@ fn encode_path_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // ── display_error_chain (transport diagnostics preservation) ─────────────
 
@@ -1775,6 +1928,108 @@ mod tests {
         mgr
     }
 
+    // ── b8ke focused round-2 review R2-4: the dispatch-boundary witness ─────────
+
+    /// A `ServeHttp` fake whose `prompt_async` handler parks the response
+    /// until the test releases it — the exact POST-received→response-
+    /// processed window the accepted-turn witness must already cover.
+    struct ParkedPromptHttp {
+        dispatched: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl ParkedPromptHttp {
+        fn new() -> Self {
+            Self {
+                dispatched: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+    }
+
+    impl ServeHttp for ParkedPromptHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> Pin<Box<dyn Future<Output = Result<ServeHttpResponse, ServeHttpError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                if req.url.contains("/global/health") {
+                    return Ok(ServeHttpResponse::new(200, b"{}".to_vec()));
+                }
+                if req.url.contains("/prompt_async") {
+                    // The POST is on the wire — the daemon may already be
+                    // running the turn — but its response is parked.
+                    self.dispatched.notify_one();
+                    self.release.notified().await;
+                    return Ok(ServeHttpResponse::new(200, b"{}".to_vec()));
+                }
+                Ok(ServeHttpResponse::new(200, b"{}".to_vec()))
+            })
+        }
+    }
+
+    /// b8ke focused round-2 review R2-4: the accepted-turn witness must be
+    /// armed at the DISPATCH boundary — the moment the prompt POST is
+    /// issued onto the transport — NOT after `prompt_async` returns. In
+    /// the POST-received→response-processed window the daemon may already
+    /// be executing the turn while the local await is still parked on the
+    /// response; a handoff landing there must see the acceptance armed
+    /// and issue the daemon-side abort (pre-fix: the flag stayed dark
+    /// until the response was processed, so the stop path skipped the
+    /// abort and reported Reaped over a still-running daemon-side turn).
+    #[tokio::test]
+    async fn run_turn_arms_the_accepted_witness_at_the_dispatch_boundary() {
+        let http = Arc::new(ParkedPromptHttp::new());
+        let deps = ServeDeps {
+            spawner: Arc::new(FakeSpawner),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let mgr = OpencodeServeManager::new(deps, ServeConfig::default());
+        mgr.ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+
+        let witness = Arc::new(AtomicBool::new(false));
+        let armed = Arc::clone(&witness);
+        let turn = tokio::spawn(async move {
+            mgr.run_turn(
+                "ses_r24",
+                "hold this daemon-side turn open",
+                None,
+                None,
+                Duration::from_millis(50),
+                None,
+                Some(armed),
+            )
+            .await
+        });
+
+        // The POST reached the fake daemon; its response is parked. THE
+        // assertion: the witness is ALREADY armed inside this window.
+        http.dispatched.notified().await;
+        assert!(
+            witness.load(Ordering::SeqCst),
+            "the accepted witness must be armed at the dispatch boundary — the POST is \
+             on the wire and the daemon may already be running the turn while the \
+             response is still parked"
+        );
+
+        // Release: the response completes; the local await then settles
+        // (IdleTimeout here — the fake never emits an idle edge, matching
+        // a turn still running daemon-side; the flag stays armed for the
+        // stop path, exactly like the production IdleTimeout shape).
+        http.release.notify_one();
+        let settled = turn.await.expect("run_turn settled");
+        assert!(matches!(settled, Err(ServeError::IdleTimeout { .. })));
+        assert!(
+            witness.load(Ordering::SeqCst),
+            "an ambiguous local failure keeps the acceptance armed (fail closed)"
+        );
+    }
+
     #[tokio::test]
     async fn compact_posts_the_exact_validated_summarize_body() {
         let http = Arc::new(RecordingHttp::new());
@@ -1785,6 +2040,7 @@ mod tests {
             "prov-a",
             "mdl-x",
             &Some("/work dir".to_string()),
+            None,
             None,
         )
         .await
@@ -1832,7 +2088,7 @@ mod tests {
         };
         let mgr = started_recording_manager_with_config(http.clone(), config).await;
 
-        mgr.compact("ses_9", "prov-a", "mdl-x", &None, None)
+        mgr.compact("ses_9", "prov-a", "mdl-x", &None, None, None)
             .await
             .expect("200 summarize succeeds");
         // A non-compact call in the SAME manager keeps the generic bound.
@@ -1867,7 +2123,10 @@ mod tests {
         });
         let mgr = started_recording_manager(http).await;
 
-        match mgr.compact("ses_9", "prov-a", "mdl-x", &None, None).await {
+        match mgr
+            .compact("ses_9", "prov-a", "mdl-x", &None, None, None)
+            .await
+        {
             Err(ServeError::Http { method, status, .. }) => {
                 assert_eq!(method, "POST");
                 assert_eq!(status, 400);

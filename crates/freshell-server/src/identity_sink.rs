@@ -21,13 +21,118 @@ fn map_close_envelope_error(err: CloseEnvelopeError) -> SinkCloseError {
     }
 }
 
+/// b8ke focused ep5 r3 F1: the deterministic park for the
+/// canceled-authoritative-write tests. A spawn_blocking closure SURVIVES
+/// cancellation of the awaiting task (task abort never cancels a started
+/// closure), so the tests park the closure at its entry — with the write
+/// already spawned and parked, the test cancels the handoff (the abort
+/// cleanup's settled coordinator effect), then RELEASES the closure and
+/// asserts the write consults the post-cancel truth and refuses typed.
+/// std sync primitives only: the closure runs on the blocking pool (no
+/// tokio context to await inside).
+#[cfg(test)]
+pub(crate) struct AuthoritativeWritePark {
+    reached: std::sync::atomic::AtomicBool,
+    released: std::sync::Mutex<bool>,
+    cv: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl AuthoritativeWritePark {
+    pub(crate) fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            reached: std::sync::atomic::AtomicBool::new(false),
+            released: std::sync::Mutex::new(false),
+            cv: std::sync::Condvar::new(),
+        })
+    }
+
+    /// The closure side: announce arrival, then block until released.
+    fn wait_for_release(&self) {
+        self.reached
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut guard = self.released.lock().expect("park lock");
+        while !*guard {
+            guard = self.cv.wait(guard).expect("park condvar");
+        }
+    }
+
+    /// The test side: release the parked closure (idempotent).
+    pub(crate) fn release(&self) {
+        let mut guard = self.released.lock().expect("park lock");
+        *guard = true;
+        self.cv.notify_all();
+    }
+
+    /// The test side: has the closure reached the park?
+    pub(crate) fn reached(&self) -> bool {
+        self.reached.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 pub struct LedgerIdentitySink {
     ledger: Arc<PaneLedger>,
+    /// b8ke focused ep5 r3 F1: the ONE server-wide runtime-ownership
+    /// coordinator (main.rs mints it and shares it with every lane). The
+    /// authoritative binding write's ownership re-validation consults it
+    /// INSIDE the spawn_blocking closure — at the moment the closure
+    /// executes, which is the exact truth a closure surviving its
+    /// awaiting task's cancellation faces.
+    ownership: Option<std::sync::Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
+    /// b8ke focused ep5 r3 F1: the deterministic park (test-only — never
+    /// armed in production). Parks the AUTHORITATIVE closure BEFORE the
+    /// ownership consult — the canceled-ARRIVAL cells.
+    #[cfg(test)]
+    authoritative_park: Option<std::sync::Arc<AuthoritativeWritePark>>,
+    /// b8ke focused ep5 r4 F1: the deterministic POST-VALIDATION park
+    /// (test-only): parks the authoritative closure AFTER the ownership
+    /// consult passed and BEFORE the ledger mutation — the
+    /// VALIDATED-THEN-CANCELED ordering the round-4 reviewer demanded the
+    /// tests exercise (the consult passed; the cancel lands; the repair
+    /// fences; only then does the mutation run).
+    #[cfg(test)]
+    authoritative_park_after_validation: Option<std::sync::Arc<AuthoritativeWritePark>>,
 }
 
 impl LedgerIdentitySink {
-    pub fn new(ledger: Arc<PaneLedger>) -> Self {
-        Self { ledger }
+    pub fn new(
+        ledger: Arc<PaneLedger>,
+        ownership: Option<std::sync::Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
+    ) -> Self {
+        Self {
+            ledger,
+            ownership,
+            #[cfg(test)]
+            authoritative_park: None,
+            #[cfg(test)]
+            authoritative_park_after_validation: None,
+        }
+    }
+
+    /// b8ke focused ep5 r3 F1 (test-only): arm the deterministic
+    /// canceled-write park. Every AUTHORITATIVE record_binding closure
+    /// parks at entry until released — the canceled-write tests use it to
+    /// prove the consult reads the coordinator state as it stands AFTER
+    /// the abort cleanup settled, not a pre-cancel snapshot.
+    #[cfg(test)]
+    pub(crate) fn with_authoritative_park(
+        mut self,
+        park: std::sync::Arc<AuthoritativeWritePark>,
+    ) -> Self {
+        self.authoritative_park = Some(park);
+        self
+    }
+
+    /// b8ke focused ep5 r4 F1 (test-only): arm the POST-VALIDATION park —
+    /// the closure parks between the ownership consult and the ledger
+    /// mutation.
+    #[cfg(test)]
+    pub(crate) fn with_authoritative_park_after_validation(
+        mut self,
+        park: std::sync::Arc<AuthoritativeWritePark>,
+    ) -> Self {
+        self.authoritative_park_after_validation = Some(park);
+        self
     }
 }
 
@@ -78,9 +183,127 @@ impl PaneIdentitySink for LedgerIdentitySink {
 
     fn record_binding(&self, upsert: FreshAgentBindingUpsert) -> SinkWrite {
         let ledger = self.ledger.clone();
+        let ownership = self.ownership.clone();
+        #[cfg(test)]
+        let authoritative_park = self.authoritative_park.clone();
+        #[cfg(test)]
+        let authoritative_park_after_validation = self.authoritative_park_after_validation.clone();
         let now = now_ms();
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
+                // b8ke focused ep5 r3 F1 + ep5 r4 F1 (the round-4
+                // reviewer rejected the r3 "accepted residual" — the
+                // consult ALONE left a time-of-check/time-of-use window,
+                // and the abort cleanup had no ledger visibility): the
+                // authoritative write's ownership re-validation is now the
+                // FIRST of TWO serialized layers, and neither layer leaves
+                // an unaccepted window.
+                //
+                // LAYER 1 — THIS consult (execution-time truth): refuses
+                // every authoritative write whose handoff transition is
+                // already gone when the closure executes (canceled,
+                // superseded, restored, vacated, foreign epoch). Handles
+                // every post-cancel ARRIVAL, including the `spawn_blocking`
+                // closure that outlived its awaiting task's cancellation.
+                //
+                // LAYER 2 — the failed-transition repair (the runner's
+                // abort/failure cleanup, `repair_failed_transition` on this
+                // same sink): when the transition fails, its cleanup lands
+                // the durable tombstone fence + the conditional retire of
+                // the transition's own orphaned row. The fence closes THIS
+                // consult's remaining interleaving — a write whose consult
+                // passed BEFORE the cancel is suppressed wholesale at the
+                // ledger's tombstone consult, whichever arrival order its
+                // late mutation takes; the revert closes the
+                // completed-then-canceled ordering — a write that fully
+                // landed while the handoff was live is retired typed, and
+                // the coordinator and the recovery registry re-converge.
+                // A later legitimate claim clears the tombstone through
+                // its `commit_claim`, so the fence never wedges the
+                // session.
+                //
+                // The (epoch, generation) pair uniquely identifies the
+                // write's own transition (generations advance per
+                // operation on the key), so a state-shape + generation
+                // match proves the write's handoff still owns it:
+                // * `Handoff{generation == w}` — the runner's window (the
+                //   codex/opencode under-ticket writes execute inside it,
+                //   and the claude adoption can race the runner's commit).
+                // * `Live{FreshAgent, generation == w}` — the committed
+                //   target (the claude under-ticket shape, post-commit).
+                // Everything else refuses typed and the recovery row keeps
+                // its rightful owner. Non-authoritative writes never
+                // consult (the r2 ledger matrix governs them unchanged).
+                if upsert.authoritative {
+                    #[cfg(test)]
+                    if let Some(park) = authoritative_park.as_ref() {
+                        park.wait_for_release();
+                    }
+                    let stale_transition = || {
+                        std::io::Error::other(
+                            "STALE_TRANSITION_BINDING: the authoritative write's \
+                             handoff operation no longer owns the key's transition \
+                             at its generation (canceled, superseded, restored, \
+                             vacated, or a new boot epoch) — the write is refused \
+                             (kata b8ke focused ep5 r3 F1)",
+                        )
+                    };
+                    let (Some(w_epoch), Some(w_generation)) =
+                        (upsert.observed_epoch, upsert.observed_generation)
+                    else {
+                        return Err(std::io::Error::other(
+                            "STALE_TRANSITION_BINDING: an authoritative write must \
+                             carry its observed (epoch, generation) pair — the \
+                             ownership re-validation cannot run (kata b8ke focused \
+                             ep5 r3 F1)",
+                        ));
+                    };
+                    let Some(registry) = ownership.as_ref() else {
+                        return Err(std::io::Error::other(
+                            "STALE_TRANSITION_BINDING: an authoritative write \
+                             arrived at a bridge with no ownership coordinator \
+                             wired — authoritative markers are minted only by \
+                             coordinator-driven handoff lanes (kata b8ke focused \
+                             ep5 r3 F1)",
+                        ));
+                    };
+                    let snap = registry.observe(&upsert.provider, &upsert.session_id);
+                    let transition_owned = snap.epoch == w_epoch
+                        && match &snap.state {
+                            freshell_ownership::OwnershipState::Handoff {
+                                generation, ..
+                            } => *generation == w_generation,
+                            freshell_ownership::OwnershipState::Live {
+                                owner,
+                                generation,
+                                ..
+                            } => {
+                                *generation == w_generation
+                                    && owner.kind
+                                        == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                            }
+                            _ => false,
+                        };
+                    if !transition_owned {
+                        tracing::warn!(target: "invariant",
+                            provider = %upsert.provider,
+                            session_id = %upsert.session_id,
+                            write_epoch = w_epoch,
+                            write_generation = w_generation,
+                            snapshot_epoch = snap.epoch,
+                            snapshot_generation = snap.generation,
+                            "identity_sink.authoritative_binding_refused_stale_transition: \
+                             the handoff operation no longer owns the key's transition \
+                             — the canceled/superseded write is refused (kata b8ke \
+                             focused ep5 r3 F1)"
+                        );
+                        return Err(stale_transition());
+                    }
+                    #[cfg(test)]
+                    if let Some(park) = authoritative_park_after_validation.as_ref() {
+                        park.wait_for_release();
+                    }
+                }
                 // Delta-r2 Finding 2: the upsert's tri-state provenance policy
                 // maps verbatim onto the ledger's own tri-state; the merge
                 // (Replace per-field / Inherit keep / Clear erase) lives in
@@ -119,6 +342,16 @@ impl PaneIdentitySink for LedgerIdentitySink {
                     effort: upsert.settings.effort.as_deref(),
                     supersedes: upsert.supersedes.as_deref(),
                     provenance,
+                    // b8ke ext r22 F2: the upsert's observed (epoch,
+                    // generation) pair threads into the ledger write —
+                    // the delayed-write fence (the write path refuses
+                    // typed on a stale pair).
+                    observed_epoch: upsert.observed_epoch,
+                    observed_generation: upsert.observed_generation,
+                    // b8ke focused ep5 r2 F1: the runner-supplied target
+                    // binding marker threads through (the terminal-row
+                    // guard's authoritative arm).
+                    authoritative: upsert.authoritative,
                     now_ms: now,
                 };
                 ledger.record_fresh_agent_binding(&w)?; // binding-write failure propagates
@@ -465,6 +698,29 @@ impl PaneIdentitySink for LedgerIdentitySink {
         })
     }
 
+    /// b8ke focused ep5 r4 F1: the failed-transition repair — same
+    /// awaited-spawn_blocking discipline as every write lane. A failure
+    /// maps to the caller's warn path (the cleanup never blocks its
+    /// coordinator fail on a ledger hiccup, but it logs LOUD).
+    fn repair_failed_transition(
+        &self,
+        provider: &str,
+        session_id: &str,
+        epoch: u64,
+        generation: u64,
+    ) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        let now = now_ms();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                ledger.repair_failed_transition_binding(&p, &s, epoch, generation, now)
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
+    }
+
     fn load_rollback(&self, provider: &str, session_id: &str) -> Option<RollbackRecord> {
         // Reads are memory-only against the write-through index — safe inline.
         // The ledger is payload-opaque; `RollbackRecord::from_stored_payload`
@@ -503,7 +759,7 @@ mod tests {
         let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
         )));
-        let sink = LedgerIdentitySink::new(ledger.clone());
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
             provider: "codex".into(),
             session_id: "t1".into(),
@@ -512,6 +768,10 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 model: Some("gpt-5.3-codex-spark".into()),
                 sandbox: Some("workspace-write".into()),
@@ -540,7 +800,7 @@ mod tests {
         let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
         )));
-        let sink = LedgerIdentitySink::new(ledger);
+        let sink = LedgerIdentitySink::new(ledger, None);
         let mut record = freshell_freshagent::RollbackRecord::empty(100);
         record.push_entry(
             freshell_freshagent::RollbackEntry {
@@ -575,7 +835,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn rollback_record_write_over_a_disabled_ledger_reports_the_failure() {
         let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled());
-        let sink = LedgerIdentitySink::new(ledger);
+        let sink = LedgerIdentitySink::new(ledger, None);
         let mut record = freshell_freshagent::RollbackRecord::empty(100);
         record.push_entry(
             freshell_freshagent::RollbackEntry {
@@ -607,6 +867,10 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -624,7 +888,7 @@ mod tests {
         let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
         )));
-        let sink = LedgerIdentitySink::new(ledger.clone());
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
         let mut record = freshell_freshagent::RollbackRecord::empty(100);
         record.original_session_id = Some("orig".into());
         record.original_tip_uuid = Some("a2".into());
@@ -651,6 +915,10 @@ mod tests {
             resolves_pending: None,
             supersedes: Some("old-uuid".into()),
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: settings.clone(),
         })
         .await
@@ -674,6 +942,10 @@ mod tests {
             supersedes: Some("old-thread".into()),
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             settings,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
         })
         .await
         .expect("codex crash-respawn binding write");
@@ -685,6 +957,900 @@ mod tests {
             sink.load_rollback("codex", "old-thread").is_some(),
             "the codex old-thread row stays put"
         );
+    }
+
+    /// b8ke ext r27 F2: the delayed-prior-generation rejection, END-TO-END
+    /// through the production sink bridge + the real PaneLedger (the
+    /// OpenCode target arm's shape): a handoff target's binding write
+    /// stamped with the SUPPLIED handoff (epoch, generation) pair advances
+    /// the row's delayed-write fence baseline, so a delayed write from the
+    /// PRIOR generation (the old writer's in-flight upsert) is refused
+    /// typed and the new owner's recovery row survives untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handoff_generation_binding_rejects_a_delayed_prior_generation_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
+        const EPOCH: u64 = 4_242;
+        const SESSION: &str = "ses_r27_e2e";
+
+        // The pre-handoff fresh-agent row (the old owner's pair: gen 3).
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: SESSION.into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: Some(EPOCH),
+            observed_generation: Some(3),
+
+            authoritative: false,
+            settings: FreshAgentSettings {
+                model: Some("old-model".into()),
+                ..Default::default()
+            },
+        })
+        .await
+        .expect("the pre-handoff row writes");
+
+        // The handoff target's binding write carries the SUPPLIED handoff
+        // pair (the new owner: gen 4) — the row's fence baseline advances.
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: SESSION.into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: Some(EPOCH),
+            observed_generation: Some(4),
+
+            authoritative: false,
+            settings: FreshAgentSettings {
+                model: Some("new-owner-model".into()),
+                ..Default::default()
+            },
+        })
+        .await
+        .expect("the handoff target's stamped write lands");
+
+        // THE DELAYED PRIOR-GENERATION WRITE (the old writer's in-flight
+        // upsert, carrying its PRE-handoff pair) — refused typed.
+        let err = sink
+            .record_binding(FreshAgentBindingUpsert {
+                provider: "opencode".into(),
+                session_id: SESSION.into(),
+                mode: "freshopencode".into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+                observed_epoch: Some(EPOCH),
+                observed_generation: Some(3),
+
+                authoritative: false,
+                settings: FreshAgentSettings {
+                    model: Some("stale-writer-model".into()),
+                    ..Default::default()
+                },
+            })
+            .await
+            .expect_err("the delayed prior-generation write is refused typed");
+        assert!(
+            err.to_string().contains("STALE_BINDING_PAIR"),
+            "the refusal is typed: {err}"
+        );
+
+        // The new owner's row survived: the handoff pair + the new owner's
+        // settings, never the stale writer's.
+        let row = ledger
+            .load_binding("opencode", SESSION)
+            .expect("the row survives");
+        assert_eq!(row.owner_epoch, Some(EPOCH));
+        assert_eq!(row.owner_generation, Some(4));
+        assert_eq!(row.model.as_deref(), Some("new-owner-model"));
+        assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+    }
+
+    /// b8ke ext r27 F1: a stale FENCED fresh-agent compensation cannot
+    /// overwrite the new TERMINAL owner's authoritative recovery row.
+    /// The exact race the in-memory OpenCode create/resume path leaves
+    /// behind when a handoff commits while its binding write is stalled:
+    /// the compensation now carries the OBSERVED (pre-handoff) pair, so
+    /// the real ledger's delayed-write fence REFUSES it typed — the
+    /// terminal owner's runtime kind AND terminal identity survive
+    /// (pre-r27 the unfenced compensation replaced the shared row with
+    /// live_terminal_id: None and pane_kind: "fresh-agent").
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_fenced_compensation_cannot_overwrite_the_terminal_owners_recovery_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
+            tmp.path().to_path_buf(),
+        )));
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
+        const EPOCH: u64 = 9_191;
+        const SESSION: &str = "ses_r27_f1_race";
+
+        // The pre-handoff fresh-agent row (the old owner's pair: gen 3).
+        sink.record_binding(FreshAgentBindingUpsert {
+            provider: "opencode".into(),
+            session_id: SESSION.into(),
+            mode: "freshopencode".into(),
+            create_request_id: None,
+            resolves_pending: None,
+            supersedes: None,
+            provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: Some(EPOCH),
+            observed_generation: Some(3),
+
+            authoritative: false,
+            settings: FreshAgentSettings::default(),
+        })
+        .await
+        .expect("the pre-handoff row writes");
+
+        // THE HANDOFF COMMITS mid-write: the terminal target's row write
+        // (stamped with the handoff's newer pair) lands while the stale
+        // create's binding write is still stalled.
+        ledger
+            .record_binding(&freshell_ws::pane_ledger::BindingWrite {
+                provider: "opencode",
+                session_id: SESSION,
+                terminal_id: "t-mid-await",
+                mode: "opencode",
+                cwd: Some("/w"),
+                create_request_id: None,
+                origin_create_request_id: None,
+                provenance: freshell_ws::pane_ledger::ProvenancePolicy::Clear,
+                observed_epoch: Some(EPOCH),
+                observed_generation: Some(4),
+                now_ms: 1_200,
+            })
+            .expect("the handoff's terminal-side row write lands");
+
+        // THE STALE COMPENSATION (the delayed create's rollback upsert,
+        // carrying its OBSERVED pre-handoff pair) — refused typed.
+        let err = sink
+            .record_binding(FreshAgentBindingUpsert {
+                provider: "opencode".into(),
+                session_id: SESSION.into(),
+                mode: "freshopencode".into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                // keep-when-None provenance — the compensating rollback's
+                // shape.
+                provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+                observed_epoch: Some(EPOCH),
+                observed_generation: Some(3),
+
+                authoritative: false,
+                settings: FreshAgentSettings::default(),
+            })
+            .await
+            .expect_err("the stale fenced compensation is refused typed");
+        assert!(
+            err.to_string().contains("STALE_BINDING_PAIR"),
+            "the refusal is typed: {err}"
+        );
+
+        // The TERMINAL owner's authoritative recovery row SURVIVED: its
+        // runtime kind (a terminal row — pane_kind None, live_terminal_id
+        // set) AND its terminal identity, with the handoff's fence pair.
+        let row = ledger
+            .load_binding("opencode", SESSION)
+            .expect("the row survives");
+        assert_eq!(row.pane_kind, None, "the terminal row's kind stands");
+        assert_eq!(
+            row.live_terminal_id.as_deref(),
+            Some("t-mid-await"),
+            "the terminal owner's identity stands — the stale fresh-agent \
+             compensation did not erase it"
+        );
+        assert_eq!(row.owner_epoch, Some(EPOCH));
+        assert_eq!(row.owner_generation, Some(4));
+    }
+
+    // ── kata b8ke focused ep5 r3 F1: the authoritative write's ownership
+    // re-validation — the canceled/superseded handoff's orphaned
+    // spawn_blocking closure refuses typed against the coordinator's
+    // EXECUTION-TIME truth. ─────────────────────────────────────────────
+    //
+    // The shared rig: a real tempdir-rooted PaneLedger + the REAL
+    // runtime-ownership coordinator, driven through its public
+    // begin/commit/fail transitions exactly the way the runner and the
+    // abort cleanup drive it. The park proves the consult reads the
+    // POST-CANCEL state: the write is spawned and PARKED at the closure's
+    // entry, the handoff is then canceled (the settled coordinator
+    // effect of the abort cleanup's reap + fail), and only then is the
+    // closure RELEASED — the exact surviving-closure shape the finding
+    // names.
+    mod ep5_r3_authoritative_revalidation {
+        use super::*;
+        use freshell_ownership::{
+            BeginOutcome, CommitOutcome, FailOutcome, ObservedFence, OwnerIdentity,
+            RuntimeOwnerKind, RuntimeOwnershipRegistry,
+        };
+
+        const SID: &str = "ses-ep5-r3";
+        const EPOCH_MS: u64 = 0;
+
+        fn terminal_owner(terminal_id: &str) -> OwnerIdentity {
+            OwnerIdentity {
+                kind: RuntimeOwnerKind::Terminal,
+                terminal_id: Some(terminal_id.to_string()),
+                live_session_key: None,
+                pid: Some(40_000),
+                ownership_id: None,
+            }
+        }
+
+        fn fresh_agent_owner() -> OwnerIdentity {
+            OwnerIdentity {
+                kind: RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some("fake-claude-session-x".into()),
+                pid: Some(41_000),
+                ownership_id: Some("own-x".into()),
+            }
+        }
+
+        /// The ordinary TERMINAL recovery row — the NORMAL production
+        /// shape (unstamped: ordinary WS/REST/MCP terminal binding writes
+        /// stamp nothing).
+        fn seed_terminal_row(ledger: &Arc<PaneLedger>, terminal_id: &str) {
+            ledger
+                .record_binding(&freshell_ws::pane_ledger::BindingWrite {
+                    provider: "claude",
+                    session_id: SID,
+                    terminal_id,
+                    mode: "claude",
+                    cwd: Some("/w"),
+                    create_request_id: None,
+                    origin_create_request_id: None,
+                    provenance: freshell_ws::pane_ledger::ProvenancePolicy::Clear,
+                    observed_epoch: None,
+                    observed_generation: None,
+                    now_ms: 100,
+                })
+                .expect("the terminal recovery row seeds");
+        }
+
+        fn authoritative_upsert(
+            epoch: u64,
+            generation: u64,
+            authoritative: bool,
+        ) -> FreshAgentBindingUpsert {
+            FreshAgentBindingUpsert {
+                provider: "claude".into(),
+                session_id: SID.into(),
+                mode: "freshclaude".into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+                observed_epoch: Some(epoch),
+                observed_generation: Some(generation),
+                authoritative,
+                settings: FreshAgentSettings {
+                    model: Some("stale-or-current".into()),
+                    ..Default::default()
+                },
+            }
+        }
+
+        /// Drive the coordinator to `Live{Terminal}` at generation 1 — the
+        /// pre-handoff world.
+        fn drive_terminal_live(registry: &RuntimeOwnershipRegistry) {
+            match registry.begin_start(
+                "claude",
+                SID,
+                RuntimeOwnerKind::Terminal,
+                "op-term-1",
+                None,
+                "test",
+                EPOCH_MS,
+            ) {
+                BeginOutcome::Granted { generation } => {
+                    assert_eq!(
+                        registry.commit_live(
+                            "claude",
+                            SID,
+                            "op-term-1",
+                            generation,
+                            terminal_owner("t-old"),
+                        ),
+                        CommitOutcome::Committed
+                    );
+                }
+                other => panic!("the terminal start must be granted: {other:?}"),
+            }
+        }
+
+        /// Drive the coordinator into the handoff's window (the runner's
+        /// `begin_handoff`) and answer the granted generation.
+        fn drive_handoff_window(registry: &RuntimeOwnershipRegistry, operation_id: &str) -> u64 {
+            match registry.begin_handoff(
+                "claude",
+                SID,
+                RuntimeOwnerKind::FreshAgent,
+                operation_id,
+                None,
+                "test",
+                EPOCH_MS,
+            ) {
+                BeginOutcome::Granted { generation } => generation,
+                other => panic!("the handoff must be granted: {other:?}"),
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_canceled_handoffs_orphaned_write_is_refused_over_the_restored_prior_terminal_row(
+        ) {
+            let tmp = tempfile::tempdir().unwrap();
+            let ledger = Arc::new(PaneLedger::new(Some(tmp.path().to_path_buf())));
+            let registry = Arc::new(RuntimeOwnershipRegistry::new());
+            drive_terminal_live(&registry);
+            let generation = drive_handoff_window(&registry, "op-handoff-1");
+            seed_terminal_row(&ledger, "t-old");
+
+            // The write is spawned and PARKED at the closure's entry — the
+            // handoff is still live, the write is legitimate SO FAR.
+            let park = AuthoritativeWritePark::new();
+            let sink = LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .with_authoritative_park(park.clone());
+            let write_epoch = registry.boot_epoch();
+            let write = tokio::spawn(async move {
+                sink.record_binding(authoritative_upsert(write_epoch, generation, true))
+                    .await
+            });
+            while !park.reached() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+
+            // THE CANCEL (the abort cleanup's settled effect): the handoff
+            // operation fails, restoring the confirmed-live prior owner.
+            assert_eq!(
+                registry.fail("claude", SID, "op-handoff-1", generation, true),
+                FailOutcome::RestoredPriorOwner
+            );
+
+            // RELEASE the surviving closure: the consult must read the
+            // post-cancel truth and refuse typed.
+            park.release();
+            let err = write
+                .await
+                .expect("the write task joins")
+                .expect_err("the orphaned authoritative write is refused typed");
+            assert!(
+                err.to_string().contains("STALE_TRANSITION_BINDING"),
+                "the refusal is the ownership consult's typed error: {err}"
+            );
+
+            // The restored terminal's recovery row SURVIVED: still the
+            // terminal's ordinary unstamped shape — never the reaped
+            // target's fresh-agent metadata.
+            let row = ledger
+                .load_binding("claude", SID)
+                .expect("the row survives");
+            assert_eq!(row.pane_kind, None, "the terminal row's kind stands");
+            assert_eq!(
+                row.live_terminal_id.as_deref(),
+                Some("t-old"),
+                "the restored prior terminal's identity stands"
+            );
+            assert_eq!(
+                (row.owner_epoch, row.owner_generation),
+                (None, None),
+                "the ordinary terminal row stays unstamped: {row:?}"
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_canceled_handoffs_orphaned_write_is_refused_over_a_newly_attached_terminals_row(
+        ) {
+            let tmp = tempfile::tempdir().unwrap();
+            let ledger = Arc::new(PaneLedger::new(Some(tmp.path().to_path_buf())));
+            let registry = Arc::new(RuntimeOwnershipRegistry::new());
+            drive_terminal_live(&registry);
+            let generation = drive_handoff_window(&registry, "op-handoff-1");
+            seed_terminal_row(&ledger, "t-old");
+
+            // The orphaned write, parked in flight.
+            let park = AuthoritativeWritePark::new();
+            let sink = LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .with_authoritative_park(park.clone());
+            let write_epoch = registry.boot_epoch();
+            let write = tokio::spawn(async move {
+                sink.record_binding(authoritative_upsert(write_epoch, generation, true))
+                    .await
+            });
+            while !park.reached() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+
+            // THE CANCEL: the prior was reaped (dead) — the key ends Vacant.
+            assert_eq!(
+                registry.fail("claude", SID, "op-handoff-1", generation, false),
+                FailOutcome::Vacant {
+                    reason: freshell_ownership::FailVacantReason::PriorNotLive
+                }
+            );
+
+            // A NEW terminal attaches (the ordinary claim path) and writes
+            // its ordinary UNSTAMPED recovery row over the session.
+            match registry.begin_start(
+                "claude",
+                SID,
+                RuntimeOwnerKind::Terminal,
+                "op-term-2",
+                Some(ObservedFence {
+                    epoch: registry.boot_epoch(),
+                    generation,
+                }),
+                "test",
+                EPOCH_MS,
+            ) {
+                BeginOutcome::Granted { generation } => {
+                    assert_eq!(
+                        registry.commit_live(
+                            "claude",
+                            SID,
+                            "op-term-2",
+                            generation,
+                            terminal_owner("t-new"),
+                        ),
+                        CommitOutcome::Committed
+                    );
+                }
+                other => panic!("the new terminal's start must be granted: {other:?}"),
+            }
+            ledger
+                .record_binding(&freshell_ws::pane_ledger::BindingWrite {
+                    provider: "claude",
+                    session_id: SID,
+                    terminal_id: "t-new",
+                    mode: "claude",
+                    cwd: Some("/w"),
+                    create_request_id: None,
+                    origin_create_request_id: None,
+                    provenance: freshell_ws::pane_ledger::ProvenancePolicy::Clear,
+                    observed_epoch: None,
+                    observed_generation: None,
+                    now_ms: 200,
+                })
+                .expect("the new terminal's ordinary row lands");
+
+            // RELEASE the surviving closure — the consult sees the NEW
+            // terminal's Live record (a terminal owner, a newer
+            // generation): refused typed, the new terminal's row intact.
+            park.release();
+            let err = write
+                .await
+                .expect("the write task joins")
+                .expect_err("the orphaned authoritative write is refused typed");
+            assert!(
+                err.to_string().contains("STALE_TRANSITION_BINDING"),
+                "the refusal is the ownership consult's typed error: {err}"
+            );
+            let row = ledger
+                .load_binding("claude", SID)
+                .expect("the row survives");
+            assert_eq!(row.pane_kind, None, "the new terminal's row kind stands");
+            assert_eq!(
+                row.live_terminal_id.as_deref(),
+                Some("t-new"),
+                "the newly attached terminal's identity stands — the stale \
+                 fresh-agent metadata never replaced it"
+            );
+            assert_eq!(
+                (row.owner_epoch, row.owner_generation),
+                (None, None),
+                "the ordinary attach stays unstamped: {row:?}"
+            );
+        }
+
+        /// The SUCCESS arms: the consult passes while the write's own
+        /// handoff owns the transition — the runner's Handoff window (the
+        /// codex/opencode in-flight shape) AND the committed Live{FreshAgent}
+        /// (the claude post-commit shape) — and the write LANDS over the
+        /// ordinary unstamped terminal row (the r2 exception's purpose).
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_authoritative_write_lands_while_its_handoff_owns_the_transition() {
+            let tmp = tempfile::tempdir().unwrap();
+            let ledger = Arc::new(PaneLedger::new(Some(tmp.path().to_path_buf())));
+            let registry = Arc::new(RuntimeOwnershipRegistry::new());
+            drive_terminal_live(&registry);
+            let generation = drive_handoff_window(&registry, "op-handoff-1");
+            seed_terminal_row(&ledger, "t-old");
+
+            // IN-WINDOW (Handoff{generation}): the parked write is
+            // released while the runner's operation still holds the key —
+            // the consult passes, the row flips to the fresh-agent
+            // target's.
+            let park = AuthoritativeWritePark::new();
+            let sink = LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .with_authoritative_park(park.clone());
+            let write_epoch = registry.boot_epoch();
+            let write = tokio::spawn(async move {
+                sink.record_binding(authoritative_upsert(write_epoch, generation, true))
+                    .await
+            });
+            while !park.reached() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            park.release();
+            write
+                .await
+                .expect("the write task joins")
+                .expect("the in-window authoritative write lands");
+            let row = ledger.load_binding("claude", SID).expect("the row");
+            assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+            assert_eq!(row.live_terminal_id, None);
+
+            // The in-window handoff completes (the runner's commit).
+            assert_eq!(
+                registry.commit_live(
+                    "claude",
+                    SID,
+                    "op-handoff-1",
+                    generation,
+                    fresh_agent_owner(),
+                ),
+                CommitOutcome::Committed
+            );
+
+            // POST-COMMIT (Live{FreshAgent, generation}): a second
+            // handoff's committed target write also lands (the claude
+            // under-ticket shape).
+            let generation_2 = drive_handoff_window(&registry, "op-handoff-2");
+            assert_eq!(
+                registry.commit_live(
+                    "claude",
+                    SID,
+                    "op-handoff-2",
+                    generation_2,
+                    fresh_agent_owner(),
+                ),
+                CommitOutcome::Committed
+            );
+            LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .record_binding(authoritative_upsert(
+                    registry.boot_epoch(),
+                    generation_2,
+                    true,
+                ))
+                .await
+                .expect("the post-commit authoritative write lands");
+        }
+
+        /// A SUPERSEDED handoff's stale authoritative write (a later
+        /// transition moved the key to a NEWER generation) is refused —
+        /// the delayed write can never clobber the newer owner's row.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_superseded_handoffs_stale_authoritative_write_is_refused() {
+            let tmp = tempfile::tempdir().unwrap();
+            let ledger = Arc::new(PaneLedger::new(Some(tmp.path().to_path_buf())));
+            let registry = Arc::new(RuntimeOwnershipRegistry::new());
+            drive_terminal_live(&registry);
+            let generation = drive_handoff_window(&registry, "op-handoff-1");
+
+            // The key moved on: the later handoff committed gen 2 → then a
+            // THIRD transition (gen 3) committed a newer fresh-agent
+            // owner.
+            assert_eq!(
+                registry.commit_live(
+                    "claude",
+                    SID,
+                    "op-handoff-1",
+                    generation,
+                    fresh_agent_owner(),
+                ),
+                CommitOutcome::Committed
+            );
+            let generation_2 = drive_handoff_window(&registry, "op-handoff-2");
+            assert_eq!(
+                registry.commit_live(
+                    "claude",
+                    SID,
+                    "op-handoff-2",
+                    generation_2,
+                    fresh_agent_owner(),
+                ),
+                CommitOutcome::Committed
+            );
+
+            // The stale write still carries the FIRST handoff's pair —
+            // refused typed at the consult.
+            let err = LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .record_binding(authoritative_upsert(
+                    registry.boot_epoch(),
+                    generation,
+                    true,
+                ))
+                .await
+                .expect_err("the superseded handoff's stale write is refused");
+            assert!(
+                err.to_string().contains("STALE_TRANSITION_BINDING"),
+                "the refusal is the ownership consult's typed error: {err}"
+            );
+        }
+
+        /// The remaining refusal cells: Vacant, a foreign Handoff
+        /// generation, an epoch mismatch, a missing observed pair, and a
+        /// bridge with no coordinator wired — every one fails closed.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn vacant_foreign_epoch_and_malformed_authoritative_writes_all_refuse() {
+            let tmp = tempfile::tempdir().unwrap();
+            let ledger = Arc::new(PaneLedger::new(Some(tmp.path().to_path_buf())));
+            let registry = Arc::new(RuntimeOwnershipRegistry::new());
+            let epoch = registry.boot_epoch();
+
+            // VACANT (no record at all): refused.
+            LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .record_binding(authoritative_upsert(epoch, 2, true))
+                .await
+                .expect_err("an authoritative write over a vacant key is refused");
+
+            // A FOREIGN handoff generation (the write's pair names a
+            // transition that never was): drive Handoff at gen 1, write
+            // carrying gen 2 — refused.
+            let generation = drive_handoff_window(&registry, "op-handoff-x");
+            assert_eq!(generation, 1);
+            LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .record_binding(authoritative_upsert(epoch, 2, true))
+                .await
+                .expect_err("an authoritative write naming a foreign generation is refused");
+
+            // EPOCH MISMATCH (a pre-restart pair against this boot's
+            // registry): refused.
+            LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .record_binding(authoritative_upsert(epoch + 1, generation, true))
+                .await
+                .expect_err("an authoritative write from a foreign boot epoch is refused");
+
+            // MISSING PAIR: an authoritative write without its observed
+            // (epoch, generation) cannot re-validate — refused.
+            LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .record_binding({
+                    let mut u = authoritative_upsert(epoch, generation, true);
+                    u.observed_generation = None;
+                    u
+                })
+                .await
+                .expect_err("an authoritative write without its observed pair is refused");
+
+            // NO COORDINATOR WIRED (a bridge that could not re-validate at
+            // all): an authoritative marker only ever comes from
+            // coordinator-driven handoff lanes — fail closed.
+            LedgerIdentitySink::new(ledger.clone(), None)
+                .record_binding(authoritative_upsert(epoch, generation, true))
+                .await
+                .expect_err("an authoritative write over an unwired bridge is refused");
+
+            assert!(
+                ledger.load_binding("claude", SID).is_none(),
+                "no refused write ever created a row: {:?}",
+                ledger.load_binding("claude", SID)
+            );
+        }
+
+        /// NON-AUTHORITATIVE writes bypass the consult entirely: the r2
+        /// ledger matrix governs them unchanged — a lane write over a
+        /// FRESH row lands with the coordinator in ANY state (Vacant
+        /// here), and a non-authoritative write over a terminal-bound row
+        /// still gets the LEDGER's typed refusal (NOT_NEWER — not the
+        /// consult's).
+        #[tokio::test(flavor = "multi_thread")]
+        async fn non_authoritative_writes_bypass_the_transition_consult() {
+            let tmp = tempfile::tempdir().unwrap();
+            let ledger = Arc::new(PaneLedger::new(Some(tmp.path().to_path_buf())));
+            let registry = Arc::new(RuntimeOwnershipRegistry::new());
+            let epoch = registry.boot_epoch();
+
+            // Fresh row, coordinator Vacant: the ordinary lane write lands
+            // (the consult never fires for authoritative: false).
+            LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .record_binding(authoritative_upsert(epoch, 0, false))
+                .await
+                .expect("the non-authoritative write lands over a fresh row");
+            assert!(ledger.load_binding("claude", SID).is_some());
+
+            // Over a terminal-bound row: the LEDGER's r2 guard refuses it
+            // with its own typed error — proving the consult did not
+            // intervene (a fresh sink row for the terminal shape).
+            let ledger2 = Arc::new(PaneLedger::new(Some(
+                tempfile::tempdir().unwrap().path().to_path_buf(),
+            )));
+            seed_terminal_row(&ledger2, "t-plain");
+            let err = LedgerIdentitySink::new(ledger2.clone(), Some(registry.clone()))
+                .record_binding(authoritative_upsert(epoch, 0, false))
+                .await
+                .expect_err("the ledger's own terminal-row guard refuses it");
+            assert!(
+                err.to_string().contains("NOT_NEWER_BINDING_OVER_TERMINAL"),
+                "the refusal is the LEDGER's r2 typed error, not the consult's: {err}"
+            );
+        }
+
+        /// b8ke focused ep5 r4 F1 — the VALIDATED-THEN-CANCELED ordering
+        /// (the round-4 reviewer's first named ordering): the write's
+        /// ownership consult PASSES (the handoff owns the transition),
+        /// the closure parks BETWEEN the consult and the ledger mutation,
+        /// the handoff then fails (the abort cleanup's settled effect:
+        /// repair-then-fail, the runner's exact order), and only then is
+        /// the closure released. The repair's durable tombstone fence
+        /// suppresses the late mutation — the row NEVER becomes the
+        /// reaped target's fresh-agent row.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_validated_then_canceled_write_is_fenced_and_the_row_stays_consistent() {
+            let tmp = tempfile::tempdir().unwrap();
+            let ledger = Arc::new(PaneLedger::new(Some(tmp.path().to_path_buf())));
+            let registry = Arc::new(RuntimeOwnershipRegistry::new());
+            drive_terminal_live(&registry);
+            let generation = drive_handoff_window(&registry, "op-handoff-vc");
+            seed_terminal_row(&ledger, "t-old");
+
+            // The write consults (Handoff owns the transition at gen 2) and
+            // parks AFTER validation — before the ledger mutation.
+            let park = AuthoritativeWritePark::new();
+            let sink = LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .with_authoritative_park_after_validation(park.clone());
+            let write_epoch = registry.boot_epoch();
+            let write = tokio::spawn(async move {
+                sink.record_binding(authoritative_upsert(write_epoch, generation, true))
+                    .await
+            });
+            while !park.reached() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+
+            // THE CANCEL (the abort cleanup's exact order): the repair
+            // lands (the reap's ledger act), then the coordinator entry
+            // fails with the restore.
+            let repair_sink = LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()));
+            repair_sink
+                .repair_failed_transition("claude", SID, write_epoch, generation)
+                .await
+                .expect("the cleanup's repair lands");
+            assert_eq!(
+                registry.fail("claude", SID, "op-handoff-vc", generation, true),
+                FailOutcome::RestoredPriorOwner
+            );
+
+            // RELEASE the validated closure: the ledger's tombstone consult
+            // suppresses the mutation wholesale (Ok — never an error, never
+            // a row).
+            park.release();
+            let outcome = write.await.expect("the write task joins");
+            assert!(
+                outcome.is_ok(),
+                "the suppressed write answers Ok (suppression, not error): {:?}",
+                outcome.err()
+            );
+            let row = ledger.load_binding("claude", SID).expect("the row");
+            assert_eq!(
+                row.pane_kind, None,
+                "the reaped target's fresh-agent metadata never landed: {row:?}"
+            );
+            assert_eq!(
+                row.live_terminal_id.as_deref(),
+                Some("t-old"),
+                "the restored terminal's identity survives: {row:?}"
+            );
+            // The durable fence is fed (a still-in-flight sibling closure
+            // from the same transition would face it too).
+            assert!(ledger.kill_tombstone_at("claude", SID).is_some());
+        }
+
+        /// b8ke focused ep5 r4 F1 — the COMPLETED-THEN-CANCELED ordering
+        /// (the round-4 reviewer's second named ordering): the write
+        /// fully COMPLETES while the handoff is genuinely live (the row
+        /// legitimately becomes the target's fresh-agent row), the
+        /// handoff then fails and its cleanup reaps the uncommitted
+        /// target — the repair's conditional revert retires the
+        /// transition's own orphaned row, and the coordinator and the
+        /// recovery registry re-converge.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_completed_then_canceled_write_is_reverted_and_the_row_stays_consistent() {
+            let tmp = tempfile::tempdir().unwrap();
+            let ledger = Arc::new(PaneLedger::new(Some(tmp.path().to_path_buf())));
+            let registry = Arc::new(RuntimeOwnershipRegistry::new());
+            drive_terminal_live(&registry);
+            let generation = drive_handoff_window(&registry, "op-handoff-cc");
+            seed_terminal_row(&ledger, "t-old");
+            let epoch = registry.boot_epoch();
+
+            // The write completes, live handoff — the row becomes the
+            // target's (legitimate AT THIS MOMENT).
+            LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .record_binding(authoritative_upsert(epoch, generation, true))
+                .await
+                .expect("the in-window write completes");
+            let row = ledger.load_binding("claude", SID).expect("the row");
+            assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+
+            // THE CANCEL (the abort cleanup's order): the repair, then the
+            // restore-fail.
+            LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .repair_failed_transition("claude", SID, epoch, generation)
+                .await
+                .expect("the cleanup's repair lands");
+            assert_eq!(
+                registry.fail("claude", SID, "op-handoff-cc", generation, true),
+                FailOutcome::RestoredPriorOwner
+            );
+
+            // The orphaned row is REVERTED: retired typed FailedTransition,
+            // never an authoritative Bound fresh-agent claim beside a
+            // Terminal-owned coordinator record.
+            let row = ledger.load_binding("claude", SID).expect("the row");
+            assert_eq!(
+                row.state,
+                freshell_ws::pane_ledger::RowState::Retired,
+                "the row: {row:?}"
+            );
+            assert_eq!(
+                row.retired_reason,
+                Some(freshell_ws::pane_ledger::RetiredReason::FailedTransition)
+            );
+            assert!(
+                ledger.kill_tombstone_at("claude", SID).is_some(),
+                "the fence still guards any other in-flight sibling write"
+            );
+        }
+
+        /// LAYERING: an authoritative write whose consult PASSES (the
+        /// handoff owns the transition) is still subject to the ledger's
+        /// strictly-newer arithmetic over a STAMPED row — the consult
+        /// never bypasses the row's fence baseline (the ep5-r2
+        /// stamped-row trap stays closed through the production bridge).
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_consult_passing_authoritative_write_still_proves_strictly_newer_over_stamped_rows(
+        ) {
+            let tmp = tempfile::tempdir().unwrap();
+            let ledger = Arc::new(PaneLedger::new(Some(tmp.path().to_path_buf())));
+            let registry = Arc::new(RuntimeOwnershipRegistry::new());
+            drive_terminal_live(&registry);
+            let generation = drive_handoff_window(&registry, "op-handoff-1");
+
+            // The row is STAMPED at the handoff's own generation (the
+            // terminal-side commit's fence baseline) — an authoritative
+            // write carrying the SAME pair is not strictly newer.
+            ledger
+                .record_binding(&freshell_ws::pane_ledger::BindingWrite {
+                    provider: "claude",
+                    session_id: SID,
+                    terminal_id: "t-old",
+                    mode: "claude",
+                    cwd: Some("/w"),
+                    create_request_id: None,
+                    origin_create_request_id: None,
+                    provenance: freshell_ws::pane_ledger::ProvenancePolicy::Clear,
+                    observed_epoch: Some(registry.boot_epoch()),
+                    observed_generation: Some(generation),
+                    now_ms: 100,
+                })
+                .expect("the stamped terminal row seeds");
+
+            let err = LedgerIdentitySink::new(ledger.clone(), Some(registry.clone()))
+                .record_binding(authoritative_upsert(
+                    registry.boot_epoch(),
+                    generation,
+                    true,
+                ))
+                .await
+                .expect_err("the equal-pair authoritative write is refused by the ledger");
+            assert!(
+                err.to_string().contains("NOT_NEWER_BINDING_OVER_TERMINAL"),
+                "the refusal is the LEDGER's arithmetic (the consult passed): {err}"
+            );
+        }
     }
 
     /// Focused-review ep1-r1 F3: a PERSISTED pre-F8 record whose entries lack
@@ -701,7 +1867,7 @@ mod tests {
         let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
         )));
-        let sink = LedgerIdentitySink::new(ledger.clone());
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
         // The exact bytes a pre-F8 server wrote (no epoch fields anywhere).
         let legacy_payload = serde_json::json!({
             "version": 1,
@@ -781,7 +1947,7 @@ mod tests {
         let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
         )));
-        let sink = LedgerIdentitySink::new(ledger.clone());
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
         let mut tampered = freshell_freshagent::RollbackRecord::empty(100);
         tampered.version = 0;
         let payload = serde_json::to_value(&tampered).expect("serialize");
@@ -804,7 +1970,7 @@ mod tests {
         let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
         )));
-        let sink = LedgerIdentitySink::new(ledger.clone());
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
             provider: "opencode".into(),
             session_id: "ses_prov".into(),
@@ -820,6 +1986,10 @@ mod tests {
                     asserted_at: 7_777,
                 },
             ),
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -845,7 +2015,7 @@ mod tests {
         let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
         )));
-        let sink = LedgerIdentitySink::new(ledger.clone());
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
         let asserted = now_ms() - 30_000; // "provenance captured 30s before the write"
         sink.record_binding(FreshAgentBindingUpsert {
             provider: "opencode".into(),
@@ -862,6 +2032,10 @@ mod tests {
                     asserted_at: asserted,
                 },
             ),
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -895,7 +2069,7 @@ mod tests {
         let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
         )));
-        let sink = LedgerIdentitySink::new(ledger.clone());
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
         assert!(
             sink.load_provenance("opencode", "nope").is_none(),
             "no row -> None"
@@ -917,6 +2091,10 @@ mod tests {
                     asserted_at: 7_777,
                 },
             ),
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -938,6 +2116,10 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -956,6 +2138,10 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -985,6 +2171,8 @@ mod tests {
                     },
                 ),
                 now_ms: 42,
+                observed_epoch: None,
+                observed_generation: None,
             })
             .expect("terminal binding write ok");
         assert_eq!(
@@ -1006,7 +2194,7 @@ mod tests {
         let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
         )));
-        let sink = LedgerIdentitySink::new(ledger.clone());
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
         let upsert = |provenance: freshell_freshagent::ProvenanceUpdate| FreshAgentBindingUpsert {
             provider: "opencode".into(),
             session_id: "ses_clr".into(),
@@ -1015,6 +2203,10 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1060,7 +2252,7 @@ mod tests {
         let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
         )));
-        let sink = LedgerIdentitySink::new(ledger.clone());
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
             provider: "opencode".into(),
             session_id: "ses_lookup".into(),
@@ -1071,6 +2263,10 @@ mod tests {
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
             // Blank settings on purpose: lineage must resolve even for
             // lineage-only rows (settings-bearing-ness is unrelated).
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -1101,7 +2297,7 @@ mod tests {
         let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
         )));
-        let sink = LedgerIdentitySink::new(ledger.clone());
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
             provider: "claude".into(),
             session_id: "ses-to-kill".into(),
@@ -1110,6 +2306,10 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1186,7 +2386,7 @@ mod tests {
         let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
         )));
-        let sink = LedgerIdentitySink::new(ledger.clone());
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
         let bind = |id: &str, cr: &str| FreshAgentBindingUpsert {
             provider: "opencode".into(),
             session_id: id.into(),
@@ -1195,6 +2395,10 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1307,7 +2511,7 @@ mod tests {
         let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
         )));
-        let sink = LedgerIdentitySink::new(ledger);
+        let sink = LedgerIdentitySink::new(ledger, None);
         sink.record_binding(FreshAgentBindingUpsert {
             provider: "claude".into(),
             session_id: "ses-rb".into(),
@@ -1316,6 +2520,10 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1352,7 +2560,7 @@ mod tests {
         let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
         )));
-        let sink = LedgerIdentitySink::new(ledger.clone());
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
             provider: "claude".into(),
             session_id: "ses-comp".into(),
@@ -1361,6 +2569,10 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1414,7 +2626,7 @@ mod tests {
         let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
         )));
-        let sink = LedgerIdentitySink::new(ledger.clone());
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
             provider: "claude".into(),
             session_id: "d-alias".into(),
@@ -1423,6 +2635,10 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1442,7 +2658,7 @@ mod tests {
         let ledger2 = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
         )));
-        let sink2 = LedgerIdentitySink::new(ledger2.clone());
+        let sink2 = LedgerIdentitySink::new(ledger2.clone(), None);
         let mut records = sink2.alias_tombstone_records("claude", "ph-a");
         records.sort();
         assert_eq!(
@@ -1507,7 +2723,7 @@ mod tests {
         let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
         )));
-        let sink = LedgerIdentitySink::new(ledger.clone());
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
         let upsert = |session_id: &str| FreshAgentBindingUpsert {
             provider: "claude".into(),
             session_id: session_id.into(),
@@ -1516,6 +2732,10 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1555,8 +2775,8 @@ mod tests {
             let session_id = format!("durable-race-{i}");
             // A second sink over the same ledger (the orphan's write path is
             // the same choke point the kill consults).
-            let write_sink = LedgerIdentitySink::new(ledger.clone());
-            let kill_sink = LedgerIdentitySink::new(ledger.clone());
+            let write_sink = LedgerIdentitySink::new(ledger.clone(), None);
+            let kill_sink = LedgerIdentitySink::new(ledger.clone(), None);
             let (w, k) = if i % 2 == 0 {
                 let (w, k) = tokio::join!(
                     write_sink.record_binding(upsert(&session_id)),
@@ -1598,7 +2818,7 @@ mod tests {
         let ledger = std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
         )));
-        let sink = LedgerIdentitySink::new(ledger.clone());
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
         let upsert = |session_id: &str| FreshAgentBindingUpsert {
             provider: "claude".into(),
             session_id: session_id.into(),
@@ -1607,6 +2827,10 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 cwd: Some("/w".into()),
                 ..FreshAgentSettings::default()
@@ -1718,7 +2942,7 @@ mod tests {
         let ledger = Arc::new(freshell_ws::pane_ledger::PaneLedger::new(Some(
             tmp.path().to_path_buf(),
         )));
-        let sink = LedgerIdentitySink::new(ledger.clone());
+        let sink = LedgerIdentitySink::new(ledger.clone(), None);
         sink.record_binding(FreshAgentBindingUpsert {
             provider: "opencode".into(),
             session_id: "ses_lineage".into(),
@@ -1727,6 +2951,10 @@ mod tests {
             resolves_pending: Some("freshopencode-cr-9".into()),
             supersedes: None,
             provenance: freshell_freshagent::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await

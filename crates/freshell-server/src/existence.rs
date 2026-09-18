@@ -658,6 +658,8 @@ mod tests {
                 create_request_id: None,
                 origin_create_request_id: None,
                 provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+                observed_epoch: None,
+                observed_generation: None,
                 now_ms: 1_000,
             })
             .unwrap();
@@ -707,6 +709,8 @@ mod tests {
                 create_request_id: None,
                 origin_create_request_id: None,
                 provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+                observed_epoch: None,
+                observed_generation: None,
                 now_ms: 1_000,
             })
             .unwrap();
@@ -1278,6 +1282,8 @@ mod tests {
                 origin_create_request_id: None,
                 provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: 2_000,
+                observed_epoch: None,
+                observed_generation: None,
             })
             .expect("first bind: root");
         ledger
@@ -1291,6 +1297,8 @@ mod tests {
                 origin_create_request_id: None,
                 provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: 3_000,
+                observed_epoch: None,
+                observed_generation: None,
             })
             .expect("signal rebind: child");
         // Control pane: ROOT2 bound to its own terminal, never superseded.
@@ -1305,6 +1313,8 @@ mod tests {
                 origin_create_request_id: None,
                 provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
                 now_ms: 2_500,
+                observed_epoch: None,
+                observed_generation: None,
             })
             .expect("control bind: root2");
 
