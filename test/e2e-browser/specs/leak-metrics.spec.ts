@@ -216,7 +216,17 @@ test.describe('HARNESS-12 leak/resource measurements', () => {
     // BOTH live transients and zombie reap windows.
     let before: ResourceSnapshot
     try {
-      before = await captureStableBaseline([pid])
+      // 30s settle bound (was the helper's 20s default): kata 4b4b — this
+      // exact fixed-point poll failed terminally in the definitive gate's
+      // local lane 2 (gate2-e2e-local-2.log frame 4: "captureStableBaseline:
+      // tree rooted at [3918191] never reached a fixed point within 20000ms
+      // (last live set: freshell-server + bash + a still-settling opencode;
+      // zombies: 1)", thrown at helpers/leak-metrics.ts:409) and recovered on
+      // retry in the same gate's cloud lane — under co-tenant cargo-lock
+      // contention the resource baseline returns to steady state, just
+      // slower. The fixed-point protocol and every resource bound the test
+      // asserts stay identical; only the patience grows.
+      before = await captureStableBaseline([pid], { timeoutMs: 30_000 })
     } catch (baselineError) {
       // Retained process-tree artifact on baseline-drain failure too — the
       // drain error message names the still-changing live set, and this pins

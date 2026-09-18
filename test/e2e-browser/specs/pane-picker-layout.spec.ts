@@ -36,6 +36,17 @@ test('pane picker tiles are square, fluid, and fit the pane', async ({ freshellP
   await page.setViewportSize({ width: 1280, height: 800 })
   const picker = await openPanePicker(page)
   await expect(picker).toBeVisible()
+  // Settled-state wait, not a timeout raise (kata evidence: gate-e2e-local-1.log
+  // frame 2 and gate3-e2e-local-1.log frame 2 — the FIRST geometry snapshot read
+  // |t.w - expected| = 4 > 1.5: the tiles existed but the cq-unit-driven tile
+  // size had not settled on the fluid formula yet). Wait for tiles to exist and
+  // for the geometry to settle on the formula — the same settled-state
+  // discipline the second-viewport poll below already uses — then assert the
+  // full geometry contract on the settled state.
+  await expect.poll(async () => {
+    const g = await tileGeo(page)
+    return g.tiles.length > 0 && g.tiles.every((t) => Math.abs(t.w - g.expected) < 1)
+  }, { timeout: 10_000 }).toBe(true)
   const first = await tileGeo(page)
   assertGeometry(first)
 
