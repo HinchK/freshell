@@ -761,7 +761,7 @@ describe('FreshAgentSettingsButton', () => {
     expect(settingsRoot?.className).toContain('h-full')
     expect(gearButton.className).toContain('h-full')
     expect(gearButton.className).toContain('aspect-square')
-    expect(glyph?.getAttribute('class') ?? '').toContain('h-[27px]')
+    expect(glyph?.getAttribute('class') ?? '').toContain('h-5 w-5')
     expect(glyph?.getAttribute('class') ?? '').toContain('sm:h-3')
   })
 

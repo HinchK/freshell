@@ -755,7 +755,7 @@ describe('PaneHeader', () => {
       const agentIconSvg = agentIcon.querySelector('[data-testid="pane-icon"]')
       expect(agentIconSvg).not.toBeNull()
       expect(agentIconSvg?.getAttribute('class')).toContain('text-blue-500')
-      expect(agentIconSvg?.getAttribute('class')).toContain('h-[1.3125rem] w-[1.3125rem] sm:h-3.5 sm:w-3.5')
+      expect(agentIconSvg?.getAttribute('class')).toContain('h-4 w-4 sm:h-3.5 sm:w-3.5')
     })
   })
 
@@ -779,7 +779,7 @@ describe('PaneHeader', () => {
         </Provider>,
       )
       expect(screen.getByTestId('repo-icon')).toBeTruthy()
-      expect(screen.getByTestId('repo-icon').getAttribute('class') || '').toContain('h-[1.3125rem] w-[1.3125rem] shrink-0 sm:h-3.5 sm:w-3.5')
+      expect(screen.getByTestId('repo-icon').getAttribute('class') || '').toContain('h-4 w-4 shrink-0 sm:h-3.5 sm:w-3.5')
     })
 
     it('renders no repo icon for plain shell panes', () => {
@@ -1434,7 +1434,7 @@ describe('PaneHeader', () => {
     it('renders full-height square zone classes with zero gap and mobile-only size increase', () => {
       renderPaneHeader()
       const header = screen.getByRole('banner')
-      expect(header.className).toContain('h-[3.9375rem]')
+      expect(header.className).toContain('h-11')
       expect(header.className).toContain('sm:h-7')
       expect(header.className).toContain('text-sm')
 
@@ -1453,7 +1453,7 @@ describe('PaneHeader', () => {
       const close = screen.getByTitle('Close pane')
       const closeSvg = close.querySelector('svg')
       expect(closeSvg?.getAttribute('class') ?? '').toContain('sm:h-3')
-      expect(closeSvg?.getAttribute('class') ?? '').toContain('h-[27px]')
+      expect(closeSvg?.getAttribute('class') ?? '').toContain('h-5 w-5')
     })
 
     it('keeps an explicit meta margin next to the zero-gap actions', () => {

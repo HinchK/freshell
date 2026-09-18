@@ -299,7 +299,7 @@ export function FreshAgentSettingsButton({
           setOpen((value) => !value)
         }}
       >
-        <Settings ref={glyphRef} className="h-[27px] w-[27px] sm:h-3 sm:w-3" />
+        <Settings ref={glyphRef} className="h-5 w-5 sm:h-3 sm:w-3" />
       </button>
 
       {open && popoverPos ? createPortal(
