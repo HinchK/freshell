@@ -45,12 +45,13 @@
  * freshagent-settings-resume-rust.spec.ts).
  */
 import { test, expect } from '../helpers/fixtures.js'
-import { RustServer, type TestServerInfo } from '../helpers/rust-server.js'
+import { RustServer } from '../helpers/rust-server.js'
+import type { E2eServerInfo } from '../helpers/server-fixture-support.js'
 import { TestHarness } from '../helpers/test-harness.js'
 import { openPanePicker } from '../helpers/pane-picker.js'
 import { installRecoveryOfferAutoDeclineOnContext } from '../helpers/recovery-offer.js'
-import { installDualRoleCodexCli } from '../fixtures/codex-dual-role'
-import { installDualRoleOpencodeCli } from '../fixtures/opencode-dual-role'
+import { installDualRoleCodexCli } from '../fixtures/codex-dual-role.js'
+import { installDualRoleOpencodeCli } from '../fixtures/opencode-dual-role.js'
 import fs from 'node:fs/promises'
 import { existsSync, readFileSync } from 'node:fs'
 import os from 'node:os'
@@ -110,7 +111,7 @@ async function waitForJsonlRow(
 }
 
 /** The Rust server's structured JSONL log rows (logging.rs schema). */
-function readServerLogRows(info: TestServerInfo): any[] {
+function readServerLogRows(info: E2eServerInfo): any[] {
   return readJsonl(path.join(info.logsDir, 'rust-server.jsonl'))
 }
 
@@ -303,9 +304,26 @@ async function newDeviceContext(browser: Browser): Promise<BrowserContext> {
 /** Open one device's page against the owned server and wait for the harness. */
 async function openDevicePage(
   context: BrowserContext,
-  info: TestServerInfo,
+  info: E2eServerInfo,
+  receivedFrames?: Array<Record<string, any>>,
 ): Promise<{ page: Page; harness: TestHarness }> {
   const page = await context.newPage()
+  if (receivedFrames) {
+    const ownedWsOrigin = info.baseUrl.replace(/^http/, 'ws')
+    page.on('websocket', (socket) => {
+      if (!socket.url().startsWith(ownedWsOrigin)) return
+      socket.on('framereceived', ({ payload }) => {
+        try {
+          const frame = JSON.parse(String(payload))
+          if (frame && typeof frame === 'object' && !Array.isArray(frame)) {
+            receivedFrames.push(frame as Record<string, any>)
+          }
+        } catch {
+          // Ignore protocol frames that are not JSON.
+        }
+      })
+    })
+  }
   await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
   const harness = new TestHarness(page)
   await harness.waitForHarness()
@@ -325,7 +343,7 @@ async function deviceId(page: Page): Promise<string | null> {
  * the phone's sidebar open through the fresh-agent branch.
  */
 async function waitForSessionDirectoryTag(
-  info: TestServerInfo,
+  info: E2eServerInfo,
   provider: string,
   sessionId: string,
   timeoutMs = 45_000,
@@ -572,6 +590,65 @@ test.describe('Session handoff across two devices (rust only)', () => {
         .toBe(CODEX_THREAD_ID)
       await waitForPaneLeafStatus(phone.harness, phoneSession.tabId, 'idle', 45_000)
 
+      // Restart the owned server while both devices remain mounted. The
+      // reconnect must use the new boot/owner authority without replacing the
+      // durable conversation, and a subsequent turn must remain visible on
+      // both devices.
+      const readyBeforeRestart = await Promise.all([
+        desktop.page.evaluate(() => ({
+          lastReadyAt: (window as any).__FRESHELL_TEST_HARNESS__?.getState?.()?.connection?.lastReadyAt ?? null,
+          bootId: (window as any).__FRESHELL_TEST_HARNESS__?.getState?.()?.connection?.bootId ?? null,
+        })),
+        phone.page.evaluate(() => ({
+          lastReadyAt: (window as any).__FRESHELL_TEST_HARNESS__?.getState?.()?.connection?.lastReadyAt ?? null,
+          bootId: (window as any).__FRESHELL_TEST_HARNESS__?.getState?.()?.connection?.bootId ?? null,
+        })),
+      ])
+      await server.restart()
+      await expect(async () => {
+        const current = await desktop.page.evaluate(() => ({
+          ws: (window as any).__FRESHELL_TEST_HARNESS__?.getWsReadyState?.() ?? null,
+          lastReadyAt: (window as any).__FRESHELL_TEST_HARNESS__?.getState?.()?.connection?.lastReadyAt ?? null,
+          bootId: (window as any).__FRESHELL_TEST_HARNESS__?.getState?.()?.connection?.bootId ?? null,
+        }))
+        expect(current.ws).toBe('ready')
+        expect(String(current.lastReadyAt)).not.toBe(String(readyBeforeRestart[0].lastReadyAt))
+        expect(current.bootId).not.toBe(readyBeforeRestart[0].bootId)
+      }).toPass({ timeout: 60_000 })
+      await expect(async () => {
+        const current = await phone.page.evaluate(() => ({
+          ws: (window as any).__FRESHELL_TEST_HARNESS__?.getWsReadyState?.() ?? null,
+          lastReadyAt: (window as any).__FRESHELL_TEST_HARNESS__?.getState?.()?.connection?.lastReadyAt ?? null,
+          bootId: (window as any).__FRESHELL_TEST_HARNESS__?.getState?.()?.connection?.bootId ?? null,
+        }))
+        expect(current.ws).toBe('ready')
+        expect(String(current.lastReadyAt)).not.toBe(String(readyBeforeRestart[1].lastReadyAt))
+        expect(current.bootId).not.toBe(readyBeforeRestart[1].bootId)
+      }).toPass({ timeout: 60_000 })
+      await expect
+        .poll(async () => freshAgentDurableRef(desktop.harness, desktopTabId), { timeout: 45_000 })
+        .toBe(CODEX_THREAD_ID)
+      await expect
+        .poll(async () => freshAgentDurableRef(phone.harness, phoneSession.tabId), { timeout: 45_000 })
+        .toBe(CODEX_THREAD_ID)
+      await waitForPaneLeafStatus(desktop.harness, desktopTabId, 'idle', 45_000)
+      await waitForPaneLeafStatus(phone.harness, phoneSession.tabId, 'idle', 45_000)
+      await expect(desktop.page.getByText('two-device handoff turn one', { exact: true })).toBeVisible({ timeout: 30_000 })
+      await expect(phone.page.getByText('two-device handoff turn one', { exact: true })).toBeVisible({ timeout: 30_000 })
+      await sendComposerText(desktop.page, 'two-device handoff turn after restart')
+      await expect
+        .poll(
+          async () => await desktop.page.locator('[data-context="fresh-agent"]').last().locator('article[data-turn-index]').count(),
+          { timeout: 30_000 },
+        )
+        .toBeGreaterThanOrEqual(3)
+      await expect
+        .poll(
+          async () => await phone.page.locator('[data-context="fresh-agent"]').last().locator('article[data-turn-index]').count(),
+          { timeout: 30_000 },
+        )
+        .toBeGreaterThanOrEqual(3)
+
       // The watermarks: everything the phone's pane did to adopt the live
       // session is BEFORE this point; post-handmark writer rows are the
       // sidecar-resurrection failure mode.
@@ -761,7 +838,8 @@ test.describe('Session handoff across two devices (rust only)', () => {
       const info = await server.start()
       desktopCtx = await newDeviceContext(browser)
       phoneCtx = await newDeviceContext(browser)
-      const desktop = await openDevicePage(desktopCtx, info)
+      const desktopFrames: Array<Record<string, any>> = []
+      const desktop = await openDevicePage(desktopCtx, info, desktopFrames)
       const phone = await openDevicePage(phoneCtx, info)
 
       expect(await deviceId(desktop.page)).not.toBe(await deviceId(phone.page))
@@ -775,6 +853,36 @@ test.describe('Session handoff across two devices (rust only)', () => {
       expect(desktopTabId).toBeTruthy()
       await createFreshAgentPane(desktop.page, /^Freshopencode$/, 'Freshopencode', projectDir)
       await waitForPaneLeafStatus(desktop.harness, desktopTabId, 'idle')
+
+      // The fresh OpenCode pane starts with an unmaterialized placeholder.
+      // Observe the actual wire snapshot before sending a turn, then force
+      // one real reconnect and require another snapshot for that same
+      // placeholder. A placeholder attach is observation-only: neither cycle
+      // may reserve a provider writer.
+      const placeholderId = await expect
+        .poll(async () => freshAgentDurableRef(desktop.harness, desktopTabId), { timeout: 20_000 })
+        .toMatch(/^freshopencode-/)
+        .then(async () => (await freshAgentDurableRef(desktop.harness, desktopTabId))!)
+      const placeholderSnapshots = () => desktopFrames.filter(
+        (frame) => frame.type === 'freshAgent.event'
+          && frame.sessionId === placeholderId
+          && frame.event?.type === 'freshAgent.session.snapshot',
+      )
+      const placeholderReservationErrors = () => desktopFrames.filter(
+        (frame) => frame.type === 'freshAgent.event'
+          && frame.sessionId === placeholderId
+          && frame.event?.type === 'freshAgent.error'
+          && frame.event?.code === 'SESSION_RESERVED',
+      )
+      await expect.poll(() => placeholderSnapshots().length, { timeout: 30_000 }).toBeGreaterThan(0)
+      const snapshotsBeforeReconnect = placeholderSnapshots().length
+      await expect.poll(() => placeholderReservationErrors().length).toBe(0)
+      await desktop.harness.forceDisconnect()
+      await expect
+        .poll(() => placeholderSnapshots().length, { timeout: 30_000 })
+        .toBeGreaterThan(snapshotsBeforeReconnect)
+      expect(placeholderReservationErrors(), 'placeholder attaches never reserve a writer').toHaveLength(0)
+
       await sendComposerText(desktop.page, 'two-device opencode turn one')
       const sesId = await expect
         .poll(async () => freshAgentDurableRef(desktop.harness, desktopTabId), { timeout: 30_000 })

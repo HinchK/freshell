@@ -88,6 +88,14 @@ Freshclaude, Freshcodex, and Freshopencode share a chat interface with tool outp
 
 You can queue follow-up messages while an agent works. They run one at a time, and the queue stays available if the session disconnects or ends. Expand the queue to read or cancel individual messages. Codex permission settings control when it asks for approval; “Never ask” does not change the session’s file or network access limits.
 
+### Session switching and recovery
+
+Reopening a session in another mode keeps the same provider session and conversation. When another device is using that session, freshell shows its current mode and offers an action to open the same session here. The action attaches to the existing session; it does not create a blank replacement.
+
+**Force clear** repairs stale ownership bookkeeping only. It does not stop a running writer or start a replacement. If freshell cannot confirm that the old writer has stopped, the session remains blocked and the recovery message explains that you must stop and reopen it explicitly.
+
+**Stop and reopen** is available only when freshell can confirm the old writer and its owned child processes have stopped. The new mode starts only after that confirmation. On platforms where freshell cannot establish that proof, the request is refused before changing the session, and the existing session remains usable. The current atomic handoff implementation supports this operation when the Freshell server runs on Linux; Windows and macOS receive the explicit refusal and can still use clear-only bookkeeping repair.
+
 ## Stream Deck
 
 Freshell can drive an Elgato Stream Deck straight from the browser. Each key shows a tab — by default the **Status icons** style: title on top, centered repo icons, and a status background (green for tabs that want attention), with keys sorted so attention-seeking tabs come first. Press a key to focus that tab; long-press (500 ms) to open an action layer with BACK / APPROVE / STOP keys (it closes itself after 10 s). When you have more tabs than keys, the last key pages through them (wrapping around). On a Stream Deck +, the dials cycle tabs and flip pages and the touch strip shows the active tab plus busy/waiting counts (waiting = tabs that finished a turn or are waiting for approval). The deck dims after a configurable idle timeout and wakes on activity.
