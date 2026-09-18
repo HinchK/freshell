@@ -1256,11 +1256,30 @@ impl FreshOpencodeState {
                     .map(str::to_string),
                 resolves_pending: Some(session.placeholder_id.clone()),
                 supersedes: None,
-                // Unified agent names: the materialization's naming transfer
-                // is committed by the dedicated bind lane below (BEFORE the
-                // materialized frame publishes the identity); the ledger
-                // edge itself carries no naming fact.
-                name_transition: None,
+                // Unified agent names (Task 4, T2-M5 wired): the
+                // materialization's DECLARED classification — the same
+                // InitialMaterialization the dedicated bind lane below
+                // folds through the shared classification-driven fold
+                // (opencode persistence is verified at materialization).
+                name_transition: Some(crate::naming::NameTransition::binding(
+                    crate::naming::NameTransitionReason::InitialMaterialization,
+                    freshell_protocol::native_location::NativeAcquisition {
+                        location: freshell_protocol::native_location::NativeLocation::Opencode {
+                            database_path: freshell_sessions::parse::default_opencode_data_home()
+                                .join("opencode.db")
+                                .display()
+                                .to_string(),
+                            native_session_id: Some(durable_id.clone()),
+                            original_directory: session.cwd.clone(),
+                            owned_local_endpoint: None,
+                        },
+                        evidence:
+                            freshell_protocol::native_location::NativeEvidenceKind::PersistedMetadata,
+                        persistence:
+                            freshell_protocol::native_location::NativePersistence::Verified,
+                    },
+                    session.placeholder_id.clone(),
+                )),
                 provenance: session.provenance.clone().into(),
                 settings: crate::identity_sink::FreshAgentSettings {
                     model: session.model.clone(),
@@ -1356,6 +1375,36 @@ impl FreshOpencodeState {
         let real_id = acked_session_id.clone();
         let route = session.cwd.clone();
         let text = msg.text.clone();
+
+        // Unified agent names (Task 4): the shared accepted-input callback —
+        // the turn was accepted for submission, so the user input is
+        // ACCEPTED. The naming target is the stashed pre-durable handle
+        // (freshopencode-<createRequestId>, still pending until the
+        // materialization bind consumes it), else the durable `ses_*` id. A
+        // failed feed never blocks the turn.
+        let naming_target = self
+            .fresh_agent
+            .peek_naming_handle(&session.placeholder_id)
+            .map(|handle| freshell_protocol::session_names::SessionNameRef::Pending { id: handle })
+            .or_else(|| {
+                session.real_session_id.clone().map(|ses_id| {
+                    freshell_protocol::session_names::SessionNameRef::Session {
+                        provider: freshell_protocol::session_names::NamedProvider::Opencode,
+                        session_id: ses_id,
+                    }
+                })
+            });
+        if let Some(target) = naming_target {
+            crate::naming::report_accepted_input(
+                &self.naming(),
+                &target,
+                SESSION_TYPE,
+                request_id.as_deref().unwrap_or(""),
+                &msg.text,
+                route.as_deref(),
+            )
+            .await;
+        }
 
         // `freshAgent.send.accepted` (ws-handler.ts:3487-3495) — broadcast immediately,
         // mirroring the codex slice's ack timing. The turn itself runs in a detached

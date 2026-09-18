@@ -86,6 +86,7 @@ fn sessions_router(home: &std::path::Path, names: &Arc<SessionNames>) -> Router 
         ai_key: crate::ai_title::AiKeyCell::init(None, None),
         gemini: Arc::new(FakeGemini(Err("unused".into()))),
         index: None,
+        generation_wake: None,
     })
 }
 

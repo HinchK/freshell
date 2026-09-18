@@ -240,10 +240,11 @@ async fn manual_survives_reload_and_ai_race() {
     // Same race through the completion seam: a late generation answer can
     // never land on a protected record (no series exists for it).
     let late = store
-        .complete_generation(
+        .fold_generation_outcome(
             target.clone(),
             "bogus-series".to_string(),
-            "Late AI".to_string(),
+            "fingerprint".to_string(),
+            crate::session_name_generation::GenerationOutcome::Answer("Late AI".to_string()),
         )
         .await;
     assert!(
@@ -1457,6 +1458,7 @@ async fn pending_collision_budget_union_and_redirects() {
     store
         .claim_generation_start(pending("h-union-0"), "attempt-target".to_string())
         .await
+        .expect("claim transaction runs")
         .expect("consume one target start");
     store
         .bind_pending(BindNameInput {
@@ -1480,12 +1482,40 @@ async fn pending_collision_budget_union_and_redirects() {
     )
     .await
     .expect("arm pending series");
-    for attempt in ["attempt-pending-1", "attempt-pending-2"] {
-        store
+    for (index, attempt) in ["attempt-pending-1", "attempt-pending-2"]
+        .into_iter()
+        .enumerate()
+    {
+        // One in-flight attempt per series, and each failed start schedules
+        // the bounded retry delay: fold each start and advance the test
+        // clock past its delay before the next claims (the reshaped Task-4
+        // claim enforces single-flight and due-time).
+        if index > 0 {
+            set_test_hooks(
+                dir.path(),
+                vec![TestHook::ClockOffsetMs(
+                    crate::session_names::GENERATION_RETRY_1_MS,
+                )],
+            );
+        }
+        let claim = store
             .claim_generation_start(pending("h-union-1"), attempt.to_string())
             .await
+            .expect("claim transaction runs")
             .expect("consume pending start");
+        store
+            .fold_generation_outcome(
+                pending("h-union-1"),
+                claim.series_id.clone(),
+                claim.input_fingerprint.clone(),
+                crate::session_name_generation::GenerationOutcome::Failed(
+                    "scripted failure between starts".to_string(),
+                ),
+            )
+            .await
+            .expect("the start folds before the next claims");
     }
+    clear_test_hooks(dir.path());
 
     // Colliding bind: equal automatic ranks favor the durable record; the
     // budgets union (1 + 2 = 3 => exhausted at the cap).
@@ -1538,10 +1568,11 @@ async fn pending_collision_budget_union_and_redirects() {
     let series = after.generation.get(&key).expect("series after activity");
     assert_eq!(series.consumed, 3, "exhaustion never re-arms");
     assert_eq!(series.status, GenerationStatus::Exhausted);
-    store
+    let beyond = store
         .claim_generation_start(durable.clone(), "attempt-beyond".to_string())
         .await
         .expect("claim beyond the cap is a bounded no-op");
+    assert!(beyond.is_none(), "an exhausted series is never claimable");
     let final_doc = read_raw_document(dir.path());
     assert_eq!(final_doc.generation[&key].consumed, 3);
 
@@ -1780,11 +1811,9 @@ async fn activity_first_message_fallback_and_dedupe() {
     );
     let unclaimed = store
         .claim_generation_start(target.clone(), "attempt-unarmed".to_string())
-        .await;
-    assert!(
-        matches!(unclaimed, Err(NameError::NotFound(_))),
-        "no series was armed"
-    );
+        .await
+        .expect("claim transaction runs");
+    assert!(unclaimed.is_none(), "no series was armed");
 
     // Accepted input upgrades the fallback without waiting for generation.
     let upgraded = activity(
@@ -1804,6 +1833,7 @@ async fn activity_first_message_fallback_and_dedupe() {
     store
         .claim_generation_start(target.clone(), "attempt-1".to_string())
         .await
+        .expect("claim transaction runs")
         .expect("armed series is claimable");
 
     // Duplicate delivery of the same event/message is a no-op.

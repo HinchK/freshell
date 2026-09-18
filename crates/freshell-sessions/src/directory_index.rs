@@ -239,11 +239,22 @@ pub trait SessionSource: Send + Sync {
     /// (amplifier's sidecar mtimes) MUST fold identically here — otherwise
     /// the discover and scoped paths write different cache keys for the same
     /// file (raw-vs-folded thrash + frozen recency, design lines 77-83).
-    /// `None` means the file is gone/unreadable and prunes the entry — a
+    /// `None` means the path is gone/unreadable and prunes the entry — a
     /// source override must therefore return None when ITS canonical file is
     /// missing regardless of surviving sidecars (never resurrect a ghost).
     fn stat_scoped(&self, path: &Path) -> Option<FileStat> {
         stat_file(path)
+    }
+
+    /// Unified agent names (plan Task 4): the TARGETED first-user-message
+    /// lookup for an already-named session. OpenCode names parent sessions
+    /// itself after the first exchange, so the bounded listing carries first
+    /// messages only for placeholder-titled rows — the naming sweep needs
+    /// the single named session's first real user message on demand (one
+    /// bounded read-only query, never a full-history pass). `None` (the
+    /// default) = this source has no targeted accessor.
+    fn targeted_first_user_message(&self, _session_id: &str) -> Option<String> {
+        None
     }
 }
 
@@ -722,9 +733,25 @@ impl OpencodeSource {
     pub fn scan(&self) -> Vec<IndexedSession> {
         self.direct_list().unwrap_or_default()
     }
+
+    /// Unified agent names (plan Task 4): the targeted first-user-message
+    /// lookup for an already-named opencode session (see
+    /// [`SessionSource::targeted_first_user_message`]) — one bounded
+    /// read-only sqlite query through the same data home the listing uses.
+    pub fn first_user_message_for(&self, session_id: &str) -> Option<String> {
+        let database_path = self.provider.database_path();
+        let data_home = database_path.parent()?;
+        crate::parse::opencode::opencode_first_user_message_by_id(data_home, session_id)
+            .ok()
+            .flatten()
+    }
 }
 
 impl SessionSource for OpencodeSource {
+    fn targeted_first_user_message(&self, session_id: &str) -> Option<String> {
+        self.first_user_message_for(session_id)
+    }
+
     fn discover(&self) -> Vec<FileStat> {
         Vec::new()
     }
@@ -1109,6 +1136,19 @@ impl SessionIndex {
             amplifier_root_report: Arc::new(StdMutex::new(None)),
             startup_gate: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    /// Unified agent names (plan Task 4): the targeted first-user-message
+    /// lookup for an already-named session, served by whichever source owns
+    /// a targeted accessor (opencode — see
+    /// [`SessionSource::targeted_first_user_message`]). One bounded
+    /// read-only query per call; the naming sweep consults it only for
+    /// sessions whose generation can still use input, so exhausted or
+    /// protected sessions never pay the lookup.
+    pub fn opencode_first_user_message(&self, session_id: &str) -> Option<String> {
+        self.sources
+            .iter()
+            .find_map(|source| source.targeted_first_user_message(session_id))
     }
 
     /// Providers whose MOST RECENT listing attempt failed (unsearchable, not

@@ -273,7 +273,8 @@ pub enum NativeOutcomeFold {
 /// manual projection traffic can starve nothing because every cycle is
 /// bounded, a capability-paused series rotates out of selection for only a
 /// bounded re-probe window, and generation (Task 4) alternates on this same
-/// selector.
+/// selector ([`select_work`]: a persisted alternating class cursor when
+/// both classes have ready work).
 pub struct SessionNameWorker;
 
 impl SessionNameWorker {
@@ -282,14 +283,71 @@ impl SessionNameWorker {
     pub fn start(
         names: Arc<SessionNames>,
         native: Arc<dyn NativeNameBackend>,
+        generator: Arc<crate::session_name_generation::SessionNameGenerator>,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            run(names, native).await;
+            run(names, native, generator).await;
         })
     }
 }
 
-async fn run(names: Arc<SessionNames>, native: Arc<dyn NativeNameBackend>) {
+/// One selected dispatch: a native cycle or a generation attempt.
+#[derive(Clone, Debug)]
+pub(crate) enum WorkSelection {
+    Native(NativeWorkItem),
+    Generation(crate::session_name_generation::GenerationWorkItem),
+}
+
+/// The generation half of the fair selection: earliest nextDue (an
+/// unarmed `None` due is immediately ready), then the stable
+/// name-reference key.
+pub(crate) fn select_generation(
+    items: &[crate::session_name_generation::GenerationWorkItem],
+) -> Option<crate::session_name_generation::GenerationWorkItem> {
+    items
+        .iter()
+        .min_by(|a, b| {
+            a.next_due
+                .unwrap_or(0)
+                .cmp(&b.next_due.unwrap_or(0))
+                .then_with(|| {
+                    freshell_freshagent::naming::name_ref_debug_key(&a.target)
+                        .cmp(&freshell_freshagent::naming::name_ref_debug_key(&b.target))
+                })
+        })
+        .cloned()
+}
+
+/// The class selector: when BOTH classes have ready work, the persisted
+/// alternating class cursor (stamped by each claim) picks the OTHER class;
+/// a single ready class serves itself regardless of the cursor.
+pub(crate) fn select_work(
+    native_items: &[NativeWorkItem],
+    generation_items: &[crate::session_name_generation::GenerationWorkItem],
+    last_class: Option<&str>,
+    probe_backoff: &mut HashMap<(String, NameRevision), tokio::time::Instant>,
+) -> Option<WorkSelection> {
+    let native_pick = select_next(native_items, probe_backoff);
+    let generation_pick = select_generation(generation_items);
+    match (native_pick, generation_pick) {
+        (Some(native), Some(generation)) => {
+            if last_class == Some("native") {
+                Some(WorkSelection::Generation(generation))
+            } else {
+                Some(WorkSelection::Native(native))
+            }
+        }
+        (Some(native), None) => Some(WorkSelection::Native(native)),
+        (None, Some(generation)) => Some(WorkSelection::Generation(generation)),
+        (None, None) => None,
+    }
+}
+
+async fn run(
+    names: Arc<SessionNames>,
+    native: Arc<dyn NativeNameBackend>,
+    generator: Arc<crate::session_name_generation::SessionNameGenerator>,
+) {
     // The transient per-series re-probe backoff: a capability refusal
     // rotates THAT series out of selection for a bounded window instead of
     // re-selecting the same paused head every poll. Keyed by the stable
@@ -301,21 +359,49 @@ async fn run(names: Arc<SessionNames>, native: Arc<dyn NativeNameBackend>) {
     // one window of its arrival.
     let mut probe_backoff: HashMap<(String, NameRevision), tokio::time::Instant> = HashMap::new();
     loop {
-        let items = names.native_work_snapshot();
-        let Some(item) = select_next(&items, &mut probe_backoff) else {
-            tokio::time::sleep(WORKER_POLL_INTERVAL).await;
+        // Capability is checked BEFORE selection: disabled naming or a
+        // missing key pauses the generation class without consuming
+        // anything and without ever reaching the guard (a paused contender
+        // cannot monopolize the worker).
+        let generation_items = if generator.capability_ready().await {
+            names.generation_work_snapshot()
+        } else {
+            Vec::new()
+        };
+        let native_items = names.native_work_snapshot();
+        let selection = select_work(
+            &native_items,
+            &generation_items,
+            names.scheduling_cursor_last_class().as_deref(),
+            &mut probe_backoff,
+        );
+        let Some(work) = selection else {
+            tokio::select! {
+                _ = tokio::time::sleep(WORKER_POLL_INTERVAL) => {}
+                // A settings/key capability change wakes the poll
+                // immediately; the next pass re-evaluates capability.
+                _ = generator.wake_notify().notified() => {}
+            }
             continue;
         };
         // Acquire the shared worker guard for the actual local operation
         // (worker THEN document, never the reverse). Another cooperating
         // process holding it means ITS worker drives this work now — ours
         // polls again later. Retry delays hold neither lock.
+        let item_key = match &work {
+            WorkSelection::Native(item) => {
+                freshell_freshagent::naming::name_ref_debug_key(&item.target)
+            }
+            WorkSelection::Generation(item) => {
+                freshell_freshagent::naming::name_ref_debug_key(&item.target)
+            }
+        };
         let Some(guard) = names.try_background_guard().unwrap_or_else(|error| {
             tracing::warn!(
                 target: "freshell_server::session_name_native",
                 op = "try_background_guard",
-                name_ref = %freshell_freshagent::naming::name_ref_debug_key(&item.target),
-                revision = item.desired_revision,
+                name_ref = %item_key,
+                revision = 0,
                 class = %error.code(),
                 "session_names.operation_failed: {error}"
             );
@@ -324,45 +410,124 @@ async fn run(names: Arc<SessionNames>, native: Arc<dyn NativeNameBackend>) {
             tokio::time::sleep(WORKER_POLL_INTERVAL).await;
             continue;
         };
-        // The capability probe: "initially missing location/capability pauses
-        // before consuming a cycle". An absent route/capability (no live
-        // provider connection for the root, no wired adapter, a missing
-        // helper) consumes NOTHING — the series stays `pending` with its full
-        // allowance, the rotation below moves it out of the selector for a
-        // bounded window so lower-priority armed series keep receiving
-        // slots, and it re-probes once that window expires.
-        if !native
-            .route_available(NativeNameTarget {
-                name_ref: item.target.clone(),
-                location: item.location.clone(),
-                location_revision: item.location_revision,
-            })
-            .await
-        {
-            tracing::debug!(
-                target: "freshell_server::session_name_native",
-                op = "route_available",
-                name_ref = %freshell_freshagent::naming::name_ref_debug_key(&item.target),
-                revision = item.desired_revision,
-                class = "capability_absent",
-                "session_names.native_route_unavailable: capability paused before claiming a cycle"
-            );
-            probe_backoff.insert(
-                (
-                    freshell_freshagent::naming::name_ref_debug_key(&item.target),
-                    item.desired_revision,
-                ),
-                tokio::time::Instant::now() + CAPABILITY_REPROBE_DELAY,
-            );
-            drop(guard);
-            tokio::time::sleep(WORKER_POLL_INTERVAL).await;
-            continue;
+        match work {
+            WorkSelection::Native(item) => {
+                // The capability probe: "initially missing location/capability
+                // pauses before consuming a cycle". An absent route/capability
+                // consumes NOTHING — the series stays `pending` with its full
+                // allowance, the rotation below moves it out of the selector
+                // for a bounded window so lower-priority armed series keep
+                // receiving slots, and it re-probes once that window expires.
+                if !native
+                    .route_available(NativeNameTarget {
+                        name_ref: item.target.clone(),
+                        location: item.location.clone(),
+                        location_revision: item.location_revision,
+                    })
+                    .await
+                {
+                    tracing::debug!(
+                        target: "freshell_server::session_name_native",
+                        op = "route_available",
+                        name_ref = %freshell_freshagent::naming::name_ref_debug_key(&item.target),
+                        revision = item.desired_revision,
+                        class = "capability_absent",
+                        "session_names.native_route_unavailable: capability paused before claiming a cycle"
+                    );
+                    probe_backoff.insert(
+                        (
+                            freshell_freshagent::naming::name_ref_debug_key(&item.target),
+                            item.desired_revision,
+                        ),
+                        tokio::time::Instant::now() + CAPABILITY_REPROBE_DELAY,
+                    );
+                    drop(guard);
+                    tokio::time::sleep(WORKER_POLL_INTERVAL).await;
+                    continue;
+                }
+                // Recover any interrupted generation start while holding the
+                // guard (only a guard-holder dispatches, so an InFlight series
+                // seen here is provably dead).
+                if names.interrupted_generation_count() > 0 {
+                    match names.recover_interrupted_generation().await {
+                        Ok(count) if count > 0 => {
+                            tracing::info!(
+                                target: "freshell_server::session_name_generation",
+                                op = "recover_interrupted",
+                                name_ref = "-",
+                                revision = 0,
+                                class = "recovered",
+                                "session_names.generation_recovered: {count} interrupted start(s) folded as failed"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "freshell_server::session_name_generation",
+                                op = "recover_interrupted",
+                                name_ref = "-",
+                                revision = 0,
+                                class = %error.code(),
+                                "session_names.operation_failed: {error}"
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                // The guard is retained through the cycle's actual local work
+                // (the provider calls and any owned-helper cleanup) and
+                // released right after the fold — external ambiguity never
+                // retains it.
+                run_cycle(&names, native.as_ref(), &item.target).await;
+                drop(guard);
+            }
+            WorkSelection::Generation(item) => {
+                // A capability pause consumed nothing (the pre-selection gate
+                // and the claim's own guards hold); re-checking here covers
+                // the race where capability vanished between selection and
+                // the guard.
+                if !generator.capability_ready().await {
+                    tracing::debug!(
+                        target: "freshell_server::session_name_generation",
+                        op = "capability_pause",
+                        name_ref = %freshell_freshagent::naming::name_ref_debug_key(&item.target),
+                        series = %item.series_id,
+                        revision = 0,
+                        class = "paused",
+                        "session_names.generation_paused: capability absent before the claim"
+                    );
+                    drop(guard);
+                    tokio::time::sleep(WORKER_POLL_INTERVAL).await;
+                    continue;
+                }
+                if names.interrupted_generation_count() > 0 {
+                    match names.recover_interrupted_generation().await {
+                        Ok(count) if count > 0 => {
+                            tracing::info!(
+                                target: "freshell_server::session_name_generation",
+                                op = "recover_interrupted",
+                                name_ref = "-",
+                                revision = 0,
+                                class = "recovered",
+                                "session_names.generation_recovered: {count} interrupted start(s) folded as failed"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                target: "freshell_server::session_name_generation",
+                                op = "recover_interrupted",
+                                name_ref = "-",
+                                revision = 0,
+                                class = %error.code(),
+                                "session_names.operation_failed: {error}"
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                generator.run_due_attempt(&names, &item).await;
+                drop(guard);
+            }
         }
-        // The guard is retained through the cycle's actual local work (the
-        // provider calls and any owned-helper cleanup) and released right
-        // after the fold — external ambiguity never retains it.
-        run_cycle(&names, native.as_ref(), &item.target).await;
-        drop(guard);
     }
 }
 

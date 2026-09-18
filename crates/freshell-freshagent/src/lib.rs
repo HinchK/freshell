@@ -3437,6 +3437,24 @@ async fn send_keys(
     let effort = normalize_opencode_effort(pane.model.as_deref(), pane.effort.as_deref());
     let submitted_turn_id = Uuid::new_v4().to_string();
 
+    // Unified agent names (Task 4): the shared accepted-input callback runs
+    // once the provider ACCEPTED the turn (Ok or IdleTimeout — the turn was
+    // accepted and drove; a hard failure never feeds). The target is the
+    // pane's pre-durable handle while it is still stashed, else the durable
+    // `ses_*` identity.
+    let naming_target = state
+        .peek_naming_handle(&pane.placeholder_id)
+        .map(|handle| freshell_protocol::session_names::SessionNameRef::Pending { id: handle })
+        .or_else(|| {
+            (!durable_id.is_empty()).then(|| {
+                freshell_protocol::session_names::SessionNameRef::Session {
+                    provider: freshell_protocol::session_names::NamedProvider::Opencode,
+                    session_id: durable_id.clone(),
+                }
+            })
+        });
+    let naming_mode = SESSION_TYPE.to_string();
+
     match manager
         .run_turn(
             &durable_id,
@@ -3448,27 +3466,53 @@ async fn send_keys(
         )
         .await
     {
-        Ok(()) => ok_json(
-            json!({
-                "paneId": pane_id,
-                "sessionId": durable_id,
-                "submittedTurnId": submitted_turn_id,
-                "sessionRef": { "provider": PROVIDER, "sessionId": durable_id },
-                "status": "idle",
-            }),
-            "prompt sent",
-        ),
+        Ok(()) => {
+            if let Some(target) = naming_target {
+                naming::report_accepted_input(
+                    &state.naming(),
+                    &target,
+                    &naming_mode,
+                    &submitted_turn_id,
+                    &text,
+                    pane.cwd.as_deref(),
+                )
+                .await;
+            }
+            ok_json(
+                json!({
+                    "paneId": pane_id,
+                    "sessionId": durable_id,
+                    "submittedTurnId": submitted_turn_id,
+                    "sessionRef": { "provider": PROVIDER, "sessionId": durable_id },
+                    "status": "idle",
+                }),
+                "prompt sent",
+            )
+        }
         // Idle deadline missed → approx (the turn was accepted; it just did not idle in time).
-        Err(ServeError::IdleTimeout { .. }) => approx_json(
-            json!({
-                "paneId": pane_id,
-                "sessionId": durable_id,
-                "submittedTurnId": submitted_turn_id,
-                "sessionRef": { "provider": PROVIDER, "sessionId": durable_id },
-                "status": "approx",
-            }),
-            "prompt sent; turn did not complete within deadline",
-        ),
+        Err(ServeError::IdleTimeout { .. }) => {
+            if let Some(target) = naming_target {
+                naming::report_accepted_input(
+                    &state.naming(),
+                    &target,
+                    &naming_mode,
+                    &submitted_turn_id,
+                    &text,
+                    pane.cwd.as_deref(),
+                )
+                .await;
+            }
+            approx_json(
+                json!({
+                    "paneId": pane_id,
+                    "sessionId": durable_id,
+                    "submittedTurnId": submitted_turn_id,
+                    "sessionRef": { "provider": PROVIDER, "sessionId": durable_id },
+                    "status": "approx",
+                }),
+                "prompt sent; turn did not complete within deadline",
+            )
+        }
         Err(err) => fail_json(serve_error_status(&err), err.to_string()),
     }
 }

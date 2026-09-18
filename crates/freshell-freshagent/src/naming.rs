@@ -15,7 +15,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use freshell_protocol::native_location::NativeAcquisition;
+use freshell_protocol::native_location::{NativeAcquisition, NativePersistence};
 use freshell_protocol::session_names::{
     NameIntent, NameRevision, NamedProvider, SessionNameRecord, SessionNameRef, SessionNameUpdate,
     MAX_NAME_REVISION,
@@ -411,6 +411,134 @@ pub fn name_ref_debug_key(target: &SessionNameRef) -> String {
     }
 }
 
+/// The shared accepted-input callback (unified-agent-names plan, Task 4):
+/// fold ONE accepted user send into the naming authority — the immediate
+/// first-message fallback upgrade plus generation-eligibility arming happen
+/// store-side from the message text (never raw keystrokes, ANSI, assistant
+/// text, or tool output). Called at every scoped runtime's send-acceptance
+/// point (claude's sidecar write, codex's `turn/start` ack, opencode's
+/// accepted turn submission, and the REST send lanes). Never blocks the
+/// send: errors log and the turn proceeds.
+pub async fn report_accepted_input(
+    sink: &Option<Arc<dyn SessionNaming>>,
+    target: &SessionNameRef,
+    mode: &str,
+    event_id: &str,
+    message: &str,
+    cwd: Option<&str>,
+) {
+    let Some(sink) = sink.as_ref() else {
+        return;
+    };
+    let message = message.trim();
+    if message.is_empty() {
+        return;
+    }
+    if let Err(error) = sink
+        .activity(NameActivity {
+            target: target.clone(),
+            mode: mode.to_string(),
+            event_id: event_id.to_string(),
+            reason: NameActivityReason::AcceptedUserMessage,
+            first_user_message: Some(message.to_string()),
+            cwd: cwd.map(str::to_string),
+        })
+        .await
+    {
+        log_name_error("activity", target, &error);
+    }
+}
+
+/// The shared open/resume/materialization transition fold (plan Task 4) —
+/// the classification-driven consumer of [`NameTransition`] (the T2-M5
+/// field's one reader): the sites that know WHY an identity edge happened
+/// classify it, and this fold applies the naming policy each class carries.
+///
+/// * `InitialMaterialization` / `InternalContinuation` with VERIFIED
+///   persistence bind the pending handle onto the durable identity (the
+///   store's collision rules seed a rollback-fork child once with the source
+///   preserved); PROSPECTIVE evidence cannot authorize a bind — the pending
+///   handle and name are RETAINED (only the routing evidence moves), exactly
+///   the zero-turn rule.
+/// * `InitialRecovery` never binds: the pre-durable handle survives the
+///   recovery remint and only its acquisition evidence is retained.
+/// * `Resume` / `Switch` / `NewConversation` never transfer a name: the pane
+///   ADOPTS the durable session's own record (the caller projects it).
+pub async fn fold_identity_transition(
+    sink: &Option<Arc<dyn SessionNaming>>,
+    transition: &NameTransition,
+    durable: SessionNameRef,
+) -> Option<SessionNameUpdate> {
+    let sink = sink.as_ref()?;
+    let pending = transition
+        .pending
+        .as_ref()
+        .map(|handle| SessionNameRef::Pending { id: handle.clone() });
+    match transition.reason {
+        NameTransitionReason::InitialMaterialization
+        | NameTransitionReason::InternalContinuation => {
+            let pending = pending?;
+            match transition.acquisition.persistence {
+                NativePersistence::Verified => {
+                    match sink
+                        .bind_pending(BindNameInput {
+                            pending: pending.clone(),
+                            target: durable,
+                            acquisition: transition.acquisition.clone(),
+                        })
+                        .await
+                    {
+                        Ok(update) => Some(update),
+                        Err(error) => {
+                            log_name_error("bind_pending", &pending, &error);
+                            // "On failed bind retain the handle": the caller
+                            // keeps its stash entry for the visible retry.
+                            None
+                        }
+                    }
+                }
+                NativePersistence::Prospective => {
+                    // Zero-turn/pre-persistence: the name authority (and the
+                    // handle) stay untouched until verified persistence
+                    // exists; only the routing evidence moves.
+                    if let Err(error) = sink
+                        .record_acquisition(pending.clone(), transition.acquisition.clone())
+                        .await
+                    {
+                        log_name_error("record_acquisition", &pending, &error);
+                    }
+                    None
+                }
+            }
+        }
+        NameTransitionReason::InitialRecovery => {
+            // Retains the SAME pending handle/name; only the acquired
+            // location evidence moves onto it.
+            let pending = pending?;
+            if let Err(error) = sink
+                .record_acquisition(pending.clone(), transition.acquisition.clone())
+                .await
+            {
+                log_name_error("record_acquisition", &pending, &error);
+            }
+            None
+        }
+        NameTransitionReason::Resume
+        | NameTransitionReason::Switch
+        | NameTransitionReason::NewConversation => {
+            // Adoption, not transfer: answer the durable record's current
+            // projection so the caller can broadcast the adopted name.
+            match sink.get(vec![durable.clone()]).await {
+                Ok(updates) => updates.into_iter().next(),
+                Err(error) => {
+                    log_name_error("get", &durable, &error);
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// Admit a pre-durable handle (idempotent) and answer the additive frame
 /// projection (`nameRef` + last-known `sessionName`) for a
 /// `freshAgent.created`/`terminal.created` acknowledgment. `None` when no
@@ -526,6 +654,7 @@ pub(crate) mod test_support {
 
     pub(crate) struct RecordingSink {
         pub renames: Mutex<Vec<RenameNameInput>>,
+        pub activities: Mutex<Vec<NameActivity>>,
         records: Mutex<Vec<(SessionNameRef, SessionNameRecord)>>,
         redirects: Mutex<Vec<(SessionNameRef, SessionNameRef)>>,
     }
@@ -534,6 +663,7 @@ pub(crate) mod test_support {
         pub fn new() -> std::sync::Arc<Self> {
             std::sync::Arc::new(Self {
                 renames: Mutex::new(Vec::new()),
+                activities: Mutex::new(Vec::new()),
                 records: Mutex::new(Vec::new()),
                 redirects: Mutex::new(Vec::new()),
             })
@@ -712,6 +842,7 @@ pub(crate) mod test_support {
         }
 
         fn activity(&self, input: NameActivity) -> NameFuture<SessionNameUpdate> {
+            self.activities.lock().unwrap().push(input.clone());
             let answer = match self.record_of(&input.target) {
                 Some(record) => Ok(self.update_for(record, false)),
                 None => Err(NameError::NotFound(format!(
@@ -753,6 +884,7 @@ pub(crate) mod test_support {
         fn default() -> Self {
             Self {
                 renames: Mutex::new(Vec::new()),
+                activities: Mutex::new(Vec::new()),
                 records: Mutex::new(Vec::new()),
                 redirects: Mutex::new(Vec::new()),
             }

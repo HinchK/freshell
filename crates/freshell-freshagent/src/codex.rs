@@ -757,21 +757,21 @@ impl FreshCodexState {
     /// store answers the already-bound handle with a Read, and the stash is
     /// consumed on success). `codex_home` comes from the app-server's own
     /// initialize result when known.
-    pub(crate) async fn try_bind_pending_naming(&self, thread_id: &str, codex_home: Option<&str>) {
-        let Some(sink) = self.naming() else {
-            return;
-        };
+    pub(crate) async fn try_bind_pending_naming(
+        &self,
+        thread_id: &str,
+        codex_home: Option<&str>,
+    ) -> Option<crate::naming::NameTransition> {
         let Some(handle) = self.naming_handles.lock().await.get(thread_id).cloned() else {
-            return;
+            return None;
         };
         let Some(home) = codex_home.map(str::to_string).or_else(codex_home_from_env) else {
-            return;
+            return None;
         };
         let sessions_root = std::path::Path::new(&home).join("sessions");
         let Some(rollout) = locate_thread_rollout(&sessions_root, thread_id) else {
-            return; // still prospective: the tick retries the transition visibly
+            return None; // still prospective: the tick retries the transition visibly
         };
-        let pending = freshell_protocol::session_names::SessionNameRef::Pending { id: handle };
         let target = freshell_protocol::session_names::SessionNameRef::Session {
             provider: freshell_protocol::session_names::NamedProvider::Codex,
             session_id: thread_id.to_string(),
@@ -786,23 +786,29 @@ impl FreshCodexState {
             evidence: freshell_protocol::native_location::NativeEvidenceKind::PersistedMetadata,
             persistence: freshell_protocol::native_location::NativePersistence::Verified,
         };
-        match sink
-            .bind_pending(crate::naming::BindNameInput {
-                pending: pending.clone(),
-                target: target.clone(),
-                acquisition,
-            })
+        // Unified agent names (Task 4, T2-M5): the rollout-verified
+        // pending→durable transition is an InitialMaterialization — the
+        // shared classification-driven fold owns the policy, and the
+        // declared transition travels back to the identity event's caller.
+        let transition = crate::naming::NameTransition {
+            reason: crate::naming::NameTransitionReason::InitialMaterialization,
+            acquisition,
+            pending: Some(handle),
+        };
+        match crate::naming::fold_identity_transition(&self.naming(), &transition, target.clone())
             .await
         {
-            Ok(update) => {
+            Some(update) => {
                 if update.record.name_ref == target {
                     self.naming_handles.lock().await.remove(thread_id);
                 }
             }
-            Err(error) => {
-                crate::naming::log_name_error("bind_pending", &pending, &error);
+            None => {
+                // Unwired, or a failed bind: "on failed bind retain the
+                // handle" — the stash survives for the next visible retry.
             }
         }
+        Some(transition)
     }
 
     /// Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Finding 4),
@@ -936,6 +942,11 @@ impl FreshCodexState {
         // `None` on conn-less refresh/respawn lanes (the ledger merge keeps or
         // supersedes-inherits prior stamps).
         provenance: Option<&crate::BindProvenance>,
+        // Unified agent names (Task 4, T2-M5 wired): the DECLARED naming
+        // classification when this identity event carries one (the create
+        // tail's pending→durable transition); `None` on settings-refresh
+        // edges that carry no naming fact.
+        name_transition: Option<crate::naming::NameTransition>,
     ) {
         let Some(sink) = self.identity_sink() else {
             return;
@@ -974,11 +985,9 @@ impl FreshCodexState {
                 create_request_id: create_request_id.map(Into::into),
                 resolves_pending: None,
                 supersedes: supersedes.map(Into::into),
-                // Unified agent names: the mint-new respawn's naming
-                // classification is driven by the dedicated naming lanes
-                // (see the materialized broadcast); the ledger edge alone
-                // carries no naming fact.
-                name_transition: None,
+                // Unified agent names (Task 4): the declared classification
+                // when this identity event carries one; `None` otherwise.
+                name_transition,
                 // Delta-r2 Finding 2 tri-state: a connection-supplied value
                 // asserts (`Replace`); a conn-less refresh/respawn lane
                 // asserts nothing (`Inherit` — the ledger merge keeps prior
@@ -1782,6 +1791,12 @@ impl FreshCodexState {
             cwd.as_deref(),
             None,
             provenance.as_ref(),
+            // Unified agent names (Task 4, T2-M5): the naming classification
+            // is folded by the dedicated bind lane (the shared
+            // classification-driven fold) AFTER this durable-before-answer
+            // ledger write — the bind's own declaration travels with its
+            // fold, so this edge carries no naming fact.
+            None,
         )
         .await;
 
@@ -1953,6 +1968,8 @@ impl FreshCodexState {
                     cwd.as_deref(),
                     None,
                     Some(&p),
+                    // Unified agent names: a refresh carries no naming fact.
+                    None,
                 )
                 .await;
             }
@@ -2187,6 +2204,9 @@ impl FreshCodexState {
             // Send/settings mutation is not a new browser assertion — conn-less
             // (merge keeps prior stamps, ep4 writer rules).
             None,
+            // Unified agent names: the send's accepted-input feed is the
+            // naming fact; this ledger edge carries none.
+            None,
         )
         .await;
 
@@ -2203,6 +2223,34 @@ impl FreshCodexState {
                 effort.as_deref(),
             ));
         }
+
+        // Unified agent names (Task 4): the shared accepted-input callback —
+        // `turn/start` acked, so the user input is ACCEPTED. The naming
+        // target is the stashed pre-durable handle (it redirects once the
+        // rollout bind lands), else the durable thread itself. A failed feed
+        // never blocks the turn.
+        let naming_target = self
+            .naming_handles
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .map(|handle| freshell_protocol::session_names::SessionNameRef::Pending { id: handle })
+            .unwrap_or_else(
+                || freshell_protocol::session_names::SessionNameRef::Session {
+                    provider: freshell_protocol::session_names::NamedProvider::Codex,
+                    session_id: session_id.clone(),
+                },
+            );
+        crate::naming::report_accepted_input(
+            &self.naming(),
+            &naming_target,
+            SESSION_TYPE,
+            submitted_turn_id.as_str(),
+            &msg.text,
+            turn_cwd.as_deref(),
+        )
+        .await;
 
         // DIAG-01: the turn was accepted by the sidecar -- session_id + turn
         // id only, never the submitted text/prompt.
@@ -2332,6 +2380,8 @@ impl FreshCodexState {
             None,
             // A settings record is not a new browser assertion — conn-less
             // (the ledger merge keeps the row's prior stamps).
+            None,
+            // Unified agent names: a settings refresh carries no naming fact.
             None,
         )
         .await;
@@ -3306,6 +3356,10 @@ impl FreshCodexState {
             eff_cwd.as_deref(),
             None,
             fork_provenance.as_ref(),
+            // Unified agent names (Task 4): the fork's naming classification
+            // is driven by its dedicated lane; this ledger edge carries no
+            // naming fact.
+            None,
         )
         .await;
 
@@ -3998,6 +4052,8 @@ impl FreshCodexState {
             cwd.as_deref(),
             None,
             None,
+            // Unified agent names: a refresh carries no naming fact.
+            None,
         )
         .await;
 
@@ -4177,6 +4233,10 @@ impl FreshCodexState {
             Some(old_session_id),
             // D8: conn-less crash-respawn — provenance `None`; the ledger
             // inherits the superseded parent's stamps (fork-chain rule).
+            None,
+            // Unified agent names (Task 4): the mint-new respawn is a
+            // NewConversation edge for naming, driven by the dedicated naming
+            // lanes; this ledger edge itself carries no pending transfer.
             None,
         )
         .await;
@@ -5237,6 +5297,8 @@ impl FreshCodexState {
                 None,
                 // D8: conn-less attach-resume refresh — provenance `None`
                 // keeps the row's existing stamps.
+                None,
+                // Unified agent names: a settings refresh carries no naming fact.
                 None,
             )
             .await;

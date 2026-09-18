@@ -76,6 +76,11 @@ pub struct SessionsState {
     /// short-circuit (`sessions-router.ts:186-192`). `None` when no provider
     /// home resolves (the same `Option` main.rs threads everywhere else).
     pub index: Option<Arc<freshell_sessions::directory_index::SessionIndex>>,
+    /// Unified agent names (Task 4): the shared generation participant, so
+    /// the SCOPED compatibility path of `generate-title` can wake the
+    /// worker's already-eligible unattempted work (never rearm it). `None`
+    /// degrades the wake to the worker's ordinary poll.
+    pub generation_wake: Option<Arc<crate::session_name_generation::SessionNameGenerator>>,
 }
 
 /// The sessions sub-router (`PATCH`/`DELETE /api/sessions/:id` + `POST .../generate-title`).
@@ -478,6 +483,59 @@ fn extract_title_from_message(content: &str, max_len: usize) -> String {
     cleaned.chars().take(max_len).collect()
 }
 
+/// The legacy source-string vocabulary for the scoped compatibility answer
+/// (`{title, source}` keeps the old route's shape for old clients).
+fn scoped_name_source(source: freshell_protocol::session_names::NameSource) -> &'static str {
+    use freshell_protocol::session_names::NameSource;
+    match source {
+        NameSource::Manual => "user",
+        NameSource::LegacyProtected => "legacy",
+        NameSource::FreshellAi => "ai",
+        NameSource::ProviderAi => "provider-generated",
+        NameSource::FirstMessage => "first-message",
+        NameSource::Directory => "dir",
+    }
+}
+
+/// Unified agent names (Task 4): the SCOPED compatibility arm of
+/// `generate-title` — "may only ensure already eligible unattempted work;
+/// they cannot reset/rearm the series". The worker's own claim enforces the
+/// policy; this side answers the current saved name and wakes the worker so
+/// eligible work dispatches promptly.
+async fn scoped_generate_title(
+    state: &SessionsState,
+    provider: freshell_protocol::session_names::NamedProvider,
+    session_id: String,
+) -> Response {
+    use freshell_protocol::session_names::SessionNameRef;
+    let target = SessionNameRef::Session {
+        provider,
+        session_id,
+    };
+    let record = match state.identity.naming() {
+        Some(sink) => sink
+            .get(vec![target])
+            .await
+            .ok()
+            .and_then(|updates| updates.into_iter().next())
+            .map(|update| update.record),
+        None => None,
+    };
+    if let Some(generator) = &state.generation_wake {
+        // Ensure already-eligible unattempted work: the wake makes the
+        // worker's next pass immediate. Never replenishes anything.
+        generator.notify_capability_change();
+    }
+    match record {
+        Some(record) => Json(json!({
+            "title": record.name,
+            "source": scoped_name_source(record.source),
+        }))
+        .into_response(),
+        None => Json(json!({ "title": null, "source": "none" })).into_response(),
+    }
+}
+
 /// `POST /api/sessions/:sessionId/generate-title` — a blank `firstMessage` is
 /// the only 400 this emits (`sessions-router.ts:167-179`); everything else
 /// resolves to `200`, never `5xx` (Global Constraint 8). Resolution order
@@ -516,6 +574,23 @@ async fn generate_title(
             .into_response();
     }
     let key = composite_key(&raw_id, &provider_of(&q));
+
+    // Unified agent names (Task 4): a SCOPED session's generate-title call is
+    // the compatibility route only — the old user-facing generate control is
+    // removed for the six modes. It answers the current saved session name
+    // (mapped into the legacy source vocabulary), may wake the shared
+    // worker's ALREADY-eligible unattempted work, and can never reset or
+    // re-arm the durable series, never writes the settings ladder, and
+    // never calls Gemini itself.
+    let (scoped_provider, scoped_session_id) = match raw_id.split_once(':') {
+        Some((prefix, rest)) => (prefix.to_string(), rest.to_string()),
+        None => (provider_of(&q), raw_id.clone()),
+    };
+    if let Some(named) =
+        freshell_freshagent::naming::named_provider_for(Some(&scoped_provider), None)
+    {
+        return scoped_generate_title(&state, named, scoped_session_id).await;
+    }
 
     // (1) provider-generated short-circuit (`sessions-router.ts:186-192`): a
     // session whose PARSED title is provider-authored is never renamed by

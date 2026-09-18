@@ -1,5 +1,6 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use freshell_freshagent::naming::SessionNaming;
 use tower::ServiceExt;
 
 fn state(dir: &std::path::Path) -> super::SessionsState {
@@ -17,6 +18,7 @@ fn state(dir: &std::path::Path) -> super::SessionsState {
         ai_key: crate::ai_title::AiKeyCell::init(None, None),
         gemini: std::sync::Arc::new(FakeGemini(Err("unused in default test state".into()))),
         index: None,
+        generation_wake: None,
     }
 }
 
@@ -517,7 +519,7 @@ async fn generate_title_no_key_uses_first_message_heuristic() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/sessions/abc/generate-title")
+                .uri("/api/sessions/abc/generate-title?provider=gemini")
                 .header("x-auth-token", "tok")
                 .header("content-type", "application/json")
                 .body(Body::from(
@@ -542,7 +544,7 @@ async fn generate_title_after_user_rename_is_ladder_blocked() {
     // Pre-seed a user rename (rank 5).
     st.settings
         .patch_session_override(
-            "claude:abc",
+            "gemini:abc",
             &[
                 ("titleOverride", Some(serde_json::json!("User Named"))),
                 ("titleSource", Some(serde_json::json!("user"))),
@@ -554,7 +556,7 @@ async fn generate_title_after_user_rename_is_ladder_blocked() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/sessions/abc/generate-title")
+                .uri("/api/sessions/abc/generate-title?provider=gemini")
                 .header("x-auth-token", "tok")
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"firstMessage":"Some prompt"}"#))
@@ -582,7 +584,7 @@ async fn generate_title_multiline_takes_first_nonempty_line_truncated() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/api/sessions/abc/generate-title")
+                .uri("/api/sessions/abc/generate-title?provider=gemini")
                 .header("x-auth-token", "tok")
                 .header("content-type", "application/json")
                 .body(Body::from(
@@ -692,6 +694,7 @@ async fn patch_override_is_visible_through_session_directory_overlay() {
         ai_key: crate::ai_title::AiKeyCell::init(None, None),
         gemini: std::sync::Arc::new(FakeGemini(Err("unused in default test state".into()))),
         index: None,
+        generation_wake: None,
     });
     let patch_resp = sessions_app
         .oneshot(
@@ -989,6 +992,7 @@ async fn deleted_session_disappears_from_session_directory_overlay() {
         ai_key: crate::ai_title::AiKeyCell::init(None, None),
         gemini: std::sync::Arc::new(FakeGemini(Err("unused in default test state".into()))),
         index: None,
+        generation_wake: None,
     });
     let session_index =
         std::sync::Arc::new(freshell_sessions::directory_index::SessionIndex::new(vec![
@@ -1117,14 +1121,19 @@ async fn generate_title_uses_gemini_when_key_present_and_broadcasts_sessions_cha
     st.gemini = std::sync::Arc::new(FakeGemini(Ok("  Sardine crash investigation  ".into())));
     let mut rx = st.broadcast_tx.subscribe();
     let sid = uuid_like();
-    let resp = post_generate_title(&st, &sid, "investigate the sardine crash").await;
+    let resp = post_generate_title(
+        &st,
+        &format!("gemini:{sid}"),
+        "investigate the sardine crash",
+    )
+    .await;
     let body = body_json(resp).await;
     assert_eq!(body["title"], "Sardine crash investigation");
     assert_eq!(body["source"], "ai");
     let row = st
         .settings
         .session_overrides()
-        .get(&format!("claude:{sid}"))
+        .get(&format!("gemini:{sid}"))
         .cloned()
         .unwrap();
     assert_eq!(row["titleSource"], "ai");
@@ -1139,20 +1148,22 @@ async fn generate_title_gemini_error_returns_200_none_with_error_and_no_write() 
     st.ai_key = crate::ai_title::AiKeyCell::init(Some("k".into()), None);
     st.gemini = std::sync::Arc::new(FakeGemini(Err("boom".into())));
     let sid = uuid_like();
-    let body = body_json(post_generate_title(&st, &sid, "hello").await).await;
+    let body = body_json(post_generate_title(&st, &format!("gemini:{sid}"), "hello").await).await;
     assert_eq!(body["title"], serde_json::Value::Null);
     assert_eq!(body["source"], "none");
     assert_eq!(body["error"], "boom");
     assert!(st
         .settings
         .session_overrides()
-        .get(&format!("claude:{sid}"))
+        .get(&format!("gemini:{sid}"))
         .is_none());
 }
 
 #[tokio::test]
 async fn generate_title_after_user_rename_is_still_ladder_blocked_for_ai() {
-    // AI write attempted, ladder rejects, response echoes the user's stored title.
+    // AI write attempted, ladder rejects, response echoes the user's stored
+    // title. Unified agent names (Task 4): claude is scoped, so this pin of
+    // the RETAINED ladder runs on an excluded provider.
     let dir = tempfile::tempdir().unwrap();
     let mut st = state(dir.path());
     st.ai_key = crate::ai_title::AiKeyCell::init(Some("k".into()), None);
@@ -1160,14 +1171,14 @@ async fn generate_title_after_user_rename_is_still_ladder_blocked_for_ai() {
     let sid = uuid_like();
     st.settings
         .patch_session_override(
-            &format!("claude:{sid}"),
+            &format!("gemini:{sid}"),
             &[
                 ("titleOverride", Some(serde_json::json!("Mine"))),
                 ("titleSource", Some(serde_json::json!("user"))),
             ],
         )
         .await;
-    let body = body_json(post_generate_title(&st, &sid, "hello").await).await;
+    let body = body_json(post_generate_title(&st, &format!("gemini:{sid}"), "hello").await).await;
     assert_eq!(body["title"], "Mine");
     assert_eq!(body["source"], "user");
 }
@@ -1210,7 +1221,36 @@ async fn generate_title_provider_generated_short_circuits_without_write() {
     ));
     // Claude's canonical identity is the transcript filename, even when an
     // embedded record carries a different (for example parent-agent) id.
+    // Unified agent names (Task 4): claude is SCOPED, so the route is the
+    // compatibility arm — a provider-authored title NEVER suppresses the
+    // naming pipeline; it lands at its own fallback rank and the route
+    // answers the SAVED name.
     let sid = "real-corrupted";
+    let names = crate::session_names::SessionNames::open(home.join(".freshell")).unwrap();
+    let parsed = st
+        .index
+        .as_ref()
+        .unwrap()
+        .snapshot()
+        .await
+        .iter()
+        .find(|s| s.session_id == sid)
+        .cloned()
+        .expect("the fixture session is indexed");
+    names
+        .hydrate_indexed(
+            crate::session_name_generation::IndexedNameInput {
+                provider: freshell_protocol::session_names::NamedProvider::Claude,
+                session_id: sid.to_string(),
+                cwd: parsed.cwd.clone(),
+                first_user_message: parsed.first_user_message.clone(),
+                provider_title: parsed.title.clone(),
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    st.identity.set_session_naming(names);
     let body = body_json(post_generate_title(&st, sid, "hello").await).await;
     assert_eq!(body["title"], "Test Session 1"); // the fixture's parsed summary title
     assert_eq!(body["source"], "provider-generated");
@@ -1225,4 +1265,100 @@ async fn generate_title_provider_generated_short_circuits_without_write() {
 fn uuid_like() -> String {
     format!("{}-{:?}", std::process::id(), std::time::SystemTime::now())
         .replace([':', '.', ' '], "-")
+}
+
+// ---------------------------------------------------------------------------
+// Unified agent names (Task 4): the scoped generate-title compatibility path
+// ---------------------------------------------------------------------------
+
+fn uuid_like_scoped() -> String {
+    format!("{}-{:?}", std::process::id(), std::time::SystemTime::now())
+        .replace([':', '.', ' '], "-")
+}
+
+/// A scoped session's generate-title call is the COMPATIBILITY route only:
+/// it answers the saved session name (mapped to the legacy source
+/// vocabulary), never writes the settings ladder, never calls Gemini
+/// itself, and never arms or re-arms the durable series. An un-armed
+/// session stays un-armed; an exhausted series stays exhausted.
+#[tokio::test]
+async fn scoped_generate_title_answers_the_saved_name_and_never_touches_the_ladder() {
+    let dir = std::env::temp_dir().join(format!("frs-sess-gen-{}", uuid_like_scoped()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let names = crate::session_names::SessionNames::open(dir.join(".freshell")).unwrap();
+    let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+    identity.set_session_naming(names.clone());
+    let mut scoped_state = state(&dir);
+    scoped_state.identity = identity;
+
+    // A saved FirstMessage fallback for the scoped claude session, plus an
+    // armed (unattempted) series.
+    let target = freshell_protocol::SessionNameRef::Session {
+        provider: freshell_protocol::session_names::NamedProvider::Claude,
+        session_id: "ses-scoped-gen".to_string(),
+    };
+    names
+        .hydrate_indexed(
+            crate::session_name_generation::IndexedNameInput {
+                provider: freshell_protocol::session_names::NamedProvider::Claude,
+                session_id: "ses-scoped-gen".to_string(),
+                cwd: Some("/w/proj".to_string()),
+                first_user_message: Some("Saved fallback message".to_string()),
+                provider_title: None,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+
+    let app = super::router(scoped_state);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sessions/claude%3Ases-scoped-gen/generate-title")
+                .header("x-auth-token", "tok")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"firstMessage":"A late compatibility request"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(v["title"], serde_json::json!("Saved fallback message"));
+    assert_eq!(v["source"], serde_json::json!("first-message"));
+    // The settings ladder never acquired a competing scoped title.
+    assert!(state(&dir)
+        .settings
+        .session_overrides()
+        .get("claude:ses-scoped-gen")
+        .is_none());
+    // The record's own name is untouched by the compatibility call.
+    let updates = names.get(vec![target]).await.unwrap();
+    assert_eq!(updates[0].record.name, "Saved fallback message");
+
+    // A scoped session with NO naming record answers `{title: null}` without
+    // creating one.
+    let app = super::router(state(&dir));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/sessions/codex%3Ases-unknown/generate-title")
+                .header("x-auth-token", "tok")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"firstMessage":"anything"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let v = body_json(resp).await;
+    assert_eq!(v["title"], serde_json::Value::Null);
+    assert_eq!(v["source"], serde_json::json!("none"));
+
+    std::fs::remove_dir_all(&dir).ok();
 }

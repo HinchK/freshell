@@ -863,6 +863,29 @@ async fn provider_fallbacks_never_arm_a_native_series() {
     );
 }
 
+/// The inert generation participant for native-only worker tests: no Gemini
+/// key means generation capability is absent, so the shared loop's
+/// generation half stays paused (consuming nothing) while native work runs.
+fn inert_generation(
+    dir: &std::path::Path,
+) -> Arc<crate::session_name_generation::SessionNameGenerator> {
+    struct NeverTransport;
+    impl crate::ai_title::GeminiTransport for NeverTransport {
+        fn generate_content(
+            &self,
+            _p: String,
+            _m: u32,
+        ) -> crate::ai_title::BoxFuture<Result<String, String>> {
+            Box::pin(std::future::pending())
+        }
+    }
+    Arc::new(crate::session_name_generation::SessionNameGenerator::new(
+        crate::settings_store::SettingsStore::load(Some(dir), vec![]),
+        crate::ai_title::AiKeyCell::init(None, None),
+        Arc::new(NeverTransport),
+    ))
+}
+
 /// The worker loop drives armed work end-to-end under the shared background
 /// guard: a manual rename arms the series and the running worker converges
 /// the provider to the exact desired name.
@@ -874,7 +897,11 @@ async fn the_worker_loop_converges_an_armed_series() {
     let backend = ScriptedBackend::new(vec![WriteStep::Confirm]);
     backend.set_title(Some("Divergent"));
 
-    let worker = SessionNameWorker::start(Arc::clone(&store), backend.clone());
+    let worker = SessionNameWorker::start(
+        Arc::clone(&store),
+        backend.clone(),
+        inert_generation(dir.path()),
+    );
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         if let Some(sync) = native_sync_of(&store, target.clone()).await {
@@ -1658,7 +1685,11 @@ async fn an_absent_native_capability_pauses_before_consuming_a_cycle() {
     let target = armed_pending(&store, "h-capability", "/h/.claude").await;
     let dispatch = SwappableDispatch::unwired();
 
-    let worker = SessionNameWorker::start(Arc::clone(&store), dispatch.clone());
+    let worker = SessionNameWorker::start(
+        Arc::clone(&store),
+        dispatch.clone(),
+        inert_generation(dir.path()),
+    );
     // Ample opportunity for the loop to (wrongly) claim while the capability
     // is absent — the worker polls every 500ms.
     tokio::time::sleep(Duration::from_millis(900)).await;
@@ -1777,7 +1808,11 @@ async fn a_capability_paused_head_does_not_starve_the_ready_series_behind_it() {
     scripted.set_title(Some("Divergent"));
     let dispatch = SelectiveCapabilityBackend::refusing(scripted.clone(), &["/paused/.claude"]);
 
-    let worker = SessionNameWorker::start(Arc::clone(&store), dispatch.clone());
+    let worker = SessionNameWorker::start(
+        Arc::clone(&store),
+        dispatch.clone(),
+        inert_generation(dir.path()),
+    );
 
     // THE fairness assertion: the ready series converges DESPITE the paused
     // head holding the front of the selector.

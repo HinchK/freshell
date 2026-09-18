@@ -2232,6 +2232,41 @@ impl FreshClaudeState {
         }
         drop(guard);
 
+        // Unified agent names (Task 4): the shared accepted-input callback —
+        // the send reached the sidecar, so the user input is ACCEPTED. The
+        // naming target is the stashed pre-durable handle when one exists
+        // (it redirects to the bound durable record once adopted), else the
+        // adopted durable claude session. Kilroy is out of scope; a failed
+        // feed never blocks the turn.
+        let naming_target = self
+            .naming_handles
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .map(|handle| freshell_protocol::session_names::SessionNameRef::Pending { id: handle })
+            .or_else(|| {
+                is_canonical_claude_uuid(&session_id).then(|| {
+                    freshell_protocol::session_names::SessionNameRef::Session {
+                        provider: freshell_protocol::session_names::NamedProvider::Claude,
+                        session_id: session_id.clone(),
+                    }
+                })
+            });
+        if session_type != "kilroy" {
+            if let Some(target) = naming_target {
+                crate::naming::report_accepted_input(
+                    &self.naming(),
+                    &target,
+                    session_type,
+                    request_id.as_deref().unwrap_or(""),
+                    &msg.text,
+                    msg.cwd.as_deref(),
+                )
+                .await;
+            }
+        }
+
         self.broadcast(&ServerMessage::FreshAgentSendAccepted(
             FreshAgentSendAccepted {
                 provider: PROVIDER.to_string(),
@@ -4469,7 +4504,8 @@ impl FreshClaudeState {
         // semantics — the name authority never moves on unverified
         // evidence). A rollback fork classifies as InternalContinuation (the
         // child is seeded once with the source preserved).
-        self.bind_naming_handle_at_init(cli_id, session_id, session_type, supersedes)
+        let declared_transition = self
+            .bind_naming_handle_at_init(cli_id, session_id, session_type, supersedes)
             .await;
         let recordable = settings
             .filter(|s| **s != crate::identity_sink::FreshAgentSettings::default())
@@ -4487,7 +4523,13 @@ impl FreshClaudeState {
                 create_request_id: None,
                 resolves_pending: None,
                 supersedes: supersedes.map(str::to_string),
-                name_transition: None,
+                // Unified agent names (Task 4, T2-M5 wired): the init lane's
+                // DECLARED classification — the same transition the direct
+                // naming fold above consumed (InternalContinuation for a
+                // rollback fork, InitialMaterialization otherwise), so the
+                // identity event carries the naming fact alongside the
+                // ledger write.
+                name_transition: declared_transition,
                 provenance: provenance.cloned().into(),
                 settings: settings.cloned().unwrap_or_default(),
             })
@@ -4513,15 +4555,12 @@ impl FreshClaudeState {
         placeholder: &str,
         session_type: &str,
         supersedes: Option<&str>,
-    ) {
+    ) -> Option<crate::naming::NameTransition> {
         if session_type == "kilroy" {
-            return;
+            return None;
         }
-        let Some(sink) = self.naming() else {
-            return;
-        };
         let Some(handle) = self.naming_handles.lock().await.get(placeholder).cloned() else {
-            return;
+            return None;
         };
         // Existing provider durability evidence: the claude CLI writes the
         // session transcript at startup, so a located transcript file
@@ -4561,61 +4600,57 @@ impl FreshClaudeState {
             evidence,
             persistence,
         };
-        let pending = freshell_protocol::session_names::SessionNameRef::Pending { id: handle };
         let target = freshell_protocol::session_names::SessionNameRef::Session {
             provider: freshell_protocol::session_names::NamedProvider::Claude,
             session_id: cli_id.to_string(),
         };
-        // Transition classification (retained for the store's routing log):
-        // a rollback fork is an InternalContinuation (the child is seeded
-        // once with the source preserved — the store's collision rules keep
-        // a manual winner); every other init is the initial materialization.
+        // Transition classification: a rollback fork is an
+        // InternalContinuation (the child is seeded once with the source
+        // preserved — the store's collision rules keep a manual winner);
+        // every other init is the initial materialization. The shared
+        // classification-driven fold (plan Task 4) applies the policy:
+        // verified persistence binds the handle, prospective evidence
+        // RETAINS it (zero-turn rule — only the routing evidence moves).
         let reason = if supersedes.is_some() {
             crate::naming::NameTransitionReason::InternalContinuation
         } else {
             crate::naming::NameTransitionReason::InitialMaterialization
         };
-        let outcome =
-            if persistence == freshell_protocol::native_location::NativePersistence::Verified {
-                sink.bind_pending(crate::naming::BindNameInput {
-                    pending: pending.clone(),
-                    target: target.clone(),
-                    acquisition,
-                })
-                .await
-            } else {
-                // Zero-turn init: update the acquired location only — the name
-                // authority (and the handle) stay untouched until verified.
-                sink.record_acquisition(pending.clone(), acquisition).await
-            };
-        match outcome {
-            Ok(update) => {
+        let transition = crate::naming::NameTransition {
+            reason,
+            acquisition,
+            pending: Some(handle),
+        };
+        let pending_ref = freshell_protocol::session_names::SessionNameRef::Pending {
+            id: transition.pending.clone().unwrap_or_default(),
+        };
+        match crate::naming::fold_identity_transition(&self.naming(), &transition, target.clone())
+            .await
+        {
+            Some(update) => {
                 tracing::debug!(target: "freshell_freshagent::claude",
                     session_id = %cli_id,
                     reason = ?reason,
                     "freshagent.claude.naming_transition_committed"
                 );
-                // Bound (or retained): the stash entry is consumed once the
-                // handle is redirected to the durable record; a retained
-                // (prospective) stash survives for the tick's retry.
+                // Bound: the stash entry is consumed once the handle is
+                // redirected to the durable record.
                 if update.record.name_ref == target {
                     self.naming_handles.lock().await.remove(placeholder);
                 }
             }
-            Err(error) => {
-                crate::naming::log_name_error(
-                    if persistence
-                        == freshell_protocol::native_location::NativePersistence::Verified
-                    {
-                        "bind_pending"
-                    } else {
-                        "record_acquisition"
-                    },
-                    &pending,
-                    &error,
+            None => {
+                // Retained (prospective zero-turn), unwired, or a failed
+                // bind: the stash survives for the tick's visible retry.
+                tracing::debug!(target: "freshell_freshagent::claude",
+                    session_id = %cli_id,
+                    reason = ?reason,
+                    "freshagent.claude.naming_transition_retained"
                 );
+                let _ = pending_ref;
             }
         }
+        Some(transition)
     }
 
     // ── stdout consumer (the completion edge normalization) ──────────────────────────
@@ -7400,6 +7435,48 @@ rl.on('line', (line) => {
                 "the observability event must never carry prompt content (saw `{key}`)"
             );
         }
+    }
+
+    /// Unified agent names (Task 4): the shared accepted-input callback — an
+    /// accepted freshclaude send feeds the naming authority ONE activity
+    /// carrying the prompt text (the first-message fallback upgrade plus
+    /// generation arming happen store-side); the pre-durable handle is the
+    /// activity target until the init adoption binds it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_feeds_the_naming_authority_once_with_the_accepted_text() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut rx) = state_with_bus();
+        let sink = crate::naming::test_support::RecordingSink::new();
+        state.set_session_naming(sink.clone());
+        let mut create = dedup_create_msg("naming-send");
+        create.naming_handle = Some("handle-naming-send".into());
+        state.handle_create(create, None).await;
+        let created = await_claude_created(&mut rx, "naming-send").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        state
+            .handle_send(send_msg(&session_id, "Fix the sardine crash"))
+            .await;
+        let _ = env.respond_log_frames(1).await;
+
+        let activities = sink.activities.lock().unwrap();
+        assert_eq!(activities.len(), 1, "{activities:?}");
+        assert_eq!(
+            activities[0].target,
+            freshell_protocol::session_names::SessionNameRef::Pending {
+                id: "handle-naming-send".to_string()
+            }
+        );
+        assert_eq!(activities[0].mode, "freshclaude");
+        assert_eq!(
+            activities[0].first_user_message.as_deref(),
+            Some("Fix the sardine crash")
+        );
+        assert_eq!(
+            activities[0].reason,
+            crate::naming::NameActivityReason::AcceptedUserMessage
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

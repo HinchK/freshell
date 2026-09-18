@@ -71,6 +71,9 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::auto_title::basename_segment;
+use crate::session_name_generation::{
+    GenerationClaim, GenerationOutcome, GenerationWorkItem, IndexedNameInput,
+};
 
 #[cfg(test)]
 #[path = "session_names_tests.rs"]
@@ -92,7 +95,11 @@ const LOCK_RETRY_BUDGET: Duration = Duration::from_secs(1);
 /// Hard accepted-name cap: 200 Unicode scalar values.
 const MAX_NAME_SCALARS: usize = 200;
 /// Generation series exhaust after three consumed starts.
-const MAX_GENERATION_STARTS: u32 = 3;
+pub(crate) const MAX_GENERATION_STARTS: u32 = 3;
+/// Task 4: after failure 1 the generation retry becomes due in 30 seconds.
+pub(crate) const GENERATION_RETRY_1_MS: i64 = 30_000;
+/// Task 4: after failure 2 the generation retry becomes due in five minutes.
+pub(crate) const GENERATION_RETRY_2_MS: i64 = 300_000;
 /// Task 3: a desired canonical revision gets at most three native cycles.
 pub(crate) const MAX_NATIVE_CYCLES: u32 = 3;
 /// Task 3: each desired revision permits at most three writes and six reads
@@ -387,6 +394,38 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The data-dir-keyed test clock offset ([`TestHook::ClockOffsetMs`]) — the
+/// store's internal clock injection for the generation retry arithmetic.
+fn clock_offset_ms(data_dir: &Path) -> i64 {
+    #[cfg(test)]
+    {
+        take_matching_hook(data_dir, |h| matches!(h, TestHook::ClockOffsetMs(_)))
+            .map(|hook| match hook {
+                TestHook::ClockOffsetMs(offset) => offset,
+                _ => 0,
+            })
+            .unwrap_or(0)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = data_dir;
+        0
+    }
+}
+
+/// The store's decision clock for `data_dir`: wall-clock now plus the
+/// data-dir-keyed test offset.
+fn effective_now_ms(data_dir: &Path) -> i64 {
+    now_ms() + clock_offset_ms(data_dir)
+}
+
+/// Test-visible read of the data-dir clock offset (the generation tests'
+/// `decision_now` helper mirrors the store's decision clock).
+#[cfg(test)]
+pub(crate) fn clock_offset_ms_for_tests(data_dir: &Path) -> i64 {
+    clock_offset_ms(data_dir)
+}
+
 fn digest_bytes(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -583,13 +622,16 @@ impl SessionNames {
     /// Durable generation work-claim seam (Task 4's worker dispatches through
     /// this): persist an attempt's start before any provider call, consuming
     /// one of the bounded three starts and exhausting the series at the cap.
+    /// `Ok(None)` = the series is not claimable right now (absent, not yet
+    /// due, already in flight, exhausted, or the record's accepted source
+    /// is protected) — nothing was consumed.
     // Tasks 3–4 seam: the generation worker lands next.
     #[allow(dead_code)]
     pub(crate) fn claim_generation_start(
         &self,
         target: SessionNameRef,
         attempt_id: String,
-    ) -> NameFuture<SessionNameUpdate> {
+    ) -> NameFuture<Option<GenerationClaim>> {
         let core = Arc::clone(&self.core);
         Box::pin(spawn_txn(core, move |doc, meta| {
             claim_generation_start_decision(doc, meta, &target, &attempt_id)
@@ -597,19 +639,148 @@ impl SessionNames {
     }
 
     /// Durable generation completion seam (Task 4's worker folds answers
-    /// through this): accept a Freshell AI answer only if that same series is
-    /// current and the accepted source is below Freshell AI.
+    /// through this): accept a Freshell AI answer only if that same series
+    /// is current, the captured input fingerprint still matches the
+    /// persisted series (a re-armed series keeps its series id, so a late
+    /// answer generated from older input must not be accepted), and the
+    /// accepted source is below Freshell AI; empty/failed outcomes schedule
+    /// the bounded retry (30s after failure 1, five minutes after failure
+    /// 2) without consuming another start.
     // Tasks 3–4 seam: the generation worker lands next.
     #[allow(dead_code)]
-    pub(crate) fn complete_generation(
+    pub(crate) fn fold_generation_outcome(
         &self,
         target: SessionNameRef,
         series_id: String,
-        answer: String,
+        input_fingerprint: String,
+        outcome: GenerationOutcome,
     ) -> NameFuture<SessionNameUpdate> {
         let core = Arc::clone(&self.core);
         Box::pin(spawn_txn(core, move |doc, meta| {
-            complete_generation_decision(doc, meta, &target, &series_id, &answer)
+            fold_generation_outcome_decision(
+                doc,
+                meta,
+                &target,
+                &series_id,
+                &input_fingerprint,
+                outcome,
+            )
+        }))
+    }
+
+    /// Task 4: the generation selector's snapshot — every ARMED generation
+    /// series that is due now, from the currently adopted view (the claim
+    /// itself is the strict transaction; this read never takes the document
+    /// lock). Protected records and exhausted/absent/not-yet-due series are
+    /// omitted.
+    pub(crate) fn generation_work_snapshot(&self) -> Vec<GenerationWorkItem> {
+        let view = self.core.current_view();
+        let document = &view.document;
+        let now = effective_now_ms(&self.core.data_dir);
+        let mut items = Vec::new();
+        for (key, series) in &document.generation {
+            if series.status != GenerationStatus::Eligible
+                || series.consumed >= MAX_GENERATION_STARTS
+            {
+                continue;
+            }
+            if let Some(due) = series.next_due {
+                if due > now {
+                    continue;
+                }
+            }
+            let Some(record) = document.record_at(key) else {
+                continue;
+            };
+            if source_is_protected(record.source) {
+                continue;
+            }
+            items.push(GenerationWorkItem {
+                target: record.name_ref.clone(),
+                series_id: series.series_id.clone(),
+                input_fingerprint: series.input_fingerprint.clone().unwrap_or_default(),
+                excerpt: series.excerpt.clone(),
+                consumed: series.consumed,
+                next_due: series.next_due,
+            });
+        }
+        items
+    }
+
+    /// Task 4: how many series are currently InFlight (a start was persisted
+    /// but never folded — a dispatch interrupted by process death). The
+    /// worker recovers each once while holding the background guard.
+    pub(crate) fn interrupted_generation_count(&self) -> usize {
+        let view = self.core.current_view();
+        view.document
+            .generation
+            .values()
+            .filter(|series| series.status == GenerationStatus::InFlight)
+            .count()
+    }
+
+    /// Task 4: recover every interrupted generation start ONCE as failed at
+    /// recovery time, scheduling the remaining delay from this fold. Only a
+    /// background-guard holder ever dispatches, so an InFlight series seen
+    /// under the guard is provably dead. Returns the recovered count.
+    pub(crate) fn recover_interrupted_generation(&self) -> NameFuture<usize> {
+        let core = Arc::clone(&self.core);
+        Box::pin(spawn_txn(core, move |doc, meta| {
+            recover_interrupted_generation_decision(doc, meta)
+        }))
+    }
+
+    /// Task 4: the persisted alternating class cursor's last-served class
+    /// (`"native"`/`"generation"`) — the worker alternates classes when both
+    /// have ready work.
+    pub(crate) fn scheduling_cursor_last_class(&self) -> Option<String> {
+        self.core
+            .current_view()
+            .document
+            .scheduling_cursor
+            .last_class
+            .clone()
+    }
+
+    /// Task 4: whether a scoped session's record can still use generation
+    /// input — true when no record exists yet (hydration needs the message)
+    /// or the record's accepted source is below protection and its series is
+    /// not exhausted. Bounds the targeted first-message lookups: an
+    /// exhausted or protected session never pays a transcript read again.
+    pub(crate) fn needs_generation_input(&self, target: &SessionNameRef) -> bool {
+        let view = self.core.current_view();
+        let document = &view.document;
+        let (resolved, _) = document.resolve_ref(target);
+        let key = name_ref_key(&resolved);
+        let Some(record) = document.record_at(&key) else {
+            return true;
+        };
+        if source_is_protected(record.source) {
+            return false;
+        }
+        match document.generation.get(&key) {
+            None => true,
+            Some(series) => series.status != GenerationStatus::Exhausted,
+        }
+    }
+
+    /// Task 4: index hydration for one scoped CLI session — install the free
+    /// fallbacks (provider title > first message > directory basename) as a
+    /// durable record when absent, WITHOUT scheduling any paid title across
+    /// history. With `absorb`, a present first user message populates the
+    /// series' input fingerprint/excerpt at rest (Idle — never eligible):
+    /// the boot snapshot must not arm generation for every historical
+    /// session, while a genuinely newly observed message (a later pass, or
+    /// an explicit open's bind) arms it. An existing record is returned
+    /// unchanged — hydration never touches established names.
+    pub(crate) fn hydrate_indexed(
+        &self,
+        input: IndexedNameInput,
+        absorb: bool,
+    ) -> NameFuture<SessionNameUpdate> {
+        let core = Arc::clone(&self.core);
+        Box::pin(spawn_txn(core, move |doc, meta| {
+            hydrate_indexed_decision(doc, meta, input, absorb)
         }))
     }
 
@@ -994,7 +1165,7 @@ where
     }
 
     let meta = TxnMeta {
-        now_ms: now_ms(),
+        now_ms: effective_now_ms(&core.data_dir),
         native_retry_floor: take_native_retry_floor(&core.data_dir),
     };
     let decision = f(&mut document, &meta)?;
@@ -1318,6 +1489,13 @@ pub(crate) enum TestHook {
     /// data dir — the bounded-allowance tests pin exhaustion without
     /// wall-clock waits. Persists until cleared (like the failure injections).
     NativeRetryFloorMs(i64),
+    /// Task 4: a persistent wall-clock OFFSET for the data dir — the store's
+    /// decision clock (`TxnMeta::now_ms` and the generation due-reads)
+    /// reports `system_now + offset`, so clock-controlled tests pin the
+    /// retry-schedule arithmetic (immediately ready / +30s / +5min) and
+    /// advance virtual time without sleeping. Data-dir-keyed like every
+    /// other hook, so parallel tests never cross-contaminate.
+    ClockOffsetMs(i64),
 }
 
 /// Readiness sentinel written by `HoldLock` hooks while the document lock is
@@ -2061,6 +2239,24 @@ fn bind_pending_decision(
     transfer_native_write(document, &pending_key, &target_key, &record);
     apply_verified_location(document, &target_key, acquisition.location);
 
+    // Task 4 — the explicit-open hook: a pending handle exists only through
+    // an explicit create/open/resume lane, so this bind IS the user opening
+    // the session. An unattempted absorbed series (hydration installed the
+    // fingerprint at rest so history alone never schedules the paid title)
+    // becomes eligible now; an attempted series keeps its own schedule, and
+    // a protected winner keeps generation stopped.
+    if !source_is_protected(record.source) {
+        if let Some(series) = document.generation.get_mut(&target_key) {
+            if series.status == GenerationStatus::Idle
+                && series.consumed == 0
+                && series.input_fingerprint.is_some()
+            {
+                series.status = GenerationStatus::Eligible;
+                series.next_due = None;
+            }
+        }
+    }
+
     Ok(commit_decision(document, &target_key, true))
 }
 
@@ -2071,13 +2267,20 @@ fn activity_decision(
 ) -> Result<Decision<SessionNameUpdate>, NameError> {
     let NameActivity {
         target,
-        mode: _mode,
+        mode,
         event_id: _event_id,
         reason,
         first_user_message,
         cwd: _cwd,
     } = input;
     let (key, _record) = required_record(document, &target)?;
+
+    // Scope admission (Task 4): only the unified coding-agent modes ever
+    // enter the generator — kilroy (despite sharing the Claude runtime),
+    // excluded providers, and shells keep their existing naming approach.
+    if !freshell_freshagent::naming::is_unified_agent_mode(Some(&mode), None) {
+        return Ok(Decision::Read(read_update(document, &key)));
+    }
 
     let mut changed = false;
     // Accepted input upgrades the fallback without waiting for generation.
@@ -2102,40 +2305,71 @@ fn activity_decision(
 
     // Eligibility arming: protected names never arm; an exhausted series
     // never re-arms; duplicate delivery (same input fingerprint) is a no-op.
+    // Opened/Resumed arm only an UNATTEMPTED series (consumed == 0) — an
+    // explicit open never resets an attempted series' schedule.
     let current_source = document
         .record_at(&key)
         .map(|record| record.source)
         .expect("record exists");
     let mut armed_or_updated = false;
     if !source_is_protected(current_source) {
-        if let Some(message) = first_user_message.as_deref() {
-            let fingerprint = fingerprint_message(message);
-            let needs_arm = match document.generation.get(&key) {
-                None => true,
-                Some(series) => series.input_fingerprint.as_deref() != Some(fingerprint.as_str()),
+        if let Some(message) = first_user_message
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            let unattempted_only = match reason {
+                NameActivityReason::AcceptedUserMessage | NameActivityReason::IndexUserMessage => {
+                    true
+                }
+                NameActivityReason::Opened | NameActivityReason::Resumed => document
+                    .generation
+                    .get(&key)
+                    .is_none_or(|series| series.consumed == 0),
             };
-            if needs_arm {
-                let series =
-                    document
-                        .generation
-                        .entry(key.clone())
-                        .or_insert_with(|| GenerationState {
-                            status: GenerationStatus::Eligible,
-                            series_id: Uuid::new_v4().to_string(),
-                            input_fingerprint: None,
-                            excerpt: None,
-                            attempt_ids: Vec::new(),
-                            attempt_starts: Vec::new(),
-                            consumed: 0,
-                            next_due: None,
-                            exhausted_at: None,
-                        });
-                if series.status != GenerationStatus::Exhausted {
-                    series.status = GenerationStatus::Eligible;
-                    series.input_fingerprint = Some(fingerprint);
-                    series.excerpt = Some(excerpt_of(message));
-                    series.next_due = None;
-                    armed_or_updated = true;
+            if unattempted_only {
+                let fingerprint = fingerprint_message(message);
+                let needs_arm = match document.generation.get(&key) {
+                    None => true,
+                    Some(series) => {
+                        if series.input_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+                            true
+                        } else {
+                            // "Explicit open/resume may arm an unattempted
+                            // series": the boot snapshot's absorbed series
+                            // (Idle, consumed == 0) rests until the user
+                            // actually opens the session — the same message
+                            // then arms it. An attempted series (Eligible
+                            // retry, InFlight, Exhausted) never resets.
+                            reason == NameActivityReason::Opened
+                                && series.status == GenerationStatus::Idle
+                                && series.consumed == 0
+                        }
+                    }
+                };
+                if needs_arm {
+                    let series =
+                        document
+                            .generation
+                            .entry(key.clone())
+                            .or_insert_with(|| GenerationState {
+                                status: GenerationStatus::Eligible,
+                                series_id: Uuid::new_v4().to_string(),
+                                input_fingerprint: None,
+                                excerpt: None,
+                                attempt_ids: Vec::new(),
+                                attempt_starts: Vec::new(),
+                                consumed: 0,
+                                next_due: None,
+                                exhausted_at: None,
+                            });
+                    if series.status != GenerationStatus::Exhausted {
+                        series.status = GenerationStatus::Eligible;
+                        series.input_fingerprint = Some(fingerprint);
+                        series.excerpt = Some(excerpt_of(message));
+                        series.next_due = None;
+                        armed_or_updated = true;
+                    }
                 }
             }
         }
@@ -2327,26 +2561,51 @@ fn record_acquisition_decision(
     }
 }
 
+/// Task 4: the remaining-generation retry delay ("after failure 1 retry
+/// becomes due in 30 seconds, after failure 2 in five minutes"). These are
+/// eligibility delays, not queue latency guarantees. A consumed count at
+/// the cap answers `None` (exhaustion is final).
+fn generation_retry_delay_ms(consumed: u32) -> Option<i64> {
+    match consumed {
+        1 => Some(GENERATION_RETRY_1_MS),
+        2 => Some(GENERATION_RETRY_2_MS),
+        _ => None,
+    }
+}
+
 fn claim_generation_start_decision(
     document: &mut StoredDocument,
     meta: &TxnMeta,
     target: &SessionNameRef,
     attempt_id: &str,
-) -> Result<Decision<SessionNameUpdate>, NameError> {
-    let (key, _record) = required_record(document, target)?;
+) -> Result<Decision<Option<GenerationClaim>>, NameError> {
+    let (key, record) = required_record(document, target)?;
     let Some(series) = document.generation.get_mut(&key) else {
-        return Err(NameError::NotFound(format!(
-            "no generation series is armed for {key}"
-        )));
+        return Ok(Decision::Read(None));
     };
-    if series.status == GenerationStatus::Exhausted || series.consumed >= MAX_GENERATION_STARTS {
-        // Exhaustion is final: a claim beyond the cap is a bounded no-op.
-        return Ok(Decision::Read(read_update(document, &key)));
+    // Claimable right now: an armed Eligible series that is due, below the
+    // cap, on a record whose accepted source is below Freshell AI. Anything
+    // else is a bounded no-op — nothing is consumed.
+    if series.status != GenerationStatus::Eligible
+        || series.consumed >= MAX_GENERATION_STARTS
+        || source_is_protected(record.source)
+    {
+        return Ok(Decision::Read(None));
     }
-    // Persist the start before dispatch; empty/invalid answers consume it.
+    if let Some(due) = series.next_due {
+        if due > meta.now_ms {
+            return Ok(Decision::Read(None));
+        }
+    }
+    // Persist the start before dispatch; empty/invalid answers and
+    // interrupted starts consume it.
+    let series_id = series.series_id.clone();
+    let input_fingerprint = series.input_fingerprint.clone();
+    let excerpt = series.excerpt.clone();
     series.consumed += 1;
     series.attempt_ids.push(attempt_id.to_string());
     series.attempt_starts.push(meta.now_ms);
+    let consumed = series.consumed;
     if series.consumed >= MAX_GENERATION_STARTS {
         series.status = GenerationStatus::Exhausted;
         series.exhausted_at = Some(meta.now_ms);
@@ -2354,18 +2613,33 @@ fn claim_generation_start_decision(
     } else {
         series.status = GenerationStatus::InFlight;
     }
-    Ok(commit_decision(document, &key, false))
+    // The persisted alternating class cursor: this claim served generation.
+    document.scheduling_cursor.last_class = Some("generation".to_string());
+    let _value = update_after_commit(document, &key, false, RedirectScope::ToRecord)
+        .expect("the record resolves");
+    Ok(Decision::Write {
+        value: Some(GenerationClaim {
+            target: record.name_ref.clone(),
+            series_id,
+            input_fingerprint: input_fingerprint.unwrap_or_default(),
+            excerpt,
+            attempt_id: attempt_id.to_string(),
+            consumed,
+        }),
+        publish: Vec::new(),
+    })
 }
 
-fn complete_generation_decision(
+fn fold_generation_outcome_decision(
     document: &mut StoredDocument,
     meta: &TxnMeta,
     target: &SessionNameRef,
     series_id: &str,
-    answer: &str,
+    input_fingerprint: &str,
+    outcome: GenerationOutcome,
 ) -> Result<Decision<SessionNameUpdate>, NameError> {
-    let (key, _record) = required_record(document, target)?;
-    let Some(series) = document.generation.get(&key).cloned() else {
+    let (key, record) = required_record(document, target)?;
+    let Some(series) = document.generation.get_mut(&key) else {
         return Err(NameError::NotFound(format!(
             "no generation series is armed for {key}"
         )));
@@ -2375,36 +2649,189 @@ fn complete_generation_decision(
     if series.series_id != series_id {
         return Ok(Decision::Read(read_update(document, &key)));
     }
-    // A protected winner (manual, migration-protected, accepted Freshell AI)
-    // rejects late output.
-    let current_source = document
-        .record_at(&key)
-        .map(|record| record.source)
-        .expect("record exists");
-    if source_is_protected(current_source) {
+    // The input-fingerprint guard: a re-armed series keeps its series id, so
+    // a late answer generated from older input must not be accepted.
+    if series.input_fingerprint.as_deref() != Some(input_fingerprint) {
         return Ok(Decision::Read(read_update(document, &key)));
     }
-    let name = validate_name(answer)?;
-    if offer_mut(document, &key, name, NameSource::FreshellAi, meta.now_ms)? {
-        {
-            let series = document
-                .generation
-                .get_mut(&key)
-                .expect("the series still exists");
-            series.status = GenerationStatus::Idle;
-            series.excerpt = None;
-        }
-        // An accepted Freshell AI name is a writable name decision: arm its
-        // bounded native writeback series.
-        let record = document
-            .record_at(&key)
-            .cloned()
-            .expect("the accepted record resolves");
-        reset_native_series(document, &key, &record);
-        Ok(commit_decision(document, &key, true))
-    } else {
-        Ok(Decision::Read(read_update(document, &key)))
+    // A protected winner (manual, migration-protected, accepted Freshell AI)
+    // rejects late output — and stops the series for good.
+    if source_is_protected(record.source) {
+        series.status = GenerationStatus::Idle;
+        series.next_due = None;
+        series.excerpt = None;
+        return Ok(commit_decision(document, &key, false));
     }
+    match outcome {
+        GenerationOutcome::Answer(answer) => {
+            let name = validate_name(&answer)?;
+            if offer_mut(document, &key, name, NameSource::FreshellAi, meta.now_ms)? {
+                {
+                    let series = document
+                        .generation
+                        .get_mut(&key)
+                        .expect("the series still exists");
+                    series.status = GenerationStatus::Idle;
+                    series.excerpt = None;
+                    series.next_due = None;
+                }
+                // An accepted Freshell AI name is a writable name decision:
+                // arm its bounded native writeback series.
+                let record = document
+                    .record_at(&key)
+                    .cloned()
+                    .expect("the accepted record resolves");
+                reset_native_series(document, &key, &record);
+                Ok(commit_decision(document, &key, true))
+            } else {
+                Ok(Decision::Read(read_update(document, &key)))
+            }
+        }
+        GenerationOutcome::Empty | GenerationOutcome::Failed(_) => {
+            // The attempt was charged at the claim; schedule the remaining
+            // delay from this fold. At the cap the series stays exhausted
+            // (the claim already exhausted it) — nothing more to schedule.
+            if series.status == GenerationStatus::Exhausted
+                || series.consumed >= MAX_GENERATION_STARTS
+            {
+                series.status = GenerationStatus::Exhausted;
+                series.next_due = None;
+                series.excerpt = None;
+            } else {
+                series.status = GenerationStatus::Eligible;
+                series.next_due =
+                    Some(meta.now_ms + generation_retry_delay_ms(series.consumed).unwrap_or(0));
+            }
+            Ok(commit_decision(document, &key, false))
+        }
+    }
+}
+
+fn recover_interrupted_generation_decision(
+    document: &mut StoredDocument,
+    meta: &TxnMeta,
+) -> Result<Decision<usize>, NameError> {
+    let mut recovered = 0usize;
+    for (_key, series) in document.generation.iter_mut() {
+        if series.status != GenerationStatus::InFlight {
+            continue;
+        }
+        // Recover the interrupted start ONCE as failed at recovery time and
+        // schedule the remaining delay from this fold. The claim already
+        // charged the attempt; the recovered series is Eligible again (or
+        // exhausted at the cap).
+        if series.consumed >= MAX_GENERATION_STARTS {
+            series.status = GenerationStatus::Exhausted;
+            series.exhausted_at = Some(meta.now_ms);
+            series.excerpt = None;
+        } else {
+            series.status = GenerationStatus::Eligible;
+        }
+        series.next_due =
+            Some(meta.now_ms + generation_retry_delay_ms(series.consumed).unwrap_or(0));
+        recovered += 1;
+    }
+    if recovered == 0 {
+        return Ok(Decision::Read(0));
+    }
+    Ok(Decision::Write {
+        value: recovered,
+        publish: Vec::new(),
+    })
+}
+
+fn hydrate_indexed_decision(
+    document: &mut StoredDocument,
+    meta: &TxnMeta,
+    input: IndexedNameInput,
+    absorb: bool,
+) -> Result<Decision<SessionNameUpdate>, NameError> {
+    let IndexedNameInput {
+        provider,
+        session_id,
+        cwd,
+        first_user_message,
+        provider_title,
+    } = input;
+    let target = SessionNameRef::Session {
+        provider: provider.clone(),
+        session_id,
+    };
+    let key = name_ref_key(&target);
+    // An established record (or a pending handle already bound to this
+    // durable session through a redirect) is returned unchanged — hydration
+    // never touches existing names.
+    if document.record_at(&key).is_some() {
+        return Ok(Decision::Read(read_update(document, &key)));
+    }
+    // The free fallbacks: a provider-authored title, then the first-message
+    // extraction, then the directory basename (the ensure_pending fallback).
+    let (name, source) = if let Some(title) = provider_title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        (validate_name(title)?, NameSource::ProviderAi)
+    } else if let Some(message) = first_user_message
+        .as_deref()
+        .and_then(first_message_fallback)
+        .filter(|fallback| validate_name(fallback).is_ok())
+    {
+        (message, NameSource::FirstMessage)
+    } else {
+        (
+            directory_fallback_name(cwd.as_deref(), &provider),
+            NameSource::Directory,
+        )
+    };
+    let revision = document.allocate_revision()?;
+    document.records.insert(
+        key.clone(),
+        SessionNameRecord {
+            name_ref: target.clone(),
+            name,
+            source,
+            revision,
+            manual_revision: None,
+            renamed_at: None,
+            legacy_origin: None,
+        },
+    );
+    // Absorb the observed first message at rest: the series keeps the input
+    // fingerprint/excerpt so a later pass re-feeding the SAME message is a
+    // no-op, but it rests Idle — the boot snapshot never schedules paid
+    // titles across history. Without absorption (a later pass observing a
+    // genuinely new session), no series is created here: the activity feed
+    // right after arms it with the newly observed message.
+    if absorb {
+        if let Some(message) = first_user_message
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            document.generation.insert(
+                key.clone(),
+                GenerationState {
+                    status: GenerationStatus::Idle,
+                    series_id: Uuid::new_v4().to_string(),
+                    input_fingerprint: Some(fingerprint_message(message)),
+                    excerpt: Some(excerpt_of(message)),
+                    attempt_ids: Vec::new(),
+                    attempt_starts: Vec::new(),
+                    consumed: 0,
+                    next_due: None,
+                    exhausted_at: None,
+                },
+            );
+        }
+    }
+    let _ = meta;
+    let value = update_after_commit(document, &key, true, RedirectScope::None)
+        .expect("the freshly inserted record resolves");
+    Ok(Decision::Write {
+        value,
+        publish: vec![PublishSpec { key, changed: true }],
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2509,6 +2936,8 @@ fn claim_native_cycle_decision(
         entry.attempted_location = Some(location.clone());
         entry.attempted_location_revision = Some(location_revision);
     }
+    // The persisted alternating class cursor: this claim served native.
+    document.scheduling_cursor.last_class = Some("native".to_string());
     let series_epoch = document
         .native_write
         .get(&key)

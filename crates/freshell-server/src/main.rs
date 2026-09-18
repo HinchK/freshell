@@ -52,6 +52,7 @@ mod screenshots;
 mod serve_client;
 mod session_directory;
 mod session_metadata;
+mod session_name_generation;
 mod session_name_native;
 mod session_name_routes;
 mod session_names;
@@ -316,6 +317,16 @@ async fn main() -> ExitCode {
     let gemini: std::sync::Arc<dyn ai_title::GeminiTransport> = std::sync::Arc::new(
         ai_title::GeminiHttp::new(reqwest::Client::new(), ai_key.clone(), gemini_base_url),
     );
+    // Unified agent names (Task 4): the generation participant of the ONE
+    // shared serial naming worker — execution only, never another loop.
+    // Capability (the naming toggle + the Gemini key) is checked before
+    // selection, so disabled naming pauses without consuming anything.
+    let session_name_generator =
+        std::sync::Arc::new(session_name_generation::SessionNameGenerator::new(
+            settings_store.clone(),
+            ai_key.clone(),
+            gemini.clone(),
+        ));
 
     // The shared server→client broadcast bus (pre-serialized frames). REST handlers
     // (fresh-agent create/send) push here; every `/ws` connection fans it out to its
@@ -644,7 +655,11 @@ async fn main() -> ExitCode {
                 Some(codex_adapter),
                 opencode_adapter,
             ));
-            session_name_native::SessionNameWorker::start(names, dispatch);
+            session_name_native::SessionNameWorker::start(
+                names,
+                dispatch,
+                session_name_generator.clone(),
+            );
         }
     }
     // TERM-11 fix: honor `settings.safety.autoKillIdleMinutes` at boot (the
@@ -1634,6 +1649,17 @@ async fn main() -> ExitCode {
                 // so the sweep's meta refresh feeds the handshake + broadcasts.
                 terminal_meta: terminal_meta.clone(),
                 git_meta_cache: Default::default(),
+                // Unified agent names (Task 4): the scoped coding-agent
+                // sessions feed the ONE naming authority (hydration + the
+                // index-observed activity that arms generation) — never the
+                // settings ladder. A `None` store (no home) degrades the
+                // scoped branch to nothing; excluded providers keep the
+                // legacy ladder either way.
+                names: session_names.clone(),
+                // The shared index serves the targeted opencode
+                // first-message lookup for already-named sessions.
+                index: Some(Arc::clone(index)),
+                index_hydrated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
             Arc::clone(index),
             SESSIONS_SWEEP_INTERVAL,
@@ -1985,6 +2011,9 @@ async fn main() -> ExitCode {
             ai_key: ai_key.clone(),
             gemini: gemini.clone(),
             index: sessions_state_index,
+            // Unified agent names (Task 4): the scoped generate-title
+            // compatibility path wakes the shared worker through this.
+            generation_wake: Some(session_name_generator.clone()),
         }))
         // Unified agent names (Task 2): the canonical session-name HTTP
         // surface — `POST /api/session-names/read` + `PATCH
