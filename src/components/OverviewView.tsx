@@ -4,6 +4,10 @@ import { api } from '@/lib/api'
 import { useAppDispatch, useAppSelector } from '@/store/hooks'
 import { addTab, setActiveTab, updateTab } from '@/store/tabsSlice'
 import { initLayout, updatePaneTitleByTerminalId } from '@/store/panesSlice'
+import { receiveSessionNames } from '@/store/sessionNamesSlice'
+import { parseSessionNameUpdate } from '@/lib/session-names'
+import { isScopedSessionRow } from '@/store/selectors/sessionNameSelectors'
+import type { SessionNameRecord, SessionNameRef } from '@shared/session-names'
 import type { AppDispatch } from '@/store/store'
 import { getWsClient } from '@/lib/ws-client'
 import { collectTerminalIds } from '@/lib/pane-utils'
@@ -20,6 +24,11 @@ type TerminalOverview = {
   status: 'running' | 'exited'
   hasClients: boolean
   cwd?: string
+  mode?: string
+  /** Unified agent names (Task 1/2 projection): the terminal's naming
+   * identity and its last-known canonical record. */
+  nameRef?: SessionNameRef
+  sessionName?: SessionNameRecord
 }
 
 function formatTime(ts: number) {
@@ -43,14 +52,35 @@ function formatTime(ts: number) {
  * (registry == override → no mismatch → no terminal.title.updated push), so
  * the client must do the pane mirroring itself. This is a user rename →
  * setByUser: true (Scope Decision 3).
+ *
+ * Unified agent names (Task 5): a SCOPED coding-agent terminal routes through
+ * the same PATCH with explicit user intent (+ the captured revision when the
+ * row carries a record); the server targets the ONE canonical session name,
+ * the accepted record folds into the canonical cache, and NO local
+ * pane/tab user-flag write fires. Shell/other terminals keep the legacy
+ * override path unchanged.
  */
 export async function renameOverviewTerminal(input: {
   dispatch: AppDispatch
   terminalId: string
   title: string
   description: string
+  scoped?: {
+    ifRevision?: number
+  }
 }): Promise<void> {
-  const { dispatch, terminalId, title, description } = input
+  const { dispatch, terminalId, title, description, scoped } = input
+  if (scoped) {
+    const response = await api.patch<{ sessionName?: unknown }>(`/api/terminals/${encodeURIComponent(terminalId)}`, {
+      titleOverride: title || undefined,
+      descriptionOverride: description || undefined,
+      nameIntent: 'user',
+      ...(scoped.ifRevision !== undefined ? { ifRevision: scoped.ifRevision } : {}),
+    })
+    const accepted = parseSessionNameUpdate(response?.sessionName)
+    if (accepted) dispatch(receiveSessionNames([accepted]))
+    return
+  }
   await api.patch(`/api/terminals/${encodeURIComponent(terminalId)}`, {
     titleOverride: title || undefined,
     descriptionOverride: description || undefined,
@@ -190,10 +220,19 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                         onOpenTab?.()
                       }}
                       onRename={async (title, description) => {
-                        await renameOverviewTerminal({ dispatch, terminalId: t.terminalId, title, description })
-                        const existing = findTabByTerminalId(t.terminalId)
-                        if (existing && title) {
-                          dispatch(updateTab({ id: existing.id, updates: { title } }))
+                        const scoped = terminalCardScopedRename(t)
+                        await renameOverviewTerminal({
+                          dispatch,
+                          terminalId: t.terminalId,
+                          title,
+                          description,
+                          ...(scoped ? { scoped } : {}),
+                        })
+                        if (!scoped) {
+                          const existing = findTabByTerminalId(t.terminalId)
+                          if (existing && title) {
+                            dispatch(updateTab({ id: existing.id, updates: { title } }))
+                          }
                         }
                         await refresh()
                       }}
@@ -244,7 +283,14 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
                         onOpenTab?.()
                       }}
                       onRename={async (title, description) => {
-                        await renameOverviewTerminal({ dispatch, terminalId: t.terminalId, title, description })
+                        const scoped = terminalCardScopedRename(t)
+                        await renameOverviewTerminal({
+                          dispatch,
+                          terminalId: t.terminalId,
+                          title,
+                          description,
+                          ...(scoped ? { scoped } : {}),
+                        })
                         await refresh()
                       }}
                       onDelete={async () => {
@@ -271,6 +317,41 @@ export default function OverviewView({ onOpenTab }: { onOpenTab?: () => void }) 
   )
 }
 
+/**
+ * Unified agent names (Task 5): the Overview rename's scoped capture — the
+ * row's nameRef proves the server holds a naming binding for a scoped mode,
+ * and the row's record revision becomes the editor's captured revision. A
+ * scoped blank title is never sent (a saved name is never cleared).
+ */
+function terminalCardScopedRename(
+  terminal: TerminalOverview,
+): { ifRevision?: number } | undefined {
+  if (
+    !terminal.nameRef
+    || !isScopedSessionRow(terminal.mode === 'shell' ? undefined : terminal.mode)
+  ) {
+    return undefined
+  }
+  const ifRevision = terminal.sessionName?.revision
+  return ifRevision !== undefined ? { ifRevision } : {}
+}
+
+/**
+ * A scoped coding-agent terminal displays its canonical session name (the
+ * row's last-known record) — the terminal-level title stays visible only for
+ * out-of-scope terminals.
+ */
+function terminalCardDisplayName(terminal: TerminalOverview): string {
+  if (
+    terminal.nameRef
+    && terminal.sessionName?.name
+    && isScopedSessionRow(terminal.mode === 'shell' ? undefined : terminal.mode)
+  ) {
+    return terminal.sessionName.name
+  }
+  return terminal.title
+}
+
 function TerminalCard({
   terminal,
   isOpen,
@@ -287,15 +368,15 @@ function TerminalCard({
   onGenerateSummary: () => void
 }) {
   const [editing, setEditing] = useState(false)
-  const [title, setTitle] = useState(terminal.title)
+  const [title, setTitle] = useState(terminalCardDisplayName(terminal))
   const [desc, setDesc] = useState(terminal.description || '')
   const [showActions, setShowActions] = useState(false)
   const [generating, setGenerating] = useState(false)
 
   useEffect(() => {
-    setTitle(terminal.title)
+    setTitle(terminalCardDisplayName(terminal))
     setDesc(terminal.description || '')
-  }, [terminal.title, terminal.description])
+  }, [terminal])
 
   const handleGenerateSummary = async () => {
     setGenerating(true)
@@ -337,7 +418,7 @@ function TerminalCard({
           </button>
           <button
             onClick={() => {
-              setTitle(terminal.title)
+              setTitle(terminalCardDisplayName(terminal))
               setDesc(terminal.description || '')
               setEditing(false)
             }}
@@ -364,7 +445,7 @@ function TerminalCard({
       onMouseLeave={() => setShowActions(false)}
       role="button"
       tabIndex={0}
-      aria-label={`Open terminal ${terminal.title}`}
+      aria-label={`Open terminal ${terminalCardDisplayName(terminal)}`}
       data-context={ContextIds.OverviewTerminal}
       data-terminal-id={terminal.terminalId}
     >
@@ -384,7 +465,7 @@ function TerminalCard({
         {/* Content */}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
-            <h3 className="font-medium text-sm">{terminal.title}</h3>
+            <h3 className="font-medium text-sm">{terminalCardDisplayName(terminal)}</h3>
             {isOpen && (
               <span className="text-2xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
                 open

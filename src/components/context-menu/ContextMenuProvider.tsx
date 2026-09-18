@@ -15,6 +15,10 @@ import {
   updatePaneTitleByTerminalId,
 } from '@/store/panesSlice'
 import { applySessionRenameCascade, clearSessionTitleOverride } from '@/store/titleSync'
+import { receiveSessionNames } from '@/store/sessionNamesSlice'
+import { renameSessionName, parseSessionNameUpdate } from '@/lib/session-names'
+import { isScopedSessionRow, selectSessionNameRecord } from '@/store/selectors/sessionNameSelectors'
+import type { SessionNameRef } from '@shared/session-names'
 import { removeSessionFromProjects, setProjectExpanded } from '@/store/sessionsSlice'
 import { getWsClient } from '@/lib/ws-client'
 import { sendTerminalKillAndAwait, sendFreshAgentKillAndAwait } from '@/lib/kill-ack'
@@ -529,6 +533,31 @@ export function ContextMenuProvider({
     }
     try {
       const resolvedProvider = provider || info.session.provider || 'claude'
+      // Unified agent names (Task 5): a scoped session's rename targets the
+      // ONE canonical saved name with explicit user intent and the captured
+      // target/revision; the accepted record folds into the canonical cache
+      // and NO local user-flag cascade fires. Out-of-scope providers keep
+      // the legacy session override + mirror unchanged.
+      if (isScopedSessionRow(resolvedProvider, info.session.sessionType)) {
+        const target: SessionNameRef = info.session.nameRef
+          ?? { kind: 'session', provider: resolvedProvider as 'claude' | 'codex' | 'opencode', sessionId }
+        // Captured revision at edit start (last-known canonical record).
+        const ifRevision = selectSessionNameRecord(appStore.getState(), target)?.revision
+        const accepted = await renameSessionName({
+          target,
+          name: title,
+          nameIntent: 'user',
+          ...(ifRevision !== undefined ? { ifRevision } : {}),
+        })
+        dispatch(receiveSessionNames([accepted]))
+        // Non-name summary fields still patch through the legacy store.
+        if (summary !== undefined) {
+          const compositeKey = `${resolvedProvider}:${sessionId}`
+          await api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, { summaryOverride: summary })
+        }
+        await dispatch(refreshActiveSessionWindow() as any)
+        return
+      }
       const compositeKey = `${resolvedProvider}:${sessionId}`
       const result = await api.patch<{ cascadedTerminalId?: string | null }>(`/api/sessions/${encodeURIComponent(compositeKey)}`, {
         titleOverride: title || undefined,
@@ -537,6 +566,7 @@ export function ContextMenuProvider({
       if (title) {
         applySessionRenameCascade({
           dispatch,
+          getState: appStore.getState,
           provider: resolvedProvider,
           sessionId,
           title,
@@ -544,10 +574,14 @@ export function ContextMenuProvider({
         })
       }
       await dispatch(refreshActiveSessionWindow() as any)
-    } catch {
-      // ignore
+    } catch (error: any) {
+      // A conflict carries the server's accepted record: fold it so the
+      // winning name is visible everywhere; other failures stay quiet like
+      // the legacy flow (the refresh still lands).
+      const accepted = parseSessionNameUpdate(error?.data?.sessionName)
+      if (accepted) dispatch(receiveSessionNames([accepted]))
     }
-  }, [dispatch, getSessionInfo, menuState?.target])
+  }, [dispatch, appStore, getSessionInfo, menuState?.target])
 
   const generateSessionTitle = useCallback(async (sessionId: string, provider?: string) => {
     const info = getSessionInfo(sessionId, provider, menuState?.target)
@@ -800,12 +834,25 @@ export function ContextMenuProvider({
   const renameTerminal = useCallback(async (terminalId: string) => {
     let currentTitle = ''
     let currentDesc = ''
+    let scopedRow: {
+      mode?: string
+      nameRef?: SessionNameRef
+      sessionName?: { revision?: number }
+    } | undefined
     try {
-      const terminals = await api.get<Array<{ terminalId: string; title?: string; description?: string }>>('/api/terminals')
+      const terminals = await api.get<Array<{
+        terminalId: string
+        title?: string
+        description?: string
+        mode?: string
+        nameRef?: SessionNameRef
+        sessionName?: { revision?: number }
+      }>>('/api/terminals')
       const term = terminals.find((t) => t.terminalId === terminalId)
       if (term) {
         currentTitle = term.title || ''
         currentDesc = term.description || ''
+        scopedRow = term
       }
     } catch {
       // ignore
@@ -814,7 +861,31 @@ export function ContextMenuProvider({
     if (title === null) return
     const description = window.prompt('Update description', currentDesc)
     if (description === null) return
+    // Unified agent names (Task 5): a scoped coding-agent terminal's rename
+    // targets its ONE canonical session name with explicit user intent (the
+    // server's terminal route resolves the naming binding); the accepted
+    // record folds into the canonical cache and NO local pane/tab user-flag
+    // write fires. Shell and other terminals keep the legacy override path.
+    // The row's nameRef proves the server holds a naming binding — a scoped
+    // mode without one renames through the legacy path on both sides.
+    const scoped = Boolean(
+      scopedRow
+      && scopedRow.nameRef
+      && isScopedSessionRow(scopedRow.mode === 'shell' ? undefined : scopedRow.mode),
+    )
     try {
+      if (scoped) {
+        const ifRevision = scopedRow?.sessionName?.revision
+        const response = await api.patch<{ sessionName?: unknown }>(`/api/terminals/${encodeURIComponent(terminalId)}`, {
+          titleOverride: title || undefined,
+          descriptionOverride: description || undefined,
+          nameIntent: 'user',
+          ...(ifRevision !== undefined ? { ifRevision } : {}),
+        })
+        const accepted = parseSessionNameUpdate(response?.sessionName)
+        if (accepted) dispatch(receiveSessionNames([accepted]))
+        return
+      }
       await api.patch(`/api/terminals/${encodeURIComponent(terminalId)}`, {
         titleOverride: title || undefined,
         descriptionOverride: description || undefined,
@@ -828,8 +899,11 @@ export function ContextMenuProvider({
         // getTabDisplayTitle's pane-title preference both converge.
         dispatch(updatePaneTitleByTerminalId({ terminalId, title, setByUser: true }))
       }
-    } catch {
-      // ignore
+    } catch (error: any) {
+      // A conflict carries the server's accepted record: fold it so the
+      // winning name is visible everywhere.
+      const accepted = parseSessionNameUpdate(error?.data?.sessionName)
+      if (accepted) dispatch(receiveSessionNames([accepted]))
     }
   }, [dispatch, findTabByTerminalId])
 

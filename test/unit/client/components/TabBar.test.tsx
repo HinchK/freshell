@@ -444,7 +444,10 @@ describe('TabBar', () => {
 
       renderWithStore(<TabBar />, store)
 
-      const tabElement = screen.getByLabelText('Codex Pending')
+      // Unified agent names (Task 5): the scoped tab's display name is its
+      // canonical/derived pane name, not the stored tab title — locate the
+      // tab by its id.
+      const tabElement = document.querySelector('[data-tab-id="tab-codex"]') as HTMLElement
       const blueIcons = within(tabElement).getAllByTestId('pane-icon')
         .filter((icon) => icon.getAttribute('class')?.includes('text-blue-500'))
 
@@ -488,7 +491,7 @@ describe('TabBar', () => {
 
       renderWithStore(<TabBar />, store)
 
-      const tabElement = screen.getByLabelText('Rehydrate Gap')
+      const tabElement = document.querySelector('[data-tab-id="tab-rehydrate"]') as HTMLElement
       const blueIcons = within(tabElement).getAllByTestId('pane-icon')
         .filter((icon) => icon.getAttribute('class')?.includes('text-blue-500'))
 

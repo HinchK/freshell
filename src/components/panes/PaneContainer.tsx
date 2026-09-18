@@ -1,5 +1,5 @@
 import { Suspense, lazy, useRef, useCallback, useMemo, useState, useEffect } from 'react'
-import { useAppDispatch, useAppSelector } from '@/store/hooks'
+import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { setActivePane, updatePaneContent, clearPaneRenameRequest, toggleZoom, requestPaneRefresh } from '@/store/panesSlice'
 import { closePaneWithCleanup } from '@/store/tabsSlice'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
@@ -14,7 +14,7 @@ import PanePicker, { type PanePickerType } from './PanePicker'
 import DirectoryPicker from './DirectoryPicker'
 import { getProviderLabel, isCodingCliProviderName } from '@/lib/coding-cli-utils'
 import { isFreshAgentProviderName, getFreshAgentProviderConfig } from '@/lib/fresh-agent-provider-utils'
-import { getFreshAgentLabel, normalizeFreshAgentEffort, normalizeFreshAgentModel, resolveFreshAgentPaneCreateEffort, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
+import { normalizeFreshAgentEffort, normalizeFreshAgentModel, resolveFreshAgentPaneCreateEffort, resolveFreshAgentType } from '@/lib/fresh-agent-registry'
 import { clearDraft } from '@/lib/draft-store'
 import { getTerminalActions } from '@/lib/pane-action-registry'
 import { renamePaneAfterMirrorReady } from '@/lib/pane-rename'
@@ -25,7 +25,6 @@ import { getWsClient } from '@/lib/ws-client'
 import { KILL_ACK_TIMEOUT_MESSAGE, KILL_FAILED_MESSAGE, sendFreshAgentKillAndAwait } from '@/lib/kill-ack'
 import { api } from '@/lib/api'
 import { isTrulyIdleCliMode, resolvePaneActivity, resolvePaneIdleGreen } from '@/lib/pane-activity'
-import { getPaneDisplayTitle } from '@/lib/pane-title'
 import { getTabDirectoryPreference } from '@/lib/tab-directory-preference'
 import {
   formatPaneRuntimeLabel,
@@ -54,14 +53,21 @@ import type { ProjectGroup } from '@/store/types'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { applyPaneRename } from '@/store/titleSync'
+import { receiveSessionNames } from '@/store/sessionNamesSlice'
+import {
+  isScopedPaneContent,
+  resolvePaneRenameCapture,
+  selectPaneDisplayName,
+  selectPaneNativeSync,
+} from '@/store/selectors/sessionNameSelectors'
+import { parseSessionNameUpdate } from '@/lib/session-names'
+import type { SessionNameRef } from '@shared/session-names'
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
 import { getPreferredResumeSessionId } from '@/store/persistControl'
 import { findIndexedSessionById } from '@/lib/fresh-agent-context-usage'
 import type { SessionLocator } from '@shared/ws-protocol'
 
 // Stable empty object to avoid selector memoization issues
-const EMPTY_PANE_TITLES: Record<string, string> = {}
-const EMPTY_PANE_TITLE_SET_BY_USER: Record<string, boolean> = {}
 const EMPTY_TERMINAL_META_BY_ID: Record<string, TerminalMetaRecord> = {}
 const EMPTY_PROJECTS: ProjectGroup[] = []
 const EMPTY_FRESH_AGENT_SESSIONS: Record<string, FreshAgentSessionState> = {}
@@ -177,29 +183,11 @@ function resolveFreshAgentRuntimeMeta(
   }
 }
 
-function resolveStoredTitleForDisplay(
-  content: PaneContent,
-  storedTitle: string | undefined,
-  setByUser: boolean | undefined,
-): string | undefined {
-  if (content.kind !== 'fresh-agent' || setByUser || !storedTitle) return storedTitle
-
-  const normalizedStoredTitle = storedTitle.trim().toLowerCase()
-  const legacyProviderTitle = getFreshAgentLabel(content.sessionType).trim().toLowerCase()
-  const providerIdentity = content.sessionType.trim().toLowerCase()
-  if (normalizedStoredTitle === legacyProviderTitle || normalizedStoredTitle === providerIdentity) {
-    return undefined
-  }
-
-  return storedTitle
-}
-
 export default function PaneContainer({ tabId, node, hidden }: PaneContainerProps) {
   const dispatch = useAppDispatch()
+  const appStore = useAppStore()
   const activePane = useAppSelector((s) => s.panes.activePane[tabId])
   const tab = useAppSelector((s) => s.tabs.tabs.find((t) => t.id === tabId))
-  const paneTitles = useAppSelector((s) => s.panes.paneTitles[tabId] ?? EMPTY_PANE_TITLES)
-  const paneTitleSetByUser = useAppSelector((s) => s.panes.paneTitleSetByUser?.[tabId] ?? EMPTY_PANE_TITLE_SET_BY_USER)
   // Per-leaf focus-epoch subscription: an explicit select nudges ONE pane's
   // epoch (see PanesState.focusEpochByPaneId); subscribing per leaf means a
   // select re-renders only that pane's container. (The previous whole-map
@@ -207,7 +195,6 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const focusEpoch = useAppSelector((s) =>
     node.type === 'leaf' ? (s.panes?.focusEpochByPaneId?.[node.id] ?? 0) : 0
   )
-  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const terminalMetaById = useAppSelector(
     (s) => s.terminalMeta?.byTerminalId ?? EMPTY_TERMINAL_META_BY_ID
   )
@@ -251,6 +238,18 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
   const [renameValue, setRenameValue] = useState('')
   const [renameError, setRenameError] = useState<string | null>(null)
   const renameAbortRef = useRef<{ paneId: string; controller: AbortController } | null>(null)
+  // Unified agent names (Task 5): the editor's captured naming target +
+  // revision, taken when the editor OPENS. A commit that lands after the pane
+  // switched conversations carries the capture (expectedNameRef/ifRevision) so
+  // the server refuses to retitle the new conversation.
+  const renameCaptureRef = useRef<{ ref?: SessionNameRef; revision?: number } | null>(null)
+
+  // The scoped pane display title (canonical name with legacy fallback) —
+  // one hook-level subscription so both the header and the rename editor
+  // read the same projection.
+  const leafPaneId = node.type === 'leaf' ? node.id : null
+  const paneDisplayName = useAppSelector((s) => (leafPaneId ? selectPaneDisplayName(s, tabId, leafPaneId) : ''))
+  const paneNativeSyncStatus = useAppSelector((s) => (leafPaneId ? selectPaneNativeSync(s, tabId, leafPaneId) : undefined))
 
   useEffect(() => () => {
     renameAbortRef.current?.controller.abort()
@@ -266,23 +265,20 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
     // Only handle the request if this PaneContainer renders the target pane as a leaf
     if (node.type !== 'leaf' || node.id !== renameRequestPaneId) return
 
-    const storedTitle = resolveStoredTitleForDisplay(
-      node.content,
-      paneTitles[node.id],
-      paneTitleSetByUser[node.id],
-    )
-    const currentTitle = getPaneDisplayTitle(node.content, storedTitle, extensionEntries)
     setRenamingPaneId(node.id)
-    setRenameValue(currentTitle)
+    setRenameValue(paneDisplayName)
     setRenameError(null)
+    // Capture the naming target + revision at editor open.
+    renameCaptureRef.current = resolvePaneRenameCapture(appStore.getState(), tabId, node.id)
     dispatch(clearPaneRenameRequest())
-  }, [renameRequestTabId, renameRequestPaneId, tabId, node, paneTitles, paneTitleSetByUser, extensionEntries, dispatch])
+  }, [renameRequestTabId, renameRequestPaneId, tabId, node, paneDisplayName, appStore, dispatch])
 
   const startRename = useCallback((paneId: string, currentTitle: string) => {
     setRenamingPaneId(paneId)
     setRenameValue(currentTitle)
     setRenameError(null)
-  }, [])
+    renameCaptureRef.current = resolvePaneRenameCapture(appStore.getState(), tabId, paneId)
+  }, [appStore, tabId])
 
   const handleRenameChange = useCallback((value: string) => {
     setRenameValue(value)
@@ -297,30 +293,55 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       setRenameError(null)
       setRenamingPaneId(null)
       setRenameValue('')
+      renameCaptureRef.current = null
       return
     }
     if (node.type !== 'leaf') return
     renameAbortRef.current?.controller.abort()
     const controller = new AbortController()
     renameAbortRef.current = { paneId, controller }
+    // Unified agent names (Task 5): a scoped pane's rename is the ONE
+    // canonical session rename with explicit user intent and the captured
+    // target/revision — the response folds the accepted record into the
+    // canonical cache; NO local pane/tab alias is written. Legacy panes
+    // keep the existing layout-label path unchanged.
+    const scoped = isScopedPaneContent(node.content)
+    const capture = renameCaptureRef.current
     void (async () => {
       try {
         const result = await renamePaneAfterMirrorReady(tabId, paneId, trimmed, {
           signal: controller.signal,
           get: (path, options) => api.get(path, options),
           patch: (path, body, options) => api.patch(path, body, options),
+          ...(scoped
+            ? {
+              nameIntent: 'user' as const,
+              ...(capture?.ref !== undefined ? { expectedNameRef: capture.ref } : {}),
+              ...(capture?.revision !== undefined ? { ifRevision: capture.revision } : {}),
+            }
+            : {}),
         })
         if (controller.signal.aborted) return
         if (!result.ok) {
           setRenameError(result.message)
           return
         }
-        dispatch(applyPaneRename({ tabId, paneId, title: trimmed }))
+        if (scoped) {
+          const accepted = parseSessionNameUpdate(result.response?.data?.sessionName)
+          if (accepted) dispatch(receiveSessionNames([accepted]))
+        } else {
+          dispatch(applyPaneRename({ tabId, paneId, title: trimmed }))
+        }
         setRenameError(null)
         setRenamingPaneId(null)
         setRenameValue('')
+        renameCaptureRef.current = null
       } catch (error: any) {
         if (controller.signal.aborted) return
+        // A conflict carries the server's accepted record: fold it so the
+        // winning name is visible everywhere while the error stays shown.
+        const accepted = parseSessionNameUpdate(error?.data?.sessionName)
+        if (accepted) dispatch(receiveSessionNames([accepted]))
         const message = typeof error?.message === 'string' && error.message
           ? error.message
           : 'Failed to rename pane'
@@ -417,12 +438,11 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
 
   // Render a leaf pane
   if (node.type === 'leaf') {
-    const explicitTitle = resolveStoredTitleForDisplay(
-      node.content,
-      paneTitles[node.id],
-      paneTitleSetByUser[node.id],
-    )
-    const paneTitle = getPaneDisplayTitle(node.content, explicitTitle, extensionEntries)
+    // Unified agent names (Task 5): the pane's display title comes from the
+    // ONE scoped selector — for scoped agent panes that is the canonical
+    // session name (legacy sticky flags/inventory strings are fallback-only);
+    // every other pane keeps the legacy derivation inside the selector.
+    const paneTitle = paneDisplayName
     const paneStatus = node.content.kind === 'terminal'
       ? node.content.status
       : node.content.kind === 'fresh-agent'
@@ -550,6 +570,16 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
           node.content.kind === 'host-stats' ? undefined : () => startRename(node.id, paneTitle)
         }
       >
+        {isScopedPaneContent(node.content) && paneNativeSyncStatus && paneNativeSyncStatus.status !== 'synced' ? (
+          <div
+            className="border-b border-border bg-muted/40 px-2 py-1 text-xs text-muted-foreground"
+            role="status"
+            aria-live="polite"
+          >
+            Native sync: {paneNativeSyncStatus.status}
+            {paneNativeSyncStatus.reason ? ` — ${paneNativeSyncStatus.reason}` : ''}
+          </div>
+        ) : null}
         {renderContent(tabId, node.id, node.content, isOnlyPane, hidden, focusEligible, focusEpoch)}
       </Pane>
     )
@@ -608,8 +638,8 @@ function PickerWrapper({
   const dispatch = useAppDispatch()
   const settings = useAppSelector((s) => s.settings?.settings)
   const freshAgentSettings = useAppSelector((s) => s.settings?.settings?.freshAgent ?? s.settings?.serverSettings?.freshAgent)
-  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const paneLayout = useAppSelector((s) => s.panes.layouts[tabId])
+  const extensionEntries = useAppSelector((s) => s.extensions?.entries ?? EMPTY_EXTENSION_ENTRIES)
   const tabPref = useMemo(
     () => paneLayout ? getTabDirectoryPreference(paneLayout) : { defaultCwd: undefined, tabDirectories: [] },
     [paneLayout],

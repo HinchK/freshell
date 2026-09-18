@@ -4,9 +4,26 @@ import { handleUiCommand } from '../../../src/lib/ui-commands'
 import { captureUiScreenshot } from '../../../src/lib/ui-screenshot'
 import tabsReducer from '../../../src/store/tabsSlice'
 import panesReducer from '../../../src/store/panesSlice'
+import sessionNamesReducer from '../../../src/store/sessionNamesSlice'
+import { receiveSessionNames } from '../../../src/store/sessionNamesSlice'
 
 vi.mock('../../../src/lib/ui-screenshot', () => ({
   captureUiScreenshot: vi.fn(),
+}))
+
+const apiPost = vi.hoisted(() => vi.fn())
+
+vi.mock('@/lib/api', () => ({
+  ApiError: class ApiError extends Error {
+    constructor(public status: number, message: string) {
+      super(message)
+    }
+  },
+  api: {
+    get: vi.fn(),
+    patch: vi.fn(),
+    post: (...args: unknown[]) => apiPost(...args) as unknown as Promise<unknown>,
+  },
 }))
 
 describe('handleUiCommand', () => {
@@ -357,5 +374,106 @@ describe('ui.command focus neutrality through a real Redux store', () => {
     handleUiCommand({ type: 'ui.command', command: 'tab.select', payload: { id: 'tab-B' } }, store.dispatch)
     expect(store.getState().tabs.activeTabId).toBe('tab-B')
     expect(store.getState().panes.focusEpochByPaneId?.['pane-A1']).toBe(1) // unchanged: tab-B has no active pane
+  })
+
+  it('a scoped pane.rename receipt folds an embedded canonical update and never writes a local alias (Task 5)', () => {
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer, sessionNames: sessionNamesReducer },
+      preloadedState: {
+        tabs: { tabs: [{ id: 't1', createRequestId: 't1', title: 'T1', status: 'running', mode: 'claude', createdAt: 1 }], activeTabId: 't1', renameRequestTabId: null },
+        panes: {
+          layouts: { t1: { type: 'leaf', id: 'p1', content: { kind: 'terminal', mode: 'claude', status: 'running', terminalId: 'term-1', sessionRef: { provider: 'claude', sessionId: 'sess-ui-1' } } } },
+          activePane: { t1: 'p1' },
+          paneTitles: { t1: { p1: 'freshell' } },
+          paneTitleSetByUser: {},
+          renameRequestTabId: null,
+          renameRequestPaneId: null,
+          zoomedPane: {},
+          refreshRequestsByPane: {},
+        },
+      } as never,
+    })
+    const dispatched: any[] = []
+    const runtime = {
+      dispatch: (action: any) => {
+        dispatched.push(action)
+        return store.dispatch(action)
+      },
+      getState: () => store.getState(),
+    }
+
+    handleUiCommand({
+      type: 'ui.command',
+      command: 'pane.rename',
+      payload: {
+        tabId: 't1',
+        paneId: 'p1',
+        title: 'Agent-applied name',
+        sessionName: {
+          record: { ref: { kind: 'session', provider: 'claude', sessionId: 'sess-ui-1' }, name: 'Agent-applied name', source: 'first_message', revision: 7 },
+          documentGeneration: 9,
+          redirects: [],
+          changed: true,
+        },
+      },
+    }, runtime)
+
+    const key = JSON.stringify(['session', 'claude', 'sess-ui-1'])
+    expect(store.getState().sessionNames.records[key]?.name).toBe('Agent-applied name')
+    // No local alias write ever fired: no pane-title alias, no thunk dispatch.
+    expect(dispatched.some((a) => a.type === 'panes/updatePaneTitle' || a.type === 'panes/updatePaneTitleByTerminalId')).toBe(false)
+    expect(dispatched.some((a) => typeof a === 'function')).toBe(false)
+  })
+
+  it('a scoped tab.rename receipt without an embedded record refetches and never writes a local alias (Task 5)', async () => {
+    apiPost.mockResolvedValue({
+      names: [{
+        record: { ref: { kind: 'session', provider: 'claude', sessionId: 'sess-ui-2' }, name: 'Refetched canonical name', source: 'manual', revision: 2 },
+        documentGeneration: 3,
+        redirects: [],
+        changed: false,
+      }],
+    })
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer, sessionNames: sessionNamesReducer },
+      preloadedState: {
+        tabs: { tabs: [{ id: 't1', createRequestId: 't1', title: 'T1', status: 'running', mode: 'claude', createdAt: 1 }], activeTabId: 't1', renameRequestTabId: null },
+        panes: {
+          layouts: { t1: { type: 'leaf', id: 'p1', content: { kind: 'terminal', mode: 'claude', status: 'running', terminalId: 'term-2', sessionRef: { provider: 'claude', sessionId: 'sess-ui-2' } } } },
+          activePane: { t1: 'p1' },
+          paneTitles: { t1: { p1: 'freshell' } },
+          paneTitleSetByUser: {},
+          renameRequestTabId: null,
+          renameRequestPaneId: null,
+          zoomedPane: {},
+          refreshRequestsByPane: {},
+        },
+      } as never,
+    })
+    const dispatched: any[] = []
+    const runtime = {
+      dispatch: (action: any) => {
+        dispatched.push(action)
+        return store.dispatch(action)
+      },
+      getState: () => store.getState(),
+    }
+
+    handleUiCommand({
+      type: 'ui.command',
+      command: 'tab.rename',
+      payload: { id: 't1', title: 'Agent-applied name' },
+    }, runtime)
+
+    // No local alias write, no manual flag, no second PATCH: the receipt is
+    // consumed through a canonical refetch only.
+    expect(dispatched.some((a) => a.type === 'panes/updatePaneTitle' || a.type === 'panes/updatePaneTitleByTerminalId')).toBe(false)
+    expect(dispatched.some((a) => typeof a === 'function')).toBe(false)
+    const { waitFor } = await import('@testing-library/react')
+    await waitFor(() => {
+      expect(apiPost).toHaveBeenCalledWith('/api/session-names/read', expect.anything(), expect.anything())
+      const key = JSON.stringify(['session', 'claude', 'sess-ui-2'])
+      expect(store.getState().sessionNames.records[key]?.name).toBe('Refetched canonical name')
+    })
   })
 })

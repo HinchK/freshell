@@ -11,6 +11,7 @@ import {
 import { nanoid } from 'nanoid'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import type { PaneReconcileRequest } from '@shared/ws-protocol'
+import { isUnifiedAgentMode } from '@shared/session-names'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
@@ -1142,8 +1143,13 @@ export function FreshAgentView({
     previousSessionId: string | undefined,
     nextSessionId: string | undefined,
     provider: string,
+    sessionType?: string,
   ) => {
     if (!previousSessionId || !nextSessionId || previousSessionId === nextSessionId) return
+    // Unified agent names (Task 5): scoped fresh types never ran the local
+    // pending-title machinery (sendUserText skips it), so there is nothing to
+    // migrate — kilroy keeps the legacy behavior.
+    if (isUnifiedAgentMode(provider, sessionType)) return
     const firstMessage = pendingAutoTitleBySessionIdRef.current.get(previousSessionId)
     if (!firstMessage) return
     pendingAutoTitleBySessionIdRef.current.delete(previousSessionId)
@@ -1151,6 +1157,7 @@ export function FreshAgentView({
       tabId,
       paneId,
       provider,
+      sessionType,
       sessionId: nextSessionId,
       firstMessage,
     }))
@@ -1868,7 +1875,7 @@ export function FreshAgentView({
           sessionType: message.sessionType,
           sessionRef,
         })
-        migratePendingAutoTitle(current.sessionId, message.sessionId, message.provider)
+        migratePendingAutoTitle(current.sessionId, message.sessionId, message.provider, message.sessionType)
         requestSnapshotRefresh('materialized')
         dispatch(updatePaneContent({
           tabId,
@@ -2183,7 +2190,7 @@ export function FreshAgentView({
       const nextSessionRef = snapshotSessionRef ?? fresh.sessionRef
       const nextResumeSessionId = snapshotSessionRef?.sessionId ?? fresh.resumeSessionId ?? sessionId
       if (snapshotSessionRef) {
-        migratePendingAutoTitle(fresh.sessionId, snapshotSessionRef.sessionId, provider)
+        migratePendingAutoTitle(fresh.sessionId, snapshotSessionRef.sessionId, provider, requestSessionType)
       }
       const hasBlockingLocalEchoForSession = hasUnresolvedLocalEchoForSessionRef.current
       const sessionStatus = nextStatus === 'create-failed' ? null : nextStatus
@@ -2578,14 +2585,23 @@ export function FreshAgentView({
     if (isFirstMessage) {
       autoTitleFreshBoundaryRef.current = false
       autoTitleSentRef.current = true
-      pendingAutoTitleBySessionIdRef.current.set(current.sessionId, text)
-      dispatch(finalizeCodingAgentSessionName({
-        tabId,
-        paneId,
-        provider: current.provider,
-        sessionId: current.sessionId,
-        firstMessage: text,
-      }))
+      // Unified agent names (Task 5): scoped fresh types (freshclaude,
+      // freshcodex, freshopencode) never trigger client-side generation —
+      // the server's input-activity pipeline owns their fallback and AI
+      // naming, and the accepted name arrives through the canonical
+      // session.name.updated push. Kilroy keeps the legacy first-message
+      // finalize.
+      if (!isUnifiedAgentMode(current.provider, current.sessionType)) {
+        pendingAutoTitleBySessionIdRef.current.set(current.sessionId, text)
+        dispatch(finalizeCodingAgentSessionName({
+          tabId,
+          paneId,
+          provider: current.provider,
+          sessionType: current.sessionType,
+          sessionId: current.sessionId,
+          firstMessage: text,
+        }))
+      }
     }
     const nextLocalEcho: LocalEcho = {
       text,

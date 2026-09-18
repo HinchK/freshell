@@ -2,6 +2,7 @@ import type { Middleware } from '@reduxjs/toolkit'
 import { updatePaneTitle } from './panesSlice'
 import { collectPaneEntries, paneContentMatchesSessionRef } from '@/lib/pane-utils'
 import { getCachedTerminalTitle } from '@/lib/terminal-inventory-titles'
+import { isScopedPaneContent } from '@/store/selectors/sessionNameSelectors'
 import type { RootState } from './store'
 
 type TitledSessionRow = {
@@ -107,6 +108,10 @@ function collectSessionTitleTargets(
   for (const [tabId, layout] of Object.entries(panes.layouts ?? {})) {
     if (!layout) continue
     for (const { paneId, content } of collectPaneEntries(layout)) {
+      // Unified agent names (Task 5): scoped agent panes display their
+      // canonical session name from the sessionNames cache — this legacy
+      // mirror (directory-row title -> pane title) never writes them.
+      if (isScopedPaneContent(content)) continue
       if (!paneContentMatchesSessionRef(content, provider, sessionId)) continue
       if (content.kind === 'terminal' && content.terminalId && getCachedTerminalTitle(content.terminalId) !== undefined) continue
       if (panes.paneTitleSetByUser?.[tabId]?.[paneId]) continue

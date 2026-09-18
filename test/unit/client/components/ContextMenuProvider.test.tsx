@@ -13,6 +13,7 @@ import extensionsReducer from '@/store/extensionsSlice'
 import tabRecencyReducer from '@/store/tabRecencySlice'
 import freshAgentReducer, { sessionInit } from '@/store/freshAgentSlice'
 import tabRegistryReducer, { setTabRegistrySnapshot } from '@/store/tabRegistrySlice'
+import sessionNamesReducer from '@/store/sessionNamesSlice'
 import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
 import { ContextMenuProvider } from '@/components/context-menu/ContextMenuProvider'
 import { registerFreshAgentTurnItems } from '@/lib/pane-action-registry'
@@ -300,6 +301,7 @@ function createStoreWithSidebarWindowAgentSession() {
       connection: connectionReducer,
       settings: settingsReducer,
       extensions: extensionsReducer,
+      sessionNames: sessionNamesReducer,
     },
     middleware: (getDefaultMiddleware) =>
       getDefaultMiddleware({ serializableCheck: false }),
@@ -389,6 +391,8 @@ function createStoreWithSidebarWindowAgentSession() {
                     cwd: '/sidebar/project',
                     createdAt: 1000,
                     updatedAt: 2000,
+                    nameRef: { kind: 'session', provider: 'claude', sessionId: VALID_SESSION_ID },
+                    sessionName: 'Sidebar Agent Session',
                   },
                 ],
               },
@@ -1534,6 +1538,70 @@ describe('ContextMenuProvider', () => {
         sessionType: 'freshclaude',
       },
     })
+  })
+
+  it('renames a scoped session through the canonical route with user intent and folds the accepted record', async () => {
+    const user = userEvent.setup()
+    const promptSpy = vi.spyOn(window, 'prompt').mockReturnValue('Renamed canonically')
+    apiMocks.patch.mockResolvedValueOnce({
+      record: {
+        ref: { kind: 'session', provider: 'claude', sessionId: VALID_SESSION_ID },
+        name: 'Renamed canonically',
+        source: 'manual',
+        revision: 4,
+        renamedAt: 1_700_000_000_000,
+      },
+      documentGeneration: 6,
+      redirects: [],
+      changed: true,
+    })
+
+    const store = createStoreWithSidebarWindowAgentSession()
+    render(
+      <Provider store={store}>
+        <ContextMenuProvider
+          view="terminal"
+          onViewChange={() => {}}
+          onToggleSidebar={() => {}}
+          sidebarCollapsed={false}
+        >
+          <div
+            data-context={ContextIds.SidebarSession}
+            data-session-id={VALID_SESSION_ID}
+            data-provider="claude"
+            data-session-type="freshclaude"
+          >
+            Sidebar Agent Session
+          </div>
+        </ContextMenuProvider>
+      </Provider>
+    )
+
+    await user.pointer({ target: screen.getByText('Sidebar Agent Session'), keys: '[MouseRight]' })
+    await user.click(screen.getByText('Rename'))
+
+    await waitFor(() => {
+      expect(apiMocks.patch).toHaveBeenCalledWith(
+        '/api/session-names',
+        {
+          target: { kind: 'session', provider: 'claude', sessionId: VALID_SESSION_ID },
+          name: 'Renamed canonically',
+          nameIntent: 'user',
+        },
+        expect.anything(),
+      )
+    })
+    // No legacy alias-store patch rode along.
+    const legacyCalls = apiMocks.patch.mock.calls.filter(([pathArg]) => (
+      typeof pathArg === 'string' && pathArg.startsWith('/api/sessions/')
+    ))
+    expect(legacyCalls).toEqual([])
+    // The accepted record folded into the canonical cache.
+    const key = JSON.stringify(['session', 'claude', VALID_SESSION_ID])
+    await waitFor(() => {
+      expect(store.getState().sessionNames.records[key]?.name).toBe('Renamed canonically')
+    })
+    promptSpy.mockRestore()
   })
 
   it('uses the history session window for history-session actions even when sidebar has a conflicting session snapshot', async () => {

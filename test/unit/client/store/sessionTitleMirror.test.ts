@@ -4,6 +4,8 @@ import tabsReducer, { addTab } from '@/store/tabsSlice'
 import { panesSlice, initLayout, updatePaneTitle, updatePaneTitleBySessionRef } from '@/store/panesSlice'
 import sessionsReducer, { commitSessionWindowVisibleRefresh } from '@/store/sessionsSlice'
 import { sessionTitleMirrorMiddleware } from '@/store/sessionTitleMirror'
+import { getFreshAgentLabel } from '@/lib/fresh-agent-registry'
+import { getProviderLabel } from '@/lib/coding-cli-utils'
 import {
   foldTerminalInventoryTitles,
   recordTerminalTitleForReplay,
@@ -21,7 +23,15 @@ function buildStore() {
   })
 }
 
-function seedFreshAgentPane(store: ReturnType<typeof buildStore>, sessionId: string, provider = 'opencode') {
+/**
+ * Unified agent names (Task 5): the mirror now serves only the RETAINED
+ * LEGACY scope — out-of-scope panes (kilroy here; shells and non-unified
+ * providers below). Scoped agent panes (freshclaude/freshcodex/
+ * freshopencode and the claude/codex/opencode terminal modes) are excluded:
+ * their display comes from the canonical sessionNames cache. The full
+ * behavioral matrix below keeps its meaning for the retained scope.
+ */
+function seedFreshAgentPane(store: ReturnType<typeof buildStore>, sessionId: string, provider = 'claude') {
   store.dispatch(addTab({ id: 'tab-z', title: 'ZZ probe' }))
   store.dispatch(initLayout({
     tabId: 'tab-z',
@@ -30,7 +40,7 @@ function seedFreshAgentPane(store: ReturnType<typeof buildStore>, sessionId: str
       kind: 'fresh-agent',
       provider,
       sessionId,
-      sessionType: 'freshopencode',
+      sessionType: 'kilroy',
       sessionRef: { provider, sessionId },
     },
   }))
@@ -63,43 +73,43 @@ function landSessionRow(store: ReturnType<typeof buildStore>, row: {
 describe('sessionTitleMirrorMiddleware', () => {
   it('mirrors a session-directory title into a matching fresh-agent pane (the MCP-created-pane symptom)', () => {
     const store = buildStore()
-    seedFreshAgentPane(store, 'sess-1')
-    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'ZZ probe summarize' })
+    seedFreshAgentPane(store, DURABLE_CLAUDE)
+    landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider: 'claude', title: 'ZZ probe summarize' })
     expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('ZZ probe summarize')
     expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-z']).toBeFalsy()
   })
 
   it('never overwrites a user-set pane title', () => {
     const store = buildStore()
-    seedFreshAgentPane(store, 'sess-1')
+    seedFreshAgentPane(store, DURABLE_CLAUDE)
     store.dispatch(updatePaneTitle({ tabId: 'tab-z', paneId: 'pane-z', title: 'My name', setByUser: true }))
-    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'Directory title' })
+    landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider: 'claude', title: 'Directory title' })
     expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('My name')
   })
 
   it('skips rows without a title and ignores non-sessions actions', () => {
     const store = buildStore()
-    seedFreshAgentPane(store, 'sess-1')
+    seedFreshAgentPane(store, DURABLE_CLAUDE)
     const seeded = store.getState().panes.paneTitles['tab-z']['pane-z']
-    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode' })
+    landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider: 'claude' })
     store.dispatch({ type: 'settings/updated', payload: {} })
     expect(store.getState().panes.paneTitles['tab-z']?.['pane-z']).toBe(seeded)
   })
 
   it('does not re-dispatch when the mirrored title already equals the pane title', () => {
     const store = buildStore()
-    seedFreshAgentPane(store, 'sess-1')
-    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'Same title' })
+    seedFreshAgentPane(store, DURABLE_CLAUDE)
+    landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider: 'claude', title: 'Same title' })
     const before = store.getState()
-    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'Same title' })
+    landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider: 'claude', title: 'Same title' })
     expect(store.getState().panes).toBe(before.panes)
   })
 
   it('a row RETAINED from an older fetch does not beat a fresher row another window fetched later (the deep-page retention case)', () => {
     const store = buildStore()
-    seedFreshAgentPane(store, 'sess-1')
-    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'Retained sidebar title', lastActivityAt: 2_000 })
-    landSessionRow(store, { surface: 'history', sessionId: 'sess-1', provider: 'opencode', title: 'Fresh history title', lastActivityAt: 2_000 })
+    seedFreshAgentPane(store, DURABLE_CLAUDE)
+    landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider: 'claude', title: 'Retained sidebar title', lastActivityAt: 2_000 })
+    landSessionRow(store, { surface: 'history', sessionId: DURABLE_CLAUDE, provider: 'claude', title: 'Fresh history title', lastActivityAt: 2_000 })
     expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Fresh history title')
     // The later sidebar refresh commits the merged window the real thunk
     // builds — the retained row carries its existing fetchSeq because
@@ -116,24 +126,24 @@ describe('sessionTitleMirrorMiddleware', () => {
 
   it('equal-activity rows fetched fresh by both windows: the later-fetched row wins (History holds the newer title)', () => {
     const store = buildStore()
-    seedFreshAgentPane(store, 'sess-1')
-    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'Older sidebar title', lastActivityAt: 2_000 })
-    landSessionRow(store, { surface: 'history', sessionId: 'sess-1', provider: 'opencode', title: 'Newer history title', lastActivityAt: 2_000 })
+    seedFreshAgentPane(store, DURABLE_CLAUDE)
+    landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider: 'claude', title: 'Older sidebar title', lastActivityAt: 2_000 })
+    landSessionRow(store, { surface: 'history', sessionId: DURABLE_CLAUDE, provider: 'claude', title: 'Newer history title', lastActivityAt: 2_000 })
     expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Newer history title')
   })
 
   it('titles a pane created AFTER its directory row is already loaded (the missed-ordering symptom)', () => {
     const store = buildStore()
-    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'ZZ probe summarize' })
-    seedFreshAgentPane(store, 'sess-1')
+    landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider: 'claude', title: 'ZZ probe summarize' })
+    seedFreshAgentPane(store, DURABLE_CLAUDE)
     expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('ZZ probe summarize')
     expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-z']).toBeFalsy()
   })
 
   it('a splitPane that binds a new pane to an already-landed session row mirrors the split pane (REST/MCP split binding path)', () => {
     const store = buildStore()
-    seedFreshAgentPane(store, 'sess-1')
-    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'ZZ probe summarize' })
+    seedFreshAgentPane(store, DURABLE_CLAUDE)
+    landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider: 'claude', title: 'ZZ probe summarize' })
     store.dispatch({
       type: 'panes/splitPane',
       payload: {
@@ -143,10 +153,10 @@ describe('sessionTitleMirrorMiddleware', () => {
         newPaneId: 'pane-z-split',
         newContent: {
           kind: 'fresh-agent',
-          provider: 'opencode',
-          sessionId: 'sess-1',
-          sessionType: 'freshopencode',
-          sessionRef: { provider: 'opencode', sessionId: 'sess-1' },
+          provider: 'claude',
+          sessionId: DURABLE_CLAUDE,
+          sessionType: 'kilroy',
+          sessionRef: { provider: 'claude', sessionId: DURABLE_CLAUDE },
         },
       },
     })
@@ -156,7 +166,7 @@ describe('sessionTitleMirrorMiddleware', () => {
 
   it('mirrors into EVERY pane bound to the same session (two panes in one tab; the churn guard then rests)', () => {
     const store = buildStore()
-    seedFreshAgentPane(store, 'sess-1')
+    seedFreshAgentPane(store, DURABLE_CLAUDE)
     store.dispatch({
       type: 'panes/splitPane',
       payload: {
@@ -166,18 +176,18 @@ describe('sessionTitleMirrorMiddleware', () => {
         newPaneId: 'pane-z-2',
         newContent: {
           kind: 'fresh-agent',
-          provider: 'opencode',
-          sessionId: 'sess-1',
-          sessionType: 'freshopencode',
-          sessionRef: { provider: 'opencode', sessionId: 'sess-1' },
+          provider: 'claude',
+          sessionId: DURABLE_CLAUDE,
+          sessionType: 'kilroy',
+          sessionRef: { provider: 'claude', sessionId: DURABLE_CLAUDE },
         },
       },
     })
-    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'Both mirror' })
+    landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider: 'claude', title: 'Both mirror' })
     expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Both mirror')
     expect(store.getState().panes.paneTitles['tab-z']['pane-z-2']).toBe('Both mirror')
     const before = store.getState()
-    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'Both mirror' })
+    landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider: 'claude', title: 'Both mirror' })
     expect(store.getState().panes).toBe(before.panes)
   })
 
@@ -196,6 +206,7 @@ describe('sessionTitleMirrorMiddleware', () => {
   // fresh-agent-turn-complete.test.ts:143-184. Directory rows key by the
   // durable UUID, so the mirror must title the pane through sessionRef.
   const DURABLE_CLAUDE = '11111111-2222-4333-8444-555555555555'
+  const DURABLE_CLAUDE_2 = '22222222-3333-4444-8555-666666666666'
 
   function seedLiveDualIdClaudePane(store: ReturnType<typeof buildStore>) {
     store.dispatch(addTab({ id: 'tab-z', title: 'Claude probe' }))
@@ -205,7 +216,7 @@ describe('sessionTitleMirrorMiddleware', () => {
       content: {
         kind: 'fresh-agent',
         provider: 'claude',
-        sessionType: 'freshclaude',
+        sessionType: 'kilroy',
         sessionId: 'claude-runtime-nanoid',
         createRequestId: 'req-claude',
         status: 'connected',
@@ -238,27 +249,27 @@ describe('sessionTitleMirrorMiddleware', () => {
       paneId: 'pane-z',
       content: {
         kind: 'fresh-agent',
-        provider: 'opencode',
-        sessionType: 'freshopencode',
+        provider: 'claude',
+        sessionType: 'kilroy',
         createRequestId: 'req-z',
         status: 'idle',
-        sessionRef: { provider: 'opencode', sessionId: 'sess-1' },
+        sessionRef: { provider: 'claude', sessionId: DURABLE_CLAUDE },
       },
     }))
-    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'ZZ probe summarize' })
+    landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider: 'claude', title: 'ZZ probe summarize' })
     expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('ZZ probe summarize')
     expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-z']).toBeFalsy()
   })
 
   it('updates the pane title when applyFreshAgentReconcileAttach rebinds the pane to a different titled session', () => {
     const store = buildStore()
-    seedFreshAgentPane(store, 'sess-1')
-    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-1', provider: 'opencode', title: 'Old session title' })
-    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-2', provider: 'opencode', title: 'New session title' })
+    seedFreshAgentPane(store, DURABLE_CLAUDE)
+    landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider: 'claude', title: 'Old session title' })
+    landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE_2, provider: 'claude', title: 'New session title' })
     expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Old session title')
     store.dispatch({
       type: 'panes/applyFreshAgentReconcileAttach',
-      payload: { tabId: 'tab-z', paneId: 'pane-z', sessionRef: { provider: 'opencode', sessionId: 'sess-2' } },
+      payload: { tabId: 'tab-z', paneId: 'pane-z', sessionRef: { provider: 'claude', sessionId: DURABLE_CLAUDE_2 } },
     })
     expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('New session title')
   })
@@ -277,7 +288,7 @@ describe('sessionTitleMirrorMiddleware', () => {
       paneId: 'pane-z',
       content: {
         kind: 'terminal',
-        mode: 'claude',
+        mode: 'shell',
         createRequestId: 'req-t',
         status: 'running',
         terminalId: 'term-1',
@@ -318,12 +329,12 @@ describe('sessionTitleMirrorMiddleware', () => {
 
   it('never overwrites a user-set pane title when reconcile-attach rebinds the pane (rename-scope contract)', () => {
     const store = buildStore()
-    seedFreshAgentPane(store, 'sess-1')
+    seedFreshAgentPane(store, DURABLE_CLAUDE)
     store.dispatch(updatePaneTitle({ tabId: 'tab-z', paneId: 'pane-z', title: 'My name', setByUser: true }))
-    landSessionRow(store, { surface: 'sidebar', sessionId: 'sess-2', provider: 'opencode', title: 'New session title' })
+    landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE_2, provider: 'claude', title: 'New session title' })
     store.dispatch({
       type: 'panes/applyFreshAgentReconcileAttach',
-      payload: { tabId: 'tab-z', paneId: 'pane-z', sessionRef: { provider: 'opencode', sessionId: 'sess-2' } },
+      payload: { tabId: 'tab-z', paneId: 'pane-z', sessionRef: { provider: 'claude', sessionId: DURABLE_CLAUDE_2 } },
     })
     expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('My name')
   })
@@ -348,7 +359,7 @@ describe('sessionTitleMirrorMiddleware', () => {
         content: {
           kind: 'fresh-agent',
           provider: 'claude',
-          sessionType: 'freshclaude',
+          sessionType: 'kilroy',
           sessionId: DURABLE_CLAUDE,
           createRequestId: 'req-fa',
           status: 'connected',
@@ -364,7 +375,7 @@ describe('sessionTitleMirrorMiddleware', () => {
           newPaneId: 'pane-term',
           newContent: {
             kind: 'terminal',
-            mode: 'claude',
+            mode: 'shell',
             createRequestId: 'req-term',
             status: 'running',
             terminalId: 'term-1',
@@ -432,7 +443,7 @@ describe('sessionTitleMirrorMiddleware', () => {
         paneId: 'pane-z',
         content: {
           kind: 'terminal',
-          mode: 'claude',
+          mode: 'shell',
           createRequestId: 'req-unbound',
           status: 'exited',
           sessionRef: { provider: 'claude', sessionId: 's1' },
@@ -500,7 +511,7 @@ describe('sessionTitleMirrorMiddleware', () => {
         paneId: 'pane-z',
         content: {
           kind: 'terminal',
-          mode: 'claude',
+          mode: 'shell',
           createRequestId: 'req-e2r5',
           status: 'running',
           terminalId,
@@ -555,6 +566,67 @@ describe('sessionTitleMirrorMiddleware', () => {
       // the registry title.
       landSessionRow(store, { surface: 'sidebar', sessionId: 's1', provider: 'claude', title: 'Directory title again' })
       expect(store.getState().panes.paneTitles['tab-z']['pane-z']).toBe('Registry title')
+      expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-z']).toBeFalsy()
+    })
+  })
+
+  /**
+   * Unified agent names (Task 5): the scoped agent panes are EXCLUDED from
+   * this legacy mirror — their display is the canonical session name from
+   * the sessionNames cache, and no directory-row mirror write (or user
+   * flag) ever lands on them. Kilroy, shells, and non-unified providers
+   * keep the mirror (the matrix above).
+   */
+  describe('unified agent names: scoped panes never mirror', () => {
+    it.each([
+      ['freshclaude', 'claude'],
+      ['freshcodex', 'codex'],
+      ['freshopencode', 'opencode'],
+      ['kilroy', 'claude'],
+    ] as const)('fresh pane %s: mirrored only when out of scope', (sessionType, provider) => {
+      const store = buildStore()
+      store.dispatch(addTab({ id: 'tab-z', title: 'Scoped probe' }))
+      store.dispatch(initLayout({
+        tabId: 'tab-z',
+        paneId: 'pane-z',
+        content: {
+          kind: 'fresh-agent',
+          provider,
+          sessionType,
+          sessionId: DURABLE_CLAUDE,
+          sessionRef: { provider, sessionId: DURABLE_CLAUDE },
+        },
+      }))
+      landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider, title: 'Directory title' })
+      const paneTitle = store.getState().panes.paneTitles['tab-z']?.['pane-z']
+      if (sessionType === 'kilroy') {
+        expect(paneTitle).toBe('Directory title')
+      } else {
+        // The pane keeps its derived default — the directory row never
+        // mirrors into a scoped pane.
+        expect(paneTitle).toBe(getFreshAgentLabel(sessionType))
+        expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-z']).toBeFalsy()
+      }
+    })
+
+    it.each(['claude', 'codex', 'opencode'] as const)('a scoped %s terminal pane never mirrors the directory row', (mode) => {
+      const store = buildStore()
+      store.dispatch(addTab({ id: 'tab-z', title: 'Scoped terminal probe' }))
+      store.dispatch(initLayout({
+        tabId: 'tab-z',
+        paneId: 'pane-z',
+        content: {
+          kind: 'terminal',
+          mode,
+          createRequestId: 'req-scoped-term',
+          status: 'running',
+          sessionRef: { provider: mode, sessionId: DURABLE_CLAUDE },
+        },
+      }))
+      landSessionRow(store, { surface: 'sidebar', sessionId: DURABLE_CLAUDE, provider: mode, title: 'Directory title' })
+      // The pane keeps its derived provider label — the directory row never
+      // mirrors into a scoped terminal pane.
+      expect(store.getState().panes.paneTitles['tab-z']?.['pane-z']).toBe(getProviderLabel(mode))
       expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-z']).toBeFalsy()
     })
   })

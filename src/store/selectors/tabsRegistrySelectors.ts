@@ -4,6 +4,7 @@ import type { RegistryTabRecord } from '@/store/tabRegistryTypes'
 import { buildOpenTabRegistryRecord } from '@/lib/tab-registry-snapshot'
 import { UNKNOWN_SERVER_INSTANCE_ID } from '@/store/tabRegistryConstants'
 import { deriveTabRecencyAt } from '@/lib/tab-recency'
+import { selectScopedTabDisplayTitles } from '@/store/selectors/sessionNameSelectors'
 
 const EMPTY_PANE_LAST_INPUT_AT: Record<string, number | undefined> = {}
 const EMPTY_REGISTRY_RECORDS: RegistryTabRecord[] = []
@@ -105,8 +106,8 @@ const selectClosedRetentionDays = (state: RootState) => Math.min(30, Math.max(1,
 )))
 
 export const selectLiveLocalTabRecords = createSelector(
-  [selectTabs, selectLayouts, selectPaneTitles, selectPaneLastInputAt, selectDeviceId, selectDeviceLabel, selectServerInstanceId, selectExtensionEntries],
-  (tabs, layouts, paneTitles, paneLastInputAt, deviceId, deviceLabel, serverInstanceId, extensions): RegistryTabRecord[] => {
+  [selectTabs, selectLayouts, selectPaneTitles, selectPaneLastInputAt, selectDeviceId, selectDeviceLabel, selectServerInstanceId, selectExtensionEntries, selectScopedTabDisplayTitles],
+  (tabs, layouts, paneTitles, paneLastInputAt, deviceId, deviceLabel, serverInstanceId, extensions, scopedTabTitles): RegistryTabRecord[] => {
     const records: RegistryTabRecord[] = []
     for (const tab of tabs) {
       const layout = layouts[tab.id]
@@ -116,7 +117,7 @@ export const selectLiveLocalTabRecords = createSelector(
         layout,
         paneLastInputAt,
       })
-      records.push(buildOpenTabRegistryRecord({
+      const record = buildOpenTabRegistryRecord({
         tab,
         layout,
         serverInstanceId,
@@ -126,7 +127,15 @@ export const selectLiveLocalTabRecords = createSelector(
         deviceLabel,
         revision: 0,
         updatedAt,
-      }))
+      })
+      // Unified agent names (Task 5): a session-owned local tab's registry
+      // summary shows its canonical session name (the tab keeps no
+      // independently stored name); legacy tabs keep the built title.
+      const canonicalTitle = scopedTabTitles?.[tab.id]
+      if (canonicalTitle) {
+        record.tabName = canonicalTitle
+      }
+      records.push(record)
     }
     return records.sort(sortUpdatedDesc)
   },

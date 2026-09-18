@@ -79,6 +79,7 @@ import {
 } from '@/lib/terminal-restore'
 import { isTerminalPasteShortcut } from '@/lib/terminal-input-policy'
 import { terminalFollowsOscTitle } from '@/lib/terminal-title-policy'
+import { isUnifiedAgentMode } from '@shared/session-names'
 import { recordTerminalTitleForReplay } from '@/lib/terminal-inventory-titles'
 import {
   clearTerminalCursor,
@@ -4783,11 +4784,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           // snapshot. The pane's own title update below stays tid-gated.
           recordTerminalTitleForReplay(msg.terminalId, msg.title)
           if (msg.terminalId === tid) {
+            // Unified agent names (Task 5): a scoped coding-agent terminal's
+            // presentation comes from the canonical sessionNames cache — an
+            // unrevisioned registry title never rewrites its pane, and it
+            // can never name a session-owned tab (only the tab's stable
+            // source pane's session owns that tab's display).
+            const scopedPane = isUnifiedAgentMode(contentRef.current?.mode, undefined)
             const titleTab = tabRef.current
-            if (titleTab && !titleTab.titleSetByUser) {
+            if (!scopedPane && titleTab && !titleTab.titleSetByUser) {
               dispatch(updateTab({ id: titleTab.id, updates: { title: msg.title } }))
             }
-            dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: msg.title, setByUser: false }))
+            if (!scopedPane) {
+              dispatch(updatePaneTitle({ tabId, paneId: paneIdRef.current, title: msg.title, setByUser: false }))
+            }
           }
         }
 

@@ -1,5 +1,6 @@
 import { api } from '@/lib/api'
 import { extractTitleFromMessage } from '@shared/title-utils'
+import { isUnifiedAgentMode } from '@shared/session-names'
 import { updatePaneTitle } from './panesSlice'
 import { updateTab } from './tabsSlice'
 import type { AppDispatch, RootState } from './store'
@@ -8,32 +9,26 @@ import type { AppDispatch, RootState } from './store'
  * Finalize the name of a coding-agent SDK session (fresh-agent)
  * from its first user message.
  *
- * The server is the single writer of the session title override (which drives
- * the sidebar). On the first message we:
- *
- *  1. If no Gemini key is configured, apply the first-message name immediately
- *     so there is no round-trip latency (matches decision: dir -> first-message).
- *  2. Always POST generate-title so the server persists the canonical override
- *     and, when a Gemini key IS configured, returns the AI name which replaces
- *     the working-directory placeholder once ready (decision: dir -> Gemini).
- *
- * The resolved title is mirrored into the pane (and the tab, for single-pane
- * tabs) as an automatic (non-user) title so tab, pane and sidebar align. SDK
- * panes are not PTY terminals, so the server's terminal title promotion does
- * not reach them — this mirror is how they pick up the canonical name. The
- * local first-message title uses the same default length as the server's
- * first-message override so the two never disagree.
+ * Unified agent names (Task 5): scoped fresh types (freshclaude, freshcodex,
+ * freshopencode) no longer run ANY client-side generation — the server's
+ * input-activity pipeline owns their fallback and AI naming, and the accepted
+ * name arrives through the canonical `session.name.updated` push. This thunk
+ * remains ONLY for the out-of-scope fresh types (kilroy), whose legacy
+ * naming behavior is preserved unchanged.
  */
 export function finalizeCodingAgentSessionName(input: {
   tabId: string
   paneId: string
   provider: string
+  sessionType?: string
   sessionId: string
   firstMessage: string
 }) {
   return async (dispatch: AppDispatch, getState: () => RootState) => {
-    const { tabId, paneId, provider, sessionId, firstMessage } = input
+    const { tabId, paneId, provider, sessionType, sessionId, firstMessage } = input
     if (!firstMessage.trim()) return
+    // Scoped modes: the server's session-activity pipeline owns naming.
+    if (isUnifiedAgentMode(provider, sessionType)) return
 
     const applyTitle = (title: string) => {
       dispatch(updatePaneTitle({ tabId, paneId, title, setByUser: false }))

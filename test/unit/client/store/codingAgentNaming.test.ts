@@ -14,24 +14,45 @@ const apiMocks = vi.hoisted(() => ({ post: vi.fn() }))
 const apiPost = apiMocks.post
 vi.mock('@/lib/api', () => ({ api: { post: apiMocks.post } }))
 
-function singlePaneStore() {
+function singlePaneStore(sessionType: 'kilroy' | 'freshclaude' | 'claude') {
   const store = configureStore({ reducer: { tabs: tabsReducer, panes: panesReducer } })
   store.dispatch(addTab({ title: 'freshell', mode: 'claude' }))
   const tabId = store.getState().tabs.tabs[0].id
-  store.dispatch(initLayout({ tabId, content: { kind: 'fresh-agent', sessionType: 'claude', provider: 'claude', sessionId: 'sess-1', createRequestId: 'r', status: 'idle' } }))
+  store.dispatch(initLayout({ tabId, content: { kind: 'fresh-agent', sessionType, provider: 'claude', sessionId: 'sess-1', createRequestId: 'r', status: 'idle' } }))
   const paneId = (store.getState().panes.layouts[tabId] as Extract<PaneNode, { type: 'leaf' }>).id
   return { store, tabId, paneId }
 }
 
+/**
+ * Unified agent names (Task 5): the scoped fresh types (freshclaude,
+ * freshcodex, freshopencode) no longer run ANY client-side generation — the
+ * server's input-activity pipeline owns their fallback and AI naming, and
+ * the accepted name arrives through the canonical session.name.updated push.
+ * These tests pin BOTH sides: the scoped no-op, and the retained legacy
+ * finalize for the out-of-scope kilroy type (unchanged behavior).
+ */
 describe('finalizeCodingAgentSessionName', () => {
   beforeEach(() => apiPost.mockReset())
 
-  it('POSTs generate-title and mirrors the server title into pane + single-pane tab', async () => {
-    apiPost.mockResolvedValue({ title: 'Fix login redirect', source: 'ai' })
-    const { store, tabId, paneId } = singlePaneStore()
+  it('no-ops for scoped fresh types: no POST, no pane/tab title writes', async () => {
+    const { store, tabId, paneId } = singlePaneStore('freshclaude')
 
     await store.dispatch(finalizeCodingAgentSessionName({
-      tabId, paneId, provider: 'claude', sessionId: 'sess-1', firstMessage: 'please fix the login redirect bug',
+      tabId, paneId, provider: 'claude', sessionType: 'freshclaude', sessionId: 'sess-1', firstMessage: 'please fix the login redirect bug',
+    }) as never)
+
+    expect(apiPost).not.toHaveBeenCalled()
+    // The pane keeps its derived default — nothing was written.
+    expect(store.getState().panes.paneTitles[tabId]?.[paneId]).toBe('Freshclaude')
+    expect(store.getState().tabs.tabs[0].title).toBe('freshell')
+  })
+
+  it('still POSTs generate-title for the out-of-scope kilroy type and mirrors the server title into pane + single-pane tab', async () => {
+    apiPost.mockResolvedValue({ title: 'Fix login redirect', source: 'ai' })
+    const { store, tabId, paneId } = singlePaneStore('kilroy')
+
+    await store.dispatch(finalizeCodingAgentSessionName({
+      tabId, paneId, provider: 'claude', sessionType: 'kilroy', sessionId: 'sess-1', firstMessage: 'please fix the login redirect bug',
     }) as never)
 
     expect(apiPost).toHaveBeenCalledWith(
@@ -42,23 +63,23 @@ describe('finalizeCodingAgentSessionName', () => {
     expect(store.getState().tabs.tabs[0].title).toBe('Fix login redirect')
   })
 
-  it('falls back to a local first-message title when the server returns no title', async () => {
+  it('falls back to a local first-message title for kilroy when the server returns no title', async () => {
     apiPost.mockResolvedValue({ title: null, source: 'none' })
-    const { store, tabId, paneId } = singlePaneStore()
+    const { store, tabId, paneId } = singlePaneStore('kilroy')
 
     await store.dispatch(finalizeCodingAgentSessionName({
-      tabId, paneId, provider: 'claude', sessionId: 'sess-1', firstMessage: 'Add a logout button to the header',
+      tabId, paneId, provider: 'claude', sessionType: 'kilroy', sessionId: 'sess-1', firstMessage: 'Add a logout button to the header',
     }) as never)
 
     expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('Add a logout button to the header')
   })
 
-  it('writes the pane title as an auto source (not a user freeze)', async () => {
+  it('writes the kilroy pane title as an auto source (not a user freeze)', async () => {
     apiPost.mockResolvedValue({ title: 'Server Title', source: 'first-message' })
-    const { store, tabId, paneId } = singlePaneStore()
+    const { store, tabId, paneId } = singlePaneStore('kilroy')
 
     await store.dispatch(finalizeCodingAgentSessionName({
-      tabId, paneId, provider: 'claude', sessionId: 'sess-1', firstMessage: 'hello',
+      tabId, paneId, provider: 'claude', sessionType: 'kilroy', sessionId: 'sess-1', firstMessage: 'hello',
     }) as never)
 
     expect(store.getState().panes.paneTitleSetByUser?.[tabId]?.[paneId]).toBeFalsy()

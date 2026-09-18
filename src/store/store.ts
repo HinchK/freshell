@@ -25,6 +25,7 @@ import tabRegistryReducer from './tabRegistrySlice'
 import machineIdentityReducer from './machineIdentitySlice'
 import extensionsReducer from './extensionsSlice'
 import deckReducer from './deckSlice'
+import sessionNamesReducer from './sessionNamesSlice'
 import { perfMiddleware } from './perfMiddleware'
 import { persistMiddleware } from './persistMiddleware'
 import { sessionActivityPersistMiddleware } from './sessionActivityPersistence'
@@ -33,6 +34,7 @@ import { createLogger } from '@/lib/client-logger'
 import { layoutMirrorMiddleware } from './layoutMirrorMiddleware'
 import { sessionTitleMirrorMiddleware } from './sessionTitleMirror'
 import { terminalInventoryTitleReplayMiddleware } from '@/lib/terminal-inventory-titles'
+import { sessionNamesIngestMiddleware } from './sessionNamesSlice'
 import { subagentInterestMiddleware } from './subagentInterestMiddleware'
 import { terminalDetachMiddleware } from './terminalDetachMiddleware'
 import { serverSettingsSaveStateMiddleware } from './settingsThunks'
@@ -83,6 +85,10 @@ export const store = configureStore({
     extensions: extensionsReducer,
     // Ephemeral device state — never persisted (allowlist rule)
     deck: deckReducer,
+    // Unified agent names (Task 5): the revisioned canonical-name cache —
+    // last-known server projections only, rebuilt from bootstrap/pushes.
+    // Never persisted (allowlist rule).
+    sessionNames: sessionNamesReducer,
   },
   middleware: (getDefault) =>
     getDefault({
@@ -100,6 +106,7 @@ export const store = configureStore({
       layoutMirrorMiddleware,
       sessionTitleMirrorMiddleware,
       terminalInventoryTitleReplayMiddleware,
+      sessionNamesIngestMiddleware,
       subagentInterestMiddleware,
       terminalDetachMiddleware,
       sessionActivityPersistMiddleware,

@@ -8,6 +8,9 @@ import panesReducer from '@/store/panesSlice'
 import settingsReducer, { defaultSettings } from '@/store/settingsSlice'
 import connectionReducer from '@/store/connectionSlice'
 import sessionsReducer from '@/store/sessionsSlice'
+import sessionNamesReducer from '@/store/sessionNamesSlice'
+import { receiveSessionNames } from '@/store/sessionNamesSlice'
+import { selectTabDisplayName, selectPaneDisplayName } from '@/store/selectors/sessionNameSelectors'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 import type { BackgroundTerminal, ProjectGroup } from '@/store/types'
 import {
@@ -152,6 +155,7 @@ function createStore(options: {
       connection: connectionReducer,
       sessions: sessionsReducer,
       sessionActivity: sessionActivityReducer,
+      sessionNames: sessionNamesReducer,
     },
     middleware: (getDefault) =>
       getDefault({
@@ -448,7 +452,7 @@ describe('sidebar click opens pane (e2e)', () => {
     expect(state.panes.layouts['tab-2'].type).toBe('leaf')
   })
 
-  it('syncs tab and pane title when clicking a renamed session already open in a pane', async () => {
+  it('focuses a renamed scoped session on click; the canonical name owns the display, never a local title write (Task 5)', async () => {
     const targetId = sessionId('renamed-session')
 
     const projects: ProjectGroup[] = [
@@ -461,6 +465,8 @@ describe('sidebar click opens pane (e2e)', () => {
             lastActivityAt: Date.now(),
             title: 'Renamed beside name',
             cwd: '/home/user/project',
+            nameRef: { kind: 'session', provider: 'claude', sessionId: targetId },
+            sessionName: 'Renamed beside name',
           },
         ],
       },
@@ -486,6 +492,7 @@ describe('sidebar click opens pane (e2e)', () => {
             content: {
               kind: 'terminal', mode: 'claude', createRequestId: 'req-2', status: 'running',
               resumeSessionId: targetId,
+              sessionRef: { provider: 'claude', sessionId: targetId },
             },
           },
         },
@@ -494,7 +501,21 @@ describe('sidebar click opens pane (e2e)', () => {
       },
     })
 
-    // Set a stale pane title to test it also gets synced
+    // The session's canonical record lives in the server store; the client
+    // folds it through the sessionNames cache.
+    store.dispatch(receiveSessionNames([{
+      record: {
+        ref: { kind: 'session', provider: 'claude', sessionId: targetId },
+        name: 'Renamed beside name',
+        source: 'manual',
+        revision: 4,
+      },
+      documentGeneration: 5,
+      redirects: [],
+      changed: true,
+    }]))
+
+    // Set a stale pane title to prove the click never syncs a local write.
     store.dispatch({ type: 'panes/updatePaneTitle', payload: { tabId: 'tab-2', paneId: 'pane-2', title: 'Old Pane Name', setByUser: false } })
 
     renderSidebar(store)
@@ -508,14 +529,17 @@ describe('sidebar click opens pane (e2e)', () => {
 
     const state = store.getState()
 
-    // Should focus the existing tab
+    // Should focus the existing tab and pane.
     expect(state.tabs.activeTabId).toBe('tab-2')
-    // Tab title should be updated
+    expect(state.panes.activePane['tab-2']).toBe('pane-2')
+    // The click performs NO local title write for a scoped session — the tab
+    // and pane keep their stored (stale) strings and the canonical record
+    // owns what the user actually sees on every surface.
     const tab = state.tabs.tabs.find((t) => t.id === 'tab-2')
-    expect(tab?.title).toBe('Renamed beside name')
-    // Pane title should also be updated (stale title replaced)
-    const paneTitle = state.panes.paneTitles?.['tab-2']?.['pane-2']
-    expect(paneTitle).toBe('Renamed beside name')
+    expect(tab?.title).toBe('Stale Title')
+    expect(state.panes.paneTitles?.['tab-2']?.['pane-2']).toBe('Old Pane Name')
+    expect(selectTabDisplayName(state, 'tab-2')).toBe('Renamed beside name')
+    expect(selectPaneDisplayName(state, 'tab-2', 'pane-2')).toBe('Renamed beside name')
   })
 
   it('does not sync title when clicking a session without a custom title (hasTitle=false)', async () => {

@@ -40,6 +40,9 @@ import {
   seedBrowserPreferencesSettingsIfEmpty,
 } from '@/lib/browser-preferences'
 import { handleUiCommand } from '@/lib/ui-commands'
+import { bootstrapSessionNames, collectSessionNameRefs } from '@/lib/session-names'
+import { receiveSessionNames, receiveSessionNameProjections } from '@/store/sessionNamesSlice'
+import { parseSessionNameUpdate } from '@/lib/session-names'
 import { getAuthToken } from '@/lib/auth'
 import { installTestHarness } from '@/lib/test-harness'
 import { checkServerBuildId } from '@/lib/server-build-check'
@@ -1215,6 +1218,12 @@ export default function App() {
         ),
       })
 
+      // Unified agent names (Task 5): the ready/reconnect batch bootstrap —
+      // collects every naming ref the client currently knows and reads them
+      // in 100-ref chunks from the server's canonical store.
+      const bootstrapSessionNamesNow = () =>
+        bootstrapSessionNames(collectSessionNameRefs(appStore.getState()))
+
       const unsubscribe = ws.onMessage((msg) => {
         if (!msg?.type) return
         if (msg.type === 'ready') {
@@ -1379,7 +1388,40 @@ export default function App() {
             dispatch(hostStatsSubscribedSet(true))
           }
           lastSessionsRevision = -1
+          // Unified agent names (Task 5): reconnect batch bootstrap — every
+          // naming ref this client knows about (open panes, directory rows,
+          // background terminals), independent of a mounted composer/history
+          // page. The fold is by revision: a fresh browser converges from an
+          // empty cache, a reconnect keeps its last-known projections and
+          // only applies newer records.
+          void bootstrapSessionNamesNow().then((updates) => {
+            if (updates.length > 0) dispatch(receiveSessionNames(updates))
+          }).catch((error: unknown) => log.debug('session name bootstrap failed', error))
           void recoverMissingStartupState()
+        }
+        // Unified agent names (Task 5): the canonical name broadcast.
+        // Folded at the connection layer, never inside a mounted view — a
+        // background pane, hidden tab, or unopened session converges too.
+        if (msg.type === 'session.name.updated') {
+          const update = parseSessionNameUpdate(msg)
+          if (update) {
+            dispatch(receiveSessionNames([update]))
+          }
+        }
+        // Unified agent names (Task 5): bare last-known record projections
+        // riding on creation/materialization frames (runtime-ID projections
+        // still point at pending handles until verified materialization).
+        if (
+          (msg.type === 'terminal.created'
+            || msg.type === 'freshAgent.created'
+            || msg.type === 'freshAgent.session.materialized')
+          && (msg as { nameRef?: unknown }).nameRef
+          && (msg as { sessionName?: unknown }).sessionName
+        ) {
+          dispatch(receiveSessionNameProjections([{
+            ref: (msg as { nameRef: unknown }).nameRef,
+            record: (msg as { sessionName: unknown }).sessionName,
+          }] as Parameters<typeof receiveSessionNameProjections>[0]))
         }
         if (msg.type === 'pane.reconcile.result') {
           const pending = pendingReconcileRef.current
@@ -1539,6 +1581,22 @@ export default function App() {
             remove: removedTerminalMetaIds,
           }))
           foldTerminalInventoryTitles(appStore, msg.terminals)
+          // Unified agent names (Task 5): inventory rows carry last-known
+          // canonical records — fold them into the sessionNames cache (the
+          // ingest middleware also sees the terminal-directory slice, but
+          // the boot frame reaches App directly).
+          {
+            const projections: Array<{ ref: unknown; record: unknown }> = []
+            for (const terminal of terminals) {
+              const row = terminal as { nameRef?: unknown; sessionName?: unknown }
+              if (row.nameRef && row.sessionName) {
+                projections.push({ ref: row.nameRef, record: row.sessionName })
+              }
+            }
+            if (projections.length > 0) {
+              dispatch(receiveSessionNameProjections(projections as Parameters<typeof receiveSessionNameProjections>[0]))
+            }
+          }
           // fetchTerminalDirectoryWindow still re-throws on failure, so contain its
           // rejection. queueActiveSessionWindowRefresh resolves even on failure.
           void appStore.dispatch(fetchTerminalDirectoryWindow({

@@ -152,11 +152,13 @@ export interface CodingCliSession {
    */
   nameRef?: SessionNameRef
   /**
-   * Unified agent names (Task 1): last-known canonical name projection.
-   * Never an independent override — the server's session.name.updated
-   * broadcast and batch reads refresh it by revision.
+   * Unified agent names (Task 2 projection): the durable record's CURRENT
+   * name (a plain string — the server merges it onto every directory row
+   * additively; manual/legacy-protected names also win the displayed
+   * `title`). The canonical sessionNames cache stays the live display
+   * authority; this is the row's last-known projection.
    */
-  sessionName?: SessionNameRecord
+  sessionName?: string
 }
 
 export interface ProjectGroup {

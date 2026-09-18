@@ -1,11 +1,16 @@
 import { useEffect, useMemo, useState } from 'react'
-import { useAppDispatch, useAppSelector } from '@/store/hooks'
+import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import type { CodingCliProviderName, CodingCliSession, ProjectGroup } from '@/store/types'
+import type { RootState } from '@/store/store'
 import { removeSessionFromProjects, toggleProjectExpanded } from '@/store/sessionsSlice'
 import { api } from '@/lib/api'
 import { activateSessionSurface, fetchSessionWindow } from '@/store/sessionsThunks'
 import { openSessionTab } from '@/store/tabsSlice'
 import { applySessionRenameCascade } from '@/store/titleSync'
+import { receiveSessionNames } from '@/store/sessionNamesSlice'
+import { renameSessionName, parseSessionNameUpdate } from '@/lib/session-names'
+import { isScopedSessionRow, selectSessionNameRecord } from '@/store/selectors/sessionNameSelectors'
+import type { SessionNameRef } from '@shared/session-names'
 import { cn } from '@/lib/utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
 import { useMobile } from '@/hooks/useMobile'
@@ -31,6 +36,23 @@ function getProjectName(path: string): string {
   return parts[parts.length - 1] || path
 }
 
+/**
+ * Unified agent names (Task 5): a scoped coding-agent row displays its
+ * canonical session name — the live canonical cache first (folded from
+ * `session.name.updated` in real time), then the directory row's additive
+ * `sessionName` projection (the durable record's last-known name) — over
+ * the provider-native `title`. Out-of-scope rows keep the existing title
+ * rule.
+ */
+function sessionDisplayName(session: CodingCliSession, sessionNames?: RootState['sessionNames']): string {
+  if (isScopedSessionRow(session.provider, session.sessionType)) {
+    const record = sessionNames?.records?.[JSON.stringify(['session', session.provider, session.sessionId])]
+    if (record) return record.name
+    if (session.sessionName) return session.sessionName
+  }
+  return session.title || ''
+}
+
 type MobileSessionSheetState = {
   session: CodingCliSession
   onOpen: () => void
@@ -40,8 +62,10 @@ type MobileSessionSheetState = {
 
 export default function HistoryView({ onOpenSession }: { onOpenSession?: () => void }) {
   const dispatch = useAppDispatch()
+  const store = useAppStore()
   const isMobile = useMobile()
   const expandedProjects = useAppSelector((s) => s.sessions.expandedProjects)
+  const sessionNames = useAppSelector((s) => s.sessionNames)
   const historyWindow = useAppSelector((s) => s.sessions.windows?.history)
   const projects = useAppSelector((s) => s.sessions.windows?.history?.projects ?? s.sessions.projects)
   const topLevelSessionCount = useAppSelector((s) => s.sessions.projects?.length ?? 0)
@@ -103,14 +127,60 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
     await refresh()
   }
 
+  /** The history window's row for a provider/session (naming capture). */
+  function findSessionRow(provider: string, sessionId: string): CodingCliSession | undefined {
+    for (const project of projects ?? []) {
+      const row = (project.sessions ?? []).find((s) => s.sessionId === sessionId && s.provider === provider)
+      if (row) return row
+    }
+    return undefined
+  }
+
   async function renameSession(provider: CodingCliProviderName | undefined, sessionId: string, titleOverride?: string, summaryOverride?: string) {
+    const resolvedProvider = provider || 'claude'
+    // Unified agent names (Task 5): a scoped session's rename targets the ONE
+    // canonical saved name with explicit user intent; the accepted record
+    // folds into the canonical cache and NO local user-flag cascade fires.
+    // A scoped saved name is never cleared, so a blank title skips the
+    // rename entirely (summary fields still patch through).
+    const sessionInfo = findSessionRow(resolvedProvider, sessionId)
+    if (isScopedSessionRow(resolvedProvider, sessionInfo?.sessionType)) {
+      const trimmedTitle = (titleOverride ?? '').trim()
+      if (trimmedTitle) {
+        try {
+          const target: SessionNameRef = sessionInfo?.nameRef
+            ?? { kind: 'session', provider: resolvedProvider as 'claude' | 'codex' | 'opencode', sessionId }
+          const ifRevision = selectSessionNameRecord(store.getState(), target)?.revision
+          const accepted = await renameSessionName({
+            target,
+            name: trimmedTitle,
+            nameIntent: 'user',
+            ...(ifRevision !== undefined ? { ifRevision } : {}),
+          })
+          dispatch(receiveSessionNames([accepted]))
+        } catch (error: any) {
+          // A conflict carries the server's accepted record: fold it so the
+          // winning name is visible everywhere.
+          const accepted = parseSessionNameUpdate(error?.data?.sessionName)
+          if (accepted) dispatch(receiveSessionNames([accepted]))
+        }
+      }
+      if (summaryOverride !== undefined) {
+        // Non-name summary fields still patch through the legacy store.
+        const compositeKey = `${resolvedProvider}:${sessionId}`
+        await api.patch(`/api/sessions/${encodeURIComponent(compositeKey)}`, { summaryOverride }).catch(() => {})
+      }
+      await refresh()
+      return
+    }
     // Use composite key format: provider:sessionId
-    const compositeKey = `${provider || 'claude'}:${sessionId}`
+    const compositeKey = `${resolvedProvider}:${sessionId}`
     const result = await api.patch<{ cascadedTerminalId?: string | null }>(`/api/sessions/${encodeURIComponent(compositeKey)}`, { titleOverride, summaryOverride })
     if (titleOverride) {
       applySessionRenameCascade({
         dispatch,
-        provider: provider || 'claude',
+        getState: store.getState,
+        provider: resolvedProvider,
         sessionId,
         title: titleOverride,
         cascadedTerminalId: result.cascadedTerminalId,
@@ -141,16 +211,17 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
   function openSession(session: CodingCliSession) {
     const label = getProviderLabel(session.provider)
     const mode = (session.provider || 'claude') as CodingCliProviderName
+    const displayName = sessionDisplayName(session, sessionNames)
     dispatch(openSessionTab({
       sessionId: session.sessionId,
-      title: session.title || label,
+      title: displayName || label,
       cwd: session.cwd,
       provider: mode,
       sessionType: session.sessionType || mode,
       firstUserMessage: session.firstUserMessage,
       isSubagent: session.isSubagent,
       isNonInteractive: session.isNonInteractive,
-      hasTitle: !!session.title,
+      hasTitle: !!displayName,
     }))
     onOpenSession?.()
   }
@@ -419,7 +490,13 @@ function SessionRow({
   onShowDetails: () => void
 }) {
   const [editing, setEditing] = useState(false)
-  const [title, setTitle] = useState(session.title || '')
+  // Unified agent names (Task 5): a scoped session row displays its
+  // canonical name — the live canonical cache first, then the row's additive
+  // last-known projection; the provider title stays visible only for
+  // out-of-scope rows.
+  const sessionNames = useAppSelector((s) => s.sessionNames)
+  const displayTitle = sessionDisplayName(session, sessionNames)
+  const [title, setTitle] = useState(displayTitle)
   const [summary, setSummary] = useState(session.summary || '')
 
   if (editing) {
@@ -451,7 +528,7 @@ function SessionRow({
           </button>
           <button
             onClick={() => {
-              setTitle(session.title || '')
+              setTitle(displayTitle)
               setSummary(session.summary || '')
               setEditing(false)
             }}
@@ -476,11 +553,11 @@ function SessionRow({
           type="button"
           className="flex-1 min-w-0 text-left cursor-pointer"
           onClick={isMobile ? onShowDetails : onOpen}
-          aria-label={`Open session ${session.title || session.sessionId.slice(0, 8)}`}
+          aria-label={`Open session ${displayTitle || session.sessionId.slice(0, 8)}`}
         >
           <div className="flex items-center gap-2">
             <span className="font-medium text-sm truncate">
-              {session.title || session.sessionId.slice(0, 8)}
+              {displayTitle || session.sessionId.slice(0, 8)}
             </span>
             <span className="text-2xs text-muted-foreground bg-muted/60 px-1.5 py-0.5 rounded">
               {getProviderLabel(session.provider)}
@@ -552,13 +629,14 @@ function MobileSessionDetailsSheet({
   onRename: (title?: string, summary?: string) => void
   onDelete: () => void
 }) {
-  const [title, setTitle] = useState(session.title || '')
+  const sessionNames = useAppSelector((s) => s.sessionNames)
+  const [title, setTitle] = useState(sessionDisplayName(session, sessionNames))
   const [summary, setSummary] = useState(session.summary || '')
 
   useEffect(() => {
-    setTitle(session.title || '')
+    setTitle(sessionDisplayName(session, sessionNames))
     setSummary(session.summary || '')
-  }, [session])
+  }, [session, sessionNames])
 
   return (
     <>
