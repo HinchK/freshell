@@ -97,6 +97,16 @@ export default function PanesSettings({
           />
         </SettingsRow>
 
+        <SettingsRow label="Show button to split panes" description="Show the floating add/split button in the corner of the pane area.">
+          <Toggle
+            checked={settings.panes?.floatingActionButton ?? false}
+            aria-label="Show button to split panes"
+            onChange={(checked) => {
+              applyLocalSetting({ panes: { floatingActionButton: checked } })
+            }}
+          />
+        </SettingsRow>
+
         <SettingsRow label="Tab completion indicator">
           <SegmentedControl
             value={settings.panes?.tabAttentionStyle ?? 'highlight'}

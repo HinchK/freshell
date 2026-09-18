@@ -82,7 +82,7 @@ const TERMINAL_LOCAL_KEYS = [
   'osc52Clipboard',
   'renderer',
 ] as const
-const PANES_LOCAL_KEYS = ['snapThreshold', 'iconsOnTabs', 'tabAttentionStyle', 'attentionDismiss', 'sessionOpenMode', 'multirowTabs', 'repoIconsOnTabs', 'tabBarRows'] as const
+const PANES_LOCAL_KEYS = ['snapThreshold', 'iconsOnTabs', 'tabAttentionStyle', 'attentionDismiss', 'sessionOpenMode', 'multirowTabs', 'repoIconsOnTabs', 'tabBarRows', 'floatingActionButton'] as const
 const SIDEBAR_LOCAL_KEYS = [
   'sortMode',
   'worktreeGrouping',
@@ -215,6 +215,7 @@ export type LocalSettings = {
     multirowTabs: boolean
     repoIconsOnTabs: boolean
     tabBarRows: number
+    floatingActionButton: boolean
   }
   sidebar: {
     sortMode: SidebarSortMode
@@ -270,6 +271,21 @@ export type ResolvedSettings = {
 
 type SettingsDefaultsOptions = {
   loggingDebug?: boolean
+}
+
+/**
+ * Platform-dependent defaults for browser-local settings. The shared layer
+ * stays deterministic: every option is optional and, when omitted, the
+ * static defaultLocalSettings value applies. The browser client injects
+ * its boot-time platform snapshot (desktop vs mobile viewport class) so
+ * resolution AND the browser-preferences write-diff share one base within
+ * a boot; Node tools and zero-arg callers keep the static defaults.
+ */
+export interface LocalSettingsPlatformDefaults {
+  /** Default for panes.floatingActionButton. Undefined = the shared
+   * static default (false). Desktop clients pass true; mobile clients
+   * pass false. */
+  floatingActionButtonDefault?: boolean
 }
 
 const ThemeSchema = z.enum(THEME_VALUES)
@@ -585,6 +601,9 @@ function normalizeExtractedLocalSeed(patch: Record<string, unknown>): LocalSetti
     )
     if (normalizedTabBarRows !== undefined) {
       panes.tabBarRows = normalizedTabBarRows
+    }
+    if (typeof patch.panes.floatingActionButton === 'boolean') {
+      panes.floatingActionButton = patch.panes.floatingActionButton as boolean
     }
     if (Object.keys(panes).length > 0) {
       normalized.panes = panes
@@ -910,6 +929,7 @@ export const defaultLocalSettings: LocalSettings = {
     multirowTabs: true,
     repoIconsOnTabs: true,
     tabBarRows: TAB_BAR_ROWS_DEFAULT,
+    floatingActionButton: false,
   },
   sidebar: {
     sortMode: 'activity',
@@ -1319,19 +1339,29 @@ export function mergeServerSettings(base: ServerSettings, patch: ServerSettingsP
   }
 }
 
-export function resolveLocalSettings(patch?: LocalSettingsPatch): LocalSettings {
+export function panesDefaultsWith(options: LocalSettingsPlatformDefaults): LocalSettings['panes'] {
+  return options.floatingActionButtonDefault === undefined
+    ? defaultLocalSettings.panes
+    : { ...defaultLocalSettings.panes, floatingActionButton: options.floatingActionButtonDefault }
+}
+
+export function resolveLocalSettings(
+  patch?: LocalSettingsPatch,
+  options: LocalSettingsPlatformDefaults = {},
+): LocalSettings {
   const migratedFreshAgentPatch = patch
     ? migrateLegacyFreshAgentSettingsInput(patch as Record<string, unknown>).freshAgent as FreshAgentSettingsPatchInput | undefined
     : undefined
   const freshAgentPatch = sanitizeFreshAgentLocalSettingsPatchInput(
     isRecord(migratedFreshAgentPatch) ? migratedFreshAgentPatch : {},
   )
+  const panesDefaults = panesDefaultsWith(options)
   return {
     ...defaultLocalSettings,
     ...(hasOwn(patch, 'theme') ? { theme: patch?.theme ?? defaultLocalSettings.theme } : {}),
     ...(hasOwn(patch, 'uiScale') ? { uiScale: patch?.uiScale ?? defaultLocalSettings.uiScale } : {}),
     terminal: mergeDefined(defaultLocalSettings.terminal, patch?.terminal),
-    panes: mergeDefined(defaultLocalSettings.panes, patch?.panes),
+    panes: mergeDefined(panesDefaults, patch?.panes),
     sidebar: {
       ...mergeDefined(defaultLocalSettings.sidebar, patch?.sidebar),
       sortMode: normalizeLocalSortMode(patch?.sidebar?.sortMode),

@@ -5,7 +5,8 @@ import { Provider } from 'react-redux'
 import PaneLayout from '@/components/panes/PaneLayout'
 import panesReducer from '@/store/panesSlice'
 import tabsReducer from '@/store/tabsSlice'
-import settingsReducer from '@/store/settingsSlice'
+import settingsReducer, { setLocalSettings } from '@/store/settingsSlice'
+import { resolveLocalSettings } from '@shared/settings'
 import type { PanesState } from '@/store/panesSlice'
 import type { PaneNode, PaneContent } from '@/store/paneTypes'
 import { installPaneGeometry } from '@test/helpers/pane-geometry'
@@ -176,6 +177,15 @@ function renderWithStore(
   store: ReturnType<typeof createStore>
 ) {
   return render(<Provider store={store}>{ui}</Provider>)
+}
+
+function createStoreWithFab(initialPanesState: Partial<PanesState> = {}) {
+  const store = createStore(initialPanesState)
+  store.dispatch({
+    type: 'settings/updateSettingsLocal',
+    payload: { panes: { floatingActionButton: true } },
+  })
+  return store
 }
 
 describe('PaneLayout', () => {
@@ -369,7 +379,7 @@ describe('PaneLayout', () => {
       expect(await screen.findByTestId(`editor-${existingPaneId}`)).toBeInTheDocument()
     })
 
-    it('renders FloatingActionButton', async () => {
+    it('shows the floating action button by default on desktop', async () => {
       const existingPaneId = 'pane-1'
       const store = createStore({
         layouts: {
@@ -387,15 +397,70 @@ describe('PaneLayout', () => {
         store
       )
 
-      // FAB should be present
+      // jsdom boots desktop-ambient: the panes.floatingActionButton platform
+      // default is ON (desktop true / mobile false), so a default boot shows
+      // the FAB with no Settings change.
       expect(screen.getByTitle('Add pane')).toBeInTheDocument()
+    })
+
+    it('hides the floating action button when the setting is explicitly disabled', async () => {
+      const existingPaneId = 'pane-1'
+      const store = createStore({
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: existingPaneId,
+            content: createTerminalContent(),
+          },
+        },
+        activePane: { 'tab-1': existingPaneId },
+      })
+      store.dispatch({
+        type: 'settings/updateSettingsLocal',
+        payload: { panes: { floatingActionButton: false } },
+      })
+
+      renderWithStore(
+        <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} />,
+        store
+      )
+
+      expect(screen.queryByTitle('Add pane')).not.toBeInTheDocument()
+    })
+
+    it('hides the floating action button when the store resolved the mobile platform default', async () => {
+      const existingPaneId = 'pane-1'
+      const store = createStore({
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: existingPaneId,
+            content: createTerminalContent(),
+          },
+        },
+        activePane: { 'tab-1': existingPaneId },
+      })
+      // Model a mobile boot's local settings exactly as the settings slice
+      // would resolve them at mobile width (module-init is desktop-ambient in
+      // this file, so the mobile default is injected through the resolution
+      // option instead of matchMedia timing).
+      store.dispatch(setLocalSettings(
+        resolveLocalSettings(undefined, { floatingActionButtonDefault: false }),
+      ))
+
+      renderWithStore(
+        <PaneLayout tabId="tab-1" defaultContent={createTerminalContent()} />,
+        store
+      )
+
+      expect(screen.queryByTitle('Add pane')).not.toBeInTheDocument()
     })
   })
 
   describe('adding terminal pane', () => {
     it('splits active pane when adding terminal', async () => {
       const paneId = 'pane-1'
-      const store = createStore({
+      const store = createStoreWithFab({
         layouts: {
           'tab-1': {
             type: 'leaf',
@@ -440,7 +505,7 @@ describe('PaneLayout', () => {
       }))
 
       const paneId = 'pane-1'
-      const store = createStore({
+      const store = createStoreWithFab({
         layouts: {
           'tab-1': {
             type: 'leaf',
@@ -479,7 +544,7 @@ describe('PaneLayout', () => {
       }))
 
       const paneId = 'pane-1'
-      const store = createStore({
+      const store = createStoreWithFab({
         layouts: {
           'tab-1': {
             type: 'leaf',
@@ -506,7 +571,7 @@ describe('PaneLayout', () => {
 
     it('sets new pane as active after adding', async () => {
       const paneId = 'pane-1'
-      const store = createStore({
+      const store = createStoreWithFab({
         layouts: {
           'tab-1': {
             type: 'leaf',
@@ -536,7 +601,7 @@ describe('PaneLayout', () => {
   describe('adding browser pane', () => {
     it('splits active pane when adding browser', async () => {
       const paneId = 'pane-1'
-      const store = createStore({
+      const store = createStoreWithFab({
         layouts: {
           'tab-1': {
             type: 'leaf',
@@ -566,7 +631,7 @@ describe('PaneLayout', () => {
 
     it('creates picker pane when FAB is clicked', async () => {
       const paneId = 'pane-1'
-      const store = createStore({
+      const store = createStoreWithFab({
         layouts: {
           'tab-1': {
             type: 'leaf',
@@ -596,7 +661,7 @@ describe('PaneLayout', () => {
   describe('edge cases', () => {
     it('adds pane even when no active pane is set (falls back to first leaf)', async () => {
       const paneId = 'pane-1'
-      const store = createStore({
+      const store = createStoreWithFab({
         layouts: {
           'tab-1': {
             type: 'leaf',
@@ -622,7 +687,7 @@ describe('PaneLayout', () => {
 
     it('handles rapid add operations', async () => {
       const paneId = 'pane-1'
-      const store = createStore({
+      const store = createStoreWithFab({
         layouts: {
           'tab-1': {
             type: 'leaf',
@@ -659,7 +724,7 @@ describe('PaneLayout', () => {
       defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor',
       panesState: Partial<PanesState> = {},
     ) {
-      const store = createStore(panesState)
+      const store = createStoreWithFab(panesState)
       store.dispatch({
         type: 'settings/previewServerSettingsPatch',
         payload: { panes: { defaultNewPane } },
@@ -740,7 +805,7 @@ describe('PaneLayout', () => {
       defaultNewPane: 'ask' | 'shell' | 'browser' | 'editor',
       panesState: Partial<PanesState> = {},
     ) {
-      const store = createStore(panesState)
+      const store = createStoreWithFab(panesState)
       store.dispatch({
         type: 'settings/previewServerSettingsPatch',
         payload: { panes: { defaultNewPane } },

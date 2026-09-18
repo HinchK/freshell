@@ -34,6 +34,11 @@ describe('settingsSlice', () => {
     expect(state.localSettings.terminal.fontSize).toBe(18)
     expect(state.settings).toEqual({
       ...defaultSettings,
+      panes: {
+        ...defaultSettings.panes,
+        // jsdom boots desktop-ambient: the platform default is ON.
+        floatingActionButton: true,
+      },
       theme: 'dark',
       terminal: {
         ...defaultSettings.terminal,
@@ -50,6 +55,54 @@ describe('settingsSlice', () => {
     expect(defaultSettings.sidebar.sortMode).toBe('activity')
     expect(defaultSettings.terminal.fontFamily).toBe('monospace')
     expect(defaultSettings.terminal.scrollback).toBe(10000)
+  })
+
+  it('resolves the panes.floatingActionButton platform default at boot: desktop true, mobile false', async () => {
+    // jsdom's matchMedia mock boots desktop-ambient (test/setup/dom.ts resets
+    // __MOBILE_MATCHES__ to false), so a fresh slice import resolves the
+    // desktop default: the FAB setting is ON.
+    const desktop = await importFreshSettingsSlice()
+    expect(desktop.default(undefined, { type: 'unknown' }).localSettings.panes.floatingActionButton).toBe(true)
+
+    // Flip the mock to mobile BEFORE the fresh import: importFreshSettingsSlice
+    // resets the module registry, so the re-imported slice re-reads matchMedia
+    // and resolves the mobile default: OFF. Mobile = viewport width
+    // (max-width: 767px), not device class — same rule as useMobile().
+    ;(globalThis as any).setMobileForTest(true)
+    try {
+      const mobile = await importFreshSettingsSlice()
+      expect(mobile.default(undefined, { type: 'unknown' }).localSettings.panes.floatingActionButton).toBe(false)
+    } finally {
+      ;(globalThis as any).setMobileForTest(false)
+    }
+  })
+
+  it('keeps the boot-time platform default for the rest of the session (a later resize across the mobile breakpoint does not re-resolve)', async () => {
+    const { default: settingsReducer, updateSettingsLocal } = await importFreshSettingsSlice()
+    const initialState = settingsReducer(undefined, { type: 'unknown' })
+    expect(initialState.localSettings.panes.floatingActionButton).toBe(true) // desktop boot
+
+    ;(globalThis as any).setMobileForTest(true)
+    try {
+      const state = settingsReducer(initialState, updateSettingsLocal({ theme: 'dark' }))
+      expect(state.localSettings.panes.floatingActionButton).toBe(true) // still the boot answer
+      expect(state.localSettings.theme).toBe('dark')
+    } finally {
+      ;(globalThis as any).setMobileForTest(false)
+    }
+  })
+
+  it('hydrates a saved explicit false over the desktop platform default at boot', async () => {
+    localStorage.setItem(BROWSER_PREFERENCES_STORAGE_KEY, JSON.stringify({
+      settings: { panes: { floatingActionButton: false } },
+    }))
+    try {
+      const { default: settingsReducer } = await importFreshSettingsSlice()
+      const state = settingsReducer(undefined, { type: 'unknown' })
+      expect(state.localSettings.panes.floatingActionButton).toBe(false)
+    } finally {
+      localStorage.removeItem(BROWSER_PREFERENCES_STORAGE_KEY)
+    }
   })
 
   it('setServerSettings replaces serverSettings and recomputes the resolved view', async () => {
@@ -82,6 +135,11 @@ describe('settingsSlice', () => {
     expect('agentChat' in state.serverSettings).toBe(false)
     expect(state.settings).toEqual({
       ...defaultSettings,
+      panes: {
+        ...defaultSettings.panes,
+        // jsdom boots desktop-ambient: the platform default is ON.
+        floatingActionButton: true,
+      },
       defaultCwd: '/workspace',
       terminal: {
         ...defaultSettings.terminal,

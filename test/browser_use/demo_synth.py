@@ -218,13 +218,13 @@ async def setup_browser(args, log, token, base_url):
             token_removed = await page.evaluate(
                 "() => !new URLSearchParams(window.location.search).has('token')"
             )
-            has_add_pane = await page.evaluate(
-                '() => !!document.querySelector(\'button[aria-label="Add pane"]\')'
+            has_pane_root = await page.evaluate(
+                "() => !!document.querySelector('[data-pane-root]')"
             )
             has_connected = await page.evaluate(
                 "() => !!document.querySelector('[title=\"Connected\"]')"
             )
-            if auth_present and token_removed and has_add_pane and has_connected:
+            if auth_present and token_removed and has_pane_root and has_connected:
                 ready = True
                 break
         except Exception:
@@ -271,6 +271,47 @@ def register_insert_text(tools, timeline: Timeline | None = None):
         except Exception as e:
             return ActionResult(
                 error=f"Failed to insert text: {type(e).__name__}: {e}"
+            )
+
+
+def register_right_click(tools):
+    """Register a CDP right-click action (dispatches a contextmenu MouseEvent)."""
+    from browser_use.agent.views import ActionResult
+    from pydantic import BaseModel
+
+    class RightClickAction(BaseModel):
+        index: int
+
+    @tools.registry.action(
+        "Right-click an element by index (dispatches a contextmenu MouseEvent).",
+        param_model=RightClickAction,
+    )
+    async def right_click(params: RightClickAction, browser_session):
+        try:
+            element = await browser_session.get_element_by_index(params.index)
+            if element is None:
+                return ActionResult(error=f"Element index {params.index} not found")
+            cdp_session = await browser_session.get_or_create_cdp_session(
+                target_id=None, focus=True
+            )
+            sid = cdp_session.session_id
+            resolved = await cdp_session.cdp_client.send.DOM.resolveNode(
+                params={"backendNodeId": element.backend_node_id}, session_id=sid,
+            )
+            object_id = resolved["object"]["objectId"]
+            await cdp_session.cdp_client.send.Runtime.callFunctionOn(
+                params={
+                    "objectId": object_id,
+                    "functionDeclaration": "function() { const r = this.getBoundingClientRect(); this.dispatchEvent(new MouseEvent('contextmenu', {bubbles: true, cancelable: true, button: 2, clientX: r.left + Math.max(1, r.width / 2), clientY: r.top + Math.max(1, r.height / 2)})); }",
+                    "returnByValue": True,
+                },
+                session_id=sid,
+            )
+            memory = f"Right-clicked element at index {params.index}"
+            return ActionResult(extracted_content=memory, long_term_memory=memory)
+        except Exception as e:
+            return ActionResult(
+                error=f"Failed to right-click: {type(e).__name__}: {e}"
             )
 
 
@@ -498,6 +539,7 @@ async def run_agent_task(
         exclude_actions=["write_file", "replace_file", "read_file", "extract"]
     )
     register_insert_text(tools, timeline=timeline)
+    register_right_click(tools)
     register_dispatch_key(tools, timeline=timeline)
     register_play_melody(tools, timeline=timeline)
 
@@ -689,7 +731,7 @@ Non-negotiable constraints:
 
 === PART A: Set up the panes ===
 
-1) Click the "Add pane" button (floating button in the bottom-right area, with a "+" icon) to add a new pane.
+1) Right-click the Claude Code terminal pane (use the right_click action) and click "Split horizontally" in the menu to add a new pane.
 2) In the pane picker, click "Shell" (or "WSL" or "CMD" - whichever shell option is available).
 3) Wait for the shell to be ready (you should see a command prompt).
 4) Click inside the shell terminal to focus it, then:
@@ -697,7 +739,7 @@ Non-negotiable constraints:
    - Wait 10 seconds for Vite to start
    - Look at the output for a URL like "http://localhost:5174" or similar port
 
-5) Click "Add pane" again.
+5) Right-click the shell terminal pane (right_click action) and click "Split horizontally" again.
 6) In the pane picker, click "Browser".
 7) In the browser pane's URL input field:
    - Type the Vite URL you saw (e.g., http://localhost:5174) and press Enter

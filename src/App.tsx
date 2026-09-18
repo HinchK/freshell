@@ -2,7 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState, type TouchEve
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { setStatus, setError, setErrorCode, setServerInstanceId, setBootId, setServerRestarted, setLiveTerminalIds, setPlatform, setAvailableClis, setFeatureFlags } from '@/store/connectionSlice'
 import { resetCompletionDedupeBaselines } from '@/store/turnCompletionSlice'
-import { setLocalSettings, setServerConfigDir, setServerSettings } from '@/store/settingsSlice'
+import { setLocalSettings, setServerConfigDir, setServerSettings, localSettingsPlatformDefaults } from '@/store/settingsSlice'
 import {
   markWsSnapshotReceived,
   patchSessionRunningStateFromTerminalMeta,
@@ -671,8 +671,12 @@ export default function App() {
           if (!cancelled) {
             if (bootstrapData.legacyLocalSettingsSeed) {
               const currentPreferences = loadBrowserPreferencesRecord()
-              const currentLocalSettingsPatch = buildLocalSettingsPatch(appStore.getState().settings.localSettings)
               const currentPreferencesPatch = currentPreferences.settings ?? {}
+              const currentLocalSettingsPatch = buildLocalSettingsPatch(
+                appStore.getState().settings.localSettings,
+                localSettingsPlatformDefaults,
+                currentPreferencesPatch,
+              )
               const hasExistingLocalSettings =
                 Object.keys(currentPreferencesPatch).length > 0
                 || Object.keys(currentLocalSettingsPatch).length > 0
@@ -689,7 +693,7 @@ export default function App() {
                 : seedBrowserPreferencesSettingsIfEmpty(bootstrapData.legacyLocalSettingsSeed)
 
               if (JSON.stringify(currentPreferences.settings) !== JSON.stringify(nextPreferences.settings)) {
-                dispatch(setLocalSettings(resolveBrowserPreferenceSettings(nextPreferences)))
+                dispatch(setLocalSettings(resolveBrowserPreferenceSettings(nextPreferences, localSettingsPlatformDefaults)))
               }
             }
             if (bootstrapData.settings) {

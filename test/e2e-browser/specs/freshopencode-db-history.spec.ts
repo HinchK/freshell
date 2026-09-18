@@ -281,7 +281,15 @@ test.describe('Freshopencode DB history restore', () => {
       await sendFreshAgentPrompt(page, prompt)
 
       await expect(page.getByText(response)).toBeVisible({ timeout: 30_000 })
-      await expect(page.getByText(prompt)).toBeVisible({ timeout: 30_000 })
+      // The auto-title pipeline copies the first prompt into the tab/pane/
+      // session titles, so a bare getByText(prompt) is ambiguous (a strict-mode
+      // violation) — but whether/when that propagation lands is the title
+      // feature's concern, not history restoration's. The transcript-scoped
+      // locator is the restore assertion; it must stay scoped (delta-review
+      // round-1 F6 removed the coupling poll that waited for the title
+      // copies to appear).
+      const transcript = page.locator('[data-context="fresh-agent-transcript"]')
+      await expect(transcript.getByText(prompt, { exact: true })).toBeVisible({ timeout: 30_000 })
 
       await expect.poll(async () => getFreshOpencodePaneState(page), { timeout: 30_000 }).toMatchObject({
         sessionId: expect.stringMatching(/^ses_/),
@@ -301,7 +309,7 @@ test.describe('Freshopencode DB history restore', () => {
       await harness.waitForHarness()
       await harness.waitForConnection()
 
-      await expect(page.getByText(prompt)).toBeVisible({ timeout: 30_000 })
+      await expect(transcript.getByText(prompt, { exact: true })).toBeVisible({ timeout: 30_000 })
       await expect(page.getByText(response)).toBeVisible({ timeout: 30_000 })
       await expect.poll(async () => getFreshOpencodePaneState(page), { timeout: 30_000 }).toMatchObject({
         sessionId: beforeReload.sessionId,
@@ -313,33 +321,49 @@ test.describe('Freshopencode DB history restore', () => {
       })
 
       const auditEvents = await readAuditEvents(auditLogPath)
-      expect(auditEvents.some((event) => event.event === 'run' && event.prompt === prompt)).toBe(true)
+      expect(auditEvents.some((event) => event.event === 'prompt_async' && event.prompt === prompt)).toBe(true)
       expect(auditEvents.some((event) => event.event === 'export')).toBe(false)
+      expect(auditEvents.some((event) => event.event === 'run')).toBe(false)
     } finally {
       await server.stop().catch(() => {})
       await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
     }
   })
 
-  test('does not materialize Freshopencode from DB rows without top-level run sessionID', async ({ page }) => {
-    const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-freshopencode-no-session-id-'))
+  test('does not adopt a pre-existing DB session when materializing Freshopencode', async ({ page }) => {
+    const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-freshopencode-no-db-adoption-'))
     const binDir = path.join(sharedRoot, 'bin')
     const logsDir = path.join(sharedRoot, 'logs')
     const auditLogPath = path.join(sharedRoot, 'fake-opencode-audit.jsonl')
     const sharedOpencodeDataDir = path.join(sharedRoot, 'opencode-data')
     const cwd = path.join(sharedRoot, 'project')
     const prompt = 'Do not infer my session id'
+    const baitSessionId = 'ses_legacy_adoption_bait'
+    const baitResponse = 'The pre-existing DB session must never be adopted'
     await fsp.mkdir(cwd, { recursive: true })
     await installFakeOpencode(binDir)
+    // The adoption bait: a unique pre-existing DB session in the pane's own
+    // cwd — exactly the row a DB-inference materialization would pick up.
+    // The serve-era contract (opencode_ws.rs handle_send: materialization
+    // binds ONLY to the id POST /session issued for this pane) must never
+    // bind the pane to this row. This carries the retired CLI-era premise
+    // (never infer session ids from DB rows when the turn's own output
+    // cannot name one) into the serve flow.
+    await seedLegacyOpencodeSession({
+      sharedOpencodeDataDir,
+      cwd,
+      sessionId: baitSessionId,
+      title: 'Pre-existing bait session',
+      prompt: 'Old bait prompt that must stay unanswered',
+      response: baitResponse,
+      createdAt: Date.now() - 60_000,
+    })
 
     const server = new RustServer(createServerOptions({
       binDir,
       auditLogPath,
       logsDir,
       sharedOpencodeDataDir,
-      env: {
-        FAKE_OPENCODE_RUN_NO_SESSION_ID: '1',
-      },
     }))
 
     try {
@@ -353,124 +377,26 @@ test.describe('Freshopencode DB history restore', () => {
 
       await sendFreshAgentPrompt(page, prompt)
 
-      await expect.poll(async () => {
-        const events = await readAuditEvents(auditLogPath)
-        return events.find((event) => event.event === 'run' && event.prompt === prompt) ?? null
-      }, { timeout: 30_000 }).toMatchObject({
-        sessionId: expect.stringMatching(/^ses_/),
-        omitRunSessionId: true,
-      })
-
       await expect.poll(async () => getFreshOpencodePaneState(page), { timeout: 30_000 }).toMatchObject({
-        sessionId: expect.stringMatching(/^freshopencode-/),
-        resumeSessionId: expect.stringMatching(/^freshopencode-/),
+        sessionId: expect.stringMatching(/^ses_/),
+        resumeSessionId: expect.stringMatching(/^ses_/),
         sessionRef: {
           provider: 'opencode',
-          sessionId: expect.stringMatching(/^freshopencode-/),
+          sessionId: expect.stringMatching(/^ses_/),
         },
         status: 'idle',
       })
-    } finally {
-      await server.stop().catch(() => {})
-      await fsp.rm(sharedRoot, { recursive: true, force: true }).catch(() => {})
-    }
-  })
+      const paneState = await getFreshOpencodePaneState(page)
+      expect(paneState.sessionId).not.toBe(baitSessionId)
 
-  test('repairs a persisted legacy placeholder from a unique DB session', async ({ page }) => {
-    const sharedRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-freshopencode-legacy-'))
-    const binDir = path.join(sharedRoot, 'bin')
-    const logsDir = path.join(sharedRoot, 'logs')
-    const auditLogPath = path.join(sharedRoot, 'fake-opencode-audit.jsonl')
-    const sharedOpencodeDataDir = path.join(sharedRoot, 'opencode-data')
-    const cwd = path.join(sharedRoot, 'project')
-    const sessionId = 'ses_legacy_unique'
-    const placeholderId = 'freshopencode--legacyUnique'
-    const prompt = 'Which skills come from public repos'
-    const response = 'Only the unique legacy DB session should render'
-    const tabCreatedAt = Date.now()
-    await fsp.mkdir(cwd, { recursive: true })
-    await installFakeOpencode(binDir)
-    await seedLegacyOpencodeSession({
-      sharedOpencodeDataDir,
-      cwd,
-      sessionId,
-      title: 'Skills from public repos',
-      prompt,
-      response,
-      createdAt: tabCreatedAt + 60_000,
-    })
-
-    const server = new RustServer(createServerOptions({
-      binDir,
-      auditLogPath,
-      logsDir,
-      sharedOpencodeDataDir,
-      env: {
-        FAKE_OPENCODE_TRUNCATE_EXPORT: '1',
-      },
-    }))
-
-    try {
-      const info = await server.start()
-      await page.goto(`${info.baseUrl}/?token=${info.token}&e2e=1`)
-      const harness = new TestHarness(page)
-      await harness.waitForHarness()
-      await harness.waitForConnection()
-      await enableFreshOpencode(page)
-
-      await page.evaluate(({ cwd, placeholderId, tabCreatedAt }) => {
-        const harness = window.__FRESHELL_TEST_HARNESS__
-        harness?.dispatch({
-          type: 'tabs/addTab',
-          payload: {
-            id: 'tab-legacy-freshopencode',
-            title: 'Identifying skills from GitHub repos',
-            mode: 'shell',
-            status: 'running',
-          },
-        })
-        harness?.dispatch({
-          type: 'tabs/updateTab',
-          payload: {
-            id: 'tab-legacy-freshopencode',
-            updates: {
-              title: 'Identifying skills from GitHub repos',
-              createdAt: tabCreatedAt,
-            },
-          },
-        })
-        harness?.dispatch({
-          type: 'panes/initLayout',
-          payload: {
-            tabId: 'tab-legacy-freshopencode',
-            paneId: 'pane-legacy-freshopencode',
-            content: {
-              kind: 'fresh-agent',
-              sessionType: 'freshopencode',
-              provider: 'opencode',
-              createRequestId: '-legacyUnique',
-              sessionRef: { provider: 'opencode', sessionId: placeholderId },
-              initialCwd: cwd,
-              status: 'connected',
-            },
-          },
-        })
-        harness?.dispatch({ type: 'tabs/setActiveTab', payload: 'tab-legacy-freshopencode' })
-      }, { cwd, placeholderId, tabCreatedAt })
-
-      await expect(page.getByText(prompt)).toBeVisible({ timeout: 30_000 })
-      await expect(page.getByText(response)).toBeVisible({ timeout: 30_000 })
-      await expect.poll(async () => getFreshOpencodePaneState(page), { timeout: 30_000 }).toMatchObject({
-        sessionId,
-        resumeSessionId: sessionId,
-        sessionRef: {
-          provider: 'opencode',
-          sessionId,
-        },
-      })
+      const transcript = page.locator('[data-context="fresh-agent-transcript"]')
+      await expect(transcript.getByText(prompt, { exact: true })).toBeVisible({ timeout: 30_000 })
+      await expect(transcript.getByText(baitResponse)).toHaveCount(0)
 
       const auditEvents = await readAuditEvents(auditLogPath)
-      expect(auditEvents.some((event) => event.event === 'export')).toBe(false)
+      const delivered = auditEvents.find((event) => event.event === 'prompt_async' && event.prompt === prompt)
+      expect(delivered?.sessionId).toBe(paneState.sessionId ?? '')
+      expect(auditEvents.some((event) => event.event === 'prompt_async' && event.sessionId === baitSessionId)).toBe(false)
       expect(auditEvents.some((event) => event.event === 'run')).toBe(false)
     } finally {
       await server.stop().catch(() => {})

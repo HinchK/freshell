@@ -4,6 +4,7 @@ import {
   resolveLocalSettings,
   type LocalSettings,
   type LocalSettingsPatch,
+  type LocalSettingsPlatformDefaults,
 } from '@shared/settings'
 import { BROWSER_PREFERENCES_STORAGE_KEY as STORAGE_KEY } from '@/store/storage-keys'
 
@@ -209,8 +210,11 @@ export function seedBrowserPreferencesSettingsIfEmpty(seed: LocalSettingsPatch):
   })
 }
 
-export function resolveBrowserPreferenceSettings(record?: BrowserPreferencesRecord): LocalSettings {
-  return resolveLocalSettings(record?.settings)
+export function resolveBrowserPreferenceSettings(
+  record?: BrowserPreferencesRecord,
+  options: LocalSettingsPlatformDefaults = {},
+): LocalSettings {
+  return resolveLocalSettings(record?.settings, options)
 }
 
 export function getClosedTabRetentionDaysPreference(): number {
