@@ -262,10 +262,10 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
 .pane-header .icon { opacity: .6; }
 .pane-header-title { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pane-header-meta { font-size: 11px; color: hsl(var(--muted-foreground)); max-width: 14rem; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pane-btns { display: flex; gap: 1px; align-items: center; }
+.pane-btns { display: flex; gap: 0; align-items: center; height: 100%; }
 .pane-btn {
-  padding: 2px; border-radius: 3px; opacity: .5; cursor: pointer;
-  transition: opacity .1s, background .1s; display: flex; line-height: 0;
+  height: 100%; aspect-ratio: 1; padding: 0; border-radius: 3px; opacity: .5; cursor: pointer; flex-shrink: 0;
+  transition: opacity .1s, background .1s; display: flex; align-items: center; justify-content: center; line-height: 0;
 }
 .pane-btn:hover { opacity: 1; background: hsl(var(--foreground) / .08); }
 .split-h { display: flex; flex: 1; min-height: 0; }
@@ -627,6 +627,7 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
 .settings-agent-icon svg { width: 18px; height: 18px; }
 .settings-agent-name { min-width: 0; color: hsl(var(--foreground)); font-size: 14px; font-weight: 500; }
 @media (max-width: 767px) {
+  .pane-header { height: 63px; }
   .sidebar {
     position: fixed; inset: 0 auto 0 0; z-index: 60;
     width: min(85vw, 288px); box-shadow: var(--shadow-md);
