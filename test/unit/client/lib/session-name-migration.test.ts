@@ -19,12 +19,14 @@ import {
   captureLegacyNameEvidence,
   captureLegacyLayoutEnvelope,
   collectLegacyPendingHandleAssignments,
+  ensureLegacyNameCapturesForFlush,
   importLegacyNames,
   isLegacyNameCaptureSourceKey,
   legacyPendingNamingHandle,
   listCapturedMigrationEnvelopes,
   prepareLegacyNameImports,
   registerLegacyNameSubmitGate,
+  resetLegacyNameCaptureFailureForTests,
   SESSION_NAME_MIGRATION_KEY_PREFIX,
   stripScopedPaneTitleMetadata,
   stripSessionOwnedTabFreezeFlags,
@@ -137,6 +139,7 @@ beforeEach(() => {
   localStorage.clear()
   apiMocks.post.mockReset()
   registerLegacyNameSubmitGate(() => false)
+  resetLegacyNameCaptureFailureForTests()
 })
 
 // ── capture ─────────────────────────────────────────────────────────────────
@@ -235,6 +238,32 @@ describe('legacy-name capture', () => {
     storage.failSetItem(false)
     captureLegacyNameEvidence(storage)
     expect(listCapturedMigrationEnvelopes(storage)).toHaveLength(1)
+  })
+
+  it('gates the persistence flush on capture success — a failing capture defers, the retry recaptures and clears', () => {
+    ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true // the failure path logs
+    const storage = failingStorage()
+    storage.setItem('freshell.layout.v3.window-a', layoutEnvelope())
+    // Healthy: an O(1) yes with nothing pending.
+    expect(ensureLegacyNameCapturesForFlush(storage)).toBe(true)
+
+    // The boot capture fails (quota): the gate must defer the flush while
+    // the uncaptured legacy bytes still sit in their source key.
+    storage.failSetItem(true)
+    captureLegacyNameEvidence(storage)
+    expect(ensureLegacyNameCapturesForFlush(storage)).toBe(false)
+    expect(storage.getItem('freshell.layout.v3.window-a')).toBe(layoutEnvelope())
+
+    // The write heals: the gate's re-capture lands the envelope FIRST,
+    // then reports the flush safe (the legacy bytes are now backed up).
+    storage.failSetItem(false)
+    expect(ensureLegacyNameCapturesForFlush(storage)).toBe(true)
+    const envelopes = listCapturedMigrationEnvelopes(storage)
+    expect(envelopes).toHaveLength(1)
+    expect(envelopes[0].storageKey).toBe('freshell.layout.v3.window-a')
+    expect(envelopes[0].raw).toBe(layoutEnvelope())
+    // And the recovered gate stays O(1) healthy.
+    expect(ensureLegacyNameCapturesForFlush(storage)).toBe(true)
   })
 
   it('captures an OLD envelope delivered later via crossTabSync before sanitization, and submits only through the ready gate', async () => {
@@ -460,6 +489,101 @@ describe('legacy-name import submission', () => {
     // ready edge never re-submits it.
     await submitPendingLegacyNameImports()
     expect(apiMocks.post).toHaveBeenCalledTimes(2)
+  })
+
+  it('a failed later chunk keeps the envelope pending and resubmits only the unacknowledged chunks', async () => {
+    ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true // the failure path logs
+    const tabs: Array<Record<string, unknown>> = []
+    const layouts: Record<string, unknown> = {}
+    const paneTitles: Record<string, Record<string, string>> = {}
+    for (let index = 0; index < 250; index += 1) {
+      const tabId = `tab-${index}`
+      tabs.push({ id: tabId })
+      layouts[tabId] = scopedTerminalPane(`sess-${index}`)
+      paneTitles[tabId] = { 'pane-1': `P ${index}` }
+    }
+    localStorage.setItem('freshell.layout.v3.window-chunked', JSON.stringify({
+      version: 4,
+      tabs: { activeTabId: 'tab-0', tabs },
+      panes: { version: 7, layouts, paneTitles, paneTitleSetByUser: {} },
+    }))
+    captureLegacyNameEvidence(localStorage)
+    const base = listCapturedMigrationEnvelopes(localStorage)[0].importId
+    const postedImportIds = () =>
+      apiMocks.post.mock.calls.map(([, body]) => (body as { importId: string }).importId)
+
+    // Chunk 0 of 3 succeeds; chunk 1 fails transiently (a non-400 error —
+    // network/5xx — which must stay retryable).
+    apiMocks.post.mockImplementation(async (_url: string, body: unknown) => {
+      const importId = (body as { importId: string }).importId
+      if (importId === `${base}--1`) throw new Error('transient network failure')
+      return { acknowledged: [], names: [] }
+    })
+    await expect(submitPendingLegacyNameImports()).rejects.toThrow('transient network failure')
+    expect(postedImportIds()).toEqual([`${base}--0`, `${base}--1`])
+
+    // The envelope is still pending — chunk 0's success must NOT retire
+    // it — so the next ready edge resubmits ONLY the unacknowledged
+    // chunks (chunk 0 replays as a per-candidate no-op, so it is not
+    // even sent).
+    apiMocks.post.mockClear()
+    apiMocks.post.mockResolvedValue({ acknowledged: [], names: [] })
+    await submitPendingLegacyNameImports()
+    expect(postedImportIds()).toEqual([`${base}--1`, `${base}--2`])
+
+    // Every chunk is now acknowledged → the envelope retires: a further
+    // ready edge sends nothing.
+    apiMocks.post.mockClear()
+    await submitPendingLegacyNameImports()
+    expect(apiMocks.post).not.toHaveBeenCalled()
+    expect(listCapturedMigrationEnvelopes(localStorage)).toHaveLength(1)
+  })
+
+  it('pairs chunks to envelopes by evidence — an importId containing "--" never breaks the retirement bookkeeping', async () => {
+    ;(globalThis as any).__ALLOW_CONSOLE_ERROR__ = true // the failure path logs
+    // A captured envelope whose id contains `--` (a legal nanoid pair —
+    // seen in a real coordinated run): the chunk ids become
+    // `edge--case--0/1`, and the envelope↔chunk pairing must still hold.
+    const tabs: Array<Record<string, unknown>> = []
+    const layouts: Record<string, unknown> = {}
+    const paneTitles: Record<string, Record<string, string>> = {}
+    for (let index = 0; index < 150; index += 1) {
+      const tabId = `tab-${index}`
+      tabs.push({ id: tabId })
+      layouts[tabId] = scopedTerminalPane(`sess-${index}`)
+      paneTitles[tabId] = { 'pane-1': `P ${index}` }
+    }
+    const raw = JSON.stringify({
+      version: 4,
+      tabs: { activeTabId: 'tab-0', tabs },
+      panes: { version: 7, layouts, paneTitles, paneTitleSetByUser: {} },
+    })
+    localStorage.setItem(`${SESSION_NAME_MIGRATION_KEY_PREFIX}.edge--case`, JSON.stringify({
+      version: 1,
+      importId: 'edge--case',
+      storageKey: 'freshell.layout.v3.window-dash',
+      raw,
+      capturedAt: 1,
+    }))
+
+    // Chunk 0 succeeds, chunk 1 fails transiently: the envelope (whose id
+    // a `--`-split heuristic would mangle) must STAY pending.
+    apiMocks.post.mockImplementation(async (_url: string, body: unknown) => {
+      const importId = (body as { importId: string }).importId
+      if (importId === 'edge--case--1') throw new Error('transient network failure')
+      return { acknowledged: [], names: [] }
+    })
+    await expect(submitPendingLegacyNameImports()).rejects.toThrow('transient network failure')
+    // Still pending: the next ready edge resubmits only the missing chunk.
+    apiMocks.post.mockClear()
+    apiMocks.post.mockResolvedValue({ acknowledged: [], names: [] })
+    await submitPendingLegacyNameImports()
+    const posted = apiMocks.post.mock.calls.map(([, body]) => (body as { importId: string }).importId)
+    expect(posted).toEqual(['edge--case--1'])
+    // Fully acknowledged → retired: nothing further is sent.
+    apiMocks.post.mockClear()
+    await submitPendingLegacyNameImports()
+    expect(apiMocks.post).not.toHaveBeenCalled()
   })
 
   it('importLegacyNames posts the migration envelope to the import endpoint', async () => {

@@ -17,8 +17,13 @@
  *   legacy-pending namingHandle derivation for unbound scoped panes.
  * - `importLegacyNames(imports)` — the HTTP submit against
  *   `POST /api/session-names/import`; acknowledged import ids are marked
- *   locally, evidence is retained after acknowledgment for recovery, and a
- *   failed submit keeps the import pending for retry.
+ *   locally (evidence is retained after acknowledgment for recovery), an
+ *   already-acknowledged import replays as a no-op without a request, and
+ *   a failed submit keeps the import pending for retry. A chunked envelope
+ *   (`<base>--<N>` derived ids) retires only when ALL its chunks
+ *   acknowledged — a mid-sequence transient failure keeps the envelope
+ *   pending so the next connection-ready edge resubmits exactly the
+ *   unacknowledged chunks.
  *
  * Plus the ONE client sanitizer: `stripScopedPaneTitleMetadata` /
  * `stripSessionOwnedTabFreezeFlags` — the single gate every scoped
@@ -29,6 +34,11 @@
  * the last-known canonical title projections. Every legacy out-of-scope
  * path (shells, browsers, editors, excluded providers, nameSource-less
  * tabs) is preserved verbatim.
+ *
+ * Plus the persistence flush gate (`ensureLegacyNameCapturesForFlush`): a
+ * flush may rewrite a capture-source key only once the current raw bytes
+ * are durably captured — while a capture write keeps failing, the flush
+ * defers so uncaptured legacy labels survive for retry.
  */
 
 import { nanoid } from 'nanoid'
@@ -63,6 +73,15 @@ export const SESSION_NAME_MIGRATION_KEY_PREFIX = 'freshell.session-names.migrati
 const ACKNOWLEDGED_MARKER_SEGMENT = 'ack'
 /** At most this many candidates ride one import. */
 const IMPORT_CANDIDATE_LIMIT = 100
+
+/**
+ * Whether a capture-source envelope write has FAILED and uncaptured legacy
+ * bytes may still sit in their source keys. The persistence flush gate
+ * (`ensureLegacyNameCapturesForFlush`) consults this: a flush may rewrite a
+ * capture-source key only once the current raw bytes are durably captured —
+ * evicting uncaptured legacy labels is unrecoverable evidence loss.
+ */
+let captureWriteFailed = false
 
 /** One captured immutable recovery envelope (the local storage shape). */
 export type LegacyNameMigrationEnvelope = {
@@ -245,8 +264,11 @@ export function captureLegacyNameEvidence(
       prior.push(envelope)
       existingBySource.set(key, prior)
     }
+    // A completing pass touched every source: nothing is left uncaptured.
+    captureWriteFailed = false
   } catch (error) {
     // Do not clear the source; keep a retryable capture pending.
+    captureWriteFailed = true
     log.error('legacy-name evidence capture failed; sources retained for retry', { error })
   }
   return captured.map((envelope) => ({
@@ -301,8 +323,37 @@ export function captureLegacyLayoutEnvelope(
       }
     }
   } catch (error) {
+    // An uncaptured raw is sitting in its source key: record it so the
+    // persistence flush gate re-captures before any flush can evict it.
+    captureWriteFailed = true
     log.error('failed to capture a cross-window legacy layout envelope', { storageKey, error })
   }
+}
+
+// ---------------------------------------------------------------------------
+// The persistence flush gate (review M2)
+// ---------------------------------------------------------------------------
+
+/**
+ * The persistence flush gate: a flush may rewrite a capture-source key ONLY
+ * once the current raw bytes are durably captured in an envelope. When a
+ * capture write has failed (e.g. quota), this re-attempts the capture
+ * immediately before the caller serializes; when the re-capture still fails
+ * the caller MUST defer its write — evicting uncaptured legacy labels is
+ * unrecoverable evidence loss (there is no backup copy anywhere). With no
+ * recorded failure this is a cheap O(1) yes.
+ */
+export function ensureLegacyNameCapturesForFlush(
+  storage: Pick<Storage, 'length' | 'key' | 'getItem' | 'setItem'> = localStorage,
+): boolean {
+  if (!captureWriteFailed) return true
+  captureLegacyNameEvidence(storage)
+  return !captureWriteFailed
+}
+
+/** Test-only: reset the recorded capture-failure state between tests. */
+export function resetLegacyNameCaptureFailureForTests(): void {
+  captureWriteFailed = false
 }
 
 // ---------------------------------------------------------------------------
@@ -640,14 +691,24 @@ export function collectLegacyPendingHandleAssignments(
 /**
  * Submit prepared imports to `POST /api/session-names/import`. Each import
  * is acknowledged individually by the server (per candidate); on success
- * its import id is marked acknowledged locally (the evidence envelopes are
- * RETAINED for recovery — only the pending-submit skips them). A failure
- * throws after logging; the caller keeps the import pending for the next
- * connection-ready edge.
+ * its OWN import id is marked acknowledged locally (the evidence envelopes
+ * are RETAINED for recovery — only the pending-submit skips them), and an
+ * already-acknowledged import replays as a no-op WITHOUT a request — so a
+ * resumed sequence never re-imports the chunks that landed (per-candidate
+ * acknowledgment makes that safe/idempotent server-side anyway). A chunked
+ * envelope's BASE id is deliberately NOT marked here: only
+ * [`submitPendingLegacyNameImports`] retires an envelope, and only after
+ * ALL its chunks acknowledged. A failure throws after logging; the caller
+ * keeps the envelope pending for the next connection-ready edge.
  */
 export async function importLegacyNames(imports: LegacyNameImport[]): Promise<void> {
   const storage = typeof localStorage === 'undefined' ? null : localStorage
   for (const one of imports) {
+    if (storage && isAcknowledged(storage, one.importId)) {
+      // Already acknowledged (this sequence resumed after a mid-sequence
+      // failure, or a prior 400-terminal chunk): a pure local no-op.
+      continue
+    }
     try {
       const body = await api.post<unknown>('/api/session-names/import', one)
       const parsed = parseLegacyImportResult(body)
@@ -656,10 +717,6 @@ export async function importLegacyNames(imports: LegacyNameImport[]): Promise<vo
       }
       if (storage) {
         markAcknowledged(storage, one.importId)
-        // A chunked import (`<base>--<n>`) also retires its envelope's
-        // base id, so the pending submit stops reconsidering the evidence.
-        const base = one.importId.split('--')[0]
-        if (base !== one.importId) markAcknowledged(storage, base)
       }
     } catch (error) {
       if (error instanceof ApiError && error.status === 400) {
@@ -699,7 +756,17 @@ function parseLegacyImportResult(body: unknown): LegacyImportResult | undefined 
  * ready (the store wiring calls this on each ready edge; the server's
  * per-candidate acknowledgments make repeated submits idempotent).
  * Envelopes that yield no candidates are marked acknowledged (nothing to
- * import); a failed submit keeps everything pending.
+ * import). An envelope with chunked imports is retired ONLY after the
+ * awaited submit acknowledged ALL its chunks — a mid-sequence transient
+ * failure throws before the retirement, so the next ready edge re-prepares
+ * the whole envelope and `importLegacyNames` resubmits exactly the
+ * unacknowledged chunks (the landed ones replay as local no-ops).
+ *
+ * The envelope↔chunk pairing is by EVIDENCE (each chunk import carries the
+ * source envelope it was prepared from), never by parsing import-id
+ * strings — a captured nanoid may itself contain `--`, so a
+ * `${base}--<n>`-string heuristic could mispair and retire an envelope
+ * mid-sequence.
  */
 export async function submitPendingLegacyNameImports(): Promise<void> {
   if (typeof localStorage === 'undefined') return
@@ -710,10 +777,21 @@ export async function submitPendingLegacyNameImports(): Promise<void> {
     storageKey: envelope.storageKey,
     raw: envelope.raw,
   }))
+  const pendingBySource = new Map(
+    pending.map((envelope) => [`${envelope.storageKey}\u0000${envelope.raw}`, envelope]),
+  )
   const imports = prepareLegacyNameImports(evidence)
-  const importedBaseIds = new Set(imports.map((one) => one.importId.split('--')[0]))
+  // Which pending envelopes the prepared imports were derived from.
+  const importedEnvelopes = new Set<LegacyNameMigrationEnvelope>()
+  for (const one of imports) {
+    const source = one.evidence[0]
+    const envelope = source
+      ? pendingBySource.get(`${source.storageKey}\u0000${source.raw}`)
+      : undefined
+    if (envelope) importedEnvelopes.add(envelope)
+  }
   for (const envelope of pending) {
-    if (!importedBaseIds.has(envelope.importId)) {
+    if (!importedEnvelopes.has(envelope)) {
       // No candidates could be prepared from this envelope (sanitized or
       // corrupted bytes): nothing to acknowledge server-side.
       markAcknowledged(localStorage, envelope.importId)
@@ -721,6 +799,12 @@ export async function submitPendingLegacyNameImports(): Promise<void> {
   }
   if (imports.length === 0) return
   await importLegacyNames(imports)
+  // The whole sequence acknowledged (every chunk either succeeded or was
+  // 400-terminal): NOW the envelopes retire. A throw above marks no
+  // envelope, so the evidence stays pending for the next ready edge.
+  for (const envelope of importedEnvelopes) {
+    markAcknowledged(localStorage, envelope.importId)
+  }
 }
 
 // ---------------------------------------------------------------------------

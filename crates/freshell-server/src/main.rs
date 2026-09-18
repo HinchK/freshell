@@ -1821,6 +1821,14 @@ async fn main() -> ExitCode {
         metadata: session_metadata_store.clone(),
         // STATUS-STRIP: sessions.cloned pages are client-ordered per instance.
         server_instance: Arc::clone(&server_instance_id),
+        // Unified agent names (Task 7 review M1): captured AFTER the boot
+        // consolidation above ran — once the receipt committed, a scoped
+        // coding-agent row's displayed title never consults the migrated
+        // config title fields again (see apply_session_overrides).
+        legacy_name_migration_completed: session_names
+            .as_ref()
+            .map(|names| names.migration_completed())
+            .unwrap_or(false),
     };
 
     let client_dir = Arc::new(resolve_client_dir());

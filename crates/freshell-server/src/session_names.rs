@@ -283,14 +283,17 @@ struct SchedulingCursor {
     last_class: Option<String>,
 }
 
-/// Migration receipts (Task 7). `completed` is set in the SAME commit that
-/// installs the boot winners: once committed, canonical readers stop
-/// consulting migrated legacy fields even if physical cleanup is still
-/// pending (cleanup is idempotently retried at boot). `winning_evidence`
-/// retains, per record key, the winning migration candidate — while a record
-/// is migration-owned, a later previously-offline import compares against
-/// this retained evidence with the same deterministic total order, so import
-/// arrival order can never pick a different winner.
+/// Migration receipts (Task 7). `completed` commits once the consolidation
+/// runner finishes importing EVERY boot chunk (see
+/// [`SessionNames::complete_legacy_migration`]): once committed, canonical
+/// readers stop consulting migrated legacy fields even if physical cleanup
+/// is still pending (cleanup is idempotently retried at boot), and a boot
+/// interrupted between chunks leaves the receipt open so the next boot
+/// resumes. `winning_evidence` retains, per record key, the winning
+/// migration candidate — while a record is migration-owned, a later
+/// previously-offline import compares against this retained evidence with
+/// the same deterministic total order, so import arrival order can never
+/// pick a different winner.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MigrationReceipts {
@@ -669,6 +672,29 @@ impl SessionNames {
         self.core.current_view().document.migration.completed
     }
 
+    /// Task 7 (review I1): commit the one-time consolidation's completion
+    /// receipt. The consolidation runner calls this only after EVERY import
+    /// chunk acknowledged — winner installs and acknowledged candidate ids
+    /// commit per chunk (the plan's batching rule caps one import at
+    /// [`NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT`] candidates), while
+    /// `completed` — the receipt the canonical readers and the next boot's
+    /// gate consult — commits once, at the end, so a boot interrupted between
+    /// chunks never marks an unfinished consolidation complete. Idempotent:
+    /// committing an already-completed receipt is a pure read.
+    pub(crate) fn complete_legacy_migration(&self) -> NameFuture<()> {
+        let core = Arc::clone(&self.core);
+        Box::pin(spawn_txn(core, move |doc, _meta| {
+            if doc.migration.completed {
+                return Ok(Decision::Read(()));
+            }
+            doc.migration.completed = true;
+            Ok(Decision::Write {
+                value: (),
+                publish: Vec::new(),
+            })
+        }))
+    }
+
     /// Task 7: import one captured legacy-evidence envelope. Every raw
     /// envelope gets its own immutable per-import backup
     /// (`name-migration-v1/imports/<SHA-256 of importId>.json`, create-once)
@@ -676,10 +702,13 @@ impl SessionNames {
     /// one at a time (never an early whole-import shortcut) and carries the
     /// updates for the records the import touched — only after the backup
     /// and the canonical commit. The reserved
-    /// [`NAME_MIGRATION_BOOT_IMPORT_ID`] is the trusted server-boot lane:
-    /// only it may honor `explicit_rename` (manual) and accepted-Freshell-AI
-    /// classifications; the HTTP route rejects that id, so an arbitrary
-    /// caller can never assert them.
+    /// [`NAME_MIGRATION_BOOT_IMPORT_ID`] family (the id itself and its
+    /// `--N` chunk derivations, see [`is_boot_import_id`]) is the trusted
+    /// server-boot lane: only it may honor `explicit_rename` (manual) and
+    /// accepted-Freshell-AI classifications; the HTTP route rejects the
+    /// whole family, so an arbitrary caller can never assert them. The
+    /// import itself never completes the migration — the runner's final
+    /// [`SessionNames::complete_legacy_migration`] does.
     pub(crate) fn import_legacy(&self, input: LegacyNameImport) -> NameFuture<LegacyImportResult> {
         let core = Arc::clone(&self.core);
         let backup_dir = core
@@ -3421,7 +3450,11 @@ fn legacy_scope_rank(scope: LegacyCandidateScope) -> u8 {
 }
 
 /// Write one import's immutable backup (create-once): the raw evidence
-/// envelopes verbatim plus the candidates as received. A present file is
+/// envelopes verbatim plus the candidates as the STORE receives them —
+/// for the HTTP lane that is route-resolved (`legacy_terminal` targets the
+/// route already mapped through the identity ledger; the literal received
+/// bytes live on in the route's request body, and the raw evidence
+/// envelopes carry the original payload verbatim). A present file is
 /// never rewritten — the first receipt of an import id owns the copy. The
 /// write happens BEFORE anything is acknowledged, so a later commit failure
 /// leaves the backup (and the retry reuses it) without any ack.
@@ -3643,14 +3676,57 @@ fn retain_migration_evidence(
     );
 }
 
+/// Task 7: whether an import id belongs to the trusted server-boot lane —
+/// the reserved [`NAME_MIGRATION_BOOT_IMPORT_ID`] itself or one of its
+/// `--N` chunk derivations (the consolidation runner batches more than
+/// [`NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT`] gathered candidates into
+/// ≤100-candidate imports, per the plan's own batching rule). The HTTP
+/// route refuses this whole family, so only the in-process boot runner can
+/// ever send them.
+pub(crate) fn is_boot_import_id(import_id: &str) -> bool {
+    import_id == NAME_MIGRATION_BOOT_IMPORT_ID
+        || import_id
+            .strip_prefix(NAME_MIGRATION_BOOT_IMPORT_ID)
+            .is_some_and(|rest| rest.starts_with("--"))
+}
+
+/// Order the trusted boot lane's gathered candidates best-first by the
+/// deterministic total order (`compare_classified_candidates`), so the
+/// consolidation's ≤100-candidate import chunks keep a stable membership
+/// across boots (the create-once per-import backups and the per-candidate
+/// acknowledgment replay both key off the chunk ids). Sequential
+/// application against the retained winning evidence is already
+/// permutation-invariant — the ordering is the belt that guarantees no
+/// cross-chunk comparison is ever decided by arrival order. Comparator-
+/// equal candidates are interchangeable in every compared field (the final
+/// tiebreak is the candidate id), so the stable sort needs no extra key.
+pub(crate) fn order_boot_legacy_candidates(candidates: &mut [LegacyNameCandidate]) {
+    let mut classified: Vec<(ClassifiedLegacyCandidate, LegacyNameCandidate)> = candidates
+        .iter()
+        .map(|candidate| {
+            (
+                classify_legacy_candidate(true, candidate),
+                candidate.clone(),
+            )
+        })
+        .collect();
+    classified.sort_by(|a, b| compare_classified_candidates(&a.0, &b.0));
+    for (slot, (_, candidate)) in candidates.iter_mut().zip(classified) {
+        *slot = candidate;
+    }
+}
+
 /// The Task 7 import transaction body: immutable per-import backup first,
 /// then per-candidate classification/resolution/application — each candidate
 /// is acknowledged individually (never an early whole-import shortcut), and
 /// winners, winning migration evidence and acknowledged candidate ids commit
-/// in the SAME document transaction. The trusted boot lane additionally sets
-/// `migration.completed` in this commit, so canonical readers stop
-/// consulting migrated legacy fields even if the physical cleanup that
-/// follows never lands (it is idempotently retried at boot).
+/// in the SAME document transaction. A trusted boot-lane import (see
+/// [`is_boot_import_id`]) never completes the migration by itself — the
+/// consolidation runner commits the completion receipt only after every
+/// chunk acknowledged ([`SessionNames::complete_legacy_migration`]), so
+/// canonical readers stop consulting migrated legacy fields exactly when
+/// the whole consolidation finished (the physical cleanup that follows is
+/// idempotently retried at boot).
 fn import_legacy_decision(
     document: &mut StoredDocument,
     meta: &TxnMeta,
@@ -3678,7 +3754,7 @@ fn import_legacy_decision(
     // here retains every original and acknowledges nothing.
     write_import_backup_once(backup_dir, &input, meta.now_ms)?;
 
-    let trusted_boot = input.import_id == NAME_MIGRATION_BOOT_IMPORT_ID;
+    let trusted_boot = is_boot_import_id(&input.import_id);
     let mut acknowledged: Vec<String> = Vec::with_capacity(input.candidates.len());
     let mut newly_acknowledged = false;
     let mut publish: Vec<PublishSpec> = Vec::new();
@@ -3737,12 +3813,7 @@ fn import_legacy_decision(
         }
     }
 
-    let completed_boot = trusted_boot && !document.migration.completed;
-    if completed_boot {
-        document.migration.completed = true;
-    }
-
-    if !newly_acknowledged && !completed_boot && publish.is_empty() {
+    if !newly_acknowledged && publish.is_empty() {
         // A fully idempotent re-delivery: nothing persisted, nothing
         // published.
         return Ok(Decision::Read(LegacyImportResult {

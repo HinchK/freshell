@@ -1081,6 +1081,22 @@ async fn import_endpoint_acknowledges_per_candidate_and_resolves_terminals() {
         json!("the server-boot import id is reserved")
     );
 
+    // The whole reserved FAMILY is refused: a chunked boot derivation
+    // (`server-boot-v1--0`) can never reach the store from the untrusted
+    // lane either (only the in-process boot runner sends those).
+    let state2b = names_state(&home);
+    let router2b = super::router(state2b);
+    let (status, body) = post_import(
+        router2b,
+        json!({ "version": 1, "importId": "server-boot-v1--0", "evidence": [], "candidates": [] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["details"],
+        json!("the server-boot import id is reserved")
+    );
+
     // An oversized envelope is refused.
     let state3 = names_state(&home);
     let router3 = super::router(state3);

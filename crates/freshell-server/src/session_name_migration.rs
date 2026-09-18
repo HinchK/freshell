@@ -22,17 +22,18 @@
 //! parsed provider title those mirrors carried). Generic `updatedAt`,
 //! file mtime and registry times are NEVER explicit-rename recency.
 //!
-//! After the receipt commits (same commit as the winners, the winning
-//! evidence and the acknowledged candidate ids), the scope-only cleanup
-//! removes the migrated title fields — `titleOverride`/`titleSource` from
-//! scoped session-override rows, `titleOverride` from identity-resolvable
-//! terminal overrides, `derivedTitle` from active metadata entries —
-//! never the summary/archive/delete/description data on those rows, never
-//! a row outside the three scoped providers. Canonical readers stop
-//! consulting the migrated fields the moment the receipt commits (the
-//! in-memory override maps lose the fields in the same boot step, before
-//! any request is served); if the physical cleanup cannot flush, the next
-//! boot retries it idempotently.
+//! After the receipt commits — winners, winning evidence and the
+//! acknowledged candidate ids land per ≤100-candidate import chunk, and
+//! `completed` commits once every chunk acknowledged — the scope-only
+//! cleanup removes the migrated title fields — `titleOverride`/`titleSource`
+//! from scoped session-override rows, `titleOverride` from
+//! identity-resolvable terminal overrides, `derivedTitle` from active
+//! metadata entries — never the summary/archive/delete/description data on
+//! those rows, never a row outside the three scoped providers. Canonical
+//! readers stop consulting the migrated fields the moment the receipt
+//! commits (the in-memory override maps lose the fields in the same boot
+//! step, before any request is served); if the physical cleanup cannot
+//! flush, the next boot retries it idempotently.
 //!
 //! Late previously-offline browser imports keep arriving through
 //! `POST /api/session-names/import` with per-candidate acknowledgment and
@@ -63,7 +64,10 @@ use freshell_ws::tabs_persist::atomic_write_durable;
 use serde_json::{json, Map, Value};
 
 use crate::session_metadata::SessionMetadataStore;
-use crate::session_names::{SessionNames, NAME_MIGRATION_BOOT_IMPORT_ID, NAME_MIGRATION_DIR_NAME};
+use crate::session_names::{
+    order_boot_legacy_candidates, SessionNames, NAME_MIGRATION_BOOT_IMPORT_ID,
+    NAME_MIGRATION_DIR_NAME, NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT,
+};
 use crate::settings_store::SettingsStore;
 
 /// The boot backup file name under `name-migration-v1/`.
@@ -106,7 +110,7 @@ pub(crate) async fn run_session_name_consolidation(inputs: SessionNameConsolidat
         snapshots_dir,
     } = inputs;
 
-    let evidence =
+    let mut evidence =
         gather_legacy_evidence(&settings, &metadata, &identity, snapshots_dir.as_deref()).await;
 
     // The immutable server backup: durable create-once, byte-equivalent
@@ -128,41 +132,86 @@ pub(crate) async fn run_session_name_consolidation(inputs: SessionNameConsolidat
     }
 
     if !names.migration_completed() {
-        let import = LegacyNameImport {
-            version: 1,
-            import_id: NAME_MIGRATION_BOOT_IMPORT_ID.to_string(),
-            evidence: boot_evidence_envelopes(&evidence),
-            candidates: evidence.candidates.clone(),
-        };
-        match names.import_legacy(import).await {
-            Ok(result) => {
-                let changed = result.names.iter().filter(|u| u.changed).count();
-                tracing::info!(
-                    target: "freshell_server::session_names",
-                    op = "legacy_name_consolidation",
-                    name_ref = "-",
-                    revision = 0,
-                    acknowledged = result.acknowledged.len(),
-                    changed,
-                    "one-time legacy-name consolidation committed"
-                );
-            }
-            Err(error) => {
-                tracing::error!(
-                    target: "freshell_server::session_names",
-                    op = "legacy_name_consolidation",
-                    name_ref = "-",
-                    revision = 0,
-                    class = %error.code(),
-                    attempt = 1,
-                    "session_names.operation_failed: legacy-name consolidation failed; \
-                     originals retained, retrying next boot: {error}"
-                );
-                // Nothing was consolidated — do not clean up either: the
-                // legacy fields stay live until a boot that commits.
-                return;
+        // The plan's batching rule: at most 100 candidates per
+        // envelope/importId. Order the gathered candidates best-first by
+        // the deterministic total order first, THEN chunk: the
+        // retained-evidence comparison already makes application
+        // permutation-invariant, and the ordering additionally keeps every
+        // chunk's membership stable across boots (the create-once
+        // per-import backups and the per-candidate acknowledgment replay
+        // both key off the chunk ids).
+        let mut candidates = std::mem::take(&mut evidence.candidates);
+        order_boot_legacy_candidates(&mut candidates);
+        let envelopes = boot_evidence_envelopes(&evidence);
+        let chunked = candidates.len() > NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT;
+        let mut acknowledged = 0usize;
+        let mut changed = 0usize;
+        for (index, chunk) in candidates
+            .chunks(NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT)
+            .enumerate()
+        {
+            let import = LegacyNameImport {
+                version: 1,
+                import_id: if chunked {
+                    format!("{}--{index}", NAME_MIGRATION_BOOT_IMPORT_ID)
+                } else {
+                    NAME_MIGRATION_BOOT_IMPORT_ID.to_string()
+                },
+                evidence: envelopes.clone(),
+                candidates: chunk.to_vec(),
+            };
+            match names.import_legacy(import).await {
+                Ok(result) => {
+                    acknowledged += result.acknowledged.len();
+                    changed += result.names.iter().filter(|update| update.changed).count();
+                }
+                Err(error) => {
+                    tracing::error!(
+                        target: "freshell_server::session_names",
+                        op = "legacy_name_consolidation",
+                        name_ref = "-",
+                        revision = 0,
+                        class = %error.code(),
+                        attempt = 1,
+                        chunk = index,
+                        "session_names.operation_failed: legacy-name consolidation \
+                         failed on import chunk {index}; originals retained, the \
+                         receipt stays open, retrying next boot: {error}"
+                    );
+                    // Not every chunk committed — do not complete the
+                    // receipt and do not clean up either: the legacy
+                    // fields stay live until a boot that commits every
+                    // chunk (per-candidate acknowledgment makes the landed
+                    // chunks resume-safe no-ops).
+                    return;
+                }
             }
         }
+        // The receipt: committed only once EVERY chunk acknowledged — a
+        // boot interrupted between chunks leaves it open and the next
+        // boot resumes the remaining chunks.
+        if let Err(error) = names.complete_legacy_migration().await {
+            tracing::error!(
+                target: "freshell_server::session_names",
+                op = "legacy_name_consolidation",
+                name_ref = "-",
+                revision = 0,
+                class = %error.code(),
+                attempt = 1,
+                "session_names.operation_failed: cannot commit the legacy-name \
+                 consolidation receipt; originals retained, retrying next boot: {error}"
+            );
+            return;
+        }
+        tracing::info!(
+            target: "freshell_server::session_names",
+            op = "legacy_name_consolidation",
+            name_ref = "-",
+            revision = 0,
+            acknowledged,
+            changed,
+            "one-time legacy-name consolidation committed"
+        );
     }
 
     // Scope-only cleanup — idempotent, retried every boot while any migrated

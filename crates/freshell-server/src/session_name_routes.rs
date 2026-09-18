@@ -38,7 +38,7 @@ use freshell_ws::identity::TerminalIdentityRegistry;
 use crate::boot::{is_authed, unauthorized};
 use crate::session_name_migration::resolve_terminal_identity;
 use crate::session_names::{
-    SessionNames, NAME_MIGRATION_BOOT_IMPORT_ID, NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT,
+    is_boot_import_id, SessionNames, NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT,
 };
 
 /// Client batch reads are chunked to this many references per request (plan
@@ -280,8 +280,9 @@ async fn rename_session_name(
 /// `{acknowledged: string[], names: SessionNameUpdate[]}`. Per-candidate
 /// acknowledgment only after the import's immutable backup and the canonical
 /// commit (never an early whole-import shortcut). The reserved boot import
-/// id is refused here — the untrusted HTTP lane can never honor
-/// `explicit_rename` (manual) or accepted-Freshell-AI classifications.
+/// id FAMILY (`server-boot-v1` and its `--N` chunk derivations) is refused
+/// here — the untrusted HTTP lane can never honor `explicit_rename`
+/// (manual) or accepted-Freshell-AI classifications.
 /// `legacy_terminal` targets resolve through the identity ledger first;
 /// unresolved ones stay recovery-only.
 async fn import_legacy_names(
@@ -305,7 +306,7 @@ async fn import_legacy_names(
                 .into_response();
         }
     };
-    if import.import_id == NAME_MIGRATION_BOOT_IMPORT_ID {
+    if is_boot_import_id(&import.import_id) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({

@@ -34,9 +34,9 @@ use std::sync::Arc;
 
 use freshell_freshagent::naming::SessionNaming;
 use freshell_protocol::session_names::{
-    LegacyCandidateScope, LegacyEvidenceEnvelope, LegacyNameCandidate, LegacyNameImport,
-    LegacyNameTarget, LegacyProtectionEvidence, NameIntent, NameSource, NamedProvider,
-    SessionNameRef, SessionNameUpdate,
+    legacy_name_candidate_id, LegacyCandidateIdInput, LegacyCandidateScope, LegacyEvidenceEnvelope,
+    LegacyNameCandidate, LegacyNameImport, LegacyNameTarget, LegacyProtectionEvidence, NameIntent,
+    NameSource, NamedProvider, SessionNameRef, SessionNameUpdate,
 };
 use freshell_ws::identity::TerminalIdentityRegistry;
 use serde_json::{json, Map, Value};
@@ -219,6 +219,50 @@ fn browser_import(import_id: &str, candidates: Vec<LegacyNameCandidate>) -> Lega
             raw: json!({ "version": 4, "tabs": { "tabs": [] }, "panes": {} }).to_string(),
         }],
         candidates,
+    }
+}
+
+/// Seed `count` scoped session-override rows (`claude:s{index}` at accepted
+/// Freshell-AI rank — `titleSource:"ai"`), the object shape `seed_config`
+/// takes for `config.sessionOverrides`.
+fn seed_ai_override_rows(count: usize) -> Value {
+    let mut rows = serde_json::Map::new();
+    for index in 0..count {
+        rows.insert(
+            format!("claude:s{index}"),
+            json!({ "titleOverride": format!("AI {index}"), "titleSource": "ai" }),
+        );
+    }
+    Value::Object(rows)
+}
+
+/// The candidate `gather_session_overrides` mints for one seeded
+/// `claude:s{index}` accepted-Freshell-AI row — the stable id tuple a
+/// resumed boot must acknowledge, never re-apply.
+fn gathered_override_candidate(index: usize) -> LegacyNameCandidate {
+    let session_id = format!("s{index}");
+    let name = format!("AI {index}");
+    LegacyNameCandidate {
+        id: legacy_name_candidate_id(LegacyCandidateIdInput {
+            storage_key: "config.sessionOverrides",
+            device_id: None,
+            tab_id: None,
+            pane_id: None,
+            scope: LegacyCandidateScope::Session,
+            provider: Some("claude"),
+            session_id: Some(&session_id),
+            name: &name,
+            source: NameSource::FreshellAi,
+            protection_evidence: LegacyProtectionEvidence::None,
+            explicit_rename_at: None,
+        }),
+        target: session_target(NamedProvider::Claude, &session_id),
+        name,
+        source: NameSource::FreshellAi,
+        scope: LegacyCandidateScope::Session,
+        explicit_rename_at: None,
+        evidence_key: format!("session-override:claude:{session_id}"),
+        protection_evidence: LegacyProtectionEvidence::None,
     }
 }
 
@@ -787,7 +831,16 @@ async fn fault_after_commit_before_cleanup_finishes_idempotently() {
         assert_eq!(update.record.source, NameSource::Manual);
     } else {
         let _ = std::fs::remove_file(fdir.join("probe"));
-        eprintln!("SKIP fault_after_commit_before_cleanup: read-only dir not enforceable here");
+        // The precondition is the test: a chmod 0o555 dir is still
+        // writable for root, so under root the read-only enforcement this
+        // fault injection depends on CANNOT hold. Refuse to silently
+        // self-skip — fail loudly instead (run the suite as a non-root
+        // user) so the pinned fault behavior can never quietly not run.
+        panic!(
+            "fault_after_commit_before_cleanup: cannot enforce the read-only \
+             config dir in this environment (running as root?); rerun as a \
+             non-root user so the cleanup-flush fault injection actually fires"
+        );
     }
     drop(tmp);
 }
@@ -1168,6 +1221,167 @@ async fn per_candidate_acknowledgment_and_batch_limit() {
         .import_legacy(browser_import("batch-2", candidates))
         .await
         .is_err());
+    drop(tmp);
+}
+
+/// Task 7 review I1: a home with more than 100 gathered candidates (the
+/// long-lived multi-device install) consolidates fully. The boot import
+/// honors the plan's own batching rule — at most 100 candidates per
+/// envelope/importId — so >100 candidates arrive as sequential chunk
+/// imports; every session (including the tail chunk's) lands with its
+/// saved name, and candidates competing for one target ACROSS a chunk
+/// boundary still resolve by the deterministic total order.
+#[tokio::test]
+async fn a_boot_with_more_than_100_candidates_consolidates_fully() {
+    let (tmp, home) = fresh_home();
+    // 149 filler rows + one competed row whose session ALSO carries a
+    // snapshot pane mirror and source-tab label — lower-ranked provider-AI
+    // candidates that sort into the tail chunk.
+    let mut rows = match seed_ai_override_rows(149) {
+        Value::Object(rows) => rows,
+        _ => unreachable!("seeded as an object"),
+    };
+    rows.insert(
+        "claude:s-competed".to_string(),
+        json!({ "titleOverride": "Override Won", "titleSource": "ai" }),
+    );
+    seed_config(&home, Value::Object(rows), json!({}));
+    seed_snapshot_device(
+        &home,
+        "device-big",
+        vec![json!({
+            "tabKey": "claude:s-competed", "tabId": "tab-c", "serverInstanceId": "srv",
+            "deviceId": "device-big", "deviceLabel": "device-big",
+            "tabName": "Snapshot Tab Label", "status": "open", "revision": 1,
+            "createdAt": 1, "updatedAt": 2, "paneCount": 1, "titleSetByUser": false,
+            "panes": [{ "paneId": "p1", "kind": "terminal", "title": "Pane Mirror",
+                        "payload": scoped_pane_payload("s-competed") }],
+        })],
+    );
+    let settings = Arc::new(store_at(&home));
+    let names = open_store(&home).await;
+    let metadata = open_metadata(&home).await;
+
+    run_session_name_consolidation(consolidation_inputs(
+        &home,
+        names.clone(),
+        settings.clone(),
+        metadata.clone(),
+        TerminalIdentityRegistry::new(),
+    ))
+    .await;
+
+    assert!(
+        names.migration_completed(),
+        "the >100-candidate boot must consolidate instead of being refused"
+    );
+    // Chunk 0 landed: the lexicographically-first filler keeps its name.
+    let first = record_of(&names, NamedProvider::Claude, "s0")
+        .await
+        .unwrap();
+    assert_eq!(first.record.name, "AI 0");
+    // The tail chunk landed: "claude:s99" sorts last among the fillers, so
+    // its candidate rides the second chunk.
+    let tail = record_of(&names, NamedProvider::Claude, "s99")
+        .await
+        .unwrap();
+    assert_eq!(tail.record.name, "AI 99");
+    // Cross-chunk competition resolves by the total order: the session
+    // override (accepted Freshell AI) beats the snapshot pane mirror and
+    // source-tab label (provider AI) that arrived in the other chunk.
+    let competed = record_of(&names, NamedProvider::Claude, "s-competed")
+        .await
+        .unwrap();
+    assert_eq!(competed.record.name, "Override Won");
+    assert_eq!(competed.record.source, NameSource::FreshellAi);
+    // The receipt really completed: the cleanup cleared the migrated rows.
+    let config = read_config(&home);
+    assert!(config["sessionOverrides"]["claude:s99"]
+        .as_object()
+        .unwrap()
+        .get("titleOverride")
+        .is_none());
+    // The plan's batching rule held: one immutable backup per chunk import.
+    let imports_dir = home
+        .join(".freshell")
+        .join(NAME_MIGRATION_DIR_NAME)
+        .join("imports");
+    let backups = std::fs::read_dir(&imports_dir)
+        .map(|entries| entries.filter_map(|entry| entry.ok()).count())
+        .unwrap_or(0);
+    assert_eq!(backups, 2, "152 gathered candidates batch into two chunks");
+    drop(tmp);
+}
+
+/// Task 7 review I1 (sequencing): a boot-lane import acknowledges its
+/// candidates WITHOUT completing the receipt — completion is the
+/// consolidation runner's FINAL step — so a boot interrupted between
+/// chunks leaves the receipt open, and the next boot resumes it: the
+/// per-candidate acknowledgment makes the landed chunks no-ops (the
+/// record keeps its revision), the remaining chunks land, and only then
+/// does the receipt commit.
+#[tokio::test]
+async fn a_partial_boot_import_resumes_and_completes_on_the_next_boot() {
+    let (tmp, home) = fresh_home();
+    seed_config(&home, seed_ai_override_rows(150), json!({}));
+    let names = open_store(&home).await;
+
+    // An interrupted boot landed its first chunk only: 100 of the gathered
+    // candidates imported under the trusted boot lane.
+    let chunk: Vec<LegacyNameCandidate> = (0..100).map(gathered_override_candidate).collect();
+    names
+        .import_legacy(LegacyNameImport {
+            version: 1,
+            import_id: NAME_MIGRATION_BOOT_IMPORT_ID.to_string(),
+            evidence: vec![],
+            candidates: chunk,
+        })
+        .await
+        .unwrap();
+    assert!(
+        !names.migration_completed(),
+        "a boot-lane import acknowledges candidates without completing the receipt"
+    );
+    let landed = record_of(&names, NamedProvider::Claude, "s0")
+        .await
+        .unwrap();
+    assert_eq!(landed.record.name, "AI 0");
+    let landed_revision = landed.record.revision;
+
+    // The next boot resumes: the receipt was open, so the runner re-imports
+    // every chunk — the acknowledged candidates are no-ops — and only then
+    // completes.
+    let settings = Arc::new(store_at(&home));
+    let metadata = open_metadata(&home).await;
+    run_session_name_consolidation(consolidation_inputs(
+        &home,
+        names.clone(),
+        settings.clone(),
+        metadata.clone(),
+        TerminalIdentityRegistry::new(),
+    ))
+    .await;
+    assert!(names.migration_completed(), "the resumed boot completes");
+    let unchanged = record_of(&names, NamedProvider::Claude, "s0")
+        .await
+        .unwrap();
+    assert_eq!(
+        unchanged.record.revision, landed_revision,
+        "an acknowledged candidate never re-applies"
+    );
+    for session in ["s99", "s100", "s149"] {
+        let update = record_of(&names, NamedProvider::Claude, session)
+            .await
+            .unwrap();
+        assert_eq!(update.record.name, format!("AI {}", &session[1..]));
+    }
+    // The resumed boot's cleanup cleared the migrated rows.
+    let config = read_config(&home);
+    assert!(config["sessionOverrides"]["claude:s149"]
+        .as_object()
+        .unwrap()
+        .get("titleOverride")
+        .is_none());
     drop(tmp);
 }
 
