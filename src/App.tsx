@@ -1396,7 +1396,7 @@ export default function App() {
           // only applies newer records.
           void bootstrapSessionNamesNow().then((updates) => {
             if (updates.length > 0) dispatch(receiveSessionNames(updates))
-          }).catch((error: unknown) => log.debug('session name bootstrap failed', error))
+          }).catch((error: unknown) => log.warn('session name bootstrap failed', error))
           void recoverMissingStartupState()
         }
         // Unified agent names (Task 5): the canonical name broadcast.

@@ -202,6 +202,19 @@ function renderScoped(store: ReturnType<typeof scopedPaneStore>['store'], layout
   )
 }
 
+/** The server's 409 body: the other writer's accepted update rides along. */
+function revisionConflictError(winner: SessionNameUpdate): Error & { status: number; data: unknown } {
+  const error = new Error('another rename won') as Error & { status: number; data: unknown }
+  error.status = 409
+  error.data = {
+    error: 'NAME_REVISION_CONFLICT',
+    message: 'another rename won',
+    sessionName: winner,
+    nameRef: claudeSessionRef,
+  }
+  return error
+}
+
 describe('unified agent rename — one shared session name', () => {
   beforeEach(() => {
     localStorage.clear()
@@ -302,15 +315,7 @@ describe('unified agent rename — one shared session name', () => {
     await waitFor(() => { expect(patchDeferreds.length).toBe(1) })
     const winner = updateOf(record('Other browser name', 9, 'manual'), 61)
     await act(async () => {
-      const error = new Error('another rename won') as Error & { status: number; data: unknown }
-      error.status = 409
-      error.data = {
-        error: 'NAME_REVISION_CONFLICT',
-        message: 'another rename won',
-        sessionName: winner,
-        nameRef: claudeSessionRef,
-      }
-      patchDeferreds[0].reject(error)
+      patchDeferreds[0].reject(revisionConflictError(winner))
     })
 
     await waitFor(() => {
@@ -323,6 +328,59 @@ describe('unified agent rename — one shared session name', () => {
     expect(selectPaneDisplayName(store.getState(), 'tab-1', 'pane-1')).toBe('Other browser name')
     await waitFor(() => {
       expect(screen.getByText('Other browser name')).toBeVisible()
+    })
+  })
+
+  it('refreshes the pane rename capture after a conflict so a resubmit from the still-open editor succeeds', async () => {
+    const { store, layout } = scopedPaneStore()
+    act(() => {
+      store.dispatch(receiveSessionNames([updateOf(record('Conflict base', 8), 60)]))
+    })
+    renderScoped(store, layout)
+
+    const input = startPaneRename()
+    fireEvent.change(input, { target: { value: 'My losing rename' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    await waitFor(() => { expect(patchDeferreds.length).toBe(1) })
+    const winner = updateOf(record('Other browser name', 9, 'manual'), 61)
+    await act(async () => {
+      patchDeferreds[0].reject(revisionConflictError(winner))
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText(/another rename won/i)).toBeVisible()
+    })
+    // The still-open editor is seeded with the accepted text…
+    await waitFor(() => {
+      expect((screen.getByLabelText('Rename pane') as HTMLInputElement).value).toBe('Other browser name')
+    })
+
+    // …and a resubmit carries the ACCEPTED record's new revision, so it can
+    // actually succeed (the stale edit-start revision would 409 forever).
+    const retryInput = screen.getByLabelText('Rename pane')
+    retryInput.focus()
+    fireEvent.change(retryInput, { target: { value: 'Retry after conflict' } })
+    fireEvent.keyDown(retryInput, { key: 'Enter' })
+
+    await waitFor(() => { expect(patchDeferreds.length).toBe(2) })
+    expect(patchDeferreds[1].path).toBe('/api/panes/pane-1')
+    expect(patchDeferreds[1].body).toEqual({
+      name: 'Retry after conflict',
+      nameIntent: 'user',
+      ifRevision: 9,
+      expectedNameRef: claudeSessionRef,
+    })
+
+    const accepted = updateOf(record('Retry after conflict', 10, 'manual'), 62)
+    await act(async () => {
+      patchDeferreds[1].resolve({ data: { paneId: 'pane-1', tabId: 'tab-1', sessionName: accepted } })
+    })
+
+    expect(selectPaneDisplayName(store.getState(), 'tab-1', 'pane-1')).toBe('Retry after conflict')
+    expect(selectTabDisplayName(store.getState(), 'tab-1')).toBe('Retry after conflict')
+    await waitFor(() => {
+      expect(screen.getAllByText('Retry after conflict').length).toBeGreaterThanOrEqual(2)
     })
   })
 
@@ -399,6 +457,59 @@ describe('unified agent rename — one shared session name', () => {
     expect(state.panes.paneTitles['tab-1']['pane-1']).toBe('old sticky label')
     await waitFor(() => {
       expect(screen.getAllByText('Renamed from tab').length).toBeGreaterThanOrEqual(2)
+    })
+  })
+
+  it('refreshes the tab rename capture after a conflict so a resubmit from the still-open editor succeeds', async () => {
+    const { store, layout } = scopedPaneStore()
+    act(() => {
+      store.dispatch(receiveSessionNames([updateOf(record('Tab conflict base', 2), 80)]))
+    })
+    const renderResult = renderScoped(store, layout)
+
+    const input = await startTabRename(renderResult)
+    fireEvent.change(input, { target: { value: 'Tab losing rename' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+
+    await waitFor(() => { expect(patchDeferreds.length).toBe(1) })
+    const winner = updateOf(record('Other tab name', 3, 'manual'), 81)
+    await act(async () => {
+      patchDeferreds[0].reject(revisionConflictError(winner))
+    })
+
+    await waitFor(() => {
+      expect(screen.getByText(/another rename won/i)).toBeVisible()
+    })
+    // The still-open tab editor is seeded with the accepted text…
+    const editor = renderResult.container.querySelector('[data-tab-id="tab-1"] input') as HTMLInputElement | null
+    expect(editor).toBeTruthy()
+    await waitFor(() => {
+      expect((editor as HTMLInputElement).value).toBe('Other tab name')
+    })
+
+    // …and a resubmit carries the ACCEPTED record's new revision.
+    const retryEditor = editor as HTMLInputElement
+    retryEditor.focus()
+    fireEvent.change(retryEditor, { target: { value: 'Tab retry' } })
+    fireEvent.keyDown(retryEditor, { key: 'Enter' })
+
+    await waitFor(() => { expect(patchDeferreds.length).toBe(2) })
+    expect(patchDeferreds[1].path).toBe('/api/panes/pane-1')
+    expect(patchDeferreds[1].body).toEqual({
+      name: 'Tab retry',
+      nameIntent: 'user',
+      ifRevision: 3,
+      expectedNameRef: claudeSessionRef,
+    })
+
+    const accepted = updateOf(record('Tab retry', 4, 'manual'), 82)
+    await act(async () => {
+      patchDeferreds[1].resolve({ data: { paneId: 'pane-1', tabId: 'tab-1', sessionName: accepted } })
+    })
+
+    expect(selectTabDisplayName(store.getState(), 'tab-1')).toBe('Tab retry')
+    await waitFor(() => {
+      expect(screen.getAllByText('Tab retry').length).toBeGreaterThanOrEqual(1)
     })
   })
 

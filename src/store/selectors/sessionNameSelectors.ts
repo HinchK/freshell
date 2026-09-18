@@ -33,16 +33,20 @@ type SessionNamesCache = RootState['sessionNames']
 function resolveRefKey(cache: SessionNamesCache, ref: SessionNameRef): string {
   let key = sessionNameRefKey(ref)
   for (let hops = 0; hops < 8; hops += 1) {
-    const redirect = cache.redirects[key]
+    const redirect = cache.redirects?.[key]
     if (!redirect) break
     key = redirect.toKey
   }
   return key
 }
 
-/** The canonical record currently cached for a naming ref (redirect-resolved). */
+/** The canonical record currently cached for a naming ref (redirect-resolved).
+ * Guarded like its sibling selectors: a hand-built state lacking the slice
+ * (or its maps) resolves to undefined instead of throwing. */
 export function selectSessionNameRecord(state: RootState, ref: SessionNameRef): SessionNameRecord | undefined {
-  return state.sessionNames?.records?.[resolveRefKey(state.sessionNames, ref)]
+  const cache = state.sessionNames
+  if (!cache?.records) return undefined
+  return cache.records[resolveRefKey(cache, ref)]
 }
 
 /** The native writeback status cached for a naming ref (redirect-resolved). */
@@ -227,7 +231,7 @@ export function selectTabDisplayName(state: RootState, tabId: string): string {
 
 /** The session display rule for directory/history/sidebar surfaces. */
 export function selectSessionDisplayName(state: RootState, ref: SessionNameRef, fallback: string): string {
-  const record = state.sessionNames?.records ? selectSessionNameRecord(state, ref) : undefined
+  const record = selectSessionNameRecord(state, ref)
   return record?.name ?? fallback
 }
 

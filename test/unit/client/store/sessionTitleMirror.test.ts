@@ -1,7 +1,8 @@
 import { configureStore } from '@reduxjs/toolkit'
 import { describe, expect, it } from 'vitest'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
-import { panesSlice, initLayout, updatePaneTitle, updatePaneTitleBySessionRef } from '@/store/panesSlice'
+import { panesSlice, initLayout, updatePaneTitle } from '@/store/panesSlice'
+import { applySessionRenameCascade } from '@/store/titleSync'
 import sessionsReducer, { commitSessionWindowVisibleRefresh } from '@/store/sessionsSlice'
 import { sessionTitleMirrorMiddleware } from '@/store/sessionTitleMirror'
 import { getFreshAgentLabel } from '@/lib/fresh-agent-registry'
@@ -340,16 +341,14 @@ describe('sessionTitleMirrorMiddleware', () => {
   })
 
   // e2r1 review finding 3: the fresh-agent-only walk gated only the
-  // dispatch TRIGGER, not the reducer's targets — the shared
-  // updatePaneTitleBySessionRef reducer deliberately matches BOTH
-  // fresh-agent and terminal panes (paneContentMatchesSessionRef), so
-  // with a fresh-agent pane AND a same-session TERMINAL pane in one tab,
-  // the mirror's single dispatch re-titled the terminal pane too,
-  // overwriting its registry/REST title — the exact precedence defect
-  // the repair claimed to eliminate. The mirror must dispatch per-pane
-  // (by tabId+paneId, through updatePaneTitle's user-set guard) so the
-  // reducer can never over-reach; updatePaneTitleBySessionRef keeps its
-  // all-kinds semantics for the session-rename cascade.
+  // dispatch TRIGGER, not the reducer's targets — a mirror dispatch that
+  // matched BOTH fresh-agent and terminal panes on one session re-titled
+  // the terminal pane too, overwriting its registry/REST title — the exact
+  // precedence defect the repair claimed to eliminate. The mirror must
+  // dispatch per-pane (by tabId+paneId, through updatePaneTitle's user-set
+  // guard) so no shared walk can ever over-reach; the session-rename
+  // cascade (applySessionRenameCascade) keeps its all-kinds semantics
+  // through its own per-pane walk (paneContentMatchesSessionRef).
   describe('combined fresh-agent + terminal panes on one session', () => {
     function seedCombinedSessionPanes(store: ReturnType<typeof buildStore>) {
       store.dispatch(addTab({ id: 'tab-z', title: 'Combined panes' }))
@@ -409,19 +408,21 @@ describe('sessionTitleMirrorMiddleware', () => {
       expect(store.getState().panes.paneTitles['tab-z']['pane-term']).toBe('My terminal name')
     })
 
-    it('the session-rename cascade action (updatePaneTitleBySessionRef, titleSync.ts:42) still updates BOTH pane kinds — its default semantics are unchanged', () => {
+    it('the session-rename cascade (applySessionRenameCascade) still updates BOTH pane kinds — its per-pane walk keeps all-kinds semantics', () => {
       const store = buildStore()
       seedCombinedSessionPanes(store)
-      store.dispatch(updatePaneTitleBySessionRef({
+      applySessionRenameCascade({
+        dispatch: store.dispatch,
+        getState: store.getState,
         provider: 'claude',
         sessionId: DURABLE_CLAUDE,
         title: 'Renamed from history',
-        setByUser: true,
-      }))
+        cascadedTerminalId: null,
+      })
       expect(store.getState().panes.paneTitles['tab-z']['pane-fa']).toBe('Renamed from history')
       expect(store.getState().panes.paneTitles['tab-z']['pane-term']).toBe('Renamed from history')
-      expect(store.getState().panes.paneTitleSetByUser['tab-z']['pane-fa']).toBe(true)
-      expect(store.getState().panes.paneTitleSetByUser['tab-z']['pane-term']).toBe(true)
+      expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-fa']).toBe(true)
+      expect(store.getState().panes.paneTitleSetByUser['tab-z']?.['pane-term']).toBe(true)
     })
   })
 

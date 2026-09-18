@@ -87,17 +87,16 @@ function collectTitledSessionRows(sessions: RootState['sessions']): TitledSessio
  * terminal.title fold) — mirroring into it would undo a terminal rename
  * on every sessions/* commit; a terminal-level title that arrives LATER
  * (record → replay) overwrites the non-user-set mirror title exactly as
- * today. Fresh-agent panes keep matching unconditionally (their titles
- * have no registry pipeline). The mirror then dispatches PER-PANE
- * (updatePaneTitle, by tabId+paneId with the same user-set guard) for
- * exactly the pairs collected here, so the reducer can never over-reach
- * into a pane outside this target set (updatePaneTitleBySessionRef's
- * reducer deliberately matches both pane kinds via
- * paneContentMatchesSessionRef — e2r1 review finding 3); that shared
- * action keeps its all-kinds semantics for the session-rename cascade
- * (titleSync.ts:42). A pane whose user-set flag is true is NEVER a
- * target.
- */
+  * today. Fresh-agent panes keep matching unconditionally (their titles
+  * have no registry pipeline). The mirror then dispatches PER-PANE
+  * (updatePaneTitle, by tabId+paneId with the same user-set guard) for
+  * exactly the pairs collected here, so the reducer can never over-reach
+  * into a pane outside this target set (e2r1 review finding 3). The
+  * session-rename cascade (applySessionRenameCascade, titleSync.ts) keeps
+  * its all-kinds semantics through its own per-pane walk
+  * (paneContentMatchesSessionRef). A pane whose user-set flag is true is
+  * NEVER a target.
+  */
 function collectSessionTitleTargets(
   panes: RootState['panes'],
   provider: string,

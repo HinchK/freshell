@@ -180,10 +180,14 @@ export function parseSessionNameRef(value: unknown): SessionNameRef | undefined 
 }
 
 /** Parse a name-intent CLI/MCP argument: only `user` and `automatic` are
- * accepted; anything else is a loud error (never a silent default). */
-export function parseNameIntent(value: unknown): NameIntent {
+ * accepted; anything else is a loud error (never a silent default). The
+ * error names the argument the caller actually received — pass
+ * `'--name-intent'` (the default) for the CLI flag or `'nameIntent'` for
+ * the MCP parameter, so the message never points an MCP caller at a CLI
+ * flag they cannot type. */
+export function parseNameIntent(value: unknown, argument = '--name-intent'): NameIntent {
   if (value === 'user' || value === 'automatic') return value
-  throw new Error('--name-intent must be "user" or "automatic"')
+  throw new Error(`${argument} must be "user" or "automatic"`)
 }
 
 /** Schema-parse a canonical update riding on any response body

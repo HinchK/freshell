@@ -42,8 +42,6 @@ export interface SessionNamesState {
   /** Native writeback status by encoded (resolved) ref key, ordered by
    * documentGeneration — display/status data, never a name authority. */
   nativeSync: Record<string, { sync: NativeSync; documentGeneration: number }>
-  /** Highest documentGeneration observed (nativeSync ordering only). */
-  documentGeneration: number
 }
 
 export interface SessionNameProjection {
@@ -55,7 +53,6 @@ const initialState: SessionNamesState = {
   records: {},
   redirects: {},
   nativeSync: {},
-  documentGeneration: 0,
 }
 
 /** Fold one batch of canonical server updates (schema-validated on the wire). */
@@ -74,13 +71,21 @@ function foldUpdates(state: SessionNamesState, updates: SessionNameUpdate[]): vo
       const existing = state.redirects[fromKey]
       if (!existing || existing.revision < redirect.revision) {
         state.redirects[fromKey] = { toKey, revision: redirect.revision }
+      } else if (
+        existing.revision === redirect.revision
+        && existing.toKey !== toKey
+      ) {
+        // Symmetric with the equal-revision record case: same redirect
+        // revision carrying a different target is a protocol error; the
+        // existing redirect is retained and the mismatch is logged.
+        log.error('session name protocol error: equal redirect revision carries different target', {
+          fromKey,
+          revision: redirect.revision,
+        })
       }
     }
-    if (update.documentGeneration > state.documentGeneration) {
-      state.documentGeneration = update.documentGeneration
-    }
     foldRecord(state, update.record)
-    foldNativeSync(state, sessionNameRefKey(update.record.ref), update)
+    foldNativeSync(state, resolveNativeSyncKey(state, sessionNameRefKey(update.record.ref)), update)
   }
 }
 
@@ -119,6 +124,19 @@ function remapRedirectedRecords(state: SessionNamesState): void {
     }
     delete state.records[fromKey]
   }
+}
+
+/** Follow pending→durable redirects to the final ref key (chain-bounded),
+ * so a status update delivered at a pre-redirect pending key parks its
+ * nativeSync at the RESOLVED key instead of an orphaned one. */
+function resolveNativeSyncKey(state: SessionNamesState, key: string): string {
+  let resolved = key
+  for (let hops = 0; hops < 8; hops += 1) {
+    const redirect = state.redirects[resolved]
+    if (!redirect) break
+    resolved = redirect.toKey
+  }
+  return resolved
 }
 
 /** Fold the native-writeback projection by documentGeneration. Status-only

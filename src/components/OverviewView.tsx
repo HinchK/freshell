@@ -6,7 +6,7 @@ import { addTab, setActiveTab, updateTab } from '@/store/tabsSlice'
 import { initLayout, updatePaneTitleByTerminalId } from '@/store/panesSlice'
 import { receiveSessionNames } from '@/store/sessionNamesSlice'
 import { parseSessionNameUpdate } from '@/lib/session-names'
-import { isScopedSessionRow } from '@/store/selectors/sessionNameSelectors'
+import { isScopedSessionRow, selectSessionDisplayName, selectSessionNativeSync } from '@/store/selectors/sessionNameSelectors'
 import type { SessionNameRecord, SessionNameRef } from '@shared/session-names'
 import type { AppDispatch } from '@/store/store'
 import { getWsClient } from '@/lib/ws-client'
@@ -337,8 +337,12 @@ function terminalCardScopedRename(
 }
 
 /**
- * A scoped coding-agent terminal displays its canonical session name (the
- * row's last-known record) — the terminal-level title stays visible only for
+ * A scoped coding-agent terminal's ROW fallback display: the row's
+ * last-known canonical record. The card's rendered display resolves through
+ * the live canonical cache by the row's `nameRef` FIRST (mirroring the
+ * sidebar/history row selectors), with this record as the fallback — so a
+ * rename converges the card the moment the cache folds, before any
+ * directory refetch. The terminal-level title stays visible only for
  * out-of-scope terminals.
  */
 function terminalCardDisplayName(terminal: TerminalOverview): string {
@@ -368,15 +372,33 @@ function TerminalCard({
   onGenerateSummary: () => void
 }) {
   const [editing, setEditing] = useState(false)
-  const [title, setTitle] = useState(terminalCardDisplayName(terminal))
+  // Unified agent names (Task 5): a scoped card resolves its display and
+  // its native writeback status through the LIVE canonical cache by the
+  // row's nameRef (the row's last-known record is the display fallback) —
+  // a rename or a status push converges the card the moment the cache
+  // folds, with no directory refetch.
+  const liveCacheName = useAppSelector((s) => (
+    terminal.nameRef && isScopedSessionRow(terminal.mode === 'shell' ? undefined : terminal.mode)
+      ? selectSessionDisplayName(s, terminal.nameRef, '')
+      : ''
+  ))
+  const nativeSyncStatus = useAppSelector((s) => (
+    terminal.nameRef ? selectSessionNativeSync(s, terminal.nameRef) : undefined
+  ))
+  const displayName = liveCacheName || terminalCardDisplayName(terminal)
+  const [title, setTitle] = useState(displayName)
   const [desc, setDesc] = useState(terminal.description || '')
   const [showActions, setShowActions] = useState(false)
   const [generating, setGenerating] = useState(false)
 
   useEffect(() => {
-    setTitle(terminalCardDisplayName(terminal))
+    // A row identity change (e.g. a refresh tick landing mid-edit) must
+    // never wipe the form while the user is editing; the editor reseeds
+    // from the current display when it closes.
+    if (editing) return
+    setTitle(displayName)
     setDesc(terminal.description || '')
-  }, [terminal])
+  }, [displayName, terminal.description, editing])
 
   const handleGenerateSummary = async () => {
     setGenerating(true)
@@ -418,7 +440,7 @@ function TerminalCard({
           </button>
           <button
             onClick={() => {
-              setTitle(terminalCardDisplayName(terminal))
+              setTitle(displayName)
               setDesc(terminal.description || '')
               setEditing(false)
             }}
@@ -445,7 +467,7 @@ function TerminalCard({
       onMouseLeave={() => setShowActions(false)}
       role="button"
       tabIndex={0}
-      aria-label={`Open terminal ${terminalCardDisplayName(terminal)}`}
+      aria-label={`Open terminal ${displayName}`}
       data-context={ContextIds.OverviewTerminal}
       data-terminal-id={terminal.terminalId}
     >
@@ -465,7 +487,7 @@ function TerminalCard({
         {/* Content */}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
-            <h3 className="font-medium text-sm">{terminalCardDisplayName(terminal)}</h3>
+            <h3 className="font-medium text-sm">{displayName}</h3>
             {isOpen && (
               <span className="text-2xs px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
                 open
@@ -477,6 +499,17 @@ function TerminalCard({
               </span>
             )}
           </div>
+
+          {nativeSyncStatus && nativeSyncStatus.status !== 'synced' ? (
+            <div
+              className="mt-1 text-2xs text-muted-foreground"
+              role="status"
+              aria-live="polite"
+            >
+              Native sync: {nativeSyncStatus.status}
+              {nativeSyncStatus.reason ? ` — ${nativeSyncStatus.reason}` : ''}
+            </div>
+          ) : null}
 
           {terminal.description ? (
             <p className="mt-1 text-sm text-muted-foreground line-clamp-2">

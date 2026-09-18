@@ -339,9 +339,19 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
       } catch (error: any) {
         if (controller.signal.aborted) return
         // A conflict carries the server's accepted record: fold it so the
-        // winning name is visible everywhere while the error stays shown.
+        // winning name is visible everywhere while the error stays shown,
+        // and REFRESH the editor's capture from the accepted record (its
+        // new revision) so a resubmit from the still-open editor can
+        // succeed — the stale edit-start revision would conflict forever.
+        // The editor seeds the accepted text.
         const accepted = parseSessionNameUpdate(error?.data?.sessionName)
-        if (accepted) dispatch(receiveSessionNames([accepted]))
+        if (accepted) {
+          dispatch(receiveSessionNames([accepted]))
+          if (scoped) {
+            renameCaptureRef.current = resolvePaneRenameCapture(appStore.getState(), tabId, paneId)
+            setRenameValue(accepted.record.name)
+          }
+        }
         const message = typeof error?.message === 'string' && error.message
           ? error.message
           : 'Failed to rename pane'
@@ -352,7 +362,7 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         }
       }
     })()
-  }, [dispatch, tabId, renamingPaneId, renameValue, node])
+  }, [dispatch, appStore, tabId, renamingPaneId, renameValue, node])
 
   const handleRenameKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === 'Enter' || e.key === 'Escape') {

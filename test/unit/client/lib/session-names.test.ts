@@ -18,9 +18,10 @@ vi.mock('@/lib/api', () => ({ api: { post: apiMocks.post, patch: apiMocks.patch 
 
 import {
   bootstrapSessionNames,
+  collectSessionNameRefs,
   renameSessionName,
 } from '@/lib/session-names'
-import type { SessionNameUpdate } from '@shared/session-names'
+import { sessionNameRefKey, type SessionNameUpdate } from '@shared/session-names'
 
 function sessionRef(sessionId: string) {
   return { kind: 'session' as const, provider: 'claude' as const, sessionId }
@@ -90,6 +91,85 @@ describe('bootstrapSessionNames', () => {
     })
     await bootstrapSessionNames([sessionRef('s1')], { signal: controller.signal })
     expect(apiMocks.post).toHaveBeenCalled()
+  })
+})
+
+describe('collectSessionNameRefs', () => {
+  it('collects refs from open panes, session-directory windows, and terminal-directory windows, deduped', () => {
+    const refs = collectSessionNameRefs({
+      panes: {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              terminalId: 't1',
+              createRequestId: 'cr-1',
+              status: 'running',
+              nameRef: pendingRef('pane-handle'),
+              sessionRef: { provider: 'claude', sessionId: 's1' },
+            },
+          } as never,
+        },
+      },
+      sessions: {
+        windows: {
+          history: {
+            projects: [
+              {
+                sessions: [
+                  // Same ref as the open pane's session — collected once.
+                  { nameRef: sessionRef('s1') },
+                  { nameRef: sessionRef('s2') },
+                ],
+              },
+            ],
+          },
+        },
+      },
+      terminalDirectory: {
+        windows: {
+          sidebar: {
+            items: [
+              // "Recently closed" background terminals.
+              { nameRef: sessionRef('recently-closed') },
+              { nameRef: sessionRef('s1') },
+            ],
+          },
+        },
+      },
+    })
+
+    expect(refs).toEqual([
+      pendingRef('pane-handle'),
+      sessionRef('s1'),
+      sessionRef('s2'),
+      sessionRef('recently-closed'),
+    ])
+  })
+
+  it('ignores rows without a valid naming ref', () => {
+    const refs = collectSessionNameRefs({
+      sessions: {
+        windows: {
+          history: {
+            projects: [
+              { sessions: [{ nameRef: { kind: 'session', provider: 'claude', sessionId: '' } }, { title: 'no ref' }] },
+            ],
+          },
+        },
+      },
+      terminalDirectory: {
+        windows: {
+          sidebar: {
+            items: [{ nameRef: { kind: 'pending', id: '' } }, { title: 'no ref' }],
+          },
+        },
+      },
+    })
+    expect(refs).toEqual([])
   })
 })
 

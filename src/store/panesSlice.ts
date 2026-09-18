@@ -21,7 +21,7 @@ import {
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { matchesDerivedPaneTitle } from '@/lib/pane-title'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
-import { buildPaneRefreshTarget, paneContentMatchesSessionRef, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
+import { buildPaneRefreshTarget, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { mergeHydratedPaneMetadata, mergeCrossWindowPaneTitles, paneTitleMetadataEquals, type HydratePanesMeta } from './hydrate-pane-metadata-merge.js'
@@ -2128,37 +2128,6 @@ export const panesSlice = createSlice({
       }
     },
 
-    /**
-     * Walk all tabs' pane trees and update the title for any pane bound to
-     * the given provider:sessionId — fresh-agent panes by provider/sessionId,
-     * terminal panes by sessionRef. Used when a session rename must mirror
-     * into pane titles even when no terminal cascade exists (SDK panes,
-     * exited coding-CLI terminals).
-     */
-    updatePaneTitleBySessionRef: (
-      state,
-      action: PayloadAction<{ provider: string; sessionId: string; title: string; setByUser?: boolean }>
-    ) => {
-      const { provider, sessionId, title, setByUser } = action.payload
-      for (const tabId of Object.keys(state.layouts)) {
-        for (const leaf of collectLeaves(state.layouts[tabId])) {
-          if (!paneContentMatchesSessionRef(leaf.content, provider, sessionId)) continue
-          const paneId = leaf.id
-          if (setByUser === false && state.paneTitleSetByUser?.[tabId]?.[paneId]) {
-            continue
-          }
-          if (!state.paneTitles[tabId]) state.paneTitles[tabId] = {}
-          state.paneTitles[tabId][paneId] = title
-          if (setByUser !== false) {
-            // Mark as user-set so programmatic updates don't overwrite it
-            if (!state.paneTitleSetByUser) state.paneTitleSetByUser = {}
-            if (!state.paneTitleSetByUser[tabId]) state.paneTitleSetByUser[tabId] = {}
-            state.paneTitleSetByUser[tabId][paneId] = true
-          }
-        }
-      }
-    },
-
     reconcileTerminalSessionRefByTerminalId: (
       state,
       action: PayloadAction<{ terminalId: string; sessionRef: unknown }>
@@ -2680,7 +2649,6 @@ export const {
   hydratePaneTitles,
   updatePaneTitle,
   updatePaneTitleByTerminalId,
-  updatePaneTitleBySessionRef,
   reconcileTerminalSessionRefByTerminalId,
   requestPaneRename,
   clearPaneRenameRequest,

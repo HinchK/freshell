@@ -427,9 +427,22 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
       } catch (error: any) {
         if (controller.signal.aborted) return
         // A conflict carries the server's accepted record: fold it so the
-        // winning name is visible everywhere while the error stays shown.
+        // winning name is visible everywhere while the error stays shown,
+        // and REFRESH the editor's capture from the accepted record (its
+        // new revision) so a resubmit from the still-open editor can
+        // succeed — the stale edit-start revision would conflict forever.
+        // The editor seeds the accepted text.
         const accepted = parseSessionNameUpdate(error?.data?.sessionName)
-        if (accepted) dispatch(receiveSessionNames([accepted]))
+        if (accepted) {
+          dispatch(receiveSessionNames([accepted]))
+          if (tabRenameCaptureRef.current?.paneId === capture.paneId) {
+            tabRenameCaptureRef.current = {
+              paneId: capture.paneId,
+              ...resolvePaneRenameCapture(appStore.getState(), tab.id, capture.paneId),
+            }
+            setRenameValue(accepted.record.name)
+          }
+        }
         setTabRenameError({
           tabId: tab.id,
           message: typeof error?.message === 'string' && error.message
@@ -442,7 +455,7 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         }
       }
     })()
-  }, [dispatch])
+  }, [dispatch, appStore])
 
   const sensors = useSensors(
     useSensor(PointerSensor, {

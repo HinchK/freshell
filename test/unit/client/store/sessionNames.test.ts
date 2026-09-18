@@ -159,6 +159,26 @@ describe('sessionNames reducer', () => {
       ]))
       expect(state.redirects[sessionNameRefKey(pendingRef('h1'))]?.toKey).toBe(sessionNameRefKey(sessionRef('s1')))
     })
+
+    it('treats an equal-revision redirect with a different target as a protocol error and keeps the first target', () => {
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+      let state = sessionNamesReducer(undefined, { type: 'init' })
+      state = sessionNamesReducer(state, receiveSessionNames([
+        update(record(sessionRef('s1'), 'N', 1), 10, {
+          redirects: [{ from: pendingRef('h1'), to: sessionRef('s1'), revision: 5 }],
+        }),
+      ]))
+      // Same redirect revision, a DIFFERENT durable target: symmetric with
+      // the equal-revision record case, this is logged as a protocol error
+      // and the existing redirect is retained.
+      state = sessionNamesReducer(state, receiveSessionNames([
+        update(record(sessionRef('s2'), 'N', 1), 11, {
+          redirects: [{ from: pendingRef('h1'), to: sessionRef('s2'), revision: 5 }],
+        }),
+      ]))
+      expect(state.redirects[sessionNameRefKey(pendingRef('h1'))]?.toKey).toBe(sessionNameRefKey(sessionRef('s1')))
+      expect(errorSpy).toHaveBeenCalled()
+    })
   })
 
   describe('nativeSync', () => {
@@ -195,6 +215,29 @@ describe('sessionNames reducer', () => {
         }),
       ]))
       expect(state.nativeSync[sessionNameRefKey(sessionRef('s1'))]?.sync.status).toBe('synced')
+    })
+
+    it('keys nativeSync by the redirect-resolved ref: a late pending-keyed status lands on the durable key', () => {
+      let state = sessionNamesReducer(undefined, { type: 'init' })
+      // Materialization: the record is at the durable identity and the
+      // pending→durable redirect is folded.
+      state = sessionNamesReducer(state, receiveSessionNames([
+        update(record(sessionRef('s1'), 'Durable name', 4), 12, {
+          redirects: [{ from: pendingRef('h1'), to: sessionRef('s1'), revision: 4 }],
+        }),
+      ]))
+      // A late status push still addressed to the pending handle must park
+      // its nativeSync at the RESOLVED (durable) key, not the orphaned
+      // pending key.
+      state = sessionNamesReducer(state, receiveSessionNames([
+        update(record(pendingRef('h1'), 'Durable name', 4), 15, {
+          changed: false,
+          nativeSync: { status: 'unsynced', desiredRevision: 4, locationRevision: 1, reason: 'provider timeout' },
+        }),
+      ]))
+      expect(state.nativeSync[sessionNameRefKey(sessionRef('s1'))]?.sync.status).toBe('unsynced')
+      expect(state.nativeSync[sessionNameRefKey(sessionRef('s1'))]?.sync.reason).toBe('provider timeout')
+      expect(state.nativeSync[sessionNameRefKey(pendingRef('h1'))]).toBeUndefined()
     })
 
     it('a changed:false status-only update with a LOWER record revision never retitles', () => {

@@ -9,7 +9,7 @@ import { openSessionTab } from '@/store/tabsSlice'
 import { applySessionRenameCascade } from '@/store/titleSync'
 import { receiveSessionNames } from '@/store/sessionNamesSlice'
 import { renameSessionName, parseSessionNameUpdate } from '@/lib/session-names'
-import { isScopedSessionRow, selectSessionNameRecord } from '@/store/selectors/sessionNameSelectors'
+import { isScopedSessionRow, selectSessionNameRecord, selectSessionNativeSync } from '@/store/selectors/sessionNameSelectors'
 import type { SessionNameRef } from '@shared/session-names'
 import { cn } from '@/lib/utils'
 import { getProviderLabel } from '@/lib/coding-cli-utils'
@@ -630,6 +630,13 @@ function MobileSessionDetailsSheet({
   onDelete: () => void
 }) {
   const sessionNames = useAppSelector((s) => s.sessionNames)
+  // Unified agent names (Task 5): the session-detail sheet shows the same
+  // accessible, nonblocking native writeback status as the pane header —
+  // display/status data only, never a name authority, and no retry/reset/
+  // generate control.
+  const nativeSyncStatus = useAppSelector((s) => (
+    session.nameRef ? selectSessionNativeSync(s, session.nameRef) : undefined
+  ))
   const [title, setTitle] = useState(sessionDisplayName(session, sessionNames))
   const [summary, setSummary] = useState(session.summary || '')
 
@@ -661,6 +668,12 @@ function MobileSessionDetailsSheet({
           <div>{getProviderLabel(session.provider)}</div>
           <div>{formatTime(session.lastActivityAt)}</div>
           {session.cwd && <div className="truncate">{session.cwd}</div>}
+          {nativeSyncStatus && nativeSyncStatus.status !== 'synced' ? (
+            <div role="status" aria-live="polite">
+              Native sync: {nativeSyncStatus.status}
+              {nativeSyncStatus.reason ? ` — ${nativeSyncStatus.reason}` : ''}
+            </div>
+          ) : null}
         </div>
         <div className="mt-3 space-y-2">
           <input
