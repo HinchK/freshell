@@ -25,7 +25,7 @@ The approved pane-header redesign is implemented in Freshell: desktop (viewport 
 
 **Goal:** Pane headers look identical on desktop (except icons spreading 4px) while every action button's clickable zone becomes a full-height square that touches its neighbors; mobile headers grow ×1.5 with the same square zones; fonts and desktop glyph/icon sizes are untouched; the change is proven by unit tests and a new browser e2e spec plus regenerated screenshot goldens.
 
-**Architecture:** PaneHeader.tsx is the only pane-header renderer (zoomed panes reuse it; the deck is canvas-only). Zones are implemented by making the button box itself the zone — `h-full` plus fixed rem widths, actions `gap-0` — rather than pseudo-element overlays, so zones abut exactly with no overlap and hover/focus naturally fill the zone. FreshAgentSettingsButton follows the same geometry for the gear and re-anchors its popover to the glyph element. The `@container` fallbacks in index.css (≤280px gap, ≤180px box shrink) adjust to the new geometry. All nominal sizes stay in the current rem/px regime (rem where today's classes are rem, px where today's are px) so `--ui-scale` behavior is unchanged; mobile pane icons use rem (`h-[1.3125rem]` = 21px at the default 16px root) to preserve today's rem-based icon scaling, and mobile glyphs stay px (`h-[27px]`) matching today's `h-[18px]` px glyphs.
+**Architecture:** PaneHeader.tsx is the only pane-header renderer (zoomed panes reuse it; the deck is canvas-only). Zones are implemented by making the button box itself the zone — `h-full` plus fixed rem widths, actions `gap-0` — rather than pseudo-element overlays, so zones abut exactly with no overlap and hover/focus naturally fill the zone. Because the gear and refresh buttons sit inside auto-height wrapper divs, the wrappers (and FreshAgentSettingsButton's root) get an explicit full-height chain so `h-full` resolves all the way down. The `@container` tiers in index.css keep their space-saving hides (≤480px meta, ≤280px optional actions) and their `gap: 0`, but the ≤180px button/svg shrink overrides are deleted: a square full-height zone cannot compress without violating the square constraint, so the proportional update to that fallback is the removal of the shrink mechanism — ultra-narrow space saving comes from the hides alone. All nominal sizes stay in the current rem/px regime (rem where today's classes are rem, px where today's are px) so `--ui-scale` behavior is unchanged; mobile pane icons use rem (`h-[1.3125rem]` = 21px at the default 16px root) to preserve today's rem-based icon scaling, and mobile glyphs stay px (`h-[27px]`) matching today's `h-[18px]` px glyphs.
 
 **Tech Stack:** React 18 + TypeScript, Tailwind CSS (JIT arbitrary values), Vitest + Testing Library (jsdom, className-string assertions per house style), Playwright e2e (test/e2e-browser).
 
@@ -102,6 +102,16 @@ For the glyph assertion above, mirror the exact pattern the file already uses fo
     expect(meta.className).toContain('mr-2')
     expect(meta.className).toContain('text-xs')
   })
+
+  it('gives fresh-agent action wrappers the full-height chain', () => {
+    renderPaneHeader({ content: freshAgentPaneContent })
+    const header = screen.getByRole('banner')
+    const wrappers = header.querySelectorAll('.pane-header-fresh-agent-optional-action')
+    expect(wrappers.length).toBeGreaterThanOrEqual(1)
+    for (const w of wrappers) {
+      expect(w.className).toContain('h-full')
+    }
+  })
 })
 ```
 
@@ -165,18 +175,19 @@ Fresh-agent RepoIcon (line 200) and fresh-agent PaneIcon fragment (line 210):
 h-[1.3125rem] w-[1.3125rem] sm:h-3.5 sm:w-3.5
 ```
 
+Fresh-agent action wrappers (lines 290 and 300) — the gear and refresh buttons sit inside auto-height wrapper divs, so their zones need a definite-height chain down from the actions row:
+```tsx
+<div className="pane-header-fresh-agent-optional-action flex h-full">
+```
+(both wrapper spots; the wrapper's own `height: 100%` resolves against the definite-height actions row, giving Task 2's gear button a definite parent).
+
 In `src/index.css`, ≤280px rule (lines 48-50) — zones always touch, also ultra-narrow:
 ```css
 .pane-header--fresh-agent .pane-header-actions {
   gap: 0;
 }
 ```
-≤180px rule (lines 70-73) — width still compresses; the `height: 1rem` declaration is removed so the base `h-full` flows through and zones stay full-height; the svg rule (0.75rem) is unchanged:
-```css
-.pane-header--fresh-agent .pane-header-actions button {
-  width: 1rem;
-}
-```
+Delete the ≤180px button and svg override rules entirely (lines 70-78: the `.pane-header--fresh-agent .pane-header-actions button { height: 1rem; width: 1rem; }` rule and the `.pane-header--fresh-agent .pane-header-actions svg { height: 0.75rem; width: 0.75rem; }` rule). Square full-height zones cannot shrink without violating the square constraint, so the shrink mechanism itself goes away; ultra-narrow space saving comes from the kept ≤280px optional-action hide and ≤480px meta hide. The neighboring ≤180px title-gap and detail-font-size rules in that block stay unchanged.
 
 - [ ] **Step 4: Run the focused test**
 
@@ -236,8 +247,10 @@ it('anchors the popover to the gear glyph, not the button box', async () => {
 })
 ```
 
-Also assert the gear button's zone classes in the same test:
+Also assert the gear button's zone classes and the root chain in the same test:
 ```tsx
+  const settingsRoot = gearButton.parentElement
+  expect(settingsRoot?.className).toContain('h-full')
   expect(gearButton.className).toContain('h-full')
   expect(gearButton.className).toContain('w-[3.9375rem]')
   expect(gearButton.className).toContain('sm:w-[1.75rem]')
@@ -253,6 +266,11 @@ Expected: FAIL — popover top is `'4px'` (zero-rect button box + 4), not `'34px
 - [ ] **Step 3: Add the minimal production implementation**
 
 In `FreshAgentSettingsButton.tsx`:
+
+Root container (line 273) — the gear button's percentage height needs a definite-height chain through this auto-height root:
+```tsx
+<div className="relative flex h-full">
+```
 
 Add next to the existing `buttonRef`:
 ```tsx
@@ -348,16 +366,28 @@ test.describe('desktop pane header hit zones (>= 640px viewport)', () => {
     closeWithin((await paneIcon.boundingBox())!.width, 0.875 * root)
   })
 
-  test('ultra-narrow fresh-agent panes keep full-height zones (<=180px container tier)', async ({ page }) => {
+  test('fresh-agent gear zone is a full-height square at normal width', async ({ page }) => {
+    await createFreshAgentPane(page)
+    const root = await rootFontSize(page)
+    const header = page.getByRole('banner', { name: /Pane:/ })
+    await expect(header).toBeVisible()
+    const gear = header.getByTitle('Agent settings')
+    const box = (await gear.boundingBox())!
+    closeWithin(box.width, 1.75 * root)
+    closeWithin(box.height, 1.75 * root)
+  })
+
+  test('ultra-narrow fresh-agent panes hide optional actions and keep square full-height zones', async ({ page }) => {
     await createFreshAgentPane(page)
     await splitFreshAgentPaneThreeTimes(page)
     const header = page.getByRole('banner', { name: /Pane:/ }).last()
     await expect(header).toBeVisible()
+    await expect(header.getByTitle('Agent settings')).toBeHidden()
     const headerBox = (await header.boundingBox())!
     const zoom = header.getByTitle('Maximize pane')
     const zoomBox = (await zoom.boundingBox())!
     closeWithin(zoomBox.height, headerBox.height)
-    expect(zoomBox.width).toBeLessThanOrEqual(17)
+    closeWithin(zoomBox.width, zoomBox.height)
   })
 })
 
@@ -371,10 +401,19 @@ test.describe('mobile pane header hit zones (390px viewport)', () => {
     const headerBox = (await header.boundingBox())!
     closeWithin(headerBox.height, 3.9375 * root)
 
+    const buttons = await header.getByRole('button').all()
+    expect(buttons.length).toBeGreaterThanOrEqual(2)
+    const boxes: { x: number; width: number; height: number }[] = []
+    for (const b of buttons) boxes.push((await b.boundingBox())!)
+    boxes.sort((a, b) => a.x - b.x)
+    for (const box of boxes) {
+      closeWithin(box.width, 3.9375 * root)
+      closeWithin(box.height, 3.9375 * root)
+    }
+    for (let i = 1; i < boxes.length; i++) {
+      closeWithin(boxes[i].x, boxes[i - 1].x + boxes[i - 1].width)
+    }
     const close = header.getByTitle('Close pane')
-    const box = (await close.boundingBox())!
-    closeWithin(box.width, 3.9375 * root)
-    closeWithin(box.height, 3.9375 * root)
     const closeSvg = close.locator('svg')
     closeWithin((await closeSvg.boundingBox())!.width, 27)
     const paneIcon = header.locator('svg').first()
