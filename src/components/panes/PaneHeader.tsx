@@ -149,7 +149,7 @@ export default function PaneHeader({
       title="Refresh pane"
       aria-label="Refresh pane"
     >
-      <RefreshCw className="h-[27px] w-[27px] sm:h-3 sm:w-3" />
+      <RefreshCw className="h-5 w-5 sm:h-3 sm:w-3" />
     </button>
   ) : null
 
@@ -163,7 +163,7 @@ export default function PaneHeader({
   return (
     <div
       className={cn(
-        'pane-header flex h-[3.9375rem] shrink-0 items-center border-b border-border text-sm sm:h-7',
+        'pane-header flex h-11 shrink-0 items-center border-b border-border text-sm sm:h-7',
         isFreshAgentPane ? 'pane-header--fresh-agent gap-1.5 px-1.5' : 'gap-2 px-2',
         needsAttention
           ? 'bg-emerald-50 border-l-2 border-l-emerald-500 dark:bg-emerald-900/30'
@@ -177,14 +177,14 @@ export default function PaneHeader({
       aria-label={`Pane: ${title}`}
     >
       {!isFreshAgentPane && repoIconInfo ? (
-        <RepoIcon info={repoIconInfo} className="h-[1.3125rem] w-[1.3125rem] shrink-0 sm:h-3.5 sm:w-3.5" />
+        <RepoIcon info={repoIconInfo} className="h-4 w-4 shrink-0 sm:h-3.5 sm:w-3.5" />
       ) : null}
 
       {!isFreshAgentPane ? (
         <PaneIcon
           content={content}
           className={cn(
-            'h-[1.3125rem] w-[1.3125rem] shrink-0 sm:h-3.5 sm:w-3.5',
+            'h-4 w-4 shrink-0 sm:h-3.5 sm:w-3.5',
             busy && status === 'running' ? 'text-blue-500' : getTerminalStatusIconClassName(status),
           )}
         />
@@ -197,7 +197,7 @@ export default function PaneHeader({
               title={freshAgentRepoNameKnown ? `Repo: ${freshAgentRepoIconInfo.repoName}` : freshAgentRepoIconInfo.repoKey}
               className="inline-flex shrink-0"
             >
-              <RepoIcon info={freshAgentRepoIconInfo} className="h-[1.3125rem] w-[1.3125rem] sm:h-3.5 sm:w-3.5" />
+              <RepoIcon info={freshAgentRepoIconInfo} className="h-4 w-4 sm:h-3.5 sm:w-3.5" />
             </span>
           ) : null}
           <span
@@ -207,7 +207,7 @@ export default function PaneHeader({
             <PaneIcon
               content={content}
               className={cn(
-                'h-[1.3125rem] w-[1.3125rem] sm:h-3.5 sm:w-3.5',
+                'h-4 w-4 sm:h-3.5 sm:w-3.5',
                 busy && status === 'running' ? 'text-blue-500' : 'text-muted-foreground',
               )}
             />
@@ -277,7 +277,7 @@ export default function PaneHeader({
             title="Search in terminal"
             aria-label="Search in terminal"
           >
-            <Search className="h-[27px] w-[27px] sm:h-3 sm:w-3" />
+            <Search className="h-5 w-5 sm:h-3 sm:w-3" />
           </button>
         )}
 
@@ -313,8 +313,8 @@ export default function PaneHeader({
             aria-label={isZoomed ? 'Restore pane' : 'Maximize pane'}
           >
             {isZoomed
-              ? <Minimize2 className="h-[27px] w-[27px] sm:h-3 sm:w-3" />
-              : <Maximize2 className="h-[27px] w-[27px] sm:h-3 sm:w-3" />}
+              ? <Minimize2 className="h-5 w-5 sm:h-3 sm:w-3" />
+              : <Maximize2 className="h-5 w-5 sm:h-3 sm:w-3" />}
           </button>
         )}
 
@@ -328,7 +328,7 @@ export default function PaneHeader({
           title="Close pane"
           aria-label="Close pane"
         >
-          <X className="h-[27px] w-[27px] sm:h-3 sm:w-3" />
+          <X className="h-5 w-5 sm:h-3 sm:w-3" />
         </button>
       </div>
     </div>
