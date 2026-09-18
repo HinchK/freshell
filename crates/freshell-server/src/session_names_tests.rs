@@ -1716,7 +1716,9 @@ async fn observe_native_folds_provider_titles_and_own_write_echoes() {
     assert!(!equal.changed);
     assert_eq!(equal.record.name, "Native title");
 
-    // Invalid titles are visible validation errors.
+    // Invalid titles (an external rename over the accepted-name cap) never
+    // fail the transaction: the observation PROVENANCE is retained and only
+    // the offer is skipped — no rename, no error (Task 3 fix round M7).
     let oversize = store
         .observe_native(observe(
             target.clone(),
@@ -1724,8 +1726,22 @@ async fn observe_native_folds_provider_titles_and_own_write_echoes() {
             NativeNameOrigin::Snapshot,
             1,
         ))
-        .await;
-    assert!(matches!(oversize, Err(NameError::InvalidName(_))));
+        .await
+        .expect("an invalid observation title retains its provenance");
+    assert!(!oversize.changed);
+    assert_eq!(oversize.record.name, "Native title");
+    let document = read_raw_document(dir.path());
+    let entry = document
+        .native_write
+        .values()
+        .next()
+        .expect("an observation entry exists");
+    let observation = entry
+        .last_observation
+        .as_ref()
+        .expect("the invalid observation's provenance is retained");
+    assert_eq!(observation.origin, "snapshot");
+    assert!(!observation.stale);
 }
 
 #[tokio::test]

@@ -2,11 +2,20 @@
 // same env-seam pattern as the sidecar's fake-query-module. Exports ONLY the
 // two metadata functions the helper consumes; refuses to load when the
 // ambient project-key override leaked into the child env un-removed (the
-// Rust parent must set OR remove CLAUDE_CODE_PROJECT_DIR_NAME deliberately).
+// Rust parent must set OR remove CLAUDE_CODE_PROJECT_DIR_NAME deliberately —
+// a test that INTENDS the key to be present opts in via
+// FRESHELL_FAKE_SDK_ALLOW_PROJECT_KEY=1, mirroring the parent's deliberate
+// set).
 
-const seenEnv = {
-  configDir: process.env.CLAUDE_CONFIG_DIR ?? null,
-  projectDirName: process.env.CLAUDE_CODE_PROJECT_DIR_NAME ?? null,
+if (
+  process.env.CLAUDE_CODE_PROJECT_DIR_NAME !== undefined &&
+  process.env.FRESHELL_FAKE_SDK_ALLOW_PROJECT_KEY !== '1'
+) {
+  throw new Error(
+    'CLAUDE_CODE_PROJECT_DIR_NAME leaked into the helper child env un-removed; ' +
+      'the Rust parent must set-or-remove it deliberately (a test wanting the key ' +
+      'sets FRESHELL_FAKE_SDK_ALLOW_PROJECT_KEY=1)',
+  )
 }
 
 export async function getSessionInfo(sessionId, options) {

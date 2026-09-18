@@ -59,12 +59,20 @@ function runHelper(
   request: Record<string, unknown>,
   env: Record<string, string | undefined> = {},
 ): Promise<HelperAnswer> {
+  const childEnv: Record<string, string | undefined> = {
+    ...process.env,
+    FRESHELL_CLAUDE_SDK_SESSION_NAMES_MODULE: FAKE_SDK,
+    ...env,
+  }
+  // The Rust parent deliberately SETS OR REMOVES the project-key override for
+  // every helper child; the harness mirrors the REMOVE unless a test
+  // explicitly supplies the key (so an ambient override can never masquerade
+  // as the parent's decision).
+  if (env.CLAUDE_CODE_PROJECT_DIR_NAME === undefined) {
+    delete childEnv.CLAUDE_CODE_PROJECT_DIR_NAME
+  }
   const child = spawn(process.execPath, [HELPER], {
-    env: {
-      ...process.env,
-      FRESHELL_CLAUDE_SDK_SESSION_NAMES_MODULE: FAKE_SDK,
-      ...env,
-    },
+    env: childEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
   })
   children.add(child)
@@ -164,5 +172,60 @@ describe('Claude session-names helper (SDK boundary injected)', () => {
     expect(answer).toMatchObject({ ok: false, class: 'invalid' })
     const answer2 = await runHelper({ op: 'read', sessionId: 'boom', dir: '/d' }, { CLAUDE_CONFIG_DIR: '/tmp' })
     expect(answer2).toMatchObject({ ok: false, class: 'error', message: 'sdk exploded' })
+  })
+
+  it('refuses to load when the project-key override leaks into the child env un-removed', async () => {
+    // The fake SDK's tripwire: CLAUDE_CODE_PROJECT_DIR_NAME present WITHOUT
+    // the explicit test opt-in must abort the helper's SDK import — the
+    // Rust parent's deliberate set-or-remove is the only legitimate route
+    // for that env key to reach the child.
+    const root = configRootWithTranscript('/work/leaked', '44444444-5555-6666-7777-888888888888')
+    const child = spawn(process.execPath, [HELPER], {
+      env: {
+        ...process.env,
+        FRESHELL_CLAUDE_SDK_SESSION_NAMES_MODULE: FAKE_SDK,
+        CLAUDE_CONFIG_DIR: root,
+        CLAUDE_CODE_PROJECT_DIR_NAME: 'leaked-project-key',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    children.add(child)
+    const closed = new Promise<{ out: string; err: string }>((resolve, reject) => {
+      let out = ''
+      let err = ''
+      child.stdout!.on('data', (chunk) => (out += chunk.toString()))
+      child.stderr!.on('data', (chunk) => (err += chunk.toString()))
+      child.on('error', reject)
+      child.on('close', () => resolve({ out, err }))
+    })
+    child.stdin!.write(
+      JSON.stringify({
+        op: 'read',
+        sessionId: '44444444-5555-6666-7777-888888888888',
+        dir: '/work/leaked',
+      }) + '\n',
+    )
+    child.stdin!.end()
+    const { out, err } = await closed
+    expect(out.trim()).toBe('', 'the tripped fake SDK must answer no structured line')
+    expect(err).toContain('leaked into the helper child env un-removed')
+    rmSync(root, { recursive: true, force: true })
+  })
+
+  it('lets a deliberately set project-key override flow through to the child env', async () => {
+    // The parent's deliberate SET (mirrored by the explicit test opt-in):
+    // the helper tolerates the key and answers normally.
+    const root = configRootWithTranscript('/work/deliberate', '55555555-6666-7777-8888-999999999999')
+    const answer = await runHelper(
+      { op: 'read', sessionId: '55555555-6666-7777-8888-999999999999', dir: '/work/deliberate' },
+      {
+        CLAUDE_CONFIG_DIR: root,
+        CLAUDE_CODE_PROJECT_DIR_NAME: 'deliberate-project-key',
+        FRESHELL_FAKE_SDK_ALLOW_PROJECT_KEY: '1',
+      },
+    )
+    expect(answer.ok).toBe(true)
+    expect(answer.customTitle).toBe('Fake Custom Title')
+    rmSync(root, { recursive: true, force: true })
   })
 })

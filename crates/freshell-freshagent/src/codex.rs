@@ -4459,10 +4459,28 @@ impl FreshCodexState {
                 {
                     if name_thread == &thread_id {
                         let sink = state.naming();
-                        let target = freshell_protocol::session_names::SessionNameRef::Session {
-                            provider: freshell_protocol::session_names::NamedProvider::Codex,
-                            session_id: name_thread.clone(),
-                        };
+                        // Resolve through the runtime thread-id→pending
+                        // association (the CLI lanes'
+                        // `named_session_ref_of(...).or(name_ref_for(...))`
+                        // fallback): an external rename observed BEFORE the
+                        // durable rollout bind folds onto the stashed PENDING
+                        // record instead of NotFound-dropping. The stash is
+                        // consumed on a successful bind, after which the
+                        // durable session ref resolves (and a bound handle
+                        // resolves through the redirect either way).
+                        let target =
+                            match state.naming_handles.lock().await.get(name_thread).cloned() {
+                                Some(handle) => {
+                                    freshell_protocol::session_names::SessionNameRef::Pending {
+                                        id: handle,
+                                    }
+                                }
+                                None => freshell_protocol::session_names::SessionNameRef::Session {
+                                    provider:
+                                        freshell_protocol::session_names::NamedProvider::Codex,
+                                    session_id: name_thread.clone(),
+                                },
+                            };
                         let _ = crate::naming::observe_native_live(
                             &sink,
                             target,
@@ -7655,6 +7673,250 @@ pub(crate) mod tests {
             "composer must be sendable once the real notification stream has cleared the active turn"
         );
         assert_eq!(snapshot["capabilities"]["interrupt"], json!(false));
+    }
+
+    // ── unified agent names (Task 3 fix round, M6): the consumer's
+    // ThreadNameUpdated fold resolves through the runtime thread-id→pending
+    // association like the CLI lanes, so an external rename observed BEFORE
+    // the durable rollout bind folds instead of NotFound-dropping.
+
+    /// A naming sink that records every native observation (its chosen target
+    /// and whether that target resolved) — the freshagent-side pin for the
+    /// consumer's fold resolution. The real store's own acceptance policy is
+    /// pinned in `freshell-server`'s suites.
+    struct ObservationRecordingSink {
+        observations: StdMutex<Vec<(freshell_protocol::session_names::SessionNameRef, bool)>>,
+        records: StdMutex<
+            std::collections::HashMap<String, freshell_protocol::session_names::SessionNameRecord>,
+        >,
+    }
+
+    impl ObservationRecordingSink {
+        fn new() -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                observations: StdMutex::new(Vec::new()),
+                records: StdMutex::new(std::collections::HashMap::new()),
+            })
+        }
+
+        fn key_of(target: &freshell_protocol::session_names::SessionNameRef) -> String {
+            serde_json::to_string(target).expect("ref serializes")
+        }
+
+        fn update_for(
+            &self,
+            record: freshell_protocol::session_names::SessionNameRecord,
+        ) -> freshell_protocol::session_names::SessionNameUpdate {
+            freshell_protocol::session_names::SessionNameUpdate {
+                redirects: Vec::new(),
+                record,
+                document_generation: 1,
+                changed: false,
+                native_sync: None,
+            }
+        }
+    }
+
+    impl crate::naming::SessionNaming for ObservationRecordingSink {
+        fn get(
+            &self,
+            refs: Vec<freshell_protocol::session_names::SessionNameRef>,
+        ) -> crate::naming::NameFuture<Vec<freshell_protocol::session_names::SessionNameUpdate>>
+        {
+            let updates = refs
+                .into_iter()
+                .filter_map(|target| {
+                    self.records
+                        .lock()
+                        .unwrap()
+                        .get(&Self::key_of(&target))
+                        .cloned()
+                })
+                .map(|record| self.update_for(record))
+                .collect();
+            Box::pin(async move { Ok(updates) })
+        }
+
+        fn ensure_pending(
+            &self,
+            input: crate::naming::PendingNameInput,
+        ) -> crate::naming::NameFuture<freshell_protocol::session_names::SessionNameUpdate>
+        {
+            let target = freshell_protocol::session_names::SessionNameRef::Pending {
+                id: input.handle.clone(),
+            };
+            if let Some(existing) = self
+                .records
+                .lock()
+                .unwrap()
+                .get(&Self::key_of(&target))
+                .cloned()
+            {
+                let update = self.update_for(existing);
+                return Box::pin(async move { Ok(update) });
+            }
+            let record = freshell_protocol::session_names::SessionNameRecord {
+                name_ref: target.clone(),
+                name: "proj".to_string(),
+                source: freshell_protocol::session_names::NameSource::Directory,
+                revision: 1,
+                manual_revision: None,
+                renamed_at: None,
+                legacy_origin: None,
+            };
+            let update = self.update_for(record.clone());
+            self.records
+                .lock()
+                .unwrap()
+                .insert(Self::key_of(&target), record);
+            Box::pin(async move { Ok(update) })
+        }
+
+        fn bind_pending(
+            &self,
+            _input: crate::naming::BindNameInput,
+        ) -> crate::naming::NameFuture<freshell_protocol::session_names::SessionNameUpdate>
+        {
+            Box::pin(async move {
+                Err(crate::naming::NameError::NotFound(
+                    "not needed here".to_string(),
+                ))
+            })
+        }
+
+        fn rename(
+            &self,
+            _input: crate::naming::RenameNameInput,
+        ) -> crate::naming::NameFuture<freshell_protocol::session_names::SessionNameUpdate>
+        {
+            Box::pin(async move {
+                Err(crate::naming::NameError::NotFound(
+                    "not needed here".to_string(),
+                ))
+            })
+        }
+
+        fn activity(
+            &self,
+            _input: crate::naming::NameActivity,
+        ) -> crate::naming::NameFuture<freshell_protocol::session_names::SessionNameUpdate>
+        {
+            Box::pin(async move {
+                Err(crate::naming::NameError::NotFound(
+                    "not needed here".to_string(),
+                ))
+            })
+        }
+
+        fn observe_native(
+            &self,
+            input: crate::naming::NativeNameObservation,
+        ) -> crate::naming::NameFuture<freshell_protocol::session_names::SessionNameUpdate>
+        {
+            let record = self
+                .records
+                .lock()
+                .unwrap()
+                .get(&Self::key_of(&input.target))
+                .cloned();
+            self.observations
+                .lock()
+                .unwrap()
+                .push((input.target.clone(), record.is_some()));
+            let answer = match record {
+                Some(record) => Ok(self.update_for(record)),
+                None => Err(crate::naming::NameError::NotFound(format!(
+                    "no naming record for {}",
+                    Self::key_of(&input.target)
+                ))),
+            };
+            Box::pin(async move { answer })
+        }
+
+        fn record_acquisition(
+            &self,
+            target: freshell_protocol::session_names::SessionNameRef,
+            _acquisition: freshell_protocol::native_location::NativeAcquisition,
+        ) -> crate::naming::NameFuture<freshell_protocol::session_names::SessionNameUpdate>
+        {
+            let answer = Err(crate::naming::NameError::NotFound(format!(
+                "no record for {}",
+                Self::key_of(&target)
+            )));
+            Box::pin(async move { answer })
+        }
+    }
+
+    /// M6 (Task 3 fix round): the fresh-codex consumer's `ThreadNameUpdated`
+    /// fold resolves through the runtime thread-id→pending association (the
+    /// CLI lanes' `named_session_ref_of(...).or(name_ref_for(...))` shape) —
+    /// an external rename observed BEFORE the durable rollout bind folds onto
+    /// the stashed pending record instead of NotFound-dropping.
+    #[tokio::test]
+    async fn an_external_rename_before_the_durable_bind_folds_via_the_pending_handle() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, _rx) = state_with_bus();
+        let sink = ObservationRecordingSink::new();
+        st.set_session_naming(sink.clone());
+        // A pre-durable pending record plus the runtime thread→handle stash
+        // (exactly what a freshcodex create carries before its rollout lands).
+        use crate::naming::SessionNaming as _;
+        sink.ensure_pending(crate::naming::PendingNameInput {
+            handle: "handle-pending-rename".to_string(),
+            provider: freshell_protocol::session_names::NamedProvider::Codex,
+            cwd: Some("/w/proj".to_string()),
+        })
+        .await
+        .expect("ensure pending");
+        st.naming_handles.lock().await.insert(
+            "thread-pending-rename".to_string(),
+            "handle-pending-rename".to_string(),
+        );
+        let active_turn = Arc::new(StdMutex::new(None));
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-pending-rename",
+            client,
+            active_turn,
+            notifs,
+            spawn_sleeper(),
+            "codex-sidecar-test-name-updated-pending",
+        )
+        .await;
+
+        // The upstream renames the thread BEFORE the rollout bind verifies.
+        peer.emit_notification(
+            "thread/name/updated",
+            json!({ "threadId": "thread-pending-rename", "name": "Externally Renamed" }),
+        );
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if sink.observations.lock().unwrap().len() == 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the consumer never folded the thread/name/updated notification"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (target, folded) = sink.observations.lock().unwrap()[0].clone();
+        assert!(
+            matches!(
+                &target,
+                freshell_protocol::session_names::SessionNameRef::Pending { id }
+                    if id == "handle-pending-rename"
+            ),
+            "the pre-bind observation resolves through the thread→pending association, got {target:?}"
+        );
+        assert!(
+            folded,
+            "the observation folds (the pending record resolves) instead of NotFound-dropping"
+        );
     }
 
     // ── wedged-sidecar quiet deadman (the wedged-but-ALIVE sidecar case) ────────

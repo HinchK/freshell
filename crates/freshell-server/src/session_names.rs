@@ -240,6 +240,15 @@ struct NativeWriteState {
     /// series stayed `unsynced` (ambiguity) — projected as `observedCurrent`.
     #[serde(skip_serializing_if = "Option::is_none")]
     observed_current: Option<bool>,
+    /// Task 3 fix round (M5): the series identity — the revision the series
+    /// was last ARMED at (stamped by `reset_native_series`; a bind transfer
+    /// keeps it, binding is not a new name decision). Every claim captures it
+    /// and every fold/read-charge carries it, so operations dispatched by a
+    /// series superseded by a newer name decision are provenance only — never
+    /// a state change, never a charged allowance. Backfilled from the desired
+    /// revision at claim time for documents written before the stamp existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    series_epoch: Option<NameRevision>,
 }
 
 /// Persisted fair-scheduling cursor (Task 3/4's serial worker alternates
@@ -699,17 +708,23 @@ impl SessionNames {
     }
 
     /// Task 3: charge one read against the six-per-revision allowance,
-    /// persisted before the read dispatch. `false` = the allowance is
-    /// exhausted (or the series was superseded) and the read must not run.
-    pub(crate) fn charge_native_read(&self, target: SessionNameRef) -> NameFuture<bool> {
+    /// persisted before the read dispatch, carrying the dispatching series'
+    /// epoch. `false` = the allowance is exhausted (or the series was
+    /// superseded) and the read must not run.
+    pub(crate) fn charge_native_read(
+        &self,
+        target: SessionNameRef,
+        series_epoch: NameRevision,
+    ) -> NameFuture<bool> {
         let core = Arc::clone(&self.core);
         Box::pin(spawn_txn(core, move |doc, _meta| {
-            charge_native_read_decision(doc, &target)
+            charge_native_read_decision(doc, &target, series_epoch)
         }))
     }
 
-    /// Task 3: fold one classified native outcome into the durable series.
-    /// Stale outcomes (a newer name decision or a relocated target) can never
+    /// Task 3: fold one classified native outcome into the durable series,
+    /// stamped with the dispatching series' epoch. Stale outcomes (a newer
+    /// name decision, a superseded series, or a relocated target) can never
     /// change the saved winner or mark anything synchronized; ordinary
     /// confirmed success plus a current-revision readback synchronizes the
     /// EXACT revision/location. Folds that move the projection publish a
@@ -718,11 +733,19 @@ impl SessionNames {
         &self,
         target: SessionNameRef,
         attempted_location_revision: NameRevision,
+        series_epoch: NameRevision,
         outcome: crate::session_name_native::NativeOutcomeFold,
     ) -> NameFuture<SessionNameUpdate> {
         let core = Arc::clone(&self.core);
         Box::pin(spawn_txn(core, move |doc, meta| {
-            fold_native_outcome_decision(doc, meta, &target, attempted_location_revision, outcome)
+            fold_native_outcome_decision(
+                doc,
+                meta,
+                &target,
+                attempted_location_revision,
+                series_epoch,
+                outcome,
+            )
         }))
     }
 }
@@ -1125,13 +1148,22 @@ fn update_for_key(
 /// The additive Task 3 status projection: present only for records that CARRY
 /// a native writeback series (manual and accepted-Freshell-AI names —
 /// directory/first-message/provider fallbacks are never written back, so
-/// they project no native status at all).
+/// they project no native status at all). An entry can exist purely to
+/// retain observation provenance for a non-writable record (live providers
+/// observe fallback-named sessions); such an entry is not a series.
 fn native_sync_projection(
     document: &StoredDocument,
     key: &str,
 ) -> Option<freshell_protocol::session_names::NativeSyncProjection> {
     let state = document.native_write.get(key)?;
     let record = document.record_at(key)?;
+    // Gate on series existence AND writability: an observation-only entry
+    // (no desired revision) or a record whose accepted source is never
+    // written back projects no native status — a permanently-`pending` badge
+    // for work that will never run is a contract violation.
+    if state.desired_revision.is_none() || !source_is_writable(record.source) {
+        return None;
+    }
     let location_revision = document
         .locations
         .get(key)
@@ -1652,6 +1684,10 @@ fn reset_native_series(document: &mut StoredDocument, key: &str, record: &Sessio
     entry.desired_revision = Some(record.revision);
     entry.desired_name = Some(record.name.clone());
     entry.desired_source = Some(record.source);
+    // The series identity: stamped at the ARMING revision. Folds and read
+    // charges dispatched by a superseded series (a newer name decision
+    // re-armed this key) carry an older epoch and are provenance only.
+    entry.series_epoch = Some(record.revision);
     entry.ambiguous = false;
     entry.observed_current = None;
     entry.settled = false;
@@ -1731,8 +1767,11 @@ fn union_generation_state(document: &mut StoredDocument, from_key: &str, to_key:
 }
 
 /// Transfer native-write state on bind: consumed cycles and read allowance
-/// move conservatively, the desired revision rebases to the bound record
-/// (binding is not a new name decision), and original receipts are retained.
+/// move conservatively — the summed counts CAP at the per-revision
+/// allowances (the persisted counters never read past three cycles / six
+/// reads) — the desired revision rebases to the bound record (binding is
+/// not a new name decision, so the series EPOCH transfers with the series),
+/// and original receipts are retained.
 fn transfer_native_write(
     document: &mut StoredDocument,
     from_key: &str,
@@ -1742,8 +1781,10 @@ fn transfer_native_write(
     if let Some(mut pending_state) = document.native_write.remove(from_key) {
         match document.native_write.get_mut(to_key) {
             Some(durable) => {
-                durable.cycles_consumed += pending_state.cycles_consumed;
-                durable.reads_consumed += pending_state.reads_consumed;
+                durable.cycles_consumed = (durable.cycles_consumed + pending_state.cycles_consumed)
+                    .min(MAX_NATIVE_CYCLES);
+                durable.reads_consumed =
+                    (durable.reads_consumed + pending_state.reads_consumed).min(MAX_NATIVE_READS);
                 for receipt in pending_state.attempted_receipts {
                     if !durable.attempted_receipts.contains(&receipt) {
                         durable.attempted_receipts.push(receipt);
@@ -1751,6 +1792,11 @@ fn transfer_native_write(
                 }
                 if durable.last_confirmed_receipt.is_none() {
                     durable.last_confirmed_receipt = pending_state.last_confirmed_receipt;
+                }
+                // The surviving series keeps its own epoch; if only the
+                // transferred series ever armed, its identity rides along.
+                if durable.series_epoch.is_none() {
+                    durable.series_epoch = pending_state.series_epoch;
                 }
             }
             None => {
@@ -2145,14 +2191,20 @@ fn observe_native_decision(
     }
 
     let mut changed = false;
+    // An invalid observation title (an external rename over the accepted-name
+    // cap, or control characters) never fails the transaction: the
+    // observation PROVENANCE staged above is retained, and only the offer and
+    // the divergence rearm are skipped for the invalid text.
+    let valid_title = validate_name(&title).ok();
     match origin {
         // An own-write echo is provenance only: same-name or late echoes never
         // promote the source or revision.
         NativeNameOrigin::OwnWrite => {}
         NativeNameOrigin::Snapshot | NativeNameOrigin::ProviderAi => {
             if !stale {
-                let name = validate_name(&title)?;
-                changed = offer_mut(document, &key, name, NameSource::ProviderAi, meta.now_ms)?;
+                if let Some(name) = valid_title.clone() {
+                    changed = offer_mut(document, &key, name, NameSource::ProviderAi, meta.now_ms)?;
+                }
             }
         }
     }
@@ -2164,28 +2216,37 @@ fn observe_native_decision(
     // exhaustion stays final for the revision; an `unsupported` series re-arms
     // only through a genuine capability/lifecycle change
     // (`record_acquisition_decision`), never through an observation; and no
-    // observation ever replenishes consumed counts.
+    // observation ever replenishes consumed counts. An invalid title skips the
+    // rearm too (it is not a trustable observation of a name).
     let mut status_changed = false;
-    if !stale {
-        let record_revision = document
-            .record_at(&key)
-            .map(|record| record.revision)
-            .expect("the record exists");
-        if let Some(state) = document.native_write.get_mut(&key) {
-            let has_series = state.desired_revision.is_some() && state.desired_name.is_some();
-            let current_series = state.desired_revision == Some(record_revision);
-            let diverged = state.desired_name.as_deref().is_some_and(|d| d != title);
-            if has_series && current_series && diverged && state.cycles_consumed < MAX_NATIVE_CYCLES
-            {
-                let rearm = state.settled && state.status != NativeSyncStatus::Unsupported;
-                if rearm {
-                    state.status = NativeSyncStatus::Unsynced;
-                    state.settled = false;
-                    state.unsynced_reason = Some("native divergence observed".to_string());
-                    status_changed = true;
-                }
-                if state.next_due.is_none() {
-                    state.next_due = Some(meta.now_ms);
+    if let Some(observed_name) = valid_title.as_deref() {
+        if !stale {
+            let record_revision = document
+                .record_at(&key)
+                .map(|record| record.revision)
+                .expect("the record exists");
+            if let Some(state) = document.native_write.get_mut(&key) {
+                let has_series = state.desired_revision.is_some() && state.desired_name.is_some();
+                let current_series = state.desired_revision == Some(record_revision);
+                let diverged = state
+                    .desired_name
+                    .as_deref()
+                    .is_some_and(|d| d != observed_name);
+                if has_series
+                    && current_series
+                    && diverged
+                    && state.cycles_consumed < MAX_NATIVE_CYCLES
+                {
+                    let rearm = state.settled && state.status != NativeSyncStatus::Unsupported;
+                    if rearm {
+                        state.status = NativeSyncStatus::Unsynced;
+                        state.settled = false;
+                        state.unsynced_reason = Some("native divergence observed".to_string());
+                        status_changed = true;
+                    }
+                    if state.next_due.is_none() {
+                        state.next_due = Some(meta.now_ms);
+                    }
                 }
             }
         }
@@ -2434,6 +2495,12 @@ fn claim_native_cycle_decision(
             .native_write
             .get_mut(&key)
             .expect("claimable series exists");
+        // Backfill a legacy series' epoch (documents written before the
+        // stamp existed): the claimable series' desired revision IS its
+        // arming revision.
+        if entry.series_epoch.is_none() {
+            entry.series_epoch = Some(record.revision);
+        }
         entry.cycles_consumed += 1;
         entry.receipt_id = Some(receipt_id.to_string());
         if !entry.attempted_receipts.contains(&receipt_id.to_string()) {
@@ -2442,11 +2509,18 @@ fn claim_native_cycle_decision(
         entry.attempted_location = Some(location.clone());
         entry.attempted_location_revision = Some(location_revision);
     }
+    let series_epoch = document
+        .native_write
+        .get(&key)
+        .expect("the series exists")
+        .series_epoch
+        .expect("stamped above");
     let claim = crate::session_name_native::NativeCycleClaim {
         target: record.name_ref.clone(),
         location,
         location_revision,
         desired_revision: record.revision,
+        series_epoch,
         title: record.name.clone(),
         source,
         receipt_id: receipt_id.to_string(),
@@ -2468,14 +2542,21 @@ fn claim_native_cycle_decision(
 fn charge_native_read_decision(
     document: &mut StoredDocument,
     target: &SessionNameRef,
+    series_epoch: NameRevision,
 ) -> Result<Decision<bool>, NameError> {
     let (key, record) = required_record(document, target)?;
     let Some(state) = document.native_write.get_mut(&key) else {
         return Ok(Decision::Read(false));
     };
     // Only the CURRENT series' reads charge the allowance — a superseded
-    // series' late operations are provenance, never budget.
+    // series' late operations are provenance, never budget. The desired-
+    // revision guard catches a series superseded by a newer record revision;
+    // the EPOCH guard catches a series superseded by a newer name decision on
+    // the same record.
     if state.desired_revision != Some(record.revision) {
+        return Ok(Decision::Read(false));
+    }
+    if state.series_epoch != Some(series_epoch) {
         return Ok(Decision::Read(false));
     }
     if state.reads_consumed >= MAX_NATIVE_READS {
@@ -2493,16 +2574,18 @@ fn charge_native_read_decision(
 
 /// The Task 3 outcome fold. Guards: an old acknowledgement (or read) can never
 /// synchronize a newer revision or a relocated target — the series'
-/// `desired_revision` must still be the accepted record's revision AND the
-/// attempted location revision must still be the record's current verified
-/// route. Classification is preserved (`Undelivered` vs `Ambiguous` vs
-/// `Unsupported` keep their own reasons); provider failures never roll the
-/// canonical name back.
+/// `desired_revision` must still be the accepted record's revision, the fold's
+/// SERIES EPOCH must still be the armed series' identity (a superseded
+/// dispatch's late operations are provenance only), AND the attempted location
+/// revision must still be the record's current verified route. Classification
+/// is preserved (`Undelivered` vs `Ambiguous` vs `Unsupported` keep their own
+/// reasons); provider failures never roll the canonical name back.
 fn fold_native_outcome_decision(
     document: &mut StoredDocument,
     meta: &TxnMeta,
     target: &SessionNameRef,
     attempted_location_revision: NameRevision,
+    series_epoch: NameRevision,
     outcome: crate::session_name_native::NativeOutcomeFold,
 ) -> Result<Decision<SessionNameUpdate>, NameError> {
     use crate::session_name_native::NativeOutcomeFold;
@@ -2521,7 +2604,8 @@ fn fold_native_outcome_decision(
     // Stale fold guards: a newer name decision superseded the series, or the
     // target relocated since the attempt. Nothing changes — unknown old
     // outcomes cannot change the saved winner.
-    let series_current = state.desired_revision == Some(record.revision);
+    let series_current =
+        state.desired_revision == Some(record.revision) && state.series_epoch == Some(series_epoch);
     let location_current = match verified_revision {
         Some(current) => attempted_location_revision == current,
         // No verified route: the attempt targeted a prospective route that is
@@ -2588,7 +2672,11 @@ fn fold_native_outcome_decision(
             } else {
                 state.status = NativeSyncStatus::Unsynced;
                 state.unsynced_reason = Some(if observed.is_none() {
-                    "native target missing at the attempted location".to_string()
+                    // A `None` readback is an EXISTING target holding no
+                    // title (a missing target is diagnosed through the
+                    // adapter's error paths) — the attempted write did not
+                    // stick.
+                    "the native target holds no title at the attempted location".to_string()
                 } else {
                     "divergent native title at the attempted location".to_string()
                 });

@@ -8,12 +8,28 @@
 //! then ≥30s after a cycle-2 failure). A cycle permits one current-target
 //! read before any retry/reconciliation, at most one write, and one
 //! confirming read afterward — at most three writes and six reads per
-//! desired revision, each request bounded to 20 seconds. The cycle/start
-//! and every read are charged before dispatch; no location change,
-//! reconnect, observation, restart or repeated capability check replenishes
-//! these counters. Only a current-revision readback within that allowance
-//! can establish the target as synchronized; an old acknowledgement alone
+//! desired revision, each request bounded to 20 seconds (the codex metadata
+//! read carries its own dedicated 20s bound —
+//! [`freshell_codex::app_server::NATIVE_METADATA_READ_TIMEOUT_MS`] — rather
+//! than the 30s full-thread snapshot budget). The cycle/start and every
+//! read are charged before dispatch; no location change, reconnect,
+//! observation, restart or repeated capability check replenishes these
+//! counters. Only a current-revision readback within that allowance can
+//! establish the target as synchronized; an old acknowledgement alone
 //! cannot. Exhaustion is final for the revision.
+//!
+//! A pre-write read that answers `None` reports an EXISTING target holding
+//! no title yet — divergence, and exactly the state the writeback exists to
+//! fill. A missing/archived target is a DIAGNOSED capability failure that
+//! arrives through the adapter's error paths (`Unsupported`), never as a
+//! `None` readback.
+//!
+//! An initially absent route or CAPABILITY pauses the series before
+//! consuming a cycle: the worker probes [`NativeNameBackend::route_available`]
+//! before claiming, so a closed session's pane (no live provider
+//! connection), a degraded boot (no wired adapter), or a missing helper
+//! keeps the series `pending` with its whole allowance intact, and work
+//! proceeds once the capability arrives.
 //!
 //! The [`SessionNameWorker`] owns the serial dispatch loop under the shared
 //! `.session-names-worker.lock` background guard (acquire worker then
@@ -118,8 +134,13 @@ pub struct NativeNameAttempt {
     pub cycle: u32,
 }
 
-/// The current native title observed at a target (the backend read answer);
-/// `None` = the native target does not exist there (missing/archived).
+/// The current native title observed at a target (the backend read answer).
+/// `None` = the target EXISTS and currently holds no native title —
+/// divergence, and exactly the state the writeback fills. A missing/archived
+/// target is a diagnosed capability failure that arrives through the
+/// adapter's ERROR paths (`Unsupported`), never this shape: the adapters can
+/// only produce a `Confirmed { title: None }` for an existing untitled
+/// target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NativeNameReadback {
     pub title: Option<String>,
@@ -130,12 +151,23 @@ pub struct NativeNameReadback {
 pub type NativeFuture<T> =
     Pin<Box<dyn std::future::Future<Output = NativeCallResult<T>> + Send + 'static>>;
 
+/// The owned boxed `Send` future the capability probe resolves to (a plain
+/// bool — a probe is not an operation and classifies nothing).
+pub type NativeProbeFuture = Pin<Box<dyn std::future::Future<Output = bool> + Send + 'static>>;
+
 /// The provider-adapter seam. `read` returns the current native title at the
 /// target; `write` sets the attempted title. Both preserve the provider's
-/// own error classification.
+/// own error classification. `route_available` answers whether the backend
+/// can ATTEMPT an operation for this target right now — the serial worker
+/// probes it before claiming a cycle so an initially absent route or
+/// capability (no live provider connection, no wired adapter, an unspawnable
+/// helper) pauses the series as `pending` without consuming any allowance; a
+/// `true` answer is not a health guarantee, the attempt itself still
+/// classifies its own outcome.
 pub trait NativeNameBackend: Send + Sync {
     fn read(&self, target: NativeNameTarget) -> NativeFuture<NativeNameReadback>;
     fn write(&self, attempt: NativeNameAttempt) -> NativeFuture<()>;
+    fn route_available(&self, target: NativeNameTarget) -> NativeProbeFuture;
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +193,12 @@ pub struct NativeCycleClaim {
     pub location: NativeLocation,
     pub location_revision: NameRevision,
     pub desired_revision: NameRevision,
+    /// The series identity this cycle was dispatched under (the arming
+    /// revision stamped at the series' last reset): every fold and read
+    /// charge the cycle makes carries it, so a series superseded by a newer
+    /// name decision treats this cycle's late operations as provenance
+    /// only — never a state change, never a charged allowance.
+    pub series_epoch: NameRevision,
     pub title: String,
     pub source: NameSource,
     pub receipt_id: String,
@@ -251,7 +289,7 @@ async fn run(names: Arc<SessionNames>, native: Arc<dyn NativeNameBackend>) {
                 target: "freshell_server::session_name_native",
                 op = "try_background_guard",
                 name_ref = %freshell_freshagent::naming::name_ref_debug_key(&item.target),
-                revision = 0,
+                revision = item.desired_revision,
                 class = %error.code(),
                 "session_names.operation_failed: {error}"
             );
@@ -260,6 +298,31 @@ async fn run(names: Arc<SessionNames>, native: Arc<dyn NativeNameBackend>) {
             tokio::time::sleep(WORKER_POLL_INTERVAL).await;
             continue;
         };
+        // The capability probe: "initially missing location/capability pauses
+        // before consuming a cycle". An absent route/capability (no live
+        // provider connection for the root, no wired adapter, a missing
+        // helper) consumes NOTHING — the series stays `pending` with its full
+        // allowance and the next poll re-probes until the capability arrives.
+        if !native
+            .route_available(NativeNameTarget {
+                name_ref: item.target.clone(),
+                location: item.location.clone(),
+                location_revision: item.location_revision,
+            })
+            .await
+        {
+            tracing::debug!(
+                target: "freshell_server::session_name_native",
+                op = "route_available",
+                name_ref = %freshell_freshagent::naming::name_ref_debug_key(&item.target),
+                revision = item.desired_revision,
+                class = "capability_absent",
+                "session_names.native_route_unavailable: capability paused before claiming a cycle"
+            );
+            drop(guard);
+            tokio::time::sleep(WORKER_POLL_INTERVAL).await;
+            continue;
+        }
         // The guard is retained through the cycle's actual local work (the
         // provider calls and any owned-helper cleanup) and released right
         // after the fold — external ambiguity never retains it.
@@ -322,21 +385,25 @@ async fn run_cycle(
     };
     let claim_target = claim.target.clone();
     let location_revision = claim.location_revision;
+    let series_epoch = claim.series_epoch;
 
     // 1. One current-target read before any retry/reconciliation. Matching
     //    titles synchronize immediately (the native already holds the exact
-    //    desired value); a missing target is an explicit native failure.
+    //    desired value); a readback of `None` reports an EXISTING target
+    //    holding no title yet — divergence the write below reconciles.
     if !names
-        .charge_native_read(claim_target.clone())
+        .charge_native_read(claim_target.clone(), series_epoch)
         .await
         .unwrap_or(false)
     {
-        // Read allowance exhausted before the cycle could even read: the
-        // series retains its incomplete status and stops repair.
+        // Read allowance exhausted (or the series superseded) before the
+        // cycle could even read: the series retains its incomplete status
+        // and stops repair.
         let _ = names
             .fold_native_outcome(
                 claim_target.clone(),
                 location_revision,
+                series_epoch,
                 NativeOutcomeFold::Undelivered {
                     reason: "native read allowance exhausted".to_string(),
                 },
@@ -358,6 +425,7 @@ async fn run_cycle(
                 names,
                 &claim_target,
                 location_revision,
+                series_epoch,
                 NativeOutcomeFold::Undelivered { reason },
             )
             .await;
@@ -368,6 +436,7 @@ async fn run_cycle(
                 names,
                 &claim_target,
                 location_revision,
+                series_epoch,
                 NativeOutcomeFold::Ambiguous { reason },
             )
             .await;
@@ -378,6 +447,7 @@ async fn run_cycle(
                 names,
                 &claim_target,
                 location_revision,
+                series_epoch,
                 NativeOutcomeFold::Unsupported { reason },
             )
             .await;
@@ -391,6 +461,7 @@ async fn run_cycle(
             names,
             &claim_target,
             location_revision,
+            series_epoch,
             NativeOutcomeFold::Read {
                 observed,
                 receipt: Some(claim.receipt_id.clone()),
@@ -399,20 +470,10 @@ async fn run_cycle(
         .await;
         return;
     }
-    if observed.is_none() {
-        // A missing native target is an explicit native failure.
-        fold(
-            names,
-            &claim_target,
-            location_revision,
-            NativeOutcomeFold::Unsupported {
-                reason: "native target missing at the attempted location".to_string(),
-            },
-        )
-        .await;
-        return;
-    }
-    // Divergent title: the write below reconciles.
+    // Divergent title (including `None` — an existing target with no title
+    // yet, exactly the state the writeback exists to fill): the write below
+    // reconciles. A missing target can never reach here — the adapters
+    // diagnose it through their error paths as an explicit native failure.
     // 2. At most one write per cycle, bounded to 20 seconds by the adapter.
     match native.write(claim.attempt()).await {
         NativeCallResult::Confirmed(()) => {
@@ -420,6 +481,7 @@ async fn run_cycle(
                 names,
                 &claim_target,
                 location_revision,
+                series_epoch,
                 NativeOutcomeFold::WriteAcknowledged {
                     receipt: claim.receipt_id.clone(),
                 },
@@ -431,6 +493,7 @@ async fn run_cycle(
                 names,
                 &claim_target,
                 location_revision,
+                series_epoch,
                 NativeOutcomeFold::Undelivered { reason },
             )
             .await;
@@ -441,6 +504,7 @@ async fn run_cycle(
                 names,
                 &claim_target,
                 location_revision,
+                series_epoch,
                 NativeOutcomeFold::Ambiguous { reason },
             )
             .await;
@@ -451,6 +515,7 @@ async fn run_cycle(
                 names,
                 &claim_target,
                 location_revision,
+                series_epoch,
                 NativeOutcomeFold::Unsupported { reason },
             )
             .await;
@@ -461,7 +526,7 @@ async fn run_cycle(
     // 3. One confirming read afterward — only a current-revision readback can
     //    establish the target as synchronized.
     if !names
-        .charge_native_read(claim_target.clone())
+        .charge_native_read(claim_target.clone(), series_epoch)
         .await
         .unwrap_or(false)
     {
@@ -469,6 +534,7 @@ async fn run_cycle(
             .fold_native_outcome(
                 claim_target.clone(),
                 location_revision,
+                series_epoch,
                 NativeOutcomeFold::Undelivered {
                     reason: "native read allowance exhausted before the confirming readback"
                         .to_string(),
@@ -490,6 +556,7 @@ async fn run_cycle(
                 names,
                 &claim_target,
                 location_revision,
+                series_epoch,
                 NativeOutcomeFold::Read {
                     observed: readback.title,
                     receipt: Some(claim.receipt_id.clone()),
@@ -502,6 +569,7 @@ async fn run_cycle(
                 names,
                 &claim_target,
                 location_revision,
+                series_epoch,
                 NativeOutcomeFold::Undelivered { reason },
             )
             .await;
@@ -511,6 +579,7 @@ async fn run_cycle(
                 names,
                 &claim_target,
                 location_revision,
+                series_epoch,
                 NativeOutcomeFold::Ambiguous { reason },
             )
             .await;
@@ -520,6 +589,7 @@ async fn run_cycle(
                 names,
                 &claim_target,
                 location_revision,
+                series_epoch,
                 NativeOutcomeFold::Unsupported { reason },
             )
             .await;
@@ -531,10 +601,11 @@ async fn fold(
     names: &Arc<SessionNames>,
     target: &SessionNameRef,
     location_revision: NameRevision,
+    series_epoch: NameRevision,
     outcome: NativeOutcomeFold,
 ) {
     if let Err(error) = names
-        .fold_native_outcome(target.clone(), location_revision, outcome)
+        .fold_native_outcome(target.clone(), location_revision, series_epoch, outcome)
         .await
     {
         tracing::warn!(
@@ -552,6 +623,19 @@ async fn fold(
 // Production provider adapters
 // ---------------------------------------------------------------------------
 
+/// The deliberate set-or-remove decision for the helper child's effective
+/// project-key override: a non-empty location override SETS the env key; an
+/// absent/empty one REMOVES it, so an inactive ambient override can never
+/// hijack the project key. Returns the env key and its value (`None` =
+/// remove).
+fn project_key_child_env(override_value: Option<&str>) -> (&'static str, Option<String>) {
+    const KEY: &str = "CLAUDE_CODE_PROJECT_DIR_NAME";
+    match override_value.filter(|value| !value.is_empty()) {
+        Some(value) => (KEY, Some(value.to_string())),
+        None => (KEY, None),
+    }
+}
+
 /// The Claude `session-names.mjs` adapter: spawns the DEDICATED helper child
 /// per operation (one JSON line in, one structured line out), with a
 /// child-only absolute `CLAUDE_CONFIG_DIR` from the selected location and a
@@ -568,11 +652,28 @@ impl ClaudeNativeNameAdapter {
     /// The production adapter: node from `FRESHELL_CLAUDE_NODE` (default
     /// `node`), the helper at `FRESHELL_CLAUDE_SESSION_NAMES` (default the
     /// staged sidecar's `session-names.mjs` beside `index.mjs`).
+    ///
+    /// Path resolution order: an explicit `FRESHELL_CLAUDE_SESSION_NAMES`
+    /// wins; otherwise, when `FRESHELL_CLAUDE_SIDECAR` is set (the packaged
+    /// desktop app spawns the server with the STAGED sidecar entry), the
+    /// helper is derived from its SIBLING directory — the Electron runtime
+    /// stages `session-names.mjs` right beside `index.mjs`, and the
+    /// build-time `CARGO_MANIFEST_DIR` default points at a nonexistent
+    /// build-machine source path in a packaged install. Without either
+    /// override the build-tree default beside the sidecar source applies.
     pub fn from_env() -> Self {
         let helper = std::env::var("FRESHELL_CLAUDE_SESSION_NAMES")
             .ok()
             .filter(|p| !p.is_empty())
             .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var("FRESHELL_CLAUDE_SIDECAR")
+                    .ok()
+                    .filter(|p| !p.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .and_then(|sidecar| sidecar.parent().map(|dir| dir.to_path_buf()))
+                    .map(|dir| dir.join("session-names.mjs"))
+            })
             .unwrap_or_else(|| {
                 std::path::PathBuf::from(concat!(
                     env!("CARGO_MANIFEST_DIR"),
@@ -616,12 +717,12 @@ impl ClaudeNativeNameAdapter {
         command.env("CLAUDE_CONFIG_DIR", config_root);
         // Deliberately set or REMOVE the effective project-key override so an
         // inactive ambient override cannot hijack the project key.
-        match effective_project_key_override.as_deref() {
-            Some(override_value) if !override_value.is_empty() => {
-                command.env("CLAUDE_CODE_PROJECT_DIR_NAME", override_value);
+        match project_key_child_env(effective_project_key_override.as_deref()) {
+            (key, Some(value)) => {
+                command.env(key, value);
             }
-            _ => {
-                command.env_remove("CLAUDE_CODE_PROJECT_DIR_NAME");
+            (key, None) => {
+                command.env_remove(key);
             }
         }
         command
@@ -795,6 +896,15 @@ impl NativeNameBackend for ClaudeNativeNameAdapter {
             }
         })
     }
+
+    fn route_available(&self, target: NativeNameTarget) -> NativeProbeFuture {
+        // A pending claude name has no durable session to address (the claude
+        // location carries no native session id) — the series pauses until
+        // the bind, and the staged helper must exist for any attempt.
+        let session_ok = !session_id_of(&target.name_ref).is_empty();
+        let helper_exists = self.helper_path.exists();
+        Box::pin(async move { session_ok && helper_exists })
+    }
 }
 
 /// The session id of a naming target — pending targets address the acquired
@@ -881,10 +991,38 @@ async fn codex_root_matched_thread(
     Ok((client, thread_id))
 }
 
-/// Classify a codex app-server RPC failure: a timeout is AMBIGUOUS (the call
-/// may have applied), a transport send refusal is UNDELIVERED (provably
-/// never dispatched), and any other answered error is a diagnosed capability
-/// failure. Never reduced to a generic timeout.
+/// Whether an ANSWERED JSON-RPC error diagnoses the native target as
+/// missing or the API as unsupported — a settled capability failure.
+/// Best-effort on the provider's own message/code vocabulary: an answered
+/// rejection we cannot positively diagnose is a definitive no-effect
+/// failure (`Undelivered`, retryable within the allowance), never a blanket
+/// capability failure.
+fn rpc_diagnoses_missing_target(error: &freshell_codex::protocol::RpcError) -> bool {
+    // JSON-RPC "method not found": the app-server lacks the management API.
+    if error.code == -32601 {
+        return true;
+    }
+    let message = error.message.to_ascii_lowercase();
+    [
+        "not found",
+        "not_found",
+        "no such",
+        "unknown thread",
+        "unknown session",
+        "unsupported",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+/// Classify a codex app-server RPC failure, preserving the four-way
+/// contract: a timeout, a MID-FLIGHT DROP (the connection closed before the
+/// answer), or an unparseable answer is AMBIGUOUS (the call may have
+/// applied); a transport send refusal is UNDELIVERED (provably never
+/// dispatched); an answered JSON-RPC rejection is a definitive no-effect
+/// failure (retryable) UNLESS it diagnoses the target as missing or the API
+/// as unsupported (a settled capability failure). Never reduced to a
+/// generic timeout or a blanket unsupported.
 fn classify_codex_error(
     error: freshell_codex::app_server::CodexAppServerError,
     what: &str,
@@ -893,12 +1031,30 @@ fn classify_codex_error(
         freshell_codex::app_server::CodexAppServerError::Timeout { .. } => {
             NativeClassified::Ambiguous(format!("codex {what} timed out"))
         }
+        freshell_codex::app_server::CodexAppServerError::Closed { .. } => {
+            NativeClassified::Ambiguous(format!(
+                "codex {what} dropped mid-flight (the connection closed before the answer)"
+            ))
+        }
+        freshell_codex::app_server::CodexAppServerError::InvalidResponse { detail, .. } => {
+            NativeClassified::Ambiguous(format!(
+                "codex {what} answered an unparseable payload: {detail}"
+            ))
+        }
         freshell_codex::app_server::CodexAppServerError::Transport { message, .. } => {
             NativeClassified::Undelivered(format!(
                 "codex transport refused before dispatch: {message}"
             ))
         }
-        error => NativeClassified::Unsupported(error.to_string()),
+        freshell_codex::app_server::CodexAppServerError::Rpc { error, .. } => {
+            if rpc_diagnoses_missing_target(&error) {
+                NativeClassified::Unsupported(format!("codex {what} diagnosed: {error}"))
+            } else {
+                NativeClassified::Undelivered(format!(
+                    "codex {what} answered a definitive rejection: {error}"
+                ))
+            }
+        }
     }
 }
 
@@ -910,7 +1066,10 @@ impl NativeNameBackend for CodexNativeNameAdapter {
                 Ok(pair) => pair,
                 Err(classified) => return classified.into_call(),
             };
-            match client.read_thread(&thread_id, false).await {
+            // The metadata read rides its OWN 20-second native request bound
+            // (the plan's per-request budget) — not the 30s snapshot budget a
+            // full-thread `thread/read` rides.
+            match client.read_thread_metadata(&thread_id).await {
                 Ok(result) => NativeCallResult::Confirmed(NativeNameReadback {
                     title: freshell_codex::protocol::thread_name_from_result(&result),
                 }),
@@ -932,6 +1091,15 @@ impl NativeNameBackend for CodexNativeNameAdapter {
                 Err(error) => classify_codex_error(error, "thread/name/set").into_call(),
             }
         })
+    }
+
+    fn route_available(&self, target: NativeNameTarget) -> NativeProbeFuture {
+        // A fresh-codex session renamed while its pane is closed, or a CLI
+        // codex pane (which never has a management connection here), has no
+        // LIVE root-matched app-server connection — the series pauses until
+        // one exists, consuming nothing.
+        let resolver = Arc::clone(&self.client_for_root);
+        Box::pin(async move { codex_root_matched_thread(&resolver, &target).await.is_ok() })
     }
 }
 
@@ -983,6 +1151,38 @@ impl OpencodeNativeNameAdapter {
     }
 }
 
+/// Classify an opencode serve failure for a native-name operation,
+/// preserving the crate's own delivery taxonomy: a provable connect-phase
+/// refusal (`ServeError::Undelivered`) is the ONLY known-no-effect failure; a
+/// timeout or post-dispatch transport error is AMBIGUOUS; a definitive
+/// 404/405 answers that the target/management API is missing (a settled
+/// capability failure); any other HTTP answer AFTER dispatch — a 5xx in
+/// particular — is not provably effect-free, so it is AMBIGUOUS; and a
+/// definitive 4xx rejection is a known-no-effect retryable failure.
+fn classify_opencode_error(error: freshell_opencode::ServeError, what: &str) -> NativeClassified {
+    match error {
+        freshell_opencode::ServeError::Undelivered(reason) => NativeClassified::Undelivered(reason),
+        freshell_opencode::ServeError::RequestTimeout { .. } => {
+            NativeClassified::Ambiguous(format!("opencode {what} timed out"))
+        }
+        freshell_opencode::ServeError::Transport(reason) => NativeClassified::Ambiguous(reason),
+        freshell_opencode::ServeError::Http { status, body, .. }
+            if status == 404 || status == 405 =>
+        {
+            NativeClassified::Unsupported(format!("opencode answered {status}: {body}"))
+        }
+        freshell_opencode::ServeError::Http { status, body, .. } if status >= 500 => {
+            // Delivered and answered — not provably effect-free: the crate's
+            // own contract reserves "provably never dispatched" for
+            // `ServeError::Undelivered` alone.
+            NativeClassified::Ambiguous(format!(
+                "opencode answered {status} after dispatch: {body}"
+            ))
+        }
+        error => NativeClassified::Undelivered(error.to_string()),
+    }
+}
+
 impl NativeNameBackend for OpencodeNativeNameAdapter {
     fn read(&self, target: NativeNameTarget) -> NativeFuture<NativeNameReadback> {
         let manager = self.manager.clone();
@@ -993,6 +1193,15 @@ impl NativeNameBackend for OpencodeNativeNameAdapter {
                     "the opencode location carries no native session id".to_string(),
                 );
             }
+            // Effective-database context BEFORE dispatch, BOTH directions
+            // (the write's gate): a mismatched serve must never answer a
+            // read either — a wrong-store observation or a burned cycle
+            // before the write's gate rejects.
+            if let Some(database) = Self::database_of(&target.location) {
+                if let Err(rejection) = manager.check_database_context(&database) {
+                    return NativeCallResult::Unsupported(rejection.to_string());
+                }
+            }
             let route = Self::route_of(&target.location);
             match manager.get_session(&session_id, &route).await {
                 Ok(session) => NativeCallResult::Confirmed(NativeNameReadback {
@@ -1002,21 +1211,7 @@ impl NativeNameBackend for OpencodeNativeNameAdapter {
                         .filter(|t| !t.trim().is_empty())
                         .map(|title| title.to_string()),
                 }),
-                Err(freshell_opencode::ServeError::Undelivered(reason)) => {
-                    NativeCallResult::Undelivered(reason)
-                }
-                Err(freshell_opencode::ServeError::RequestTimeout { .. }) => {
-                    NativeCallResult::Ambiguous("opencode GET timed out".to_string())
-                }
-                Err(freshell_opencode::ServeError::Transport(reason)) => {
-                    NativeCallResult::Ambiguous(reason)
-                }
-                Err(freshell_opencode::ServeError::Http { status, body, .. })
-                    if status == 404 || status == 405 =>
-                {
-                    NativeCallResult::Unsupported(format!("opencode answered {status}: {body}"))
-                }
-                Err(error) => NativeCallResult::Undelivered(error.to_string()),
+                Err(error) => classify_opencode_error(error, "GET").into_call(),
             }
         })
     }
@@ -1044,23 +1239,18 @@ impl NativeNameBackend for OpencodeNativeNameAdapter {
                 .await
             {
                 Ok(_) => NativeCallResult::Confirmed(()),
-                Err(freshell_opencode::ServeError::Undelivered(reason)) => {
-                    NativeCallResult::Undelivered(reason)
-                }
-                Err(freshell_opencode::ServeError::RequestTimeout { .. }) => {
-                    NativeCallResult::Ambiguous("opencode PATCH timed out".to_string())
-                }
-                Err(freshell_opencode::ServeError::Transport(reason)) => {
-                    NativeCallResult::Ambiguous(reason)
-                }
-                Err(freshell_opencode::ServeError::Http { status, body, .. })
-                    if status == 404 || status == 405 =>
-                {
-                    NativeCallResult::Unsupported(format!("opencode answered {status}: {body}"))
-                }
-                Err(error) => NativeCallResult::Undelivered(error.to_string()),
+                Err(error) => classify_opencode_error(error, "PATCH").into_call(),
             }
         })
+    }
+
+    fn route_available(&self, target: NativeNameTarget) -> NativeProbeFuture {
+        // A serve is startable on demand (`ensure_started`), so a wired
+        // adapter with a resolvable session id can always attempt; a
+        // mismatched database context is a DIAGNOSED provider failure the
+        // dispatch itself reports, not an absent capability.
+        let resolvable = !Self::session_id_of_target(&target.name_ref, &target.location).is_empty();
+        Box::pin(async move { resolvable })
     }
 }
 
@@ -1121,6 +1311,15 @@ impl NativeNameBackend for NativeNameDispatch {
                     "no native adapter is wired for this provider".to_string(),
                 )
             }),
+        }
+    }
+
+    fn route_available(&self, target: NativeNameTarget) -> NativeProbeFuture {
+        match self.backend_for(&target.location) {
+            Some(backend) => backend.route_available(target),
+            // No adapter wired (a degraded boot): the capability is absent —
+            // the series pauses as pending, never a burned cycle.
+            None => Box::pin(async move { false }),
         }
     }
 }

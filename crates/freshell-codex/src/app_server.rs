@@ -57,6 +57,15 @@ pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
 /// fast). But it also shouldn't hang forever, so this is capped rather than unbounded: 30s.
 pub const SNAPSHOT_READ_TIMEOUT_MS: u64 = 30_000;
 
+/// Unified agent names (Task 3): the per-request bound for the NATIVE-NAMES
+/// metadata read (`thread/read` with `includeTurns:false`) — the plan's
+/// 20-second native request budget. Deliberately NOT the 30s snapshot budget
+/// above (that exists for full-thread reads whose parse can take seconds; a
+/// metadata-only read has no such latency profile and must never pin the
+/// serial native worker for 30s), and not the 5s interactive budget either —
+/// the plan bounds every native request to 20s.
+pub const NATIVE_METADATA_READ_TIMEOUT_MS: u64 = 20_000;
+
 /// A boxed, `Send` future — the object-safe async return used by [`WsTransport`] (keeps it
 /// `dyn`-compatible without an `async-trait` dependency; same pattern as `freshell-opencode`).
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -533,6 +542,25 @@ impl CodexAppServerClient {
             "thread/read",
             json!({ "threadId": thread_id, "includeTurns": include_turns }),
             self.read_timeout,
+        )
+        .await
+    }
+
+    /// Unified agent names (Task 3): the native-names METADATA read —
+    /// `thread/read` with `includeTurns:false`, bounded to the plan's
+    /// 20-second native request budget
+    /// ([`NATIVE_METADATA_READ_TIMEOUT_MS`]) instead of this client's 30s
+    /// snapshot budget: a name-synchronization read never parses a huge
+    /// thread's turns, and the serial native worker must not park on it
+    /// past the plan's per-request bound.
+    pub async fn read_thread_metadata(
+        &self,
+        thread_id: &str,
+    ) -> Result<Value, CodexAppServerError> {
+        self.request_with_timeout(
+            "thread/read",
+            json!({ "threadId": thread_id, "includeTurns": false }),
+            Duration::from_millis(NATIVE_METADATA_READ_TIMEOUT_MS),
         )
         .await
     }

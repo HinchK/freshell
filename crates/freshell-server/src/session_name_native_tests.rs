@@ -237,6 +237,10 @@ impl NativeNameBackend for ScriptedBackend {
         Box::pin(async move { NativeCallResult::Confirmed(NativeNameReadback { title }) })
     }
 
+    fn route_available(&self, _target: NativeNameTarget) -> super::NativeProbeFuture {
+        Box::pin(async move { true })
+    }
+
     fn write(&self, attempt: super::NativeNameAttempt) -> super::NativeFuture<()> {
         self.writes.fetch_add(1, Ordering::SeqCst);
         let step = self
@@ -576,6 +580,7 @@ async fn ambiguous_write_matching_readback_records_observed_current_but_stays_un
         .fold_native_outcome(
             target.clone(),
             1,
+            current_series_epoch(dir.path()),
             NativeOutcomeFold::Read {
                 observed: Some("Manual Title".to_string()),
                 receipt: None,
@@ -720,13 +725,17 @@ async fn binding_transfers_cycles_rebases_desired_revision_and_retains_receipts(
         .expect("claim");
     assert_eq!(claim.cycle, 1);
     assert!(
-        store.charge_native_read(target.clone()).await.unwrap(),
+        store
+            .charge_native_read(target.clone(), claim.series_epoch)
+            .await
+            .unwrap(),
         "the read allowance charges"
     );
     store
         .fold_native_outcome(
             target.clone(),
             claim.location_revision,
+            claim.series_epoch,
             NativeOutcomeFold::WriteAcknowledged {
                 receipt: claim.receipt_id.clone(),
             },
@@ -914,4 +923,1099 @@ async fn the_selector_prefers_manual_projection_then_the_stable_key() {
     assert_eq!(picked.unwrap().target, b_manual.target);
     let picked = super::select_next(&[a_freshell.clone(), c_freshell.clone()]);
     assert_eq!(picked.unwrap().target, c_freshell.target);
+}
+
+// ---------------------------------------------------------------------------
+// Task 3 fix round: the writeback contract's behavioral reds and pins.
+// ---------------------------------------------------------------------------
+
+/// The single nativeWrite series entry of a seeded one-series document
+/// (black-box: the persisted document is the contract).
+fn native_entry_of(doc: &Value) -> &Value {
+    doc["nativeWrite"]
+        .as_object()
+        .expect("nativeWrite section")
+        .values()
+        .next()
+        .expect("one series")
+}
+
+/// The current armed series' epoch (black-box: the persisted document is the
+/// contract) — the stamp a hand-rolled fold "as the next cycle's read would"
+/// carries.
+fn current_series_epoch(dir: &std::path::Path) -> u64 {
+    native_entry_of(&document_json(dir))["seriesEpoch"]
+        .as_u64()
+        .expect("the armed series stamps its epoch")
+}
+
+fn codex_location(home: &str, thread: &str) -> NativeLocation {
+    NativeLocation::Codex {
+        codex_home: home.to_string(),
+        native_thread_id: Some(thread.to_string()),
+        rollout_path: None,
+        persistence_evidence: None,
+    }
+}
+
+fn opencode_location(database: &str, session_id: &str, directory: &str) -> NativeLocation {
+    NativeLocation::Opencode {
+        database_path: database.to_string(),
+        native_session_id: Some(session_id.to_string()),
+        original_directory: Some(directory.to_string()),
+        owned_local_endpoint: None,
+    }
+}
+
+/// T3-C1: an existing native target that holds NO title yet is divergence,
+/// not a missing target — the primary writeback case on every provider
+/// (Claude sessions essentially never carry a customTitle until something
+/// writes one; codex threads are unnamed until a TUI rename; opencode titles
+/// can be null). The pre-write read answering `None` must DISPATCH the write
+/// and the confirming readback must synchronize the series.
+#[tokio::test]
+async fn an_untitled_native_target_still_receives_the_writeback() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-untitled", "/h/.claude").await;
+    let backend = ScriptedBackend::new(vec![WriteStep::Confirm]);
+    backend.set_title(None);
+
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+
+    assert_eq!(backend.writes(), 1, "an untitled target receives the write");
+    assert_eq!(backend.reads(), 2, "pre-write read + confirming readback");
+    let sync = native_sync_of(&store, target.clone())
+        .await
+        .expect("series projected");
+    assert_eq!(
+        sync.status,
+        NativeSyncStatus::Synced,
+        "the confirming readback synchronizes the exact revision"
+    );
+}
+
+/// T3-I1: an observed fallback-named record projects NO nativeSync at all —
+/// the entry that retains the observation is provenance, never a series.
+#[tokio::test]
+async fn observed_fallback_records_never_project_a_native_series() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = pending("h-obs-fallback");
+    ensure_pending(&store, "h-obs-fallback", Some("/work/project"))
+        .await
+        .expect("ensure pending");
+
+    // A live provider observation arrives for the fallback-named record and
+    // is accepted (directory rank loses to provider_ai).
+    observe(&store, target.clone(), "Externally Retitled", 0)
+        .await
+        .expect("the observation folds");
+    let record = store
+        .get(vec![target.clone()])
+        .await
+        .unwrap()
+        .remove(0)
+        .record;
+    assert_eq!(
+        record.source,
+        freshell_protocol::session_names::NameSource::ProviderAi
+    );
+
+    let sync = native_sync_of(&store, target.clone()).await;
+    assert!(
+        sync.is_none(),
+        "non-writable observed records project no native status"
+    );
+    assert!(
+        store.native_work_snapshot().is_empty(),
+        "no series is armed for fallback names"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T3-I2 / T3-M2: the codex adapter's classification fidelity and the
+// metadata-read request bound, driven through a scripted app-server peer.
+// ---------------------------------------------------------------------------
+
+/// The codex adapter over a root-matched LIVE client on the in-memory
+/// channel transport (the exact seam production main wires), paired with the
+/// scriptable server end.
+fn codex_adapter_with_peer(
+    root: &str,
+) -> (super::CodexNativeNameAdapter, freshell_codex::ChannelPeer) {
+    let (transport, peer) = freshell_codex::new_channel_transport();
+    let (client, notifs) = freshell_codex::app_server::CodexAppServerClient::connect(transport);
+    // Keep the notification stream alive for the client's lifetime.
+    std::mem::forget(notifs);
+    let client = Arc::new(client);
+    let matched_root = root.to_string();
+    let resolver: super::CodexRootClientResolver = Arc::new(move |root: String| {
+        let matched_root = matched_root.clone();
+        let client = Arc::clone(&client);
+        Box::pin(async move { (root == matched_root).then(|| Arc::clone(&client)) })
+            as std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = Option<Arc<freshell_codex::app_server::CodexAppServerClient>>,
+                        > + Send,
+                >,
+            >
+    });
+    (super::CodexNativeNameAdapter::new(resolver), peer)
+}
+
+/// Serve the initialize handshake on `peer` (initialize request + initialized
+/// notification), returning once the client is ready for method calls.
+async fn serve_codex_handshake(peer: &freshell_codex::ChannelPeer, root: &str) {
+    let (id, method, _) = peer.expect_request().await;
+    assert_eq!(method, "initialize");
+    peer.respond(&id, serde_json::json!({ "codexHome": root }));
+    let (method, _) = peer.expect_notification().await;
+    assert_eq!(method, "initialized");
+}
+
+/// T3-I2: the classifier itself keeps the four-way contract faithful — a
+/// mid-flight drop and an unparseable answer are AMBIGUOUS (the call may have
+/// applied), an answered rejection is UNDELIVERED (known-no-effect, retryable)
+/// unless it diagnoses the target as missing/unsupported, and a timeout stays
+/// ambiguous. Never reduced to a generic timeout or a blanket unsupported.
+#[test]
+fn codex_error_classes_preserve_their_native_classification() {
+    use freshell_codex::app_server::CodexAppServerError;
+    use freshell_codex::protocol::RpcError;
+
+    let classified =
+        |error: CodexAppServerError| super::classify_codex_error(error, "thread/name/set");
+    assert!(matches!(
+        classified(CodexAppServerError::Timeout {
+            method: "thread/name/set".into(),
+            timeout_ms: 20_000,
+        }),
+        super::NativeClassified::Ambiguous(_)
+    ));
+    assert!(
+        matches!(
+            classified(CodexAppServerError::Closed {
+                method: "thread/name/set".into()
+            }),
+            super::NativeClassified::Ambiguous(_)
+        ),
+        "a mid-flight drop may have applied — ambiguous, never unsupported"
+    );
+    assert!(
+        matches!(
+            classified(CodexAppServerError::InvalidResponse {
+                method: "thread/name/set".into(),
+                detail: "unparseable".into(),
+            }),
+            super::NativeClassified::Ambiguous(_)
+        ),
+        "an unparseable answer is not a diagnosed capability failure"
+    );
+    assert!(matches!(
+        classified(CodexAppServerError::Transport {
+            method: "thread/name/set".into(),
+            message: "send refused".into(),
+        }),
+        super::NativeClassified::Undelivered(_)
+    ));
+    assert!(
+        matches!(
+            classified(CodexAppServerError::Rpc {
+                method: "thread/name/set".into(),
+                error: RpcError {
+                    code: -32004,
+                    message: "thread not found".into(),
+                    data: None,
+                },
+            }),
+            super::NativeClassified::Unsupported(_)
+        ),
+        "a diagnosed not-found is a capability failure"
+    );
+    assert!(
+        matches!(
+            classified(CodexAppServerError::Rpc {
+                method: "thread/name/set".into(),
+                error: RpcError {
+                    code: -32603,
+                    message: "internal error".into(),
+                    data: None,
+                },
+            }),
+            super::NativeClassified::Undelivered(_)
+        ),
+        "a generic answered rejection is known-no-effect retryable, never a settled capability failure"
+    );
+}
+
+/// T3-I2: a connection closed while the metadata read is in flight must
+/// classify AMBIGUOUS — settling `unsupported` on a possibly-applied call
+/// ends repair until a location change.
+#[tokio::test]
+async fn a_mid_flight_connection_close_on_the_read_is_ambiguous() {
+    let (adapter, peer) = codex_adapter_with_peer("/h/codex");
+    let target = NativeNameTarget {
+        name_ref: session(
+            freshell_protocol::session_names::NamedProvider::Codex,
+            "t-closed",
+        ),
+        location: codex_location("/h/codex", "t-closed"),
+        location_revision: 1,
+    };
+    let read = tokio::spawn(adapter.read(target));
+    serve_codex_handshake(&peer, "/h/codex").await;
+    let (_id, method, _) = peer.expect_request().await;
+    assert_eq!(method, "thread/read");
+    peer.disconnect();
+    match read.await.expect("read task") {
+        NativeCallResult::Ambiguous(reason) => {
+            assert!(reason.contains("closed"), "{reason}")
+        }
+        other => panic!("a mid-flight drop must classify ambiguous, got: {other:?}"),
+    }
+}
+
+/// T3-I2: the same fidelity on the WRITE — the mutation-critical direction.
+#[tokio::test]
+async fn a_write_dropped_mid_flight_is_ambiguous() {
+    let (adapter, peer) = codex_adapter_with_peer("/h/codex");
+    let attempt = super::NativeNameAttempt {
+        target: NativeNameTarget {
+            name_ref: session(
+                freshell_protocol::session_names::NamedProvider::Codex,
+                "t-write-closed",
+            ),
+            location: codex_location("/h/codex", "t-write-closed"),
+            location_revision: 1,
+        },
+        desired_revision: 7,
+        title: "Manual Title".to_string(),
+        source: freshell_protocol::session_names::NameSource::Manual,
+        receipt_id: "receipt-write-closed".to_string(),
+        cycle: 1,
+    };
+    let write = tokio::spawn(adapter.write(attempt));
+    serve_codex_handshake(&peer, "/h/codex").await;
+    let (_id, method, _) = peer.expect_request().await;
+    assert_eq!(method, "thread/name/set");
+    peer.disconnect();
+    match write.await.expect("write task") {
+        NativeCallResult::Ambiguous(reason) => {
+            assert!(reason.contains("closed"), "{reason}")
+        }
+        other => panic!("a mid-flight write drop must classify ambiguous, got: {other:?}"),
+    }
+}
+
+/// T3-I2: an ANSWERED JSON-RPC error is a definitive rejection —
+/// known-no-effect retryable (`Undelivered`) for a generic failure, and a
+/// diagnosed not-found settles as `Unsupported`.
+#[tokio::test]
+async fn answered_rpc_rejections_classify_by_diagnosis() {
+    // A generic answered rejection: retryable known-no-effect.
+    let (adapter, peer) = codex_adapter_with_peer("/h/codex");
+    let target = NativeNameTarget {
+        name_ref: session(
+            freshell_protocol::session_names::NamedProvider::Codex,
+            "t-rpc-generic",
+        ),
+        location: codex_location("/h/codex", "t-rpc-generic"),
+        location_revision: 1,
+    };
+    let read = tokio::spawn(adapter.read(target));
+    serve_codex_handshake(&peer, "/h/codex").await;
+    let (id, method, _) = peer.expect_request().await;
+    assert_eq!(method, "thread/read");
+    peer.respond_error(&id, -32603, "internal error");
+    match read.await.expect("read task") {
+        NativeCallResult::Undelivered(reason) => {
+            assert!(reason.contains("internal error"), "{reason}")
+        }
+        other => panic!("a generic answered rejection is undelivered retryable, got: {other:?}"),
+    }
+
+    // A diagnosed not-found: the target is missing — a settled capability
+    // failure that only a location change re-arms.
+    let (adapter, peer) = codex_adapter_with_peer("/h/codex");
+    let target = NativeNameTarget {
+        name_ref: session(
+            freshell_protocol::session_names::NamedProvider::Codex,
+            "t-rpc-missing",
+        ),
+        location: codex_location("/h/codex", "t-rpc-missing"),
+        location_revision: 1,
+    };
+    let read = tokio::spawn(adapter.read(target));
+    serve_codex_handshake(&peer, "/h/codex").await;
+    let (id, method, _) = peer.expect_request().await;
+    assert_eq!(method, "thread/read");
+    peer.respond_error(&id, -32004, "thread not found");
+    match read.await.expect("read task") {
+        NativeCallResult::Unsupported(reason) => {
+            assert!(reason.contains("not found"), "{reason}")
+        }
+        other => panic!("a diagnosed not-found is unsupported, got: {other:?}"),
+    }
+}
+
+/// T3-M2: the native metadata read (`thread/read` with `includeTurns:false`)
+/// is bounded to the plan's 20-second native request budget — NOT the 30s
+/// snapshot budget a full-thread read rides. Virtual time: the handshake is
+/// answered, the metadata request never is, and the read must resolve inside
+/// a 25s guard.
+#[tokio::test(start_paused = true)]
+async fn the_codex_native_metadata_read_is_bounded_to_twenty_seconds() {
+    let (adapter, peer) = codex_adapter_with_peer("/h/codex");
+    let target = NativeNameTarget {
+        name_ref: session(
+            freshell_protocol::session_names::NamedProvider::Codex,
+            "t-metadata-bound",
+        ),
+        location: codex_location("/h/codex", "t-metadata-bound"),
+        location_revision: 1,
+    };
+    let read = tokio::spawn(adapter.read(target));
+    // Handshake servant: answer initialize, observe the metadata request,
+    // then HOLD the peer open without answering — the bound under test is
+    // the client's own request timeout.
+    tokio::spawn(async move {
+        let (id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "initialize");
+        peer.respond(&id, serde_json::json!({ "codexHome": "/h/codex" }));
+        let (method, _) = peer.expect_notification().await;
+        assert_eq!(method, "initialized");
+        let (_id, method, _) = peer.expect_request().await;
+        assert_eq!(method, "thread/read");
+        // Keep the connection open and never answer the metadata read.
+        std::future::pending::<()>().await;
+    });
+    tokio::select! {
+        result = read => match result.expect("read task") {
+            NativeCallResult::Ambiguous(reason) => {
+                assert!(reason.contains("timed out"), "{reason}");
+            }
+            other => panic!("the bounded metadata read should time out ambiguous, got: {other:?}"),
+        },
+        _ = tokio::time::sleep(Duration::from_secs(25)) => {
+            panic!("the codex native metadata read outlived the 20s native request bound (the 30s snapshot budget)");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T3-M3 / T3-M4: the opencode adapter's HTTP classification and the read's
+// effective-database context gate (the opencode crate's scripted-IO shapes).
+// ---------------------------------------------------------------------------
+
+use freshell_opencode::serve::{
+    Endpoint, EventSink, EventSource, EventStreamHandle, HttpMethod, OpencodeServeManager,
+    PortAllocator, ProcessSpawner, ServeConfig, ServeDeps, ServeHttp, ServeHttpError,
+    ServeHttpRequest, ServeHttpResponse, ServeProcess, SpawnRequest,
+};
+
+/// Records every dispatched request and answers a fixed status with `{}` —
+/// except the `/global/health` readiness probe, which always answers healthy
+/// (the scripted status models the SESSION routes' answers, not the health
+/// endpoint).
+struct StatusHttp {
+    status: u16,
+    requests: Mutex<Vec<HttpMethod>>,
+}
+
+impl ServeHttp for StatusHttp {
+    fn request<'a>(
+        &'a self,
+        req: ServeHttpRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>> + Send + 'a,
+        >,
+    > {
+        let is_health_probe = req.url.contains("/global/health");
+        if !is_health_probe {
+            // Only SESSION-route dispatches count as dispatches under test;
+            // the readiness probe is infrastructure.
+            self.requests.lock().unwrap().push(req.method);
+        }
+        let status = if is_health_probe { 200 } else { self.status };
+        Box::pin(async move { Ok(ServeHttpResponse::new(status, b"{}".to_vec())) })
+    }
+}
+
+struct FixedPort;
+impl PortAllocator for FixedPort {
+    fn allocate(&self) -> Result<Endpoint, String> {
+        Ok(Endpoint {
+            hostname: "127.0.0.1".into(),
+            port: 1,
+        })
+    }
+}
+
+struct NeverExitsProcess;
+impl ServeProcess for NeverExitsProcess {
+    fn exited(&self) -> Option<i32> {
+        None
+    }
+    fn take_fatal_startup_error(&self) -> Option<String> {
+        None
+    }
+    fn kill(&self) {}
+}
+
+struct FakeSpawner;
+impl ProcessSpawner for FakeSpawner {
+    fn spawn(&self, _req: SpawnRequest) -> Result<Box<dyn ServeProcess>, String> {
+        Ok(Box::new(NeverExitsProcess))
+    }
+}
+
+struct NeverConnects;
+impl EventSource for NeverConnects {
+    fn connect(&self, _url: String, _sink: EventSink) -> Box<dyn EventStreamHandle> {
+        struct Handle;
+        impl EventStreamHandle for Handle {}
+        Box::new(Handle)
+    }
+}
+
+/// A started manager over the scripted fake. `env` layers the serve's spawn
+/// environment (the OPENCODE_DB override evaluation reads the LAST entry).
+async fn started_opencode_manager(
+    env: Vec<(String, String)>,
+    status: u16,
+) -> (OpencodeServeManager, Arc<StatusHttp>) {
+    let http = Arc::new(StatusHttp {
+        status,
+        requests: Mutex::new(Vec::new()),
+    });
+    let deps = ServeDeps {
+        spawner: Arc::new(FakeSpawner),
+        http: http.clone(),
+        ports: Arc::new(FixedPort),
+        events: Arc::new(NeverConnects),
+    };
+    let config = ServeConfig {
+        env,
+        health_timeout: Duration::from_millis(500),
+        ..Default::default()
+    };
+    let manager = OpencodeServeManager::new(deps, config);
+    manager.ensure_started().await.expect("fake serve starts");
+    (manager, http)
+}
+
+fn opencode_attempt(database: &str, session_id: &str) -> super::NativeNameAttempt {
+    super::NativeNameAttempt {
+        target: NativeNameTarget {
+            name_ref: session(
+                freshell_protocol::session_names::NamedProvider::Opencode,
+                session_id,
+            ),
+            location: opencode_location(database, session_id, "/work/project"),
+            location_revision: 1,
+        },
+        desired_revision: 7,
+        title: "The Renamed Session".to_string(),
+        source: freshell_protocol::session_names::NameSource::Manual,
+        receipt_id: "receipt-opencode".to_string(),
+        cycle: 1,
+    }
+}
+
+/// T3-M3: an HTTP error AFTER dispatch is not provably effect-free — a 5xx
+/// must classify AMBIGUOUS (the request was delivered and answered), while a
+/// definitive 4xx rejection stays UNDELIVERED.
+#[tokio::test]
+async fn opencode_http_failures_after_dispatch_are_ambiguous() {
+    // A matching database context (the serve is pinned to the database the
+    // location carries), so the write dispatches.
+    let (manager, http) = started_opencode_manager(
+        vec![("OPENCODE_DB".to_string(), "/pinned/other.db".to_string())],
+        500,
+    )
+    .await;
+    let adapter = super::OpencodeNativeNameAdapter::new(manager);
+    match adapter
+        .write(opencode_attempt("/pinned/other.db", "ses_5xx"))
+        .await
+    {
+        NativeCallResult::Ambiguous(reason) => assert!(reason.contains("500"), "{reason}"),
+        other => {
+            panic!("a 5xx-after-dispatch is not provably effect-free — ambiguous, got: {other:?}")
+        }
+    }
+    assert_eq!(
+        http.requests.lock().unwrap().len(),
+        1,
+        "the PATCH did dispatch"
+    );
+
+    // A definitive 4xx rejection: the request never took effect.
+    let (manager, http) = started_opencode_manager(
+        vec![("OPENCODE_DB".to_string(), "/pinned/other.db".to_string())],
+        400,
+    )
+    .await;
+    let adapter = super::OpencodeNativeNameAdapter::new(manager);
+    match adapter
+        .write(opencode_attempt("/pinned/other.db", "ses_4xx"))
+        .await
+    {
+        NativeCallResult::Undelivered(reason) => assert!(reason.contains("400"), "{reason}"),
+        other => panic!("a definitive 4xx rejection is undelivered, got: {other:?}"),
+    }
+    assert_eq!(http.requests.lock().unwrap().len(), 1);
+}
+
+/// T3-M4: the READ dispatches only past the same effective-database context
+/// gate the write honors — a mismatched serve must never answer a read
+/// (wrong-store observation or a burned cycle before the write's gate
+/// rejects).
+#[tokio::test]
+async fn the_opencode_read_gates_on_the_effective_database_context() {
+    let (manager, http) = started_opencode_manager(
+        vec![("OPENCODE_DB".to_string(), "/pinned/other.db".to_string())],
+        200,
+    )
+    .await;
+    let adapter = super::OpencodeNativeNameAdapter::new(manager);
+    let target = NativeNameTarget {
+        name_ref: session(
+            freshell_protocol::session_names::NamedProvider::Opencode,
+            "ses_mismatch",
+        ),
+        location: opencode_location(
+            "/data/home/opencode/opencode.db",
+            "ses_mismatch",
+            "/work/project",
+        ),
+        location_revision: 1,
+    };
+    match adapter.read(target).await {
+        NativeCallResult::Unsupported(reason) => assert!(reason.contains("mismatch"), "{reason}"),
+        other => panic!(
+            "a mismatched database context must refuse the READ as unsupported, got: {other:?}"
+        ),
+    }
+    assert!(
+        http.requests.lock().unwrap().is_empty(),
+        "the refused read never dispatches"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T3-I3: the capability-pause rule — an absent route/capability pauses
+// BEFORE consuming a cycle (the series stays pending, the allowance intact),
+// and work proceeds once the capability arrives.
+// ---------------------------------------------------------------------------
+
+/// A dispatch-shaped backend whose wired adapter can swap mid-test: `None`
+/// models the degraded boot (no adapter for the provider — every operation
+/// answers the production `Unsupported`), `Some(scripted)` models the
+/// capability arriving.
+struct SwappableDispatch {
+    live: Arc<std::sync::RwLock<Option<Arc<ScriptedBackend>>>>,
+}
+
+impl SwappableDispatch {
+    fn unwired() -> Arc<Self> {
+        Arc::new(Self {
+            live: Arc::new(std::sync::RwLock::new(None)),
+        })
+    }
+
+    fn wire(self: &Arc<Self>, backend: Arc<ScriptedBackend>) {
+        *self.live.write().unwrap() = Some(backend);
+    }
+}
+
+impl NativeNameBackend for SwappableDispatch {
+    fn read(&self, target: NativeNameTarget) -> super::NativeFuture<NativeNameReadback> {
+        let live = self.live.read().unwrap().clone();
+        match live {
+            Some(backend) => backend.read(target),
+            None => Box::pin(async move {
+                NativeCallResult::Unsupported(
+                    "no native adapter is wired for this provider".to_string(),
+                )
+            }),
+        }
+    }
+
+    fn write(&self, attempt: super::NativeNameAttempt) -> super::NativeFuture<()> {
+        let live = self.live.read().unwrap().clone();
+        match live {
+            Some(backend) => backend.write(attempt),
+            None => Box::pin(async move {
+                NativeCallResult::Unsupported(
+                    "no native adapter is wired for this provider".to_string(),
+                )
+            }),
+        }
+    }
+
+    fn route_available(&self, _target: NativeNameTarget) -> super::NativeProbeFuture {
+        let live = self.live.read().unwrap().is_some();
+        Box::pin(async move { live })
+    }
+}
+
+/// T3-I3: rename a session whose provider capability is ABSENT (a degraded
+/// boot with no adapter wired): no cycle is consumed, the series stays
+/// `pending` and discoverable, and the work proceeds once the capability
+/// arrives — never a burned cycle and a misleading `unsupported` per
+/// decision.
+#[tokio::test]
+async fn an_absent_native_capability_pauses_before_consuming_a_cycle() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-capability", "/h/.claude").await;
+    let dispatch = SwappableDispatch::unwired();
+
+    let worker = SessionNameWorker::start(Arc::clone(&store), dispatch.clone());
+    // Ample opportunity for the loop to (wrongly) claim while the capability
+    // is absent — the worker polls every 500ms.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    let sync = native_sync_of(&store, target.clone())
+        .await
+        .expect("series projected");
+    assert_eq!(
+        sync.status,
+        NativeSyncStatus::Pending,
+        "capability-absent pauses as pending"
+    );
+    assert!(
+        !store.native_work_snapshot().is_empty(),
+        "the series stays discoverable work while paused"
+    );
+    let doc = document_json(dir.path());
+    assert_eq!(
+        native_entry_of(&doc)["cyclesConsumed"].as_u64(),
+        Some(0),
+        "no cycle is consumed while the capability is absent"
+    );
+
+    // The capability arrives: the SAME series proceeds and converges.
+    let backend = ScriptedBackend::new(vec![WriteStep::Confirm]);
+    backend.set_title(Some("Divergent"));
+    dispatch.wire(backend.clone());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(sync) = native_sync_of(&store, target.clone()).await {
+            if sync.status == NativeSyncStatus::Synced {
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the paused series must converge once the capability arrives"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    worker.abort();
+    assert_eq!(backend.writes(), 1);
+    assert_eq!(backend.reads(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// T3-I4: the packaged desktop app's staged helper path derivation.
+// ---------------------------------------------------------------------------
+
+/// `from_env` reads process-global env — serialize every from_env probe and
+/// restore the prior values (the repo's ENV_LOCK convention).
+static FROM_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn probe_from_env(
+    vars: &[(&str, Option<&str>)],
+    probe: impl FnOnce(&super::ClaudeNativeNameAdapter),
+) {
+    let _guard = FROM_ENV_LOCK.lock().unwrap();
+    let saved: Vec<(&str, Option<std::ffi::OsString>)> = vars
+        .iter()
+        .map(|(key, _)| (*key, std::env::var_os(key)))
+        .collect();
+    for (key, value) in vars {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+    probe(&super::ClaudeNativeNameAdapter::from_env());
+    for (key, value) in saved {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+}
+
+/// T3-I4: the packaged app spawns the server with `FRESHELL_CLAUDE_SIDECAR`
+/// pointing at the STAGED sidecar entry — the session-names helper must be
+/// derived from its sibling directory (the staging places them together),
+/// or Claude native writeback silently fails in every packaged install.
+#[test]
+fn the_packaged_sidecar_override_derives_the_staged_helper_path() {
+    // The sidecar override alone: the helper is the staged sibling.
+    probe_from_env(
+        &[
+            ("FRESHELL_CLAUDE_SESSION_NAMES", None),
+            (
+                "FRESHELL_CLAUDE_SIDECAR",
+                Some("/runtime/claude-sidecar/index.mjs"),
+            ),
+        ],
+        |adapter| {
+            assert_eq!(
+                adapter.helper_path,
+                std::path::PathBuf::from("/runtime/claude-sidecar/session-names.mjs"),
+                "the staged helper sits beside the staged sidecar entry"
+            );
+        },
+    );
+    // The explicit helper override WINS over the sibling derivation.
+    probe_from_env(
+        &[
+            (
+                "FRESHELL_CLAUDE_SESSION_NAMES",
+                Some("/explicit/session-names.mjs"),
+            ),
+            (
+                "FRESHELL_CLAUDE_SIDECAR",
+                Some("/runtime/claude-sidecar/index.mjs"),
+            ),
+        ],
+        |adapter| {
+            assert_eq!(
+                adapter.helper_path,
+                std::path::PathBuf::from("/explicit/session-names.mjs")
+            );
+        },
+    );
+    // Neither override: the build-tree default beside the sidecar source.
+    probe_from_env(
+        &[
+            ("FRESHELL_CLAUDE_SESSION_NAMES", None),
+            ("FRESHELL_CLAUDE_SIDECAR", None),
+        ],
+        |adapter| {
+            assert_eq!(
+                adapter.helper_path,
+                std::path::PathBuf::from(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../freshell-claude-sidecar/session-names.mjs"
+                ))
+            );
+        },
+    );
+}
+
+/// T3-M1 (Rust side): the helper child's project-key env is a deliberate
+/// SET-OR-REMOVE — a non-empty location override sets the key, an absent or
+/// empty one REMOVES it, so an inactive ambient override can never hijack
+/// the project key. (The end-to-end leak tripwire lives in the vitest
+/// claude-sidecar suite's fake SDK.)
+#[test]
+fn the_helper_child_env_sets_or_removes_the_project_key() {
+    assert_eq!(
+        super::project_key_child_env(Some("custom-project-key")),
+        (
+            "CLAUDE_CODE_PROJECT_DIR_NAME",
+            Some("custom-project-key".to_string())
+        ),
+        "a non-empty override sets the key"
+    );
+    assert_eq!(
+        super::project_key_child_env(None),
+        ("CLAUDE_CODE_PROJECT_DIR_NAME", None),
+        "an absent override removes the key"
+    );
+    assert_eq!(
+        super::project_key_child_env(Some("")),
+        ("CLAUDE_CODE_PROJECT_DIR_NAME", None),
+        "an empty override removes the key too"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T3-I5(a)/(b): the read allowance cap and the stale-location fold guard
+// (pins for rules the machine already enforces; the fix round proves each
+// detects its harm by mutation before trusting it).
+// ---------------------------------------------------------------------------
+
+/// The six-read allowance: six charges succeed, the seventh is refused, and a
+/// cycle whose pre-read cannot charge folds the refusal as its own undelivered
+/// reason WITHOUT dispatching the provider read.
+#[tokio::test]
+async fn native_reads_are_bounded_at_six_per_revision() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-reads", "/h/.claude").await;
+    let claim = store
+        .claim_native_cycle(target.clone(), "receipt-reads".to_string())
+        .await
+        .unwrap()
+        .expect("claim");
+    for i in 1..=6 {
+        assert!(
+            store
+                .charge_native_read(target.clone(), claim.series_epoch)
+                .await
+                .unwrap(),
+            "read {i} charges against the allowance"
+        );
+    }
+    assert!(
+        !store
+            .charge_native_read(target.clone(), claim.series_epoch)
+            .await
+            .unwrap(),
+        "the seventh read is refused"
+    );
+
+    // The worker's exhaustion fold: the refused charge must never dispatch.
+    let backend = ScriptedBackend::new(vec![]);
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+    assert_eq!(backend.reads(), 0, "the refused read never dispatches");
+    let sync = native_sync_of(&store, target.clone())
+        .await
+        .expect("series");
+    assert_eq!(sync.status, NativeSyncStatus::Unsynced);
+    assert!(
+        sync.reason.unwrap().contains("read allowance exhausted"),
+        "the exhaustion fold names the refused allowance"
+    );
+    let doc = document_json(dir.path());
+    assert_eq!(
+        native_entry_of(&doc)["readsConsumed"].as_u64(),
+        Some(6),
+        "the cap is persisted, never exceeded"
+    );
+}
+
+/// A late outcome folded with a SUPERSEDED attempted location revision is
+/// provenance only: it must never mark the RELOCATED target synchronized or
+/// leave a confirmed receipt behind.
+#[tokio::test]
+async fn a_relocated_target_ignores_late_folds_from_the_old_location() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-reloc", "/h/.claude").await;
+    let claim = store
+        .claim_native_cycle(target.clone(), "receipt-old-location".to_string())
+        .await
+        .unwrap()
+        .expect("claim");
+    assert_eq!(claim.location_revision, 1);
+
+    // The verified route MOVES (a genuine reacquisition at a new root).
+    record_acquisition(
+        &store,
+        target.clone(),
+        verified_acquisition(claude_location("/h/.claude-moved", "h-reloc")),
+    )
+    .await
+    .unwrap();
+
+    // The old cycle completes late at the OLD location revision.
+    store
+        .fold_native_outcome(
+            target.clone(),
+            claim.location_revision,
+            claim.series_epoch,
+            NativeOutcomeFold::Read {
+                observed: Some("Manual Title".to_string()),
+                receipt: Some(claim.receipt_id.clone()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let sync = native_sync_of(&store, target.clone())
+        .await
+        .expect("series");
+    assert_ne!(
+        sync.status,
+        NativeSyncStatus::Synced,
+        "an old-location acknowledgement cannot sync the relocated target"
+    );
+    let doc = document_json(dir.path());
+    let native = native_entry_of(&doc);
+    assert!(
+        native.get("lastConfirmedReceipt").is_none(),
+        "the stale fold left no confirmed receipt"
+    );
+    // The series proceeds at the NEW route.
+    let next = store
+        .claim_native_cycle(target.clone(), "receipt-new-location".to_string())
+        .await
+        .unwrap()
+        .expect("the series continues at the new location");
+    assert_eq!(next.location_revision, 2);
+}
+
+// ---------------------------------------------------------------------------
+// T3-M5: a mid-flight DOUBLE rename supersedes the executing cycle's series;
+// the superseded cycle's folds and charges are provenance only.
+// ---------------------------------------------------------------------------
+
+/// The traced harm: the superseded cycle's AMBIGUOUS outcome lands on the
+/// successor series and its inherited marker keeps a genuinely-converged
+/// series visibly unsynced.
+#[tokio::test]
+async fn a_superseded_cycles_ambiguous_marker_cannot_keep_a_converged_series_unsynced() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-epoch-amb", "/h/.claude").await;
+    let backend =
+        ScriptedBackend::new(vec![WriteStep::AmbiguousLateApply { delay_ms: 10 }]).arm_read_gate();
+    backend.set_title(Some("Divergent"));
+
+    let store_for_cycle = Arc::clone(&store);
+    let backend_for_cycle = backend.clone();
+    let target_for_cycle = target.clone();
+    let worker = tokio::spawn(async move {
+        super::run_cycle(
+            &store_for_cycle,
+            backend_for_cycle.as_ref() as &dyn NativeNameBackend,
+            &target_for_cycle,
+        )
+        .await;
+    });
+
+    // While the cycle parks on its pre-write read, a DOUBLE rename supersedes
+    // its series twice.
+    backend.gate_arrived.notified().await;
+    rename_user(&store, target.clone(), "Second Decision")
+        .await
+        .unwrap();
+    rename_user(&store, target.clone(), "Third Decision")
+        .await
+        .unwrap();
+    backend.gate_open.notify_one();
+    worker.await.unwrap();
+
+    // The superseded cycle's ambiguous outcome must be provenance ONLY: the
+    // successor series is untouched — pending, no inherited marker.
+    let sync = native_sync_of(&store, target.clone())
+        .await
+        .expect("series");
+    assert_eq!(
+        sync.status,
+        NativeSyncStatus::Pending,
+        "a superseded dispatch must not mark the successor series"
+    );
+    assert!(sync.reason.is_none(), "no inherited unsynced reason");
+
+    // The successor series converges on its own matching readback: the
+    // inherited marker must not keep a genuinely-converged series unsynced.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    backend.set_title(Some("Third Decision"));
+    super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
+    let sync = native_sync_of(&store, target).await.expect("series");
+    assert_eq!(
+        sync.status,
+        NativeSyncStatus::Synced,
+        "an inherited ambiguous marker must not survive a genuine convergence"
+    );
+}
+
+/// The same guard on the charge side: the superseded cycle's confirming read
+/// must not consume the successor series' read allowance.
+#[tokio::test]
+async fn a_superseded_cycle_charges_no_read_against_the_successor_series() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-epoch-charge", "/h/.claude").await;
+    let backend = ScriptedBackend::new(vec![WriteStep::Confirm]).arm_read_gate();
+    backend.set_title(Some("Divergent"));
+
+    let store_for_cycle = Arc::clone(&store);
+    let backend_for_cycle = backend.clone();
+    let target_for_cycle = target.clone();
+    let worker = tokio::spawn(async move {
+        super::run_cycle(
+            &store_for_cycle,
+            backend_for_cycle.as_ref() as &dyn NativeNameBackend,
+            &target_for_cycle,
+        )
+        .await;
+    });
+    backend.gate_arrived.notified().await;
+    rename_user(&store, target.clone(), "Second Decision")
+        .await
+        .unwrap();
+    rename_user(&store, target.clone(), "Third Decision")
+        .await
+        .unwrap();
+    backend.gate_open.notify_one();
+    worker.await.unwrap();
+
+    let doc = document_json(dir.path());
+    let native = native_entry_of(&doc);
+    assert_eq!(
+        native["readsConsumed"].as_u64(),
+        Some(0),
+        "the superseded cycle's confirming read charges nothing against the successor series"
+    );
+    let sync = native_sync_of(&store, target.clone())
+        .await
+        .expect("series");
+    assert_eq!(
+        sync.status,
+        NativeSyncStatus::Pending,
+        "the superseded cycle's late readback folds nothing onto the successor series"
+    );
+
+    // The successor proceeds on its own full allowance.
+    let claim = store
+        .claim_native_cycle(target.clone(), "successor-cycle-1".to_string())
+        .await
+        .unwrap()
+        .expect("the successor series has its own allowance");
+    assert_eq!(claim.title, "Third Decision");
+    assert_eq!(claim.cycle, 1);
+}
+
+// ---------------------------------------------------------------------------
+// T3-M7: an invalid observation title retains the observation provenance and
+// skips only the offer/rearm — an external >200-scalar rename must not abort
+// the whole transaction.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_invalid_observation_title_retains_provenance_without_offering_or_rearming() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-invalid-obs", "/h/.claude").await;
+
+    // An external rename longer than the accepted-name cap arrives.
+    let oversize = "x".repeat(201);
+    let folded = observe(&store, target.clone(), &oversize, 1).await;
+    let folded = folded
+        .expect("an invalid observation title is retained as provenance, not a failed transaction");
+    assert_eq!(
+        folded.record.name, "Manual Title",
+        "an invalid title never renames"
+    );
+    assert_eq!(
+        folded.record.source,
+        freshell_protocol::session_names::NameSource::Manual
+    );
+    let doc = document_json(dir.path());
+    let observation = native_entry_of(&doc)["lastObservation"]
+        .as_object()
+        .expect("the observation provenance is retained");
+    assert_eq!(observation["origin"].as_str(), Some("snapshot"));
+    assert_eq!(observation["stale"].as_bool(), Some(false));
+
+    // No rearm: the armed series stays untouched by the invalid event.
+    let sync = native_sync_of(&store, target.clone())
+        .await
+        .expect("series");
+    assert_eq!(sync.status, NativeSyncStatus::Pending);
+    assert!(sync.reason.is_none());
 }

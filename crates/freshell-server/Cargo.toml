@@ -130,3 +130,9 @@ futures-util = "0.3"
 # NET-09: black-box config-preservation test requires reqwest with json encoding
 # (main [dependencies] reqwest is feature-gated for stream+rustls only).
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+# Unified agent names (Task 3 fix round): `test-util` unlocks
+# `#[tokio::test(start_paused = true)]` so the native metadata-read bound test
+# pins the 20-second request budget against virtual time (same precedent as
+# `crates/freshell-opencode/Cargo.toml`'s dev-dependency comment). No new
+# download — tokio is already a direct dependency above.
+tokio = { version = "1", features = ["test-util"] }
