@@ -1,10 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
   findReleaseServerPid,
   readProcessSnapshot,
+  runCommand,
   type CommandResult,
 } from '../../../scripts/testing/process-tree.js'
 
@@ -43,14 +44,20 @@ describe('process tree ownership', () => {
 })
 
 /**
- * POSIX read resilience (kata qesq): on WSL2, `spawnSync ps` uses stdio pipes
- * backed by AF_UNIX socketpairs; under concurrent spawn churn on a long-uptime
- * VM the socket pool exhausts and EVERY call fails ENOBUFS, terminal-failing
- * the source-runtime smoke while the actual server chain is healthy. The POSIX
- * read must retry with backoff, then fall back to a spawn-free /proc reader,
- * and its final error must distinguish "ps failed AND /proc failed".
+ * POSIX read resilience (kata qesq, corrected diagnosis — fresh-eyes review
+ * of b2bbded15): the recorded `spawnSync ps ENOBUFS` failures were NOT
+ * "WSL2 AF_UNIX socketpair exhaustion". They were Node's spawnSync default
+ * 1 MiB maxBuffer overflowing when the full-table ps output grows past the
+ * limit under process churn: spawnSync reports exactly `spawnSync <cmd>
+ * ENOBUFS` (status null, child SIGTERM'd) on output overflow — reproduced
+ * with `spawnSync head -c 2000000 /dev/zero` → "spawnSync head ENOBUFS".
+ * runCommand now passes a 16 MiB maxBuffer, the retry loop retries only
+ * genuinely transient spawn errors (never ENOENT-class), and the Linux
+ * spawn-free /proc fallback stays as defense-in-depth — observable via a
+ * stderr warning. The final error must distinguish "ps failed AND /proc
+ * failed".
  */
-describe('readProcessSnapshot POSIX resilience (WSL2 AF_UNIX pool exhaustion)', () => {
+describe('readProcessSnapshot POSIX resilience (ps output over spawnSync 1 MiB maxBuffer)', () => {
   let tmpRoot = ''
   let procRoot = ''
 
@@ -94,13 +101,37 @@ describe('readProcessSnapshot POSIX resilience (WSL2 AF_UNIX pool exhaustion)', 
     commandLine: argv.join(' '),
   }))
 
-  /** ENOBUFS-shaped failure exactly like spawnSync's stdio-pipe exhaustion. */
+  /**
+   * ENOBUFS-shaped spawn failure — the exact error spawnSync reports when
+   * output exceeds maxBuffer (the recorded real-world failure mode).
+   */
   const enoBufferResult = (): CommandResult => ({
     status: null,
     error: Object.assign(new Error('spawnSync ps ENOBUFS'), { code: 'ENOBUFS' }),
   })
 
-  it('retries ps on ENOBUFS spawn errors, then reads the same snapshot shape from /proc', () => {
+  /** ENOENT-shaped spawn failure — `ps` is not installed; permanent, never retried. */
+  const enoentResult = (): CommandResult => ({
+    status: null,
+    error: Object.assign(new Error('spawnSync ps ENOENT'), { code: 'ENOENT' }),
+  })
+
+  it.skipIf(process.platform === 'win32')(
+    'gives spawnSync a 16 MiB maxBuffer: 2 MiB of child output (past the old 1 MiB default) reads clean',
+    () => {
+      // Real-spawn pin of the corrected mechanism. Without the maxBuffer
+      // option this is the reviewer's exact reproduction of the recorded
+      // failure: status null, child SIGTERM'd, error "spawnSync head
+      // ENOBUFS". A full-table `ps` on a busy host produces exactly this
+      // shape once its output passes 1 MiB.
+      const result = runCommand('head', ['-c', '2000000', '/dev/zero'])
+      expect(result.error).toBeUndefined()
+      expect(result.status).toBe(0)
+      expect(result.stdout?.length).toBe(2_000_000)
+    },
+  )
+
+  it('retries transient ps spawn errors (ENOBUFS) once, then reads the same snapshot shape from /proc', () => {
     for (const entry of treeEntries) writeProcEntry(entry.pid, entry.comm, entry.ppid, entry.argv)
 
     const calls: Array<{ command: string; args: string }> = []
@@ -110,9 +141,24 @@ describe('readProcessSnapshot POSIX resilience (WSL2 AF_UNIX pool exhaustion)', 
       return enoBufferResult()
     }, { procRoot, sleep: (ms) => sleeps.push(ms) })
 
-    expect(calls).toHaveLength(4) // 1 initial attempt + 3 bounded retries
+    expect(calls).toHaveLength(2) // 1 initial attempt + 1 bounded transient retry
     expect(calls.every((call) => call.command === 'ps' && call.args === '-eo pid=,ppid=,args=')).toBe(true)
-    expect(sleeps).toEqual([250, 250, 250])
+    expect(sleeps).toEqual([250])
+    expect(records).toEqual(expectedTreeRecords)
+  })
+
+  it('does not retry permanent ENOENT spawn errors — one attempt, then the /proc fallback', () => {
+    for (const entry of treeEntries) writeProcEntry(entry.pid, entry.comm, entry.ppid, entry.argv)
+
+    const calls: Array<{ command: string; args: string }> = []
+    const sleeps: number[] = []
+    const records = readProcessSnapshot('linux', (command, args) => {
+      calls.push({ command, args: args.join(' ') })
+      return enoentResult()
+    }, { procRoot, sleep: (ms) => sleeps.push(ms) })
+
+    expect(calls).toEqual([{ command: 'ps', args: '-eo pid=,ppid=,args=' }])
+    expect(sleeps).toEqual([])
     expect(records).toEqual(expectedTreeRecords)
   })
 
@@ -121,12 +167,76 @@ describe('readProcessSnapshot POSIX resilience (WSL2 AF_UNIX pool exhaustion)', 
     const sleeps: number[] = []
     const records = readProcessSnapshot('linux', () => {
       attempts += 1
-      return attempts < 3 ? enoBufferResult() : { status: 0, stdout: psStdoutForTree }
+      return attempts === 1 ? enoBufferResult() : { status: 0, stdout: psStdoutForTree }
     }, { procRoot, sleep: (ms) => sleeps.push(ms) })
 
-    expect(attempts).toBe(3)
-    expect(sleeps).toEqual([250, 250])
+    expect(attempts).toBe(2)
+    expect(sleeps).toEqual([250])
     expect(records).toEqual(expectedTreeRecords)
+  })
+
+  it('honors the retryDelayMs option between retry attempts', () => {
+    let attempts = 0
+    const sleeps: number[] = []
+    const records = readProcessSnapshot('linux', () => {
+      attempts += 1
+      return attempts === 1 ? enoBufferResult() : { status: 0, stdout: psStdoutForTree }
+    }, { procRoot, retryDelayMs: 125, sleep: (ms) => sleeps.push(ms) })
+
+    expect(attempts).toBe(2)
+    expect(sleeps).toEqual([125])
+    expect(records).toEqual(expectedTreeRecords)
+  })
+
+  it('warns on stderr (with the ps failure) when the /proc fallback rescues a failed ps read', () => {
+    for (const entry of treeEntries) writeProcEntry(entry.pid, entry.comm, entry.ppid, entry.argv)
+    const writes: string[] = []
+    const stderrSpy = vi.spyOn(process.stderr, 'write').mockImplementation((chunk) => {
+      writes.push(typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8'))
+      return true
+    })
+
+    try {
+      // A healthy ps read never warns.
+      const healthy = readProcessSnapshot('linux', () => ({ status: 0, stdout: psStdoutForTree }), {
+        procRoot,
+        sleep: () => {},
+      })
+      expect(healthy).toEqual(expectedTreeRecords)
+      expect(writes).toEqual([])
+
+      // A rescued read warns exactly once, carrying the last ps failure.
+      const rescued = readProcessSnapshot('linux', () => enoentResult(), { procRoot, sleep: () => {} })
+      expect(rescued).toEqual(expectedTreeRecords)
+      expect(writes).toHaveLength(1)
+      expect(writes[0]).toContain('spawnSync ps ENOENT')
+      expect(writes[0]).toContain('/proc fallback')
+    } finally {
+      stderrSpy.mockRestore()
+    }
+  })
+
+  it('skips pids that vanish mid-scan (missing stat or cmdline file)', () => {
+    for (const entry of treeEntries) writeProcEntry(entry.pid, entry.comm, entry.ppid, entry.argv)
+    // 4600: stat readable, cmdline already gone — exited between the two reads.
+    fs.mkdirSync(path.join(procRoot, '4600'), { recursive: true })
+    fs.writeFileSync(path.join(procRoot, '4600', 'stat'), `4600 (bash) S 4100 1 1 1 0 -1 4194304 100 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0\n`)
+    // 4700: cmdline still present, stat gone — reaped before we read it.
+    fs.mkdirSync(path.join(procRoot, '4700'), { recursive: true })
+    fs.writeFileSync(path.join(procRoot, '4700', 'cmdline'), 'bash\x00-l\x00')
+
+    const records = readProcessSnapshot('linux', () => enoBufferResult(), { procRoot, sleep: () => {} })
+
+    expect(records).toEqual(expectedTreeRecords)
+  })
+
+  it('keeps a present-but-empty cmdline as an empty command line (kernel-thread shape)', () => {
+    for (const entry of treeEntries) writeProcEntry(entry.pid, entry.comm, entry.ppid, entry.argv)
+    writeProcEntry(4800, 'kworker/0:1', 2, [])
+
+    const records = readProcessSnapshot('linux', () => enoBufferResult(), { procRoot, sleep: () => {} })
+
+    expect(records).toEqual([...expectedTreeRecords, { pid: 4800, parentPid: 2, commandLine: '' }])
   })
 
   it('produces the identical snapshot shape from ps and from the /proc fallback', () => {
@@ -150,7 +260,7 @@ describe('readProcessSnapshot POSIX resilience (WSL2 AF_UNIX pool exhaustion)', 
         procRoot: path.join(tmpRoot, 'proc-that-does-not-exist'),
         sleep: () => {},
       }),
-    ).toThrowError(/ps failed after 4 attempts \(spawnSync ps ENOBUFS\).*\/proc fallback also failed/)
+    ).toThrowError(/ps failed after 2 attempts \(spawnSync ps ENOBUFS\).*\/proc fallback also failed/)
   })
 
   it('off Linux, a failing ps reports only the ps failure (no /proc fallback)', () => {
@@ -158,7 +268,7 @@ describe('readProcessSnapshot POSIX resilience (WSL2 AF_UNIX pool exhaustion)', 
 
     expect(() =>
       readProcessSnapshot('darwin', () => enoBufferResult(), { procRoot, sleep: () => {} }),
-    ).toThrowError(/ps failed after 4 attempts \(spawnSync ps ENOBUFS\)/)
+    ).toThrowError(/ps failed after 2 attempts \(spawnSync ps ENOBUFS\)/)
   })
 
   it('does not retry or sleep when the first ps read succeeds', () => {

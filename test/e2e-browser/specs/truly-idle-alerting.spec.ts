@@ -145,14 +145,15 @@ test.describe('Truly-idle alerting (terminal.idle)', () => {
       await page.locator('.xterm').first().click()
       await page.keyboard.type('hello fake claude')
       await page.keyboard.press('Enter')
-      // 30s bound (was 10s): kata k81d — this exact busy-blue frame timed
-      // out in gate-e2e-local-2.log, gate2-e2e-local-2.log, and
-      // gate3-e2e-local-1.log. The receipts' failures were the stale-locator
-      // artifact above (no bound could pass them); the 30s sizing is the
-      // wall-family campaign ladder for this frame under co-tenant load.
-      // Only THIS frame is raised — FAKE_TURN_MS and the busy-clear margin
-      // below are untouched.
-      await expect(claudeTabBusyIcon).not.toHaveCount(0, { timeout: 30_000 })
+      // 10s bound (the original): the 2026-09-17 control run at this bound
+      // showed the pane icon going blue well within 10s once the locator
+      // defect above was fixed — the kata k81d receipts' failures at this
+      // frame were entirely that stale-locator artifact (no bound could pass
+      // them), so the interim 30s raise had no evidence behind it and would
+      // only slow a real busy-blue regression. The busy window is only
+      // FAKE_TURN_MS (4s) wide once the turn starts; FAKE_TURN_MS and the
+      // busy-clear margin below are untouched.
+      await expect(claudeTabBusyIcon).not.toHaveCount(0, { timeout: 10_000 })
 
       // Move away so the claude tab is a background tab when the turn ends.
       await page.getByRole('button', { name: 'New shell tab' }).click()

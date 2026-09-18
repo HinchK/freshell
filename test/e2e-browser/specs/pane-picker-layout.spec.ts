@@ -42,11 +42,16 @@ test('pane picker tiles are square, fluid, and fit the pane', async ({ freshellP
   // size had not settled on the fluid formula yet). Wait for tiles to exist and
   // for the geometry to settle on the formula — the same settled-state
   // discipline the second-viewport poll below already uses — then assert the
-  // full geometry contract on the settled state.
+  // full geometry contract on the settled state. The poll returns the per-tile
+  // deviations instead of a bare boolean, so a genuine non-settle failure
+  // message carries the numbers the direct assertGeometry below reports.
   await expect.poll(async () => {
     const g = await tileGeo(page)
-    return g.tiles.length > 0 && g.tiles.every((t) => Math.abs(t.w - g.expected) < 1)
-  }, { timeout: 10_000 }).toBe(true)
+    if (g.tiles.length === 0) return [{ problem: 'no tiles rendered yet' }]
+    return g.tiles
+      .map((t, i) => ({ tile: i, w: t.w, expected: g.expected, dev: Math.abs(t.w - g.expected) }))
+      .filter((d) => d.dev >= 1)
+  }, { timeout: 10_000 }).toEqual([])
   const first = await tileGeo(page)
   assertGeometry(first)
 

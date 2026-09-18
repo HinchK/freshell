@@ -27,19 +27,54 @@ export interface ReadProcessSnapshotOptions {
   /** Delay between `ps` retry attempts. Default 250ms. */
   retryDelayMs?: number
   /**
-   * Synchronous sleep between retries, injectable for tests. The public API
-   * is synchronous (callers poll it in synchronous loops), so the default
-   * parks the thread via Atomics.wait instead of busy-waiting.
+   * Synchronous sleep between retries, injectable for tests. The default
+   * parks the calling thread via Atomics.wait, blocking it for up to `ms`
+   * per call. The public API is synchronous, but its only caller
+   * (source-runtime-rust.test.ts) polls it from an async loop, so each
+   * retry delay briefly blocks that loop's turn.
    */
   sleep?: (ms: number) => void
 }
 
-/** 1 initial attempt + 3 bounded retries of the `ps` read. */
-const PS_RETRIES = 3
+/**
+ * Node's spawnSync kills the child and reports ENOBUFS once collected output
+ * exceeds its `maxBuffer` (default 1 MiB): `spawnSync('head', ['-c',
+ * '2000000', '/dev/zero'])` returns status null / SIGTERM with "spawnSync
+ * head ENOBUFS". A full-table `ps -eo pid=,ppid=,args=` can exceed 1 MiB on
+ * busy hosts (thousands of processes with very long command lines under
+ * process churn), which is the real mechanism behind the recorded
+ * `spawnSync ps ENOBUFS` snapshot failures. 16 MiB restores ample headroom
+ * for the shared POSIX and Windows runners alike.
+ */
+const SPAWN_MAX_BUFFER_BYTES = 16 * 1024 * 1024
+
+/**
+ * Spawn-error codes that can plausibly clear on their own and are worth one
+ * bounded retry. ENOBUFS (maxBuffer overflow) is near-impossible now that
+ * runCommand passes a 16 MiB maxBuffer — the minimal retry is a hedge; the
+ * rest are classic transient resource pressure. Everything else — ENOENT
+ * (no `ps` installed), EACCES, nonzero exits — is permanent and fails fast
+ * to the /proc fallback or the final error.
+ */
+const TRANSIENT_PS_SPAWN_CODES: ReadonlySet<string> = new Set([
+  'EAGAIN',
+  'EINTR',
+  'EMFILE',
+  'ENFILE',
+  'ENOBUFS',
+  'ENOMEM',
+])
+
+/** 1 initial attempt + 1 bounded retry, and only for transient spawn errors. */
+const PS_TRANSIENT_RETRIES = 1
 const PS_RETRY_DELAY_MS = 250
 
-function runCommand(command: string, args: readonly string[]): CommandResult {
-  const result = spawnSync(command, [...args], { encoding: 'utf8' })
+/**
+ * Run a command synchronously and collect stdout/stderr. Exported for the
+ * unit suite's real-spawn maxBuffer pin.
+ */
+export function runCommand(command: string, args: readonly string[]): CommandResult {
+  const result = spawnSync(command, [...args], { encoding: 'utf8', maxBuffer: SPAWN_MAX_BUFFER_BYTES })
   return {
     status: result.status,
     stdout: result.stdout,
@@ -160,14 +195,20 @@ function parseWindowsSnapshot(stdout: string): ProcessRecord[] {
  * injectable so parsing and Windows behavior remain unit-testable without
  * spawning a shell or depending on a particular CI host.
  *
- * POSIX resilience (kata qesq): `spawnSync ps` allocates stdio pipes backed
- * by AF_UNIX socketpairs, which on WSL2 can exhaust under concurrent spawn
- * churn — every call then fails ENOBUFS and the smoke test terminal-fails
- * while the actual server chain is healthy. The POSIX read therefore (a)
- * retries `ps` a bounded number of times with backoff, and (b) on Linux
- * falls back to a spawn-free `/proc` reader (same `ProcessRecord[]` shape)
- * when `ps` keeps failing. The final error distinguishes "ps failed AND the
- * /proc fallback failed" from a plain failure.
+ * POSIX resilience (kata qesq, corrected diagnosis — fresh-eyes review of
+ * b2bbded15): the recorded `spawnSync ps ENOBUFS` failures were NOT "WSL2
+ * AF_UNIX socketpair exhaustion" — they were Node's spawnSync default 1 MiB
+ * maxBuffer overflowing when the full-table ps output grows past the limit
+ * under process churn (spawnSync reports exactly `spawnSync <cmd> ENOBUFS`,
+ * status null / SIGTERM, on output overflow; reproduced with `spawnSync
+ * head -c 2000000 /dev/zero` → "spawnSync head ENOBUFS"). The read
+ * therefore (a) gives spawnSync a 16 MiB maxBuffer, (b) retries only
+ * genuinely transient spawn errors once (ENOBUFS is near-impossible with
+ * the larger buffer; permanent shapes such as ENOENT never retry), and
+ * (c) keeps the Linux spawn-free `/proc` fallback (same `ProcessRecord[]`
+ * shape) as defense-in-depth when `ps` still fails — with a one-line stderr
+ * warning so a rescued read stays observable. The final error distinguishes
+ * "ps failed AND the /proc fallback failed" from a plain failure.
  */
 export function readProcessSnapshot(
   platform: NodeJS.Platform = process.platform,
@@ -189,30 +230,52 @@ export function readProcessSnapshot(
 
   const sleep = opts.sleep ?? defaultRetrySleep
   const retryDelayMs = opts.retryDelayMs ?? PS_RETRY_DELAY_MS
-  const attempts = 1 + PS_RETRIES
 
   let lastPsFailure = ''
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+  let attempts = 0
+  while (attempts <= PS_TRANSIENT_RETRIES) {
+    attempts += 1
     const result = runner('ps', ['-eo', 'pid=,ppid=,args='])
     if (!result.error && result.status === 0) {
       return parsePosixSnapshot(result.stdout ?? '')
     }
     lastPsFailure = describeFailure(result)
-    if (attempt < attempts) sleep(retryDelayMs)
+    // Retry only genuinely transient spawn errors; permanent shapes (no `ps`
+    // installed, nonzero exit) fail fast to the fallback / final error.
+    if (attempts > PS_TRANSIENT_RETRIES || !isTransientPsFailure(result)) break
+    sleep(retryDelayMs)
   }
+
+  const attemptsWord = attempts === 1 ? 'attempt' : 'attempts'
 
   if (platform === 'linux') {
     try {
-      return readProcSnapshot(opts.procRoot ?? '/proc')
+      const records = readProcSnapshot(opts.procRoot ?? '/proc')
+      // Observability: a silent fallback would hide the ps failure that
+      // caused it (the condition needed to correct the original diagnosis).
+      process.stderr.write(
+        `process-tree: ps failed after ${attempts} ${attemptsWord} (${lastPsFailure}); using spawn-free /proc fallback snapshot\n`,
+      )
+      return records
     } catch (procError) {
       throw new Error(
-        `could not read POSIX process table: ps failed after ${attempts} attempts (${lastPsFailure}); ` +
+        `could not read POSIX process table: ps failed after ${attempts} ${attemptsWord} (${lastPsFailure}); ` +
         `/proc fallback also failed: ${errorMessage(procError)}`,
       )
     }
   }
 
-  throw new Error(`could not read POSIX process table: ps failed after ${attempts} attempts (${lastPsFailure})`)
+  throw new Error(`could not read POSIX process table: ps failed after ${attempts} ${attemptsWord} (${lastPsFailure})`)
+}
+
+/**
+ * True only for spawn errors whose cause can plausibly clear on its own
+ * (see TRANSIENT_PS_SPAWN_CODES). Nonzero exits carry no code and are never
+ * retried.
+ */
+function isTransientPsFailure(result: CommandResult): boolean {
+  const code = (result.error as { code?: string } | undefined)?.code
+  return typeof code === 'string' && TRANSIENT_PS_SPAWN_CODES.has(code)
 }
 
 function describeFailure(result: CommandResult): string {
@@ -235,7 +298,7 @@ function readTextIfPresent(filePath: string): string | null {
   try {
     return fs.readFileSync(filePath, 'utf8')
   } catch {
-    // Process vanished mid-scan (or never existed) — skip it.
+    // Process vanished mid-scan (or never existed) — the caller skips the pid.
     return null
   }
 }
@@ -259,7 +322,10 @@ function parseCmdline(content: string): string {
  * Spawn-free /proc snapshot (Linux fallback): `<pid>/stat` supplies the
  * parent pid, `<pid>/cmdline` the arguments. Produces the same
  * `ProcessRecord[]` shape as the `ps` read — including the ps parser's
- * positive-pid filtering, so the two paths stay interchangeable.
+ * positive-pid filtering, so the two paths stay interchangeable. A pid
+ * whose `stat` or `cmdline` disappears mid-scan (it exited and was reaped
+ * between reads) is skipped; a present-but-empty `cmdline` (kernel thread)
+ * yields an empty command line.
  */
 function readProcSnapshot(procRoot: string): ProcessRecord[] {
   let entries: string[]
@@ -279,7 +345,8 @@ function readProcSnapshot(procRoot: string): ProcessRecord[] {
     const parentPid = parseStatPpid(stat)
     if (parentPid === undefined) continue
     const cmdlineRaw = readTextIfPresent(path.join(procRoot, entry, 'cmdline'))
-    records.push({ pid, parentPid, commandLine: cmdlineRaw === null ? '' : parseCmdline(cmdlineRaw) })
+    if (cmdlineRaw === null) continue
+    records.push({ pid, parentPid, commandLine: parseCmdline(cmdlineRaw) })
   }
 
   records.sort((a, b) => a.pid - b.pid)
