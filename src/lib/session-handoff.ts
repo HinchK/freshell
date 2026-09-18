@@ -56,6 +56,14 @@ function sameReopenTargetIdentity(
     && a.sessionId === b.sessionId
 }
 
+function sameReopenContextIdentity(
+  a: ReopenPaneContext,
+  b: ReopenPaneContext,
+): boolean {
+  return sameReopenTargetIdentity(a.target, b.target)
+    && a.content.createRequestId === b.content.createRequestId
+}
+
 function resolveReopenContext(
   state: ReturnType<AppStore['getState']>,
   tabId: string,
@@ -215,6 +223,22 @@ async function runPaneSessionHandoffInternal(
       action,
     })
   } catch (err) {
+    const currentAfterFailure = resolveReopenContext(
+      appStore.getState(),
+      tabId,
+      paneId,
+      { allowRecovery },
+    )
+    if (!currentAfterFailure || !sameReopenContextIdentity(currentAfterFailure, latest)) {
+      log.info({
+        event: 'session_handoff_failure_ignored_pane_changed',
+        provider: latest.target.provider,
+        sessionId: latest.target.sessionId,
+        tabId,
+        paneId,
+      })
+      return false
+    }
     log.warn({
       event: 'session_handoff_request_failed',
       provider: latest.target.provider,
@@ -234,6 +258,27 @@ async function runPaneSessionHandoffInternal(
         generation: 0,
       },
     }))
+    return false
+  }
+
+  // A delayed response belongs only to the identity captured before the
+  // request. This guard covers clear-only results and typed failures too;
+  // neither may overwrite a pane that was replaced while the request was in
+  // flight.
+  const postResponse = resolveReopenContext(
+    appStore.getState(),
+    tabId,
+    paneId,
+    { allowRecovery },
+  )
+  if (!postResponse || !sameReopenContextIdentity(postResponse, latest)) {
+    log.info({
+      event: 'session_handoff_response_ignored_pane_changed',
+      provider: latest.target.provider,
+      sessionId: latest.target.sessionId,
+      tabId,
+      paneId,
+    })
     return false
   }
 
@@ -312,10 +357,10 @@ async function runPaneSessionHandoffInternal(
   // nothing undoes that — but a pane that changed identity mid-request
   // is NEVER clobbered by the fold (it moved on; the owner broadcasts
   // converge every surface).
-  const post = resolveReopenContext(appStore.getState(), tabId, paneId, { allowRecovery })
-  if (!post
-    || (expected && !sameReopenTargetIdentity(post.target, expected))
-    || !sameReopenTargetIdentity(post.target, latest.target)) {
+  if (
+    (expected && !sameReopenTargetIdentity(postResponse.target, expected))
+    || !sameReopenContextIdentity(postResponse, latest)
+  ) {
     log.info({
       event: 'session_handoff_pane_changed_mid_request',
       provider: latest.target.provider,
