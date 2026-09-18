@@ -3862,8 +3862,9 @@ impl SessionHandoffRunner {
     /// retained only AFTER the commit, so a target exiting between the
     /// two left a dead runtime advertised globally Live with the stamp
     /// inserted too late for the completed watcher to consume. TERMINAL
-    /// targets take no stamp (the terminal lane's own registry claims
-    /// own their release evidence) and publish exactly as before.
+    /// targets use the terminal registry's commit template here so the
+    /// coordinator commit and its retained release evidence are published
+    /// at the same publication boundary.
     fn commit_live_target_with_release_evidence(
         &self,
         req: &HandoffRequest,
@@ -3871,16 +3872,30 @@ impl SessionHandoffRunner {
         generation: u64,
         owner: &OwnerIdentity,
     ) -> CommitOutcome {
-        // Terminal targets: no fresh-agent stamp, no lane-stamps
-        // critical section — the plain commit (the registry's retained
-        // claims + the PTY exit hook own the release).
-        if owner.kind != RuntimeOwnerKind::FreshAgent {
-            return self.ownership.commit_live(
-                &req.provider,
-                &req.session_id,
+        // Terminal targets publish through the terminal registry's commit
+        // template. The under-ticket spawn deliberately skips its own
+        // coordinator commit, so this is the publication boundary that must
+        // retain the PTY's fenced release evidence for its exit/kill path.
+        if owner.kind == RuntimeOwnerKind::Terminal {
+            let Some(terminal_id) = owner.terminal_id.as_deref() else {
+                tracing::error!(target: "invariant",
+                    provider = %req.provider,
+                    session_id = %req.session_id,
+                    operation_id = %operation_id,
+                    event = "ownership.handoff.terminal_publication_missing_id",
+                    "terminal handoff target has no terminal id at publication"
+                );
+                return CommitOutcome::ForeignOperation;
+            };
+            let locator = freshell_protocol::SessionLocator {
+                provider: req.provider.clone(),
+                session_id: req.session_id.clone(),
+            };
+            return self.registry.commit_session_ref_ownership(
+                &locator,
                 operation_id,
                 generation,
-                owner.clone(),
+                terminal_id,
             );
         }
         let stamps = match req.provider.as_str() {

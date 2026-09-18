@@ -3247,6 +3247,28 @@ async fn fresh_agent_to_terminal_handoff_is_atomic_and_broadcast() {
         snap.state
     );
 
+    // The terminal target is published at the handoff commit boundary.  That
+    // commit must also retain the registry's release evidence so the PTY exit
+    // path can release the same fenced owner; a plain coordinator commit
+    // leaves Live{Terminal} stranded after the target exits.
+    let locator = freshell_protocol::SessionLocator {
+        provider: "claude".to_string(),
+        session_id: sid.clone(),
+    };
+    let retained = h
+        .ws_state
+        .registry
+        .retained_ownership_claim_by_locator(&locator)
+        .expect("terminal handoff commit retains release evidence");
+    assert_eq!(retained.terminal_id, terminal_id);
+    assert_eq!(
+        retained.operation_id,
+        body["operationId"]
+            .as_str()
+            .expect("handoff response operation id")
+    );
+    assert_eq!(retained.generation, snap.generation);
+
     // Both broadcast transitions arrived on the WS.
     let _started = await_frame(&mut h.ws, Duration::from_secs(10), |v| {
         v.get("type").and_then(|t| t.as_str()) == Some("session.runtimeOwner")
@@ -3291,6 +3313,34 @@ async fn fresh_agent_to_terminal_handoff_is_atomic_and_broadcast() {
         refused.get("ownerKind").and_then(|k| k.as_str()),
         Some("terminal"),
         "the refusal names the terminal owner: {refused}"
+    );
+
+    // The actual terminal publication boundary owns the release path too:
+    // killing this PTY must release the handoff's Live record and consume the
+    // retained claim.
+    h.ws_state.registry.kill(&terminal_id);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = h
+            .ws_state
+            .fresh_claude
+            .ownership_snapshot("claude", &sid)
+            .state;
+        if matches!(state, freshell_ownership::OwnershipState::Vacant) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "terminal exit did not release the handoff owner: {state:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        h.ws_state
+            .registry
+            .retained_ownership_claim_by_locator(&locator)
+            .is_none(),
+        "terminal exit consumes the retained release evidence"
     );
     let _ = sidecar;
 }
