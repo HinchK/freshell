@@ -11,7 +11,7 @@ vi.mock('@/lib/api', async (importOriginal) => {
   }
 })
 
-import { runPaneSessionHandoff } from '@/lib/session-handoff'
+import { runPaneSessionHandoff, runPaneSessionRecovery } from '@/lib/session-handoff'
 import panesReducer, { initLayout } from '@/store/panesSlice'
 import freshAgentReducer, { applyRuntimeOwner } from '@/store/freshAgentSlice'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
@@ -32,7 +32,10 @@ function buildStore(): RootState['panes'] extends never ? never : ReturnType<typ
   })
 }
 
-function seedRekeyedPane(store: ReturnType<typeof buildStore>) {
+function seedRekeyedPane(
+  store: ReturnType<typeof buildStore>,
+  status: 'idle' | 'creating' | 'starting' = 'idle',
+) {
   store.dispatch(addTab({ id: 'tab-1' }))
   store.dispatch(initLayout({
     tabId: 'tab-1',
@@ -43,7 +46,7 @@ function seedRekeyedPane(store: ReturnType<typeof buildStore>) {
       provider: 'claude',
       createRequestId: 'req-handoff',
       sessionRef: { provider: 'claude', sessionId: OLD_SESSION_ID },
-      status: 'idle',
+      status,
     },
   }))
   // The rekey mirror pair: the OLD key's record carries the canonical
@@ -141,6 +144,45 @@ describe('b8ke ext F1: the direct handoff navigates the rekey alias chain', () =
   })
 })
 
+describe('clear-only recovery remains callable while a pane is starting', () => {
+  beforeEach(() => {
+    requestSessionHandoffMock.mockReset()
+  })
+
+  it('sends exactly the clear action and leaves pane identity unchanged', async () => {
+    const store = buildStore()
+    seedRekeyedPane(store, 'starting')
+    requestSessionHandoffMock.mockResolvedValue({
+      ok: true,
+      cleared: 'platform-limited-fence',
+      operationId: 'clear-starting',
+      generation: 5,
+      shutdownConfirmed: false,
+    })
+
+    await runPaneSessionRecovery(store, {
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      action: 'clear-stale-bookkeeping',
+    })
+
+    expect(requestSessionHandoffMock).toHaveBeenCalledTimes(1)
+    expect(requestSessionHandoffMock).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'clear-stale-bookkeeping',
+      sessionId: NEW_SESSION_ID,
+    }))
+    const leaf = store.getState().panes.layouts['tab-1'] as Extract<
+      import('@/store/paneTypes').PaneNode,
+      { type: 'leaf' }
+    >
+    expect(leaf.content).toMatchObject({
+      kind: 'fresh-agent',
+      status: 'starting',
+      sessionRef: { provider: 'claude', sessionId: OLD_SESSION_ID },
+    })
+  })
+})
+
 describe('b8ke ext r12 F1: the acknowledged force-clear STOPS at the clear', () => {
   beforeEach(() => {
     requestSessionHandoffMock.mockReset()
@@ -166,10 +208,10 @@ describe('b8ke ext r12 F1: the acknowledged force-clear STOPS at the clear', () 
         owner: { kind: 'terminal', terminalId: 't-auto', mode: 'claude' },
       })
 
-    const result = await runPaneSessionHandoff(store, {
+    const result = await runPaneSessionRecovery(store, {
       tabId: 'tab-1',
       paneId: 'pane-1',
-      acknowledgePlatformLimitedRisk: true,
+      action: 'clear-stale-bookkeeping',
     })
     expect(result).toBe(false)
 
@@ -178,7 +220,7 @@ describe('b8ke ext r12 F1: the acknowledged force-clear STOPS at the clear', () 
     // clear, starting a writer over the acknowledged-risk tree.
     expect(requestSessionHandoffMock).toHaveBeenCalledTimes(1)
     expect(requestSessionHandoffMock).toHaveBeenCalledWith(expect.objectContaining({
-      acknowledgePlatformLimitedRisk: true,
+      action: 'clear-stale-bookkeeping',
     }))
 
     // The cleared state is SURFACED (the banner's explicit user action

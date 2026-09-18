@@ -60,6 +60,7 @@ function resolveReopenContext(
   state: ReturnType<AppStore['getState']>,
   tabId: string,
   paneId: string,
+  options: { allowRecovery?: boolean } = {},
 ): ReopenPaneContext | null {
   const tab = state.tabs.tabs.find((item) => item.id === tabId)
   const layout = state.panes.layouts[tabId]
@@ -99,16 +100,23 @@ function resolveReopenContext(
     paneId,
     content,
     tab,
-    activity: {
-      isBusy: activity.isBusy,
-      ...(hasWaitingItems ? { hasWaitingItems } : {}),
-    },
+    activity: options.allowRecovery
+      ? { isBusy: false }
+      : {
+        isBusy: activity.isBusy,
+        ...(hasWaitingItems ? { hasWaitingItems } : {}),
+      },
   })
   if (!target) return null
   return {
     tab,
     content,
-    target,
+    // Recovery is a bookkeeping action. It still requires a canonical
+    // identity, but it must remain callable while the pane is creating,
+    // starting, busy, or waiting so the server can return the typed refusal.
+    target: options.allowRecovery
+      ? { ...target, disabled: false, disabledReason: undefined }
+      : target,
     providerSettings: state.settings.settings.freshAgent?.providers?.[target.targetSessionType],
     freshAgentSessions: state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS,
   }
@@ -126,15 +134,21 @@ function resolveReopenContext(
  * `expected` (the clicked menu target) guards against the pane changing
  * identity mid-flight — the same guard the pre-b8ke flow had.
  */
-export async function runPaneSessionHandoff(
+async function runPaneSessionHandoffInternal(
   appStore: AppStore,
-  options: { tabId: string; paneId: string; expected?: ReopenPaneSessionTarget; acknowledgePlatformLimitedRisk?: boolean },
+  options: {
+    tabId: string
+    paneId: string
+    expected?: ReopenPaneSessionTarget
+    action?: 'switch' | 'clear-stale-bookkeeping' | 'stop-and-reopen'
+  },
+  allowRecovery = false,
 ): Promise<boolean> {
   const { tabId, paneId, expected } = options
-  const acknowledgePlatformLimitedRisk = options.acknowledgePlatformLimitedRisk === true
+  const action = options.action ?? 'switch'
 
-  const current = resolveReopenContext(appStore.getState(), tabId, paneId)
-  if (!current || current.target.disabled) return false
+  const current = resolveReopenContext(appStore.getState(), tabId, paneId, { allowRecovery })
+  if (!current || (!allowRecovery && current.target.disabled)) return false
   if (expected && !sameReopenTargetIdentity(current.target, expected)) return false
 
   // b8ke delta round-3 F3: the durable metadata write belongs to the
@@ -147,8 +161,8 @@ export async function runPaneSessionHandoff(
   // its live owner was still the Fresh Agent, or vice versa. On failure
   // the durable flavor now still identifies the live owner by
   // construction (nothing was written).
-  const latest = resolveReopenContext(appStore.getState(), tabId, paneId)
-  if (!latest || latest.target.disabled) return false
+  const latest = resolveReopenContext(appStore.getState(), tabId, paneId, { allowRecovery })
+  if (!latest || (!allowRecovery && latest.target.disabled)) return false
   if (expected && !sameReopenTargetIdentity(latest.target, expected)) return false
 
   // b8ke ext F1: the pane's CANONICAL key — the stored rekey alias chain
@@ -198,7 +212,7 @@ export async function runPaneSessionHandoff(
         ? { observedEpoch: ownerRecord.epoch, observedGeneration: ownerRecord.generation }
         : {}),
       deviceId: appStore.getState().tabRegistry?.deviceId,
-      ...(acknowledgePlatformLimitedRisk ? { acknowledgePlatformLimitedRisk: true } : {}),
+      action,
     })
   } catch (err) {
     log.warn({
@@ -246,14 +260,9 @@ export async function runPaneSessionHandoff(
       // b8ke ext r28 F2: the reason-typed cleared label rides the log.
       cleared: handoff.cleared,
     })
-    // b8ke ext r28 F2: the cleared banner's message names the ACTUAL
-    // fenced reason (pre-r28 it was hard-coded platform-limited — a
-    // stale-start/stale-stop clear surfaced a wrong-reason message).
-    const clearedMessage = handoff.cleared === 'stale-start-fence'
-      ? 'The stale-start fence was force-cleared (the unconfirmed runtime\'s surviving processes are the acknowledged risk). No reopen has run — start it again when ready.'
-      : handoff.cleared === 'stale-stop-fence'
-        ? 'The stale-stop fence was force-cleared (the unconfirmed runtime\'s surviving processes are the acknowledged risk). No reopen has run — start it again when ready.'
-        : 'The platform-limited fence was cleared (unverified descendant processes are the acknowledged risk). No reopen has run — start it again when ready.'
+    const clearedMessage = handoff.shutdownConfirmed
+      ? 'Stale bookkeeping cleared and writer shutdown confirmed. Stop and reopen when ready.'
+      : 'Stale bookkeeping cleared. Writer shutdown is unconfirmed; starting a replacement remains blocked.'
     appStore.dispatch(setPaneHandoffError({
       tabId,
       paneId,
@@ -262,6 +271,22 @@ export async function runPaneSessionHandoff(
         message: clearedMessage,
         retryable: true,
         generation: handoff.generation,
+      },
+    }))
+    return false
+  }
+
+  // The clear-only contract is immutable at both boundaries: a malformed or
+  // incompatible server response must never be folded as a new owner.
+  if (action === 'clear-stale-bookkeeping' && handoff.ok && 'owner' in handoff) {
+    appStore.dispatch(setPaneHandoffError({
+      tabId,
+      paneId,
+      error: {
+        code: 'HANDOFF_REQUEST_FAILED',
+        message: 'The server returned an invalid clear-only response. No reopen was started.',
+        retryable: true,
+        generation: 0,
       },
     }))
     return false
@@ -287,7 +312,7 @@ export async function runPaneSessionHandoff(
   // nothing undoes that — but a pane that changed identity mid-request
   // is NEVER clobbered by the fold (it moved on; the owner broadcasts
   // converge every surface).
-  const post = resolveReopenContext(appStore.getState(), tabId, paneId)
+  const post = resolveReopenContext(appStore.getState(), tabId, paneId, { allowRecovery })
   if (!post
     || (expected && !sameReopenTargetIdentity(post.target, expected))
     || !sameReopenTargetIdentity(post.target, latest.target)) {
@@ -350,4 +375,29 @@ export async function runPaneSessionHandoff(
   // metadata POSTs out of order and an earlier generation's flavor
   // overwrote the later owner; failure was log-only success).
   return true
+}
+
+/** Run the ordinary mode switch. Busy/starting/waiting gates remain in force. */
+export async function runPaneSessionHandoff(
+  appStore: AppStore,
+  options: {
+    tabId: string
+    paneId: string
+    expected?: ReopenPaneSessionTarget
+    action?: 'switch' | 'stop-and-reopen'
+  },
+): Promise<boolean> {
+  return runPaneSessionHandoffInternal(appStore, options)
+}
+
+/**
+ * Repair stale ownership bookkeeping without stopping or starting anything.
+ * Recovery deliberately resolves identity independently of activity so the
+ * user can get a typed server result from a starting or busy pane.
+ */
+export async function runPaneSessionRecovery(
+  appStore: AppStore,
+  options: { tabId: string; paneId: string; action: 'clear-stale-bookkeeping' },
+): Promise<boolean> {
+  return runPaneSessionHandoffInternal(appStore, options, true)
 }

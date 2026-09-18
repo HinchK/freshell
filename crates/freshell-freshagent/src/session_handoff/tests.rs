@@ -27,8 +27,8 @@ use freshell_protocol::{
 };
 
 use super::{
-    kill_and_confirm_terminal_pid, AbortPayload, HandoffHandle, HandoffRequest, HandoffTestHooks,
-    SessionHandoffRunner, UncommittedTargetOutcome,
+    kill_and_confirm_terminal_pid, AbortPayload, HandoffAction, HandoffHandle, HandoffRequest,
+    HandoffTestHooks, SessionHandoffRunner, UncommittedTargetOutcome,
 };
 
 /// Serializes the tests in this file: they mutate process-global env vars
@@ -641,6 +641,7 @@ fn build_rig_inner(
 
 fn handoff_req_terminal(provider: &str, sid: &str, mode: &str) -> HandoffRequest {
     HandoffRequest {
+        action: HandoffAction::Switch,
         provider: provider.to_string(),
         session_id: sid.to_string(),
         target_kind: RuntimeOwnerKind::Terminal,
@@ -652,12 +653,12 @@ fn handoff_req_terminal(provider: &str, sid: &str, mode: &str) -> HandoffRequest
         observed_epoch: None,
         observed_generation: None,
         device_id: Some("test-device-a".to_string()),
-        acknowledge_platform_limited_risk: false,
     }
 }
 
 fn handoff_req_fresh(provider: &str, sid: &str, session_type: &str) -> HandoffRequest {
     HandoffRequest {
+        action: HandoffAction::Switch,
         provider: provider.to_string(),
         session_id: sid.to_string(),
         target_kind: RuntimeOwnerKind::FreshAgent,
@@ -669,8 +670,35 @@ fn handoff_req_fresh(provider: &str, sid: &str, session_type: &str) -> HandoffRe
         observed_epoch: None,
         observed_generation: None,
         device_id: Some("test-device-a".to_string()),
-        acknowledge_platform_limited_risk: false,
     }
+}
+
+#[test]
+fn handoff_action_contract_defaults_legacy_ack_only_to_clear() {
+    assert_eq!(
+        super::parse_handoff_action(&json!({})),
+        Ok(HandoffAction::Switch)
+    );
+    assert_eq!(
+        super::parse_handoff_action(&json!({
+            "acknowledgePlatformLimitedRisk": true
+        })),
+        Ok(HandoffAction::ClearStaleBookkeeping)
+    );
+    assert_eq!(
+        super::parse_handoff_action(&json!({ "action": "stop-and-reopen" })),
+        Ok(HandoffAction::StopAndReopen)
+    );
+    assert!(super::parse_handoff_action(&json!({
+        "action": "switch",
+        "acknowledgePlatformLimitedRisk": true,
+    }))
+    .is_err());
+    assert!(super::parse_handoff_action(&json!({
+        "action": "clear-stale-bookkeeping",
+        "acknowledgePlatformLimitedRisk": false,
+    }))
+    .is_err());
 }
 
 fn create_msg(sid: &str) -> FreshAgentCreate {
@@ -1969,7 +1997,7 @@ async fn a_stale_stop_fence_recovers_through_the_handoff_runner() {
     let _ = drain_runtime_owner_frames(&mut rig.rx);
     let snap = rig.ownership.observe("claude", &sid);
     let mut clear_req = handoff_req_terminal("claude", &sid, "claude");
-    clear_req.acknowledge_platform_limited_risk = true;
+    clear_req.action = HandoffAction::ClearStaleBookkeeping;
     clear_req.observed_epoch = Some(snap.epoch);
     clear_req.observed_generation = Some(snap.generation);
     let clear = rig.runner.spawn_handoff(clear_req);
@@ -2058,7 +2086,7 @@ async fn a_stale_stop_fence_recovers_through_the_handoff_runner() {
     let _ = drain_runtime_owner_frames(&mut rig.rx);
     let snap = rig.ownership.observe("claude", &sid);
     let mut start_req = handoff_req_terminal("claude", &sid, "claude");
-    start_req.acknowledge_platform_limited_risk = true;
+    start_req.action = HandoffAction::StopAndReopen;
     start_req.observed_epoch = Some(snap.epoch);
     start_req.observed_generation = Some(snap.generation);
     let start = rig.runner.spawn_handoff(start_req);
@@ -3697,7 +3725,7 @@ async fn a_stale_start_fence_recovers_through_the_acknowledged_force_clear() {
     let _ = drain_runtime_owner_frames(&mut rig.rx);
     let snap = rig.ownership.observe("claude", &sid);
     let mut clear_req = handoff_req_terminal("claude", &sid, "claude");
-    clear_req.acknowledge_platform_limited_risk = true;
+    clear_req.action = HandoffAction::ClearStaleBookkeeping;
     clear_req.observed_epoch = Some(snap.epoch);
     clear_req.observed_generation = Some(snap.generation);
     let clear = rig.runner.spawn_handoff(clear_req);
@@ -3788,7 +3816,7 @@ async fn a_stale_start_fence_recovers_through_the_acknowledged_force_clear() {
     let _ = drain_runtime_owner_frames(&mut rig.rx);
     let snap = rig.ownership.observe("claude", &sid);
     let mut start_req = handoff_req_terminal("claude", &sid, "claude");
-    start_req.acknowledge_platform_limited_risk = true;
+    start_req.action = HandoffAction::StopAndReopen;
     start_req.observed_epoch = Some(snap.epoch);
     start_req.observed_generation = Some(snap.generation);
     let start = rig.runner.spawn_handoff(start_req);
@@ -3892,7 +3920,7 @@ async fn a_platform_limited_fence_recovers_only_through_the_acknowledged_force_c
     // device converges.
     let _ = drain_runtime_owner_frames(&mut rig.rx);
     let mut clear_req = handoff_req_terminal("claude", &sid, "claude");
-    clear_req.acknowledge_platform_limited_risk = true;
+    clear_req.action = HandoffAction::ClearStaleBookkeeping;
     clear_req.observed_epoch = Some(snap.epoch);
     clear_req.observed_generation = Some(snap.generation);
     let clear = rig.runner.spawn_handoff(clear_req);
@@ -4006,7 +4034,7 @@ async fn the_cleared_unverified_state_requires_the_acknowledged_start() {
     assert_eq!(result["error"]["code"], json!("PLATFORM_LIMITED"));
     let snap = rig.ownership.observe("claude", &sid);
     let mut clear_req = handoff_req_terminal("claude", &sid, "claude");
-    clear_req.acknowledge_platform_limited_risk = true;
+    clear_req.action = HandoffAction::ClearStaleBookkeeping;
     clear_req.observed_epoch = Some(snap.epoch);
     clear_req.observed_generation = Some(snap.generation);
     let clear = rig.runner.spawn_handoff(clear_req);
@@ -4054,7 +4082,7 @@ async fn the_cleared_unverified_state_requires_the_acknowledged_start() {
     // `the_acknowledged_start_reaps_the_live_prior_before_the_new_writer`.
     let clear_snap = rig.ownership.observe("claude", &sid);
     let mut ack_req = handoff_req_terminal("claude", &sid, "claude");
-    ack_req.acknowledge_platform_limited_risk = true;
+    ack_req.action = HandoffAction::StopAndReopen;
     ack_req.observed_epoch = Some(clear_snap.epoch);
     ack_req.observed_generation = Some(clear_snap.generation);
     let retry = rig.runner.spawn_handoff(ack_req);
@@ -4167,7 +4195,7 @@ async fn the_acknowledged_start_reaps_the_live_prior_before_the_new_writer() {
     // reap target — the forced kill + confirm, THEN the target.
     let ack_snap = rig.ownership.observe("claude", &sid);
     let mut ack_req = handoff_req_terminal("claude", &sid, "claude");
-    ack_req.acknowledge_platform_limited_risk = true;
+    ack_req.action = HandoffAction::StopAndReopen;
     ack_req.observed_epoch = Some(ack_snap.epoch);
     ack_req.observed_generation = Some(ack_snap.generation);
     let handle = rig.runner.spawn_handoff(ack_req);
@@ -4267,7 +4295,7 @@ async fn the_acknowledged_start_over_an_already_dead_prior_proceeds() {
     // THE ACKNOWLEDGED START proceeds — no permanent wedge.
     let ack_snap = rig.ownership.observe("claude", &sid);
     let mut ack_req = handoff_req_terminal("claude", &sid, "claude");
-    ack_req.acknowledge_platform_limited_risk = true;
+    ack_req.action = HandoffAction::StopAndReopen;
     ack_req.observed_epoch = Some(ack_snap.epoch);
     ack_req.observed_generation = Some(ack_snap.generation);
     let handle = rig.runner.spawn_handoff(ack_req);
@@ -6610,7 +6638,7 @@ async fn an_aborted_from_vacant_platform_limited_target_fences_typed_and_recover
     // typed PlatformLimited fence (pre-fix: force_release_platform_
     // limited matched nothing — SESSION_FENCED, blocked until restart).
     let mut clear = handoff_req_fresh("claude", &sid, "freshclaude");
-    clear.acknowledge_platform_limited_risk = true;
+    clear.action = HandoffAction::ClearStaleBookkeeping;
     clear.observed_epoch = Some(snap.epoch);
     clear.observed_generation = Some(snap.generation);
     let clear_handle = rig.runner.spawn_handoff(clear);

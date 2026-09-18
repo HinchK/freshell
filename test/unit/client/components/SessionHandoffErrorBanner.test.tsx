@@ -5,8 +5,10 @@ import { FencedOwnerRecoveryActions, SessionHandoffErrorBanner } from '@/compone
 import type { HandoffError } from '@/store/paneTypes'
 
 const runPaneSessionHandoffMock = vi.hoisted(() => vi.fn())
+const runPaneSessionRecoveryMock = vi.hoisted(() => vi.fn())
 vi.mock('@/lib/session-handoff', () => ({
   runPaneSessionHandoff: runPaneSessionHandoffMock,
+  runPaneSessionRecovery: runPaneSessionRecoveryMock,
   SESSION_HANDOFF_RETRY_BACKOFF_MS: 0,
 }))
 
@@ -26,6 +28,8 @@ describe('SessionHandoffErrorBanner (kata b8ke R4-4 force-clear action)', () => 
   beforeEach(() => {
     runPaneSessionHandoffMock.mockReset()
     runPaneSessionHandoffMock.mockResolvedValue(false)
+    runPaneSessionRecoveryMock.mockReset()
+    runPaneSessionRecoveryMock.mockResolvedValue(false)
   })
 
   afterEach(() => {
@@ -47,17 +51,17 @@ describe('SessionHandoffErrorBanner (kata b8ke R4-4 force-clear action)', () => 
     // explicit "Start reopen again" action (the pre-r19 name promised
     // "and reopen", misleading screen-reader users).
     const button = screen.getByRole('button', {
-      name: 'Force clear the platform-limited fence, acknowledging unverified descendant processes may remain — the reopen is a separate explicit action',
+      name: 'Force clear stale session bookkeeping — this does not stop or reopen the session',
     })
     expect(button).toBeDefined()
     await user.click(button)
     await waitFor(() => {
-      expect(runPaneSessionHandoffMock).toHaveBeenCalledWith(
+      expect(runPaneSessionRecoveryMock).toHaveBeenCalledWith(
         store,
         expect.objectContaining({
           tabId: 'tab-1',
           paneId: 'pane-1',
-          acknowledgePlatformLimitedRisk: true,
+          action: 'clear-stale-bookkeeping',
         }),
       )
     })
@@ -99,16 +103,16 @@ describe('SessionHandoffErrorBanner (kata b8ke R4-4 force-clear action)', () => 
       expect(button, code).toBeDefined()
       await user.click(button)
       await waitFor(() => {
-        expect(runPaneSessionHandoffMock).toHaveBeenCalledWith(
+        expect(runPaneSessionRecoveryMock).toHaveBeenCalledWith(
           store,
           expect.objectContaining({
             tabId: 'tab-1',
             paneId: 'pane-1',
-            acknowledgePlatformLimitedRisk: true,
+            action: 'clear-stale-bookkeeping',
           }),
         )
       })
-      runPaneSessionHandoffMock.mockClear()
+      runPaneSessionRecoveryMock.mockClear()
       unmount()
     }
   })
@@ -137,7 +141,7 @@ describe('SessionHandoffErrorBanner (kata b8ke R4-4 force-clear action)', () => 
         expect.objectContaining({
           tabId: 'tab-1',
           paneId: 'pane-1',
-          acknowledgePlatformLimitedRisk: true,
+          action: 'stop-and-reopen',
         }),
       )
     })
@@ -202,7 +206,7 @@ describe('b8ke ext r12 F1: the cleared state presents the explicit re-initiation
         expect.objectContaining({
           tabId: 'tab-1',
           paneId: 'pane-1',
-          acknowledgePlatformLimitedRisk: true,
+          action: 'stop-and-reopen',
         }),
       )
     })
@@ -239,6 +243,8 @@ describe('b8ke ext r28 F2: FencedOwnerRecoveryActions (the fenced-owner card rec
   beforeEach(() => {
     runPaneSessionHandoffMock.mockReset()
     runPaneSessionHandoffMock.mockResolvedValue(false)
+    runPaneSessionRecoveryMock.mockReset()
+    runPaneSessionRecoveryMock.mockResolvedValue(false)
   })
 
   afterEach(() => {
@@ -269,16 +275,16 @@ describe('b8ke ext r28 F2: FencedOwnerRecoveryActions (the fenced-owner card rec
       expect(button, fencedReason).toBeDefined()
       await user.click(button)
       await waitFor(() => {
-        expect(runPaneSessionHandoffMock).toHaveBeenCalledWith(
+        expect(runPaneSessionRecoveryMock).toHaveBeenCalledWith(
           store,
           expect.objectContaining({
             tabId: 'tab-1',
             paneId: 'pane-1',
-            acknowledgePlatformLimitedRisk: true,
+            action: 'clear-stale-bookkeeping',
           }),
         )
       })
-      runPaneSessionHandoffMock.mockClear()
+      runPaneSessionRecoveryMock.mockClear()
       unmount()
     }
   })
@@ -302,7 +308,7 @@ describe('b8ke ext r28 F2: FencedOwnerRecoveryActions (the fenced-owner card rec
         expect.objectContaining({
           tabId: 'tab-1',
           paneId: 'pane-1',
-          acknowledgePlatformLimitedRisk: true,
+            action: 'stop-and-reopen',
         }),
       )
     })

@@ -724,12 +724,16 @@ export const SessionHandoffResultSchema = z.union([
     cleared: z.enum(['platform-limited-fence', 'stale-start-fence', 'stale-stop-fence']),
     operationId: z.string(),
     generation: z.number().int().nonnegative(),
+    // Older servers omitted this field. Absence is deliberately treated as
+    // unconfirmed so the client never infers process death from compatibility.
+    shutdownConfirmed: z.boolean().default(false),
   }),
   SessionHandoffFailureSchema,
 ])
 export type SessionHandoffResult = z.infer<typeof SessionHandoffResultSchema>
 
 export type SessionHandoffRequestBody = {
+  action?: 'switch' | 'clear-stale-bookkeeping' | 'stop-and-reopen'
   provider: string
   sessionId: string
   targetKind: 'terminal' | 'fresh-agent'
@@ -744,11 +748,8 @@ export type SessionHandoffRequestBody = {
   observedEpoch?: number
   observedGeneration?: number
   deviceId?: string
-  /** b8ke focused round-4 R4-4: the EXPLICIT operator acknowledgment
-   *  licensing the PlatformLimited force-clear (an ordinary retry never
-   *  clears the fence). With this flag, a Fenced{PlatformLimited} key
-   *  force-clears and the request answers the TYPED CLEAR — no handoff
-   *  starts; the caller retries the handoff explicitly afterwards. */
+  /** Deprecated compatibility alias. The server accepts it only when no
+   *  explicit action is supplied, mapping `true` to clear-only. */
   acknowledgePlatformLimitedRisk?: boolean
 }
 

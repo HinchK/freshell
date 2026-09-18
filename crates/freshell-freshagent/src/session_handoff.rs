@@ -142,8 +142,31 @@ impl HandoffTestHooks {
     }
 }
 
+/// The lifecycle operation requested by `POST /api/sessions/handoff`.
+///
+/// `ClearStaleBookkeeping` is deliberately a separate operation. It may
+/// release only an already fenced record and never enters the handoff
+/// lifecycle, so a delayed clear cannot turn into a stop or a new writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandoffAction {
+    Switch,
+    ClearStaleBookkeeping,
+    StopAndReopen,
+}
+
+impl HandoffAction {
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            Self::Switch => "switch",
+            Self::ClearStaleBookkeeping => "clear-stale-bookkeeping",
+            Self::StopAndReopen => "stop-and-reopen",
+        }
+    }
+}
+
 /// The handoff request (the `POST /api/sessions/handoff` body, parsed).
 pub struct HandoffRequest {
+    pub action: HandoffAction,
     pub provider: String,
     pub session_id: String,
     pub target_kind: RuntimeOwnerKind,
@@ -159,16 +182,6 @@ pub struct HandoffRequest {
     pub observed_epoch: Option<u64>,
     pub observed_generation: Option<u64>,
     pub device_id: Option<String>,
-    /// b8ke focused round-4 review R4-4: the EXPLICIT operator
-    /// acknowledgment that licenses the PlatformLimited force-clear. An
-    /// ordinary retry NEVER clears the fence (the prior's descendant tree
-    /// is unverified on this platform — starting a new writer over it is
-    /// the operator's acknowledged risk, never an implicit one). When set
-    /// against a `Fenced{PlatformLimited}` key the request force-clears
-    /// the fence (recording the limitation prominently) and answers the
-    /// TYPED CLEAR — it does NOT start a handoff; the caller retries the
-    /// handoff explicitly afterwards as a fresh no-prior sequence.
-    pub acknowledge_platform_limited_risk: bool,
 }
 
 /// The lanes' `kill_for_handoff` answer. The reap TIMEOUT itself is the
@@ -422,6 +435,126 @@ impl SessionHandoffRunner {
         }
     }
 
+    /// Clear only stale ownership bookkeeping. This path intentionally does
+    /// not call `begin_handoff`, stop a runtime, start a target, or change a
+    /// durable flavor. A clear request can therefore never become a reopen
+    /// because a delayed response or a concurrent lifecycle operation changed
+    /// the record while it was in flight.
+    async fn clear_stale_bookkeeping(
+        &self,
+        req: &HandoffRequest,
+        operation_id: &str,
+        initiator: &str,
+    ) -> Value {
+        let snapshot = self.ownership.observe(&req.provider, &req.session_id);
+        let generation = snapshot.generation;
+        let observed = match (req.observed_epoch, req.observed_generation) {
+            (Some(epoch), Some(generation)) => Some(ObservedFence { epoch, generation }),
+            _ => None,
+        };
+
+        match snapshot.state {
+            freshell_ownership::OwnershipState::Fenced {
+                reason:
+                    reason @ (freshell_ownership::FenceReason::PlatformLimited
+                    | freshell_ownership::FenceReason::StaleStart
+                    | freshell_ownership::FenceReason::StaleStop),
+                prior,
+                ..
+            } => {
+                let Some(observed) = observed else {
+                    return typed_failure(
+                        "INVALID_FENCE",
+                        "clear-stale-bookkeeping requires the current observed (epoch, generation) fence pair",
+                        false,
+                        generation,
+                    );
+                };
+                match self.ownership.force_release_platform_limited(
+                    &req.provider,
+                    &req.session_id,
+                    observed,
+                    initiator,
+                ) {
+                    freshell_ownership::ForceReleaseOutcome::Released => {
+                        let cleared = match reason {
+                            freshell_ownership::FenceReason::PlatformLimited => {
+                                "platform-limited-fence"
+                            }
+                            freshell_ownership::FenceReason::StaleStart => "stale-start-fence",
+                            freshell_ownership::FenceReason::StaleStop => "stale-stop-fence",
+                            _ => unreachable!("matched only force-clearable fences"),
+                        };
+                        tracing::warn!(target: "freshell_ownership",
+                            event = "ownership.handoff.clear_stale_bookkeeping",
+                            operation_id = %operation_id,
+                            provider = %req.provider,
+                            session_id = %req.session_id,
+                            epoch = observed.epoch,
+                            generation = observed.generation,
+                            fence_reason = ?reason,
+                            action = HandoffAction::ClearStaleBookkeeping.wire_name(),
+                            outcome = "cleared_unverified",
+                            shutdown_confirmed = false,
+                            "clear-only released stale bookkeeping while retaining the unverified prior in ClearedUnverified; no runtime was stopped or started");
+                        self.broadcast_owner(
+                            req,
+                            "handoff-failed",
+                            prior.as_ref().map(|(owner, _)| owner.kind),
+                            prior
+                                .as_ref()
+                                .and_then(|(owner, _)| owner.terminal_id.clone()),
+                            operation_id,
+                            observed.generation,
+                            prior.as_ref().map(|(owner, _)| owner.kind),
+                            Some(freshell_ownership::FenceReason::ClearedUnverified.wire_str()),
+                            Some(true),
+                        );
+                        json!({
+                            "ok": true,
+                            "cleared": cleared,
+                            "operationId": operation_id,
+                            "generation": observed.generation,
+                            "shutdownConfirmed": false,
+                        })
+                    }
+                    freshell_ownership::ForceReleaseOutcome::NotPlatformLimited { .. } => {
+                        typed_failure(
+                            "SESSION_FENCED",
+                            "clear-stale-bookkeeping was refused because the recovery state moved on; retry with a fresh observation",
+                            true,
+                            self.ownership.observe(&req.provider, &req.session_id).generation,
+                        )
+                    }
+                    freshell_ownership::ForceReleaseOutcome::StaleObservation {
+                        current_generation,
+                        ..
+                    } => typed_failure(
+                        "STALE_GENERATION",
+                        "observed ownership fence is stale; refresh and retry",
+                        true,
+                        current_generation,
+                    ),
+                }
+            }
+            freshell_ownership::OwnershipState::Vacant => typed_failure(
+                "SESSION_NOT_FOUND",
+                "There is no stale bookkeeping to clear. No reopen was started.",
+                false,
+                generation,
+            ),
+            // A clear-only request never treats a live or in-progress state
+            // as proof that its writer is dead. It is a typed refusal and
+            // leaves the ownership record untouched.
+            _ => typed_failure(
+                "SESSION_FENCED",
+                "clear-stale-bookkeeping requires a fenced stale record; no writer was stopped or started",
+                true,
+                generation,
+            ),
+        }
+    }
+
     /// The atomic sequence. See the module doc; every failure branch is a
     /// typed, retryable JSON body and leaves the coordinator in a coherent
     /// state (restored prior, or Vacant — never a stranded Handoff).
@@ -499,6 +632,14 @@ impl SessionHandoffRunner {
         }
         let operation_id = format!("handoff-{}", uuid::Uuid::new_v4());
         let initiator = req.device_id.clone().unwrap_or_else(|| "rest".into());
+        if req.action == HandoffAction::ClearStaleBookkeeping {
+            // Clear-only is dispatched before `begin_handoff`: it cannot
+            // claim a lifecycle lease, signal a process, start a target, or
+            // reinterpret a race as permission to reopen.
+            return self
+                .clear_stale_bookkeeping(&req, &operation_id, &initiator)
+                .await;
+        }
         let began = std::time::Instant::now();
         // 1. Atomically enter Handoff (+generation). The fence pair is
         // (epoch, generation) — a pre-restart pair is always stale; a half
@@ -571,7 +712,7 @@ impl SessionHandoffRunner {
                     .ownership
                     .observe(&req.provider, &req.session_id)
                     .generation;
-                if !req.acknowledge_platform_limited_risk {
+                if req.action != HandoffAction::StopAndReopen {
                     tracing::warn!(target: "freshell_ownership",
                         event = "ownership.handoff.cleared_unverified_refused",
                         operation_id = %operation_id, provider = %req.provider,
@@ -731,7 +872,7 @@ impl SessionHandoffRunner {
                     freshell_ownership::FenceReason::StaleStop => "STALE_STOP_FENCED",
                     _ => "STALE_START_FENCED",
                 };
-                if !req.acknowledge_platform_limited_risk {
+                if req.action != HandoffAction::StopAndReopen {
                     let generation = self
                         .ownership
                         .observe(&req.provider, &req.session_id)
@@ -2133,6 +2274,7 @@ impl SessionHandoffRunner {
         kind: RuntimeOwnerKind,
     ) -> HandoffRequest {
         HandoffRequest {
+            action: HandoffAction::Switch,
             provider: provider.to_string(),
             session_id: session_id.to_string(),
             target_kind: kind,
@@ -2144,7 +2286,6 @@ impl SessionHandoffRunner {
             observed_epoch: None,
             observed_generation: None,
             device_id: Some("handoff-guard-cleanup".into()),
-            acknowledge_platform_limited_risk: false,
         }
     }
 
@@ -4452,6 +4593,40 @@ fn owner_json(owner: &OwnerIdentity, req: &HandoffRequest) -> Value {
     }
 }
 
+/// Parse the public handoff action exactly once at the REST boundary. The
+/// pre-action acknowledgment remains a compatibility alias only when no
+/// explicit action is present; sending both is rejected so an old caller
+/// cannot silently change the meaning of a newer action.
+fn parse_handoff_action(body: &Value) -> Result<HandoffAction, &'static str> {
+    let explicit = body.get("action");
+    let explicit_name = explicit.and_then(Value::as_str);
+    if explicit.is_some() && explicit_name.is_none() {
+        return Err(
+            "action must be \"switch\", \"clear-stale-bookkeeping\", or \"stop-and-reopen\"",
+        );
+    }
+    let legacy = body.get("acknowledgePlatformLimitedRisk");
+    let legacy_ack = match legacy {
+        None => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or("acknowledgePlatformLimitedRisk must be a boolean")?,
+    };
+    if explicit.is_some() && legacy.is_some() {
+        return Err("action cannot be combined with acknowledgePlatformLimitedRisk");
+    }
+    match explicit_name {
+        None if legacy_ack => Ok(HandoffAction::ClearStaleBookkeeping),
+        None => Ok(HandoffAction::Switch),
+        Some("switch") => Ok(HandoffAction::Switch),
+        Some("clear-stale-bookkeeping") => Ok(HandoffAction::ClearStaleBookkeeping),
+        Some("stop-and-reopen") => Ok(HandoffAction::StopAndReopen),
+        Some(_) => {
+            Err("action must be \"switch\", \"clear-stale-bookkeeping\", or \"stop-and-reopen\"")
+        }
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -4507,6 +4682,10 @@ async fn handoff_handler(
             return typed_bad_request("targetKind must be \"terminal\" or \"fresh-agent\"");
         }
     };
+    let action = match parse_handoff_action(&body) {
+        Ok(action) => action,
+        Err(message) => return typed_bad_request(message),
+    };
     // b8ke delta review F7: a half-sent observed pair (exactly one of
     // epoch/generation) is the typed invalid-fence refusal — never a silent
     // downgrade to the unfenced legacy path. No handoff is spawned.
@@ -4541,6 +4720,7 @@ async fn handoff_handler(
         return typed_bad_request(&reason);
     }
     let req = HandoffRequest {
+        action,
         provider,
         session_id,
         target_kind,
@@ -4555,13 +4735,6 @@ async fn handoff_handler(
             .get("deviceId")
             .and_then(Value::as_str)
             .map(String::from),
-        // b8ke focused round-4 R4-4: the EXPLICIT operator
-        // acknowledgment licensing the PlatformLimited force-clear
-        // (an ordinary retry never clears the fence).
-        acknowledge_platform_limited_risk: body
-            .get("acknowledgePlatformLimitedRisk")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
     };
     // The reply rides the handle's oneshot with a bounded HTTP timeout; the
     // operation itself is detached and outlives the request.

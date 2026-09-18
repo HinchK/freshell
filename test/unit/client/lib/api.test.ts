@@ -1288,6 +1288,7 @@ describe('requestSessionHandoff()', () => {
       cleared: 'stale-stop-fence',
       operationId: 'op-clear-ss',
       generation: 7,
+      shutdownConfirmed: false,
     })
   })
 

@@ -1,7 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
 import type { AppStore } from '@/store/store'
 import type { HandoffError } from '@/store/paneTypes'
-import { runPaneSessionHandoff, SESSION_HANDOFF_RETRY_BACKOFF_MS } from '@/lib/session-handoff'
+import {
+  runPaneSessionHandoff,
+  runPaneSessionRecovery,
+  SESSION_HANDOFF_RETRY_BACKOFF_MS,
+} from '@/lib/session-handoff'
 
 /**
  * Typed reopen-handoff failure banner (kata b8ke) — the stuck-card pattern
@@ -12,23 +16,15 @@ import { runPaneSessionHandoff, SESSION_HANDOFF_RETRY_BACKOFF_MS } from '@/lib/s
  * double-click can't stack timers), refreshing the observed
  * (epoch, generation) fence from the runtime-owner record at send time.
  *
- * b8ke focused round-4 R4-4: a PlatformLimited fence (this platform cannot
- * verify the prior runtime's descendant processes) renders the EXPLICIT
- * operator force-clear action — "Force clear" sends the handoff request
- * with the `acknowledgePlatformLimitedRisk` acknowledgment: the server
- * clears the fence (recording the unverified-descendant limitation) and
- * answers the typed clear. b8ke ext r28 F2: the r25 server repair made
+ * Force clear is a clear-only request: it repairs stale bookkeeping without
+ * stopping or starting a writer. b8ke ext r28 F2: the r25 server repair made
  * the acknowledged clear accept the STALE-reason fences too (their
  * probe-only recovery left an evidence-less stale fence permanently
  * unrecoverable), so those refusals render the same action. b8ke ext r12
  * F1: the clear STOPS AT THE CLEAR —
- * acknowledgment covers clearing the fence, not starting a writer over the
- * acknowledged-risk tree, so the client performs NO handoff request after
- * the clear; the cleared banner (HANDOFF_FORCE_CLEARED) surfaces the state
- * with the explicit "Start reopen again" action, and only THAT user action
- * re-initiates the handoff (which goes through the coordinator fresh, as
- * any new request would). An ordinary Retry never clears the fence (the
- * server answers the typed PLATFORM_LIMITED_FENCED refusal).
+ * clear; the cleared banner (HANDOFF_FORCE_CLEARED) surfaces the state with
+ * an explicit Stop and reopen action. An ordinary Retry never clears the
+ * fence (the server answers the typed PLATFORM_LIMITED_FENCED refusal).
  */
 export function SessionHandoffErrorBanner({ error, appStore, tabId, paneId }: {
   error: HandoffError
@@ -114,7 +110,7 @@ export function SessionHandoffErrorBanner({ error, appStore, tabId, paneId }: {
           <button
             type="button"
             className="rounded border border-amber-500/70 px-2 py-1 text-xs disabled:opacity-60"
-            aria-label="Force clear the platform-limited fence, acknowledging unverified descendant processes may remain — the reopen is a separate explicit action"
+            aria-label="Force clear stale session bookkeeping — this does not stop or reopen the session"
             data-testid="session-handoff-force-clear-button"
             disabled={forceClearArmed}
             onClick={() => {
@@ -123,7 +119,11 @@ export function SessionHandoffErrorBanner({ error, appStore, tabId, paneId }: {
               forceClearTimerRef.current = setTimeout(() => {
                 forceClearTimerRef.current = null
                 setForceClearArmed(false)
-                void runPaneSessionHandoff(appStore, { tabId, paneId, acknowledgePlatformLimitedRisk: true })
+                void runPaneSessionRecovery(appStore, {
+                  tabId,
+                  paneId,
+                  action: 'clear-stale-bookkeeping',
+                })
               }, SESSION_HANDOFF_RETRY_BACKOFF_MS)
             }}
           >
@@ -146,13 +146,7 @@ export function SessionHandoffErrorBanner({ error, appStore, tabId, paneId }: {
               void runPaneSessionHandoff(appStore, {
                 tabId,
                 paneId,
-                // b8ke ext r16 F4: the cleared state's start-again action
-                // CARRIES THE ACKNOWLEDGMENT — the clear landed in the
-                // typed cleared-unverified state (never plain Vacant), and
-                // the acknowledged-risk arm is what licenses the new
-                // writer's START (the server records the acknowledgment
-                // at the START; an unacknowledged start is refused typed).
-                ...(forceCleared ? { acknowledgePlatformLimitedRisk: true } : {}),
+                ...(forceCleared ? { action: 'stop-and-reopen' as const } : {}),
               })
             }, SESSION_HANDOFF_RETRY_BACKOFF_MS)
           }}
@@ -223,12 +217,16 @@ export function FencedOwnerRecoveryActions({ fencedReason, appStore, tabId, pane
         <button
           type="button"
           className="shrink-0 rounded border border-amber-500/70 px-2 py-1 text-xs disabled:opacity-60"
-          aria-label={`Force clear the ${fencedReason} fence, acknowledging the unverified runtime's processes may remain — the reopen is a separate explicit action`}
+          aria-label={`Force clear the ${fencedReason} fence — this does not stop or reopen the session`}
           data-testid="fenced-owner-force-clear-button"
           disabled={armed}
           onClick={() => {
             arm(() => {
-              void runPaneSessionHandoff(appStore, { tabId, paneId, acknowledgePlatformLimitedRisk: true })
+              void runPaneSessionRecovery(appStore, {
+                tabId,
+                paneId,
+                action: 'clear-stale-bookkeeping',
+              })
             })
           }}
         >
@@ -244,11 +242,11 @@ export function FencedOwnerRecoveryActions({ fencedReason, appStore, tabId, pane
           disabled={armed}
           onClick={() => {
             arm(() => {
-              // The acknowledged START — the cleared-unverified state is
-              // not permission to start a writer; the acknowledgment at
-              // the START is (the same arm the cleared banner's
-              // start-again action carries).
-              void runPaneSessionHandoff(appStore, { tabId, paneId, acknowledgePlatformLimitedRisk: true })
+              void runPaneSessionHandoff(appStore, {
+                tabId,
+                paneId,
+                action: 'stop-and-reopen',
+              })
             })
           }}
         >
