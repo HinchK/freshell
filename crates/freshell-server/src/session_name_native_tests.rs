@@ -894,7 +894,9 @@ async fn the_worker_loop_converges_an_armed_series() {
 }
 
 /// The selector prefers ready manual-name projection, then the stable
-/// name-reference key — the persisted fair-scheduling policy's native half.
+/// name-reference key — the persisted fair-scheduling policy's native half —
+/// and a live capability-reprobe window skips its refused series while an
+/// expired one no longer does.
 #[tokio::test]
 async fn the_selector_prefers_manual_projection_then_the_stable_key() {
     let items =
@@ -919,10 +921,79 @@ async fn the_selector_prefers_manual_projection_then_the_stable_key() {
         freshell_protocol::session_names::NameSource::FreshellAi,
         "b-early",
     );
-    let picked = super::select_next(&[a_freshell.clone(), b_manual.clone(), c_freshell.clone()]);
+    let mut backoff = std::collections::HashMap::new();
+    let picked = super::select_next(
+        &[a_freshell.clone(), b_manual.clone(), c_freshell.clone()],
+        &mut backoff,
+    );
     assert_eq!(picked.unwrap().target, b_manual.target);
-    let picked = super::select_next(&[a_freshell.clone(), c_freshell.clone()]);
+    let picked = super::select_next(&[a_freshell.clone(), c_freshell.clone()], &mut backoff);
     assert_eq!(picked.unwrap().target, c_freshell.target);
+
+    // A live re-probe window rotates the refused series out: the selector
+    // picks the next available armed series instead.
+    backoff.insert(
+        (
+            freshell_freshagent::naming::name_ref_debug_key(&b_manual.target),
+            b_manual.desired_revision,
+        ),
+        tokio::time::Instant::now() + super::CAPABILITY_REPROBE_DELAY,
+    );
+    let picked = super::select_next(
+        &[a_freshell.clone(), b_manual.clone(), c_freshell.clone()],
+        &mut backoff,
+    );
+    assert_eq!(
+        picked.unwrap().target,
+        c_freshell.target,
+        "a live capability backoff skips the refused series"
+    );
+
+    // An EXPIRED window no longer skips (and is pruned): the manual head is
+    // selected again.
+    backoff.insert(
+        (
+            freshell_freshagent::naming::name_ref_debug_key(&b_manual.target),
+            b_manual.desired_revision,
+        ),
+        tokio::time::Instant::now() - Duration::from_secs(1),
+    );
+    let picked = super::select_next(
+        &[a_freshell.clone(), b_manual.clone(), c_freshell.clone()],
+        &mut backoff,
+    );
+    assert_eq!(
+        picked.unwrap().target,
+        b_manual.target,
+        "an expired capability backoff re-admits the series"
+    );
+    assert!(
+        !backoff.contains_key(&(
+            freshell_freshagent::naming::name_ref_debug_key(&b_manual.target),
+            b_manual.desired_revision,
+        )),
+        "the expired entry is pruned"
+    );
+
+    // A fresh name decision (a new desired revision) is never penalized by
+    // the superseded series' window: the backoff is keyed per series.
+    backoff.insert(
+        (
+            freshell_freshagent::naming::name_ref_debug_key(&b_manual.target),
+            b_manual.desired_revision,
+        ),
+        tokio::time::Instant::now() + super::CAPABILITY_REPROBE_DELAY,
+    );
+    let re_decided = super::NativeWorkItem {
+        desired_revision: b_manual.desired_revision + 1,
+        ..b_manual.clone()
+    };
+    let picked = super::select_next(std::slice::from_ref(&re_decided), &mut backoff);
+    assert_eq!(
+        picked.unwrap().target,
+        re_decided.target,
+        "a fresh armed revision is probed promptly despite the old series' window"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -938,6 +1009,18 @@ fn native_entry_of(doc: &Value) -> &Value {
         .values()
         .next()
         .expect("one series")
+}
+
+/// The nativeWrite series entry for ONE chosen target (black-box: the
+/// persisted document is the contract) — the keyed lookup multi-series
+/// documents need.
+fn native_entry_for<'a>(doc: &'a Value, target: &SessionNameRef) -> &'a Value {
+    let key = crate::session_names::name_ref_key(target);
+    doc["nativeWrite"]
+        .as_object()
+        .expect("nativeWrite section")
+        .get(&key)
+        .unwrap_or_else(|| panic!("no native series for {key}"))
 }
 
 /// The current armed series' epoch (black-box: the persisted document is the
@@ -1619,6 +1702,143 @@ async fn an_absent_native_capability_pauses_before_consuming_a_cycle() {
     worker.abort();
     assert_eq!(backend.writes(), 1);
     assert_eq!(backend.reads(), 2);
+}
+
+/// A dispatch-shaped backend whose capability probe refuses a chosen set of
+/// claude locations (keyed by config root) until they are wired: the
+/// per-target capability shape the fairness guarantee needs — one paused
+/// head, one ready series — over an ordinary scripted provider.
+struct SelectiveCapabilityBackend {
+    scripted: Arc<ScriptedBackend>,
+    refused: Arc<Mutex<Vec<String>>>,
+}
+
+impl SelectiveCapabilityBackend {
+    fn refusing(scripted: Arc<ScriptedBackend>, roots: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            scripted,
+            refused: Arc::new(Mutex::new(
+                roots.iter().map(|root| root.to_string()).collect(),
+            )),
+        })
+    }
+
+    fn wire(&self, root: &str) {
+        self.refused.lock().unwrap().retain(|r| r != root);
+    }
+}
+
+impl NativeNameBackend for SelectiveCapabilityBackend {
+    fn read(&self, target: NativeNameTarget) -> super::NativeFuture<NativeNameReadback> {
+        self.scripted.read(target)
+    }
+
+    fn write(&self, attempt: super::NativeNameAttempt) -> super::NativeFuture<()> {
+        self.scripted.write(attempt)
+    }
+
+    fn route_available(&self, target: NativeNameTarget) -> super::NativeProbeFuture {
+        let refused = match &target.location {
+            NativeLocation::Claude { config_root, .. } => self
+                .refused
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r == config_root),
+            _ => false,
+        };
+        Box::pin(async move { !refused })
+    }
+}
+
+/// NEW-1: a capability-paused series at the HEAD of the selector must never
+/// starve the armed series behind it. A probe refusal rotates the paused
+/// head out of selection for a bounded window: the READY series converges,
+/// the paused series itself stays pending, discoverable, and uncharged, and
+/// once its capability arrives it converges within one bounded window —
+/// the rotation is a re-probe backoff, never an eviction.
+#[tokio::test]
+async fn a_capability_paused_head_does_not_starve_the_ready_series_behind_it() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    // The paused head sorts FIRST under the selector's stable key order
+    // (`["pending",a-head]` < `["pending",b-ready]`), so without rotation
+    // it would hold the single-item selection forever.
+    let paused = armed_pending(&store, "a-head", "/paused/.claude").await;
+    let ready = armed_pending(&store, "b-ready", "/ready/.claude").await;
+    rename_user(&store, paused.clone(), "Paused Name")
+        .await
+        .expect("rename the head");
+    rename_user(&store, ready.clone(), "Ready Name")
+        .await
+        .expect("rename the ready series");
+
+    let scripted = ScriptedBackend::new(vec![WriteStep::Confirm, WriteStep::Confirm]);
+    scripted.set_title(Some("Divergent"));
+    let dispatch = SelectiveCapabilityBackend::refusing(scripted.clone(), &["/paused/.claude"]);
+
+    let worker = SessionNameWorker::start(Arc::clone(&store), dispatch.clone());
+
+    // THE fairness assertion: the ready series converges DESPITE the paused
+    // head holding the front of the selector.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(sync) = native_sync_of(&store, ready.clone()).await {
+            if sync.status == NativeSyncStatus::Synced {
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the ready series must converge despite the paused head"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // The paused head consumed nothing while refused: still pending, still
+    // discoverable work, its whole allowance intact.
+    let sync = native_sync_of(&store, paused.clone())
+        .await
+        .expect("series projected");
+    assert_eq!(
+        sync.status,
+        NativeSyncStatus::Pending,
+        "the refused head stays pending"
+    );
+    assert!(
+        store
+            .native_work_snapshot()
+            .iter()
+            .any(|item| item.target == paused),
+        "the refused head stays discoverable work"
+    );
+    let doc = document_json(dir.path());
+    assert_eq!(
+        native_entry_for(&doc, &paused)["cyclesConsumed"].as_u64(),
+        Some(0),
+        "the refused head consumed no cycle"
+    );
+
+    // The capability arrives: the paused head converges too.
+    dispatch.wire("/paused/.claude");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(sync) = native_sync_of(&store, paused.clone()).await {
+            if sync.status == NativeSyncStatus::Synced {
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the paused head must converge once its capability arrives"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    worker.abort();
+    // Both series converged through their own full cycles — one write and
+    // two reads each — and nothing was double-dispatched while paused.
+    assert_eq!(scripted.writes(), 2);
+    assert_eq!(scripted.reads(), 4);
 }
 
 // ---------------------------------------------------------------------------

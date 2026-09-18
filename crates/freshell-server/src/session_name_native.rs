@@ -29,7 +29,9 @@
 //! before claiming, so a closed session's pane (no live provider
 //! connection), a degraded boot (no wired adapter), or a missing helper
 //! keeps the series `pending` with its whole allowance intact, and work
-//! proceeds once the capability arrives.
+//! proceeds once the capability arrives — a refusal rotates the series
+//! out of the selector for a bounded re-probe window, so a paused head
+//! can never starve the armed series behind it.
 //!
 //! The [`SessionNameWorker`] owns the serial dispatch loop under the shared
 //! `.session-names-worker.lock` background guard (acquire worker then
@@ -46,6 +48,7 @@
 //! and the kill/wait cleanup of the dedicated helper child — never a shared
 //! runtime or conversation).
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -69,6 +72,16 @@ pub const NATIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// Eligibility delays (the 5s/30s retry floors) govern readiness; this poll
 /// is only discovery latency.
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The bounded window a capability-refused series rotates out of the
+/// worker's selection: the next poll selects the next available armed
+/// series instead of re-probing the same paused head forever, and the
+/// refused series re-probes once the window expires — capability arrival is
+/// discovered within one window. Strictly longer than
+/// [`WORKER_POLL_INTERVAL`] so lower-priority armed series actually receive
+/// slots between re-probes; the series itself is untouched — pending,
+/// discoverable, allowance intact.
+const CAPABILITY_REPROBE_DELAY: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // Backend contract
@@ -161,9 +174,10 @@ pub type NativeProbeFuture = Pin<Box<dyn std::future::Future<Output = bool> + Se
 /// can ATTEMPT an operation for this target right now — the serial worker
 /// probes it before claiming a cycle so an initially absent route or
 /// capability (no live provider connection, no wired adapter, an unspawnable
-/// helper) pauses the series as `pending` without consuming any allowance; a
-/// `true` answer is not a health guarantee, the attempt itself still
-/// classifies its own outcome.
+/// helper) pauses the series as `pending` without consuming any allowance,
+/// and a refusal rotates the series out of the selector for a bounded
+/// re-probe window; a `true` answer is not a health guarantee, the attempt
+/// itself still classifies its own outcome.
 pub trait NativeNameBackend: Send + Sync {
     fn read(&self, target: NativeNameTarget) -> NativeFuture<NativeNameReadback>;
     fn write(&self, attempt: NativeNameAttempt) -> NativeFuture<()>;
@@ -257,7 +271,9 @@ pub enum NativeOutcomeFold {
 /// Ordering (the persisted fair-scheduling policy): ready manual-name
 /// projection first, then earliest-due, then the stable name-reference key —
 /// manual projection traffic can starve nothing because every cycle is
-/// bounded and generation (Task 4) alternates on this same selector.
+/// bounded, a capability-paused series rotates out of selection for only a
+/// bounded re-probe window, and generation (Task 4) alternates on this same
+/// selector.
 pub struct SessionNameWorker;
 
 impl SessionNameWorker {
@@ -274,9 +290,19 @@ impl SessionNameWorker {
 }
 
 async fn run(names: Arc<SessionNames>, native: Arc<dyn NativeNameBackend>) {
+    // The transient per-series re-probe backoff: a capability refusal
+    // rotates THAT series out of selection for a bounded window instead of
+    // re-selecting the same paused head every poll. Keyed by the stable
+    // series identity (name-ref key + desired revision) so a fresh name
+    // decision is probed promptly, never penalized by the superseded
+    // series' window. Worker-local by design: the refusal consumed
+    // nothing, so the durable series keeps no trace of it — it stays
+    // pending and discoverable, and the capability is rediscovered within
+    // one window of its arrival.
+    let mut probe_backoff: HashMap<(String, NameRevision), tokio::time::Instant> = HashMap::new();
     loop {
         let items = names.native_work_snapshot();
-        let Some(item) = select_next(&items) else {
+        let Some(item) = select_next(&items, &mut probe_backoff) else {
             tokio::time::sleep(WORKER_POLL_INTERVAL).await;
             continue;
         };
@@ -302,7 +328,9 @@ async fn run(names: Arc<SessionNames>, native: Arc<dyn NativeNameBackend>) {
         // before consuming a cycle". An absent route/capability (no live
         // provider connection for the root, no wired adapter, a missing
         // helper) consumes NOTHING — the series stays `pending` with its full
-        // allowance and the next poll re-probes until the capability arrives.
+        // allowance, the rotation below moves it out of the selector for a
+        // bounded window so lower-priority armed series keep receiving
+        // slots, and it re-probes once that window expires.
         if !native
             .route_available(NativeNameTarget {
                 name_ref: item.target.clone(),
@@ -319,6 +347,13 @@ async fn run(names: Arc<SessionNames>, native: Arc<dyn NativeNameBackend>) {
                 class = "capability_absent",
                 "session_names.native_route_unavailable: capability paused before claiming a cycle"
             );
+            probe_backoff.insert(
+                (
+                    freshell_freshagent::naming::name_ref_debug_key(&item.target),
+                    item.desired_revision,
+                ),
+                tokio::time::Instant::now() + CAPABILITY_REPROBE_DELAY,
+            );
             drop(guard);
             tokio::time::sleep(WORKER_POLL_INTERVAL).await;
             continue;
@@ -332,10 +367,24 @@ async fn run(names: Arc<SessionNames>, native: Arc<dyn NativeNameBackend>) {
 }
 
 /// The selection order: manual-name projection first, then earliest due
-/// (equal-due falls back to the stable name-reference key).
-fn select_next(items: &[NativeWorkItem]) -> Option<NativeWorkItem> {
+/// (equal-due falls back to the stable name-reference key). A series whose
+/// capability probe was refused is skipped until its bounded re-probe
+/// window expires (expired backoff entries are pruned as part of every
+/// selection), so a paused head can never starve the armed series behind it.
+fn select_next(
+    items: &[NativeWorkItem],
+    probe_backoff: &mut HashMap<(String, NameRevision), tokio::time::Instant>,
+) -> Option<NativeWorkItem> {
+    let now = tokio::time::Instant::now();
+    probe_backoff.retain(|_, until| *until > now);
     items
         .iter()
+        .filter(|item| {
+            !probe_backoff.contains_key(&(
+                freshell_freshagent::naming::name_ref_debug_key(&item.target),
+                item.desired_revision,
+            ))
+        })
         .min_by(|a, b| {
             let manual = match (
                 a.desired_source == NameSource::Manual,
