@@ -5200,7 +5200,26 @@ impl FreshOpencodeState {
         // e2e regression: a fresh `freshopencode-*` id instead of the
         // stable `ses_*` id).
         let attach_row_materialized = if let Some(arc) = session_arc.as_ref() {
-            arc.lock().await.real_session_id.clone().is_some()
+            // Classify the map hit while holding the session lock. A fresh pane's
+            // placeholder has no provider runtime or bridge to adopt, so this is
+            // observation-only: emit the current snapshot and return while the
+            // classification still holds. If materialization wins the same lock
+            // first, the durable attach path below owns the guarded bridge restart.
+            let session = arc.lock().await;
+            if session.real_session_id.is_none() {
+                let running = session
+                    .turn_task
+                    .as_ref()
+                    .map(|task| !task.is_finished())
+                    .unwrap_or(false);
+                let status = if running { "running" } else { "idle" };
+                self.broadcast(&event_frame(
+                    &session.placeholder_id,
+                    snapshot_event(&session.placeholder_id, status),
+                ));
+                return;
+            }
+            true
         } else {
             false
         };
@@ -5335,7 +5354,7 @@ impl FreshOpencodeState {
         // refuses typed (the FENCE_REQUIRED contract: re-observe the
         // owner record and retry with the pair).
         let mut existing_session_attach_guard = None;
-        if session_arc.is_some() {
+        if attach_row_materialized {
             match attach_fence {
                 Some(adopt_fence) => {
                     let expected_fresh_owner = freshell_ownership::OwnerIdentity {
@@ -8071,10 +8090,49 @@ mod tests {
             .await;
         let placeholder = "freshopencode-req-gate-c-mount-attach";
 
+        // Subscribe after create so this receiver observes only the mount-time attach
+        // frames below, including any typed refusal that would otherwise be easy to miss.
+        let mut rx = st.fresh_agent.broadcast_tx.subscribe();
+
         // The pane's mount-time attach — no observed pair (none exists:
         // the create claims nothing, so there is no owner record to
-        // observe), and NO registration may commit for it.
+        // observe), and NO registration may commit for it. Repeat the
+        // reconnect-shaped attach so a reservation error cannot be hidden
+        // as a one-time mount race, then repeat once with the placeholder's
+        // complete current Vacant fence.
         st.handle_attach(attach_msg(placeholder)).await;
+        st.handle_attach(attach_msg(placeholder)).await;
+        let current = registry.observe(PROVIDER, placeholder);
+        let mut fenced_attach = attach_msg(placeholder);
+        fenced_attach.observed_epoch = Some(current.epoch);
+        fenced_attach.observed_generation = Some(current.generation);
+        st.handle_attach(fenced_attach).await;
+
+        let mut frames = Vec::new();
+        while let Ok(raw) = rx.try_recv() {
+            frames
+                .push(serde_json::from_str::<serde_json::Value>(&raw).expect("server JSON frame"));
+        }
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| {
+                    frame["type"] == "freshAgent.event"
+                        && frame["sessionId"] == placeholder
+                        && frame["event"]["type"] == "freshAgent.session.snapshot"
+                })
+                .count(),
+            3,
+            "each placeholder attach emits an observable snapshot: {frames:?}"
+        );
+        assert!(
+            frames.iter().all(|frame| {
+                frame["type"] != "freshAgent.event"
+                    || frame["sessionId"] != placeholder
+                    || frame["event"]["type"] != "freshAgent.error"
+            }),
+            "ordinary placeholder attach must not reserve a nonexistent writer: {frames:?}"
+        );
 
         // THE REGRESSION PIN: the placeholder key stays VACANT — no leaked
         // Live{FreshAgent} owner registered over nothing real.
