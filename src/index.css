@@ -46,7 +46,7 @@ html {
 
 @container (max-width: 280px) {
   .pane-header--fresh-agent .pane-header-actions {
-    gap: 0.25rem;
+    gap: 0;
   }
 
   .pane-header--fresh-agent .pane-header-fresh-agent-optional-action {
@@ -65,16 +65,6 @@ html {
 
   .pane-header--fresh-agent .pane-header-fresh-agent-detail {
     font-size: 13px;
-  }
-
-  .pane-header--fresh-agent .pane-header-actions button {
-    height: 1rem;
-    width: 1rem;
-  }
-
-  .pane-header--fresh-agent .pane-header-actions svg {
-    height: 0.75rem;
-    width: 0.75rem;
   }
 }
 
