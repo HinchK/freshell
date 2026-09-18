@@ -47,9 +47,11 @@ Use absolute paths for `--cwd` and `--editor`.
 - **Prefer specialized pane types:** Do NOT open a terminal to run `cat`/`vim`/`nano`/`curl`/`wget` when a dedicated pane type fits.
   - "open/edit/show a file" -> `split-pane --editor /path/to/file`
   - "open/show a URL" or "view a webpage" -> `split-pane --browser URL` or `open-browser URL`
+    - For a **local server**, pass `http://localhost:PORT/...` -- not a LAN-IP URL: BrowserPane rewrites loopback URLs through Freshell's same-origin proxy (`/api/proxy/http/PORT/...`), which every client can reach. A direct LAN-IP URL can be unreachable from the user's machine and shows an empty pane.
   - "run a command" or "use a CLI tool" -> `split-pane --mode shell` or `new-tab --mode shell`
 - **Sending text:** Use `send-keys -l` for natural-language prompts or multi-word text. Do NOT append "ENTER" as literal text — send the command with `-l`, then send `ENTER` as a separate call.
 - **Default targeting (MCP only):** When no target is specified, the MCP tool resolves to your own pane/tab (set by `FRESHELL_TAB_ID`/`FRESHELL_PANE_ID`), not the user's active viewport. `split-pane` without a target splits your own pane.
+- **Sidecar agent sessions have no ambient target:** if you are an agent running inside Freshell (e.g. `FRESHELL_OPENCODE_SIDECAR_ID` is set), you do NOT get `FRESHELL_TAB_ID`/`FRESHELL_PANE_ID`, and the CLI's omitted target resolves to the user's active tab -- not yours. With many concurrent agent tabs, that is usually a different session's tab. Before splitting/creating "here", find your own pane: `list-tabs`, then `list-panes --titles -t <tab>` per candidate, and match your conversation's topic (fresh-agent pane titles mirror the session topic).
 - **Default direction:** `split-pane` defaults to vertical (top/bottom). Use `-h` for horizontal (left/right).
 
 ## Focus neutrality
