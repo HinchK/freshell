@@ -13,6 +13,7 @@ import { FreshAgentView, IDLE_INCOMPLETE_MAX_RETRIES, locatorMatchesPane } from 
 import { FreshAgentSettingsButton } from '@/components/fresh-agent/FreshAgentSettingsButton'
 import {
   initLayout,
+  applyFreshAgentReconcileAttach,
   requestPaneRefresh,
   resetFreshAgentPaneForReconcileCreate,
   setActivePane,
@@ -9419,6 +9420,62 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
     expect(alert).toHaveTextContent(/being reopened/i)
     // Round-3 F15: no Attach action until the committed owner event.
     expect(within(alert).queryByRole('button')).toBeNull()
+  })
+
+  it('same-session authoritative attach recovery sends the new round fence', async () => {
+    const store = createStore()
+    const sid = 'thread-attach-recovery'
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: divergencePaneContent({
+        sessionId: sid,
+        sessionRef: { provider: 'codex', sessionId: sid },
+      }),
+    }))
+    store.dispatch(applyRuntimeOwner(terminalOwnerFrame({
+      sessionId: sid,
+      ownerKind: 'fresh-agent',
+      terminalId: undefined,
+      epoch: 1,
+      generation: 5,
+    })))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1))
+    expect(sentFreshAgentMessages('freshAgent.attach')[0]).toMatchObject({
+      sessionId: sid,
+      observedEpoch: 1,
+      observedGeneration: 5,
+    })
+
+    act(() => {
+      store.dispatch(applyRuntimeOwner(terminalOwnerFrame({
+        sessionId: sid,
+        ownerKind: 'fresh-agent',
+        terminalId: undefined,
+        epoch: 1,
+        generation: 9,
+      })))
+      store.dispatch(applyFreshAgentReconcileAttach({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        sessionRef: { provider: 'codex', sessionId: sid },
+        serverInstanceId: 'same-server',
+      }))
+    })
+
+    await waitFor(() => expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(2))
+    expect(sentFreshAgentMessages('freshAgent.attach')[1]).toMatchObject({
+      sessionId: sid,
+      observedEpoch: 1,
+      observedGeneration: 9,
+    })
   })
 
   // b8ke ext r34 F2: the attach-here path CANONICALIZES at the write — a

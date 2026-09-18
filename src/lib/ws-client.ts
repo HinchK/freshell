@@ -128,6 +128,11 @@ function isTerminalAttachMessage(msg: unknown): msg is TerminalAttachClientMessa
     && candidate.terminalId.length > 0
 }
 
+function isFreshAgentAttachMessage(msg: unknown): boolean {
+  if (!msg || typeof msg !== 'object') return false
+  return (msg as { type?: unknown }).type === 'freshAgent.attach'
+}
+
 export class WsClient {
   private ws: WebSocket | null = null
   private _state: ConnectionState = 'disconnected'
@@ -339,7 +344,11 @@ export class WsClient {
       // after the pane's next anchor instead).
       const pendingMessages = isReconnect
         ? this.pendingMessages.filter(
-            (queued) => !isTerminalAttachMessage(queued) && !isTerminalInputMessage(queued),
+            (queued) => (
+              !isTerminalAttachMessage(queued)
+              && !isFreshAgentAttachMessage(queued)
+              && !isTerminalInputMessage(queued)
+            ),
           )
         : this.pendingMessages
       this.pendingMessages = []
