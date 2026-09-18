@@ -1064,9 +1064,15 @@ async fn the_worker_recovers_an_interrupted_series_that_is_the_only_work() {
     let generator = generator_with(dir.path(), Some("gen-key"), transport.clone());
     let worker = SessionNameWorker::start(Arc::clone(&store), Arc::new(NoRouteNative), generator);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // Converge on BOTH pins before breaking: the recovery commit writes
+    // the durable file first and swaps the in-memory read model after, so
+    // a file-only poll can observe the fold while the count still reports
+    // the stale InFlight view (the race the post-loop assertions pin).
     loop {
         let doc = document_json(dir.path());
-        if generation_status(&doc, &target).as_deref() == Some("eligible") {
+        if generation_status(&doc, &target).as_deref() == Some("eligible")
+            && store.interrupted_generation_count() == 0
+        {
             break;
         }
         assert!(
