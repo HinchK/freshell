@@ -244,8 +244,8 @@ vi.mock('lucide-react', () => ({
   RefreshCw: ({ className }: { className?: string }) => (
     <svg data-testid="refresh-icon" className={className} />
   ),
-  Settings: ({ className }: { className?: string }) => (
-    <svg data-testid="settings-icon" className={className} />
+  Settings: (require('react') as typeof import('react')).forwardRef<SVGSVGElement, { className?: string }>(
+    ({ className }, ref) => <svg ref={ref} data-testid="settings-icon" className={className} />
   ),
   FilePen: () => null,
   FileSearch: () => null,
