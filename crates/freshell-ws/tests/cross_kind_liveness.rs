@@ -5220,6 +5220,7 @@ async fn race_coordinator_cancellation_and_sidecar_crash_leave_consistent_state(
     let handle = h
         .handoff_runner
         .spawn_handoff(freshell_freshagent::HandoffRequest {
+            action: freshell_freshagent::session_handoff::HandoffAction::Switch,
             provider: "codex".to_string(),
             session_id: sid.clone(),
             target_kind: freshell_ownership::RuntimeOwnerKind::Terminal,
@@ -5231,7 +5232,6 @@ async fn race_coordinator_cancellation_and_sidecar_crash_leave_consistent_state(
             observed_epoch: None,
             observed_generation: None,
             device_id: Some("race-r7".to_string()),
-            acknowledge_platform_limited_risk: false,
         });
     let _ = await_owner_transition(&mut h, &sid, "handoff-started").await;
     handle.abort();
