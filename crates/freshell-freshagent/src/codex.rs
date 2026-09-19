@@ -14883,11 +14883,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn fork_after_a_mint_new_respawn_keeps_the_create_provenance_chain() {
         let _guard = ENV_LOCK.lock().await;
-        // Spawn 1: the parent, crashing right after `thread/start`.
+        // D8: spawn 1 keeps its sidecar ALIVE; the crashed state is produced by
+        // hand (see `simulate_unrequested_crash`) so the mint-new recovery never
+        // depends on the runner-failing reap-confirmation machinery.
         configure_fake_codex_cmd(
             &json!({
                 "threadStartThreadId": "parent-old-prov",
-                "exitProcessAfterMethodsOnce": ["thread/start"],
             })
             .to_string(),
         );
@@ -14907,7 +14908,7 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(old_id, "parent-old-prov", "fixture sanity: the clicked id");
-        wait_for_self_heal(&st, &mut rx, &old_id).await;
+        simulate_unrequested_crash(&st, &old_id).await;
 
         // The durable rollout is confirmed gone — ensure-alive mints a fresh
         // thread (spawn 2: `thread/start` -> "parent-new-prov"); the fork child's
@@ -19251,6 +19252,16 @@ pub(crate) mod tests {
     /// Wait for `session_id`'s exit-watcher to flip [`CodexSession::exited`] (the
     /// self-heal branch observing an unrequested crash), then drain the resulting
     /// `freshAgent.status{exited}` frame off `rx`.
+    ///
+    /// Only for tests whose SUBJECT is the watcher's own detection flow — the
+    /// recovery-flow fixtures below must use [`simulate_unrequested_crash`]
+    /// instead: a real die-at-`thread/start` crash routes the fixture through
+    /// the exit-watcher's reap-confirmation machinery, which FAILS CLOSED on
+    /// the GitHub runner (unrecordable /proc evidence — the D7 group-(d)
+    /// finding): the watcher then retains a condemned prior, the foreground
+    /// action's own `confirm_fenced_prior_dead` fails the same way, and
+    /// `ensure_session_alive` answers SESSION_RESERVED for the very recovery
+    /// the test is driving (the rust-gate run-3 red, 7 tests).
     async fn wait_for_self_heal(
         st: &FreshCodexState,
         rx: &mut tokio::sync::broadcast::Receiver<String>,
@@ -19287,6 +19298,31 @@ pub(crate) mod tests {
         .await
         .expect("the exited status frame arrives within the budget");
         assert_eq!(exited_frame["sessionId"], session_id);
+    }
+
+    /// Produce the post-unrequested-crash state BY HAND for the recovery-flow
+    /// fixtures (D8): flip `exited` (the lazy-restart flag the exit-watcher's
+    /// self-heal sets on an unrequested exit) and clear the completed lease
+    /// binding (the documented watcher release `cleanup_confirmed_codex_teardown`
+    /// performs once a natural exit's writer tree is CONFIRMED dead). The create
+    /// keeps its sidecar ALIVE at the commit (r30 F1), so — unlike a real
+    /// die-at-`thread/start` crash — the fixture never enters the reap-confirmation
+    /// machinery, which fails closed on constrained runners (see
+    /// [`wait_for_self_heal`]'s doc comment). The recovery pipeline under test —
+    /// respawn, resume/mint-new, snapshot/materialized broadcasts, the fork
+    /// handoff — still runs end-to-end for real; only the crash DETECTION is
+    /// simulated (the `onexit_self_heal_*` family covers the real watcher flow).
+    /// Same reshape rationale as the D7 stale-family and group-(d) fixtures.
+    async fn simulate_unrequested_crash(st: &FreshCodexState, session_id: &str) {
+        {
+            let sessions = st.sessions.lock().await;
+            sessions
+                .get(session_id)
+                .expect("the session row")
+                .exited
+                .store(true, Ordering::SeqCst);
+        }
+        st.leases.clear_binding(PROVIDER, session_id);
     }
 
     /// Task 4 (P1.13): a healthy create writes a fresh-agent binding row (provider
@@ -19698,11 +19734,12 @@ pub(crate) mod tests {
         let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
-        configure_fake_codex_cmd(
-            r#"{"threadStartThreadId":"thread-original","exitProcessAfterMethodsOnce":["thread/start"]}"#,
-        );
+        // D8: the create keeps its sidecar ALIVE; the crashed state is produced
+        // by hand (see `simulate_unrequested_crash`) so the mint-new recovery
+        // never depends on the runner-failing reap-confirmation machinery.
+        configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-original"}"#);
         let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        simulate_unrequested_crash(&st, &thread_id).await;
 
         // The respawned sidecar's `thread/resume` reports the thread as genuinely gone,
         // forcing the mint-new-thread crash-respawn fallback.
@@ -20056,9 +20093,12 @@ pub(crate) mod tests {
         let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
+        // D8: the create keeps its sidecar ALIVE; the crashed state is produced
+        // by hand (see `simulate_unrequested_crash`) so the racing recovery
+        // never depends on the runner-failing reap-confirmation machinery.
+        configure_fake_codex_cmd("{}");
         let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        simulate_unrequested_crash(&st, &thread_id).await;
 
         // A small delay on `thread/resume` widens the race window between the two
         // concurrent recovery attempts below.
@@ -20143,9 +20183,12 @@ pub(crate) mod tests {
         let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
+        // D8: the create keeps its sidecar ALIVE; the crashed state is produced
+        // by hand (see `simulate_unrequested_crash`) so the attach's recovery
+        // never depends on the runner-failing reap-confirmation machinery.
+        configure_fake_codex_cmd("{}");
         let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        simulate_unrequested_crash(&st, &thread_id).await;
 
         configure_fake_codex_cmd("{}");
         st.handle_attach(FreshAgentAttach {
@@ -20326,15 +20369,17 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
         let capture = tracing_capture::capture_by_session("fork-respawn-marker-unused");
 
+        // D8: the create keeps its sidecar ALIVE; the crashed state is produced
+        // by hand (see `simulate_unrequested_crash`) so the fork's recovery
+        // never depends on the runner-failing reap-confirmation machinery.
         configure_fake_codex_cmd(
             &json!({
-                "exitProcessAfterMethodsOnce": ["thread/start"],
                 "appendThreadOperationLogPath": log_path.to_string_lossy(),
             })
             .to_string(),
         );
         let parent_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &parent_id).await;
+        simulate_unrequested_crash(&st, &parent_id).await;
         assert_eq!(
             spawn_count(&capture),
             1,
@@ -20378,8 +20423,9 @@ pub(crate) mod tests {
             spawn_count(&capture)
         );
 
-        // Per-connection RPC order over THREE sidecars: crashed spawn = thread/start;
-        // respawned parent = thread/resume → thread/fork → thread/archive; child =
+        // Per-connection RPC order over THREE sidecars: first spawn (kept alive,
+        // hand-flagged crashed — D8) = thread/start; respawned parent =
+        // thread/resume → thread/fork → thread/archive; child =
         // thread/unarchive → thread/resume.
         let log_text = read_op_log_when_complete(&log_path, 6).await;
         let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
@@ -20393,7 +20439,7 @@ pub(crate) mod tests {
         assert_eq!(
             by_url.len(),
             3,
-            "exactly three sidecar connections (crashed + respawned parent + child): {log_text}"
+            "exactly three sidecar connections (first + respawned parent + child): {log_text}"
         );
         let mut sequences: Vec<Vec<String>> = by_url.values().cloned().collect();
         sequences.sort();
@@ -20406,7 +20452,7 @@ pub(crate) mod tests {
         assert_eq!(
             sequences[1],
             vec!["thread/start"],
-            "the crashed spawn served only the create: {log_text}"
+            "the first spawn served only the create: {log_text}"
         );
         assert_eq!(
             sequences[2],
@@ -20476,19 +20522,19 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
         let capture = tracing_capture::capture_by_session("fork-mint-new-marker-unused");
 
-        // Spawn 1: the parent, which crashes right after `thread/start` (a real
-        // unrequested exit, observed by the exit-watcher self-heal).
+        // D8: spawn 1 keeps its sidecar ALIVE; the crashed state is produced by
+        // hand (see `simulate_unrequested_crash`) so the mint-new route never
+        // depends on the runner-failing reap-confirmation machinery.
         configure_fake_codex_cmd(
             &json!({
                 "threadStartThreadId": "parent-old-mint",
-                "exitProcessAfterMethodsOnce": ["thread/start"],
                 "appendThreadOperationLogPath": log_path.to_string_lossy(),
             })
             .to_string(),
         );
         let old_id = create_real_fake_session(&st, &mut rx).await;
         assert_eq!(old_id, "parent-old-mint", "fixture sanity: the clicked id");
-        wait_for_self_heal(&st, &mut rx, &old_id).await;
+        simulate_unrequested_crash(&st, &old_id).await;
         assert_eq!(
             spawn_count(&capture),
             1,
@@ -20543,9 +20589,10 @@ pub(crate) mod tests {
             spawn_count(&capture)
         );
 
-        // Per-connection RPC order over THREE sidecars: crashed spawn = thread/start;
-        // respawned parent = thread/start (the mint) → thread/fork → thread/archive,
-        // with the fork RPC TARGETING the minted parent id; child = unarchive → resume.
+        // Per-connection RPC order over THREE sidecars: first spawn (kept alive,
+        // hand-flagged crashed — D8) = thread/start; respawned parent =
+        // thread/start (the mint) → thread/fork → thread/archive, with the fork
+        // RPC TARGETING the minted parent id; child = unarchive → resume.
         let log_text = read_op_log_when_complete(&log_path, 6).await;
         let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
         let mut fork_target: Option<String> = None;
@@ -20572,7 +20619,7 @@ pub(crate) mod tests {
         assert_eq!(
             by_url.len(),
             3,
-            "exactly three sidecar connections (crashed + respawned parent + child): {log_text}"
+            "exactly three sidecar connections (first + respawned parent + child): {log_text}"
         );
         let mut sequences: Vec<Vec<String>> = by_url.values().cloned().collect();
         sequences.sort();
@@ -20580,7 +20627,7 @@ pub(crate) mod tests {
         assert_eq!(
             sequences[0],
             vec!["thread/start"],
-            "the crashed spawn served only the original create: {log_text}"
+            "the first spawn served only the original create: {log_text}"
         );
         assert_eq!(
             sequences[1],
@@ -20657,17 +20704,19 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn fork_on_a_mint_new_respawn_keys_mid_flight_failures_to_the_resolved_parent_id() {
         let _guard = ENV_LOCK.lock().await;
+        // D8: the create keeps its sidecar ALIVE; the crashed state is produced
+        // by hand (see `simulate_unrequested_crash`) so the mint-new route never
+        // depends on the runner-failing reap-confirmation machinery.
         configure_fake_codex_cmd(
             &json!({
                 "threadStartThreadId": "parent-old-mint",
-                "exitProcessAfterMethodsOnce": ["thread/start"],
             })
             .to_string(),
         );
         let (st, mut rx) = state_with_bus();
         let capture = tracing_capture::capture_by_session("fork-mint-fail-marker-unused");
         let old_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &old_id).await;
+        simulate_unrequested_crash(&st, &old_id).await;
         st.mark_thread_dead(&old_id).await;
 
         // The respawned parent mints "parent-new-mint"; its `thread/fork` then fails with
