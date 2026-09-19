@@ -21,7 +21,7 @@
 
 **Goal:** All six standing failures on main go green — the four e2e specs pass with the title-precedence contract restored in the product, and the two Rust flakes (59nb capture race, hsrh session-init race) are fixed at their diagnosed mechanisms — proven by a green full local suite.
 
-**Architecture:** One coherent product-side title-precedence resolution (Task 1: explicit creator/user titles outrank mirrored and auto titles; server-fabricated live-terminal session rows carry no title) that the four e2e specs already encode, so they flip red→green as the regression proofs; two Rust test-infrastructure fixes — migrate the freshell-ws lib capture util to the repo's e08g process-global OnceLock pattern with per-test-unique-field filtering (Task 3), and delete the merge-repair-resurrected zombie test while landing the stranded either-order combined drain on its live siblings (Tasks 4–5); a full-suite gate closes the campaign (Task 6).
+**Architecture:** One coherent product-side title-precedence resolution (Task 1: explicit creator/user titles outrank mirrored and auto titles; server-fabricated live-terminal session rows carry no title, while the client's sidebar label falls back to the provider label so placeholder rows stay meaningful) that the four e2e specs already encode, so they flip red→green as the regression proofs; two Rust test-infrastructure fixes — migrate the freshell-ws lib capture util to the repo's e08g process-global OnceLock pattern with per-test-unique-field filtering (Task 3), and delete the merge-repair-resurrected zombie test while landing the stranded either-order combined drain on its live siblings (Tasks 4–5); a full-suite gate closes the campaign (Task 6).
 
 **Tech Stack:** React 18 + Redux Toolkit (client fold, display-title precedence), Rust (freshell-server session directory, freshell-ws test capture, freshell-freshagent claude tests), Vitest (unit), Playwright (e2e), tracing/tracing-subscriber (callsite Interest cache mechanics).
 
@@ -45,29 +45,42 @@ These are the plan's riskiest claims; stage 2 validates each before/while execut
 1. **PR #799 (pane-header-mobile-v3, in base dbbfd0752) did not change the sidebar-opencode-rail failure shape.** The investigation ran at `22a6083ee`/`34f425fae`; #799 rewrote the pane header (`src/components/PaneHeader.tsx` → `src/components/panes/PaneHeader.tsx`). Verified statically at dbbfd0752: `role="banner"` + `aria-label={`Pane: ${title}`}` survive at `src/components/panes/PaneHeader.tsx:176-177`. Task 1 Step 1 re-runs the spec focused at this base BEFORE any fix; if the failure is not the diagnosed `Pane: OpenCode` clobber at spec line 327 (banner missing, renamed, or a new #799-induced failure), STOP and re-diagnose before touching production code.
 2. **Title-precedence conflict between investigations, resolved product-side.** The deploy-tab-diff investigation prescribed a TEST-SIDE fix (assert `tabId`, and explicitly warned the `titleSetByUser` product change "must not be slipped in under this test"); the rest-tab-persistence investigation prescribed exactly that PRODUCT fix as minimal-and-correct. The User Request resolves this in favor of ONE product-side precedence (see Resolution section) applied campaign-wide. Consequence: the four specs pass with their ORIGINAL assertions (they were authored against this contract; the Sep-15 title-pipeline campaign broke it). The deploy-tab-diff tabId hardening (Task 2) is added, not substituted.
 3. **The sidebar dedupe click preserves the explicit REST name under the new precedence** (`tabsSlice.ts:1141`'s existing `!existingTab.titleSetByUser` guard blocks the click's session-title sync once Task 1 sets the flag), so remote-tab-linkage's post-restart leg (:310, `tabTitleAfterClick` read dynamically from raw Redux `tab.title`) passes with the REST name. The spec's stale NOTE comment (:255-260) claimed the opposite; Task 2 corrects the comment and adds a pin.
-4. **The 59nb capture migration's consumer-filter audit is complete and load-bearing.** Converting `capture()` to a process-global OnceLock subscriber routes EVERY test's events into one shared vec; each of the 26 consumer call sites across 5 files must filter by a per-test-unique field (`root`/`path`/`device_id`/`terminal_id`), and colliding ids must be made unique per test. A missed consumer turns the rare race into a deterministic false-fail (exact-count/negative assertions) or false-pass (`.any()` assertions) under parallelism. Task 3 enumerates every site; none may be skipped.
+4. **The 59nb capture migration's consumer-filter audit is complete and load-bearing.** Converting `capture()` to a process-global OnceLock subscriber routes EVERY test's events into one shared vec; each of the 26 consumer call sites across 5 files must filter by a per-test-unique field (`root`/`path`/`device_id`/`terminal_id`), and colliding ids must be made unique per test — in `invariants.rs` the shared ids are REAL: `t-ev` is used by BOTH `:760` (expects exactly one warning) and `:801` (expects none), `t-late` by BOTH `:1154` (expects a warning) and `:939` (expects none), and `t-young` (`:585`/`:992`) and `t-idle` (`:709`/`:1234`) are each shared by two tests as well; the unresolved-warning event carries ONLY `terminal_id`/`mode`/`age_ms` (`invariants.rs:232-237`), so terminal-id renaming per test is the ONLY available discriminator there. A missed consumer (or a missed id collision) turns the rare race into a deterministic false-fail (exact-count/negative assertions) or false-pass (`.any()` assertions) under parallelism. Task 3 enumerates every site and every collision; none may be skipped.
 
 ## The Title-Precedence Resolution (authoritative for Tasks 1–2)
 
-**Canonical tab display-title precedence, resolved:**
+**Canonical display-title precedence, resolved (as the code actually composes it — verified against `src/lib/tab-title.ts` and `src/store/sessionTitleMirror.ts` at the base):**
 
-1. **Explicit creator/user title** — `tab.title` with `titleSetByUser: true`: a TabBar inline rename, a `PATCH /api/tabs/:id`, or an explicit non-empty `name` on a REST/MCP tab create (all three `ui.command{tab.create}` emitters put only caller-provided names in `payload.title`: `terminal_tabs.rs:300` `create_content_tab`, `terminal_tabs.rs:3356` `create_terminal_tab`, `lib.rs:4709` `broadcast_tab_create`).
-2. **Session-title mirror** — a real, titled session-directory row folded into the pane title by `sessionTitleMirrorMiddleware` (`src/store/sessionTitleMirror.ts`), surfaced through `getTabDisplayTitle`'s single-pane override.
-3. **Auto mode-labels** — server registry/terminal auto titles ("Amplifier", "Codex CLI") folded via `terminal.inventory`.
-4. **cwd-leaf derived titles** — `derivePaneTitle`/`deriveTabName` fallbacks.
+1. **Tab display title** (`getTabDisplayTitle`, `src/lib/tab-title.ts`):
+   1. **Explicit title** — `tab.title` with `titleSetByUser: true`: a TabBar inline rename, a `PATCH /api/tabs/:id`, or an explicit non-empty `name` on a REST/MCP tab create (all three `ui.command{tab.create}` emitters put only caller-provided names in `payload.title`: `terminal_tabs.rs:300` `create_content_tab`, `terminal_tabs.rs:3356` `create_terminal_tab`, `lib.rs:4709` `broadcast_tab_create`). An empty explicit title falls through.
+   2. **Single-pane override** — the sole leaf pane's stored non-derived pane title, *whatever composed it* (see the pane ladder below — this is why a registry "Codex CLI" or a mirrored session title can show as the tab title).
+   3. **Stored non-derived `tab.title`** set without the user flag (create-time mode labels like "Amplifier" that reached `tab.title`).
+   4. **cwd-leaf derived titles** — `deriveTabName`/`derivePaneTitle` fallbacks.
+2. **Pane title**, composed per pane kind (NOT a blanket mirror-over-auto rule):
+   - A **user-set pane title** (`paneTitleSetByUser`) is never mirrored over.
+   - **Terminal panes**: a **cached terminal-level title outranks the session-title mirror** — `collectSessionTitleTargets` (`sessionTitleMirror.ts:111`) skips any terminal pane whose terminalId has a cached title, so registry auto-titles ("Codex CLI"), `PATCH /api/terminals/:id` renames, and inventory/live folds own that pane; the mirror only titles terminal panes with NO cached terminal title (unattached/exited/not-yet-reattached panes). This is load-bearing for deploy-tab-diff: post-restart the "Codex CLI" inventory fold owns the pane, and only the tab-level rung 1 (explicit title) keeps the display `work`.
+   - **Fresh-agent panes**: no registry pipeline — the session-title mirror is their runtime title source (always eligible).
+   - Fallback: the `initLayout`-derived cwd-leaf.
 
-**Plus: fabricated live-terminal session rows carry NO title.** `build_live_terminal_session_item` (`crates/freshell-server/src/session_directory.rs:1265`) must stop fabricating `title: Some(provider_display_name(...))`; the mirror's existing `if (!session.title) continue` guard (`sessionTitleMirror.ts:44`) then skips them naturally. A provider label is not a session name.
+**Plus: fabricated live-terminal session rows carry NO title, and the client keeps their label meaningful at display time.** Two halves:
+- **Server:** `build_live_terminal_session_item` (`crates/freshell-server/src/session_directory.rs:1265`) must stop fabricating `title: Some(provider_display_name(...))`; the mirror's existing `if (!session.title) continue` guard (`sessionTitleMirror.ts:44`) then skips them naturally. A provider label is not a session name.
+- **Client:** the sidebar row's main label is NOT "subtitle || projectPath" — it is `sidebarSelectors.ts:264`'s `session.title || session.sessionId.slice(0, 8)`, rendered at `Sidebar.tsx:1175` (`:1199` is the tooltip's project line). With the server half alone, a fabricated `terminal:<id>` row would read literally "terminal" and a bound-but-unindexed row would read as an 8-char id prefix. `buildSessionItems`' server-row mapping therefore gains a provider-label rung, stated precisely: a title-less row whose `isRunning && runningTerminalId` are set (the wire shape EVERY `build_live_terminal_session_item` row carries, both variants — `terminal:<id>` sessionIds and bound-but-unindexed session ids) falls back to `getProviderLabel(provider)` (the same helper the client-side fallback row uses at `sidebarSelectors.ts:511`), while every other title-less row (real transcript rows, running or not) keeps today's `sessionId.slice(0, 8)` fallback. `hasTitle` stays `!!session.title` — the provider label is a display fallback, not a session title, so a later title-carrying fetch or the `pushFallbackItem` merge still overrides it. Accepted residual: a REAL running session whose transcript has not yet yielded a title also takes the provider-label rung (indistinguishable at the wire level from a fabricated row without new protocol machinery; strictly more meaningful than the id prefix it replaces); HistoryView's main label keeps the id-prefix fallback with its existing provider badge (`HistoryView.tsx:481`) — the cited regression is the sidebar row, which has no badge.
 
-**Reconciliation with the rename-scope contract:** the contract governs WRITE scoping (who owns which rename surface); this resolution governs DISPLAY composition (which stored label a tab renders when several exist). No hard rule is violated: rule 5's "pane/tab labels can no longer mint a user-rung [session] override" is untouched (the fold sets a TAB-local `titleSetByUser`, never a session override); rule 1's "no sessionRef fallback write" is untouched (nothing durable is written). The existing guard in `openSessionTab` (`tabsSlice.ts:1141`, `!existingTab.titleSetByUser`) already establishes the product semantic that explicit titles beat session-title sync — Task 1 extends "explicit" to creator-provided names. The contract doc gains a short display-precedence subsection (Task 1 Step 6) recording the four-rung ladder and the fabricated-row rule.
+**Reconciliation with the rename-scope contract:** the contract governs WRITE scoping (who owns which rename surface); this resolution governs DISPLAY composition (which stored label a tab renders when several exist). No hard rule is violated: rule 5's "pane/tab labels can no longer mint a user-rung [session] override" is untouched (the fold sets a TAB-local `titleSetByUser`, never a session override); rule 1's "no sessionRef fallback write" is untouched (nothing durable is written). The existing guard in `openSessionTab` (`tabsSlice.ts:1141`, `!existingTab.titleSetByUser`) already establishes the product semantic that explicit titles beat session-title sync — Task 1 extends "explicit" to creator-provided names. The contract doc gains a short display-precedence subsection (Task 1 Step 4e) recording the ladders above EXACTLY as the code composes them (including the pane-kind split — a blanket "mirror over auto-labels" rule would be false for terminal panes and must not be written into the contract), the fabricated-row rule with its client display fallback, and one scope-table update: the Tab label row's "Written by" column gains the create-time explicit name (`name` on a REST/MCP tab create), since Task 1 makes that a tab-label write.
+
+**Intended consequences of setting `titleSetByUser` on every named REST/MCP tab (analyzed, accepted):**
+1. `shouldKeepClosedTab` (`src/lib/tab-registry-snapshot.ts:167-176`, called from the removeTab flow at `src/store/tabsSlice.ts:785-789`) keys on `titleSetByUser`, so every closed named agent tab now keeps a closed-tab registry record (recoverable from the closed-tab list). Intended: an explicitly named tab is user-meaningful and worth a keep-record, same as an inline rename today.
+2. OSC terminal-title updates (`TerminalView.tsx` ~:2719), the `terminal.title.updated` fold (~:4965), and the `(exit N)` suffix (~:4946) all gate on `!tab.titleSetByUser`, so a named tab's TAB title freezes at the creator name (an exited named tab shows `work`, not `work (exit 3)`). Intended: that is precisely rung 1 — auto/OSC titles no longer overwrite an explicit name. Pane titles are independently guarded (`paneTitleSetByUser`) and keep flowing.
+Task 1 Step 7 verifies both through the whole client unit tree (`tabsPersistence`, `tab-registry-snapshot`, `tabsSlice` suites live there).
 
 **Derived final expectation per spec (all four keep their original assertions):**
 
 - **deploy-tab-diff-rust :207** — REST `name: 'work'` is rung 1 → the tabs-sync `tabName` is `"work"` at every capture (the pre-restart session-title mirror and post-restart "Codex CLI" inventory fold no longer win the display) → `verify` prints `tab=work`. The original assertion passes as written; it becomes the e2e proof that an explicit REST name survives a restart as the canonical title. Task 2 adds the identity hardening `toContain(codex.data.tabId)`.
 - **remote-tab-linkage-rust :213** — `TAB_NAME` ('remote-linkage-tab') is rung 1 → visible in the strip immediately and stably (the mirror still titles the PANE with the session name — pane-level canonical — but the tab display shows the creator name). **:310** — `tabTitleAfterClick` is read dynamically from raw Redux after the dedupe click; under the new precedence the click's sync is blocked by the `titleSetByUser` guard, so it reads `'remote-linkage-tab'`, and the post-restart strip shows the same (rung 1 persisted through `freshell.layout.v3`). Passes as written; the stale NOTE comment is corrected and a preservation pin added (Task 2).
-- **rest-tab-persistence :142/:176** — 'amplifier-poison-tab' is rung 1 pre-reload (the racy create-time "Amplifier" fold can no longer flip the display) and post-reload (`stripTabVolatileFields` spreads `...tab`, so `titleSetByUser` round-trips through `freshell.layout.v3`; `restoreLayout` keeps it, `tabsSlice.ts:788`). Passes as written.
+- **rest-tab-persistence :142/:176** — 'amplifier-poison-tab' is rung 1 pre-reload (the racy create-time "Amplifier" fold can no longer flip the display) and post-reload: `stripTabVolatileFields` (`src/store/persistMiddleware.ts:82`) spreads `...tab`, so `titleSetByUser` lands in the localStorage `freshell.layout.v3.<window-id>` payload, and the rehydrate path admits it — `persistedState.ts:53`'s `zTab` schema carries `titleSetByUser: z.boolean().optional()` (NOT `tabsSlice.ts:788`, which is the closed-tab keep policy). Passes as written.
 - **sidebar-opencode-rail :326-328** — the pane is harness-created (no REST name in play); under the fabricated-row rule the child2 placeholder row carries no title → the mirror never fires → the pane title stays the `initLayout`-derived cwd-leaf `railsubagentpane` → `Pane: railsubagentpane` renders. Passes as written; this spec IS the red→green regression test for the fabricated-row fix.
 
-**Impacted-by-derivation (not the campaign four):** any spec that REST/MCP-creates a NAMED tab and asserts strip text. Verified greps: `git-badges-rust.spec.ts:190` asserts the REST name `'badge-rest-tab'` (T1 makes it strictly more stable); `fresh-agent-rest-resume-rust.spec.ts:378` and `tabs-client-retire.spec.ts:73` already dispatch `titleSetByUser: true` themselves (consistent convention); no spec asserts a session title replacing a REST name in the strip. Task 2 Step 6 runs the named-create family focused; the Task 6 local lane is the net.
+**Impacted-by-derivation (not the campaign four):** any spec that REST/MCP-creates a NAMED tab and asserts strip text. Verified greps: `git-badges-rust.spec.ts:190` asserts the REST name `'badge-rest-tab'` (T1 makes it strictly more stable); `fresh-agent-rest-resume-rust.spec.ts:378` already carries `titleSetByUser: true` as a field in its tabs-sync record fixture and `tabs-client-retire.spec.ts:73` already dispatches it via an `addTab` payload (consistent conventions — note :378 is a fixture field, not a dispatch); no spec asserts a session title replacing a REST name in the strip. Task 2 Step 5 runs the named-create family focused; the full local e2e lane added to Task 6 is the complete net.
 
 ---
 
@@ -77,15 +90,18 @@ Standing ledger item (e2e four, no kata). This is the product change that turns 
 
 **Files:**
 - Modify: `src/lib/ui-commands.ts:80-90` (the `tab.create` fold)
+- Modify: `src/store/selectors/sidebarSelectors.ts:264` (provider-label rung for title-less running live-terminal rows)
 - Modify: `crates/freshell-server/src/session_directory.rs:1282` (`title: Some(...)` → `title: None`)
-- Modify: `crates/freshell-server/src/session_directory.rs:1499-1565` (the fabricated-item unit tests)
+- Modify: `crates/freshell-server/src/session_directory.rs:1226-1234` (`provider_display_name` becomes test-only: `#[cfg(test)]`)
+- Modify: `crates/freshell-server/src/session_directory.rs:1514,:1558` (the two fabricated-item unit tests) AND `:3621-3631` (`persisted_identity_collision_keeps_a_matching_live_terminal_as_a_safe_placeholder` — asserts the SAME fabricated row's `"Claude CLI"` title at `:3625`; THREE fabricated-title assertions change, not two)
 - Test: `test/unit/client/ui-commands.test.ts` (fold regression, red-first)
+- Test: `test/unit/client/store/selectors/sidebarSelectors.test.ts` (provider-label fallback, red-first)
 - Test: `test/unit/client/store/sessionTitleMirror.test.ts` (fabricated title-less row pin)
-- Modify: `docs/development/rename-scope-contract.md` (display-precedence subsection)
+- Modify: `docs/development/rename-scope-contract.md` (display-precedence subsection + Tab-label "Written by" row)
 
 **Interfaces:**
-- Consumes: `addTab` payload field `titleSetByUser?: boolean` (`src/store/tabsSlice.ts:293`, reducer stores it at `:330`); `getTabDisplayTitle`'s `titleSetByUser` branch (`src/lib/tab-title.ts:28-30`); the mirror's `if (!session.title) continue` guard (`src/store/sessionTitleMirror.ts:44`).
-- Produces: the contract that every `ui.command{tab.create}` broadcast carrying a non-empty `payload.title` (only ever caller-provided: verified across all three emitters) folds into Redux with `titleSetByUser: true`; and that `DirItem`s synthesized by `build_live_terminal_session_item` carry `title: None`. Task 2 and the four e2e specs depend on both.
+- Consumes: `addTab` payload field `titleSetByUser?: boolean` (`src/store/tabsSlice.ts:293`, reducer stores it at `:330`); `getTabDisplayTitle`'s `titleSetByUser` branch (`src/lib/tab-title.ts:28-30`); the mirror's `if (!session.title) continue` guard (`src/store/sessionTitleMirror.ts:44`); `getProviderLabel` (`src/lib/coding-cli-utils.ts:33`, already imported by `sidebarSelectors.ts:8`).
+- Produces: the contract that every `ui.command{tab.create}` broadcast carrying a non-empty `payload.title` (only ever caller-provided: verified across all three emitters) folds into Redux with `titleSetByUser: true`; that `DirItem`s synthesized by `build_live_terminal_session_item` carry `title: None` (test-only `provider_display_name` retained behind `#[cfg(test)]` — its only non-test caller is the removed fabrication, and a now-unused module-level fn fails clippy `-D warnings` and the pre-push gate); and that the sidebar row's main label for a title-less running live-terminal row is `getProviderLabel(provider)`. Task 2 and the four e2e specs depend on all three.
 
 - [ ] **Step 1: Baseline red confirmation at dbbfd0752 (BEFORE any fix)**
 
@@ -106,7 +122,7 @@ Expected: each file reports **1 failed / rest passed** with EXACTLY the diagnose
 
 Record each failure output path under the logs dir (`reports/`) in run-state. These runs are the campaign's red receipts.
 
-- [ ] **Step 2: Write the failing unit test (client fold)**
+- [ ] **Step 2: Write the failing unit tests (client fold + sidebar label)**
 
 Add to `test/unit/client/ui-commands.test.ts` (same idiom as the existing `tab.create` tests — actions-array dispatch spy):
 
@@ -130,11 +146,37 @@ Add to `test/unit/client/ui-commands.test.ts` (same idiom as the existing `tab.c
   })
 ```
 
-- [ ] **Step 3: Run it and verify the intended failure**
+Add to `test/unit/client/store/selectors/sidebarSelectors.test.ts` (inside the existing `describe('buildSessionItems', …)` block, reusing its `emptyTabs`/`emptyPanes`/`emptyTerminals`/`emptyActivity` consts at :125-128; both fabricated-row variants plus the unchanged real-row fallback):
 
-Run: `npm run test:vitest -- run test/unit/client/ui-commands.test.ts`
+```ts
+  it('keeps a provider label on title-less running live-terminal rows instead of an id prefix', () => {
+    const projects = [{
+      projectPath: '/repo',
+      sessions: [
+        // Fabricated variant A: terminal:<id> sessionId (today would render
+        // literally "terminal" once the server stops fabricating titles).
+        { provider: 'codex', sessionId: 'terminal:term-9', projectPath: '/repo', lastActivityAt: 1_000, isRunning: true, runningTerminalId: 'term-9' },
+        // Fabricated variant B: bound-but-unindexed session id (the
+        // sidebar-opencode-rail child2 shape).
+        { provider: 'opencode', sessionId: 'ses-child2', projectPath: '/repo', lastActivityAt: 1_000, isRunning: true, runningTerminalId: 'term-c2' },
+        // Real title-less row, NOT running: keeps today's id-prefix fallback.
+        { provider: 'claude', sessionId: 'claude-real-no-title', projectPath: '/repo', lastActivityAt: 900 },
+      ] as any,
+    }]
+    const items = buildSessionItems(projects, emptyTabs, emptyPanes, emptyTerminals, emptyActivity)
+    expect(items.find((i) => i.sessionId === 'terminal:term-9')?.title).toBe('Codex')
+    expect(items.find((i) => i.sessionId === 'ses-child2')?.title).toBe('Opencode')
+    expect(items.find((i) => i.sessionId === 'claude-real-no-title')?.title).toBe('claude-')
+    // Display fallback only — the row still reports no session title.
+    expect(items.find((i) => i.sessionId === 'terminal:term-9')?.hasTitle).toBe(false)
+  })
+```
 
-Expected: FAIL — the new test fails because the fold never sets `titleSetByUser` (first expectation receives `undefined`); the trailing unnamed-create expectation is the pin that must hold after the change.
+- [ ] **Step 3: Run them and verify the intended failures**
+
+Run: `npm run test:vitest -- run test/unit/client/ui-commands.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts`
+
+Expected: FAIL both — the fold test fails because the fold never sets `titleSetByUser` (first expectation receives `undefined`); the selector test fails because the title-less running rows render `'terminal'`/`'ses-chil'` (the `sessionId.slice(0, 8)` fallback). The trailing unnamed-create and real-row expectations are the pins that must hold after the change.
 
 - [ ] **Step 4: Minimal production implementation (client + server + contract doc)**
 
@@ -151,7 +193,7 @@ Expected: FAIL — the new test fails because the fold never sets `titleSetByUse
         mode: msg.payload.mode,
 ```
 
-4b. Red-first for the server side — update the two fabricated-item unit tests in `crates/freshell-server/src/session_directory.rs` to assert the NEW contract (they currently assert the fabrication):
+4b. Red-first for the server side — update the THREE fabricated-title assertions in `crates/freshell-server/src/session_directory.rs` to assert the NEW contract (they currently assert the fabrication; `freshell-server` has NO library target — `Cargo.toml` declares only `[[bin]] freshell-server` — so the selector is `--bin freshell-server`, verified: `--lib` fails with "no library targets found in package `freshell-server`"):
 
 In `build_live_terminal_session_item_with_session_id_is_not_live_terminal_only` (~:1515):
 ```rust
@@ -162,9 +204,10 @@ In `build_live_terminal_session_item_with_session_id_is_not_live_terminal_only` 
         assert_eq!(item.title, None);
 ```
 In `build_live_terminal_session_item_without_session_id_is_live_terminal_only` (~:1562): replace `assert_eq!(item.title.as_deref(), Some("Codex CLI"));` with `assert_eq!(item.title, None);`.
+In `persisted_identity_collision_keeps_a_matching_live_terminal_as_a_safe_placeholder` (~:3621-3631): the joined safe-placeholder row is built by the same `build_live_terminal_session_item` (its `projectPath` is the identity's cwd `/live-terminal`), so its `&& item["title"] == "Claude CLI"` at `:3625` breaks too — replace that conjunct with `&& item.get("title").is_none()` (`to_value` omits absent titles; keep the surrounding `provider`/`sessionId`/`projectPath`/`isRunning`/`runningTerminalId` conjuncts and the `liveTerminalOnly != true` pin below unchanged).
 
-Run: `cargo test -p freshell-server --locked --lib session_directory`
-Expected: FAIL — exactly the two updated assertions fail (current code fabricates `Some("OpenCode")` / `Some("Codex CLI")`).
+Run: `cargo test -p freshell-server --locked --bin freshell-server session_directory`
+Expected: FAIL — exactly the three updated assertions fail (current code fabricates `Some("OpenCode")` / `Some("Codex CLI")` / `"Claude CLI"`).
 
 4c. Apply the one-line production change in `build_live_terminal_session_item` (`session_directory.rs:1282`):
 
@@ -174,13 +217,39 @@ Expected: FAIL — exactly the two updated assertions fail (current code fabrica
         // real pane titles with a generic label ("OpenCode") for every
         // unlisted-session resume (e.g. subagent children, root-filtered).
         // Title-less rows are skipped by the mirror (`if (!session.title)
-        // continue`) and render with existing fallbacks (HistoryView:
-        // sessionId.slice(0, 8); sidebar rail: subtitle || projectPath).
+        // continue`); the client keeps the row's label meaningful at display
+        // time (sidebarSelectors provider-label rung for title-less running
+        // live-terminal rows; HistoryView keeps its id-prefix + provider
+        // badge).
         title: None,
 ```
 
-Run: `cargo test -p freshell-server --locked --lib session_directory`
-Expected: PASS (all session_directory tests, including the two updated ones and the join tests, which assert no title).
+`provider_display_name` (`session_directory.rs:1227`) now has NO non-test caller (its only one was this line) — dead code in the non-test build, which fails `cargo clippy --all-targets -- -D warnings` (Task 6 Step 1) and the pre-push gate. Gate it: `#[cfg(test)]` above `fn provider_display_name` (its `mod tests` consumers at `:1457-1461` keep it alive under `--bin` test builds; keep the fn and its parity doc comment in place).
+
+Run: `cargo test -p freshell-server --locked --bin freshell-server session_directory`
+Expected: PASS (all session_directory tests, including the three updated ones and the join tests, which assert no title).
+
+4c-2. Apply the client display-fallback production change in `buildSessionItems` (`src/store/selectors/sidebarSelectors.ts:264`) — the sidebar row's main label, rendered at `Sidebar.tsx:1175` (NOT the `:1199` tooltip, whose `subtitle || projectPath || sessionLabel` line is untouched):
+
+```ts
+        // A title-less RUNNING live-terminal row (a server-fabricated
+        // placeholder — build_live_terminal_session_item, either variant:
+        // `terminal:<id>` sessionIds or a bound-but-unindexed session id)
+        // keeps its provider label instead of degrading to "terminal" or an
+        // id prefix. Every fabricated row carries isRunning +
+        // runningTerminalId on the wire; real title-less rows keep today's
+        // id-prefix fallback. Same helper the client-side fallback row uses
+        // (the `getProviderLabel(provider)` chain below), so a placeholder
+        // renders identically before and after the server row arrives.
+        // hasTitle stays !!session.title — this is a display fallback, not a
+        // session title; later title-carrying fetches still override it.
+        title: session.title
+          || ((session.isRunning && session.runningTerminalId)
+            ? getProviderLabel(provider)
+            : session.sessionId.slice(0, 8)),
+```
+
+(`getProviderLabel` is already imported at `sidebarSelectors.ts:8`; no other line of the item mapping changes.)
 
 4d. Add the fabricated-row pin to `test/unit/client/store/sessionTitleMirror.test.ts` (guards the client-side half of the contract the server fix relies on; it fails if anyone removes the `!session.title` skip). The file's existing `buildStore()` and `landSessionRow()` helpers plus the imported `addTab`/`initLayout` provide everything needed — this is the e2e sidebar-opencode-rail shape in miniature (terminal pane bound by sessionRef to a session whose only "row" is a title-less fabricated placeholder):
 
@@ -210,37 +279,39 @@ Expected: PASS (all session_directory tests, including the two updated ones and 
 Run: `npm run test:vitest -- run test/unit/client/store/sessionTitleMirror.test.ts`
 Expected: PASS (pins existing guard behavior; it is the companion to 4c, not red-first — its red would only fire if the guard is later removed).
 
-4e. Update `docs/development/rename-scope-contract.md` — append a short "Display precedence (composition of stored labels)" subsection recording the four-rung ladder and the fabricated-row rule from the Resolution section above, noting it governs display composition while the hard rules govern write scoping, and that the ladder is enforced by `getTabDisplayTitle` (`src/lib/tab-title.ts`) + `sessionTitleMirrorMiddleware` (`src/store/sessionTitleMirror.ts`).
+4e. Update `docs/development/rename-scope-contract.md` — TWO edits, both recording ACTUAL behavior (do not write an inaccurate blanket rule into the governing contract):
+   - Append a short "Display precedence (composition of stored labels)" subsection recording the Resolution's ladders EXACTLY as the code composes them: the tab ladder (explicit `titleSetByUser` title → single-pane override → stored non-derived `tab.title` → derived cwd-leaf), the PANE-KIND-SPLIT rule (terminal panes: a cached terminal-level title outranks the session-title mirror — `sessionTitleMirror.ts:111`'s cache-aware skip; fresh-agent panes: the mirror is the runtime title source), the fabricated-row rule (server placeholder rows carry no title; the client's sidebar label for a title-less running live-terminal row falls back to the provider label), and a note that the subsection governs display composition while the hard rules govern write scoping and the "Persists" column is untouched. The tab ladder is enforced by `getTabDisplayTitle` (`src/lib/tab-title.ts`); the pane split by the terminal-title cache + `sessionTitleMirrorMiddleware` (`src/store/sessionTitleMirror.ts`) — name both mechanisms, not the mirror alone.
+   - Scope-table update: the Tab label row's "Written by" column gains the create-time explicit name — `name` on a REST/MCP tab create (agent API / MCP) — since Task 1 makes that a tab-label write in the same rung as TabBar inline rename / `PATCH /api/tabs/:id`. No other row changes.
 
 - [ ] **Step 5: Run the focused tests green**
 
 ```bash
-npm run test:vitest -- run test/unit/client/ui-commands.test.ts test/unit/client/store/sessionTitleMirror.test.ts test/unit/client/store/tabsPersistence.test.ts test/unit/client/lib/terminal-inventory-titles.test.ts
-cargo test -p freshell-server --locked --lib session_directory
+npm run test:vitest -- run test/unit/client/ui-commands.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/store/sessionTitleMirror.test.ts test/unit/client/store/tabsPersistence.test.ts test/unit/client/lib/terminal-inventory-titles.test.ts
+cargo test -p freshell-server --locked --bin freshell-server session_directory
 ```
 
-Expected: PASS on all (the two Step-3/4b reds are now green).
+Expected: PASS on all (the Step-3 reds and the 4b reds are now green).
 
 - [ ] **Step 6: Refactor while green**
 
-None needed — one field added to one fold payload; one line changed server-side; assertions moved to the new contract. Confirm no other `tab.create` consumer in the client reads `titleSetByUser` from the payload (grep `titleSetByUser` in `src/lib/` — the fold is the only writer of the flag outside explicit renames).
+Small but real: confirm `provider_display_name`'s `#[cfg(test)]` gating left no non-test caller behind (`rg -n "provider_display_name" crates/freshell-server/src/` — every hit is the gated fn, its doc comment, or `mod tests`), and confirm no other `tab.create` consumer in the client reads `titleSetByUser` from the payload (grep `titleSetByUser` in `src/lib/` — the fold is the only writer of the flag outside explicit renames). Confirm `hasTitle` semantics are unchanged in `buildSessionItems` (still `!!session.title`; the provider-label rung is display-only).
 
 - [ ] **Step 7: Impacted-test verification**
 
-Impacted set: everything that renders or persists tab titles and everything that consumes fabricated session rows:
-- Unit: `npm run test:vitest -- run test/unit/client/` (the whole client unit tree is fast; it covers tabsSlice/persistMiddleware/tab-registry-snapshot/TabBar/HistoryView/Sidebar selectors that touch titles and fabricated rows).
-- Rust: `cargo test -p freshell-server --locked --lib` (the whole server lib — session_directory feeds /api/sessions consumers).
-- Fabricated-title consumers audit (grep-verified baseline, confirm and record): `src/components/HistoryView.tsx:479-483` already falls back to `session.sessionId.slice(0, 8)` for title-less rows; `src/components/Sidebar.tsx:1199` falls back to `subtitle || projectPath || sessionLabel`; unit fixtures in `test/unit/client/store/selectors/sidebarSelectors.runningTerminal.test.ts` use client-side fixtures (unaffected by the server change). No e2e spec asserts a provider label ON a live-terminal fabricated row (verified by grep over `test/e2e-browser/specs/`; re-grep `OpenCode`/`Codex CLI`/`Claude CLI` strip/row assertions to confirm).
+Impacted set: everything that renders or persists tab titles, everything that consumes fabricated session rows, and both analyzed `titleSetByUser` side effects:
+- Unit: `npm run test:vitest -- run test/unit/client/` (the whole client unit tree is fast; it covers tabsSlice/persistMiddleware/persistedState/tab-registry-snapshot/TabBar/HistoryView/Sidebar selectors that touch titles and fabricated rows — including the `shouldKeepClosedTab` keep-policy suites for named agent tabs and the OSC/`(exit N)` title-freeze behavior, both analyzed as intended consequences in the Resolution).
+- Rust: `cargo test -p freshell-server --locked --bin freshell-server` (the whole server bin unit suite — session_directory feeds /api/sessions consumers).
+- Fabricated-title consumers audit (grep-verified baseline, confirm and record): the sidebar row's main label is `sidebarSelectors.ts:264` rendered at `Sidebar.tsx:1175` — now the provider-label rung (4c-2); `Sidebar.tsx:1199` is the tooltip's project line and is untouched. `src/components/HistoryView.tsx:479-483` keeps `session.title || sessionId.slice(0, 8)` for its main label WITH its existing `getProviderLabel` badge right beside it — accepted residual (the cited regression is the sidebar row, which has no badge). Unit fixtures in `test/unit/client/store/selectors/sidebarSelectors.runningTerminal.test.ts` exercise the client-side fallback rows (`buildSessionItems([], …, terminals, …)`), which already use `getProviderLabel` — unaffected by the server change. No e2e spec asserts a provider label ON a live-terminal fabricated row (verified by grep over `test/e2e-browser/specs/`; re-grep `OpenCode`/`Codex CLI`/`Claude CLI` sidebar-row assertions to confirm — the current hits are pickers, pane headers, and banners).
 - The four e2e specs re-run green in Task 2 (do not double-run here).
 
-Run: `npm run test:vitest -- run test/unit/client/ && cargo test -p freshell-server --locked --lib`
+Run: `npm run test:vitest -- run test/unit/client/ && cargo test -p freshell-server --locked --bin freshell-server`
 
 Expected: PASS.
 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/lib/ui-commands.ts crates/freshell-server/src/session_directory.rs test/unit/client/ui-commands.test.ts test/unit/client/store/sessionTitleMirror.test.ts docs/development/rename-scope-contract.md
+git add src/lib/ui-commands.ts src/store/selectors/sidebarSelectors.ts crates/freshell-server/src/session_directory.rs test/unit/client/ui-commands.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/store/sessionTitleMirror.test.ts docs/development/rename-scope-contract.md
 git commit -m "fix(titles): explicit creator tab names outrank mirrored/auto pane titles; fabricated live-terminal rows carry no title"
 ```
 
@@ -357,7 +428,11 @@ In `pane_ledger_tests.rs`, extend `load_index_dir_io_errors_disable_the_ledger_l
     std::fs::write(poison_root.join("pending"), b"not a dir").unwrap();
     let (events, guard) = crate::invariants::capture::capture();
     std::thread::spawn(move || {
-        let _poisoned = PaneLedger::new(Some(poison_root));
+        // clone: `PaneLedger::new(root: Option<PathBuf>)` (pane_ledger.rs:1491)
+        // takes ownership — without the clone, `remove_dir_all(&poison_root)`
+        // would borrow a moved value (E0382), and Step 2's red would be a
+        // compile error instead of the diagnosed mechanism.
+        let _poisoned = PaneLedger::new(Some(poison_root.clone()));
         std::fs::remove_dir_all(&poison_root).ok();
     })
     .join()
@@ -423,7 +498,7 @@ Mechanical rule for every site: `let events = capture();` (drop the `(events, _g
 | `opencode_signal.rs:758` (`hello_files_never_hit_the_reject_warn_lane`) | NEGATIVE `.any()` by message `opencode_signal_rejected` | `path` | negative filter scoped to this test's tempdir: `!events.iter().any(rejected && path contains my dir)` |
 | `opencode_signal.rs:816` (`warns_once_for_an_opencode_pane_past_grace_with_no_hello`) | exact-1 by message `opencode_rebind_heartbeat_missing` | `terminal_id` (currently `"term-1"` — collides with the next test's rows) | rename its probe terminal to a unique `term-hb-once` and filter by `fields["terminal_id"] == "term-hb-once"` |
 | `opencode_signal.rs:832` (`no_warn_when_hello_seen_young_non_opencode_or_injection_disabled`) | negative by same message | `terminal_id` (currently `"term-1"` rows) | rename its rows to per-test-unique ids (`term-hello`, `term-young`, `term-nonoc`, `term-injdis`) and scope the negative filter to those ids |
-| `invariants.rs` internal `mod tests` — 15 call sites spanning `:544`–`:1234`: `warns_once_per_unresolved…` (`t-lost`), `never_warns_inside_the_grace_window` (`t-young`), `never_warns_for_shell_or_exited_terminals` (`t-shell`/`t-gone`), `never_warns_when_either_identity_home_resolves…`, `error_claude_restore_unresolved_emits_on_invariants_target` (`:632`), and the opencode probe-phase family `:698`–`:1234` (`:709`, `:760`, `:801`, `:835`, `:875`, `:902`, `:939`, `:992`, `:1154`, `:1234` — incl. `probe_phase_closes_the_late_row_hole_and_the_next_pass_warns` and `idle_never_submitted_pane_is_never_queued_for_probing`, whose per-test-unique terminal ids `t-late`/`t-idle`/… and `unique_opencode_home(...)` roots give the same unique-field treatment) | the `unresolved_warnings` helper (`:466`) filters by target+message only; several tests assert exact counts or emptiness | `terminal_id` (already per-test-unique `t-*` ids), `request_id` for the claude-restore test | extend the helper (or its call sites) to also filter by the test's terminal id(s); the claude-restore test filters by its `request_id`; every probe-phase site filters by its unique terminal id + home root — audit each `capture()` in the file the same way |
+| `invariants.rs` internal `mod tests` — 15 call sites spanning `:544`–`:1234`: `warns_once_per_unresolved…` (`t-lost`), `never_warns_inside_the_grace_window` (`t-young`), `never_warns_for_shell_or_exited_terminals` (`t-shell`/`t-gone`), `never_warns_when_either_identity_home_resolves…` (`t-identity`/`t-rest-resume`), `error_claude_restore_unresolved_emits_on_invariants_target` (`:632`), and the opencode probe-phase family `:698`–`:1234` (`:709`, `:760`, `:801`, `:835`, `:875`, `:902`, `:939`, `:992`, `:1154`, `:1234`) | the `unresolved_warnings` helper (`:466`) filters by target+message ONLY; several tests assert exact counts or emptiness | `terminal_id` ONLY for the unresolved-warning sites — the event carries just `terminal_id`/`mode`/`age_ms` (`invariants.rs:232-237`), so NO home-root/path filter is possible there; `request_id` for the claude-restore test (its event carries the field, `:342`) | **the terminal ids are NOT already unique — four are shared by two tests each and must be renamed per test:** `t-ev` (`:760` `…stale_candidate_evidence_still_warns` expects EXACTLY ONE warning; `:801` `…fresh_candidate_evidence_does_not_warn_yet` expects NONE), `t-late` (`:1154` `probe_phase_closes_the_late_row_hole…` expects a warning; `:939` `opencode_latch_miss…` expects NONE), `t-young` (`:585`/`:992`), `t-idle` (`:709`/`:1234`). The t-ev and t-late pairs are hard false-fails under the shared never-cleared vec (the warning-free sibling sees its sibling's warning); the t-young/t-idle pairs are negative-negative today but are renamed anyway so a later positive sibling can't silently recreate the race. Rename per test (e.g. `t-ev-stale`/`t-ev-fresh`, `t-late-hole`/`t-late-latch`, `t-young-grace`/`t-young-boundary`, `t-idle-grace`/`t-idle-never`), then extend `unresolved_warnings` (or its call sites) to also filter by the test's terminal id(s); the claude-restore test filters by its `request_id`. Every other capture site in the file keeps its already-unique id (`t-lost`, `t-shell`, `t-gone`, `t-bound`, `t-noloc`, `t-resume`, `t-identity`, `t-rest-resume`) — audit each `capture()` the same way |
 
 Any site not in this table that greps as `capture::capture()` must get the same treatment. Stage-2's grep at base dbbfd0752 verified the full census: **26 call sites in 5 files** — `pane_ledger_tests.rs:8847,:8885`; `tabs_persist_tests.rs:1217,:1270,:1321,:1376`; `claude_signal.rs:440,:598`; `opencode_signal.rs:758,:816,:832`; and `invariants.rs` ×15 (`:544,:585,:610,:632,:661,:709,:760,:801,:835,:875,:902,:939,:992,:1154,:1234` — the seven beyond `:830` are the opencode probe-phase family, outside the 59nb report's original `:544-801` range). The Step 6 re-grep remains the mechanical completeness gate.
 
@@ -442,7 +517,7 @@ Expected: PASS — the worst-case-order proof passes under the global capture (t
 
 - [ ] **Step 6: Refactor while green**
 
-Remove dead imports (`DefaultGuard`, `set_default`) and any now-unused guard bindings across the five files. Re-grep `capture::capture()` in `crates/freshell-ws/src/` to confirm every consumer was converted.
+Remove dead imports (`DefaultGuard`, `set_default`) and any now-unused guard bindings across the five files. Re-grep `capture::capture()` in `crates/freshell-ws/src/` to confirm every consumer was converted — AND audit id uniqueness, which the call-site census alone cannot detect: every `terminal_id` literal asserted against the shared vec (and every `device_id` in `tabs_persist_tests.rs`, every `temp_root` label in `pane_ledger_tests.rs`) must appear in exactly ONE test. The known collisions to confirm gone: `t-ev`, `t-late`, `t-young`, `t-idle` in `invariants.rs` (each was shared by two tests; see the Step 4 table), and the `term-1`/`term-hb-once` renames in `opencode_signal.rs`.
 
 - [ ] **Step 7: Impacted-test verification**
 
@@ -604,7 +679,7 @@ Run: `cargo test -p freshell-freshagent --locked session_init`
 
 Expected: PASS (7 passed, 0 failed).
 
-Note on red-first: this is a broadcast-order race whose red is the recorded load-flake receipt (base-gate panic `freshAgent.session.init consumed within budget` at `claude.rs`'s old `:11189`, retained at `/tmp/base-gate-run2.log:7031`) — the mechanism cannot be forced deterministically without injecting a production seam into `handle_create`'s spawn/tail ordering, which this campaign will not add (repo precedent: the stranded fix and the `97da6718a`/e2e-wall katas also shipped mechanism fixes without order-forcing seams). The deterministic coverage is Task 4's zombie red; this task's verification is repeated green under load:
+Note on red-first: the race's natural red is the recorded load-flake receipt (base-gate panic `freshAgent.session.init consumed within budget` at `claude.rs`'s old `:11189`, retained at `/tmp/base-gate-run2.log:7031`), but a DETERMINISTIC red receipt is reproducible with the stranded commit's own throwaway harness — `8186d9f3e`'s message records: "Evidence (temporary harness, not committed: a 200ms sleep before the created broadcast): before, all 3 tests failed; after, 50/50 runs of the tests passed pinned to 8 CPUs with busy loops on them." Repro recipe (UNCOMMITTED, never part of any commit): before applying Step 2, temporarily insert a 200ms `tokio::time::sleep` in `handle_create` between the stdout-consumer spawn and the `freshAgent.created` broadcast, run `cargo test -p freshell-freshagent --locked session_init` → expect the three live siblings to FAIL on the init-drain budget (record the receipts in run-state), then revert the sleep and confirm the working tree is clean before continuing. This is a throwaway repro step, not a committed production seam (repo precedent stands: no order-forcing seam is shipped). The deterministic committed coverage is Task 4's zombie red; this task's verification is repeated green under load:
 
 ```bash
 for i in 1 2 3; do cargo test -p freshell-freshagent --locked || break; done
@@ -618,7 +693,7 @@ None — the helper is the stranded branch's reviewed shape verbatim; `await_cla
 
 - [ ] **Step 5: Impacted-test verification**
 
-Impacted set: every test that drains this bus in claude.rs (the family plus any `await_claude_created` consumer) — covered by the Step 3 full-crate runs. Also confirm no other test in the crate greps for `freshAgent.session.init` with its own two-phase drain: `grep -n "freshAgent.session.init" crates/freshell-freshagent/src/claude.rs` — every hit must be inside the combined helper or a comment, none in a standalone timeout drain.
+Impacted set: every test that drains this bus in claude.rs (the family plus any `await_claude_created` consumer) — covered by the Step 3 full-crate runs. Also confirm no remaining standalone two-phase init drain: `grep -n "freshAgent.session.init" crates/freshell-freshagent/src/claude.rs` — expected hit classes are the module doc comment (~:22), the `normalize_sdk_type` mapping arm (~:8628), the frame-shape assertions in `normalize_maps_the_known_sdk_set_and_ignores_others` (~:10138) and the `sdk_line_to_frame` wire test (~:10197), and the combined helper's own comment/matcher; none is a standalone timeout drain (a `tokio::time::timeout` block matching `freshAgent.session.init` outside the combined helper). The zombie's drain copy is already gone with Task 4.
 
 - [ ] **Step 6: Commit**
 
@@ -650,16 +725,27 @@ cargo clippy -p freshell-ws -p freshell-server -p freshell-freshagent --all-targ
 
 Expected: PASS (the pre-push gate runs the same filtered checks on push; run them explicitly so failures surface before the gate).
 
-- [ ] **Step 2: Coordinated full suite**
+- [ ] **Step 2: Coordinated full suite + the full local e2e lane**
 
-Check the coordinator and run the full suite through it (broad runs wait for the shared gate; use the holder/status reason):
+`npm test` does NOT run the browser suite: it routes to `test:balanced` → `scripts/run-standard-tests.ts`, whose lanes are client, source-runtime, rust, electron, electron-runtime ONLY (verified at the base: no Playwright invocation anywhere in the file). The four e2e specs therefore need their own explicit gate — AGENTS.md requires the affected e2e specs to pass before a PR, and Task 1 changes behavior for every REST/MCP-named tab and every placeholder session row, so the net is the FULL local lane, not just the nine focused specs from Tasks 1–2.
+
+2a. Coordinated non-e2e suite (broad runs wait for the shared gate; use the holder/status reason):
 
 ```bash
 npm run test:status
 FRESHELL_TEST_SUMMARY="main-green-sixpack campaign gate: six standing failures fixed" npm test
 ```
 
-Expected: PASS — including the local e2e lane. The e2e four all run in the LOCAL lane (three of the four specs are on `CLOUD_SKIP_SPECS` — per AGENTS.md a cloud lane is NOT coverage for them; the local lane result is the campaign's authoritative e2e evidence). The 59nb/hsrh lanes are covered by the coordinated Rust suites.
+Expected: PASS — client, source-runtime, Rust (59nb/hsrh lanes covered here), electron, electron-runtime.
+
+2b. Full local e2e lane (also coordinator-gated — a zero-argument full e2e lane is a broad run; wait for the gate):
+
+```bash
+npm run test:status
+FRESHELL_TEST_SUMMARY="main-green-sixpack campaign gate: full local e2e net for title-precedence + placeholder-row changes" npm run test:e2e:local
+```
+
+Expected: PASS — every spec in `test/e2e-browser/specs/`, including all four campaign families. Census note: only TWO of the four are on `CLOUD_SKIP_SPECS` (`playwright.cloud.config.ts`: `remote-tab-linkage-rust.spec.ts` and `rest-tab-persistence.spec.ts` — deploy-tab-diff-rust and sidebar-opencode-rail are cloud-legal; `LOCAL_ONLY_SPECS` adds only `mcp-qa-smoke-rust.spec.ts`), so a cloud lane would NOT be coverage for the linkage/persistence pair regardless — the local lane result is the campaign's authoritative e2e evidence.
 
 - [ ] **Step 3: Zero-flake acceptance**
 
@@ -688,8 +774,8 @@ No files change in this task; run-state (outside the tracked worktree) carries t
 
 ## Verification summary (what proves the User Request's result)
 
-1. **Requested result — six failures fixed:** Task 1 Step 1 records the four e2e red receipts at base; Task 2 Step 3 records them green; Task 3 Steps 2/5 record the 59nb proof red→green plus 0/30 pinned-combo; Tasks 4/5 Steps 1/3 record the hsrh zombie red and family green ×3 under load; Task 6 Step 2 records the full coordinated suite green.
+1. **Requested result — six failures fixed:** Task 1 Step 1 records the four e2e red receipts at base; Task 2 Step 3 records them green; Task 3 Steps 2/5 record the 59nb proof red→green plus 0/30 pinned-combo; Tasks 4/5 Steps 1/3 record the hsrh zombie red and family green ×3 under load; Task 6 Step 2a records the coordinated non-e2e suite green and Step 2b records the FULL local e2e lane green (the complete net for the title/placeholder changes — `npm test` alone runs no Playwright).
 2. **Explicit constraint — root-cause-first, no patience raises:** no timeout value is raised anywhere in the plan; the hsrh 15s budget is retained as a dead-man switch while the wait shape becomes order-immune; the e2e fixes restore a product contract rather than extending waits.
-3. **Explicit constraint — rename-scope coherence:** the Resolution section reconciles the precedence with docs/development/rename-scope-contract.md; Task 1 Step 4e records the ladder in the contract doc; no hard rule is violated (write-scoping untouched).
+3. **Explicit constraint — rename-scope coherence:** the Resolution section reconciles the precedence with docs/development/rename-scope-contract.md; Task 1 Step 4e records the display-precedence ladders in the contract doc exactly as the code composes them (tab ladder + the pane-kind split, so no inaccurate blanket rule enters the contract) and adds the Tab-label "Written by" create-time entry; no hard rule is violated (write-scoping untouched).
 4. **Explicit constraint — one branch/PR via the campaign pattern:** single branch `main-green-sixpack` from `dbbfd0752`; PR only after explicit user approval (Task 6 Step 5).
 5. **Explicit constraint — production safety:** every command runs from the linked worktree; e2e/cargo runs spawn their own ephemeral servers; nothing touches the port-3001 production process.
