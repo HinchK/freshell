@@ -11,6 +11,9 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 - We fix the system over the symptom.
 
 ## Repo Rules
+
+Proposed package-manager migration: [pnpm migration plan](docs/plans/2026-09-19-pnpm-migration.md). This is a planning artifact, not a change to the current npm workflow.
+
 - Always work in a worktree (in \.worktrees\)
 - Pull before starting major work: `git fetch origin` and bring local `main` to `origin/main` (fast-forward) so new work always bases on the latest merged state.
 - Before creating a new worktree, ensure the repo-supported test suite is green on the intended base. If the suite is not green, pause before creating the worktree and notify the user with the failing command and failure summary.
