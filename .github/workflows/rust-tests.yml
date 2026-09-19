@@ -46,6 +46,15 @@ jobs:
         with:
           toolchain: 1.96.0
       - uses: Swatinem/rust-cache@v2
+      # The Rust suite spawns Node test fixtures (the codex fake app-server
+      # imports `ws`), so this job needs npm dependencies installed or those
+      # tests die at fixture boot ("fake app-server exited before listening").
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install npm dependencies (Rust test fixtures)
+        run: npm ci
       - name: Workspace tests
         run: cargo test --workspace --exclude freshell-tauri --locked
 
