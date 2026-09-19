@@ -142,7 +142,7 @@ npm run serve               # Build and run the Rust server
 **On WSL machines, "the desktop app" means the Windows app.** Always build, install, and launch the Windows Electron app (`npm run electron:build:win` + the NSIS installer) — never a Linux AppImage/deb under WSLg. The Windows build must run as a native Windows process so Cargo produces a native `freshell-server.exe`; drive it from WSL by rsyncing to a Windows-local dir and running Windows npm via `cmd.exe` — see [docs/development/windows-electron-build.md](docs/development/windows-electron-build.md).
 
 ### Testing
-Pre-push gate: every `git push` runs the cheap local checks (cargo fmt, typecheck, clippy) filtered by what the push changes — see [docs/development/pre-push-gate.md](docs/development/pre-push-gate.md). Bypass: `git push --no-verify`.
+Pre-push gate: every `git push` runs the cheap local checks (cargo fmt, typecheck, clippy, plus targeted `cargo test` for the changed Rust crates and their dependents when the push touches Rust) filtered by what the push changes — see [docs/development/pre-push-gate.md](docs/development/pre-push-gate.md). Bypass: `git push --no-verify`. Server-side backstop: PRs touching Rust must pass the required `rust-gate` check (workspace `cargo test`, `.github/workflows/rust-tests.yml`); PRs with no Rust changes pass it instantly.
 Backend fallback policy: never silently fall back from the configured cloud test backend to local — if the cloud path fails, fix it; a local-backend run may substitute only when the cloud path cannot be fixed AND the user explicitly approves.
 
 ```bash
