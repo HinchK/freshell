@@ -78,7 +78,7 @@ Task 1 Step 7 verifies both through the whole client unit tree (`tabsPersistence
 - **deploy-tab-diff-rust :207** — REST `name: 'work'` is rung 1 → the tabs-sync `tabName` is `"work"` at every capture (the pre-restart session-title mirror and post-restart "Codex CLI" inventory fold no longer win the display) → `verify` prints `tab=work`. The original assertion passes as written; it becomes the e2e proof that an explicit REST name survives a restart as the canonical title. Task 2 adds the identity hardening `toContain(codex.data.tabId)`.
 - **remote-tab-linkage-rust :213** — `TAB_NAME` ('remote-linkage-tab') is rung 1 → visible in the strip immediately and stably (the mirror still titles the PANE with the session name — pane-level canonical — but the tab display shows the creator name). **:310** — `tabTitleAfterClick` is read dynamically from raw Redux after the dedupe click; under the new precedence the click's sync is blocked by the `titleSetByUser` guard, so it reads `'remote-linkage-tab'`, and the post-restart strip shows the same (rung 1 persisted through `freshell.layout.v3`). Passes as written; the stale NOTE comment is corrected and a preservation pin added (Task 2).
 - **rest-tab-persistence :142/:176** — 'amplifier-poison-tab' is rung 1 pre-reload (the racy create-time "Amplifier" fold can no longer flip the display) and post-reload: `stripTabVolatileFields` (`src/store/persistMiddleware.ts:82`) spreads `...tab`, so `titleSetByUser` lands in the localStorage `freshell.layout.v3.<window-id>` payload, and the rehydrate path admits it — `persistedState.ts:53`'s `zTab` schema carries `titleSetByUser: z.boolean().optional()` (NOT `tabsSlice.ts:788`, which is the closed-tab keep policy). Passes as written.
-- **sidebar-opencode-rail :326-328** — the pane is harness-created (no REST name in play); under the fabricated-row rule the child2 placeholder row carries no title → the mirror never fires → the pane title stays the `initLayout`-derived cwd-leaf `railsubagentpane` → `Pane: railsubagentpane` renders. Passes as written; this spec IS the red→green regression test for the fabricated-row fix.
+- **sidebar-opencode-rail :326-328** — **AMENDED (execution-evidenced, see Decision Notes):** the original diagnosis (session-title mirror over a fabricated row) was wrong for this shape — the fabricated `is_subagent` row is dropped server-side (`session_directory.rs:1723`) before the client ever sees it, so the mirror never fires; the real banner writer is the terminal-directory title replay (`e78c25c8c`): registry auto-title `"OpenCode"` (`terminal.rs:5218` `mode_label`) → `terminals.changed` → `recordTerminalTitleForReplay` (`terminalDirectoryThunks.ts:198`) → `initLayout` replay. Per the pane ladder this plan itself establishes (registry auto-titles own terminal panes — the same rule that makes deploy-tab-diff print `tab=Codex CLI`), the spec's cwd-leaf expectation rotted when `e78c25c8c` landed. **Resolution: reshape the spec** — assert `Pane: OpenCode` (the pane's canonical registry auto-title) with a comment documenting the ladder + writer path; keep the rail-flow assertions intact. The Task 1 fabricated-row fix still stands on its own merits (sidebar provider-label honesty; unit-proven; contract-documented) but is NOT what makes this spec green.
 
 **Impacted-by-derivation (not the campaign four):** any spec that REST/MCP-creates a NAMED tab and asserts strip text. Verified greps: `git-badges-rust.spec.ts:190` asserts the REST name `'badge-rest-tab'` (T1 makes it strictly more stable); `fresh-agent-rest-resume-rust.spec.ts:378` already carries `titleSetByUser: true` as a field in its tabs-sync record fixture and `tabs-client-retire.spec.ts:73` already dispatches it via an `addTab` payload (consistent conventions — note :378 is a fixture field, not a dispatch); no spec asserts a session title replacing a REST name in the strip. Task 2 Step 5 runs the named-create family focused; the full local e2e lane added to Task 6 is the complete net.
 
@@ -326,7 +326,8 @@ Standing ledger items (no kata). The four specs keep their original assertions (
 **Files:**
 - Modify: `test/e2e-browser/specs/remote-tab-linkage-rust.spec.ts:255-267` (stale NOTE comment + creator-title preservation pin)
 - Modify: `test/e2e-browser/specs/deploy-tab-diff-rust.spec.ts:207` (add tabKey identity hardening)
-- No change: `test/e2e-browser/specs/rest-tab-persistence.spec.ts`, `test/e2e-browser/specs/sidebar-opencode-rail.spec.ts` — they are the regression tests as written.
+- **AMENDED** Modify: `test/e2e-browser/specs/sidebar-opencode-rail.spec.ts:326-328` — reshape the banner assertion from the rotted cwd-leaf expectation to the pane's canonical registry auto-title: assert `Pane: OpenCode` (per the amended derived-expectation bullet in the Title-Precedence Resolution; writer path `terminal.rs:5218` → `terminalDirectoryThunks.ts:198` → `initLayout` replay; add a comment documenting the ladder + writer), keep all rail-flow assertions unchanged.
+- No change: `test/e2e-browser/specs/rest-tab-persistence.spec.ts` — the regression test as written.
 
 **Interfaces:**
 - Consumes: Task 1's precedence contract (both client fold and server fabricated-row halves must be committed).
@@ -378,9 +379,11 @@ At `:207`, keep the contract assertion and add the stable-identity belt (the MIS
   → initLayout replay; see `<git-dir>/sixpack-t1t2-report.md` and probe
   receipts `reports/t1-probe-rail-title-writer*.log`). Fabricated-row mirror
   path confirmed dead (the row is also server-side is_subagent-filtered from
-  the client's pages). STOPPED per the plan-contradiction rule — needs a
-  product decision (registry-title ownership vs. cwd-leaf for CLI panes)
-  before reshaping the spec or changing product behavior.
+  the client's pages). STOPPED per the plan-contradiction rule — RESOLVED by
+  the plan owner: registry-title ownership is the ladder rule (this plan's
+  own Title-Precedence Resolution; the same rule deploy-tab-diff encodes),
+  the cwd-leaf expectation rotted with `e78c25c8c`, and the spec is reshaped
+  per the amended Files list: assert `Pane: OpenCode`.
 
 ```bash
 npm run test:e2e:local -- test/e2e-browser/specs/deploy-tab-diff-rust.spec.ts
@@ -897,3 +900,8 @@ No files change in this task; run-state (outside the tracked worktree) carries t
 3. **Explicit constraint — rename-scope coherence:** the Resolution section reconciles the precedence with docs/development/rename-scope-contract.md; Task 1 Step 4e records the display-precedence ladders in the contract doc exactly as the code composes them (tab ladder + the pane-kind split, so no inaccurate blanket rule enters the contract) and adds the Tab-label "Written by" create-time entry; no hard rule is violated (write-scoping untouched).
 4. **Explicit constraint — one branch/PR via the campaign pattern:** single branch `main-green-sixpack` from `dbbfd0752`; PR only after explicit user approval (Task 6 Step 5).
 5. **Explicit constraint — production safety:** every command runs from the linked worktree; e2e/cargo runs spawn their own ephemeral servers; nothing touches the port-3001 production process.
+
+## Decision Notes (execution amendments)
+
+- **D3 (Task 2, sidebar-opencode-rail):** The investigation's mirror-based diagnosis was wrong for this shape. Execution evidence (probe receipts t1-probe-rail-title-writer*.log): the fabricated is_subagent session row is dropped server-side (session_directory.rs:1723) and never reaches the client; the actual banner writer is the terminal-directory title replay (e78c25c8c): registry auto-title 'OpenCode' (terminal.rs:5218 mode_label) -> terminals.changed -> recordTerminalTitleForReplay (terminalDirectoryThunks.ts:198) -> initLayout replay. Decision by the plan owner: the pane ladder already in this plan (registry auto-titles own terminal panes) governs; the spec's cwd-leaf expectation rotted with e78c25c8c; the spec is reshaped to assert 'Pane: OpenCode' (canonical registry auto-title) with a documenting comment, rail-flow assertions unchanged. The Task 1 fabricated-row fix stands independently (sidebar provider-label honesty, unit-proven, contract-documented). This amendment carries to the delta review as a recorded plan deviation.
+
