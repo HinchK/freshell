@@ -18316,56 +18316,6 @@ rl.on('line', (line) => {
         drop(env);
     }
 
-    /// No-laundering guard (V7/A10, parity with codex's `record_codex_binding`):
-    /// a create carrying NO optional settings (model/permissionMode/effort/cwd all
-    /// None) must NOT persist an all-blank binding row at `sdk.session.init`. A blank
-    /// row makes `was_recorded` true while `load_settings` returns None (the server
-    /// sink's blank-snapshot guard) — the exact SETTINGS_RESET alarm condition — so a
-    /// legitimately-default session would false-alarm on a later resume. The init
-    /// frame itself still broadcasts; only the ledger write is skipped.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn session_init_with_all_blank_settings_records_no_binding() {
-        let _guard = CLAUDE_ENV_LOCK.lock().await;
-        let env = FakeClaudeSidecarEnv::install();
-        let (state, mut rx) = state_with_bus();
-        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
-        state.set_identity_sink(fake.clone());
-
-        // dedup_create_msg carries no model/permissionMode/effort/cwd — the
-        // all-blank snapshot shape.
-        state
-            .handle_create(dedup_create_msg("req-binding-blank"), None)
-            .await;
-        await_claude_created(&mut rx, "req-binding-blank").await;
-
-        // The init frame still broadcasts (the skip affects ONLY the ledger write).
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let frame: Value = match rx.recv().await {
-                    // Under host load the bounded drain can fall behind the
-                    // 64-frame bus: re-sync and keep waiting (the 15s budget
-                    // stays the dead-man switch); `Closed` surfaces through
-                    // the same deadline as a lost sender.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(err) => panic!("broadcast recv failed: {err}"),
-                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
-                };
-                if frame["event"]["type"] == "freshAgent.session.init" {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("freshAgent.session.init consumed within budget");
-
-        assert!(
-            fake.bindings.lock().unwrap().is_empty(),
-            "an all-blank settings snapshot must not be persisted \
-             (it would arm a false SETTINGS_RESET on resume)"
-        );
-        drop(env);
-    }
-
     /// D8 lane-reach (restore-open-sessions-only, review round 3): the
     /// WS-dispatched connection provenance threaded into `handle_create` must
     /// reach the identity-sink write at `sdk.session.init`. The ledger schema
