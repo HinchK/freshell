@@ -12,6 +12,17 @@ if [ "${FRESHELL_PREPUSH:-1}" = "0" ]; then
   exit 0
 fi
 
+# git exports GIT_DIR/GIT_PREFIX (the pushing worktree's gitdir) into this
+# hook. If they leak into the lane processes, every test-side `git` child
+# resolves against the SHARED repository instead of the test's own tempdir:
+# a `git init` inside a freshell-server test re-initialized the main
+# checkout's config (observed writing core.bare=true and colliding on
+# config.lock), and test add/commit landed on the main HEAD. The hook's own
+# git calls use cwd discovery (equivalent in a worktree), so strip the
+# overrides before anything runs.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX \
+  GIT_CONFIG_PARAMETERS GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+
 ZERO=0000000000000000000000000000000000000000
 changed=""
 full_gate=0
@@ -38,7 +49,7 @@ if [ "$full_gate" = 1 ]; then
   run_rust=1
   run_ts=1
 elif [ -n "$changed" ]; then
-  printf '%s' "$changed" | grep -Eq '\.rs$|Cargo\.(toml|lock)$|rust-toolchain' && run_rust=1
+  printf '%s' "$changed" | grep -Eq '\.rs$|Cargo\.(toml|lock)$|rust-toolchain|^\.cargo/|^test/fixtures/' && run_rust=1
   printf '%s' "$changed" | grep -Eq '\.(ts|tsx)$|package(-lock)?\.json$|tsconfig' && run_ts=1
 fi
 
@@ -51,6 +62,17 @@ if [ -x node_modules/.bin/tsx ]; then
   TSX="node_modules/.bin/tsx"
 elif [ -x "$HOOK_DIR/../../node_modules/.bin/tsx" ]; then
   TSX="$HOOK_DIR/../../node_modules/.bin/tsx"
+else
+  # Fresh worktrees often lack node_modules; the owning checkout (the one
+  # whose .git dir this worktree shares) has it. Derive the owning root
+  # from the git common dir so worktree pushes still get the full gate.
+  common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+  if [ -n "$common_dir" ] && [ -d "$common_dir" ]; then
+    owning_root="${common_dir%/.git}"
+    if [ "$owning_root" != "$common_dir" ] && [ -x "$owning_root/node_modules/.bin/tsx" ]; then
+      TSX="$owning_root/node_modules/.bin/tsx"
+    fi
+  fi
 fi
 
 # Targeted cargo-test plan: computed only when the rust gate fired, so

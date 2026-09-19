@@ -30,7 +30,12 @@ function isRustRelevant(p: string): boolean {
     /(^|\/)Cargo\.toml$/.test(p) ||
     /(^|\/)Cargo\.lock$/.test(p) ||
     /^rust-toolchain/.test(p) ||
-    /^\.cargo\//.test(p)
+    /^\.cargo\//.test(p) ||
+    // Test fixtures are cross-crate rust-test infrastructure (e.g. the
+    // codex fake app-server consumed by freshell-codex/freshell-ws tests):
+    // a fixture change can break any crate's tests, and no single crate
+    // owns the path, so it routes to the whole workspace.
+    /^test\/fixtures\//.test(p)
   )
 }
 

@@ -96,6 +96,18 @@ describe('computeRustTestPlan', () => {
     expect(computeRustTestPlan(['tools/foo.rs'], graph)).toEqual({ mode: 'workspace' })
   })
 
+  it('treats test fixtures consumed by rust tests as workspace-wide', () => {
+    expect(
+      computeRustTestPlan(['test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs'], graph),
+    ).toEqual({ mode: 'workspace' })
+  })
+
+  it('widens to the workspace when a fixture change mixes with a crate change', () => {
+    expect(
+      computeRustTestPlan(['test/fixtures/x.mjs', 'crates/freshell-terminal/src/x.rs'], graph),
+    ).toEqual({ mode: 'workspace' })
+  })
+
   it('treats crate-local manifests as crate changes', () => {
     expect(computeRustTestPlan(['crates/freshell-ws/Cargo.toml'], graph)).toEqual({
       mode: 'packages',
@@ -197,11 +209,30 @@ describe('planToInvocation', () => {
 
 describe('pre-push hook routing (hermetic fixture repo)', () => {
   const hookPath = path.resolve(import.meta.dirname, '../../../scripts/hooks/pre-push')
+
+  // The hook resolves tsx from cwd, the script dir, or the owning checkout.
+  // A fresh worktree has no node_modules, so pin the real tsx from the
+  // owning checkout and stub it into the fixture repo — the hermetic tests
+  // then exercise the hook's full chain regardless of the worktree's
+  // install state (the hook passes the real rust-test-targets.ts path as
+  // the script argument, so the stub only supplies the runtime).
+  const owningRoot = (() => {
+    const commonDir = spawnSync(
+      'git',
+      ['rev-parse', '--path-format=absolute', '--git-common-dir'],
+      { cwd: import.meta.dirname, encoding: 'utf8' },
+    )
+    return (commonDir.stdout ?? '').trim().replace(/\/\.git$/, '')
+  })()
+  const realTsx = path.join(owningRoot, 'node_modules', '.bin', 'tsx')
+
   let fixtureRoot: string
   let baseSha: string
   let rustSha: string
   let docsSha: string
   let tauriSha: string
+  let fixtureSha: string
+  let cargoConfigSha: string
 
   function git(args: string[], opts: { cwd: string; stdin?: string } = { cwd: '' }): string {
     const res = spawnSync('git', args, { cwd: opts.cwd, encoding: 'utf8' })
@@ -229,7 +260,12 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
   }
 
   beforeAll(() => {
+    if (!fs.existsSync(realTsx)) throw new Error(`owning checkout tsx missing: ${realTsx}`)
     fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'prepush-routing-'))
+    const stubDir = path.join(fixtureRoot, 'node_modules/.bin')
+    fs.mkdirSync(stubDir, { recursive: true })
+    fs.writeFileSync(path.join(stubDir, 'tsx'), `#!/bin/sh\nexec "${realTsx}" "$@"\n`)
+    fs.chmodSync(path.join(stubDir, 'tsx'), 0o755)
     git(['init', '-q', '-b', 'main'], { cwd: fixtureRoot })
     writeFixture(
       path.join(fixtureRoot, 'Cargo.toml'),
@@ -275,16 +311,29 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
 
     writeFixture(path.join(fixtureRoot, 'crates/freshell-tauri/src/main.rs'), 'fn main() {}\n')
     tauriSha = commit('rust: tauri-only change')
+
+    writeFixture(
+      path.join(fixtureRoot, 'test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs'),
+      '// fixture change\n',
+    )
+    fixtureSha = commit('test fixture change')
+
+    writeFixture(path.join(fixtureRoot, '.cargo/config.toml'), '[build]\n')
+    cargoConfigSha = commit('cargo config change')
   })
 
   afterAll(() => {
     fs.rmSync(fixtureRoot, { recursive: true, force: true })
   })
 
-  function runHook(localSha: string, remoteSha: string): { status: number; stderr: string } {
+  function runHook(
+    localSha: string,
+    remoteSha: string,
+    extraEnv: Record<string, string> = {},
+  ): { status: number; stderr: string } {
     const res = spawnSync('bash', [hookPath], {
       input: `refs/heads/x ${localSha} refs/heads/x ${remoteSha}\n`,
-      env: { ...process.env, FRESHELL_PREPUSH_DEBUG: '1' },
+      env: { ...process.env, ...extraEnv, FRESHELL_PREPUSH_DEBUG: '1' },
       encoding: 'utf8',
       cwd: fixtureRoot,
     })
@@ -304,11 +353,37 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
     expect(out.stderr).toContain('test_mode=packages test_pkgs=freshell-freshagent freshell-server freshell-ws')
   })
 
+  it('strips git hook env overrides (GIT_DIR et al) before any lane runs', () => {
+    // git exports GIT_DIR/GIT_PREFIX into real pre-push invocations (the
+    // pushing worktree's gitdir). Unstripped, a bogus or stale GIT_DIR breaks
+    // the hook's own routing git calls — and in non-debug mode the leaked
+    // vars redirect every test-side git child at the SHARED repository
+    // (observed: cargo-test children re-initialized the main checkout's
+    // config). The hook must resolve everything via cwd discovery instead.
+    const out = runHook(rustSha, baseSha, { GIT_DIR: '/nonexistent-prepush-hook-env' })
+    expect(out.status).toBe(0)
+    expect(out.stderr).toContain('test_mode=packages test_pkgs=freshell-freshagent freshell-server freshell-ws')
+  })
+
   it('skips the test lane for tauri-only changes (clippy parity)', () => {
     const out = runHook(tauriSha, docsSha)
     expect(out.status).toBe(0)
     expect(out.stderr).toContain('run_rust=1')
     expect(out.stderr).toContain('test_mode=skip')
+  })
+
+  it('runs the workspace test lane for test-fixture changes', () => {
+    const out = runHook(fixtureSha, tauriSha)
+    expect(out.status).toBe(0)
+    expect(out.stderr).toContain('run_rust=1')
+    expect(out.stderr).toContain('test_mode=workspace')
+  })
+
+  it('runs the rust gate for cargo-config changes', () => {
+    const out = runHook(cargoConfigSha, fixtureSha)
+    expect(out.status).toBe(0)
+    expect(out.stderr).toContain('run_rust=1')
+    expect(out.stderr).toContain('test_mode=workspace')
   })
 
   it('runs the full gate when the merge base is unknown', () => {
