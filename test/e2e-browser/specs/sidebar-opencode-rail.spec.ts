@@ -61,8 +61,14 @@ const CHILD2_TITLE = 'Rail e2e subagent child session two'
  * `Pane: OpenCode` (registry auto-title: terminal.rs mode_label ->
  * terminals.changed -> recordTerminalTitleForReplay -> initLayout
  * replay; rotted with e78c25c8c). The leaf survives only as the cwd a
- * client-side FALLBACK rail row for this pane would be badged with --
- * giving the "no rail entry for the child-target terminal" assertion a
+ * client-side FALLBACK rail row for this pane would be badged with:
+ * that row is the pane-content fallback (`pushFallbackItem` /
+ * `collectFallbackItemsFromNode` in sidebarSelectors.ts), which takes
+ * its cwd from the pane content's `initialCwd`, NOT from the
+ * terminal's cwd (the terminal-cwd-badged shapes -- the server's
+ * fabricated row and the manufactured live-terminal row -- are what
+ * CHILD_TERMINAL_CWD_LEAF negates below). This gives the "no rail
+ * entry for the child-target terminal" assertion a
  * unique, greppable name to negate instead of the generic provider
  * label "OpenCode" (which the tab strip, the pane picker, and the pane
  * banner itself also render).
