@@ -905,6 +905,21 @@ Then STOP and ask the user for explicit PR-creation approval (repo rule: no `gh 
 
 No files change in this task; run-state (outside the tracked worktree) carries the receipts.
 
+### Task 6 addendum — D7 checklist (post-wrap amendment, executed 2026-09-19)
+
+D7 (the second landing blocker: the PR #795-landed freshell-freshagent red family
+the rust-gate exposes on the runner — investigation
+`reports/investigate-795-family.md`, full report `sixpack-d7-report.md` in the
+git dir) executed after the Task 6 gate. Commits `65f2994d7` (c),
+`fec4fc696` (a+b+d), `d1d992614` (e); receipts `reports/d7-*.log`.
+
+- [x] **(c) REAL REGRESSION — send-time metadata broadcast restored** (`claude::tests::a_settings_changing_send_broadcasts_session_metadata`): the before/after block from `bf9b8d31a` is back in `handle_send` (mirroring `handle_configure`'s emission) — a settings-changing send again converges every device's model surfaces. Red→green with the test unchanged (`d7-red-c-metadata.log` / `d7-green-c-metadata.log`). Kata **p6q2 CLOSED --done** with evidence.
+- [x] **(a) 8 codex `a_stale_{fence,generation}_*` fixtures reshaped to r30 alive-at-commit creates** — the crashed state is built by hand (the manual exited flip each test already performed + its own `begin_handoff`/`fail` advance/vacate); every stale-refusal assertion still exercises the fencing semantics at the coordinator claim, which precedes any respawn (27/27 `a_stale_*` green, `d7-green-a-stale-family.log`). Kata **7ad4 CLOSED --done** with evidence.
+- [x] **(b) opencode_ws `a_stale_fence_map_hit` fixture seeds a materialized row** (`real_session_id: Some`) per gate-C, so the attach reaches the r15 F1 fenced map-hit adopt claim it covers; both create-path siblings sharing the fixture stay green (`d7-green-b-map-hit-final.log`). Kata **17eh CLOSED --done** with evidence.
+- [x] **(d) `fork_in_flight_guard_covers_the_respawn_rekeyed_parent_id` made deterministic** — alive-at-commit create + exited flip + `clear_binding` (the watcher's own confirmed-death release) + the existing `mark_thread_dead`; the CI-only `Elapsed` is root-caused to the fail-closed reap-confirmation dependency (retained binding ⇒ `BoundLive`→`Recovered` hijack, or a retained condemned prior ⇒ `Reserved`) and removed (`d7-green-d-fork-guard.log`).
+- [x] **(e) session_handoff old-rebound codex handoff made hermetic** — the target spawn routes through the committed fake app-server (`CODEX_CMD` wrapper, now `pub(crate)`), never a host-installed `codex` (`d7-green-e-handoff.log`).
+- [x] **Verification:** whole-crate `cargo test -p freshell-freshagent --locked --lib` **1154 passed / 0 failed** (`d7-whole-crate-freshagent.log` — the crate is FULLY green; D4's recorded standing-red set is CLEARED, closing the rust-gate blocker); `freshell-codex --lib` 139 passed (`d7-codex-crate.log`); the 59nb trio (pane_ledger 170 / invariants 19 / worst-case-proof 1) green (`d7-59nb-*.log`); session_handoff module 76/76 (`d7-green-session-handoff-module.log`); clippy `-D warnings` + fmt clean (`d7-clippy-freshagent.log`, `d7-fmt.log`). 84nb stays separately recorded (not D7's scope).
+
 ---
 
 ## Verification summary (what proves the User Request's result)
