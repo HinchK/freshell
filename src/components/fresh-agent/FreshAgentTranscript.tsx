@@ -25,7 +25,7 @@ import { FreshAgentTranscriptMinimap } from './FreshAgentTranscriptMinimap'
 import { deriveGlomTarget, measureTranscriptUserTurns, type TranscriptMeasurement } from './shared/transcript-measurement'
 import { registerFreshAgentTurnItems } from '@/lib/pane-action-registry'
 import { buildLongPressHandlers, useCoarsePointer } from '@/lib/pointer'
-import { getFreshAgentDisplayTurnKey, turnSummaryIsAuthored } from '@shared/fresh-agent-turns'
+import { getFreshAgentDisplayTurnKey, reclassifyPtyNotificationTurns, turnSummaryIsAuthored } from '@shared/fresh-agent-turns'
 
 function getTurnLabel(turn: FreshAgentTurn, agentLabel?: string): string {
   switch (turn.role) {
@@ -1106,7 +1106,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   const historicalSteps = historicalMarkers.filter((t) => t.role === 'user').length
   const resolvedShowTimecodes = showTimecodes ?? showModel
   const displayTurns = useMemo(() => (
-    coalesceSyntheticToolResultTurns(turns)
+    coalesceSyntheticToolResultTurns(reclassifyPtyNotificationTurns(turns))
   ), [turns])
   const { layouts: turnLayouts, lineEndIndex, tail, tailCaption } = useMemo(
     () => buildTranscriptLayout(displayTurns),
