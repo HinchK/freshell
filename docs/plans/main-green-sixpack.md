@@ -641,7 +641,7 @@ Closes part 2 of **kata hsrh**. Root cause (proven, and already root-caused on t
 - Consumes: the stranded branch `origin/fix-session-init-provenance-flake` @ `8186d9f3e` — the FRAME-drain helper is taken verbatim from `git show 8186d9f3e -- crates/freshell-freshagent/src/claude.rs` (reproduced below so the task is self-contained; its base predates `54850ac5c`'s deferral, which is exactly why the row barrier must be ADDED here); `await_claude_created` (unchanged); the 64-frame broadcast bus + `Lagged`-resync idiom shared by every drain in the file; `FakeIdentitySink::bindings` (`identity_sink.rs:605`, `std::sync::Mutex<Vec<FreshAgentBindingUpsert>>`) and `FRESH_CREATE_DURABLE_ID` (`claude.rs:12969` — the fake sidecar's fixed cliSessionId `aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa`, the key every create's binding row lands under in these tests; a same-module const, so the helper can reference it regardless of declaration order).
 - Produces: no production change (test-only). The family is race-immune at BOTH orderings: no frame is ever discarded (either-order drain), and no assertion races the deferred binding write (the row barrier).
 
-- [ ] **Step 1: Add the combined either-order drain helper (verbatim from 8186d9f3e) AND its row-barrier companion**
+- [x] **Step 1: Add the combined either-order drain helper (verbatim from 8186d9f3e) AND its row-barrier companion**
 
 Insert the frame-drain helper immediately after the `await_claude_created` helper (after its closing `}` around `claude.rs:11033`):
 
@@ -758,7 +758,7 @@ Then insert the row-barrier companion IMMEDIATELY AFTER it (NEW at this base —
 
 (`FRESH_CREATE_DURABLE_ID` is a same-module const (`claude.rs:12969`) — items are order-independent in a module, so the helper may reference it; `FreshAgentBindingUpsert` is Clone — the lineage test already clones the row it finds at `:18141-18144`. The find predicate is exactly the lineage-row test's existing predicate (`:18138-18139`), so one barrier serves all three tests: each test's fake is private and its single create lands the row under that one durable id.)
 
-- [ ] **Step 2: Replace the two-phase drain in the three live siblings (drain + row barrier + comment corrections + row-sourced assertions)**
+- [x] **Step 2: Replace the two-phase drain in the three live siblings (drain + row barrier + comment corrections + row-sourced assertions)**
 
 In each of the three tests named above, make FOUR changes:
 
@@ -782,7 +782,7 @@ In each of the three tests named above, make FOUR changes:
 
 Verify against `git show 8186d9f3e` that the FRAME-drain call-site shape matches the stranded branch's intent (the row barrier has no stranded counterpart — it is this base's addition). Do NOT apply the stranded commit by cherry-pick or merge: stage 2 verified via read-only `git merge-tree` that a mechanical 3-way merge onto dbbfd0752 is textually clean but applies the `req-binding-blank` hunk onto the ZOMBIE's drain copy (`:18336-18359`), leaving the LIVE lineage-row test's two-phase drain (`:18110-18130`) unconverted — the conversion MUST be applied by test name as this step prescribes, and the zombie's copy disappears with Task 4's deletion.
 
-- [ ] **Step 3: Run the family green**
+- [x] **Step 3: Run the family green**
 
 Run: `cargo test -p freshell-freshagent --locked session_init`
 
@@ -800,15 +800,15 @@ for i in 1 2 3; do cargo test -p freshell-freshagent --locked || break; done
 
 Expected: PASS ×3 (the full crate spawns real node sidecars under parallel load — the exact condition that fired the flake). **Known-open sibling-flake allowance (the ×3 loop):** the same load conditions fire the still-open kata-on-file sibling 3fxd/y5fw — `approval_respond_write_failure_keeps_the_pending_entry_and_emits_the_error` (`claude.rs:17450`, the a2 write-then-remove ordering pin; recorded as a load flake in the hsrh investigation). If it — or any other kata-on-file load flake — fails in a loop iteration: re-run THAT test focused (`cargo test -p freshell-freshagent --locked approval_respond_write_failure`); a focused PASS confirms the recorded flake shape — record the occurrence in run-state, do NOT count it against the ×3 (continue the loop), and do NOT fix it (out of scope: a separate kata family, recorded untouched). A focused re-run that STILL fails is a campaign defect: STOP and diagnose against Tasks 4/5 before proceeding.
 
-- [ ] **Step 4: Refactor while green**
+- [x] **Step 4: Refactor while green**
 
 None — the frame-drain helper is the stranded branch's reviewed shape verbatim, the row barrier is the shape specified in Step 1, and `await_claude_created` remains for the tests that legitimately need created-only waits.
 
-- [ ] **Step 5: Impacted-test verification**
+- [x] **Step 5: Impacted-test verification**
 
 Impacted set: every test that drains this bus in claude.rs (the family plus any `await_claude_created` consumer) — covered by the Step 3 full-crate runs. Also confirm no remaining standalone two-phase init drain: `grep -n "freshAgent.session.init" crates/freshell-freshagent/src/claude.rs` — expected hit classes are the module doc comment (~:22), the `normalize_sdk_type` mapping arm (~:8628), the frame-shape assertions in `normalize_maps_the_known_sdk_set_and_ignores_others` (~:10138) and the `sdk_line_to_frame` wire test (~:10197), and the combined helper's own comment/matcher; none is a standalone timeout drain (a `tokio::time::timeout` block matching `freshAgent.session.init` outside the combined helper). The zombie's drain copy is already gone with Task 4.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/freshell-freshagent/src/claude.rs
