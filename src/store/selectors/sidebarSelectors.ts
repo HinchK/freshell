@@ -261,7 +261,25 @@ export function buildSessionItems(
         sessionId: session.sessionId,
         provider,
         sessionType: session.sessionType || provider,
-        title: session.title || session.sessionId.slice(0, 8),
+        // A title-less RUNNING live-terminal row (a server-fabricated
+        // placeholder — build_live_terminal_session_item, either variant:
+        // `terminal:<id>` sessionIds or a bound-but-unindexed session id)
+        // keeps its provider label instead of degrading to "terminal" or an
+        // id prefix. Every fabricated row carries isRunning +
+        // runningTerminalId on the wire; real title-less rows keep today's
+        // id-prefix fallback. Same helper as the client-side fallback row's
+        // LAST rung (:511 composes the pane title, then the terminal title,
+        // then getProviderLabel), so the label is stable when the server row
+        // replaces the fallback row — with one honest cosmetic change:
+        // getProviderLabel without extension data renders
+        // Opencode/Codex/Claude, where the server's now-deleted fabricated
+        // titles read OpenCode/Codex CLI/Claude CLI (provider_display_name).
+        // hasTitle stays !!session.title — this is a display fallback, not a
+        // session title; later title-carrying fetches still override it.
+        title: session.title
+          || ((session.isRunning && session.runningTerminalId)
+            ? getProviderLabel(provider)
+            : session.sessionId.slice(0, 8)),
         hasTitle,
         subtitle: getProjectName(effectivePath),
         projectPath: effectivePath,

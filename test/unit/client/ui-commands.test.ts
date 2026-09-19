@@ -35,6 +35,24 @@ describe('handleUiCommand', () => {
     expect(actions[0].payload.activate).toBe(false)
   })
 
+  it('tab.create folds a non-empty caller-provided title as a user-set title; unnamed creates stay unset', () => {
+    const actions: any[] = []
+    const dispatch = (action: any) => { actions.push(action); return action }
+
+    // Named create (REST/MCP `name`) — the title is an explicit creator title
+    // and must outrank pane-title overrides (mirror / registry auto-titles)
+    // in getTabDisplayTitle, before AND after a reload or restart.
+    handleUiCommand({ type: 'ui.command', command: 'tab.create', payload: { id: 't-named', title: 'work' } }, dispatch)
+    expect(actions[0].type).toBe('tabs/addTab')
+    expect(actions[0].payload.titleSetByUser).toBe(true)
+
+    // Unnamed create — no caller title; derived/mirror behavior unchanged.
+    const actions2: any[] = []
+    const dispatch2 = (action: any) => { actions2.push(action); return action }
+    handleUiCommand({ type: 'ui.command', command: 'tab.create', payload: { id: 't-unnamed', title: null } }, dispatch2)
+    expect(actions2[0].payload.titleSetByUser).toBeUndefined()
+  })
+
   it('initializes layout when tab.create includes pane content', () => {
     const actions: any[] = []
     const dispatch = (action: any) => {

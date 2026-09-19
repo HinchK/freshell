@@ -6,7 +6,7 @@ one owner and each rename surface writes exactly one scope:
 | Scope | Owned by | Written by | Persists |
 | --- | --- | --- | --- |
 | Pane label | the pane (layout snapshot) | pane header inline rename; `PATCH /api/panes/:id` (agent API / MCP) | layout snapshot only |
-| Tab label | the tab (layout organization) | TabBar inline rename; `PATCH /api/tabs/:id` | layout snapshot only |
+| Tab label | the tab (layout organization) | TabBar inline rename; `PATCH /api/tabs/:id`; `name` on a REST/MCP tab create (agent API / MCP) | layout snapshot only |
 | Terminal title | the terminal process | `PATCH /api/terminals/:id` (Overview card / terminal context menu) | `terminalOverrides[terminalId]` |
 | Session title | the durable provider session | `PATCH /api/sessions/:key` (sidebar/history "Rename") | `sessionOverrides["provider:sessionId"]` |
 
@@ -49,3 +49,51 @@ Hard rules:
    one-generation `config.backup.json` (refreshed on every persist) are the
    recoverable path. The `titleSource` ladder (`shared/title-source.ts`)
    still governs all automatic writers.
+
+## Display precedence (composition of stored labels)
+
+The rules above govern WRITE scoping (who owns which rename surface). This
+section records how the DISPLAY composes the several labels one tab or row can
+hold at read time — exactly as the code composes them. The "Persists" column
+above is untouched by this section.
+
+**Tab display title** (enforced by `getTabDisplayTitle`, `src/lib/tab-title.ts`):
+
+1. **Explicit title** — `tab.title` with `titleSetByUser: true`: a TabBar
+   inline rename, a `PATCH /api/tabs/:id`, or an explicit non-empty `name` on a
+   REST/MCP tab create (the `tab.create` fold sets the user flag for
+   caller-provided names). An empty explicit title falls through.
+2. **Single-pane override** — the sole leaf pane's stored non-derived pane
+   title, whatever composed it (see the pane ladder below — a registry
+   auto-title like "Codex CLI" or a mirrored session title can show as the
+   tab title when no explicit title outranks it).
+3. **Stored non-derived `tab.title`** set without the user flag (create-time
+   mode labels like "Amplifier").
+4. **cwd-leaf derived titles** — the `deriveTabName`/`derivePaneTitle`
+   fallbacks.
+
+**Pane title** — composed per pane kind (NOT a blanket mirror-over-auto rule;
+enforced by the terminal-title cache plus `sessionTitleMirrorMiddleware`,
+`src/store/sessionTitleMirror.ts`):
+
+- A **user-set pane title** is never mirrored over.
+- **Terminal panes**: a cached terminal-level title outranks the session-title
+  mirror — the mirror skips any terminal pane whose `terminalId` has a cached
+  title (`collectSessionTitleTargets`, `sessionTitleMirror.ts`), so registry
+  auto-titles ("Codex CLI"), `PATCH /api/terminals/:id` renames, and the
+  inventory/live folds own that pane; the mirror only titles terminal panes
+  with NO cached terminal title (unattached/exited/not-yet-reattached panes).
+- **Fresh-agent panes**: no registry pipeline — the session-title mirror is
+  their runtime title source (always eligible).
+- Fallback: the `initLayout`-derived cwd-leaf.
+
+**Fabricated live-terminal session rows** (server placeholders for live
+terminals with no indexed session yet, `build_live_terminal_session_item` in
+`crates/freshell-server/src/session_directory.rs`): they carry NO title — a
+provider label is not a session name, and the mirror's no-title skip leaves
+real pane titles alone. The client keeps such rows meaningful at display
+time: the sidebar row's label for a title-less running live-terminal row
+falls back to the provider label (`getProviderLabel`,
+`src/store/selectors/sidebarSelectors.ts`); every other title-less row keeps
+the id-prefix fallback. The label is a display fallback only — `hasTitle`
+stays false, and a later title-carrying fetch still overrides it.

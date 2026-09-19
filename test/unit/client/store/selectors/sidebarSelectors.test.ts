@@ -619,6 +619,28 @@ describe('sidebarSelectors', () => {
       })
     })
 
+    it('keeps a provider label on title-less running live-terminal rows instead of an id prefix', () => {
+      const projects = [{
+        projectPath: '/repo',
+        sessions: [
+          // Fabricated variant A: terminal:<id> sessionId (today would render
+          // literally "terminal" once the server stops fabricating titles).
+          { provider: 'codex', sessionId: 'terminal:term-9', projectPath: '/repo', lastActivityAt: 1_000, isRunning: true, runningTerminalId: 'term-9' },
+          // Fabricated variant B: bound-but-unindexed session id (the
+          // sidebar-opencode-rail child2 shape).
+          { provider: 'opencode', sessionId: 'ses-child2', projectPath: '/repo', lastActivityAt: 1_000, isRunning: true, runningTerminalId: 'term-c2' },
+          // Real title-less row, NOT running: keeps today's id-prefix fallback.
+          { provider: 'claude', sessionId: 'claude-real-no-title', projectPath: '/repo', lastActivityAt: 900 },
+        ] as any,
+      }]
+      const items = buildSessionItems(projects, emptyTabs, emptyPanes, emptyTerminals, emptyActivity)
+      expect(items.find((i) => i.sessionId === 'terminal:term-9')?.title).toBe('Codex')
+      expect(items.find((i) => i.sessionId === 'ses-child2')?.title).toBe('Opencode')
+      expect(items.find((i) => i.sessionId === 'claude-real-no-title')?.title).toBe('claude-r')
+      // Display fallback only — the row still reports no session title.
+      expect(items.find((i) => i.sessionId === 'terminal:term-9')?.hasTitle).toBe(false)
+    })
+
     it('preserves fallback visibility metadata from tab session metadata so hidden sessions stay filtered', () => {
       const hiddenSessionId = 'codex-hidden'
       const tabs = [
