@@ -26,6 +26,7 @@ Vitest/e2e/electron lanes and the real-transport clippy lanes stay with the norm
 - Bypass (emergencies only): `git push --no-verify`
 - Disable for one push: `FRESHELL_PREPUSH=0 git push ...`
 - See routing without running checks: `FRESHELL_PREPUSH_DEBUG=1 git push --dry-run ...`
+- Bypass the server-side `rust-gate` (merge-time, PRs only): the owner account is a `pull_request`-mode bypass actor on the "Protect Main - No Direct Push" ruleset, so merging with a red or missing `rust-gate` is just `gh pr merge <n> --merge` from that account — GitHub records it as a ruleset bypass with an audit entry. This is the explicit escape hatch for landing on a red base; it does NOT unlock direct pushes to main.
 - If a lane's tooling is unavailable it is skipped with an accurate warning (not a failure). The hook self-heals stripped-environment contexts (ssh/agents/IDEs/cron): it sources `~/.nvm/nvm.sh` when `npm` is missing from PATH, and adds `~/.cargo/bin` when `cargo` is missing.
 
 ## Setup
