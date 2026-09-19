@@ -87,13 +87,10 @@ enforced by the terminal-title cache plus `sessionTitleMirrorMiddleware`,
   their runtime title source (always eligible).
 - Fallback: the `initLayout`-derived cwd-leaf.
 
-**Fabricated live-terminal session rows** (server placeholders for live
-terminals with no indexed session yet, `build_live_terminal_session_item` in
-`crates/freshell-server/src/session_directory.rs`): they carry NO title — a
-provider label is not a session name, and the mirror's no-title skip leaves
-real pane titles alone. The client keeps such rows meaningful at display
-time: the sidebar row's label for a title-less running live-terminal row
-falls back to the provider label (`getProviderLabel`,
-`src/store/selectors/sidebarSelectors.ts`); every other title-less row keeps
-the id-prefix fallback. The label is a display fallback only — `hasTitle`
-stays false, and a later title-carrying fetch still overrides it.
+**Title-less running session rows** (a real session whose transcript has not
+yet yielded a title): the sidebar row's label composes the same name order the
+client-side fallback row uses — pane title, then the terminal's registry
+title, then the provider label (`src/store/selectors/sidebarSelectors.ts`);
+every other title-less row keeps the id-prefix fallback. The label is a
+display fallback only — `hasTitle` stays false, and a later title-carrying
+fetch still overrides it.

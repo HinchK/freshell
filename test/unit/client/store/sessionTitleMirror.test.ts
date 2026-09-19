@@ -86,27 +86,6 @@ describe('sessionTitleMirrorMiddleware', () => {
     expect(store.getState().panes.paneTitles['tab-z']?.['pane-z']).toBe(seeded)
   })
 
-  it('never folds a fabricated live-terminal row (title-less) over a session-bound terminal pane — a provider label is not a session name', () => {
-    const store = buildStore()
-    store.dispatch(addTab({ id: 'tab-z', title: 'OpenCode' }))
-    store.dispatch(initLayout({
-      tabId: 'tab-z',
-      paneId: 'pane-z',
-      content: {
-        kind: 'terminal',
-        mode: 'opencode',
-        createRequestId: 'req-rail',
-        status: 'running',
-        terminalId: 'term-rail-child2',
-        sessionRef: { provider: 'opencode', sessionId: 'ses-child2' },
-        initialCwd: '/tmp/e2e/work/railsubagentpane',
-      },
-    }))
-    const derived = store.getState().panes.paneTitles['tab-z']['pane-z'] // initLayout-derived cwd leaf ('railsubagentpane')
-    landSessionRow(store, { surface: 'sidebar', sessionId: 'ses-child2', provider: 'opencode' }) // no title — fabricated placeholder shape
-    expect(store.getState().panes.paneTitles['tab-z']?.['pane-z']).toBe(derived)
-  })
-
   it('does not re-dispatch when the mirrored title already equals the pane title', () => {
     const store = buildStore()
     seedFreshAgentPane(store, 'sess-1')

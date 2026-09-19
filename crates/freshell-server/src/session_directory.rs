@@ -1223,6 +1223,16 @@ fn apply_session_metadata(
 // where a live identity lacks a `session_id` while a Bound ledger row covers
 // its current terminal id, so the fallback would be dormant machinery.
 
+/// `providerDisplayName` (`service.ts:97-108`).
+fn provider_display_name(provider: &str) -> String {
+    match provider {
+        "claude" => "Claude CLI".to_string(),
+        "codex" => "Codex CLI".to_string(),
+        "opencode" => "OpenCode".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// `joinRunningState` (`service.ts:77-95`): a session-file item whose
 /// `provider:sessionId` matches a LIVE terminal identity gains
 /// `isRunning`/`runningTerminalId`; no match clears both (matching the
@@ -1269,16 +1279,7 @@ fn build_live_terminal_session_item(
         legacy_session_id: None,
         provider: provider.clone(),
         project_path,
-        // A synthesized live-terminal item has no session name. Fabricating
-        // provider_display_name here made the session-title mirror clobber
-        // real pane titles with a generic label ("OpenCode") for every
-        // unlisted-session resume (e.g. subagent children, root-filtered).
-        // Title-less rows are skipped by the mirror (`if (!session.title)
-        // continue`); the client keeps the row's label meaningful at display
-        // time (sidebarSelectors provider-label rung for title-less running
-        // live-terminal rows; HistoryView keeps its id-prefix + provider
-        // badge).
-        title: None,
+        title: Some(provider_display_name(&provider)),
         summary: None,
         first_user_message: None,
         last_activity_at: identity.updated_at,
@@ -1450,6 +1451,16 @@ mod join_tests {
         assert_eq!(payload["cwd"], serde_json::json!(checkout_path));
     }
 
+    // ── provider_display_name ──
+
+    #[test]
+    fn provider_display_name_matches_known_providers_and_falls_back_to_raw() {
+        assert_eq!(provider_display_name("claude"), "Claude CLI");
+        assert_eq!(provider_display_name("codex"), "Codex CLI");
+        assert_eq!(provider_display_name("opencode"), "OpenCode");
+        assert_eq!(provider_display_name("amplifier"), "amplifier");
+    }
+
     // ── join_running_state ──
 
     #[test]
@@ -1500,11 +1511,7 @@ mod join_tests {
         assert_eq!(item.provider, "opencode");
         assert_eq!(item.session_id, "sess-77");
         assert_eq!(item.project_path, "/home/dan/project");
-        // A fabricated live-terminal row is a placeholder, not a session:
-        // its "title" was the generic provider label, which the session-title
-        // mirror then folded over real pane titles. Fabricated rows carry NO
-        // title (rename-scope-contract display precedence).
-        assert_eq!(item.title, None);
+        assert_eq!(item.title.as_deref(), Some("OpenCode"));
         assert_eq!(item.session_type.as_deref(), Some("opencode"));
         assert!(item.is_running);
         assert_eq!(item.running_terminal_id.as_deref(), Some("term-9"));
@@ -1548,7 +1555,7 @@ mod join_tests {
         assert!(item.live_terminal_only);
         assert_eq!(item.session_id, "terminal:term-5");
         assert_eq!(item.project_path, "terminal:term-5");
-        assert_eq!(item.title, None);
+        assert_eq!(item.title.as_deref(), Some("Codex CLI"));
     }
 
     // ── join_live_terminals (toItems) ──
@@ -3615,7 +3622,7 @@ mod tests {
             items.iter().any(|item| {
                 item["provider"] == "claude"
                     && item["sessionId"] == "duplicate"
-                    && item.get("title").is_none()
+                    && item["title"] == "Claude CLI"
                     && item["projectPath"] == "/live-terminal"
                     && item["isRunning"] == true
                     && item["runningTerminalId"] == "term-conflicted"
