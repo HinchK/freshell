@@ -38,7 +38,7 @@ if [ "$full_gate" = 1 ]; then
   run_rust=1
   run_ts=1
 elif [ -n "$changed" ]; then
-  printf '%s' "$changed" | grep -Eq '\.rs$|Cargo\.(toml|lock)$|rust-toolchain' && run_rust=1
+  printf '%s' "$changed" | grep -Eq '\.rs$|Cargo\.(toml|lock)$|rust-toolchain|^\.cargo/|^test/fixtures/' && run_rust=1
   printf '%s' "$changed" | grep -Eq '\.(ts|tsx)$|package(-lock)?\.json$|tsconfig' && run_ts=1
 fi
 
@@ -51,6 +51,17 @@ if [ -x node_modules/.bin/tsx ]; then
   TSX="node_modules/.bin/tsx"
 elif [ -x "$HOOK_DIR/../../node_modules/.bin/tsx" ]; then
   TSX="$HOOK_DIR/../../node_modules/.bin/tsx"
+else
+  # Fresh worktrees often lack node_modules; the owning checkout (the one
+  # whose .git dir this worktree shares) has it. Derive the owning root
+  # from the git common dir so worktree pushes still get the full gate.
+  common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+  if [ -n "$common_dir" ] && [ -d "$common_dir" ]; then
+    owning_root="${common_dir%/.git}"
+    if [ "$owning_root" != "$common_dir" ] && [ -x "$owning_root/node_modules/.bin/tsx" ]; then
+      TSX="$owning_root/node_modules/.bin/tsx"
+    fi
+  fi
 fi
 
 # Targeted cargo-test plan: computed only when the rust gate fired, so

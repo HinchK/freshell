@@ -8,7 +8,7 @@ Filtered by what the push changes (diff between the remote refs being updated an
 
 | Push contains | Checks |
 |---|---|
-| Any `.rs`, `Cargo.toml`/`Cargo.lock`, `rust-toolchain*` | `cargo fmt --all --check`, then `cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings`, then **targeted `cargo test`**: the changed crates plus every workspace crate that transitively depends on them (full `--workspace --exclude freshell-tauri` when the change is root-level — `Cargo.lock`, toolchain, `.cargo/` — or the base is unknown). `freshell-tauri` is excluded per clippy parity. |
+| Any `.rs`, `Cargo.toml`/`Cargo.lock`, `rust-toolchain*`, `test/fixtures/**` | `cargo fmt --all --check`, then `cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings`, then **targeted `cargo test`**: the changed crates plus every workspace crate that transitively depends on them (full `--workspace --exclude freshell-tauri` when the change is root-level — `Cargo.lock`, toolchain, `.cargo/` — or the base is unknown). `freshell-tauri` is excluded per clippy parity. Test fixtures are cross-crate rust-test infrastructure, so a `test/fixtures/**` change routes to the whole workspace. |
 | Any `.ts`/`.tsx`, `package.json`/`package-lock.json`, `tsconfig*` | `npm run typecheck` (client + server, tsc `--noEmit`) |
 | Only docs/config/other files | Nothing |
 | New branch with no merge-base with origin/main | Both gates (full) |
@@ -27,7 +27,7 @@ Vitest/e2e/electron lanes and the real-transport clippy lanes stay with the norm
 - Disable for one push: `FRESHELL_PREPUSH=0 git push ...`
 - See routing without running checks: `FRESHELL_PREPUSH_DEBUG=1 git push --dry-run ...`
 - Bypass the server-side `rust-gate` (merge-time, PRs only): the owner account is a `pull_request`-mode bypass actor on the "Protect Main - No Direct Push" ruleset, so merging with a red or missing `rust-gate` is just `gh pr merge <n> --merge` from that account — GitHub records it as a ruleset bypass with an audit entry. This is the explicit escape hatch for landing on a red base; it does NOT unlock direct pushes to main.
-- If a lane's tooling is unavailable it is skipped with an accurate warning (not a failure). The hook self-heals stripped-environment contexts (ssh/agents/IDEs/cron): it sources `~/.nvm/nvm.sh` when `npm` is missing from PATH, and adds `~/.cargo/bin` when `cargo` is missing.
+- If a lane's tooling is unavailable it is skipped with an accurate warning (not a failure). The hook self-heals stripped-environment contexts (ssh/agents/IDEs/cron): it sources `~/.nvm/nvm.sh` when `npm` is missing from PATH, and adds `~/.cargo/bin` when `cargo` is missing. The rust-test lane's `tsx` resolves from the pushing worktree's `node_modules`, the hook's own checkout, or the owning checkout (derived from the git common dir) — so fresh worktrees without `node_modules` still run the full lane.
 
 ## Setup
 
