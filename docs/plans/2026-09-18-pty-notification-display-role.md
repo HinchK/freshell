@@ -347,7 +347,13 @@ Confirm the e2e backend with the user first (repo rule; `FRESHELL_E2E_BACKEND` u
 
 Lane choice: the route-intercept lane (schema-valid snapshot fulfilled in the browser, no provider binary) is the right level for this change — the change is client-display-only and the Rust role mapping that a full-stack fake-serve lane would exercise (`opencode_role`, snapshot contract) is untouched and already pinned by the Rust tests. Route-intercept also keeps the spec cloud-legal.
 
-Create `test/e2e-browser/specs/fresh-agent-pty-notification-display.spec.ts` (adapted verbatim from `seedMinimapPane` at `test/e2e-browser/specs/transcript-minimap.spec.ts:49-99`, re-routed to an opencode pane — this is the first spec intercepting `threads/freshopencode`):
+Lane receipt first: run the donor spec once from the worktree BEFORE authoring the new spec, on the user-chosen backend:
+
+`npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/transcript-minimap.spec.ts` (or `test:e2e:cloud` per the user's choice)
+
+Expected: PASS — this receipts that the route-intercept e2e lane works at base from this worktree (validator load-bearing evidence in `reports/load-bearing-strategist.md` §C1). A donor failure here is an environment/lane breakage, never attributable to this change — stop and escalate rather than proceeding to the new spec. First local run pays the global-setup builds (`target/release` and `dist/client` are already warm in this worktree from the electron staging chain).
+
+Create `test/e2e-browser/specs/fresh-agent-pty-notification-display.spec.ts` (adapted verbatim from `seedMinimapPane` at `test/e2e-browser/specs/transcript-minimap.spec.ts:49-99`, re-routed to an opencode pane — the only existing freshopencode route-intercept precedent, `freshopencode-model-picker.spec.ts:129`, seeds `turns: []`, so this is the first to seed a freshopencode pane with non-empty turns):
 
 ```ts
 import { test, expect } from '../helpers/fixtures.js'
@@ -478,6 +484,10 @@ Run (backend per the user's choice; local shown):
 
 Expected: FAIL — `article[data-turn-role="assistant"]` with `SYNC_EXIT=0` never appears (the PTY turn renders as a user article today), and the minimap rail shows 2 `Jump to prompt:` ticks (both user-role turns).
 
+RED attribution criteria (a wrong-reason failure must not be mistaken for the intended one):
+- Intended RED: the fresh pane and transcript scroller become visible, and the failure is the assistant-article visibility timeout and/or the user-article count assertion, while the seeded turns visibly render (the `Run the backup sync now` user article is present, the PTY block text is inside a `data-turn-role="user"` article).
+- Wrong-reason RED (seed/lane failure): the pane or scroller never becomes visible, or no seeded turn text renders anywhere → apply the snapshot-shape contingency above (adjust ONLY the seeded snapshot's optional fields; never production code) and re-run. If it still fails, stop and escalate — do not swap lanes and do not touch the classifier.
+
 - [ ] **Step 5: Add the minimal production implementation**
 
 Edit 1 — `src/components/fresh-agent/FreshAgentTranscript.tsx:28`, extend the existing import:
@@ -528,9 +538,13 @@ git commit -m "feat(fresh-agent): render opencode-pty notifications as agent tex
 ## Final verification (after Task 2)
 
 1. Focused suites green (Task 2 Step 8).
-2. E2E spec passes on the chosen backend.
-3. Full-suite gate per [usual-executing-plans] from the worktree HEAD — pass criterion: green excluding the baseline ledger's 11 recorded pre-existing Rust failures (receipts in `reports/workspace-baseline.md`). Any other failure must be attributed to this change and fixed, or reproduced at base_ref and ledgered before being excluded.
-4. `git status` clean of stray files; worktree contains exactly: the plan commit + Task 1 commit + Task 2 commit.
+2. E2E: donor-spec lane receipt (Task 2 Step 3) and the new spec both pass on the user-chosen backend.
+3. Full-suite gate per [usual-executing-plans] from the worktree HEAD, judged per phase (the composite `npm test` runner aborts at its first failing phase; rust is red at base with the ledgered 11, so the composite reaching rust-red is expected and is NOT itself a gate failure):
+   - client phase: green.
+   - source-runtime phase: green.
+   - rust phase: red with EXACTLY the baseline ledger's 11 recorded pre-existing failures (receipts in `reports/workspace-baseline.md`); any other rust failure must be attributed to this change (impossible by construction — no Rust file changes — and must then be reproduced at base_ref and ledgered before being excluded).
+   - electron + electron-runtime lanes: unreachable via the composite once rust fails — run both lane commands separately at HEAD: `npm run test:electron`, then the staging chain (`npm run build:rust && npm run build:client && npm run build:tools && npm run prepare:claude-sidecar && npm run prepare:electron-runtime`) followed by `npm run test:electron:runtime`. Base receipts proving both lanes green at the base-equivalent tree (42 files/372 tests and 1 file/2 tests respectively) are in `reports/load-bearing-validator-C2.md`. Expect the same green at HEAD; any HEAD failure is attributable to this change, anchored by those base receipts.
+4. `git status` clean of stray files; worktree contains exactly: the plan commits + Task 1 commit + Task 2 commit.
 
 ## Out-of-scope notes (do not build)
 
