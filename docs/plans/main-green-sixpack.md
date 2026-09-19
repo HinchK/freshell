@@ -593,33 +593,33 @@ Closes part 1 of **kata hsrh**. Root cause (proven): r27 F4 (`129613906`) delibe
 - Consumes: nothing.
 - Produces: a narrowed `cargo test -p freshell-freshagent --locked session_init` selector that is green (this also unblocks every later green-base check on the rust lane, which currently trips on the zombie).
 
-- [ ] **Step 1: Reproduce the deterministic red**
+- [x] **Step 1: Reproduce the deterministic red**
 
 Run: `cargo test -p freshell-freshagent --locked session_init_with_all_blank`
 
 Expected: FAIL — `session_init_with_all_blank_settings_records_no_binding` panics at the semantic assert ("an all-blank settings snapshot must not be persisted …") in ~0.2s, while `session_init_with_all_blank_settings_records_the_lineage_row` passes. This is the red receipt for the deletion.
 
-- [ ] **Step 2: Delete the zombie**
+- [x] **Step 2: Delete the zombie**
 
 Delete the doc-comment block starting `/// No-laundering guard (V7/A10, parity with codex's` through the end of the `session_init_with_all_blank_settings_records_no_binding` test (claude.rs:18319-18367). Do not touch the live reshape (`:18087-18150` region) or the provenance sibling that follows.
 
-- [ ] **Step 3: Run the family green**
+- [x] **Step 3: Run the family green**
 
 Run: `cargo test -p freshell-freshagent --locked session_init`
 
 Expected: PASS — the whole `session_init` family green (7 passed, 0 failed — was 7 passed / 1 failed).
 
-- [ ] **Step 4: Refactor while green**
+- [x] **Step 4: Refactor while green**
 
 None (pure deletion of a superseded duplicate).
 
-- [ ] **Step 5: Impacted-test verification**
+- [x] **Step 5: Impacted-test verification**
 
 Run the whole crate (narrowed selector, delegated): `cargo test -p freshell-freshagent --locked`
 
 Expected: PASS (the crate is green at this point; the two-phase-drain flake is fixed in Task 5, not here — if the 15s budget flake fires during this run under co-load, that is the Task 5 mechanism, not a regression from this deletion; re-run and proceed. The same applies to the known-open 3fxd/y5fw load flake, with the classification recipe in Task 5 Step 3's known-open allowance: confirm by focused re-run, record, proceed — never a regression from this deletion).
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/freshell-freshagent/src/claude.rs
