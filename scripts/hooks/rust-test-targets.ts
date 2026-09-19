@@ -87,14 +87,17 @@ export function computeRustTestPlan(changedPaths: string[], graph: WorkspaceGrap
 
 export function graphFromCargoMetadata(metadataJson: string): WorkspaceGraph {
   const metadata = JSON.parse(metadataJson) as {
+    // workspace_members are package IDs in current cargo ("path+file://…#0.0.0");
+    // older/other shapes use manifest paths — accept both.
     workspace_members: string[]
-    packages: Array<{ name: string; manifest_path: string; dependencies: Array<{ name: string }> }>
+    packages: Array<{ name: string; id?: string; manifest_path: string; dependencies: Array<{ name: string }> }>
   }
-  const memberManifests = new Set(metadata.workspace_members)
+  const memberIds = new Set(metadata.workspace_members)
   const members: string[] = []
   const edges: Record<string, string[]> = {}
   for (const pkg of metadata.packages) {
-    if (!memberManifests.has(pkg.manifest_path)) continue
+    const isMember = (pkg.id !== undefined && memberIds.has(pkg.id)) || memberIds.has(pkg.manifest_path)
+    if (!isMember) continue
     members.push(pkg.name)
     edges[pkg.name] = pkg.dependencies.map((d) => d.name).filter((d) => d !== pkg.name)
   }

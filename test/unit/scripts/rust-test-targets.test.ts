@@ -1,6 +1,7 @@
 // @vitest-environment node
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, beforeAll, afterAll } from 'vitest'
 import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { spawnSync } from 'node:child_process'
 import {
@@ -104,26 +105,29 @@ describe('computeRustTestPlan', () => {
 })
 
 describe('graphFromCargoMetadata', () => {
-  it('builds members and workspace-internal edges from cargo metadata', () => {
+  it('builds members and workspace-internal edges from real cargo package-ID metadata', () => {
     const metadata = {
       workspace_members: [
-        '/repo/crates/freshell-server/Cargo.toml',
-        '/repo/crates/freshell-ws/Cargo.toml',
-        '/repo/crates/freshell-protocol/Cargo.toml',
+        'path+file:///repo/crates/freshell-server/Cargo.toml#0.7.5',
+        'path+file:///repo/crates/freshell-ws/Cargo.toml#0.7.5',
+        'path+file:///repo/crates/freshell-protocol/Cargo.toml#0.7.5',
       ],
       packages: [
         {
           name: 'freshell-server',
+          id: 'path+file:///repo/crates/freshell-server/Cargo.toml#0.7.5',
           manifest_path: '/repo/crates/freshell-server/Cargo.toml',
           dependencies: [{ name: 'freshell-ws' }, { name: 'serde' }, { name: 'freshell-protocol' }],
         },
         {
           name: 'freshell-ws',
+          id: 'path+file:///repo/crates/freshell-ws/Cargo.toml#0.7.5',
           manifest_path: '/repo/crates/freshell-ws/Cargo.toml',
           dependencies: [{ name: 'freshell-protocol' }, { name: 'tokio' }],
         },
         {
           name: 'freshell-protocol',
+          id: 'path+file:///repo/crates/freshell-protocol/Cargo.toml#0.7.5',
           manifest_path: '/repo/crates/freshell-protocol/Cargo.toml',
           dependencies: [],
         },
@@ -133,6 +137,43 @@ describe('graphFromCargoMetadata', () => {
     expect(built.members.sort()).toEqual(['freshell-protocol', 'freshell-server', 'freshell-ws'])
     expect(built.edges['freshell-server'].sort()).toEqual(['freshell-protocol', 'freshell-ws'])
     expect(built.edges['freshell-ws']).toEqual(['freshell-protocol'])
+  })
+
+  it('still resolves when workspace_members are manifest paths', () => {
+    const metadata = {
+      workspace_members: ['/repo/crates/freshell-ws/Cargo.toml'],
+      packages: [
+        {
+          name: 'freshell-ws',
+          manifest_path: '/repo/crates/freshell-ws/Cargo.toml',
+          dependencies: [],
+        },
+      ],
+    }
+    expect(graphFromCargoMetadata(JSON.stringify(metadata)).members).toEqual(['freshell-ws'])
+  })
+
+  it('ignores packages that are not workspace members', () => {
+    const metadata = {
+      workspace_members: ['path+file:///repo/crates/freshell-ws/Cargo.toml#0.7.5'],
+      packages: [
+        {
+          name: 'freshell-ws',
+          id: 'path+file:///repo/crates/freshell-ws/Cargo.toml#0.7.5',
+          manifest_path: '/repo/crates/freshell-ws/Cargo.toml',
+          dependencies: [{ name: 'some-external-dep' }],
+        },
+        {
+          name: 'non-member',
+          id: 'path+file:///repo/other/Cargo.toml#1.0.0',
+          manifest_path: '/repo/other/Cargo.toml',
+          dependencies: [],
+        },
+      ],
+    }
+    const built = graphFromCargoMetadata(JSON.stringify(metadata))
+    expect(built.members).toEqual(['freshell-ws'])
+    expect(built.edges['freshell-ws']).toEqual([])
   })
 })
 
@@ -154,39 +195,123 @@ describe('planToInvocation', () => {
   })
 })
 
-describe('pre-push hook routing (real git ranges)', () => {
-  const repoRoot = path.resolve(import.meta.dirname, '../../..')
-  const hasGit = fs.existsSync(path.join(repoRoot, '.git'))
-  const hasCargo = spawnSync('cargo', ['--version'], { stdio: 'ignore' }).status === 0
+describe('pre-push hook routing (hermetic fixture repo)', () => {
+  const hookPath = path.resolve(import.meta.dirname, '../../../scripts/hooks/pre-push')
+  let fixtureRoot: string
+  let baseSha: string
+  let rustSha: string
+  let docsSha: string
+  let tauriSha: string
 
-  function runHook(localSha: string, remoteSha: string): { status: number; stderr: string; stdout: string } {
-    const hook = path.join(repoRoot, 'scripts/hooks/pre-push')
-    const res = spawnSync('bash', [hook], {
+  function git(args: string[], opts: { cwd: string; stdin?: string } = { cwd: '' }): string {
+    const res = spawnSync('git', args, { cwd: opts.cwd, encoding: 'utf8' })
+    if (res.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${res.stderr}`)
+    return (res.stdout ?? '').trim()
+  }
+
+  function writeFixture(p: string, contents: string): void {
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    fs.writeFileSync(p, contents)
+  }
+
+  function pkg(name: string, deps: string[]): string {
+    const depLines = deps.map((d) => `  ${d} = { path = "../${d}" }`).join('\n')
+    return [
+      '[package]',
+      `name = "${name}"`,
+      'version = "0.0.0"',
+      'edition = "2021"',
+      depLines.length > 0 ? `[dependencies]\n${depLines}` : '',
+      '',
+    ]
+      .filter(Boolean)
+      .join('\n')
+  }
+
+  beforeAll(() => {
+    fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'prepush-routing-'))
+    git(['init', '-q', '-b', 'main'], { cwd: fixtureRoot })
+    writeFixture(
+      path.join(fixtureRoot, 'Cargo.toml'),
+      [
+        '[workspace]',
+        'members = [',
+        '  "crates/freshell-protocol",',
+        '  "crates/freshell-ws",',
+        '  "crates/freshell-freshagent",',
+        '  "crates/freshell-server",',
+        '  "crates/freshell-tauri",',
+        ']',
+        'resolver = "2"',
+        '',
+      ].join('\n'),
+    )
+    const fixtureDeps: Record<string, string[]> = {
+      'freshell-protocol': [],
+      'freshell-ws': ['freshell-protocol'],
+      'freshell-freshagent': ['freshell-ws'],
+      'freshell-server': ['freshell-ws', 'freshell-freshagent'],
+      'freshell-tauri': ['freshell-server'],
+    }
+    for (const [name, deps] of Object.entries(fixtureDeps)) {
+      writeFixture(path.join(fixtureRoot, `crates/${name}/Cargo.toml`), pkg(name, deps))
+      writeFixture(path.join(fixtureRoot, `crates/${name}/src/lib.rs`), '')
+    }
+    const commit = (msg: string): string => {
+      git(['add', '-A'], { cwd: fixtureRoot })
+      git(
+        ['-c', 'user.email=t@example.com', '-c', 'user.name=t', '-c', 'commit.gpgsign=false', 'commit', '-q', '-m', msg],
+        { cwd: fixtureRoot },
+      )
+      return git(['rev-parse', 'HEAD'], { cwd: fixtureRoot })
+    }
+    baseSha = commit('base: fixture workspace')
+
+    writeFixture(path.join(fixtureRoot, 'crates/freshell-ws/src/lib.rs'), '// ws change\n')
+    rustSha = commit('rust: freshell-ws src change')
+
+    writeFixture(path.join(fixtureRoot, 'README.md'), 'docs only\n')
+    docsSha = commit('docs: readme')
+
+    writeFixture(path.join(fixtureRoot, 'crates/freshell-tauri/src/main.rs'), 'fn main() {}\n')
+    tauriSha = commit('rust: tauri-only change')
+  })
+
+  afterAll(() => {
+    fs.rmSync(fixtureRoot, { recursive: true, force: true })
+  })
+
+  function runHook(localSha: string, remoteSha: string): { status: number; stderr: string } {
+    const res = spawnSync('bash', [hookPath], {
       input: `refs/heads/x ${localSha} refs/heads/x ${remoteSha}\n`,
       env: { ...process.env, FRESHELL_PREPUSH_DEBUG: '1' },
       encoding: 'utf8',
-      cwd: repoRoot,
+      cwd: fixtureRoot,
     })
-    return { status: res.status ?? -1, stderr: res.stderr ?? '', stdout: res.stdout ?? '' }
+    return { status: res.status ?? -1, stderr: res.stderr ?? '' }
   }
 
-  it.skipIf(!hasGit || !hasCargo, 'skips all checks for a docs-only range', () => {
-    // 63ee94e62 -> 34f425fae is PR #797 (docs only).
-    const out = runHook('34f425fae', '63ee94e62')
+  it('skips all checks for a docs-only range', () => {
+    const out = runHook(docsSha, rustSha)
     expect(out.status).toBe(0)
-    expect(out.stderr).toContain('full_gate=0 run_rust=0 run_ts=0')
+    expect(out.stderr).toContain('full_gate=0 run_rust=0 run_ts=0 test_mode=skip')
   })
 
-  it.skipIf(!hasGit || !hasCargo, 'plans targeted cargo tests for the rust range of PR #795', () => {
-    // ce1954e42 -> e76d8b5a9 is the #795 merge, which changed crates/freshell-freshagent.
-    const out = runHook('e76d8b5a9', 'ce1954e42')
+  it('plans targeted cargo tests for a changed crate plus its dependents', () => {
+    const out = runHook(rustSha, baseSha)
     expect(out.status).toBe(0)
     expect(out.stderr).toContain('run_rust=1')
-    expect(out.stderr).toContain('test_mode=packages')
-    expect(out.stderr).toContain('freshell-freshagent')
+    expect(out.stderr).toContain('test_mode=packages test_pkgs=freshell-freshagent freshell-server freshell-ws')
   })
 
-  it.skipIf(!hasGit || !hasCargo, 'runs the full gate when the merge base is unknown', () => {
+  it('skips the test lane for tauri-only changes (clippy parity)', () => {
+    const out = runHook(tauriSha, docsSha)
+    expect(out.status).toBe(0)
+    expect(out.stderr).toContain('run_rust=1')
+    expect(out.stderr).toContain('test_mode=skip')
+  })
+
+  it('runs the full gate when the merge base is unknown', () => {
     const out = runHook('0000000000000000000000000000000000000001', '0000000000000000000000000000000000000002')
     expect(out.status).toBe(0)
     expect(out.stderr).toContain('full_gate=1 run_rust=1 run_ts=1')
