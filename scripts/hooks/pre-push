@@ -12,6 +12,17 @@ if [ "${FRESHELL_PREPUSH:-1}" = "0" ]; then
   exit 0
 fi
 
+# git exports GIT_DIR/GIT_PREFIX (the pushing worktree's gitdir) into this
+# hook. If they leak into the lane processes, every test-side `git` child
+# resolves against the SHARED repository instead of the test's own tempdir:
+# a `git init` inside a freshell-server test re-initialized the main
+# checkout's config (observed writing core.bare=true and colliding on
+# config.lock), and test add/commit landed on the main HEAD. The hook's own
+# git calls use cwd discovery (equivalent in a worktree), so strip the
+# overrides before anything runs.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX \
+  GIT_CONFIG_PARAMETERS GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+
 ZERO=0000000000000000000000000000000000000000
 changed=""
 full_gate=0

@@ -326,10 +326,14 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
     fs.rmSync(fixtureRoot, { recursive: true, force: true })
   })
 
-  function runHook(localSha: string, remoteSha: string): { status: number; stderr: string } {
+  function runHook(
+    localSha: string,
+    remoteSha: string,
+    extraEnv: Record<string, string> = {},
+  ): { status: number; stderr: string } {
     const res = spawnSync('bash', [hookPath], {
       input: `refs/heads/x ${localSha} refs/heads/x ${remoteSha}\n`,
-      env: { ...process.env, FRESHELL_PREPUSH_DEBUG: '1' },
+      env: { ...process.env, ...extraEnv, FRESHELL_PREPUSH_DEBUG: '1' },
       encoding: 'utf8',
       cwd: fixtureRoot,
     })
@@ -346,6 +350,18 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
     const out = runHook(rustSha, baseSha)
     expect(out.status).toBe(0)
     expect(out.stderr).toContain('run_rust=1')
+    expect(out.stderr).toContain('test_mode=packages test_pkgs=freshell-freshagent freshell-server freshell-ws')
+  })
+
+  it('strips git hook env overrides (GIT_DIR et al) before any lane runs', () => {
+    // git exports GIT_DIR/GIT_PREFIX into real pre-push invocations (the
+    // pushing worktree's gitdir). Unstripped, a bogus or stale GIT_DIR breaks
+    // the hook's own routing git calls — and in non-debug mode the leaked
+    // vars redirect every test-side git child at the SHARED repository
+    // (observed: cargo-test children re-initialized the main checkout's
+    // config). The hook must resolve everything via cwd discovery instead.
+    const out = runHook(rustSha, baseSha, { GIT_DIR: '/nonexistent-prepush-hook-env' })
+    expect(out.status).toBe(0)
     expect(out.stderr).toContain('test_mode=packages test_pkgs=freshell-freshagent freshell-server freshell-ws')
   })
 
