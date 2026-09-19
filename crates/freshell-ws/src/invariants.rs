@@ -362,11 +362,11 @@ pub(crate) fn error_pane_ledger_write_failed(terminal_id: &str, err: &std::io::E
 
 #[cfg(test)]
 pub(crate) mod capture {
-    //! Thread-local capturing subscriber recording TARGET + message +
+    //! Process-global capturing subscriber recording TARGET + message +
     //! fields (the `freshell-freshagent` DIAG-01 convention, extended
     //! with `metadata().target()` since these alarms are target-scoped).
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, OnceLock};
     use tracing::field::{Field, Visit};
     use tracing::{Event, Subscriber};
     use tracing_subscriber::layer::{Context, SubscriberExt};
@@ -416,9 +416,14 @@ pub(crate) mod capture {
         fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
             let mut visitor = FieldVisitor::default();
             event.record(&mut visitor);
+            // The vec is shared by EVERY test in this binary; a consumer
+            // that panics while holding its side of the lock must not
+            // cascade `capture lock` panics into unrelated tests — recover
+            // from poisoning and keep recording (consumers get the
+            // complementary rule: never hold the guard across an assert).
             self.events
                 .lock()
-                .expect("capture lock")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(CapturedEvent {
                     target: event.metadata().target().to_string(),
                     message: visitor.message,
@@ -427,17 +432,30 @@ pub(crate) mod capture {
         }
     }
 
-    pub fn capture() -> (
-        Arc<Mutex<Vec<CapturedEvent>>>,
-        tracing::subscriber::DefaultGuard,
-    ) {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let layer = CaptureLayer {
-            events: Arc::clone(&events),
-        };
-        let subscriber = tracing_subscriber::registry().with(layer);
-        let guard = tracing::subscriber::set_default(subscriber);
-        (events, guard)
+    /// Process-global capture for this lib-test binary (the e08g pattern,
+    /// `tests/pane_reconcile_freshagent.rs:838-858`). Do NOT replace this
+    /// with a scoped `set_default`: tracing-core caches each callsite's
+    /// Interest process-wide on first registration, and while only one
+    /// dispatcher exists it consults only the REGISTERING thread's default
+    /// (Rebuilder::JustOne) — a subscriber-less sibling thread executing a
+    /// shared emission site first caches `Interest::never` and the event!
+    /// macro short-circuits before any dispatch; a thread-local capture
+    /// then sees nothing (kata 59nb). One global subscriber sees every
+    /// thread's events; callers MUST filter by a per-test-unique field
+    /// (root/path/device_id/terminal_id) because ALL tests share this vec.
+    pub fn capture() -> Arc<Mutex<Vec<CapturedEvent>>> {
+        static EVENTS: OnceLock<Arc<Mutex<Vec<CapturedEvent>>>> = OnceLock::new();
+
+        Arc::clone(EVENTS.get_or_init(|| {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let layer = CaptureLayer {
+                events: Arc::clone(&events),
+            };
+            let subscriber = tracing_subscriber::registry().with(layer);
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("install freshell-ws lib-test log capture");
+            events
+        }))
     }
 }
 
@@ -463,12 +481,23 @@ mod tests {
         }
     }
 
-    fn unresolved_warnings(events: &[capture::CapturedEvent]) -> Vec<capture::CapturedEvent> {
+    /// Unresolved-warning events for THIS test's terminal ids only — the
+    /// capture vec is shared by every test in the binary (kata 59nb), and
+    /// the event carries just terminal_id/mode/age_ms, so the terminal id
+    /// is the only available per-test discriminator.
+    fn unresolved_warnings(
+        events: &[capture::CapturedEvent],
+        terminal_ids: &[&str],
+    ) -> Vec<capture::CapturedEvent> {
         events
             .iter()
             .filter(|e| {
                 e.target == "freshell_ws::invariants"
                     && e.message.contains("terminal_identity_unresolved")
+                    && e.fields
+                        .get("terminal_id")
+                        .map(String::as_str)
+                        .is_some_and(|id| terminal_ids.contains(&id))
             })
             .cloned()
             .collect()
@@ -541,7 +570,7 @@ mod tests {
 
     #[test]
     fn warns_once_per_unresolved_non_shell_terminal_past_the_grace_window() {
-        let (events, _guard) = capture::capture();
+        let events = capture::capture();
         let identity = TerminalIdentityRegistry::new();
         let mut warned = HashSet::new();
         let rows = vec![row(
@@ -568,7 +597,10 @@ mod tests {
             wanted.is_empty() && wanted_again.is_empty(),
             "the probe-wanted queue is opencode-only"
         );
-        let warnings = unresolved_warnings(&events.lock().unwrap());
+        let warnings = unresolved_warnings(
+            &events.lock().unwrap_or_else(|p| p.into_inner()),
+            &["t-lost"],
+        );
         assert_eq!(warnings.len(), 1, "exactly one warn per terminal");
         assert_eq!(
             warnings[0].fields.get("terminal_id").map(String::as_str),
@@ -582,11 +614,11 @@ mod tests {
 
     #[test]
     fn never_warns_inside_the_grace_window() {
-        let (events, _guard) = capture::capture();
+        let events = capture::capture();
         let identity = TerminalIdentityRegistry::new();
         let mut warned = HashSet::new();
         let rows = vec![row(
-            "t-young",
+            "t-young-grace",
             "amplifier",
             TerminalRunStatus::Running,
             1_000,
@@ -602,12 +634,16 @@ mod tests {
         );
 
         assert!(wanted.is_empty());
-        assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
+        let warnings = unresolved_warnings(
+            &events.lock().unwrap_or_else(|p| p.into_inner()),
+            &["t-young-grace"],
+        );
+        assert!(warnings.is_empty());
     }
 
     #[test]
     fn never_warns_for_shell_or_exited_terminals() {
-        let (events, _guard) = capture::capture();
+        let events = capture::capture();
         let identity = TerminalIdentityRegistry::new();
         let mut warned = HashSet::new();
         let rows = vec![
@@ -624,20 +660,30 @@ mod tests {
         );
 
         assert!(wanted.is_empty());
-        assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
+        let warnings = unresolved_warnings(
+            &events.lock().unwrap_or_else(|p| p.into_inner()),
+            &["t-shell", "t-gone"],
+        );
+        assert!(warnings.is_empty());
     }
 
     #[test]
     fn error_claude_restore_unresolved_emits_on_invariants_target() {
-        let (events, _guard) = capture::capture();
+        let events = capture::capture();
 
         super::error_claude_restore_unresolved("req-lost-42");
 
+        // The capture vec is shared binary-wide; this test's discriminator
+        // is the emission's request_id field.
         let captured: Vec<capture::CapturedEvent> = events
             .lock()
-            .unwrap()
+            .unwrap_or_else(|p| p.into_inner())
             .iter()
-            .filter(|e| e.target == "freshell_ws::invariants")
+            .filter(|e| {
+                e.target == "freshell_ws::invariants"
+                    && e.message.contains("claude_restore_identity_unresolved")
+                    && e.fields.get("request_id").map(String::as_str) == Some("req-lost-42")
+            })
             .cloned()
             .collect();
         assert_eq!(captured.len(), 1, "exactly one emission: {captured:?}");
@@ -658,7 +704,7 @@ mod tests {
 
     #[test]
     fn never_warns_when_either_identity_home_resolves_the_terminal() {
-        let (events, _guard) = capture::capture();
+        let events = capture::capture();
         let identity = TerminalIdentityRegistry::new();
         identity.upsert("t-identity", Some("amplifier"), Some("sess-1"), None, 1);
         let mut warned = HashSet::new();
@@ -691,7 +737,11 @@ mod tests {
         );
 
         assert!(wanted.is_empty());
-        assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
+        let warnings = unresolved_warnings(
+            &events.lock().unwrap_or_else(|p| p.into_inner()),
+            &["t-identity", "t-rest-resume"],
+        );
+        assert!(warnings.is_empty());
     }
 
     #[test]
@@ -706,17 +756,24 @@ mod tests {
         // (`probe_eligible`: never-submitted panes can yield no candidates,
         // so queuing them was a per-sweep spawn_blocking round-trip that
         // could only ever return None).
-        let (events, _guard) = capture::capture();
+        let events = capture::capture();
         let home = unique_opencode_home("idle");
         let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
         // The production shape: create+arm, NO submit, spawn window closes empty.
-        assert!(locator.arm("t-idle", "opencode", true, None, Some("/proj"), 10_000));
+        assert!(locator.arm(
+            "t-idle-grace",
+            "opencode",
+            true,
+            None,
+            Some("/proj"),
+            10_000
+        ));
         let _ =
             locator.tick(10_000 + freshell_sessions::opencode_locator::OPENCODE_WINDOW_MS + 500);
         let identity = TerminalIdentityRegistry::new();
         let mut warned = HashSet::new();
         let rows = vec![row(
-            "t-idle",
+            "t-idle-grace",
             "opencode",
             TerminalRunStatus::Running,
             10_000,
@@ -741,12 +798,16 @@ mod tests {
             );
         }
 
+        let warnings = unresolved_warnings(
+            &events.lock().unwrap_or_else(|p| p.into_inner()),
+            &["t-idle-grace"],
+        );
         assert!(
-            unresolved_warnings(&events.lock().unwrap()).is_empty(),
+            warnings.is_empty(),
             "no evidence == nothing resolvable == no warn (#702)"
         );
         assert!(warned.is_empty());
-        assert_eq!(locator.identity_resolvable_since("t-idle"), None);
+        assert_eq!(locator.identity_resolvable_since("t-idle-grace"), None);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -757,12 +818,12 @@ mod tests {
         // refusals latch the same way — R2: sole-candidate emissions and
         // drain-side guard refusals deliberately do NOT, they are foreign
         // sessions) and identity is still absent past the grace.
-        let (events, _guard) = capture::capture();
+        let events = capture::capture();
         let home = unique_opencode_home("stale-evidence");
         let db = seed_opencode_db(&home);
         let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
-        assert!(locator.arm("t-ev", "opencode", true, None, Some("/proj"), 0));
-        assert!(locator.note_submit("t-ev", 100));
+        assert!(locator.arm("t-ev-stale", "opencode", true, None, Some("/proj"), 0));
+        assert!(locator.note_submit("t-ev-stale", 100));
         insert_opencode_session(&db, "ses_a", "/proj", 150);
         insert_opencode_session(&db, "ses_b", "/proj", 160); // ambiguous refusal
         let evidence_at = 100 + freshell_sessions::opencode_locator::OPENCODE_WINDOW_MS + 1;
@@ -770,7 +831,13 @@ mod tests {
 
         let identity = TerminalIdentityRegistry::new();
         let mut warned = HashSet::new();
-        let rows = vec![row("t-ev", "opencode", TerminalRunStatus::Running, 0, None)];
+        let rows = vec![row(
+            "t-ev-stale",
+            "opencode",
+            TerminalRunStatus::Running,
+            0,
+            None,
+        )];
 
         let wanted = super::warn_unresolved_terminal_identities(
             &rows,
@@ -784,11 +851,14 @@ mod tests {
             wanted.is_empty(),
             "a pane with latched evidence is never queued for probing"
         );
-        let warnings = unresolved_warnings(&events.lock().unwrap());
+        let warnings = unresolved_warnings(
+            &events.lock().unwrap_or_else(|p| p.into_inner()),
+            &["t-ev-stale"],
+        );
         assert_eq!(warnings.len(), 1, "resolvable-but-unbound must warn");
         assert_eq!(
             warnings[0].fields.get("terminal_id").map(String::as_str),
-            Some("t-ev")
+            Some("t-ev-stale")
         );
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -798,12 +868,12 @@ mod tests {
         // Evidence observed < grace ago: the 150ms locator sweep binds within
         // a tick or two in the healthy path, but the alarm must not outrun
         // the binding lanes.
-        let (events, _guard) = capture::capture();
+        let events = capture::capture();
         let home = unique_opencode_home("fresh-evidence");
         let db = seed_opencode_db(&home);
         let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
-        assert!(locator.arm("t-ev", "opencode", true, None, Some("/proj"), 0));
-        assert!(locator.note_submit("t-ev", 100));
+        assert!(locator.arm("t-ev-fresh", "opencode", true, None, Some("/proj"), 0));
+        assert!(locator.note_submit("t-ev-fresh", 100));
         insert_opencode_session(&db, "ses_a", "/proj", 150);
         insert_opencode_session(&db, "ses_b", "/proj", 160);
         let evidence_at = 100 + freshell_sessions::opencode_locator::OPENCODE_WINDOW_MS + 1;
@@ -811,7 +881,13 @@ mod tests {
 
         let identity = TerminalIdentityRegistry::new();
         let mut warned = HashSet::new();
-        let rows = vec![row("t-ev", "opencode", TerminalRunStatus::Running, 0, None)];
+        let rows = vec![row(
+            "t-ev-fresh",
+            "opencode",
+            TerminalRunStatus::Running,
+            0,
+            None,
+        )];
 
         let wanted = super::warn_unresolved_terminal_identities(
             &rows,
@@ -822,7 +898,11 @@ mod tests {
         );
 
         assert!(wanted.is_empty());
-        assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
+        let warnings = unresolved_warnings(
+            &events.lock().unwrap_or_else(|p| p.into_inner()),
+            &["t-ev-fresh"],
+        );
+        assert!(warnings.is_empty());
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -832,7 +912,7 @@ mod tests {
         // latched: the signal lane (or locator lane) bound the identity, so
         // the identity check discharges the row before the evidence gate
         // matters (the `terminal_already_bound` arbitration case).
-        let (events, _guard) = capture::capture();
+        let events = capture::capture();
         let home = unique_opencode_home("resolved-after-evidence");
         let db = seed_opencode_db(&home);
         let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
@@ -863,7 +943,11 @@ mod tests {
         );
 
         assert!(wanted.is_empty());
-        assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
+        let warnings = unresolved_warnings(
+            &events.lock().unwrap_or_else(|p| p.into_inner()),
+            &["t-bound"],
+        );
+        assert!(warnings.is_empty());
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -872,7 +956,7 @@ mod tests {
         // A boot with an unresolvable opencode data home (WsState.
         // opencode_locator == None) keeps the create-age tripwire: the
         // topology itself is broken and must stay loud.
-        let (events, _guard) = capture::capture();
+        let events = capture::capture();
         let identity = TerminalIdentityRegistry::new();
         let mut warned = HashSet::new();
         let rows = vec![row(
@@ -892,14 +976,17 @@ mod tests {
         );
 
         assert!(wanted.is_empty(), "no locator, no probe phase");
-        let warnings = unresolved_warnings(&events.lock().unwrap());
+        let warnings = unresolved_warnings(
+            &events.lock().unwrap_or_else(|p| p.into_inner()),
+            &["t-noloc"],
+        );
         assert_eq!(warnings.len(), 1);
     }
 
     #[test]
     fn opencode_row_with_resume_identity_still_skips_with_locator_present() {
         // The resume_session_id skip rule is unchanged by the new gate.
-        let (events, _guard) = capture::capture();
+        let events = capture::capture();
         let home = unique_opencode_home("resume-skip");
         let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
         let identity = TerminalIdentityRegistry::new();
@@ -921,7 +1008,11 @@ mod tests {
         );
 
         assert!(wanted.is_empty());
-        assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
+        let warnings = unresolved_warnings(
+            &events.lock().unwrap_or_else(|p| p.into_inner()),
+            &["t-resume"],
+        );
+        assert!(warnings.is_empty());
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -936,12 +1027,19 @@ mod tests {
         // the DB or latch inline — it queues the pane for the sweep's async
         // probe phase (covered end-to-end in
         // `probe_phase_closes_the_late_row_hole_and_the_next_pass_warns`).
-        let (events, _guard) = capture::capture();
+        let events = capture::capture();
         let home = unique_opencode_home("late-row-hole");
         let db = seed_opencode_db(&home);
         let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
-        assert!(locator.arm("t-late", "opencode", true, None, Some("/proj"), 10_000));
-        assert!(locator.note_submit("t-late", 10_100));
+        assert!(locator.arm(
+            "t-late-latch",
+            "opencode",
+            true,
+            None,
+            Some("/proj"),
+            10_000
+        ));
+        assert!(locator.note_submit("t-late-latch", 10_100));
         let window_closed = 10_100 + freshell_sessions::opencode_locator::OPENCODE_WINDOW_MS + 1;
         assert!(locator.tick(window_closed).is_empty(), "window saw nothing");
         insert_opencode_session(&db, "ses_late", "/proj", window_closed + 500);
@@ -950,7 +1048,7 @@ mod tests {
         let identity = TerminalIdentityRegistry::new();
         let mut warned = HashSet::new();
         let rows = vec![row(
-            "t-late",
+            "t-late-latch",
             "opencode",
             TerminalRunStatus::Running,
             10_000,
@@ -966,13 +1064,14 @@ mod tests {
             Some(&locator),
         );
 
-        assert_eq!(wanted, vec!["t-late".to_string()]);
-        assert!(
-            unresolved_warnings(&events.lock().unwrap()).is_empty(),
-            "nothing latched yet: no warn"
+        assert_eq!(wanted, vec!["t-late-latch".to_string()]);
+        let warnings = unresolved_warnings(
+            &events.lock().unwrap_or_else(|p| p.into_inner()),
+            &["t-late-latch"],
         );
+        assert!(warnings.is_empty(), "nothing latched yet: no warn");
         assert_eq!(
-            locator.identity_resolvable_since("t-late"),
+            locator.identity_resolvable_since("t-late-latch"),
             None,
             "the pure pass never latches — latching is the probe phase's write"
         );
@@ -989,12 +1088,19 @@ mod tests {
         // Plan-review R2, finding 2: a pane still inside the create-age
         // grace is the binding lanes' business; never queue a probe for it
         // (evidence arrives via the window latch instead).
-        let (events, _guard) = capture::capture();
+        let events = capture::capture();
         let home = unique_opencode_home("young-no-probe");
         let db = seed_opencode_db(&home);
         let locator = freshell_sessions::opencode_locator::OpencodeLocator::new(home.clone());
-        assert!(locator.arm("t-young", "opencode", true, None, Some("/proj"), 10_000));
-        assert!(locator.note_submit("t-young", 10_100));
+        assert!(locator.arm(
+            "t-young-boundary",
+            "opencode",
+            true,
+            None,
+            Some("/proj"),
+            10_000
+        ));
+        assert!(locator.note_submit("t-young-boundary", 10_100));
         let window_closed = 10_100 + freshell_sessions::opencode_locator::OPENCODE_WINDOW_MS + 1;
         assert!(locator.tick(window_closed).is_empty());
         insert_opencode_session(&db, "ses_late", "/proj", window_closed + 500);
@@ -1003,7 +1109,7 @@ mod tests {
         let identity = TerminalIdentityRegistry::new();
         let mut warned = HashSet::new();
         let rows = vec![row(
-            "t-young",
+            "t-young-boundary",
             "opencode",
             TerminalRunStatus::Running,
             10_000,
@@ -1020,8 +1126,12 @@ mod tests {
         );
 
         assert!(wanted.is_empty());
-        assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
-        assert_eq!(locator.identity_resolvable_since("t-young"), None);
+        let warnings = unresolved_warnings(
+            &events.lock().unwrap_or_else(|p| p.into_inner()),
+            &["t-young-boundary"],
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(locator.identity_resolvable_since("t-young-boundary"), None);
         assert_eq!(
             locator.db_scan_count(),
             scans_before,
@@ -1151,20 +1261,20 @@ mod tests {
         // signal was lost. The pure pass requests the probe; the phase
         // latches evidence; once the evidence ages past the grace the
         // alarm fires exactly once.
-        let (events, _guard) = capture::capture();
+        let events = capture::capture();
         let home = unique_opencode_home("phase-late-row");
         let db = seed_opencode_db(&home);
         let state = state_with_locator(home.clone());
         let locator = std::sync::Arc::clone(state.opencode_locator.as_ref().unwrap());
-        assert!(locator.arm("t-late", "opencode", true, None, Some("/proj"), 10_000));
-        assert!(locator.note_submit("t-late", 10_100));
+        assert!(locator.arm("t-late-hole", "opencode", true, None, Some("/proj"), 10_000));
+        assert!(locator.note_submit("t-late-hole", 10_100));
         let window_closed = 10_100 + freshell_sessions::opencode_locator::OPENCODE_WINDOW_MS + 1;
         assert!(locator.tick(window_closed).is_empty(), "window saw nothing");
         insert_opencode_session(&db, "ses_late", "/proj", window_closed + 500);
 
         let mut warned = HashSet::new();
         let rows = vec![row(
-            "t-late",
+            "t-late-hole",
             "opencode",
             TerminalRunStatus::Running,
             10_000,
@@ -1179,19 +1289,20 @@ mod tests {
             probe_at,
             state.opencode_locator.as_deref(),
         );
-        assert_eq!(wanted, vec!["t-late".to_string()]);
-        assert!(
-            unresolved_warnings(&events.lock().unwrap()).is_empty(),
-            "nothing latched yet: no warn"
+        assert_eq!(wanted, vec!["t-late-hole".to_string()]);
+        let warnings = unresolved_warnings(
+            &events.lock().unwrap_or_else(|p| p.into_inner()),
+            &["t-late-hole"],
         );
-        assert_eq!(locator.identity_resolvable_since("t-late"), None);
+        assert!(warnings.is_empty(), "nothing latched yet: no warn");
+        assert_eq!(locator.identity_resolvable_since("t-late-hole"), None);
 
         // The async probe phase latches the late, surviving row (checked
         // against CURRENT live/ledger/identity state AFTER the DB read).
         let mut live_check = production_live_check(&state);
         super::opencode_probe_phase(&state, wanted, &mut live_check).await;
         let latched = locator
-            .identity_resolvable_since("t-late")
+            .identity_resolvable_since("t-late-hole")
             .expect("the phase latches the surviving late row as evidence");
 
         // Once that evidence ages past the grace, the alarm fires exactly once.
@@ -1206,7 +1317,10 @@ mod tests {
             wanted_after.is_empty(),
             "a latched pane is never re-queued for probing"
         );
-        let warnings = unresolved_warnings(&events.lock().unwrap());
+        let warnings = unresolved_warnings(
+            &events.lock().unwrap_or_else(|p| p.into_inner()),
+            &["t-late-hole"],
+        );
         assert_eq!(
             warnings.len(),
             1,
@@ -1214,7 +1328,7 @@ mod tests {
         );
         assert_eq!(
             warnings[0].fields.get("terminal_id").map(String::as_str),
-            Some("t-late")
+            Some("t-late-hole")
         );
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1231,17 +1345,17 @@ mod tests {
         // only ever answer None. The idle pane being ABSENT from the queue
         // is the stronger statement of the old "the phase latches nothing"
         // pin: it never even reaches the phase.
-        let (events, _guard) = capture::capture();
+        let events = capture::capture();
         let home = unique_opencode_home("phase-idle-foreign-row");
         let db = seed_opencode_db(&home);
         let state = state_with_locator(home.clone());
         let locator = std::sync::Arc::clone(state.opencode_locator.as_ref().unwrap());
-        assert!(locator.arm("t-idle", "opencode", true, None, Some("/proj"), 0));
+        assert!(locator.arm("t-idle-never", "opencode", true, None, Some("/proj"), 0));
         insert_opencode_session(&db, "ses_foreign", "/proj", 5_000);
 
         let mut warned = HashSet::new();
         let rows = vec![row(
-            "t-idle",
+            "t-idle-never",
             "opencode",
             TerminalRunStatus::Running,
             0,
@@ -1259,8 +1373,12 @@ mod tests {
             wanted.is_empty(),
             "a never-submitted pane is never queued for probing; wanted: {wanted:?}"
         );
-        assert!(unresolved_warnings(&events.lock().unwrap()).is_empty());
-        assert_eq!(locator.identity_resolvable_since("t-idle"), None);
+        let warnings = unresolved_warnings(
+            &events.lock().unwrap_or_else(|p| p.into_inner()),
+            &["t-idle-never"],
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(locator.identity_resolvable_since("t-idle-never"), None);
         let _ = std::fs::remove_dir_all(&home);
     }
 

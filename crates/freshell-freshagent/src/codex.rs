@@ -14787,12 +14787,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn fork_after_crash_recovery_keeps_the_create_provenance_chain() {
         let _guard = ENV_LOCK.lock().await;
-        configure_fake_codex_cmd(
-            &json!({
-                "exitProcessAfterMethodsOnce": ["thread/start"],
-            })
-            .to_string(),
-        );
+        // D8 r2: the create keeps its sidecar ALIVE; the crashed state is
+        // produced by hand (see `simulate_unrequested_crash`) so the resume-path
+        // recovery never depends on the runner-failing reap-confirmation
+        // machinery (the run-3 coin-flip this sibling family shared).
+        configure_fake_codex_cmd("{}");
         let (st, mut rx) = state_with_bus();
         let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
         st.set_identity_sink(fake.clone());
@@ -14808,10 +14807,11 @@ pub(crate) mod tests {
             )),
         )
         .await;
-        wait_for_self_heal(&st, &mut rx, &parent_id).await;
+        simulate_unrequested_crash(&st, &parent_id).await;
 
-        // The respawned parent (spawn 2: resume echoes the requested id) and the
-        // child's own sidecar (spawn 3) share this config.
+        // The respawned parent (spawn 2: `thread/resume` echoes the requested
+        // id) and the child's own sidecar (spawn 3) share this config. (Spawn 1
+        // — the create — stayed alive, hand-flagged crashed.)
         configure_fake_codex_cmd(
             &json!({
                 "overrides": {
@@ -14883,11 +14883,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn fork_after_a_mint_new_respawn_keeps_the_create_provenance_chain() {
         let _guard = ENV_LOCK.lock().await;
-        // Spawn 1: the parent, crashing right after `thread/start`.
+        // D8: spawn 1 keeps its sidecar ALIVE; the crashed state is produced by
+        // hand (see `simulate_unrequested_crash`) so the mint-new recovery never
+        // depends on the runner-failing reap-confirmation machinery.
         configure_fake_codex_cmd(
             &json!({
                 "threadStartThreadId": "parent-old-prov",
-                "exitProcessAfterMethodsOnce": ["thread/start"],
             })
             .to_string(),
         );
@@ -14907,7 +14908,7 @@ pub(crate) mod tests {
         )
         .await;
         assert_eq!(old_id, "parent-old-prov", "fixture sanity: the clicked id");
-        wait_for_self_heal(&st, &mut rx, &old_id).await;
+        simulate_unrequested_crash(&st, &old_id).await;
 
         // The durable rollout is confirmed gone — ensure-alive mints a fresh
         // thread (spawn 2: `thread/start` -> "parent-new-prov"); the fork child's
@@ -19179,8 +19180,11 @@ pub(crate) mod tests {
     }
 
     /// Point `CODEX_CMD` at the fake app-server and configure its scripted `behavior` (a
-    /// `FAKE_CODEX_APP_SERVER_BEHAVIOR` JSON blob \u2014 see the fixture's `loadBehavior()`).
-    fn configure_fake_codex_cmd(behavior_json: &str) {
+    /// `FAKE_CODEX_APP_SERVER_BEHAVIOR` JSON blob — see the fixture's `loadBehavior()`).
+    /// `pub(crate)`: also the committed-fake route for sibling modules' tests
+    /// (e.g. session_handoff's codex target spawns) — the hermetic alternative
+    /// to depending on a host-installed `codex` binary.
+    pub(crate) fn configure_fake_codex_cmd(behavior_json: &str) {
         std::env::set_var("CODEX_CMD", format!("node {}", fake_codex_app_server_cmd()));
         std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior_json);
     }
@@ -19248,6 +19252,22 @@ pub(crate) mod tests {
     /// Wait for `session_id`'s exit-watcher to flip [`CodexSession::exited`] (the
     /// self-heal branch observing an unrequested crash), then drain the resulting
     /// `freshAgent.status{exited}` frame off `rx`.
+    ///
+    /// Only for tests whose SUBJECT is the watcher's own detection flow — the
+    /// recovery-flow fixtures below must use [`simulate_unrequested_crash`]
+    /// instead: a real die-at-`thread/start` crash routes the fixture through
+    /// the exit-watcher's reap-confirmation machinery, which FAILS CLOSED on
+    /// the GitHub runner (unrecordable /proc evidence — the D7 group-(d)
+    /// finding): the watcher then retains a condemned prior, the foreground
+    /// action's own `confirm_fenced_prior_dead` fails the same way, and
+    /// `ensure_session_alive` answers SESSION_RESERVED for the very recovery
+    /// the test is driving (the rust-gate run-3 red, 7 tests; the D8-r2
+    /// reshape converted the six exposed siblings too). The only real-crash
+    /// callers left after D8 r2: `diag01_…` (whose subject IS the detection
+    /// machinery — its crash_detected leg needs the genuine watcher flow) and
+    /// `handle_create_replay_after_unrequested_exit…` (a dedup-cache replay
+    /// that never drives a foreground recovery, so the fail-closed Reserved
+    /// window cannot fire in it; both passed the run-3 runner).
     async fn wait_for_self_heal(
         st: &FreshCodexState,
         rx: &mut tokio::sync::broadcast::Receiver<String>,
@@ -19284,6 +19304,87 @@ pub(crate) mod tests {
         .await
         .expect("the exited status frame arrives within the budget");
         assert_eq!(exited_frame["sessionId"], session_id);
+    }
+
+    /// Produce the post-unrequested-crash state BY HAND for the recovery-flow
+    /// fixtures (D8): flip `exited` (the lazy-restart flag the exit-watcher's
+    /// self-heal sets on an unrequested exit) and clear the completed lease
+    /// binding (the documented watcher release `cleanup_confirmed_codex_teardown`
+    /// performs once a natural exit's writer tree is CONFIRMED dead). The create
+    /// keeps its sidecar ALIVE at the commit (r30 F1), so — unlike a real
+    /// die-at-`thread/start` crash — the fixture never enters the reap-confirmation
+    /// machinery, which fails closed on constrained runners (see
+    /// [`wait_for_self_heal`]'s doc comment). The recovery pipeline under test —
+    /// respawn, resume/mint-new, snapshot/materialized broadcasts, the fork
+    /// handoff — still runs end-to-end for real; the crash DETECTION and the
+    /// confirmed-death lease release are produced by hand instead of by the
+    /// watcher (the `onexit_self_heal_*` family covers the real watcher flow).
+    ///
+    /// TWO real differences from a genuine crash remain — stated plainly so
+    /// future callers don't assume more than is true:
+    ///
+    /// 1. The helper is valid only where ownership tracking is NOT wired up
+    ///    (the `state_with_bus` fixtures). With a wired registry the ownership
+    ///    key stays `Live{FreshAgent}` — nothing CONFIRMED it dead — and
+    ///    `ensure_session_alive` answers Reserved through its Adopt arm,
+    ///    because `has_live_session` is false for an exited row: the very
+    ///    refusal the helper exists to keep out of these fixtures.
+    /// 2. The old sidecar process is still ALIVE. The respawn replaces the
+    ///    runtime and drops the old `kill_tx`, so the old exit-watcher takes
+    ///    the REQUESTED-kill path, and the old consumer's final
+    ///    `clear_controls(thread_id)` runs only after the recovered same-id
+    ///    runtime is registered — an ordering a real crash never produces.
+    ///    Harmless for the current fixtures (no wired registry, no pending
+    ///    approvals), but a caller asserting watcher/consumer teardown
+    ///    ordering must not use this helper.
+    ///
+    /// Same reshape rationale as the D7 stale-family and group-(d) fixtures.
+    async fn simulate_unrequested_crash(st: &FreshCodexState, session_id: &str) {
+        {
+            let sessions = st.sessions.lock().await;
+            sessions
+                .get(session_id)
+                .expect("the session row")
+                .exited
+                .store(true, Ordering::SeqCst);
+        }
+        st.leases.clear_binding(PROVIDER, session_id);
+    }
+
+    /// Drain the CREATE-TIME `freshAgent.session.snapshot` event for
+    /// `session_id` off `rx`. Every [`create_real_fake_session`] create leaves
+    /// one behind: the fake answers `thread/start`, broadcasts
+    /// `thread/started` (fake-app-server.mjs:930-940), and the create's
+    /// consumer — released only after `freshAgent.created` — turns it into a
+    /// `freshAgent.event{freshAgent.session.snapshot}` for the created id.
+    ///
+    /// Recovery-flow tests that assert a POST-recovery snapshot (the attach
+    /// recovery tests) MUST drain this frame first: [`simulate_unrequested_crash`]
+    /// reads nothing, so without the drain the stale create-time snapshot
+    /// satisfies any "first event" assert without the recovery ever having
+    /// run (the round-3 review Major — the reshaped attach test passed on this
+    /// stale frame even when the attach answered SESSION_RESERVED).
+    async fn drain_create_time_snapshot(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        session_id: &str,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                assert_ne!(
+                    frame["type"], "error",
+                    "the create fixture must not error before its snapshot: {frame}"
+                );
+                if frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.session.snapshot"
+                    && frame["sessionId"] == session_id
+                {
+                    return;
+                }
+            }
+        })
+        .await
+        .expect("the create-time snapshot drains within the budget");
     }
 
     /// Task 4 (P1.13): a healthy create writes a fresh-agent binding row (provider
@@ -19537,22 +19638,23 @@ pub(crate) mod tests {
     /// pin (see the removed `assert_ne!(new_thread_id, thread_id, ...)` this replaces).
     #[tokio::test(flavor = "multi_thread")]
     // Intentional: `_guard` is held across every `.await` in this test BY DESIGN, so it
-    // serializes against `attach_after_unrequested_crash_recovers_and_emits_a_snapshot`
-    // (the other test mutating the process-global `CODEX_CMD`/`FAKE_CODEX_APP_SERVER_BEHAVIOR`
-    // env vars) for the test's ENTIRE duration, not just around individual calls.
+    // serializes against `attach_after_unrequested_crash_respawns_the_sidecar_and_emits_a
+    // _post_recovery_snapshot` (the other test mutating the process-global
+    // `CODEX_CMD`/`FAKE_CODEX_APP_SERVER_BEHAVIOR` env vars) for the test's ENTIRE
+    // duration, not just around individual calls.
     async fn send_after_unrequested_crash_resumes_the_same_thread_id_and_completes_with_no_error_frame(
     ) {
         let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
-        // The FIRST spawn crashes deterministically right after `thread/start` responds
-        // (the fixture's `exitProcessAfterMethodsOnce`) -- a real, observable "the child
-        // process exited on its own" crash, not a simulated flag flip.
-        configure_fake_codex_cmd(
-            r#"{"threadStartThreadId":"thread-original","exitProcessAfterMethodsOnce":["thread/start"]}"#,
-        );
+        // D8 r2: the create keeps its sidecar ALIVE; the crashed state is
+        // produced by hand (see `simulate_unrequested_crash` — the crash
+        // DETECTION is simulated, the recovery below still runs for real) so
+        // the send's recovery never depends on the runner-failing
+        // reap-confirmation machinery.
+        configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-original"}"#);
         let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        simulate_unrequested_crash(&st, &thread_id).await;
 
         // The respawned sidecar must NOT immediately crash again; `thread/resume` on this
         // fixture always succeeds (echoing back whatever thread id it's asked to resume).
@@ -19572,15 +19674,23 @@ pub(crate) mod tests {
         })
         .await;
 
-        // The turn was accepted under the SAME id, with NO user-facing error frame and NO
-        // `freshAgent.session.materialized` broadcast along the way (recovery preserved
-        // the durable identity -- conversation memory for this thread is intact).
+        // The turn was accepted under the SAME id, with NO user-facing error frame —
+        // bare OR event-wrapped (the SESSION_RESERVED loser answer rides the
+        // freshAgent.event envelope; a bare-type-only assert would miss it and
+        // surface as silence-then-timeout) — and NO
+        // `freshAgent.session.materialized` broadcast along the way (recovery
+        // preserved the durable identity -- conversation memory for this thread
+        // is intact).
         let accepted: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
                 assert_ne!(
                     frame["type"], "error",
                     "no user-facing error frame: {frame}"
+                );
+                assert_ne!(
+                    frame["event"]["type"], "freshAgent.error",
+                    "no user-facing error frame, event-wrapped either: {frame}"
                 );
                 assert_ne!(
                     frame["type"], "freshAgent.session.materialized",
@@ -19612,11 +19722,13 @@ pub(crate) mod tests {
         let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
-        configure_fake_codex_cmd(
-            r#"{"threadStartThreadId":"thread-original","exitProcessAfterMethodsOnce":["thread/start"]}"#,
-        );
+        // D8 r2: the create keeps its sidecar ALIVE; the crashed state is
+        // produced by hand (see `simulate_unrequested_crash`) so the mint-new
+        // fallback recovery never depends on the runner-failing
+        // reap-confirmation machinery.
+        configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-original"}"#);
         let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        simulate_unrequested_crash(&st, &thread_id).await;
 
         // The respawned sidecar's `thread/resume` reports the thread as genuinely gone.
         configure_fake_codex_cmd(
@@ -19645,12 +19757,22 @@ pub(crate) mod tests {
         })
         .await;
 
+        // The wrapped-error assert is safe in THIS loop (unlike the
+        // accepted-wait loop below): the mint-new tail broadcasts the
+        // legitimate wrapped THREAD_MEMORY_LOST degradation strictly AFTER
+        // the materialized frame, and this loop returns on materialized —
+        // the assert can never see it, so a Reserved regression fails here
+        // as a named frame instead of a 15s Elapsed.
         let materialized: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
                 assert_ne!(
                     frame["type"], "error",
                     "no user-facing error frame: {frame}"
+                );
+                assert_ne!(
+                    frame["event"]["type"], "freshAgent.error",
+                    "no user-facing error frame, event-wrapped either: {frame}"
                 );
                 if frame["type"] == "freshAgent.session.materialized" {
                     return frame;
@@ -19695,11 +19817,12 @@ pub(crate) mod tests {
         let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
-        configure_fake_codex_cmd(
-            r#"{"threadStartThreadId":"thread-original","exitProcessAfterMethodsOnce":["thread/start"]}"#,
-        );
+        // D8: the create keeps its sidecar ALIVE; the crashed state is produced
+        // by hand (see `simulate_unrequested_crash`) so the mint-new recovery
+        // never depends on the runner-failing reap-confirmation machinery.
+        configure_fake_codex_cmd(r#"{"threadStartThreadId":"thread-original"}"#);
         let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        simulate_unrequested_crash(&st, &thread_id).await;
 
         // The respawned sidecar's `thread/resume` reports the thread as genuinely gone,
         // forcing the mint-new-thread crash-respawn fallback.
@@ -19770,9 +19893,13 @@ pub(crate) mod tests {
         let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
+        // D8 r2: the create keeps its sidecar ALIVE; the crashed state is
+        // produced by hand (see `simulate_unrequested_crash`) so the
+        // respawn-failure flow never depends on the runner-failing
+        // reap-confirmation machinery.
+        configure_fake_codex_cmd("{}");
         let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        simulate_unrequested_crash(&st, &thread_id).await;
 
         // A transient failure (NOT a "not found"-shaped message) on EVERY `thread/resume`
         // attempt -- the first (with settings) AND the retry (with settings dropped).
@@ -19804,6 +19931,11 @@ pub(crate) mod tests {
         let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                assert_ne!(
+                    frame["event"]["type"], "freshAgent.error",
+                    "the transient failure must report on the typed bare-error channel \
+                     (CODEX_RESPAWN_FAILED), never the banner event: {frame}"
+                );
                 if frame["type"] == "error" {
                     return frame;
                 }
@@ -19832,9 +19964,17 @@ pub(crate) mod tests {
         let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
+        // D8 r2: the create keeps its sidecar ALIVE; the crashed state is
+        // produced by hand (see `simulate_unrequested_crash`) so the resume
+        // never depends on the runner-failing reap-confirmation machinery.
+        configure_fake_codex_cmd("{}");
         let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        simulate_unrequested_crash(&st, &thread_id).await;
+
+        // Drain the create-time snapshot so the snapshot asserted below is the
+        // RECOVERY's own, not the stale create-time frame (the helper reads
+        // nothing off the bus — see `drain_create_time_snapshot`).
+        drain_create_time_snapshot(&mut rx, &thread_id).await;
 
         configure_fake_codex_cmd("{}");
         st.handle_attach(FreshAgentAttach {
@@ -20052,10 +20192,14 @@ pub(crate) mod tests {
     async fn concurrent_send_and_attach_single_flight_recovery_for_the_same_crashed_session() {
         let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("concurrent-single-flight-marker-unused");
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
+        // D8: the create keeps its sidecar ALIVE; the crashed state is produced
+        // by hand (see `simulate_unrequested_crash`) so the racing recovery
+        // never depends on the runner-failing reap-confirmation machinery.
+        configure_fake_codex_cmd("{}");
         let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        simulate_unrequested_crash(&st, &thread_id).await;
 
         // A small delay on `thread/resume` widens the race window between the two
         // concurrent recovery attempts below.
@@ -20107,7 +20251,11 @@ pub(crate) mod tests {
         // concurrent respawns had raced past the single-flight guard, this thread id
         // would have been resumed twice (two sidecars), and the fixture's per-process
         // `activeThreadIds` bookkeeping / a duplicate resume would surface as an error
-        // frame on the bus. Assert none arrived, and the session is alive.
+        // frame on the bus. Assert none arrived — bare OR event-wrapped (the
+        // SESSION_RESERVED loser answer rides the freshAgent.event envelope; a
+        // bare-type-only assert catches a join regression only about half the
+        // time — the round-4 review's blind spot on this test) — the session is
+        // alive, and exactly one recovery spawn ran.
         let mut saw_send_accepted = false;
         let timeout = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
@@ -20115,6 +20263,11 @@ pub(crate) mod tests {
                 assert_ne!(
                     frame["type"], "error",
                     "no user-facing error frame from either racing caller: {frame}"
+                );
+                assert_ne!(
+                    frame["event"]["type"], "freshAgent.error",
+                    "no user-facing error frame from either racing caller, event-wrapped \
+                     either: {frame}"
                 );
                 if frame["type"] == "freshAgent.send.accepted" {
                     saw_send_accepted = true;
@@ -20125,6 +20278,13 @@ pub(crate) mod tests {
         .await;
         assert!(timeout.is_ok(), "send.accepted arrives within the budget");
         assert!(saw_send_accepted);
+        assert_eq!(
+            spawn_count(&capture),
+            2,
+            "exactly one respawn recovered the session for BOTH racing callers \
+             (the create's spawn + a single recovery spawn -- the single-flight the \
+             per-thread resuming join proves; two independent respawns would double it)"
+        );
 
         let guard = st.sessions.lock().await;
         assert!(
@@ -20133,16 +20293,37 @@ pub(crate) mod tests {
         );
     }
 
+    /// Round-3 review Major (D8 r2): the previous shape of this test latched the
+    /// STALE create-time snapshot (see [`drain_create_time_snapshot`]) and so
+    /// passed even when the attach never recovered — the same wrong-reason
+    /// class as the round-1 Majors. Redesigned so the test FAILS unless the
+    /// recovery genuinely runs: the create-time snapshot is drained BEFORE the
+    /// attach, so the asserted snapshot can only be the recovery's own; the
+    /// spawn count pins the respawn (the run-3 CI red answered
+    /// SESSION_RESERVED with spawn 1 still standing — under that shape either
+    /// assert alone would catch it: the wrapped error frame trips the loop
+    /// assert, and the spawn count never reaches 2).
     #[tokio::test(flavor = "multi_thread")]
-    // Intentional: same rationale as the sibling test above -- `_guard` must span every
-    // `.await` in this test to serialize the two tests' shared env-var mutations.
-    async fn attach_after_unrequested_crash_recovers_and_emits_a_snapshot() {
+    // Intentional: `_guard` must span every `.await` in this test to serialize it against
+    // every other env-var-mutating test in this module for its ENTIRE duration.
+    async fn attach_after_unrequested_crash_respawns_the_sidecar_and_emits_a_post_recovery_snapshot(
+    ) {
         let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("attach-recovery-marker-unused");
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
+        // D8: the create keeps its sidecar ALIVE; the crashed state is produced
+        // by hand (see `simulate_unrequested_crash`) so the attach's recovery
+        // never depends on the runner-failing reap-confirmation machinery.
+        configure_fake_codex_cmd("{}");
         let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        assert_eq!(
+            spawn_count(&capture),
+            1,
+            "fixture sanity: exactly the create's spawn before the crash"
+        );
+        simulate_unrequested_crash(&st, &thread_id).await;
+        drain_create_time_snapshot(&mut rx, &thread_id).await;
 
         configure_fake_codex_cmd("{}");
         st.handle_attach(FreshAgentAttach {
@@ -20157,32 +20338,39 @@ pub(crate) mod tests {
         })
         .await;
 
-        let outcome: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        // The recovery-specific outcome: a FRESH snapshot for the session,
+        // arriving only after the attach — never an error frame, bare OR
+        // event-wrapped (the run-3 CI red was the attach answering the typed
+        // SESSION_RESERVED loser shape, which rides the freshAgent.event
+        // envelope — a bare-type-only assert would miss it).
+        let snapshot: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
                 assert_ne!(
                     frame["type"], "error",
-                    "attach recovers or reports honestly, never hangs silently: {frame}"
+                    "the attach must RECOVER, never answer the SESSION_RESERVED loser shape: {frame}"
                 );
-                if frame["type"] == "freshAgent.session.materialized"
-                    || frame["type"] == "freshAgent.event"
+                assert_ne!(
+                    frame["event"]["type"], "freshAgent.error",
+                    "the attach must RECOVER, never answer the SESSION_RESERVED loser shape: {frame}"
+                );
+                if frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.session.snapshot"
                 {
                     return frame;
                 }
             }
         })
         .await
-        .expect(
-            "attach either recovers (materialized+snapshot) or reports honestly, within the budget",
+        .expect("the recovered attach emits a fresh snapshot within the budget");
+        assert_eq!(
+            snapshot["sessionId"], thread_id,
+            "the post-recovery snapshot names the recovered session: {snapshot}"
         );
-
-        // Recovery succeeded: materialized under a new id (asserted generously here since
-        // frame order between the materialize broadcast and the snapshot broadcast is not
-        // contractually fixed -- either arriving first proves the recovery happened).
-        assert!(
-            outcome["type"] == "freshAgent.session.materialized"
-                || outcome["event"]["type"] == "freshAgent.session.snapshot",
-            "unexpected first frame: {outcome}"
+        assert_eq!(
+            spawn_count(&capture),
+            2,
+            "the attach respawned the sidecar exactly once (recovery ran for real)"
         );
     }
 
@@ -20208,8 +20396,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Whole-branch review M-2: a Compact click on a crash-stale session (sidecar died
-    /// unrequested; the self-heal design keeps the session MAPPED) must transparently
+    /// Whole-branch review M-2: a Compact click on a crash-stale session (sidecar
+    /// hand-flagged exited-unrequested, see `simulate_unrequested_crash`; the
+    /// self-heal design keeps the session MAPPED) must transparently
     /// respawn the sidecar FIRST — the `handle_send` ensure-alive precedent, and legacy's
     /// `ensureRuntime(sessionId, settings)` before compact (`adapter.ts:1030`) — then issue
     /// the compact RPC on the RESPAWNED sidecar. Dying loudly against the dead connection
@@ -20227,16 +20416,18 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
         let capture = tracing_capture::capture_by_session("compact-respawn-marker-unused");
 
-        // Spawn 1 crashes right after `thread/start` — a real unrequested-exit crash.
+        // D8 r2: spawn 1 keeps its sidecar ALIVE; the crash-stale state is
+        // produced by hand (see `simulate_unrequested_crash` — flag flipped,
+        // lease binding released) so the compact's recovery never depends on
+        // the runner-failing reap-confirmation machinery.
         configure_fake_codex_cmd(
             &json!({
-                "exitProcessAfterMethodsOnce": ["thread/start"],
                 "appendThreadOperationLogPath": log_path.to_string_lossy(),
             })
             .to_string(),
         );
         let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        simulate_unrequested_crash(&st, &thread_id).await;
         assert_eq!(
             spawn_count(&capture),
             1,
@@ -20287,7 +20478,8 @@ pub(crate) mod tests {
         assert_eq!(
             by_url.len(),
             2,
-            "exactly two sidecar connections (crashed spawn + respawn): {log_text}"
+            "exactly two sidecar connections (first spawn, kept alive and hand-flagged \
+             crashed, + respawn): {log_text}"
         );
         let mut sequences: Vec<Vec<String>> = by_url.values().cloned().collect();
         sequences.sort();
@@ -20300,7 +20492,7 @@ pub(crate) mod tests {
         assert_eq!(
             sequences[1],
             vec!["thread/start"],
-            "the crashed spawn served only the create: {log_text}"
+            "the first spawn (kept alive, hand-flagged crashed) served only the create: {log_text}"
         );
 
         let _ = std::fs::remove_file(&log_path);
@@ -20323,15 +20515,17 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
         let capture = tracing_capture::capture_by_session("fork-respawn-marker-unused");
 
+        // D8: the create keeps its sidecar ALIVE; the crashed state is produced
+        // by hand (see `simulate_unrequested_crash`) so the fork's recovery
+        // never depends on the runner-failing reap-confirmation machinery.
         configure_fake_codex_cmd(
             &json!({
-                "exitProcessAfterMethodsOnce": ["thread/start"],
                 "appendThreadOperationLogPath": log_path.to_string_lossy(),
             })
             .to_string(),
         );
         let parent_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &parent_id).await;
+        simulate_unrequested_crash(&st, &parent_id).await;
         assert_eq!(
             spawn_count(&capture),
             1,
@@ -20375,8 +20569,9 @@ pub(crate) mod tests {
             spawn_count(&capture)
         );
 
-        // Per-connection RPC order over THREE sidecars: crashed spawn = thread/start;
-        // respawned parent = thread/resume → thread/fork → thread/archive; child =
+        // Per-connection RPC order over THREE sidecars: first spawn (kept alive,
+        // hand-flagged crashed — D8) = thread/start; respawned parent =
+        // thread/resume → thread/fork → thread/archive; child =
         // thread/unarchive → thread/resume.
         let log_text = read_op_log_when_complete(&log_path, 6).await;
         let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
@@ -20390,7 +20585,7 @@ pub(crate) mod tests {
         assert_eq!(
             by_url.len(),
             3,
-            "exactly three sidecar connections (crashed + respawned parent + child): {log_text}"
+            "exactly three sidecar connections (first + respawned parent + child): {log_text}"
         );
         let mut sequences: Vec<Vec<String>> = by_url.values().cloned().collect();
         sequences.sort();
@@ -20403,7 +20598,7 @@ pub(crate) mod tests {
         assert_eq!(
             sequences[1],
             vec!["thread/start"],
-            "the crashed spawn served only the create: {log_text}"
+            "the first spawn served only the create: {log_text}"
         );
         assert_eq!(
             sequences[2],
@@ -20473,19 +20668,19 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
         let capture = tracing_capture::capture_by_session("fork-mint-new-marker-unused");
 
-        // Spawn 1: the parent, which crashes right after `thread/start` (a real
-        // unrequested exit, observed by the exit-watcher self-heal).
+        // D8: spawn 1 keeps its sidecar ALIVE; the crashed state is produced by
+        // hand (see `simulate_unrequested_crash`) so the mint-new route never
+        // depends on the runner-failing reap-confirmation machinery.
         configure_fake_codex_cmd(
             &json!({
                 "threadStartThreadId": "parent-old-mint",
-                "exitProcessAfterMethodsOnce": ["thread/start"],
                 "appendThreadOperationLogPath": log_path.to_string_lossy(),
             })
             .to_string(),
         );
         let old_id = create_real_fake_session(&st, &mut rx).await;
         assert_eq!(old_id, "parent-old-mint", "fixture sanity: the clicked id");
-        wait_for_self_heal(&st, &mut rx, &old_id).await;
+        simulate_unrequested_crash(&st, &old_id).await;
         assert_eq!(
             spawn_count(&capture),
             1,
@@ -20540,9 +20735,10 @@ pub(crate) mod tests {
             spawn_count(&capture)
         );
 
-        // Per-connection RPC order over THREE sidecars: crashed spawn = thread/start;
-        // respawned parent = thread/start (the mint) → thread/fork → thread/archive,
-        // with the fork RPC TARGETING the minted parent id; child = unarchive → resume.
+        // Per-connection RPC order over THREE sidecars: first spawn (kept alive,
+        // hand-flagged crashed — D8) = thread/start; respawned parent =
+        // thread/start (the mint) → thread/fork → thread/archive, with the fork
+        // RPC TARGETING the minted parent id; child = unarchive → resume.
         let log_text = read_op_log_when_complete(&log_path, 6).await;
         let mut by_url: HashMap<String, Vec<String>> = HashMap::new();
         let mut fork_target: Option<String> = None;
@@ -20569,7 +20765,7 @@ pub(crate) mod tests {
         assert_eq!(
             by_url.len(),
             3,
-            "exactly three sidecar connections (crashed + respawned parent + child): {log_text}"
+            "exactly three sidecar connections (first + respawned parent + child): {log_text}"
         );
         let mut sequences: Vec<Vec<String>> = by_url.values().cloned().collect();
         sequences.sort();
@@ -20577,7 +20773,7 @@ pub(crate) mod tests {
         assert_eq!(
             sequences[0],
             vec!["thread/start"],
-            "the crashed spawn served only the original create: {log_text}"
+            "the first spawn served only the original create: {log_text}"
         );
         assert_eq!(
             sequences[1],
@@ -20654,17 +20850,19 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn fork_on_a_mint_new_respawn_keys_mid_flight_failures_to_the_resolved_parent_id() {
         let _guard = ENV_LOCK.lock().await;
+        // D8: the create keeps its sidecar ALIVE; the crashed state is produced
+        // by hand (see `simulate_unrequested_crash`) so the mint-new route never
+        // depends on the runner-failing reap-confirmation machinery.
         configure_fake_codex_cmd(
             &json!({
                 "threadStartThreadId": "parent-old-mint",
-                "exitProcessAfterMethodsOnce": ["thread/start"],
             })
             .to_string(),
         );
         let (st, mut rx) = state_with_bus();
         let capture = tracing_capture::capture_by_session("fork-mint-fail-marker-unused");
         let old_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &old_id).await;
+        simulate_unrequested_crash(&st, &old_id).await;
         st.mark_thread_dead(&old_id).await;
 
         // The respawned parent mints "parent-new-mint"; its `thread/fork` then fails with
@@ -20772,19 +20970,33 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
         let capture = tracing_capture::capture_by_session("fork-mint-rekey-guard-marker-unused");
 
-        // Spawn 1: the parent, crashing right after `thread/start` (a real unrequested
-        // exit observed by the exit-watcher self-heal).
+        // Spawn 1: the parent, created with its sidecar ALIVE at the commit
+        // (r30 F1: a sidecar already dead at the commit is never published).
+        // The post-crash state is then produced by hand via
+        // `simulate_unrequested_crash` (flag flip + lease-binding release —
+        // the watcher's confirmed-death state), and the thread is marked dead
+        // (the F-1 mint-new route). The respawn under test must never depend
+        // on the reap-confirmation machinery: it fails closed on constrained
+        // runners (unrecordable /proc evidence), which retained the CONDEMNED
+        // PRIOR — so the fork's `ensure_session_alive` answered Reserved at
+        // its condemned-prior check (which runs before any lease claim), and
+        // the mint-new respawn, with its OLD→NEW materialized broadcast,
+        // never ran (the rust-gate CI Elapsed; the same retained-prior
+        // mechanism the D7-r2 simulation and D8 analysis proved). A lease
+        // claim can never be what answers for this fixture: a fresh create
+        // binds no lease (`finish_create` runs with `lease_guard = None` —
+        // bindings come only from `FreshSessionLeaseGuard::complete`), so a
+        // BoundLive→Recovered claim answer is unreachable here.
         configure_fake_codex_cmd(
             &json!({
                 "threadStartThreadId": "parent-old-mint",
-                "exitProcessAfterMethodsOnce": ["thread/start"],
                 "appendThreadOperationLogPath": log_path.to_string_lossy(),
             })
             .to_string(),
         );
         let old_id = create_real_fake_session(&st, &mut rx).await;
         assert_eq!(old_id, "parent-old-mint", "fixture sanity: the clicked id");
-        wait_for_self_heal(&st, &mut rx, &old_id).await;
+        simulate_unrequested_crash(&st, &old_id).await;
         // Dead-thread negative cache: ensure-alive goes straight to the mint-new
         // respawn fallback (the F-1 route).
         st.mark_thread_dead(&old_id).await;
@@ -20944,11 +21156,11 @@ pub(crate) mod tests {
         // Wire audit: exactly TWO thread/fork RPCs crossed the wire (fork #1 and the
         // post-completion fork #3 — the refused duplicate produced NONE), both
         // targeting the respawned parent, over exactly four sidecar connections
-        // (crashed spawn + respawned parent + one sidecar per child).
+        // (parent spawn + respawn + one sidecar per child).
         assert_eq!(
             spawn_count(&capture),
             4,
-            "crashed parent + respawn + two child sidecars: {}",
+            "parent spawn + respawn + two child sidecars: {}",
             spawn_count(&capture)
         );
         let log_text = read_op_log_when_complete(&log_path, 10).await;
@@ -22370,12 +22582,32 @@ pub(crate) mod tests {
     }
 
     // ── b8ke ext r8 F5: the crashed-recovery re-claim carries the observed fence ──
+    //
+    // Family fixture note (r30 F1, 45ff51938): `commit_lane_claim` refuses to
+    // publish a sidecar whose pid is already dead at the create's commit, so
+    // these fixtures create the session with the sidecar ALIVE ("{}") and
+    // produce the crashed state BY HAND — the manual `exited` flip plus the
+    // hand-built begin_handoff/fail generation advance or vacate each test
+    // below already performs. The `exited` flip is the lazy-restart flag the
+    // exit-watcher's self-heal sets; the sidecar PROCESS itself stays alive
+    // (only the flag routes these handlers into the crashed-recovery
+    // re-claim). The stale refusal under test happens at the coordinator
+    // claim, BEFORE any respawn, so the stale-fence/generation semantics
+    // face a session whose row is materialized and marked exited, and the
+    // no-recreation asserts stay honest.
 
     /// b8ke ext r8 F5: a delayed attach whose observed generation predates a
-    /// generation advance is refused typed (SESSION_RESERVED) — the
-    /// crashed-recovery re-claim carries the request's fence, so the stale
-    /// attach can no longer recreate the runtime past the advance (pre-r8 the
-    /// claim was hard-wired None and the recreation proceeded).
+    /// generation advance is refused typed (SESSION_RESERVED) — the key sits
+    /// VACANT at the advanced generation (the crash shape), and the tracked
+    /// attach routes through `ensure_session_alive`'s crashed-recovery
+    /// re-claim, whose coordinator claim carries the request's fence; the
+    /// stale fence refuses the claim (StaleGeneration), so the stale attach
+    /// can no longer recreate the runtime past the advance (pre-r8 the claim
+    /// was hard-wired None, and on this VACANT key that fence-less claim was
+    /// GRANTED and the recreation proceeded). The key must end VACANT, never
+    /// at a restored-Live record: a Live key would re-route the refusal
+    /// through the tracked arm's adopt guard (a DIFFERENT guard that happens
+    /// to answer the same code) and the r8 F5 fence would go unexercised.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_stale_generation_crashed_attach_is_refused_typed_no_recreation() {
         let _guard = ENV_LOCK.lock().await;
@@ -22383,13 +22615,19 @@ pub(crate) mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
-        let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        // r30 F1: the sidecar must be ALIVE at the create's commit (a
+        // dead-at-commit sidecar is never published); the crashed state
+        // is built by hand below (see the family note above).
         configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
 
-        // Advance the coordinator generation past the attach's observation: a
-        // handoff begin + fail bumps the record while the runtime stays live.
+        // Advance the coordinator generation past the attach's observation
+        // and VACATE the key at the advanced generation — the crash shape
+        // the r8 F5 fence exists for: the handoff's unwind cannot confirm
+        // the crashed prior (the row is marked exited below), so it must
+        // NOT restore it. Restoring the prior (`fail(.., true)`) would put
+        // the key back as Live and re-route the refusal through the tracked
+        // arm's adopt guard — the wrong fence.
         let before = registry.observe(PROVIDER, &thread_id);
         let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = registry
             .begin_handoff(
@@ -22404,15 +22642,19 @@ pub(crate) mod tests {
         else {
             panic!("expected the bump handoff granted")
         };
-        // The bump handoff's unwind restores the prior (or vacates a
-        // from-vacant key) — either way the RECORD's generation advanced.
-        let _ = registry.fail(PROVIDER, &thread_id, "op-r8-bump", ho_gen, true);
+        let _ = registry.fail(PROVIDER, &thread_id, "op-r8-bump", ho_gen, false);
         let after = registry.observe(PROVIDER, &thread_id);
         assert!(
             after.generation > before.generation,
             "the record's generation advanced: {} -> {}",
             before.generation,
             after.generation
+        );
+        assert!(
+            matches!(after.state, freshell_ownership::OwnershipState::Vacant),
+            "harness sanity: the key VACATED at the advanced generation (a \
+             restored-Live key would re-route the refusal through the adopt \
+             guard — the wrong fence)"
         );
 
         // Mark the session crashed so the attach runs the recovery re-claim.
@@ -22464,8 +22706,14 @@ pub(crate) mod tests {
 
     /// b8ke ext r8 F5: a send carrying a stale observed generation against a
     /// crashed session is refused typed (SESSION_RESERVED) — FreshAgentSend's
-    /// new additive pair fences the recovery re-claim on every route through
-    /// ensure_session_alive.
+    /// additive pair fences the recovery re-claim on every route through
+    /// `ensure_session_alive`. The key sits VACANT at the advanced generation
+    /// (the crash shape: the failed handoff unwind could not confirm the
+    /// crashed prior live, so it vacated): the stale fence refuses the claim
+    /// (StaleGeneration), while a dropped fence would GRANT the claim on this
+    /// VACANT key and recreate the runtime (the pre-r8 bug) — the
+    /// discrimination this test exists for. A restored-Live key would refuse
+    /// both shapes through the lease double-check and detect nothing.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_stale_generation_send_against_a_crashed_session_is_refused_typed() {
         let _guard = ENV_LOCK.lock().await;
@@ -22473,12 +22721,17 @@ pub(crate) mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
-        let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        // r30 F1: the sidecar must be ALIVE at the create's commit (a
+        // dead-at-commit sidecar is never published); the crashed state
+        // is built by hand below (see the family note above).
         configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
 
-        // Advance the generation past the send's observation.
+        // Advance the generation past the send's observation and VACATE the
+        // key at the advanced generation — the crash shape (the row is
+        // marked exited below, so the handoff's unwind cannot confirm the
+        // prior live and must not restore it; `fail(.., true)` would put the
+        // key back as Live and blind the test's fence discrimination).
         let before = registry.observe(PROVIDER, &thread_id);
         let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = registry
             .begin_handoff(
@@ -22493,7 +22746,19 @@ pub(crate) mod tests {
         else {
             panic!("expected the bump handoff granted")
         };
-        let _ = registry.fail(PROVIDER, &thread_id, "op-r8-bump-send", ho_gen, true);
+        let _ = registry.fail(PROVIDER, &thread_id, "op-r8-bump-send", ho_gen, false);
+        let after = registry.observe(PROVIDER, &thread_id);
+        assert!(
+            after.generation > before.generation,
+            "the record's generation advanced: {} -> {}",
+            before.generation,
+            after.generation
+        );
+        assert!(
+            matches!(after.state, freshell_ownership::OwnershipState::Vacant),
+            "harness sanity: the key VACATED at the advanced generation (a \
+             restored-Live key would blind the fence discrimination)"
+        );
 
         // Mark the session crashed so the send runs the recovery re-claim.
         {
@@ -22554,10 +22819,11 @@ pub(crate) mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
-        let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        // r30 F1: the sidecar must be ALIVE at the create's commit (a
+        // dead-at-commit sidecar is never published); the crashed state
+        // is built by hand below (see the family note above).
         configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
 
         // Advance the generation past the compact's observation and VACATE
         // the key (the crash shape: the handoff failed, the prior runtime
@@ -22642,10 +22908,11 @@ pub(crate) mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
-        let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        // r30 F1: the sidecar must be ALIVE at the create's commit (a
+        // dead-at-commit sidecar is never published); the crashed state
+        // is built by hand below (see the family note above).
         configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
 
         let before = registry.observe(PROVIDER, &thread_id);
         let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = registry
@@ -22708,10 +22975,11 @@ pub(crate) mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
-        let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        // r30 F1: the sidecar must be ALIVE at the create's commit (a
+        // dead-at-commit sidecar is never published); the crashed state
+        // is built by hand below (see the family note above).
         configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
 
         let before = registry.observe(PROVIDER, &thread_id);
         let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = registry
@@ -22858,10 +23126,11 @@ pub(crate) mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
-        let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        // r30 F1: the sidecar must be ALIVE at the create's commit (a
+        // dead-at-commit sidecar is never published); the crashed state
+        // is built by hand below (see the family note above).
         configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
 
         // Advance the generation past the compact's observation, then VACATE
         // the key at the advanced generation (the crash-shaped state).
@@ -22956,10 +23225,11 @@ pub(crate) mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
-        let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        // r30 F1: the sidecar must be ALIVE at the create's commit (a
+        // dead-at-commit sidecar is never published); the crashed state
+        // is built by hand below (see the family note above).
         configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
 
         let before = registry.observe(PROVIDER, &thread_id);
         let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = registry
@@ -23090,10 +23360,11 @@ pub(crate) mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
-        let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        // r30 F1: the sidecar must be ALIVE at the create's commit (a
+        // dead-at-commit sidecar is never published); the crashed state
+        // is built by hand below (see the family note above).
         configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
 
         let before = registry.observe(PROVIDER, &thread_id);
         let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = registry

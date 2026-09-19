@@ -252,12 +252,15 @@ test.describe('Remote tab linkage (Rust only)', () => {
         await expect.poll(() => harness.getActiveTabId(), { timeout: 15_000 }).toBe(restTabId)
         expect(await harness.getTabCount()).toBe(tabCountBeforeClick)
 
-        // NOTE: the dedupe click also SYNCS the real session title into the
-        // focused tab (`openSessionTab`, `tabsSlice.ts:683-688,730-759` --
-        // one of the few matchers that already handles both identity keys),
-        // so the tab is now titled with the seeded session's name, not the
-        // REST `name`. Track it by ID + current title for the post-restart
-        // assertions.
+        // NOTE (display precedence, docs/development/rename-scope-contract.md):
+        // the dedupe click finds and FOCUSES the existing tab; its historical
+        // session-title sync yields to the tab's explicit creator title (the
+        // already-open click returns early at Sidebar.tsx:486-489; the
+        // `!existingTab.titleSetByUser` check at :487 blocks the sync — same
+        // semantic as openSessionTab's tabsSlice.ts:1141 guard, which the
+        // click never reaches), so the REST `name` survives the click. The
+        // pane title still mirrors the session title (pane-scope canonical);
+        // only the tab display keeps the name.
         const tabTitleAfterClick: string = await expect.poll(async () => {
           const s = await harness.getState()
           return s?.tabs?.tabs?.find((t: any) => t.id === restTabId)?.title ?? null
@@ -265,6 +268,7 @@ test.describe('Remote tab linkage (Rust only)', () => {
           const s = await harness.getState()
           return s.tabs.tabs.find((t: any) => t.id === restTabId).title
         })
+        expect(tabTitleAfterClick).toBe(TAB_NAME)
 
         // ------------------------------------------------------------------
         // Durability mechanism: the persisted layout carries the

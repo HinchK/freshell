@@ -4141,12 +4141,45 @@ impl FreshClaudeState {
                     "freshagent.claude.unsupported-settings-ignored"
                 );
             }
+            // Convergence (restored from bf9b8d31a, dropped in the ext-r8
+            // handle_send rework): capture the pre-configure pair so a send
+            // whose settings CHANGED the live session can converge every
+            // device's model surfaces — the same frame `handle_configure`
+            // emits (a device that missed the configure still lands here).
+            let settings_before = {
+                let guard = self.sessions.lock().await;
+                guard.get(&map_key).map(|s| {
+                    (
+                        s.configuration.settings.model.clone(),
+                        s.configuration.settings.effort.clone(),
+                    )
+                })
+            };
             if let Err(err) = self
                 .configure_for_send(&map_key, settings, session_type)
                 .await
             {
                 self.send_error(&request_id, "CLAUDE_SETTINGS_FAILED", &err);
                 return;
+            }
+            let settings_after = {
+                let guard = self.sessions.lock().await;
+                guard.get(&map_key).map(|s| {
+                    (
+                        s.configuration.settings.model.clone(),
+                        s.configuration.settings.effort.clone(),
+                    )
+                })
+            };
+            if settings_before != settings_after {
+                let (model, effort) = settings_after.unwrap_or((None, None));
+                self.broadcast(&crate::session_metadata::session_metadata_frame(
+                    PROVIDER,
+                    session_type,
+                    &session_id,
+                    model.as_deref(),
+                    effort.as_deref(),
+                ));
             }
         }
         // Task 4 review (C1b): the destroy target comes from POST-lock session
@@ -11031,6 +11064,111 @@ rl.on('line', (line) => {
         })
         .await
         .unwrap_or_else(|_| panic!("freshAgent.created for {request_id} resolves within budget"))
+    }
+
+    /// Drain `rx` until BOTH the `freshAgent.created` frame for `request_id` AND that
+    /// session's `freshAgent.session.init` event have arrived, in EITHER order; returns
+    /// the created frame.
+    ///
+    /// Not [`await_claude_created`] followed by a second drain for the init event:
+    /// `handle_create` starts the stdout consumer BEFORE it registers the session and
+    /// broadcasts `freshAgent.created`, and the fake sidecar prints `sdk.session.init`
+    /// in the same burst as its `created` answer. On a multi-thread runtime another
+    /// worker can run the consumer while the handler is still between those two points,
+    /// so the init event can reach the bus FIRST — a created-only drain would discard it
+    /// and the follow-up drain would wait out its budget for a frame already consumed.
+    async fn await_claude_created_and_session_init(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        request_id: &str,
+    ) -> Value {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let mut created: Option<Value> = None;
+            let mut init_session_ids: Vec<String> = Vec::new();
+            loop {
+                let frame: Value = match rx.recv().await {
+                    // Under host load the bounded drain can fall behind the
+                    // 64-frame bus: re-sync and keep waiting (the 15s budget
+                    // stays the dead-man switch); `Closed` surfaces through
+                    // the same deadline as a lost sender.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(err) => panic!("broadcast recv failed: {err}"),
+                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
+                };
+                if frame["requestId"] == request_id {
+                    assert_ne!(
+                        frame["type"], "freshAgent.create.failed",
+                        "create for {request_id} failed: {frame}"
+                    );
+                    if frame["type"] == "freshAgent.created" {
+                        created = Some(frame);
+                    }
+                } else if frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.session.init"
+                {
+                    if let Some(sid) = frame["sessionId"].as_str() {
+                        init_session_ids.push(sid.to_string());
+                    }
+                }
+                if let Some(created) = &created {
+                    if init_session_ids
+                        .iter()
+                        .any(|sid| created["sessionId"] == sid.as_str())
+                    {
+                        return created.clone();
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "freshAgent.created and freshAgent.session.init for {request_id} \
+                 arrive within budget"
+            )
+        })
+    }
+
+    /// Await the create's `sdk.session.init` binding row in the test's
+    /// FakeIdentitySink — the ROW BARRIER of the combined drain.
+    ///
+    /// At this base the init frame does NOT prove the row: the consumer
+    /// can read `sdk.session.init` before `handle_create` inserts the
+    /// session, the adoption then defers (`defer_session_init_adoption`,
+    /// a 25 ms registration poll that performs the binding write only
+    /// once registered), and the init frame broadcasts IMMEDIATELY either
+    /// way — so the frame drain orders the FRAMES while THIS barrier
+    /// proves the ROW. Polls `bindings`, not `was_recorded`: the
+    /// all-blank lineage row never enters the fake's `recorded` set
+    /// (Task-3 keying excludes blank-settings bindings), so the vec is
+    /// the only witness all three family tests share. Same bounded-poll
+    /// idiom as the was_recorded poll in
+    /// `a_refused_kill_keeps_the_durable_ledger_bound_and_answers_typed`
+    /// — under the deferred ordering the row lands ~25 ms after the
+    /// insert, so the wait is milliseconds in practice and the 15 s
+    /// budget stays a dead-man switch, never a patience raise.
+    async fn await_claude_session_init_binding_row(
+        fake: &std::sync::Arc<crate::identity_sink::FakeIdentitySink>,
+    ) -> crate::identity_sink::FreshAgentBindingUpsert {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let row = {
+                let bindings = fake.bindings.lock().unwrap();
+                bindings
+                    .iter()
+                    .rev()
+                    .find(|b| b.provider == "claude" && b.session_id == FRESH_CREATE_DURABLE_ID)
+                    .cloned()
+            };
+            if let Some(row) = row {
+                return row;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the session-init binding row (claude, FRESH_CREATE_DURABLE_ID) \
+                 never landed within budget"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     /// Node parity (`runtime-manager.ts:106-108`): a `freshAgent.create` whose
@@ -18045,32 +18183,12 @@ rl.on('line', (line) => {
         msg.effort = Some("high".to_string());
         msg.cwd = Some(env.dir.to_string_lossy().to_string());
         state.handle_create(msg, None).await;
-        await_claude_created(&mut rx, "req-binding-init").await;
-
-        // Wait for sdk.session.init to be consumed: the binding write is AWAITED
-        // before the init frame broadcasts, so seeing the freshAgent.session.init
-        // envelope proves the row already landed.
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let frame: Value = match rx.recv().await {
-                    // Under host load the bounded drain can fall behind the
-                    // 64-frame bus: re-sync and keep waiting (the 15s budget
-                    // stays the dead-man switch); `Closed` surfaces through
-                    // the same deadline as a lost sender.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(err) => panic!("broadcast recv failed: {err}"),
-                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
-                };
-                if frame["event"]["type"] == "freshAgent.session.init" {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("freshAgent.session.init consumed within budget");
-
-        let bindings = fake.bindings.lock().unwrap();
-        let b = bindings.last().expect("binding at sdk.session.init");
+        // The frame broadcasts unconditionally after `adopt_session_init`
+        // returns (including its `Deferred` arm, claude.rs:8046-8062), so
+        // the frame orders nothing about the row; the row BARRIER below is
+        // what proves the row landed.
+        await_claude_created_and_session_init(&mut rx, "req-binding-init").await;
+        let b = await_claude_session_init_binding_row(&fake).await;
         assert_eq!(b.provider, "claude");
         assert_eq!(b.mode, "kilroy", "sessionType flavour preserved in the row");
         assert_eq!(
@@ -18107,39 +18225,15 @@ rl.on('line', (line) => {
         state
             .handle_create(dedup_create_msg("req-binding-blank"), None)
             .await;
-        await_claude_created(&mut rx, "req-binding-blank").await;
-
-        // The init frame still broadcasts (durable-before-answer landed).
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let frame: Value = match rx.recv().await {
-                    // Under host load the bounded drain can fall behind the
-                    // 64-frame bus: re-sync and keep waiting (the 15s budget
-                    // stays the dead-man switch); `Closed` surfaces through
-                    // the same deadline as a lost sender.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(err) => panic!("broadcast recv failed: {err}"),
-                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
-                };
-                if frame["event"]["type"] == "freshAgent.session.init" {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("freshAgent.session.init consumed within budget");
+        // The frame broadcasts unconditionally after `adopt_session_init`
+        // returns (including its `Deferred` arm, claude.rs:8046-8062), so
+        // the frame orders nothing about the row; the row BARRIER below is
+        // what proves the row landed.
+        await_claude_created_and_session_init(&mut rx, "req-binding-blank").await;
+        let b = await_claude_session_init_binding_row(&fake).await;
 
         // THE r27 F4 CONTRACT: the lineage row IS recorded (blank settings
         // verbatim) — the no-skip truth.
-        let b = {
-            let bindings = fake.bindings.lock().unwrap();
-            bindings
-                .iter()
-                .rev()
-                .find(|b| b.provider == "claude" && b.session_id == FRESH_CREATE_DURABLE_ID)
-                .expect("an all-blank create records its lineage row (r27 F4)")
-                .clone()
-        };
         assert_eq!(
             b.settings,
             crate::identity_sink::FreshAgentSettings::default(),
@@ -18316,56 +18410,6 @@ rl.on('line', (line) => {
         drop(env);
     }
 
-    /// No-laundering guard (V7/A10, parity with codex's `record_codex_binding`):
-    /// a create carrying NO optional settings (model/permissionMode/effort/cwd all
-    /// None) must NOT persist an all-blank binding row at `sdk.session.init`. A blank
-    /// row makes `was_recorded` true while `load_settings` returns None (the server
-    /// sink's blank-snapshot guard) — the exact SETTINGS_RESET alarm condition — so a
-    /// legitimately-default session would false-alarm on a later resume. The init
-    /// frame itself still broadcasts; only the ledger write is skipped.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn session_init_with_all_blank_settings_records_no_binding() {
-        let _guard = CLAUDE_ENV_LOCK.lock().await;
-        let env = FakeClaudeSidecarEnv::install();
-        let (state, mut rx) = state_with_bus();
-        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
-        state.set_identity_sink(fake.clone());
-
-        // dedup_create_msg carries no model/permissionMode/effort/cwd — the
-        // all-blank snapshot shape.
-        state
-            .handle_create(dedup_create_msg("req-binding-blank"), None)
-            .await;
-        await_claude_created(&mut rx, "req-binding-blank").await;
-
-        // The init frame still broadcasts (the skip affects ONLY the ledger write).
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let frame: Value = match rx.recv().await {
-                    // Under host load the bounded drain can fall behind the
-                    // 64-frame bus: re-sync and keep waiting (the 15s budget
-                    // stays the dead-man switch); `Closed` surfaces through
-                    // the same deadline as a lost sender.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(err) => panic!("broadcast recv failed: {err}"),
-                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
-                };
-                if frame["event"]["type"] == "freshAgent.session.init" {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("freshAgent.session.init consumed within budget");
-
-        assert!(
-            fake.bindings.lock().unwrap().is_empty(),
-            "an all-blank settings snapshot must not be persisted \
-             (it would arm a false SETTINGS_RESET on resume)"
-        );
-        drop(env);
-    }
-
     /// D8 lane-reach (restore-open-sessions-only, review round 3): the
     /// WS-dispatched connection provenance threaded into `handle_create` must
     /// reach the identity-sink write at `sdk.session.init`. The ledger schema
@@ -18391,31 +18435,12 @@ rl.on('line', (line) => {
             7_777,
         );
         state.handle_create(msg, Some(provenance)).await;
-        await_claude_created(&mut rx, "req-binding-prov").await;
-
-        // The binding write is AWAITED before the init frame broadcasts (same
-        // witness idiom as `session_init_records_binding_with_create_settings`).
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let frame: Value = match rx.recv().await {
-                    // Under host load the bounded drain can fall behind the
-                    // 64-frame bus: re-sync and keep waiting (the 15s budget
-                    // stays the dead-man switch); `Closed` surfaces through
-                    // the same deadline as a lost sender.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(err) => panic!("broadcast recv failed: {err}"),
-                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
-                };
-                if frame["event"]["type"] == "freshAgent.session.init" {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("freshAgent.session.init consumed within budget");
-
-        let bindings = fake.bindings.lock().unwrap();
-        let b = bindings.last().expect("binding at sdk.session.init");
+        // The frame broadcasts unconditionally after `adopt_session_init`
+        // returns (including its `Deferred` arm, claude.rs:8046-8062), so
+        // the frame orders nothing about the row; the row BARRIER below is
+        // what proves the row landed.
+        await_claude_created_and_session_init(&mut rx, "req-binding-prov").await;
+        let b = await_claude_session_init_binding_row(&fake).await;
         assert_eq!(
             b.asserted_stamps().client_instance_id.as_deref(),
             Some("client-claude")
@@ -22724,6 +22749,83 @@ rl.on('line', (line) => {
         assert_eq!(metadata["sessionId"], json!(session_id));
         assert_eq!(metadata["event"]["model"], json!("opus[1m]"));
         assert_eq!(metadata["event"]["effort"], json!("high"));
+    }
+
+    /// The send-time broadcast is DIFF-guarded: a send whose settings pair
+    /// already matches the record converges NOTHING (the mirror of the
+    /// idempotent configure). If the `settings_before != settings_after`
+    /// guard were dropped, every settings-bearing send would broadcast a
+    /// redundant metadata frame and nothing would catch it.
+    #[tokio::test]
+    async fn a_settings_unchanged_send_broadcasts_no_metadata() {
+        let _env_guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, rx) = state_with_bus();
+        let mut rx = rx;
+        state
+            .handle_create(dedup_create_msg("send-idem"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "send-idem").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        // Send #1 carries a NEW pair: the configure leg reaches the sidecar
+        // (the configure and the prompt both land in the respond log) and
+        // exactly one metadata frame converges.
+        let mut send = send_msg(&session_id, "carries a new model");
+        send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            cwd: None,
+            model: Some("opus[1m]".to_string()),
+            effort: Some("high".to_string()),
+            permission_mode: None,
+            sandbox: None,
+        });
+        state.handle_send(send).await;
+        let first = env.respond_log_frames(2).await;
+        assert_eq!(first[0]["type"], json!("configure"));
+        assert_eq!(first[0]["settings"]["model"], json!("opus[1m]"));
+        let frames = drain(&mut rx).await;
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.session.metadata")
+                .count(),
+            1,
+            "the first (changing) send broadcasts exactly one metadata frame"
+        );
+
+        // Send #2 carries the SAME pair: `configure_for_send` short-circuits
+        // before any sidecar write (the respond log gains ONLY the prompt —
+        // no second configure), and the unchanged pair converges nothing.
+        let mut resend = send_msg(&session_id, "same pair again");
+        resend.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            cwd: None,
+            model: Some("opus[1m]".to_string()),
+            effort: Some("high".to_string()),
+            permission_mode: None,
+            sandbox: None,
+        });
+        state.handle_send(resend).await;
+        let second = env.respond_log_frames(3).await;
+        assert_eq!(
+            second[2]["type"],
+            json!("send"),
+            "the unchanged send reaches the sidecar as a bare prompt: {second:?}"
+        );
+        assert_eq!(
+            second
+                .iter()
+                .filter(|f| f["type"] == json!("configure"))
+                .count(),
+            1,
+            "the unchanged send writes NO second configure: {second:?}"
+        );
+        let frames = drain(&mut rx).await;
+        assert!(
+            !frames.iter().any(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.session.metadata"),
+            "an unchanged send converges nothing"
+        );
     }
 
     // ── b8ke focused round-3 R3-7: the condemned-prior recorded identity ──

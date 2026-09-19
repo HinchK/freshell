@@ -433,11 +433,11 @@ mod tests {
         // `JustOne` rebuilder computes interest from the REGISTERING
         // thread's default subscriber -- none here would cache
         // `Interest::never` globally and silently swallow the warn that
-        // drain_warns_on_rejected_files asserts on. Holding a capture
-        // guard (the opencode lane's idiom: every test that can hit a
-        // capture-asserted callsite holds one) makes registration always
-        // see a live subscriber.
-        let (_events, _guard) = crate::invariants::capture::capture();
+        // drain_warns_on_rejected_files asserts on. Installing the
+        // process-global capture (kata 59nb: one global subscriber; every
+        // thread's events land in the shared vec) makes registration always
+        // see a live subscriber, whichever thread registers first.
+        let _ = crate::invariants::capture::capture();
         let dir = tempfile::tempdir().unwrap();
         write_file(
             dir.path(),
@@ -595,7 +595,7 @@ mod tests {
 
     #[test]
     fn drain_warns_on_rejected_files() {
-        let (events, _guard) = crate::invariants::capture::capture();
+        let events = crate::invariants::capture::capture();
         let dir = tempfile::tempdir().unwrap();
         write_file(dir.path(), "junk__1.json", "not json");
         let watcher = ClaudeSignalWatcher::new(dir.path().to_path_buf());
@@ -605,12 +605,24 @@ mod tests {
             !dir.path().join("junk__1.json").exists(),
             "malformed files stay single-shot (consumed)"
         );
-        let events = events.lock().unwrap();
-        assert!(
+        // Collect-then-assert (never hold the shared vec's guard across an
+        // assert); the path filter scopes the presence check to THIS test's
+        // junk file — the vec carries every test's events (kata 59nb).
+        let want_path = format!("{}", dir.path().join("junk__1.json").display());
+        let hits: Vec<crate::invariants::capture::CapturedEvent> = {
+            let events = events.lock().unwrap_or_else(|p| p.into_inner());
             events
                 .iter()
-                .any(|e| e.message.contains("claude_signal_rejected")),
-            "parse rejects must be warn-logged for detectability (A8)"
+                .filter(|e| {
+                    e.message.contains("claude_signal_rejected")
+                        && e.fields.get("path").map(String::as_str) == Some(want_path.as_str())
+                })
+                .cloned()
+                .collect()
+        };
+        assert!(
+            !hits.is_empty(),
+            "parse rejects must be warn-logged for detectability (A8); got: {hits:?}"
         );
     }
 }

@@ -204,7 +204,8 @@ test.describe('deploy tab-diff ritual (rust only, ephemeral server)', () => {
       expect(bad.code).not.toBe(0)                         // exits non-zero
       expect(bad.out).toContain('TAB-DIFF DIVERGENCE')     // loud
       expect(bad.out).toMatch(/MISSING/)                   // names the category (closed codex pane)
-      expect(bad.out).toContain('tab=work')                // names the diverged tab
+      expect(bad.out).toContain('tab=work')                // names the diverged tab (explicit REST name survives the restart — display precedence)
+      expect(bad.out).toContain(codex.data.tabId)          // and names its stable tabKey identity (deviceId:tabId)
       // Remediation points the operator at the UI recovery flow (the operator
       // server-push restore machinery was deleted in the kata h9vt cleanup;
       // the UI flow's end-to-end acceptance lives in

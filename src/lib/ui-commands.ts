@@ -80,6 +80,10 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
       dispatch(addTab({
         id: msg.payload.id,
         title: msg.payload.title,
+        // Explicit creator-provided name (REST/MCP `name`): an explicit title
+        // outranks mirrored session titles and registry auto-titles in
+        // getTabDisplayTitle (rename-scope-contract display precedence).
+        titleSetByUser: msg.payload.title ? true : undefined,
         mode: msg.payload.mode,
         shell: msg.payload.shell,
         initialCwd: msg.payload.initialCwd,

@@ -619,6 +619,64 @@ describe('sidebarSelectors', () => {
       })
     })
 
+    it('keeps a meaningful label on title-less running rows instead of an id prefix', () => {
+      const projects = [{
+        projectPath: '/repo',
+        sessions: [
+          // A REAL running session whose transcript has not yielded a title
+          // yet (server placeholder rows carry the provider display name, so
+          // a title-less running row is the pre-transcript window). With no
+          // local pane/terminal info the label degrades to the provider
+          // label, not the id prefix.
+          { provider: 'codex', sessionId: 'codex-real-no-title-yet', projectPath: '/repo', lastActivityAt: 1_000, isRunning: true, runningTerminalId: 'term-9' },
+          { provider: 'opencode', sessionId: 'opencode-real-no-title-yet', projectPath: '/repo', lastActivityAt: 1_000, isRunning: true, runningTerminalId: 'term-c2' },
+          // Real title-less row, NOT running: keeps today's id-prefix fallback.
+          { provider: 'claude', sessionId: 'claude-real-no-title', projectPath: '/repo', lastActivityAt: 900 },
+        ] as any,
+      }]
+      const items = buildSessionItems(projects, emptyTabs, emptyPanes, emptyTerminals, emptyActivity)
+      expect(items.find((i) => i.sessionId === 'codex-real-no-title-yet')?.title).toBe('Codex')
+      expect(items.find((i) => i.sessionId === 'opencode-real-no-title-yet')?.title).toBe('Opencode')
+      expect(items.find((i) => i.sessionId === 'claude-real-no-title')?.title).toBe('claude-r')
+      // Display fallback only — the row still reports no session title.
+      expect(items.find((i) => i.sessionId === 'codex-real-no-title-yet')?.hasTitle).toBe(false)
+    })
+
+    it('composes the title-less running row label in the fallback row name order: pane title, then terminal title, then provider label', () => {
+      const projects = [{
+        projectPath: '/repo',
+        sessions: [
+          // All three title-less running rows share the wire shape; the
+          // label rungs differ by what local info exists for the terminal.
+          { provider: 'codex', sessionId: 'ses-rt-pane', projectPath: '/repo', lastActivityAt: 1_000, isRunning: true, runningTerminalId: 'term-pane' },
+          { provider: 'codex', sessionId: 'ses-rt-term', projectPath: '/repo', lastActivityAt: 1_000, isRunning: true, runningTerminalId: 'term-title' },
+          { provider: 'opencode', sessionId: 'ses-rt-none', projectPath: '/repo', lastActivityAt: 1_000, isRunning: true, runningTerminalId: 'term-remote' },
+        ] as any,
+      }]
+      const terminals = [
+        { terminalId: 'term-pane', mode: 'codex', status: 'running', title: 'Codex CLI', createdAt: 1_000 },
+        { terminalId: 'term-title', mode: 'codex', status: 'running', title: 'Codex CLI', createdAt: 1_000 },
+      ] as any
+      const tabs = [{ id: 'tab-1', title: 'Fallback tab', createdAt: 1_000 }] as any
+      const panes = {
+        layouts: {
+          'tab-1': {
+            type: 'leaf',
+            id: 'pane-1',
+            content: { kind: 'terminal', mode: 'codex', terminalId: 'term-pane', status: 'running' },
+          },
+        },
+        paneTitles: { 'tab-1': { 'pane-1': 'My pane title' } },
+      } as any
+      const items = buildSessionItems(projects, tabs, panes, terminals, emptyActivity)
+      // Pane title outranks the terminal's registry title.
+      expect(items.find((i) => i.sessionId === 'ses-rt-pane')?.title).toBe('My pane title')
+      // Terminal registry title outranks the provider label.
+      expect(items.find((i) => i.sessionId === 'ses-rt-term')?.title).toBe('Codex CLI')
+      // No local pane/terminal info: provider label (not an id prefix).
+      expect(items.find((i) => i.sessionId === 'ses-rt-none')?.title).toBe('Opencode')
+    })
+
     it('preserves fallback visibility metadata from tab session metadata so hidden sessions stay filtered', () => {
       const hiddenSessionId = 'codex-hidden'
       const tabs = [

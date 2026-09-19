@@ -11367,8 +11367,10 @@ mod tests {
 
     // ── b8ke ext r15 F1: the map-hit/Vacant compatibility claims are FENCED ──
 
-    /// The F1 fixture: a live in-map session row over a coordinator key the
-    /// test controls (wired ownership + the session row).
+    /// The F1 fixture: a live in-map MATERIALIZED session row (the
+    /// post-first-send shape — `real_session_id: Some`, per gate-C) over a
+    /// coordinator key the test controls (wired ownership + the session
+    /// row).
     async fn fenced_state_with_map_row(
         durable_id: &str,
     ) -> (
@@ -11384,15 +11386,17 @@ mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         let mut st = FreshOpencodeState::new(fresh_agent);
         st.set_ownership(Arc::clone(&registry));
-        st.sessions.lock().await.insert(
-            durable_id.to_string(),
-            Arc::new(TokioMutex::new(OpencodeSession::new(
-                durable_id.to_string(),
-                None,
-                None,
-                None,
-            ))),
-        );
+        // Gate-C (7824b5aab): an attach finding an UNMATERIALIZED row
+        // (`real_session_id: None`, a fresh pane's placeholder) is
+        // observation-only — snapshot + return — and never reaches the r15
+        // F1 fenced map-hit adopt claim these tests exist to cover. Seed the
+        // POST-materialization shape instead: a real `ses_*` id.
+        let mut session = OpencodeSession::new(durable_id.to_string(), None, None, None);
+        session.real_session_id = Some(durable_id.to_string());
+        st.sessions
+            .lock()
+            .await
+            .insert(durable_id.to_string(), Arc::new(TokioMutex::new(session)));
         (st, rx, registry)
     }
 

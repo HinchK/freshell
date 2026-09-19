@@ -2905,95 +2905,6 @@ fn index_loads_existing_rows_at_construction() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-// ── tracing capture for the lock test's failure classification (delta-r2 M2) ──
-//
-// Adapted from the LogCapture/Visitor pattern in
-// tests/pane_reconcile_freshagent.rs (~:761-845). Thread-local capture is
-// sufficient HERE (no tokio involved): `new_locked` logs
-// `pane_ledger_lock_unavailable` SYNCHRONOUSLY on the construction thread
-// (pane_ledger.rs:248-254), and the `#[test]` body IS the construction
-// thread, so a `tracing::subscriber::set_default` guard scopes the capture
-// layer to exactly this thread. cfg(unix): the only consumer is the
-// cfg(unix) lock test below.
-#[cfg(unix)]
-mod lock_log_capture {
-    use std::sync::{Arc, Mutex};
-
-    use tracing::field::{Field, Visit};
-    use tracing::{Event, Subscriber};
-    use tracing_subscriber::layer::{Context, SubscriberExt};
-    use tracing_subscriber::Layer;
-
-    #[derive(Debug, Clone, Default)]
-    pub struct CapturedEvent {
-        pub message: String,
-        /// The event's OWN fields (the lock-unavailable log records root +
-        /// error on the event; no span merge needed).
-        pub fields: std::collections::BTreeMap<String, String>,
-    }
-
-    #[derive(Default)]
-    struct CapVisitor {
-        message: String,
-        fields: std::collections::BTreeMap<String, String>,
-    }
-
-    impl Visit for CapVisitor {
-        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-            let rendered = format!("{value:?}");
-            if field.name() == "message" {
-                self.message = rendered;
-            } else {
-                self.fields.insert(field.name().to_string(), rendered);
-            }
-        }
-        fn record_str(&mut self, field: &Field, value: &str) {
-            if field.name() == "message" {
-                self.message = value.to_string();
-            } else {
-                self.fields
-                    .insert(field.name().to_string(), value.to_string());
-            }
-        }
-    }
-
-    struct LogCapture {
-        events: Arc<Mutex<Vec<CapturedEvent>>>,
-    }
-
-    impl<S> Layer<S> for LogCapture
-    where
-        S: Subscriber,
-    {
-        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-            let mut visitor = CapVisitor::default();
-            event.record(&mut visitor);
-            self.events
-                .lock()
-                .expect("capture lock")
-                .push(CapturedEvent {
-                    message: visitor.message,
-                    fields: visitor.fields,
-                });
-        }
-    }
-
-    /// Install the thread-local capture layer; the returned guard restores the
-    /// previous default dispatcher on drop.
-    pub fn lock_failure_capture() -> (
-        Arc<Mutex<Vec<CapturedEvent>>>,
-        tracing::subscriber::DefaultGuard,
-    ) {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let layer = LogCapture {
-            events: Arc::clone(&events),
-        };
-        let subscriber = tracing_subscriber::registry().with(layer);
-        let guard = tracing::subscriber::set_default(subscriber);
-        (events, guard)
-    }
-}
-
 #[cfg(unix)]
 #[test]
 fn new_locked_degrades_to_disabled_when_another_holder_exists() {
@@ -3097,7 +3008,7 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
     //    H2).
     // The loser-construction property above and the on-disk probe stay
     // one-shot and untouched.
-    let (events, _trace_guard) = lock_log_capture::lock_failure_capture();
+    let events = crate::invariants::capture::capture();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     // libc supplies EWOULDBLOCK's portable errno value (11 on Linux, 35 on
     // macOS), so the marker is derived from the compiled constant, not a literal.
@@ -3106,7 +3017,7 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
     // assertion (a bare `next` binding would trip the repo's -D warnings gate);
     // the name documents that the loop value is the third construction.
     let _next = loop {
-        let seen_before = events.lock().expect("capture lock").len();
+        let seen_before = events.lock().unwrap_or_else(|p| p.into_inner()).len();
         let candidate = PaneLedger::new_locked(Some(root.clone()));
         if candidate.ever_bound("claude", "s1") {
             break candidate;
@@ -3136,14 +3047,19 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
         // DISABLED via the construction scan fault
         // (`pane_ledger_scan_unavailable`) while HOLDING the flock; that shape
         // must be named with its captured fields, never fall through to the
-        // generic not-captured branch.
+        // generic not-captured branch. The root filter scopes the find to THIS
+        // test's store: the capture vec is shared binary-wide (kata 59nb), so
+        // sibling lock/scan failures from other roots must not be
+        // misclassified here.
         let captured = {
-            let log = events.lock().expect("capture lock");
+            let log = events.lock().unwrap_or_else(|p| p.into_inner());
             log[seen_before..]
                 .iter()
                 .find(|e| {
-                    e.message.contains("pane_ledger_lock_unavailable")
-                        || e.message.contains("pane_ledger_scan_unavailable")
+                    (e.message.contains("pane_ledger_lock_unavailable")
+                        || e.message.contains("pane_ledger_scan_unavailable"))
+                        && e.fields.get("root").map(String::as_str)
+                            == Some(&root.display().to_string())
                 })
                 .cloned()
         };
@@ -8844,24 +8760,48 @@ fn load_index_dir_io_errors_disable_the_ledger_loudly() {
     let root = temp_root("load-loud-dir");
     std::fs::write(root.join("bindings"), b"not a dir").unwrap();
     std::fs::write(root.join("pending"), b"not a dir").unwrap();
-    let (events, guard) = crate::invariants::capture::capture();
+    // 59nb worst-case order: force the shared callsite's FIRST execution to
+    // happen on a subscriber-less thread AFTER capture() and BEFORE the
+    // guarded emission below — the exact interleave that poisons tracing-core's
+    // process-global Interest cache under the old thread-local capture.
+    let poison_root = temp_root("load-loud-dir-poisoner");
+    std::fs::write(poison_root.join("bindings"), b"not a dir").unwrap();
+    std::fs::write(poison_root.join("pending"), b"not a dir").unwrap();
+    let events = crate::invariants::capture::capture();
+    std::thread::spawn(move || {
+        // clone: `PaneLedger::new(root: Option<PathBuf>)` (pane_ledger.rs:1491)
+        // takes ownership — without the clone, `remove_dir_all(&poison_root)`
+        // would borrow a moved value (E0382), and Step 2's red would be a
+        // compile error instead of the diagnosed mechanism.
+        let _poisoned = PaneLedger::new(Some(poison_root.clone()));
+        std::fs::remove_dir_all(&poison_root).ok();
+    })
+    .join()
+    .unwrap();
     let ledger = PaneLedger::new(Some(root.clone()));
-    drop(guard);
-    let events = events.lock().unwrap();
-    let hits: Vec<_> = events
-        .iter()
-        .filter(|e| {
-            e.target == "freshell_ws::pane_ledger"
-                && e.message.contains("pane_ledger_scan_unavailable")
-        })
-        .collect();
+    // Collect-then-assert (never hold the shared vec's guard across an
+    // assert): a panic under the guard would poison the lock for every
+    // other test in the binary. The root filter scopes the assertion to
+    // THIS test's store — the poisoner's own emission (and any sibling
+    // test's) lands in the shared vec with its own root and is excluded.
+    let hits: Vec<crate::invariants::capture::CapturedEvent> = {
+        let events = events.lock().unwrap_or_else(|p| p.into_inner());
+        events
+            .iter()
+            .filter(|e| {
+                e.target == "freshell_ws::pane_ledger"
+                    && e.message.contains("pane_ledger_scan_unavailable")
+                    && e.fields.get("root").map(String::as_str) == Some(&root.display().to_string())
+            })
+            .cloned()
+            .collect()
+    };
     assert_eq!(
         hits.len(),
         1,
-        "exactly one constructor ERROR for the scan fault; got: {events:?}"
+        "exactly one constructor ERROR for the scan fault; got: {hits:?}"
     );
     assert!(hits[0].fields.contains_key("root"));
-    drop(events);
     assert!(
         !ledger.is_enabled(),
         "a store that exists but cannot be read comes up DISABLED, never blind"
@@ -8882,22 +8822,11 @@ fn load_index_row_io_errors_are_loud_per_row() {
     // owns loudness) — this test must NOT flip that: only Io arms the event.
     let root = temp_root("load-loud-row");
     std::fs::create_dir_all(root.join("bindings").join("claude").join("ghost.json")).unwrap();
-    let (events, guard) = crate::invariants::capture::capture();
+    let events = crate::invariants::capture::capture();
     let ledger = PaneLedger::new(Some(root.clone()));
-    drop(guard);
-    let events = events.lock().unwrap();
-    let hits: Vec<_> = events
-        .iter()
-        .filter(|e| {
-            e.target == "freshell_ws::pane_ledger"
-                && e.message.contains("pane_ledger_load_index_row_unreadable")
-        })
-        .collect();
-    assert_eq!(
-        hits.len(),
-        1,
-        "one ERROR for the unreadable row; got: {events:?}"
-    );
+    // Collect-then-assert (never hold the shared vec's guard across an
+    // assert); the path filter scopes the exact-1 to THIS test's unreadable
+    // row (the shared vec carries every test's events).
     let want_path = format!(
         "{}",
         root.join("bindings")
@@ -8905,8 +8834,23 @@ fn load_index_row_io_errors_are_loud_per_row() {
             .join("ghost.json")
             .display()
     );
-    assert_eq!(hits[0].fields.get("path"), Some(&want_path));
-    drop(events);
+    let hits: Vec<crate::invariants::capture::CapturedEvent> = {
+        let events = events.lock().unwrap_or_else(|p| p.into_inner());
+        events
+            .iter()
+            .filter(|e| {
+                e.target == "freshell_ws::pane_ledger"
+                    && e.message.contains("pane_ledger_load_index_row_unreadable")
+                    && e.fields.get("path").map(String::as_str) == Some(want_path.as_str())
+            })
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        hits.len(),
+        1,
+        "one ERROR for the unreadable row; got: {hits:?}"
+    );
     assert!(ledger.list_bindings().is_empty());
     std::fs::remove_dir_all(&root).ok();
 }
