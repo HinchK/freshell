@@ -19179,7 +19179,7 @@ pub(crate) mod tests {
     }
 
     /// Point `CODEX_CMD` at the fake app-server and configure its scripted `behavior` (a
-    /// `FAKE_CODEX_APP_SERVER_BEHAVIOR` JSON blob \u2014 see the fixture's `loadBehavior()`).
+    /// `FAKE_CODEX_APP_SERVER_BEHAVIOR` JSON blob — see the fixture's `loadBehavior()`).
     fn configure_fake_codex_cmd(behavior_json: &str) {
         std::env::set_var("CODEX_CMD", format!("node {}", fake_codex_app_server_cmd()));
         std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior_json);
@@ -20772,19 +20772,38 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
         let capture = tracing_capture::capture_by_session("fork-mint-rekey-guard-marker-unused");
 
-        // Spawn 1: the parent, crashing right after `thread/start` (a real unrequested
-        // exit observed by the exit-watcher self-heal).
+        // Spawn 1: the parent, created with its sidecar ALIVE at the commit
+        // (r30 F1: a sidecar already dead at the commit is never published).
+        // The post-crash state is then produced deterministically by hand:
+        // flip `exited` (the lazy-restart flag the exit-watcher's self-heal
+        // sets on an unrequested exit), mark the thread dead (the F-1
+        // mint-new route), and clear the exited session's lease binding —
+        // the exact release `cleanup_confirmed_codex_teardown` performs in
+        // production once a natural exit's writer tree is CONFIRMED dead.
+        // The respawn under test must never depend on that reap-confirmation
+        // machinery: it fails closed on constrained runners (unrecordable
+        // /proc evidence), which left the binding held — so the fork's lease
+        // claim answered BoundLive→Recovered — and the mint-new respawn, with
+        // its OLD→NEW materialized broadcast, never ran (the rust-gate CI
+        // Elapsed).
         configure_fake_codex_cmd(
             &json!({
                 "threadStartThreadId": "parent-old-mint",
-                "exitProcessAfterMethodsOnce": ["thread/start"],
                 "appendThreadOperationLogPath": log_path.to_string_lossy(),
             })
             .to_string(),
         );
         let old_id = create_real_fake_session(&st, &mut rx).await;
         assert_eq!(old_id, "parent-old-mint", "fixture sanity: the clicked id");
-        wait_for_self_heal(&st, &mut rx, &old_id).await;
+        {
+            let sessions = st.sessions.lock().await;
+            sessions
+                .get(&old_id)
+                .expect("the session row")
+                .exited
+                .store(true, Ordering::SeqCst);
+        }
+        st.leases.clear_binding(PROVIDER, &old_id);
         // Dead-thread negative cache: ensure-alive goes straight to the mint-new
         // respawn fallback (the F-1 route).
         st.mark_thread_dead(&old_id).await;
@@ -20944,11 +20963,11 @@ pub(crate) mod tests {
         // Wire audit: exactly TWO thread/fork RPCs crossed the wire (fork #1 and the
         // post-completion fork #3 — the refused duplicate produced NONE), both
         // targeting the respawned parent, over exactly four sidecar connections
-        // (crashed spawn + respawned parent + one sidecar per child).
+        // (parent spawn + respawn + one sidecar per child).
         assert_eq!(
             spawn_count(&capture),
             4,
-            "crashed parent + respawn + two child sidecars: {}",
+            "parent spawn + respawn + two child sidecars: {}",
             spawn_count(&capture)
         );
         let log_text = read_op_log_when_complete(&log_path, 10).await;
@@ -22370,6 +22389,16 @@ pub(crate) mod tests {
     }
 
     // ── b8ke ext r8 F5: the crashed-recovery re-claim carries the observed fence ──
+    //
+    // Family fixture note (r30 F1, 45ff51938): `commit_lane_claim` refuses to
+    // publish a sidecar whose pid is already dead at the create's commit, so
+    // these fixtures create the session with the sidecar ALIVE ("{}") and
+    // produce the crashed state BY HAND — the manual `exited` flip plus the
+    // hand-built begin_handoff/fail generation advance or vacate each test
+    // below already performs. The stale refusal under test happens at the
+    // coordinator claim, BEFORE any respawn, so the stale-fence/generation
+    // semantics still face a dead-but-materialized session and the
+    // no-recreation asserts stay honest.
 
     /// b8ke ext r8 F5: a delayed attach whose observed generation predates a
     /// generation advance is refused typed (SESSION_RESERVED) — the
@@ -22383,10 +22412,11 @@ pub(crate) mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
-        let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        // r30 F1: the sidecar must be ALIVE at the create's commit (a
+        // dead-at-commit sidecar is never published); the crashed state
+        // is built by hand below (see the family note above).
         configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
 
         // Advance the coordinator generation past the attach's observation: a
         // handoff begin + fail bumps the record while the runtime stays live.
@@ -22473,10 +22503,11 @@ pub(crate) mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
-        let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        // r30 F1: the sidecar must be ALIVE at the create's commit (a
+        // dead-at-commit sidecar is never published); the crashed state
+        // is built by hand below (see the family note above).
         configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
 
         // Advance the generation past the send's observation.
         let before = registry.observe(PROVIDER, &thread_id);
@@ -22554,10 +22585,11 @@ pub(crate) mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
-        let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        // r30 F1: the sidecar must be ALIVE at the create's commit (a
+        // dead-at-commit sidecar is never published); the crashed state
+        // is built by hand below (see the family note above).
         configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
 
         // Advance the generation past the compact's observation and VACATE
         // the key (the crash shape: the handoff failed, the prior runtime
@@ -22642,10 +22674,11 @@ pub(crate) mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
-        let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        // r30 F1: the sidecar must be ALIVE at the create's commit (a
+        // dead-at-commit sidecar is never published); the crashed state
+        // is built by hand below (see the family note above).
         configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
 
         let before = registry.observe(PROVIDER, &thread_id);
         let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = registry
@@ -22708,10 +22741,11 @@ pub(crate) mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
-        let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        // r30 F1: the sidecar must be ALIVE at the create's commit (a
+        // dead-at-commit sidecar is never published); the crashed state
+        // is built by hand below (see the family note above).
         configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
 
         let before = registry.observe(PROVIDER, &thread_id);
         let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = registry
@@ -22858,10 +22892,11 @@ pub(crate) mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
-        let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        // r30 F1: the sidecar must be ALIVE at the create's commit (a
+        // dead-at-commit sidecar is never published); the crashed state
+        // is built by hand below (see the family note above).
         configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
 
         // Advance the generation past the compact's observation, then VACATE
         // the key at the advanced generation (the crash-shaped state).
@@ -22956,10 +22991,11 @@ pub(crate) mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
-        let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        // r30 F1: the sidecar must be ALIVE at the create's commit (a
+        // dead-at-commit sidecar is never published); the crashed state
+        // is built by hand below (see the family note above).
         configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
 
         let before = registry.observe(PROVIDER, &thread_id);
         let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = registry
@@ -23090,10 +23126,11 @@ pub(crate) mod tests {
         let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
         st.set_ownership(Arc::clone(&registry));
 
-        configure_fake_codex_cmd(r#"{"exitProcessAfterMethodsOnce":["thread/start"]}"#);
-        let thread_id = create_real_fake_session(&st, &mut rx).await;
-        wait_for_self_heal(&st, &mut rx, &thread_id).await;
+        // r30 F1: the sidecar must be ALIVE at the create's commit (a
+        // dead-at-commit sidecar is never published); the crashed state
+        // is built by hand below (see the family note above).
         configure_fake_codex_cmd("{}");
+        let thread_id = create_real_fake_session(&st, &mut rx).await;
 
         let before = registry.observe(PROVIDER, &thread_id);
         let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = registry
