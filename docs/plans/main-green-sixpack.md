@@ -28,7 +28,7 @@
 ## Global Constraints
 
 - **Process safety:** Never restart or stop the self-hosted production Rust server on port 3001 (requires the user's explicit "APPROVED"). No broad kill patterns. All builds and focused test runs in this campaign run from THIS linked worktree (`.worktrees/main-green-sixpack`) — `scripts/prebuild-guard.ts` fails closed on the main checkout while production holds the configured PORT, and exempts linked worktrees.
-- **Test coordination:** Broad repo-supported runs (`npm test`, full e2e lanes, zero-argument server/integration invocations) wait for the shared coordinator gate (`npm run test:status`); narrowed/focused selectors run directly (delegated). Set `FRESHELL_TEST_SUMMARY` with a human-meaningful reason when holding the gate (used in Task 6). `FRESHELL_VITEST_BACKEND` and `FRESHELL_E2E_BACKEND` are UNSET in this environment — the default backend is local; do not switch backends.
+- **Test coordination:** Broad repo-supported runs (`npm test`, zero-argument server/integration invocations) wait for the shared coordinator gate (`npm run test:status`); narrowed/focused selectors run directly (delegated). The e2e lanes are NOT wired to the coordinator (`scripts/e2e-cloud.sh` execs Playwright directly; the coordinator command matrix has no e2e entry) — before any broad e2e lane, check `npm run test:status` BY HAND and wait out any active holder (Task 6 Step 2b). Set `FRESHELL_TEST_SUMMARY` with a human-meaningful reason when holding the coordinator gate (used in Task 6 Step 2a; it does nothing for e2e lanes). `FRESHELL_VITEST_BACKEND` and `FRESHELL_E2E_BACKEND` are UNSET in this environment — the default backend is local; do not switch backends.
 - **No evidence-free patience raises:** every timeout that changes in this campaign changes because the diagnosed mechanism demands it (the hsrh 15s budget stays; the wait shape changes). No wall-clock raise anywhere.
 - **TDD:** red-green-refactor per task. Every production bug fix gets a regression test that fails first for the missing behavior.
 - **TypeScript NodeNext/ESM:** relative imports in `src/` and `test/` TS files carry `.js` extensions.
@@ -44,8 +44,8 @@ These are the plan's riskiest claims; stage 2 validates each before/while execut
 
 1. **PR #799 (pane-header-mobile-v3, in base dbbfd0752) did not change the sidebar-opencode-rail failure shape.** The investigation ran at `22a6083ee`/`34f425fae`; #799 rewrote the pane header (`src/components/PaneHeader.tsx` → `src/components/panes/PaneHeader.tsx`). Verified statically at dbbfd0752: `role="banner"` + `aria-label={`Pane: ${title}`}` survive at `src/components/panes/PaneHeader.tsx:176-177`. Task 1 Step 1 re-runs the spec focused at this base BEFORE any fix; if the failure is not the diagnosed `Pane: OpenCode` clobber at spec line 327 (banner missing, renamed, or a new #799-induced failure), STOP and re-diagnose before touching production code.
 2. **Title-precedence conflict between investigations, resolved product-side.** The deploy-tab-diff investigation prescribed a TEST-SIDE fix (assert `tabId`, and explicitly warned the `titleSetByUser` product change "must not be slipped in under this test"); the rest-tab-persistence investigation prescribed exactly that PRODUCT fix as minimal-and-correct. The User Request resolves this in favor of ONE product-side precedence (see Resolution section) applied campaign-wide. Consequence: the four specs pass with their ORIGINAL assertions (they were authored against this contract; the Sep-15 title-pipeline campaign broke it). The deploy-tab-diff tabId hardening (Task 2) is added, not substituted.
-3. **The sidebar dedupe click preserves the explicit REST name under the new precedence** (`tabsSlice.ts:1141`'s existing `!existingTab.titleSetByUser` guard blocks the click's session-title sync once Task 1 sets the flag), so remote-tab-linkage's post-restart leg (:310, `tabTitleAfterClick` read dynamically from raw Redux `tab.title`) passes with the REST name. The spec's stale NOTE comment (:255-260) claimed the opposite; Task 2 corrects the comment and adds a pin.
-4. **The 59nb capture migration's consumer-filter audit is complete and load-bearing.** Converting `capture()` to a process-global OnceLock subscriber routes EVERY test's events into one shared vec; each of the 26 consumer call sites across 5 files must filter by a per-test-unique field (`root`/`path`/`device_id`/`terminal_id`), and colliding ids must be made unique per test — in `invariants.rs` the shared ids are REAL: `t-ev` is used by BOTH `:760` (expects exactly one warning) and `:801` (expects none), `t-late` by BOTH `:1154` (expects a warning) and `:939` (expects none), and `t-young` (`:585`/`:992`) and `t-idle` (`:709`/`:1234`) are each shared by two tests as well; the unresolved-warning event carries ONLY `terminal_id`/`mode`/`age_ms` (`invariants.rs:232-237`), so terminal-id renaming per test is the ONLY available discriminator there. A missed consumer (or a missed id collision) turns the rare race into a deterministic false-fail (exact-count/negative assertions) or false-pass (`.any()` assertions) under parallelism. Task 3 enumerates every site and every collision; none may be skipped.
+3. **The sidebar dedupe click preserves the explicit REST name under the new precedence** (the click on an already-open session returns early in the sidebar handler at `Sidebar.tsx:486-489` — `findPaneForSession` finds the pane — so the guard that actually fires is the `!existingTab.titleSetByUser` title-sync check at `Sidebar.tsx:487`; the click never reaches `openSessionTab`/`tabsSlice.ts:1141`, whose own `!existingTab.titleSetByUser` guard carries the same semantic on the not-already-open path — once Task 1 sets the flag, the click's session-title sync is blocked either way), so remote-tab-linkage's post-restart leg (:310, `tabTitleAfterClick` read dynamically from raw Redux `tab.title`) passes with the REST name. The spec's stale NOTE comment (:255-260) claimed the opposite; Task 2 corrects the comment and adds a pin.
+4. **The 59nb capture migration's consumer-filter audit is complete and load-bearing.** Converting `capture()` to a process-global OnceLock subscriber routes EVERY test's events into one shared vec; each of the 26 consumer call sites across 5 files must filter by a per-test-unique field (`root`/`path`/`device_id`/`terminal_id`), and colliding ids must be made unique per test — in `invariants.rs` the shared ids are REAL: `t-ev` is used by BOTH `:760` (expects exactly one warning) and `:801` (expects none), `t-late` by BOTH `:1154` (expects a warning) and `:939` (expects none), and `t-young` (`:585`/`:992`) and `t-idle` (`:709`/`:1234`) are each shared by two tests as well; the unresolved-warning event carries ONLY `terminal_id`/`mode`/`age_ms` (`invariants.rs:232-237`), so terminal-id renaming per test is the ONLY available discriminator there. A missed consumer (or a missed id collision) turns the rare race into a deterministic false-fail (exact-count/negative assertions) or false-pass (`.any()` assertions) under parallelism. The same weakness applies to the two OTHER thread-local `set_default` captures in the binary (`pane_ledger_tests.rs`'s `lock_failure_capture`, `create_dedupe.rs`'s DIAG-01 inline capture) — Task 3 folds them into the same migration, so after it NO thread-local capture remains. Task 3 enumerates every site and every collision; none may be skipped.
 
 ## The Title-Precedence Resolution (authoritative for Tasks 1–2)
 
@@ -64,7 +64,7 @@ These are the plan's riskiest claims; stage 2 validates each before/while execut
 
 **Plus: fabricated live-terminal session rows carry NO title, and the client keeps their label meaningful at display time.** Two halves:
 - **Server:** `build_live_terminal_session_item` (`crates/freshell-server/src/session_directory.rs:1265`) must stop fabricating `title: Some(provider_display_name(...))`; the mirror's existing `if (!session.title) continue` guard (`sessionTitleMirror.ts:44`) then skips them naturally. A provider label is not a session name.
-- **Client:** the sidebar row's main label is NOT "subtitle || projectPath" — it is `sidebarSelectors.ts:264`'s `session.title || session.sessionId.slice(0, 8)`, rendered at `Sidebar.tsx:1175` (`:1199` is the tooltip's project line). With the server half alone, a fabricated `terminal:<id>` row would read literally "terminal" and a bound-but-unindexed row would read as an 8-char id prefix. `buildSessionItems`' server-row mapping therefore gains a provider-label rung, stated precisely: a title-less row whose `isRunning && runningTerminalId` are set (the wire shape EVERY `build_live_terminal_session_item` row carries, both variants — `terminal:<id>` sessionIds and bound-but-unindexed session ids) falls back to `getProviderLabel(provider)` (the same helper the client-side fallback row uses at `sidebarSelectors.ts:511`), while every other title-less row (real transcript rows, running or not) keeps today's `sessionId.slice(0, 8)` fallback. `hasTitle` stays `!!session.title` — the provider label is a display fallback, not a session title, so a later title-carrying fetch or the `pushFallbackItem` merge still overrides it. Accepted residual: a REAL running session whose transcript has not yet yielded a title also takes the provider-label rung (indistinguishable at the wire level from a fabricated row without new protocol machinery; strictly more meaningful than the id prefix it replaces); HistoryView's main label keeps the id-prefix fallback with its existing provider badge (`HistoryView.tsx:481`) — the cited regression is the sidebar row, which has no badge.
+- **Client:** the sidebar row's main label is NOT "subtitle || projectPath" — it is `sidebarSelectors.ts:264`'s `session.title || session.sessionId.slice(0, 8)`, rendered at `Sidebar.tsx:1175` (`:1199` is the tooltip's project line). With the server half alone, a fabricated `terminal:<id>` row would read literally "terminal" and a bound-but-unindexed row would read as an 8-char id prefix. `buildSessionItems`' server-row mapping therefore gains a provider-label rung, stated precisely: a title-less row whose `isRunning && runningTerminalId` are set (the wire shape EVERY `build_live_terminal_session_item` row carries, both variants — `terminal:<id>` sessionIds and bound-but-unindexed session ids) falls back to `getProviderLabel(provider)` (the same helper as the client-side fallback row's LAST rung at `sidebarSelectors.ts:511` — pane title, then terminal title, then the provider label; an honest cosmetic consequence: `getProviderLabel` without extension data renders `Opencode`/`Codex`/`Claude` where the server's deleted `provider_display_name` fabricated `OpenCode`/`Codex CLI`/`Claude CLI`), while every other title-less row (real transcript rows, running or not) keeps today's `sessionId.slice(0, 8)` fallback. `hasTitle` stays `!!session.title` — the provider label is a display fallback, not a session title, so a later title-carrying fetch or the `pushFallbackItem` merge still overrides it. Accepted residual: a REAL running session whose transcript has not yet yielded a title also takes the provider-label rung (indistinguishable at the wire level from a fabricated row without new protocol machinery; strictly more meaningful than the id prefix it replaces); HistoryView's main label keeps the id-prefix fallback with its existing provider badge (`HistoryView.tsx:481`) — the cited regression is the sidebar row, which has no badge.
 
 **Reconciliation with the rename-scope contract:** the contract governs WRITE scoping (who owns which rename surface); this resolution governs DISPLAY composition (which stored label a tab renders when several exist). No hard rule is violated: rule 5's "pane/tab labels can no longer mint a user-rung [session] override" is untouched (the fold sets a TAB-local `titleSetByUser`, never a session override); rule 1's "no sessionRef fallback write" is untouched (nothing durable is written). The existing guard in `openSessionTab` (`tabsSlice.ts:1141`, `!existingTab.titleSetByUser`) already establishes the product semantic that explicit titles beat session-title sync — Task 1 extends "explicit" to creator-provided names. The contract doc gains a short display-precedence subsection (Task 1 Step 4e) recording the ladders above EXACTLY as the code composes them (including the pane-kind split — a blanket "mirror over auto-labels" rule would be false for terminal panes and must not be written into the contract), the fabricated-row rule with its client display fallback, and one scope-table update: the Tab label row's "Written by" column gains the create-time explicit name (`name` on a REST/MCP tab create), since Task 1 makes that a tab-label write.
 
@@ -92,7 +92,7 @@ Standing ledger item (e2e four, no kata). This is the product change that turns 
 - Modify: `src/lib/ui-commands.ts:80-90` (the `tab.create` fold)
 - Modify: `src/store/selectors/sidebarSelectors.ts:264` (provider-label rung for title-less running live-terminal rows)
 - Modify: `crates/freshell-server/src/session_directory.rs:1282` (`title: Some(...)` → `title: None`)
-- Modify: `crates/freshell-server/src/session_directory.rs:1226-1234` (`provider_display_name` becomes test-only: `#[cfg(test)]`)
+- Delete: `crates/freshell-server/src/session_directory.rs:1226-1234` (`provider_display_name` + its doc comment) AND its `mod join_tests` parity test (`:1454-1462`) — after the fabrication is removed, the fn's only remaining consumer is its own unit test
 - Modify: `crates/freshell-server/src/session_directory.rs:1514,:1558` (the two fabricated-item unit tests) AND `:3621-3631` (`persisted_identity_collision_keeps_a_matching_live_terminal_as_a_safe_placeholder` — asserts the SAME fabricated row's `"Claude CLI"` title at `:3625`; THREE fabricated-title assertions change, not two)
 - Test: `test/unit/client/ui-commands.test.ts` (fold regression, red-first)
 - Test: `test/unit/client/store/selectors/sidebarSelectors.test.ts` (provider-label fallback, red-first)
@@ -101,7 +101,7 @@ Standing ledger item (e2e four, no kata). This is the product change that turns 
 
 **Interfaces:**
 - Consumes: `addTab` payload field `titleSetByUser?: boolean` (`src/store/tabsSlice.ts:293`, reducer stores it at `:330`); `getTabDisplayTitle`'s `titleSetByUser` branch (`src/lib/tab-title.ts:28-30`); the mirror's `if (!session.title) continue` guard (`src/store/sessionTitleMirror.ts:44`); `getProviderLabel` (`src/lib/coding-cli-utils.ts:33`, already imported by `sidebarSelectors.ts:8`).
-- Produces: the contract that every `ui.command{tab.create}` broadcast carrying a non-empty `payload.title` (only ever caller-provided: verified across all three emitters) folds into Redux with `titleSetByUser: true`; that `DirItem`s synthesized by `build_live_terminal_session_item` carry `title: None` (test-only `provider_display_name` retained behind `#[cfg(test)]` — its only non-test caller is the removed fabrication, and a now-unused module-level fn fails clippy `-D warnings` and the pre-push gate); and that the sidebar row's main label for a title-less running live-terminal row is `getProviderLabel(provider)`. Task 2 and the four e2e specs depend on all three.
+- Produces: the contract that every `ui.command{tab.create}` broadcast carrying a non-empty `payload.title` (only ever caller-provided: verified across all three emitters) folds into Redux with `titleSetByUser: true`; that `DirItem`s synthesized by `build_live_terminal_session_item` carry `title: None` (`provider_display_name` DELETED together with its `mod join_tests` parity test — after the fabrication is removed its only consumer is its own unit test, which then protects no shipped behavior; deleting both is cleaner than `#[cfg(test)]`-gating, and a now-unused module-level fn would also fail clippy `-D warnings` and the pre-push gate); and that the sidebar row's main label for a title-less running live-terminal row is `getProviderLabel(provider)`. Task 2 and the four e2e specs depend on all three.
 
 - [ ] **Step 1: Baseline red confirmation at dbbfd0752 (BEFORE any fix)**
 
@@ -166,7 +166,7 @@ Add to `test/unit/client/store/selectors/sidebarSelectors.test.ts` (inside the e
     const items = buildSessionItems(projects, emptyTabs, emptyPanes, emptyTerminals, emptyActivity)
     expect(items.find((i) => i.sessionId === 'terminal:term-9')?.title).toBe('Codex')
     expect(items.find((i) => i.sessionId === 'ses-child2')?.title).toBe('Opencode')
-    expect(items.find((i) => i.sessionId === 'claude-real-no-title')?.title).toBe('claude-')
+    expect(items.find((i) => i.sessionId === 'claude-real-no-title')?.title).toBe('claude-r')
     // Display fallback only — the row still reports no session title.
     expect(items.find((i) => i.sessionId === 'terminal:term-9')?.hasTitle).toBe(false)
   })
@@ -224,7 +224,7 @@ Expected: FAIL — exactly the three updated assertions fail (current code fabri
         title: None,
 ```
 
-`provider_display_name` (`session_directory.rs:1227`) now has NO non-test caller (its only one was this line) — dead code in the non-test build, which fails `cargo clippy --all-targets -- -D warnings` (Task 6 Step 1) and the pre-push gate. Gate it: `#[cfg(test)]` above `fn provider_display_name` (its `mod tests` consumers at `:1457-1461` keep it alive under `--bin` test builds; keep the fn and its parity doc comment in place).
+`provider_display_name` (`session_directory.rs:1227`) now has NO non-test caller (its only one was this line) — its only remaining consumer is its own parity test, `join_tests::provider_display_name_matches_known_providers_and_falls_back_to_raw` (`:1457-1461`, inside `mod join_tests` at `:1349` — NOT `mod tests`, which starts at `:1939`). A test whose only subject is a function no shipped code calls protects no shipped behavior (repo rule) — DELETE the fn (`:1226-1234`, with its doc comment) and the test (`:1454-1462`, with its `// ── provider_display_name ──` section marker) rather than `#[cfg(test)]`-gating it. (Gating would also keep a module-level fn that is dead code in the non-test build — failing `cargo clippy --all-targets -- -D warnings`, Task 6 Step 1, and the pre-push gate; deletion makes that failure impossible by construction.)
 
 Run: `cargo test -p freshell-server --locked --bin freshell-server session_directory`
 Expected: PASS (all session_directory tests, including the three updated ones and the join tests, which assert no title).
@@ -238,9 +238,13 @@ Expected: PASS (all session_directory tests, including the three updated ones an
         // keeps its provider label instead of degrading to "terminal" or an
         // id prefix. Every fabricated row carries isRunning +
         // runningTerminalId on the wire; real title-less rows keep today's
-        // id-prefix fallback. Same helper the client-side fallback row uses
-        // (the `getProviderLabel(provider)` chain below), so a placeholder
-        // renders identically before and after the server row arrives.
+        // id-prefix fallback. Same helper as the client-side fallback row's
+        // LAST rung (:511 composes the pane title, then the terminal title,
+        // then getProviderLabel), so the label is stable when the server row
+        // replaces the fallback row — with one honest cosmetic change:
+        // getProviderLabel without extension data renders
+        // Opencode/Codex/Claude, where the server's now-deleted fabricated
+        // titles read OpenCode/Codex CLI/Claude CLI (provider_display_name).
         // hasTitle stays !!session.title — this is a display fallback, not a
         // session title; later title-carrying fetches still override it.
         title: session.title
@@ -294,7 +298,7 @@ Expected: PASS on all (the Step-3 reds and the 4b reds are now green).
 
 - [ ] **Step 6: Refactor while green**
 
-Small but real: confirm `provider_display_name`'s `#[cfg(test)]` gating left no non-test caller behind (`rg -n "provider_display_name" crates/freshell-server/src/` — every hit is the gated fn, its doc comment, or `mod tests`), and confirm no other `tab.create` consumer in the client reads `titleSetByUser` from the payload (grep `titleSetByUser` in `src/lib/` — the fold is the only writer of the flag outside explicit renames). Confirm `hasTitle` semantics are unchanged in `buildSessionItems` (still `!!session.title`; the provider-label rung is display-only).
+Small but real: confirm `provider_display_name`'s deletion left NOTHING behind (`rg -n "provider_display_name" crates/freshell-server/src/` — ZERO hits: the fn, its doc comment, and the `join_tests` parity test are all gone), and confirm no other `tab.create` consumer in the client reads `titleSetByUser` from the payload (grep `titleSetByUser` in `src/lib/` — the fold is the only writer of the flag outside explicit renames). Confirm `hasTitle` semantics are unchanged in `buildSessionItems` (still `!!session.title`; the provider-label rung is display-only).
 
 - [ ] **Step 7: Impacted-test verification**
 
@@ -330,15 +334,18 @@ Standing ledger items (no kata). The four specs keep their original assertions (
 
 - [ ] **Step 1: remote-tab-linkage — correct the stale NOTE and pin creator-title preservation**
 
-At `:255-267` the NOTE claims the dedupe click "SYNCS the real session title into the focused tab … so the tab is now titled with the seeded session's name, not the REST `name`". Under the restored precedence the click does NOT retitle an explicitly-named tab (`tabsSlice.ts:1141` yields to `titleSetByUser`). Replace the NOTE block and add a preservation assertion after the `:253` tab-count check:
+At `:255-267` the NOTE claims the dedupe click "SYNCS the real session title into the focused tab … so the tab is now titled with the seeded session's name, not the REST `name`". Under the restored precedence the click does NOT retitle an explicitly-named tab: the already-open click returns early at `Sidebar.tsx:486-489` and its `!existingTab.titleSetByUser` check (`:487`) yields to the creator title (`openSessionTab`'s `tabsSlice.ts:1141` guard is the same semantic on the not-already-open path — the click never reaches it). Replace the NOTE block and add a preservation assertion after the `:253` tab-count check:
 
 ```ts
         // NOTE (display precedence, docs/development/rename-scope-contract.md):
         // the dedupe click finds and FOCUSES the existing tab; its historical
-        // session-title sync yields to the tab's explicit creator title
-        // (tabsSlice.ts:1141 `!existingTab.titleSetByUser`), so the REST
-        // `name` survives the click. The pane title still mirrors the session
-        // title (pane-scope canonical); only the tab display keeps the name.
+        // session-title sync yields to the tab's explicit creator title (the
+        // already-open click returns early at Sidebar.tsx:486-489; the
+        // `!existingTab.titleSetByUser` check at :487 blocks the sync — same
+        // semantic as openSessionTab's tabsSlice.ts:1141 guard, which the
+        // click never reaches), so the REST `name` survives the click. The
+        // pane title still mirrors the session title (pane-scope canonical);
+        // only the tab display keeps the name.
         const tabTitleAfterClick: string = await expect.poll(async () => {
           const s = await harness.getState()
           return s?.tabs?.tabs?.find((t: any) => t.id === restTabId)?.title ?? null
@@ -402,14 +409,15 @@ Closes **kata 59nb**. Root cause (proven): tracing-core caches each callsite's I
 
 **Files:**
 - Modify: `crates/freshell-ws/src/invariants.rs:363-441` (`capture()` → OnceLock global) and its internal `mod tests` consumers
-- Modify: `crates/freshell-ws/src/pane_ledger_tests.rs:8837-8974` (the guarded tests' filters + the worst-case-order proof)
-- Modify: `crates/freshell-ws/src/tabs_persist_tests.rs:1217,1270,1321,1376` (unique-field filters + unique ids)
+- Modify: `crates/freshell-ws/src/pane_ledger_tests.rs:8837-8974` (the guarded tests' filters + the worst-case-order proof; ALSO narrow the `{events:?}` failure dumps at `:8861,:8899` to the filtered hits) AND `:2983-2996,:3100-3200` (the `lock_log_capture` thread-local helper and its one consumer — same OnceLock/filter migration; delete the helper)
+- Modify: `crates/freshell-ws/src/tabs_persist_tests.rs:1217,1270,1321,1376` (unique-field filters + unique ids) AND `:1228,:1313,:1367,:1415` (narrow the `{events:?}` failure dumps to the filtered hits)
 - Modify: `crates/freshell-ws/src/claude_signal.rs:440,598` (guard-drop + path filter)
 - Modify: `crates/freshell-ws/src/opencode_signal.rs:758,816,832` (path/terminal_id filters + per-test unique ids)
+- Modify: `crates/freshell-ws/src/create_dedupe.rs:949-977` (the DIAG-01 waiter test's inline thread-local capture — same OnceLock/filter migration)
 
 **Interfaces:**
 - Consumes: the e08g precedent shape at `crates/freshell-ws/tests/pane_reconcile_freshagent.rs:838-858` (OnceLock + `set_global_default` + loud `.expect` on install); `CapturedEvent { target, message, fields }` (unchanged).
-- Produces: `capture() -> Arc<Mutex<Vec<CapturedEvent>>>` — one process-global subscriber per lib-test binary, installed once (first call), never torn down; every consumer filters by a per-test-unique field. No later task consumes this; Task 6's gate re-runs the binary.
+- Produces: `capture() -> Arc<Mutex<Vec<CapturedEvent>>>` — one process-global subscriber per lib-test binary, installed once (first call), never torn down; every consumer filters by a per-test-unique field — INCLUDING the two pre-existing thread-local `set_default` captures this task folds in (`pane_ledger_tests.rs`'s `lock_log_capture::lock_failure_capture` and `create_dedupe.rs`'s DIAG-01 inline capture), so after this task NO thread-local capture remains anywhere in the lib-test binary. No later task consumes this; Task 6's gate re-runs the binary.
 
 - [ ] **Step 1: Write the failing worst-case-order regression proof**
 
@@ -441,7 +449,7 @@ In `pane_ledger_tests.rs`, extend `load_index_dir_io_errors_disable_the_ledger_l
     drop(guard);
 ```
 
-(The remainder of the test's assertions are unchanged at this step; the poisoner thread's own root is distinct, and later the filter in Step 3 excludes it.)
+(The remainder of the test's assertions are unchanged at this step; the poisoner thread's own root is distinct, and later the root filter added in Step 4 excludes it.)
 
 - [ ] **Step 2: Run it and verify the intended failure**
 
@@ -479,11 +487,11 @@ Replace the body of `capture()` in `crates/freshell-ws/src/invariants.rs` (e08g 
     }
 ```
 
-Add the `std::sync::OnceLock` import; remove the now-unused `DefaultGuard` return and the `set_default` import. All events of the whole binary now land in one shared vec.
+Add the `std::sync::OnceLock` import. There is NO `set_default` import to remove — the old body calls `tracing::subscriber::set_default` by its full path (`invariants.rs:439`), and that call is replaced in place by the `set_global_default` call above. What must go is the `tracing::subscriber::DefaultGuard` RETURN TYPE (`:431-432`, also fully qualified — not an import) and the guard bindings it produced at the call sites. All events of the whole binary now land in one shared vec.
 
 - [ ] **Step 4: Convert every consumer to unique-field filtering**
 
-Mechanical rule for every site: `let events = capture();` (drop the `(events, _guard)` destructure — there is no guard), and make every presence/count/negative assertion filter by a per-test-unique field. Verified emission fields and required edits:
+Mechanical rule for every site: `let events = capture();` (drop the `(events, _guard)` destructure — there is no guard), make every presence/count/negative assertion filter by a per-test-unique field, AND narrow every failure message that today dumps the whole vec via `{events:?}` to print the FILTERED hits instead (`{hits:?}` / a bound filtered slice) — the shared vec now holds every event from every test in the binary, so an unfiltered dump is unreadable noise working against the clear-failure-diagnostics goal. Six `{events:?}` sites: `pane_ledger_tests.rs:8861,:8899` (both already bind `hits` — print it) and `tabs_persist_tests.rs:1228,:1313,:1367,:1415` (hoist each inline `.any()` predicate into a `hits` binding and print that). Verified emission fields and required edits:
 
 | Site | Assertion today | Emission's unique field | Required edit |
 | --- | --- | --- | --- |
@@ -491,7 +499,7 @@ Mechanical rule for every site: `let events = capture();` (drop the `(events, _g
 | `pane_ledger_tests.rs:8885` (`load_index_row_io_errors_are_loud_per_row`) | exact-1 by message, then asserts `fields["path"]` | `path` (contains per-test temp root `load-loud-row`) | move the path into the filter: exact-1 by message + `fields["path"] == want_path` |
 | `tabs_persist_tests.rs:1217` | `.any()` by message `tabs_snapshot_dropped_oversize` | `device_id` (test's device is `"dev"`) | rename the test's device id to a per-binary-unique `dev-oversize` and filter by `e.fields.get("device_id") == Some("dev-oversize")` |
 | `tabs_persist_tests.rs:1270` | `.any()` by message `tabs_snapshot_corrupt_dir_exempt_from_eviction` | `path` (device dir under the test's tempdir) | filter adds `e.fields.get("path")` containing this test's tempdir path |
-| `tabs_persist_tests.rs:1321` | `.any()` by same message | `path` | same — its own tempdir path; ALSO make its device ids per-test-unique (e.g. `allcorrupt-…`) so dir paths cannot collide with `:1270`'s |
+| `tabs_persist_tests.rs:1321` (`cap_unenforceable_fails_the_write_and_preserves_all_evidence`) | `.any()` by message `tabs_snapshot_device_cap_unenforceable` (asserted at `:1366` — NOT the corrupt-dir-exempt message) | `root` — the cap-unenforceable emission (`tabs_persist_retention.rs:114-116`) carries `root = %root.display()` and `corrupt_exempt`, and NO `path` field | filter adds `e.fields.get("root").map(String::as_str) == Some(&dir.path().display().to_string())`. TRAP — do not take the other branch: this test ALSO emits `tabs_snapshot_corrupt_dir_exempt_from_eviction` (with `path`) for every corrupt device dir under its tempdir, so filtering on that message+path would keep the test green while silently dropping the cap-alarm check it exists to make. No device-id rename needed: its per-test tempdir already makes every `root`/`path` value distinct from `:1270`'s |
 | `tabs_persist_tests.rs:1376` | `.any()` by message `tabs_snapshot_device_identity_conflict` | `dir` (device dir path), plus `first`/`conflicting` | filter adds `e.fields.get("dir")` containing this test's tempdir path |
 | `claude_signal.rs:440` | guard held only to keep registration warm (comment documents the poisoning) | — | keep the call as `let _ = crate::invariants::capture::capture();` (installs the global early; no assertions on events). Update the comment to point at the global capture |
 | `claude_signal.rs:598` (`drain_warns_on_rejected_files`) | `.any()` by message `claude_signal_rejected` | `path` (junk file under this test's tempdir) | filter adds `e.fields.get("path")` == the test's junk-file path (or contains its tempdir) |
@@ -499,8 +507,10 @@ Mechanical rule for every site: `let events = capture();` (drop the `(events, _g
 | `opencode_signal.rs:816` (`warns_once_for_an_opencode_pane_past_grace_with_no_hello`) | exact-1 by message `opencode_rebind_heartbeat_missing` | `terminal_id` (currently `"term-1"` — collides with the next test's rows) | rename its probe terminal to a unique `term-hb-once` and filter by `fields["terminal_id"] == "term-hb-once"` |
 | `opencode_signal.rs:832` (`no_warn_when_hello_seen_young_non_opencode_or_injection_disabled`) | negative by same message | `terminal_id` (currently `"term-1"` rows) | rename its rows to per-test-unique ids (`term-hello`, `term-young`, `term-nonoc`, `term-injdis`) and scope the negative filter to those ids |
 | `invariants.rs` internal `mod tests` — 15 call sites spanning `:544`–`:1234`: `warns_once_per_unresolved…` (`t-lost`), `never_warns_inside_the_grace_window` (`t-young`), `never_warns_for_shell_or_exited_terminals` (`t-shell`/`t-gone`), `never_warns_when_either_identity_home_resolves…` (`t-identity`/`t-rest-resume`), `error_claude_restore_unresolved_emits_on_invariants_target` (`:632`), and the opencode probe-phase family `:698`–`:1234` (`:709`, `:760`, `:801`, `:835`, `:875`, `:902`, `:939`, `:992`, `:1154`, `:1234`) | the `unresolved_warnings` helper (`:466`) filters by target+message ONLY; several tests assert exact counts or emptiness | `terminal_id` ONLY for the unresolved-warning sites — the event carries just `terminal_id`/`mode`/`age_ms` (`invariants.rs:232-237`), so NO home-root/path filter is possible there; `request_id` for the claude-restore test (its event carries the field, `:342`) | **the terminal ids are NOT already unique — four are shared by two tests each and must be renamed per test:** `t-ev` (`:760` `…stale_candidate_evidence_still_warns` expects EXACTLY ONE warning; `:801` `…fresh_candidate_evidence_does_not_warn_yet` expects NONE), `t-late` (`:1154` `probe_phase_closes_the_late_row_hole…` expects a warning; `:939` `opencode_latch_miss…` expects NONE), `t-young` (`:585`/`:992`), `t-idle` (`:709`/`:1234`). The t-ev and t-late pairs are hard false-fails under the shared never-cleared vec (the warning-free sibling sees its sibling's warning); the t-young/t-idle pairs are negative-negative today but are renamed anyway so a later positive sibling can't silently recreate the race. Rename per test (e.g. `t-ev-stale`/`t-ev-fresh`, `t-late-hole`/`t-late-latch`, `t-young-grace`/`t-young-boundary`, `t-idle-grace`/`t-idle-never`), then extend `unresolved_warnings` (or its call sites) to also filter by the test's terminal id(s); the claude-restore test filters by its `request_id`. Every other capture site in the file keeps its already-unique id (`t-lost`, `t-shell`, `t-gone`, `t-bound`, `t-noloc`, `t-resume`, `t-identity`, `t-rest-resume`) — audit each `capture()` the same way |
+| `pane_ledger_tests.rs:3100` (`new_locked_degrades_to_disabled_when_another_holder_exists`, the f3wp deflake) — NOT a `capture::capture()` site: it uses the thread-LOCAL `lock_log_capture::lock_failure_capture()` (`:2983-2996`, its own `set_default` at `:2992`) | presence via `find` on `log[seen_before..]`; its `None => panic!` arm (`:3185`) requires the production `pane_ledger_lock_unavailable` (or scan-unavailable) event from `pane_ledger.rs:1573` | `root` (the lock-unavailable emission carries `root` + `error`) | migrate to the global capture: `let events = crate::invariants::capture::capture();` (drop the `_trace_guard` binding), keep the `seen_before` mark slicing, and add a root filter to the find (`e.fields.get("root")` == this test's `temp_root` path) so sibling lock failures from other roots cannot be misclassified; the `error`-contains-`would_block_marker` match arms stay unchanged. Then DELETE the now-caller-less `lock_log_capture` helper (`:2983-2996`) — a helper with no callers fails `clippy -D warnings` |
+| `create_dedupe.rs:949` (`settle_forwards_terminal_created_to_in_flight_waiter_connection`, DIAG-01) — also NOT a `capture::capture()` site: inline thread-local `set_default` capture | presence via `.find` + `.expect` (`:977`) on the production `ws.terminal.create.settled` join event | `terminal_id` (`"tX"`) + `path` (`"duplicate_in_flight_waiter"`) — both grep-unique to this one test across the whole lib at base | migrate to the global capture: drop the inline `L` layer + `set_default` guard, use `crate::invariants::capture::capture()`, and adapt the tuple find to `CapturedEvent`'s `e.message`/`e.fields` (the inline capture's i64-fields-to-string convention is identical to `invariants.rs`'s `FieldVisitor`, so `fields.get("connection_id") == Some("2")` transfers as-is); keep the existing `terminal_id`+`path` predicate as the per-test-unique filter — no rename needed |
 
-Any site not in this table that greps as `capture::capture()` must get the same treatment. Stage-2's grep at base dbbfd0752 verified the full census: **26 call sites in 5 files** — `pane_ledger_tests.rs:8847,:8885`; `tabs_persist_tests.rs:1217,:1270,:1321,:1376`; `claude_signal.rs:440,:598`; `opencode_signal.rs:758,:816,:832`; and `invariants.rs` ×15 (`:544,:585,:610,:632,:661,:709,:760,:801,:835,:875,:902,:939,:992,:1154,:1234` — the seven beyond `:830` are the opencode probe-phase family, outside the 59nb report's original `:544-801` range). The Step 6 re-grep remains the mechanical completeness gate.
+Any site not in this table that greps as `capture::capture()` — OR as a thread-local `tracing::subscriber::set_default` capture anywhere in the lib (`set_default`/`DefaultGuard` outside `invariants.rs`'s own `capture()`) — must get the same treatment. Stage-2's grep at base dbbfd0752 verified the full census: **26 `capture::capture()` call sites in 5 files** — `pane_ledger_tests.rs:8847,:8885`; `tabs_persist_tests.rs:1217,:1270,:1321,:1376`; `claude_signal.rs:440,:598`; `opencode_signal.rs:758,:816,:832`; and `invariants.rs` ×15 (`:544,:585,:610,:632,:661,:709,:760,:801,:835,:875,:902,:939,:992,:1154,:1234` — the seven beyond `:830` are the opencode probe-phase family, outside the 59nb report's original `:544-801` range) — PLUS the two thread-local `set_default` captures migrated by the last two table rows (`pane_ledger_tests.rs:2992` via `lock_failure_capture`, consumed at `:3100`; `create_dedupe.rs:949`, asserted at `:977`): 28 guarded capture sites across 6 files. The Step 6 re-grep remains the mechanical completeness gate — it greps BOTH patterns.
 
 - [ ] **Step 5: Run the focused proof and the consumer files green**
 
@@ -510,14 +520,15 @@ cargo test -p freshell-ws --locked --lib pane_ledger
 cargo test -p freshell-ws --locked --lib tabs_persist
 cargo test -p freshell-ws --locked --lib claude_signal
 cargo test -p freshell-ws --locked --lib opencode_signal
+cargo test -p freshell-ws --locked --lib create_dedupe
 cargo test -p freshell-ws --locked --lib invariants
 ```
 
-Expected: PASS — the worst-case-order proof passes under the global capture (the poisoner thread's emission lands in the shared vec with its own root and is filtered out; the main thread's emission dispatches because the callsite registers against the live global dispatcher).
+Expected: PASS — the worst-case-order proof passes under the global capture (the poisoner thread's emission lands in the shared vec with its own root and is filtered out; the main thread's emission dispatches because the callsite registers against the live global dispatcher), and the two migrated thread-local sites pass (the lock test's root-filtered find; the DIAG-01 waiter's `terminal_id`+`path` find).
 
 - [ ] **Step 6: Refactor while green**
 
-Remove dead imports (`DefaultGuard`, `set_default`) and any now-unused guard bindings across the five files. Re-grep `capture::capture()` in `crates/freshell-ws/src/` to confirm every consumer was converted — AND audit id uniqueness, which the call-site census alone cannot detect: every `terminal_id` literal asserted against the shared vec (and every `device_id` in `tabs_persist_tests.rs`, every `temp_root` label in `pane_ledger_tests.rs`) must appear in exactly ONE test. The known collisions to confirm gone: `t-ev`, `t-late`, `t-young`, `t-idle` in `invariants.rs` (each was shared by two tests; see the Step 4 table), and the `term-1`/`term-hb-once` renames in `opencode_signal.rs`.
+Remove the `tracing::subscriber::DefaultGuard` return type and every now-unused `(events, _guard)` guard binding across the six files (neither is an import — both are fully qualified in the source; there is no `set_default` import to remove). Re-grep BOTH `capture::capture()` AND `set_default`/`DefaultGuard` in `crates/freshell-ws/src/` to confirm every consumer was converted and NO thread-local capture remains (`invariants.rs`'s global `capture()` is the only subscriber install; `lock_failure_capture` and the create_dedupe inline layer are gone) — AND audit filter uniqueness, which the call-site census alone cannot detect: every id literal used AS a shared-vec filter must identify exactly ONE test — the `terminal_id` literals asserted against the vec, the oversize test's renamed `dev-oversize` `device_id`, and every `temp_root` label in `pane_ledger_tests.rs` (the `dev-000`-series device ids appear in two tabs_persist tests by design and are fine — they are never vec filters there; those tests filter by per-test-unique tempdir `root`/`path`). The known collisions to confirm gone: `t-ev`, `t-late`, `t-young`, `t-idle` in `invariants.rs` (each was shared by two tests; see the Step 4 table), and the `term-1`/`term-hb-once` renames in `opencode_signal.rs`.
 
 - [ ] **Step 7: Impacted-test verification**
 
@@ -534,7 +545,7 @@ Expected: every run green (the pinned-combo taskset loop is the investigation's 
 - [ ] **Step 8: Commit**
 
 ```bash
-git add crates/freshell-ws/src/invariants.rs crates/freshell-ws/src/pane_ledger_tests.rs crates/freshell-ws/src/tabs_persist_tests.rs crates/freshell-ws/src/claude_signal.rs crates/freshell-ws/src/opencode_signal.rs
+git add crates/freshell-ws/src/invariants.rs crates/freshell-ws/src/pane_ledger_tests.rs crates/freshell-ws/src/tabs_persist_tests.rs crates/freshell-ws/src/claude_signal.rs crates/freshell-ws/src/opencode_signal.rs crates/freshell-ws/src/create_dedupe.rs
 git commit -m "test(ws): process-global OnceLock capture with per-test-unique filters (kata 59nb) — fixes callsite Interest-cache poisoning"
 ```
 
@@ -679,7 +690,11 @@ Run: `cargo test -p freshell-freshagent --locked session_init`
 
 Expected: PASS (7 passed, 0 failed).
 
-Note on red-first: the race's natural red is the recorded load-flake receipt (base-gate panic `freshAgent.session.init consumed within budget` at `claude.rs`'s old `:11189`, retained at `/tmp/base-gate-run2.log:7031`), but a DETERMINISTIC red receipt is reproducible with the stranded commit's own throwaway harness — `8186d9f3e`'s message records: "Evidence (temporary harness, not committed: a 200ms sleep before the created broadcast): before, all 3 tests failed; after, 50/50 runs of the tests passed pinned to 8 CPUs with busy loops on them." Repro recipe (UNCOMMITTED, never part of any commit): before applying Step 2, temporarily insert a 200ms `tokio::time::sleep` in `handle_create` between the stdout-consumer spawn and the `freshAgent.created` broadcast, run `cargo test -p freshell-freshagent --locked session_init` → expect the three live siblings to FAIL on the init-drain budget (record the receipts in run-state), then revert the sleep and confirm the working tree is clean before continuing. This is a throwaway repro step, not a committed production seam (repo precedent stands: no order-forcing seam is shipped). The deterministic committed coverage is Task 4's zombie red; this task's verification is repeated green under load:
+Note on red-first: the race's natural red is the recorded load-flake receipt (base-gate panic `freshAgent.session.init consumed within budget` at `claude.rs`'s old `:11189`, retained at `/tmp/base-gate-run2.log:7031`), but a DETERMINISTIC red receipt is reproducible with the stranded commit's own throwaway harness — `8186d9f3e`'s message records: "Evidence (temporary harness, not committed: a 200ms sleep before the created broadcast): before, all 3 tests failed; after, 50/50 runs of the tests passed pinned to 8 CPUs with busy loops on them." Note the evidence's SHAPE: the stranded commit's green was also collected WITH the sleep in place — the harness forces the interleave deterministically, so green-under-harness is the load-immunity proof. Repro recipe, three beats (UNCOMMITTED, never part of any commit):
+1. RED: before applying Step 2, temporarily insert a 200ms `tokio::time::sleep` in `handle_create` between the stdout-consumer spawn and the `freshAgent.created` broadcast, run `cargo test -p freshell-freshagent --locked session_init` → expect the three live siblings to FAIL on the init-drain budget (record the receipts in run-state).
+2. GREEN UNDER THE FORCED INTERLEAVE: with the sleep STILL in place, apply Step 2's combined-drain conversion, re-run the same selector → expect the three live siblings to PASS (without this beat the green loops below exercise only the rare natural interleave and would pass even if the helper did nothing — the reorder fix is proven under the forced timing, matching the stranded commit's own 50/50 evidence).
+3. CLEANUP: revert the sleep and confirm the working tree contains ONLY the Step 2 conversion (`git diff` shows no `tokio::time::sleep` hunk) before continuing.
+This is a throwaway repro harness, not a committed production seam (repo precedent stands: no order-forcing seam is shipped). The deterministic committed coverage is Task 4's zombie red; this task's verification is repeated green under load:
 
 ```bash
 for i in 1 2 3; do cargo test -p freshell-freshagent --locked || break; done
@@ -738,18 +753,31 @@ FRESHELL_TEST_SUMMARY="main-green-sixpack campaign gate: six standing failures f
 
 Expected: PASS — client, source-runtime, Rust (59nb/hsrh lanes covered here), electron, electron-runtime.
 
-2b. Full local e2e lane (also coordinator-gated — a zero-argument full e2e lane is a broad run; wait for the gate):
+2b. Full local e2e lane. Honest gate status: this lane is NOT coordinator-gated — `test:e2e:local` runs `bash scripts/e2e-cloud.sh run --local`, which execs `npx playwright test` directly (`scripts/e2e-cloud.sh:472`; the coordinator command matrix has no e2e entry), so the shared gate never engages and `FRESHELL_TEST_SUMMARY` does nothing for this command. By-hand discipline instead: run `npm run test:status` first and WAIT for any active holder to clear before starting — a ~28-minute full lane competing with another agent's broad run causes spurious failures Step 3 would then misread as campaign defects.
 
 ```bash
-npm run test:status
-FRESHELL_TEST_SUMMARY="main-green-sixpack campaign gate: full local e2e net for title-precedence + placeholder-row changes" npm run test:e2e:local
+npm run test:status   # then WAIT for any active holder to clear — the e2e lane itself will never wait
+npm run test:e2e:local
 ```
 
 Expected: PASS — every spec in `test/e2e-browser/specs/`, including all four campaign families. Census note: only TWO of the four are on `CLOUD_SKIP_SPECS` (`playwright.cloud.config.ts`: `remote-tab-linkage-rust.spec.ts` and `rest-tab-persistence.spec.ts` — deploy-tab-diff-rust and sidebar-opencode-rail are cloud-legal; `LOCAL_ONLY_SPECS` adds only `mcp-qa-smoke-rust.spec.ts`), so a cloud lane would NOT be coverage for the linkage/persistence pair regardless — the local lane result is the campaign's authoritative e2e evidence.
 
+2c. Triage any NON-campaign failure against the base. "Expected: PASS — every spec" has no standing baseline: run-state deliberately deferred the full-lane result to this task ("known-red main by premise"), and Task 1 changes behavior for every REST/MCP-named tab and every placeholder session row. If any spec OUTSIDE the four campaign families fails in 2b, classify pre-existing vs campaign-caused by re-running THAT spec at the branch base dbbfd0752 from a clean scratch worktree:
+
+```bash
+repo="$(git rev-parse --show-toplevel)"
+git -C "$repo" worktree add --detach /tmp/freshell-base-compare dbbfd0752
+# from inside /tmp/freshell-base-compare:
+#   npm ci --no-audit --no-fund
+#   npm run test:e2e:local -- test/e2e-browser/specs/<failing-spec>.spec.ts
+git -C "$repo" worktree remove --force /tmp/freshell-base-compare
+```
+
+(same clean-scratch discipline as `scripts/base-gate.sh`, which cannot be used verbatim here: it is hardwired to `origin/main` — a valid base only while `origin/main` still equals dbbfd0752 — and takes an npm script NAME, not script args, so a single focused spec needs the explicit worktree). Classification: fails at base → PRE-EXISTING — record it in run-state under the no-scope-creep rule and move on; passes at base → a regression caused by this campaign (almost certainly Task 1's precedence or placeholder-row change) — fix within the branch before any PR.
+
 - [ ] **Step 3: Zero-flake acceptance**
 
-The full suite must be green with no recovered-retry flakes in the four campaign families. If any campaign family flakes or fails, that is a campaign defect — fix it within the branch before any PR (record the failure + receipt in run-state; do not weaken the suite).
+The full suite must be green with no recovered-retry flakes in the four campaign families. If any campaign family flakes or fails, that is a campaign defect — fix it within the branch before any PR (record the failure + receipt in run-state; do not weaken the suite). A NON-campaign spec failure is not treated as a campaign defect until Step 2c classifies it against the base — after classification, a campaign-caused one is a campaign defect (fix it); a pre-existing one is recorded and left (no scope creep).
 
 - [ ] **Step 4: Kata + ledger bookkeeping**
 
@@ -774,7 +802,7 @@ No files change in this task; run-state (outside the tracked worktree) carries t
 
 ## Verification summary (what proves the User Request's result)
 
-1. **Requested result — six failures fixed:** Task 1 Step 1 records the four e2e red receipts at base; Task 2 Step 3 records them green; Task 3 Steps 2/5 record the 59nb proof red→green plus 0/30 pinned-combo; Tasks 4/5 Steps 1/3 record the hsrh zombie red and family green ×3 under load; Task 6 Step 2a records the coordinated non-e2e suite green and Step 2b records the FULL local e2e lane green (the complete net for the title/placeholder changes — `npm test` alone runs no Playwright).
+1. **Requested result — six failures fixed:** Task 1 Step 1 records the four e2e red receipts at base; Task 2 Step 3 records them green; Task 3 Steps 2/5 record the 59nb proof red→green plus 0/30 pinned-combo; Tasks 4/5 Steps 1/3 record the hsrh zombie red, the forced-interleave red→green under the uncommitted 200ms harness, and family green ×3 under load; Task 6 Step 2a records the coordinated non-e2e suite green, Step 2b records the FULL local e2e lane green (the complete net for the title/placeholder changes — `npm test` alone runs no Playwright), and Step 2c classifies any non-campaign spec failure against the base dbbfd0752 (pre-existing → recorded, not fixed; campaign-caused → fixed in-branch).
 2. **Explicit constraint — root-cause-first, no patience raises:** no timeout value is raised anywhere in the plan; the hsrh 15s budget is retained as a dead-man switch while the wait shape becomes order-immune; the e2e fixes restore a product contract rather than extending waits.
 3. **Explicit constraint — rename-scope coherence:** the Resolution section reconciles the precedence with docs/development/rename-scope-contract.md; Task 1 Step 4e records the display-precedence ladders in the contract doc exactly as the code composes them (tab ladder + the pane-kind split, so no inaccurate blanket rule enters the contract) and adds the Tab-label "Written by" create-time entry; no hard rule is violated (write-scoping untouched).
 4. **Explicit constraint — one branch/PR via the campaign pattern:** single branch `main-green-sixpack` from `dbbfd0752`; PR only after explicit user approval (Task 6 Step 5).
