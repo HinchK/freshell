@@ -26,6 +26,7 @@ import { updateTab } from '@/store/tabsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { ApiError } from '@/lib/api'
 import { resetSnapshotSchedulerForTests, SNAPSHOT_DEBOUNCE_MS } from '@/lib/fresh-agent-snapshot-scheduler'
+import { SESSION_HANDOFF_RETRY_BACKOFF_MS } from '@/lib/session-handoff'
 import {
   ROLLBACK_BUSY_REDO_NOTICE,
   ROLLBACK_BUSY_UNDO_NOTICE,
@@ -10056,44 +10057,66 @@ describe('fresh-agent runtime-owner divergence recovery (kata b8ke)', () => {
   })
 
   it('HANDOFF_IN_PROGRESS retry waits out the backoff before re-invoking (never an immediate tight loop)', async () => {
-    const store = createStore()
-    store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent() }))
-    store.dispatch(setPaneHandoffError({
-      tabId: 'tab-1',
-      paneId: 'pane-1',
-      error: {
-        code: 'HANDOFF_IN_PROGRESS',
-        message: 'a lifecycle operation is in flight; retry after it settles',
-        retryable: true,
-        generation: 2,
-      },
-    }))
-    // The retry's handoff fails again — the pane stays; only the timing of
-    // the single re-invocation is asserted.
-    apiMock.requestSessionHandoff.mockResolvedValue({
-      ok: false,
-      error: { code: 'HANDOFF_IN_PROGRESS', message: 'still in flight', retryable: true, ownerGeneration: 2 },
-    })
-    render(
-      <Provider store={store}>
-        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
-      </Provider>,
-    )
+    // A wall-clock mid-window sleep (350ms < the 750ms backoff) races CPU
+    // contention under parallel suites — the act()-queueing gap before the
+    // sleep started could itself exceed the backoff, so the check landed
+    // after the timer legitimately fired (the snapshot-debounce sibling's
+    // note fixed the same class of flake). Advance the real timer clock
+    // deterministically instead: nothing wall-clock remains.
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+      store.dispatch(initLayout({ tabId: 'tab-1', paneId: 'pane-1', content: divergencePaneContent() }))
+      store.dispatch(setPaneHandoffError({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        error: {
+          code: 'HANDOFF_IN_PROGRESS',
+          message: 'a lifecycle operation is in flight; retry after it settles',
+          retryable: true,
+          generation: 2,
+        },
+      }))
+      // The retry's handoff fails again — the pane stays; only the timing of
+      // the single re-invocation is asserted.
+      apiMock.requestSessionHandoff.mockResolvedValue({
+        ok: false,
+        error: { code: 'HANDOFF_IN_PROGRESS', message: 'still in flight', retryable: true, ownerGeneration: 2 },
+      })
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
 
-    const banner = await screen.findByRole('alert')
-    const retry = within(banner).getByRole('button', { name: /retry reopening/i })
-    fireEvent.click(retry)
+      const banner = screen.getByRole('alert')
+      const retry = within(banner).getByRole('button', { name: /retry reopening/i })
+      fireEvent.click(retry)
 
-    // Synchronous and mid-backoff: nothing sent yet. The backoff (750ms)
-    // cannot have elapsed at 350ms wall-clock.
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 350)) })
-    expect(apiMock.requestSessionHandoff).not.toHaveBeenCalled()
+      // Synchronous: nothing sent on click itself (never a tight loop).
+      expect(apiMock.requestSessionHandoff).not.toHaveBeenCalled()
 
-    // After the backoff the single re-invocation leaves.
-    await waitFor(() => {
+      // Mid-backoff: one tick before the deadline the timer cannot have fired.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(SESSION_HANDOFF_RETRY_BACKOFF_MS - 1)
+      })
+      expect(apiMock.requestSessionHandoff).not.toHaveBeenCalled()
+
+      // At the full backoff exactly one re-invocation leaves...
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1)
+      })
       expect(apiMock.requestSessionHandoff).toHaveBeenCalledTimes(1)
-    }, { timeout: 5_000 })
-    expect(apiMock.requestSessionHandoff).toHaveBeenCalledTimes(1)
+      // ...and no stacked timer follows it: a full further window stays
+      // silent.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(SESSION_HANDOFF_RETRY_BACKOFF_MS)
+      })
+      expect(apiMock.requestSessionHandoff).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('every typed handoff-failure code composes: the banner renders the typed message with a Retry that re-invokes the same identity', async () => {
