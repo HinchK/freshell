@@ -21,7 +21,7 @@ Freshell's fresh-agent display consistently treats opencode PTY plugin notificat
 - PTY notification blocks will fold into adjacent assistant turns as continuations; the minimap rail shows only real human prompts.
 - The opencode CLI/TUI outside Freshell still shows these as user messages — out of scope.
 
-**Goal:** opencode-pty plugin notification turns (user-role wire messages whose leading text is a `<pty_exited>` / `<pty_waited>` / `<pty_wait_timeout>` block) render everywhere in the fresh-agent UI as agent text — agent label, agent bubble, markdown body, no minimap tick, no hover preview, no undo/rewind affordance — while the wire snapshot, store turns, and rollback step counts keep seeing them as raw user-role turns.
+**Goal:** opencode-pty plugin notification turns (user-role wire messages whose leading text is a `<pty_exited>` / `<pty_waited>` / `<pty_wait_timeout>` block) render everywhere in the fresh-agent UI as agent text — agent label, agent bubble, markdown body, no minimap tick, no hover preview — while the wire snapshot, store turns, and rollback step counts keep seeing them as raw user-role turns.
 
 **Architecture:** One pure helper `reclassifyPtyNotificationTurns` in `shared/fresh-agent-turns.ts` maps matching user-role turns to `{ ...turn, role: 'assistant' }` (identity-preserving for everything else). It is composed FIRST inside the existing `displayTurns` memo in `src/components/fresh-agent/FreshAgentTranscript.tsx:1104-1106`, ahead of `coalesceSyntheticToolResultTurns`. Every display consumer (turn label, bubble CSS via `data-turn-role`, markdown gate, header/continuation folding, the `[data-turn-role="user"]` minimap/glom sweep in `src/components/fresh-agent/shared/transcript-measurement.ts:33`, action-affordance gates in `FreshAgentTurnActions.tsx`) keys off the memo output and flips automatically. The rollback stepper reads the separate raw `rolledBackTurns` prop (never the memo), and `freshAgentSnapshotHasUserTurn` reads the raw snapshot — both stay raw by construction.
 
@@ -31,8 +31,9 @@ Freshell's fresh-agent display consistently treats opencode PTY plugin notificat
 
 - **Worktree discipline:** all work happens in `/home/dan/code/freshell/.worktrees/pty-notification-display-role` on branch `the-usual/pty-notification-display-role` (base_ref `34f425faeb565a993655a429d5f291681315d0a0`). Run every command from that worktree. No merge, no push, no PR without explicit user approval.
 - **Production-file allowlist:** exactly two production files change — `shared/fresh-agent-turns.ts` (additive export) and `src/components/fresh-agent/FreshAgentTranscript.tsx` (one import + one memo line). No changes to `shared/fresh-agent-contract.ts` (schema), `src/lib/api.ts`, `src/components/fresh-agent/FreshAgentView.tsx`, `src/store/`, any `crates/` Rust code, or `tools/`. A reviewer seeing any other production diff must reject it.
-- **Baseline:** `origin/main` at base_ref is red with 11 deterministic pre-existing Rust failures in `freshell-freshagent` (session handoff/ownership + claude settings families), recorded with receipts in the run's baseline ledger (`.worktrees/.the-usual-logs/pty-notification-display-role/reports/workspace-baseline.md`). This change touches no Rust code; the Rust phase is expected to show exactly those 11 failures at the final gate. No new failure may be treated as pre-existing unless it reproduces at base_ref.
-- **Test commands:** focused Vitest via the repo-owned passthrough `npm run test:vitest -- run <files> --config config/vitest/vitest.config.ts` (run from the worktree). Typecheck with `npm run typecheck:client`. Lint with `npm run lint` (a11y plugin must stay clean). E2E via `npm run test:e2e:local -- --project=chromium <spec>` or `npm run test:e2e:cloud -- --project=chromium <spec>` — **the e2e backend must be confirmed with the user before the first e2e run** (repo rule: `FRESHELL_E2E_BACKEND` is unset on this machine; once the user chooses, set it in `~/.bashrc`). Before filing the branch, the affected e2e specs must actually pass on the chosen backend.
+- **Baseline (user-authorized exception, recorded):** `origin/main` at base_ref (34f425fa) is red with 11 deterministic pre-existing Rust failures in `freshell-freshagent` (session handoff/ownership + claude settings families), recorded with receipts in the run's baseline ledger (`.worktrees/.the-usual-logs/pty-notification-display-role/reports/workspace-baseline.md`) and reproduced in isolation at base_ref. The repo rule — green base, or pause before worktree creation and notify the user — was satisfied: the run paused, presented the failing command (`scripts/base-gate.sh test`, rust phase exit 101) and the 11-failure summary, and on 2026-09-18 the user explicitly chose to proceed with the 11 failures ledger-recorded as pre-existing (the recorded decision lives in `run-state.md` under Important decisions). This is the recorded exception under which the "TDD per repo rules" constraint applies: red/green/refactor discipline governs every test this change owns, and the final gate's pass criterion is green-excluding-the-11 with receipts. This change touches no Rust code; the Rust phase is expected to show exactly those 11 failures at the final gate. No new failure may be treated as pre-existing unless it reproduces at base_ref.
+- **base_ref immutability:** the branch is based at 34f425fa and NEVER rebases or re-targets during the run, even as `origin/main` advances past it (other agents merge PRs concurrently). The final delta review uses exactly base_ref...HEAD per the run contract.
+- **Test commands:** focused Vitest via the repo-owned passthrough `npm run test:vitest -- run <files> --config config/vitest/vitest.config.ts` (run from the worktree). Typecheck with `npm run typecheck:client`. Lint with `npm run lint` (a11y plugin must stay clean). E2E via `npm run test:e2e:cloud -- --project=chromium <spec>` — `FRESHELL_E2E_BACKEND=cloud` is already set permanently in `~/.bashrc` (verified 2026-09-19 in a fresh login shell; `FRESHELL_VITEST_BACKEND=cloud` likewise), so the repo's ask-when-unset rule does not apply and NO user question is needed; cloud runs cost ~$0.03/run under the user's standing configuration, and the first cloud run at a new commit tag may pay a one-time image build (~13 min). Before filing the branch, the affected e2e specs must actually pass on the cloud backend (a spec in `CLOUD_SKIP_SPECS` or a filter matching no tests is not coverage).
 - **A11y / e2e locator rules:** e2e specs may use only `getByRole` / `getByText` / `getByTestId` / `[data-*]` locator patterns; every interactive element asserted must be reachable that way.
 - **Commit style:** focused conventional commits, one per task plus the plan commit.
 - **Docs:** no `docs/index.html` update — this is a rendering provenance correction inside existing surfaces, not a new user-facing feature.
@@ -288,7 +289,13 @@ describe('PTY notification display role (opencode-pty plugin turns)', () => {
     expect(container.querySelectorAll('article[data-turn-role="assistant"]')).toHaveLength(2)
   })
 
-  it('offers rewind only on real user turns, never on a <pty_exited> turn', () => {
+  it('gives a <pty_exited> turn the same toolbar affordances as any assistant turn (no Rewind button)', () => {
+    // Agent-text parity pin: the hover toolbar's 'Rewind code to here' button
+    // renders only for user-role turns. After reclassification the PTY turn
+    // gets the identical (absent) toolbar affordance as any assistant turn.
+    // The context menu / touch action sheet keep their disabled Undo/Rewind
+    // entries for the reclassified turn — unchanged by design, exactly as for
+    // every other assistant turn; that surface is out of scope.
     const onRewind = vi.fn()
     render(
       <FreshAgentTranscript
@@ -343,15 +350,15 @@ Expected: the four display tests FAIL for the intended reason (PTY turn still re
 
 - [ ] **Step 3: Write the failing e2e test**
 
-Confirm the e2e backend with the user first (repo rule; `FRESHELL_E2E_BACKEND` unset — ask, then set the choice in `~/.bashrc`).
+Backend: `FRESHELL_E2E_BACKEND=cloud` is permanently set in `~/.bashrc` (verified 2026-09-19 in a fresh login shell) — no user question is needed; every e2e command in this task runs on the cloud backend.
 
 Lane choice: the route-intercept lane (schema-valid snapshot fulfilled in the browser, no provider binary) is the right level for this change — the change is client-display-only and the Rust role mapping that a full-stack fake-serve lane would exercise (`opencode_role`, snapshot contract) is untouched and already pinned by the Rust tests. Route-intercept also keeps the spec cloud-legal.
 
-Lane receipt first: run the donor spec once from the worktree BEFORE authoring the new spec, on the user-chosen backend:
+Lane receipt first: run the donor spec once from the worktree BEFORE authoring the new spec:
 
-`npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/transcript-minimap.spec.ts` (or `test:e2e:cloud` per the user's choice)
+`npm run test:e2e:cloud -- --project=chromium test/e2e-browser/specs/transcript-minimap.spec.ts`
 
-Expected: PASS — this receipts that the route-intercept e2e lane works at base from this worktree (validator load-bearing evidence in `reports/load-bearing-strategist.md` §C1). A donor failure here is an environment/lane breakage, never attributable to this change — stop and escalate rather than proceeding to the new spec. First local run pays the global-setup builds (`target/release` and `dist/client` are already warm in this worktree from the electron staging chain).
+Expected: PASS — this receipts that the route-intercept e2e lane works at base from this worktree (validator load-bearing evidence in `reports/load-bearing-strategist.md` §C1; the donor spec is cloud-legal — absent from `CLOUD_SKIP_SPECS` and `LOCAL_ONLY_SPECS`). A donor failure here is an environment/lane breakage, never attributable to this change — stop and escalate rather than proceeding to the new spec. Budget a possible one-time ~13-min cloud image build at the commit tag on the first run.
 
 Create `test/e2e-browser/specs/fresh-agent-pty-notification-display.spec.ts` (adapted verbatim from `seedMinimapPane` at `test/e2e-browser/specs/transcript-minimap.spec.ts:49-99`, re-routed to an opencode pane — the only existing freshopencode route-intercept precedent, `freshopencode-model-picker.spec.ts:129`, seeds `turns: []`, so this is the first to seed a freshopencode pane with non-empty turns):
 
@@ -478,9 +485,7 @@ Execution contingency: the snapshot body is adapted from the claude-seeded helpe
 
 - [ ] **Step 4: Run the e2e test and verify the intended failure**
 
-Run (backend per the user's choice; local shown):
-
-`npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/fresh-agent-pty-notification-display.spec.ts`
+Run: `npm run test:e2e:cloud -- --project=chromium test/e2e-browser/specs/fresh-agent-pty-notification-display.spec.ts`
 
 Expected: FAIL — `article[data-turn-role="assistant"]` with `SYNC_EXIT=0` never appears (the PTY turn renders as a user article today), and the minimap rail shows 2 `Jump to prompt:` ticks (both user-role turns).
 
@@ -538,7 +543,7 @@ git commit -m "feat(fresh-agent): render opencode-pty notifications as agent tex
 ## Final verification (after Task 2)
 
 1. Focused suites green (Task 2 Step 8).
-2. E2E: donor-spec lane receipt (Task 2 Step 3) and the new spec both pass on the user-chosen backend.
+2. E2E: donor-spec lane receipt (Task 2 Step 3) and the new spec both pass on the cloud backend (`FRESHELL_E2E_BACKEND=cloud`, set in `~/.bashrc`).
 3. Full-suite gate per [usual-executing-plans] from the worktree HEAD, judged per phase (the composite `npm test` runner aborts at its first failing phase; rust is red at base with the ledgered 11, so the composite reaching rust-red is expected and is NOT itself a gate failure):
    - client phase: green.
    - source-runtime phase: green.
