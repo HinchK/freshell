@@ -4141,12 +4141,45 @@ impl FreshClaudeState {
                     "freshagent.claude.unsupported-settings-ignored"
                 );
             }
+            // Convergence (restored from bf9b8d31a, dropped in the ext-r8
+            // handle_send rework): capture the pre-configure pair so a send
+            // whose settings CHANGED the live session can converge every
+            // device's model surfaces — the same frame `handle_configure`
+            // emits (a device that missed the configure still lands here).
+            let settings_before = {
+                let guard = self.sessions.lock().await;
+                guard.get(&map_key).map(|s| {
+                    (
+                        s.configuration.settings.model.clone(),
+                        s.configuration.settings.effort.clone(),
+                    )
+                })
+            };
             if let Err(err) = self
                 .configure_for_send(&map_key, settings, session_type)
                 .await
             {
                 self.send_error(&request_id, "CLAUDE_SETTINGS_FAILED", &err);
                 return;
+            }
+            let settings_after = {
+                let guard = self.sessions.lock().await;
+                guard.get(&map_key).map(|s| {
+                    (
+                        s.configuration.settings.model.clone(),
+                        s.configuration.settings.effort.clone(),
+                    )
+                })
+            };
+            if settings_before != settings_after {
+                let (model, effort) = settings_after.unwrap_or((None, None));
+                self.broadcast(&crate::session_metadata::session_metadata_frame(
+                    PROVIDER,
+                    session_type,
+                    &session_id,
+                    model.as_deref(),
+                    effort.as_deref(),
+                ));
             }
         }
         // Task 4 review (C1b): the destroy target comes from POST-lock session
