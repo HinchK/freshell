@@ -368,13 +368,15 @@ At `:207`, keep the contract assertion and add the stable-identity belt (the MIS
       expect(bad.out).toContain(codex.data.tabId)          // and names its stable tabKey identity (deviceId:tabId)
 ```
 
-- [ ] **Step 3: Run the four specs focused — green**
+- [x] **Step 3: Run the four specs focused — green**
 
-  Partial (T1/T2 implementer): deploy-tab-diff-rust, remote-tab-linkage-rust,
-  and rest-tab-persistence all PASS with their original assertions plus the
-  Step-1/2 hardening. sidebar-opencode-rail still fails :143 at :327-328 with
-  the same `Pane: OpenCode` symptom — a SECOND writer the investigation's
-  model missed (terminal create-time registry auto-title 'OpenCode' →
+  Complete. deploy-tab-diff-rust, remote-tab-linkage-rust, and
+  rest-tab-persistence all PASS with their original assertions plus the
+  Step-1/2 hardening (T1/T2 implementer; receipts
+  `reports/t2-green-{deploy-tab-diff-rust,remote-tab-linkage-rust,rest-tab-persistence}.log`).
+  sidebar-opencode-rail initially remained red at :327-328 with the same
+  `Pane: OpenCode` symptom — a SECOND writer the investigation's model
+  missed (terminal create-time registry auto-title 'OpenCode' →
   terminals.changed → terminal-directory fetch → recordTerminalTitleForReplay
   → initLayout replay; see `<git-dir>/sixpack-t1t2-report.md` and probe
   receipts `reports/t1-probe-rail-title-writer*.log`). Fabricated-row mirror
@@ -383,7 +385,10 @@ At `:207`, keep the contract assertion and add the stable-identity belt (the MIS
   the plan owner: registry-title ownership is the ladder rule (this plan's
   own Title-Precedence Resolution; the same rule deploy-tab-diff encodes),
   the cwd-leaf expectation rotted with `e78c25c8c`, and the spec is reshaped
-  per the amended Files list: assert `Pane: OpenCode`.
+  per the amended Files list (D3): assert `Pane: OpenCode`, ladder + writer
+  path documented in the spec, rail-flow assertions unchanged. Fresh focused
+  run after the reshape: PASS — 1 passed (receipt
+  `reports/t2-rail-reshape.log`). All four campaign families green.
 
 ```bash
 npm run test:e2e:local -- test/e2e-browser/specs/deploy-tab-diff-rust.spec.ts

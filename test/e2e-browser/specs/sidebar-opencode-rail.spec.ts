@@ -55,12 +55,17 @@ const ROOT_TITLE = 'Rail e2e global root session'
 const CHILD_TITLE = 'Rail e2e subagent child session'
 const CHILD2_TITLE = 'Rail e2e subagent child session two'
 /**
- * The paned child-target pane's `initialCwd` leaf. `derivePaneTitle` names
- * non-shell terminals by their working-directory leaf, so this string
- * becomes the pane title and therefore the FALLBACK rail row's title --
+ * The paned child-target pane's `initialCwd` leaf. It is NOT the pane
+ * title: registry auto-titles own terminal panes (display precedence,
+ * docs/development/rename-scope-contract.md), so the pane banner reads
+ * `Pane: OpenCode` (registry auto-title: terminal.rs mode_label ->
+ * terminals.changed -> recordTerminalTitleForReplay -> initLayout
+ * replay; rotted with e78c25c8c). The leaf survives only as the cwd a
+ * client-side FALLBACK rail row for this pane would be badged with --
  * giving the "no rail entry for the child-target terminal" assertion a
- * unique, greppable name to negate instead of the generic provider label
- * "OpenCode" (which the tab strip and the pane picker also render).
+ * unique, greppable name to negate instead of the generic provider
+ * label "OpenCode" (which the tab strip, the pane picker, and the pane
+ * banner itself also render).
  *
  * Deliberately NOT created on disk: the directory picker enumerates real
  * directories under the isolated home into <option> elements, which would
@@ -314,17 +319,28 @@ test.describe('sidebar opencode rail', () => {
         }, { terminalId: panedTerminalId!, sessionId: CHILD2_ID, initialCwd: childPaneDir })
 
         // POSITIVE CONTROL for the negatives below: the pane really exists,
-        // carries the child sessionRef, and RENDERS under the directory-leaf
-        // title. Its header is a `banner`, the rail's rows are `button`s --
-        // so the string is provably present in the UI, and the button-scoped
-        // absence assertion below is about the RAIL specifically, not about
-        // the string being missing everywhere.
+        // carries the child sessionRef, and RENDERS -- its header is a
+        // `banner`, the rail's rows are `button`s, so the button-scoped
+        // absence assertions below are about the RAIL specifically.
+        //
+        // Display-precedence ladder: registry auto-titles OWN terminal
+        // panes -- a cached terminal-level title outranks both the
+        // session-title mirror and the initLayout-derived cwd-leaf
+        // (docs/development/rename-scope-contract.md). Writer path:
+        // terminal create stamps the registry auto-title via mode_label
+        // ("OpenCode", terminal.rs) -> `terminals.changed` -> the client's
+        // terminal-directory fetch caches it for replay
+        // (recordTerminalTitleForReplay, terminalDirectoryThunks.ts) ->
+        // this `panes/initLayout` (a TERMINAL_BINDING_PANE_ACTION)
+        // replays the cached title over the pane. The banner therefore
+        // reads `Pane: OpenCode`, never the cwd-leaf -- that expectation
+        // rotted when the title-replay pipeline landed (e78c25c8c).
         await expect.poll(async () => {
           const layout = await harness.getPaneLayout('e2e-rail-paned-tab')
           return layout?.content?.sessionRef?.sessionId ?? null
         }, { timeout: 15_000 }).toBe(CHILD2_ID)
         await expect(
-          page.getByRole('banner', { name: `Pane: ${CHILD_PANE_DIR_LEAF}` }),
+          page.getByRole('banner', { name: 'Pane: OpenCode' }),
         ).toBeVisible({ timeout: 30_000 })
 
         // Re-assert under default visibility: the paned child-target
