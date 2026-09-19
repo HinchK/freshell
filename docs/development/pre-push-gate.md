@@ -8,16 +8,18 @@ Filtered by what the push changes (diff between the remote refs being updated an
 
 | Push contains | Checks |
 |---|---|
-| Any `.rs`, `Cargo.toml`/`Cargo.lock`, `rust-toolchain*` | `cargo fmt --all --check`, then `cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings` |
+| Any `.rs`, `Cargo.toml`/`Cargo.lock`, `rust-toolchain*` | `cargo fmt --all --check`, then `cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings`, then **targeted `cargo test`**: the changed crates plus every workspace crate that transitively depends on them (full `--workspace --exclude freshell-tauri` when the change is root-level — `Cargo.lock`, toolchain, `.cargo/` — or the base is unknown). `freshell-tauri` is excluded per clippy parity. |
 | Any `.ts`/`.tsx`, `package.json`/`package-lock.json`, `tsconfig*` | `npm run typecheck` (client + server, tsc `--noEmit`) |
 | Only docs/config/other files | Nothing |
 | New branch with no merge-base with origin/main | Both gates (full) |
 
-Cost when warm: fmt ~5s, typecheck ~1-2 min, clippy ~2-5 min on a warm target dir (first run in a fresh checkout is a cold build — longer).
+Cost when warm: fmt ~5s, typecheck ~1-2 min, clippy ~2-5 min on a warm target dir (first run in a fresh checkout is a cold build — longer). The test lane adds only the affected crates' tests — e.g. a `freshell-freshagent` change tests freshagent plus its dependents (~3-4 min warm); a client-only push pays nothing.
+
+Routing lives in `scripts/hooks/pre-push`; the crate→package targeting logic is `scripts/hooks/rust-test-targets.ts`, unit-tested in `test/unit/scripts/rust-test-targets.test.ts` (which also exercises the hook end-to-end against real git ranges in debug mode). Server-side, PRs that touch Rust must also pass the required `rust-gate` check (`.github/workflows/rust-tests.yml`) — the merge-time backstop that a `--no-verify` push cannot skip.
 
 ## What it does NOT cover
 
-Unit/integration vitest, e2e, electron, the real-transport clippy lanes. Those stay with the normal QA gate / PR discipline. This gate is the cheap floor, not a replacement.
+Vitest/e2e/electron lanes and the real-transport clippy lanes stay with the normal QA gate / PR discipline. Rust unit/integration tests now run at push time (targeted, above), so the uncovered remainder is everything non-Rust.
 
 ## Controls
 
