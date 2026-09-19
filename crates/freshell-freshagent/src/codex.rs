@@ -19036,7 +19036,7 @@ pub(crate) mod tests {
     /// spawn + real WS connect + real `initialize`/`thread/start` round-trip -- rather than
     /// the in-process [`freshell_codex::new_channel_transport`] fake the interrupt/kill
     /// tests use (which bypasses `spawn_sidecar` entirely and cannot prove a respawn).
-    pub(crate) fn fake_codex_app_server_cmd() -> String {
+    fn fake_codex_app_server_cmd() -> String {
         format!(
             "{}/../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs",
             env!("CARGO_MANIFEST_DIR")
@@ -22398,16 +22398,26 @@ pub(crate) mod tests {
     // these fixtures create the session with the sidecar ALIVE ("{}") and
     // produce the crashed state BY HAND — the manual `exited` flip plus the
     // hand-built begin_handoff/fail generation advance or vacate each test
-    // below already performs. The stale refusal under test happens at the
-    // coordinator claim, BEFORE any respawn, so the stale-fence/generation
-    // semantics still face a dead-but-materialized session and the
+    // below already performs. The `exited` flip is the lazy-restart flag the
+    // exit-watcher's self-heal sets; the sidecar PROCESS itself stays alive
+    // (only the flag routes these handlers into the crashed-recovery
+    // re-claim). The stale refusal under test happens at the coordinator
+    // claim, BEFORE any respawn, so the stale-fence/generation semantics
+    // face a session whose row is materialized and marked exited, and the
     // no-recreation asserts stay honest.
 
     /// b8ke ext r8 F5: a delayed attach whose observed generation predates a
-    /// generation advance is refused typed (SESSION_RESERVED) — the
-    /// crashed-recovery re-claim carries the request's fence, so the stale
-    /// attach can no longer recreate the runtime past the advance (pre-r8 the
-    /// claim was hard-wired None and the recreation proceeded).
+    /// generation advance is refused typed (SESSION_RESERVED) — the key sits
+    /// VACANT at the advanced generation (the crash shape), and the tracked
+    /// attach routes through `ensure_session_alive`'s crashed-recovery
+    /// re-claim, whose coordinator claim carries the request's fence; the
+    /// stale fence refuses the claim (StaleGeneration), so the stale attach
+    /// can no longer recreate the runtime past the advance (pre-r8 the claim
+    /// was hard-wired None, and on this VACANT key that fence-less claim was
+    /// GRANTED and the recreation proceeded). The key must end VACANT, never
+    /// at a restored-Live record: a Live key would re-route the refusal
+    /// through the tracked arm's adopt guard (a DIFFERENT guard that happens
+    /// to answer the same code) and the r8 F5 fence would go unexercised.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_stale_generation_crashed_attach_is_refused_typed_no_recreation() {
         let _guard = ENV_LOCK.lock().await;
@@ -22421,8 +22431,13 @@ pub(crate) mod tests {
         configure_fake_codex_cmd("{}");
         let thread_id = create_real_fake_session(&st, &mut rx).await;
 
-        // Advance the coordinator generation past the attach's observation: a
-        // handoff begin + fail bumps the record while the runtime stays live.
+        // Advance the coordinator generation past the attach's observation
+        // and VACATE the key at the advanced generation — the crash shape
+        // the r8 F5 fence exists for: the handoff's unwind cannot confirm
+        // the crashed prior (the row is marked exited below), so it must
+        // NOT restore it. Restoring the prior (`fail(.., true)`) would put
+        // the key back as Live and re-route the refusal through the tracked
+        // arm's adopt guard — the wrong fence.
         let before = registry.observe(PROVIDER, &thread_id);
         let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = registry
             .begin_handoff(
@@ -22437,15 +22452,19 @@ pub(crate) mod tests {
         else {
             panic!("expected the bump handoff granted")
         };
-        // The bump handoff's unwind restores the prior (or vacates a
-        // from-vacant key) — either way the RECORD's generation advanced.
-        let _ = registry.fail(PROVIDER, &thread_id, "op-r8-bump", ho_gen, true);
+        let _ = registry.fail(PROVIDER, &thread_id, "op-r8-bump", ho_gen, false);
         let after = registry.observe(PROVIDER, &thread_id);
         assert!(
             after.generation > before.generation,
             "the record's generation advanced: {} -> {}",
             before.generation,
             after.generation
+        );
+        assert!(
+            matches!(after.state, freshell_ownership::OwnershipState::Vacant),
+            "harness sanity: the key VACATED at the advanced generation (a \
+             restored-Live key would re-route the refusal through the adopt \
+             guard — the wrong fence)"
         );
 
         // Mark the session crashed so the attach runs the recovery re-claim.
@@ -22497,8 +22516,14 @@ pub(crate) mod tests {
 
     /// b8ke ext r8 F5: a send carrying a stale observed generation against a
     /// crashed session is refused typed (SESSION_RESERVED) — FreshAgentSend's
-    /// new additive pair fences the recovery re-claim on every route through
-    /// ensure_session_alive.
+    /// additive pair fences the recovery re-claim on every route through
+    /// `ensure_session_alive`. The key sits VACANT at the advanced generation
+    /// (the crash shape: the failed handoff unwind could not confirm the
+    /// crashed prior live, so it vacated): the stale fence refuses the claim
+    /// (StaleGeneration), while a dropped fence would GRANT the claim on this
+    /// VACANT key and recreate the runtime (the pre-r8 bug) — the
+    /// discrimination this test exists for. A restored-Live key would refuse
+    /// both shapes through the lease double-check and detect nothing.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_stale_generation_send_against_a_crashed_session_is_refused_typed() {
         let _guard = ENV_LOCK.lock().await;
@@ -22512,7 +22537,11 @@ pub(crate) mod tests {
         configure_fake_codex_cmd("{}");
         let thread_id = create_real_fake_session(&st, &mut rx).await;
 
-        // Advance the generation past the send's observation.
+        // Advance the generation past the send's observation and VACATE the
+        // key at the advanced generation — the crash shape (the row is
+        // marked exited below, so the handoff's unwind cannot confirm the
+        // prior live and must not restore it; `fail(.., true)` would put the
+        // key back as Live and blind the test's fence discrimination).
         let before = registry.observe(PROVIDER, &thread_id);
         let freshell_ownership::BeginOutcome::Granted { generation: ho_gen } = registry
             .begin_handoff(
@@ -22527,7 +22556,19 @@ pub(crate) mod tests {
         else {
             panic!("expected the bump handoff granted")
         };
-        let _ = registry.fail(PROVIDER, &thread_id, "op-r8-bump-send", ho_gen, true);
+        let _ = registry.fail(PROVIDER, &thread_id, "op-r8-bump-send", ho_gen, false);
+        let after = registry.observe(PROVIDER, &thread_id);
+        assert!(
+            after.generation > before.generation,
+            "the record's generation advanced: {} -> {}",
+            before.generation,
+            after.generation
+        );
+        assert!(
+            matches!(after.state, freshell_ownership::OwnershipState::Vacant),
+            "harness sanity: the key VACATED at the advanced generation (a \
+             restored-Live key would blind the fence discrimination)"
+        );
 
         // Mark the session crashed so the send runs the recovery re-claim.
         {

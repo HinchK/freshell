@@ -22751,6 +22751,83 @@ rl.on('line', (line) => {
         assert_eq!(metadata["event"]["effort"], json!("high"));
     }
 
+    /// The send-time broadcast is DIFF-guarded: a send whose settings pair
+    /// already matches the record converges NOTHING (the mirror of the
+    /// idempotent configure). If the `settings_before != settings_after`
+    /// guard were dropped, every settings-bearing send would broadcast a
+    /// redundant metadata frame and nothing would catch it.
+    #[tokio::test]
+    async fn a_settings_unchanged_send_broadcasts_no_metadata() {
+        let _env_guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, rx) = state_with_bus();
+        let mut rx = rx;
+        state
+            .handle_create(dedup_create_msg("send-idem"), None)
+            .await;
+        let created = await_claude_created(&mut rx, "send-idem").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        // Send #1 carries a NEW pair: the configure leg reaches the sidecar
+        // (the configure and the prompt both land in the respond log) and
+        // exactly one metadata frame converges.
+        let mut send = send_msg(&session_id, "carries a new model");
+        send.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            cwd: None,
+            model: Some("opus[1m]".to_string()),
+            effort: Some("high".to_string()),
+            permission_mode: None,
+            sandbox: None,
+        });
+        state.handle_send(send).await;
+        let first = env.respond_log_frames(2).await;
+        assert_eq!(first[0]["type"], json!("configure"));
+        assert_eq!(first[0]["settings"]["model"], json!("opus[1m]"));
+        let frames = drain(&mut rx).await;
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|f| f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.session.metadata")
+                .count(),
+            1,
+            "the first (changing) send broadcasts exactly one metadata frame"
+        );
+
+        // Send #2 carries the SAME pair: `configure_for_send` short-circuits
+        // before any sidecar write (the respond log gains ONLY the prompt —
+        // no second configure), and the unchanged pair converges nothing.
+        let mut resend = send_msg(&session_id, "same pair again");
+        resend.settings = Some(freshell_protocol::FreshAgentSendSettings {
+            cwd: None,
+            model: Some("opus[1m]".to_string()),
+            effort: Some("high".to_string()),
+            permission_mode: None,
+            sandbox: None,
+        });
+        state.handle_send(resend).await;
+        let second = env.respond_log_frames(3).await;
+        assert_eq!(
+            second[2]["type"],
+            json!("send"),
+            "the unchanged send reaches the sidecar as a bare prompt: {second:?}"
+        );
+        assert_eq!(
+            second
+                .iter()
+                .filter(|f| f["type"] == json!("configure"))
+                .count(),
+            1,
+            "the unchanged send writes NO second configure: {second:?}"
+        );
+        let frames = drain(&mut rx).await;
+        assert!(
+            !frames.iter().any(|f| f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.session.metadata"),
+            "an unchanged send converges nothing"
+        );
+    }
+
     // ── b8ke focused round-3 R3-7: the condemned-prior recorded identity ──
 
     /// R3-7(b): the fenced-prior death probe must not FALSE-CONFIRM over a

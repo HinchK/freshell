@@ -920,6 +920,40 @@ git dir) executed after the Task 6 gate. Commits `65f2994d7` (c),
 - [x] **(e) session_handoff old-rebound codex handoff made hermetic** — the target spawn routes through the committed fake app-server (`CODEX_CMD` wrapper, now `pub(crate)`), never a host-installed `codex` (`d7-green-e-handoff.log`).
 - [x] **Verification:** whole-crate `cargo test -p freshell-freshagent --locked --lib` **1154 passed / 0 failed** (`d7-whole-crate-freshagent.log` — the crate is FULLY green; D4's recorded standing-red set is CLEARED, closing the rust-gate blocker); `freshell-codex --lib` 139 passed (`d7-codex-crate.log`); the 59nb trio (pane_ledger 170 / invariants 19 / worst-case-proof 1) green (`d7-59nb-*.log`); session_handoff module 76/76 (`d7-green-session-handoff-module.log`); clippy `-D warnings` + fmt clean (`d7-clippy-freshagent.log`, `d7-fmt.log`). 84nb stays separately recorded (not D7's scope).
 
+#### D7 focused round-1 remediation (fresheyes 20260919T112633Z — all six findings resolved, receipts `reports/d7-r2-*.log`)
+
+- **Majors (the two restore-shaped stale-fence tests):** D7's alive-at-commit create left the
+  ownership record `Live`, and `fail(.., true)` restored it — so the crashed-attach test was
+  refused by the tracked arm's adopt guard and the stale-send test could not tell a fenced claim
+  from an unfenced one (witness: both still passed with the claim's fence temporarily dropped,
+  `d7-r2-witness-fence-dropped-still-green.log`). Fix: vacate like the six siblings (`fail(..,
+  false)` — the crash shape; identical terminal state to the original pre-D7 fixture) plus
+  harness sanity asserts pinning Vacant at the advanced generation. Proof the fence is now
+  exercised: the same temporary fence-drop makes BOTH reshaped tests FAIL
+  (`d7-r2-red-revert-fence-dropped-reshaped-fails.log`); green `d7-r2-green-attach-send-reshaped-final.log`.
+- **Minor ((d)/(e) failing-test proof):** the missing CI receipt is captured
+  (`d7-r2-red-ci-run-35436750812-excerpts.log`); (e) is proven deterministically — the pre-fix
+  test under a codex-less PATH fails byte-identically to CI
+  (`d7-r2-red-e-codexless-path-enoent.log`), the fix passes under the same PATH
+  (`d7-r2-green-e-hermetic-codexless-path.log`); (d)'s mechanism is demonstrated by simulation —
+  the old fixture plus a forced fail-closed `kill_and_confirm_recorded_tree_dead` reproduces the
+  CI `Elapsed` byte-identically (`d7-r2-red-d-old-fixture-simulated-failclosed-reap.log`) while
+  the committed fixture passes under the same simulation
+  (`d7-r2-green-d-new-fixture-same-failclosed-reap.log`). Honest residual, recorded: which /proc
+  sub-condition actually fails on the runner is not determinable from the captured CI output;
+  "cleared on the runner" awaits the branch's next rust-gate.
+- **Nits:** family comment corrected (only the `exited` flag flips; the sidecar process stays
+  alive); the stale "restores the prior" comment replaced; `fake_codex_app_server_cmd` visibility
+  reverted to module-private; negative test added
+  (`claude::tests::a_settings_unchanged_send_broadcasts_no_metadata`) protecting the restored
+  send-time broadcast's before/after guard.
+- **Verification:** whole-crate `cargo test -p freshell-freshagent --locked --lib` **1155 passed /
+  0 failed** (`d7-r2-whole-crate-freshagent-run2.log`; run 1 hit
+  `the_claude_handoff_target_binding_carries_the_handoff_generation` — a PRE-EXISTING
+  intermittent flake, identical failure at BASE in `t6-extra11-base-crate-run-{1,3}.log`, passing
+  solo and in run 2; recorded for follow-up, untouched by this delta); clippy `-D warnings` +
+  fmt clean (`d7-r2-clippy-freshagent.log`, `d7-r2-fmt.log`).
+
 ---
 
 ## Verification summary (what proves the User Request's result)
