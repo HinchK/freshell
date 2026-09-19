@@ -19036,7 +19036,7 @@ pub(crate) mod tests {
     /// spawn + real WS connect + real `initialize`/`thread/start` round-trip -- rather than
     /// the in-process [`freshell_codex::new_channel_transport`] fake the interrupt/kill
     /// tests use (which bypasses `spawn_sidecar` entirely and cannot prove a respawn).
-    fn fake_codex_app_server_cmd() -> String {
+    pub(crate) fn fake_codex_app_server_cmd() -> String {
         format!(
             "{}/../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs",
             env!("CARGO_MANIFEST_DIR")
@@ -19180,7 +19180,10 @@ pub(crate) mod tests {
 
     /// Point `CODEX_CMD` at the fake app-server and configure its scripted `behavior` (a
     /// `FAKE_CODEX_APP_SERVER_BEHAVIOR` JSON blob — see the fixture's `loadBehavior()`).
-    fn configure_fake_codex_cmd(behavior_json: &str) {
+    /// `pub(crate)`: also the committed-fake route for sibling modules' tests
+    /// (e.g. session_handoff's codex target spawns) — the hermetic alternative
+    /// to depending on a host-installed `codex` binary.
+    pub(crate) fn configure_fake_codex_cmd(behavior_json: &str) {
         std::env::set_var("CODEX_CMD", format!("node {}", fake_codex_app_server_cmd()));
         std::env::set_var("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior_json);
     }

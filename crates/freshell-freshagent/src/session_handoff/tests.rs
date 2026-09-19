@@ -4443,6 +4443,19 @@ async fn an_abort_with_a_published_target_pid_outliving_the_reap_budget_fences()
 #[tokio::test(flavor = "multi_thread")]
 async fn a_codex_handoff_on_an_old_rebound_reference_resolves_the_permanent_alias() {
     let _guard = ENV_LOCK.lock().await;
+    // Hermeticity: the handoff's codex TARGET spawn (resume_for_handoff →
+    // spawn_sidecar) launches whatever `CODEX_CMD` names — without an
+    // override the test depends on a host-installed `codex` binary and
+    // fails on the CI runner with TARGET_SPAWN_FAILED (ENOENT). Route the
+    // spawn through the committed fake app-server (the same CODEX_CMD
+    // wrapper codex.rs's own fixtures use; its `thread/resume` echoes
+    // whatever id it is asked to resume, so the canonical-key target
+    // resumes cleanly). The codex env guard is held for the same reason
+    // as the mismatch-refusal sibling's: CODEX_CMD is codex.rs's
+    // process-global surface, and the guard snapshots/restores every
+    // mutated variable on drop.
+    let _codex_env = crate::codex::tests::ENV_LOCK.lock().await;
+    crate::codex::tests::configure_fake_codex_cmd("{}");
     let old_tid = format!("old-thread-{}", uuid::Uuid::new_v4());
     let new_tid = format!("new-thread-{}", uuid::Uuid::new_v4());
     let rig = build_rig(None);
