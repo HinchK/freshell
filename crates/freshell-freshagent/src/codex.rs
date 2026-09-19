@@ -19757,12 +19757,22 @@ pub(crate) mod tests {
         })
         .await;
 
+        // The wrapped-error assert is safe in THIS loop (unlike the
+        // accepted-wait loop below): the mint-new tail broadcasts the
+        // legitimate wrapped THREAD_MEMORY_LOST degradation strictly AFTER
+        // the materialized frame, and this loop returns on materialized —
+        // the assert can never see it, so a Reserved regression fails here
+        // as a named frame instead of a 15s Elapsed.
         let materialized: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
                 assert_ne!(
                     frame["type"], "error",
                     "no user-facing error frame: {frame}"
+                );
+                assert_ne!(
+                    frame["event"]["type"], "freshAgent.error",
+                    "no user-facing error frame, event-wrapped either: {frame}"
                 );
                 if frame["type"] == "freshAgent.session.materialized" {
                     return frame;
@@ -20182,6 +20192,7 @@ pub(crate) mod tests {
     async fn concurrent_send_and_attach_single_flight_recovery_for_the_same_crashed_session() {
         let _guard = ENV_LOCK.lock().await;
         let (st, mut rx) = state_with_bus();
+        let capture = tracing_capture::capture_by_session("concurrent-single-flight-marker-unused");
 
         // D8: the create keeps its sidecar ALIVE; the crashed state is produced
         // by hand (see `simulate_unrequested_crash`) so the racing recovery
@@ -20240,7 +20251,11 @@ pub(crate) mod tests {
         // concurrent respawns had raced past the single-flight guard, this thread id
         // would have been resumed twice (two sidecars), and the fixture's per-process
         // `activeThreadIds` bookkeeping / a duplicate resume would surface as an error
-        // frame on the bus. Assert none arrived, and the session is alive.
+        // frame on the bus. Assert none arrived — bare OR event-wrapped (the
+        // SESSION_RESERVED loser answer rides the freshAgent.event envelope; a
+        // bare-type-only assert catches a join regression only about half the
+        // time — the round-4 review's blind spot on this test) — the session is
+        // alive, and exactly one recovery spawn ran.
         let mut saw_send_accepted = false;
         let timeout = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
@@ -20248,6 +20263,11 @@ pub(crate) mod tests {
                 assert_ne!(
                     frame["type"], "error",
                     "no user-facing error frame from either racing caller: {frame}"
+                );
+                assert_ne!(
+                    frame["event"]["type"], "freshAgent.error",
+                    "no user-facing error frame from either racing caller, event-wrapped \
+                     either: {frame}"
                 );
                 if frame["type"] == "freshAgent.send.accepted" {
                     saw_send_accepted = true;
@@ -20258,6 +20278,13 @@ pub(crate) mod tests {
         .await;
         assert!(timeout.is_ok(), "send.accepted arrives within the budget");
         assert!(saw_send_accepted);
+        assert_eq!(
+            spawn_count(&capture),
+            2,
+            "exactly one respawn recovered the session for BOTH racing callers \
+             (the create's spawn + a single recovery spawn -- the single-flight the \
+             per-thread resuming join proves; two independent respawns would double it)"
+        );
 
         let guard = st.sessions.lock().await;
         assert!(
@@ -20273,9 +20300,9 @@ pub(crate) mod tests {
     /// recovery genuinely runs: the create-time snapshot is drained BEFORE the
     /// attach, so the asserted snapshot can only be the recovery's own; the
     /// spawn count pins the respawn (the run-3 CI red answered
-    /// SESSION_RESERVED with spawn 1 still standing — under that shape BOTH
-    /// asserts below fire: the error frame trips the loop assert and the count
-    /// never reaches 2).
+    /// SESSION_RESERVED with spawn 1 still standing — under that shape either
+    /// assert alone would catch it: the wrapped error frame trips the loop
+    /// assert, and the spawn count never reaches 2).
     #[tokio::test(flavor = "multi_thread")]
     // Intentional: `_guard` must span every `.await` in this test to serialize it against
     // every other env-var-mutating test in this module for its ENTIRE duration.
@@ -20950,10 +20977,16 @@ pub(crate) mod tests {
         // the watcher's confirmed-death state), and the thread is marked dead
         // (the F-1 mint-new route). The respawn under test must never depend
         // on the reap-confirmation machinery: it fails closed on constrained
-        // runners (unrecordable /proc evidence), which left the binding held
-        // — so the fork's lease claim answered BoundLive→Recovered — and the
-        // mint-new respawn, with its OLD→NEW materialized broadcast, never
-        // ran (the rust-gate CI Elapsed).
+        // runners (unrecordable /proc evidence), which retained the CONDEMNED
+        // PRIOR — so the fork's `ensure_session_alive` answered Reserved at
+        // its condemned-prior check (which runs before any lease claim), and
+        // the mint-new respawn, with its OLD→NEW materialized broadcast,
+        // never ran (the rust-gate CI Elapsed; the same retained-prior
+        // mechanism the D7-r2 simulation and D8 analysis proved). A lease
+        // claim can never be what answers for this fixture: a fresh create
+        // binds no lease (`finish_create` runs with `lease_guard = None` —
+        // bindings come only from `FreshSessionLeaseGuard::complete`), so a
+        // BoundLive→Recovered claim answer is unreachable here.
         configure_fake_codex_cmd(
             &json!({
                 "threadStartThreadId": "parent-old-mint",
