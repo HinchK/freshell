@@ -103,7 +103,7 @@ Standing ledger item (e2e four, no kata). This is the product change that turns 
 - Consumes: `addTab` payload field `titleSetByUser?: boolean` (`src/store/tabsSlice.ts:293`, reducer stores it at `:330`); `getTabDisplayTitle`'s `titleSetByUser` branch (`src/lib/tab-title.ts:28-30`); the mirror's `if (!session.title) continue` guard (`src/store/sessionTitleMirror.ts:44`); `getProviderLabel` (`src/lib/coding-cli-utils.ts:33`, already imported by `sidebarSelectors.ts:8`).
 - Produces: the contract that every `ui.command{tab.create}` broadcast carrying a non-empty `payload.title` (only ever caller-provided: verified across all three emitters) folds into Redux with `titleSetByUser: true`; that `DirItem`s synthesized by `build_live_terminal_session_item` carry `title: None` (`provider_display_name` DELETED together with its `mod join_tests` parity test — after the fabrication is removed its only consumer is its own unit test, which then protects no shipped behavior; deleting both is cleaner than `#[cfg(test)]`-gating, and a now-unused module-level fn would also fail clippy `-D warnings` and the pre-push gate); and that the sidebar row's main label for a title-less running live-terminal row is `getProviderLabel(provider)`. Task 2 and the four e2e specs depend on all three.
 
-- [ ] **Step 1: Baseline red confirmation at dbbfd0752 (BEFORE any fix)**
+- [x] **Step 1: Baseline red confirmation at dbbfd0752 (BEFORE any fix)**
 
 Run each focused ONCE from this worktree (the prebuild guard exempts linked worktrees; each boots its own ephemeral Rust e2e server — production on 3001 is untouched):
 
@@ -122,7 +122,7 @@ Expected: each file reports **1 failed / rest passed** with EXACTLY the diagnose
 
 Record each failure output path under the logs dir (`reports/`) in run-state. These runs are the campaign's red receipts.
 
-- [ ] **Step 2: Write the failing unit tests (client fold + sidebar label)**
+- [x] **Step 2: Write the failing unit tests (client fold + sidebar label)**
 
 Add to `test/unit/client/ui-commands.test.ts` (same idiom as the existing `tab.create` tests — actions-array dispatch spy):
 
@@ -172,13 +172,13 @@ Add to `test/unit/client/store/selectors/sidebarSelectors.test.ts` (inside the e
   })
 ```
 
-- [ ] **Step 3: Run them and verify the intended failures**
+- [x] **Step 3: Run them and verify the intended failures**
 
 Run: `npm run test:vitest -- run test/unit/client/ui-commands.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts`
 
 Expected: FAIL both — the fold test fails because the fold never sets `titleSetByUser` (first expectation receives `undefined`); the selector test fails because the title-less running rows render `'terminal'`/`'ses-chil'` (the `sessionId.slice(0, 8)` fallback). The trailing unnamed-create and real-row expectations are the pins that must hold after the change.
 
-- [ ] **Step 4: Minimal production implementation (client + server + contract doc)**
+- [x] **Step 4: Minimal production implementation (client + server + contract doc)**
 
 4a. `src/lib/ui-commands.ts` — in `case 'tab.create'`, add one field to the `addTab` payload (after `title:`):
 
@@ -287,7 +287,7 @@ Expected: PASS (pins existing guard behavior; it is the companion to 4c, not red
    - Append a short "Display precedence (composition of stored labels)" subsection recording the Resolution's ladders EXACTLY as the code composes them: the tab ladder (explicit `titleSetByUser` title → single-pane override → stored non-derived `tab.title` → derived cwd-leaf), the PANE-KIND-SPLIT rule (terminal panes: a cached terminal-level title outranks the session-title mirror — `sessionTitleMirror.ts:111`'s cache-aware skip; fresh-agent panes: the mirror is the runtime title source), the fabricated-row rule (server placeholder rows carry no title; the client's sidebar label for a title-less running live-terminal row falls back to the provider label), and a note that the subsection governs display composition while the hard rules govern write scoping and the "Persists" column is untouched. The tab ladder is enforced by `getTabDisplayTitle` (`src/lib/tab-title.ts`); the pane split by the terminal-title cache + `sessionTitleMirrorMiddleware` (`src/store/sessionTitleMirror.ts`) — name both mechanisms, not the mirror alone.
    - Scope-table update: the Tab label row's "Written by" column gains the create-time explicit name — `name` on a REST/MCP tab create (agent API / MCP) — since Task 1 makes that a tab-label write in the same rung as TabBar inline rename / `PATCH /api/tabs/:id`. No other row changes.
 
-- [ ] **Step 5: Run the focused tests green**
+- [x] **Step 5: Run the focused tests green**
 
 ```bash
 npm run test:vitest -- run test/unit/client/ui-commands.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/store/sessionTitleMirror.test.ts test/unit/client/store/tabsPersistence.test.ts test/unit/client/lib/terminal-inventory-titles.test.ts
@@ -296,11 +296,11 @@ cargo test -p freshell-server --locked --bin freshell-server session_directory
 
 Expected: PASS on all (the Step-3 reds and the 4b reds are now green).
 
-- [ ] **Step 6: Refactor while green**
+- [x] **Step 6: Refactor while green**
 
 Small but real: confirm `provider_display_name`'s deletion left NOTHING behind (`rg -n "provider_display_name" crates/freshell-server/src/` — ZERO hits: the fn, its doc comment, and the `join_tests` parity test are all gone), and confirm no other `tab.create` consumer in the client reads `titleSetByUser` from the payload (grep `titleSetByUser` in `src/lib/` — the fold is the only writer of the flag outside explicit renames). Confirm `hasTitle` semantics are unchanged in `buildSessionItems` (still `!!session.title`; the provider-label rung is display-only).
 
-- [ ] **Step 7: Impacted-test verification**
+- [x] **Step 7: Impacted-test verification**
 
 Impacted set: everything that renders or persists tab titles, everything that consumes fabricated session rows, and both analyzed `titleSetByUser` side effects:
 - Unit: `npm run test:vitest -- run test/unit/client/` (the whole client unit tree is fast; it covers tabsSlice/persistMiddleware/persistedState/tab-registry-snapshot/TabBar/HistoryView/Sidebar selectors that touch titles and fabricated rows — including the `shouldKeepClosedTab` keep-policy suites for named agent tabs and the OSC/`(exit N)` title-freeze behavior, both analyzed as intended consequences in the Resolution).
@@ -312,7 +312,7 @@ Run: `npm run test:vitest -- run test/unit/client/ && cargo test -p freshell-ser
 
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add src/lib/ui-commands.ts src/store/selectors/sidebarSelectors.ts crates/freshell-server/src/session_directory.rs test/unit/client/ui-commands.test.ts test/unit/client/store/selectors/sidebarSelectors.test.ts test/unit/client/store/sessionTitleMirror.test.ts docs/development/rename-scope-contract.md
@@ -332,7 +332,7 @@ Standing ledger items (no kata). The four specs keep their original assertions (
 - Consumes: Task 1's precedence contract (both client fold and server fabricated-row halves must be committed).
 - Produces: green focused runs for all four families (the campaign's e2e evidence), plus the two spec updates that pin the new contract.
 
-- [ ] **Step 1: remote-tab-linkage — correct the stale NOTE and pin creator-title preservation**
+- [x] **Step 1: remote-tab-linkage — correct the stale NOTE and pin creator-title preservation**
 
 At `:255-267` the NOTE claims the dedupe click "SYNCS the real session title into the focused tab … so the tab is now titled with the seeded session's name, not the REST `name`". Under the restored precedence the click does NOT retitle an explicitly-named tab: the already-open click returns early at `Sidebar.tsx:486-489` and its `!existingTab.titleSetByUser` check (`:487`) yields to the creator title (`openSessionTab`'s `tabsSlice.ts:1141` guard is the same semantic on the not-already-open path — the click never reaches it). Replace the NOTE block and add a preservation assertion after the `:253` tab-count check:
 
@@ -358,7 +358,7 @@ At `:255-267` the NOTE claims the dedupe click "SYNCS the real session title int
 
 (The existing `:310` post-restart assertion is unchanged and now resolves against `TAB_NAME` through the persisted `titleSetByUser`.)
 
-- [ ] **Step 2: deploy-tab-diff — add the tabKey identity hardening**
+- [x] **Step 2: deploy-tab-diff — add the tabKey identity hardening**
 
 At `:207`, keep the contract assertion and add the stable-identity belt (the MISSING row prints `tab=<tabName> (<deviceId>:<tabId>)`; `codex.data.tabId` is already in scope from the `:154` create):
 
@@ -369,6 +369,19 @@ At `:207`, keep the contract assertion and add the stable-identity belt (the MIS
 
 - [ ] **Step 3: Run the four specs focused — green**
 
+  Partial (T1/T2 implementer): deploy-tab-diff-rust, remote-tab-linkage-rust,
+  and rest-tab-persistence all PASS with their original assertions plus the
+  Step-1/2 hardening. sidebar-opencode-rail still fails :143 at :327-328 with
+  the same `Pane: OpenCode` symptom — a SECOND writer the investigation's
+  model missed (terminal create-time registry auto-title 'OpenCode' →
+  terminals.changed → terminal-directory fetch → recordTerminalTitleForReplay
+  → initLayout replay; see `<git-dir>/sixpack-t1t2-report.md` and probe
+  receipts `reports/t1-probe-rail-title-writer*.log`). Fabricated-row mirror
+  path confirmed dead (the row is also server-side is_subagent-filtered from
+  the client's pages). STOPPED per the plan-contradiction rule — needs a
+  product decision (registry-title ownership vs. cwd-leaf for CLI panes)
+  before reshaping the spec or changing product behavior.
+
 ```bash
 npm run test:e2e:local -- test/e2e-browser/specs/deploy-tab-diff-rust.spec.ts
 npm run test:e2e:local -- test/e2e-browser/specs/remote-tab-linkage-rust.spec.ts
@@ -378,11 +391,19 @@ npm run test:e2e:local -- test/e2e-browser/specs/sidebar-opencode-rail.spec.ts
 
 Expected: **PASS** — all tests in all four files green, first attempt, including the previously-failing `:81`/`:107`/`:117`/`:143` tests. Record the green receipts in run-state.
 
-- [ ] **Step 4: Refactor while green**
+- [x] **Step 4: Refactor while green**
 
 None — two comment/assert edits only.
 
-- [ ] **Step 5: Impacted-test verification (named-create family)**
+- [x] **Step 5: Impacted-test verification (named-create family)**
+
+  Result: git-badges-rust, tabs-client-retire, mcp-focus-neutrality-rust,
+  createrequestid-stabilization-rust all PASS. fresh-agent-rest-resume-rust
+  fails :401 (`409 SESSION_RESERVED` on the durable-id resume after
+  restartAbrupt) — verified IDENTICAL at base dbbfd0752 (base-run receipt
+  `reports/t2-step5-fresh-agent-rest-resume-base-run.log`): a pre-existing
+  standing failure on main, disjoint from the campaign's six, recorded for
+  Task 6's non-campaign base-comparison triage.
 
 The Task 1 change affects every spec that REST/MCP-creates a NAMED tab and asserts strip/DOM text. Run the known named-create family focused:
 
@@ -396,7 +417,7 @@ npm run test:e2e:local -- test/e2e-browser/specs/createrequestid-stabilization-r
 
 Expected: PASS (grep-verified: none asserts a session title displacing a REST name in the strip; `git-badges-rust:190` asserts the REST name itself and becomes strictly more stable). The full local e2e lane in Task 6 is the complete net.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add test/e2e-browser/specs/remote-tab-linkage-rust.spec.ts test/e2e-browser/specs/deploy-tab-diff-rust.spec.ts
