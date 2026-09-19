@@ -11033,6 +11033,111 @@ rl.on('line', (line) => {
         .unwrap_or_else(|_| panic!("freshAgent.created for {request_id} resolves within budget"))
     }
 
+    /// Drain `rx` until BOTH the `freshAgent.created` frame for `request_id` AND that
+    /// session's `freshAgent.session.init` event have arrived, in EITHER order; returns
+    /// the created frame.
+    ///
+    /// Not [`await_claude_created`] followed by a second drain for the init event:
+    /// `handle_create` starts the stdout consumer BEFORE it registers the session and
+    /// broadcasts `freshAgent.created`, and the fake sidecar prints `sdk.session.init`
+    /// in the same burst as its `created` answer. On a multi-thread runtime another
+    /// worker can run the consumer while the handler is still between those two points,
+    /// so the init event can reach the bus FIRST — a created-only drain would discard it
+    /// and the follow-up drain would wait out its budget for a frame already consumed.
+    async fn await_claude_created_and_session_init(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        request_id: &str,
+    ) -> Value {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            let mut created: Option<Value> = None;
+            let mut init_session_ids: Vec<String> = Vec::new();
+            loop {
+                let frame: Value = match rx.recv().await {
+                    // Under host load the bounded drain can fall behind the
+                    // 64-frame bus: re-sync and keep waiting (the 15s budget
+                    // stays the dead-man switch); `Closed` surfaces through
+                    // the same deadline as a lost sender.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(err) => panic!("broadcast recv failed: {err}"),
+                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
+                };
+                if frame["requestId"] == request_id {
+                    assert_ne!(
+                        frame["type"], "freshAgent.create.failed",
+                        "create for {request_id} failed: {frame}"
+                    );
+                    if frame["type"] == "freshAgent.created" {
+                        created = Some(frame);
+                    }
+                } else if frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.session.init"
+                {
+                    if let Some(sid) = frame["sessionId"].as_str() {
+                        init_session_ids.push(sid.to_string());
+                    }
+                }
+                if let Some(created) = &created {
+                    if init_session_ids
+                        .iter()
+                        .any(|sid| created["sessionId"] == sid.as_str())
+                    {
+                        return created.clone();
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "freshAgent.created and freshAgent.session.init for {request_id} \
+                 arrive within budget"
+            )
+        })
+    }
+
+    /// Await the create's `sdk.session.init` binding row in the test's
+    /// FakeIdentitySink — the ROW BARRIER of the combined drain.
+    ///
+    /// At this base the init frame does NOT prove the row: the consumer
+    /// can read `sdk.session.init` before `handle_create` inserts the
+    /// session, the adoption then defers (`defer_session_init_adoption`,
+    /// a 25 ms registration poll that performs the binding write only
+    /// once registered), and the init frame broadcasts IMMEDIATELY either
+    /// way — so the frame drain orders the FRAMES while THIS barrier
+    /// proves the ROW. Polls `bindings`, not `was_recorded`: the
+    /// all-blank lineage row never enters the fake's `recorded` set
+    /// (Task-3 keying excludes blank-settings bindings), so the vec is
+    /// the only witness all three family tests share. Same bounded-poll
+    /// idiom as the was_recorded poll in
+    /// `a_refused_kill_keeps_the_durable_ledger_bound_and_answers_typed`
+    /// — under the deferred ordering the row lands ~25 ms after the
+    /// insert, so the wait is milliseconds in practice and the 15 s
+    /// budget stays a dead-man switch, never a patience raise.
+    async fn await_claude_session_init_binding_row(
+        fake: &std::sync::Arc<crate::identity_sink::FakeIdentitySink>,
+    ) -> crate::identity_sink::FreshAgentBindingUpsert {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let row = {
+                let bindings = fake.bindings.lock().unwrap();
+                bindings
+                    .iter()
+                    .rev()
+                    .find(|b| b.provider == "claude" && b.session_id == FRESH_CREATE_DURABLE_ID)
+                    .cloned()
+            };
+            if let Some(row) = row {
+                return row;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the session-init binding row (claude, FRESH_CREATE_DURABLE_ID) \
+                 never landed within budget"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// Node parity (`runtime-manager.ts:106-108`): a `freshAgent.create` whose
     /// ONLY identity is a provider-matched `sessionRef` must resume exactly
     /// like the legacy `resumeSessionId` carrier — the canonical field cannot
@@ -18045,32 +18150,12 @@ rl.on('line', (line) => {
         msg.effort = Some("high".to_string());
         msg.cwd = Some(env.dir.to_string_lossy().to_string());
         state.handle_create(msg, None).await;
-        await_claude_created(&mut rx, "req-binding-init").await;
-
-        // Wait for sdk.session.init to be consumed: the binding write is AWAITED
-        // before the init frame broadcasts, so seeing the freshAgent.session.init
-        // envelope proves the row already landed.
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let frame: Value = match rx.recv().await {
-                    // Under host load the bounded drain can fall behind the
-                    // 64-frame bus: re-sync and keep waiting (the 15s budget
-                    // stays the dead-man switch); `Closed` surfaces through
-                    // the same deadline as a lost sender.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(err) => panic!("broadcast recv failed: {err}"),
-                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
-                };
-                if frame["event"]["type"] == "freshAgent.session.init" {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("freshAgent.session.init consumed within budget");
-
-        let bindings = fake.bindings.lock().unwrap();
-        let b = bindings.last().expect("binding at sdk.session.init");
+        // The frame broadcasts unconditionally after `adopt_session_init`
+        // returns (including its `Deferred` arm, claude.rs:8046-8062), so
+        // the frame orders nothing about the row; the row BARRIER below is
+        // what proves the row landed.
+        await_claude_created_and_session_init(&mut rx, "req-binding-init").await;
+        let b = await_claude_session_init_binding_row(&fake).await;
         assert_eq!(b.provider, "claude");
         assert_eq!(b.mode, "kilroy", "sessionType flavour preserved in the row");
         assert_eq!(
@@ -18107,39 +18192,15 @@ rl.on('line', (line) => {
         state
             .handle_create(dedup_create_msg("req-binding-blank"), None)
             .await;
-        await_claude_created(&mut rx, "req-binding-blank").await;
-
-        // The init frame still broadcasts (durable-before-answer landed).
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let frame: Value = match rx.recv().await {
-                    // Under host load the bounded drain can fall behind the
-                    // 64-frame bus: re-sync and keep waiting (the 15s budget
-                    // stays the dead-man switch); `Closed` surfaces through
-                    // the same deadline as a lost sender.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(err) => panic!("broadcast recv failed: {err}"),
-                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
-                };
-                if frame["event"]["type"] == "freshAgent.session.init" {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("freshAgent.session.init consumed within budget");
+        // The frame broadcasts unconditionally after `adopt_session_init`
+        // returns (including its `Deferred` arm, claude.rs:8046-8062), so
+        // the frame orders nothing about the row; the row BARRIER below is
+        // what proves the row landed.
+        await_claude_created_and_session_init(&mut rx, "req-binding-blank").await;
+        let b = await_claude_session_init_binding_row(&fake).await;
 
         // THE r27 F4 CONTRACT: the lineage row IS recorded (blank settings
         // verbatim) — the no-skip truth.
-        let b = {
-            let bindings = fake.bindings.lock().unwrap();
-            bindings
-                .iter()
-                .rev()
-                .find(|b| b.provider == "claude" && b.session_id == FRESH_CREATE_DURABLE_ID)
-                .expect("an all-blank create records its lineage row (r27 F4)")
-                .clone()
-        };
         assert_eq!(
             b.settings,
             crate::identity_sink::FreshAgentSettings::default(),
@@ -18341,31 +18402,12 @@ rl.on('line', (line) => {
             7_777,
         );
         state.handle_create(msg, Some(provenance)).await;
-        await_claude_created(&mut rx, "req-binding-prov").await;
-
-        // The binding write is AWAITED before the init frame broadcasts (same
-        // witness idiom as `session_init_records_binding_with_create_settings`).
-        tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            loop {
-                let frame: Value = match rx.recv().await {
-                    // Under host load the bounded drain can fall behind the
-                    // 64-frame bus: re-sync and keep waiting (the 15s budget
-                    // stays the dead-man switch); `Closed` surfaces through
-                    // the same deadline as a lost sender.
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(err) => panic!("broadcast recv failed: {err}"),
-                    Ok(raw) => serde_json::from_str(&raw).unwrap(),
-                };
-                if frame["event"]["type"] == "freshAgent.session.init" {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("freshAgent.session.init consumed within budget");
-
-        let bindings = fake.bindings.lock().unwrap();
-        let b = bindings.last().expect("binding at sdk.session.init");
+        // The frame broadcasts unconditionally after `adopt_session_init`
+        // returns (including its `Deferred` arm, claude.rs:8046-8062), so
+        // the frame orders nothing about the row; the row BARRIER below is
+        // what proves the row landed.
+        await_claude_created_and_session_init(&mut rx, "req-binding-prov").await;
+        let b = await_claude_session_init_binding_row(&fake).await;
         assert_eq!(
             b.asserted_stamps().client_instance_id.as_deref(),
             Some("client-claude")
