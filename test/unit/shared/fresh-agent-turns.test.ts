@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { FreshAgentTurnSchema } from '../../../shared/fresh-agent-contract.js'
+import { FreshAgentTurnSchema, type FreshAgentTurn } from '../../../shared/fresh-agent-contract.js'
 import {
   freshAgentSnapshotHasUserTurn,
   freshAgentTurnText,
   getFreshAgentDisplayTurnKey,
+  reclassifyPtyNotificationTurns,
   turnSummaryIsAuthored,
 } from '../../../shared/fresh-agent-turns.js'
 
@@ -102,5 +103,82 @@ describe('fresh-agent display turn helpers', () => {
       items: [],
       providerTurnId: 'legacy-id',
     })).toThrow()
+  })
+
+  describe('reclassifyPtyNotificationTurns', () => {
+    const ptyTurn = (text: string, summary = text): FreshAgentTurn => ({
+      id: 'pty-1',
+      turnId: 'pty-1',
+      role: 'user',
+      summary,
+      items: [{ id: 'pty-1-i0', kind: 'text', text }],
+    })
+
+    it('reclassifies <pty_exited>, <pty_waited>, and <pty_wait_timeout> user turns to assistant', () => {
+      for (const tag of ['<pty_exited>', '<pty_waited>', '<pty_wait_timeout>']) {
+        const turn = ptyTurn(`${tag}\nID: pty_x\nExit Code: 0`)
+        const [mapped] = reclassifyPtyNotificationTurns([turn])
+        expect(mapped?.role).toBe('assistant')
+        expect(mapped?.id).toBe('pty-1')
+        expect(mapped?.items).toEqual(turn.items)
+      }
+    })
+
+    it('matches leading-tag text after trimming, and falls back to summary when no text item exists', () => {
+      const [withWhitespace] = reclassifyPtyNotificationTurns([ptyTurn('  <pty_exited>\nLast Line: SYNC_EXIT=0')])
+      expect(withWhitespace?.role).toBe('assistant')
+
+      const summaryOnly: FreshAgentTurn = {
+        id: 'pty-2',
+        turnId: 'pty-2',
+        role: 'user',
+        summary: '<pty_exited>\nno items on this degraded snapshot',
+        items: [],
+      }
+      const [fromSummary] = reclassifyPtyNotificationTurns([summaryOnly])
+      expect(fromSummary?.role).toBe('assistant')
+    })
+
+    it('does not match when the tag appears mid-message (leading-anchored only)', () => {
+      const turn = ptyTurn('Result of the run:\n<pty_exited>\nID: pty_x')
+      const [mapped] = reclassifyPtyNotificationTurns([turn])
+      expect(mapped?.role).toBe('user')
+    })
+
+    it('leaves non-matching user turns untouched and never touches non-user roles', () => {
+      const plainUser: FreshAgentTurn = { id: 'u1', turnId: 'u1', role: 'user', summary: 'real prompt', items: [{ id: 'u1-i0', kind: 'text', text: 'real prompt' }] }
+      const taggedAssistant: FreshAgentTurn = { id: 'a1', turnId: 'a1', role: 'assistant', summary: '<pty_exited>', items: [{ id: 'a1-i0', kind: 'text', text: '<pty_exited>' }] }
+      // A user turn with NO text item (verified item shape from this file's
+      // existing `freshAgentTurnText` test) whose summary does not lead
+      // with a tag: leading-text extraction falls to the summary, no match.
+      const noTextItem: FreshAgentTurn = { id: 's1', turnId: 's1', role: 'user', summary: 'tool output', items: [{ id: 's1-i0', kind: 'thinking', text: 'internal' }] }
+
+      const turns = [plainUser, taggedAssistant, noTextItem]
+      const mapped = reclassifyPtyNotificationTurns(turns)
+
+      expect(mapped).toBe(turns) // same array reference: nothing matched
+      expect(mapped[0]).toBe(plainUser)
+      expect(mapped[1]?.role).toBe('assistant')
+      expect(mapped[2]).toBe(noTextItem)
+    })
+
+    it('returns a new array with new objects only for matches, preserving order and identity of the rest', () => {
+      const plain: FreshAgentTurn = { id: 'u1', turnId: 'u1', role: 'user', summary: 'hi', items: [{ id: 'u1-i0', kind: 'text', text: 'hi' }] }
+      const pty = ptyTurn('<pty_exited>\nID: pty_x')
+      const turns = [plain, pty]
+      const mapped = reclassifyPtyNotificationTurns(turns)
+
+      expect(mapped).not.toBe(turns)
+      expect(mapped).toHaveLength(2)
+      expect(mapped[0]).toBe(plain)
+      expect(mapped[1]).not.toBe(pty)
+      expect({ ...mapped[1], role: 'user' }).toEqual(pty)
+    })
+
+    it('does not mutate its input (wire/store turns stay raw)', () => {
+      const pty = ptyTurn('<pty_exited>\nID: pty_x')
+      reclassifyPtyNotificationTurns([pty])
+      expect(pty.role).toBe('user')
+    })
   })
 })
