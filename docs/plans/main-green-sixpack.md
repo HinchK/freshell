@@ -448,7 +448,7 @@ Closes **kata 59nb**. Root cause (proven): tracing-core caches each callsite's I
 - Consumes: the e08g precedent shape at `crates/freshell-ws/tests/pane_reconcile_freshagent.rs:838-858` (OnceLock + `set_global_default` + loud `.expect` on install); `CapturedEvent { target, message, fields }` (unchanged).
 - Produces: `capture() -> Arc<Mutex<Vec<CapturedEvent>>>` — one process-global subscriber per lib-test binary, installed once (first call), never torn down; every consumer filters by a per-test-unique field — INCLUDING the two pre-existing thread-local `set_default` captures this task folds in (`pane_ledger_tests.rs`'s `lock_log_capture::lock_failure_capture` and `create_dedupe.rs`'s DIAG-01 inline capture), so after this task no thread-local capture-util capture remains anywhere in the lib-test binary. THREE deliberate exceptions stay, recorded for the census: the scoped `tracing::subscriber::with_default` FILTER-SHAPE tests at `terminal.rs:10008`, `:10067`, `:10093` (`ws_conn_context_guarantee_envelope_across_filter_shapes` and its siblings) keep their per-thread registry+EnvFilter subscribers — they test filter pass-through behavior an unfiltered process-global capture cannot express, so converting them would delete the behavior under test. Their residual is recorded honestly, not fixed here: the `:10093` case `.expect`s an event from the SHARED `log_create_settled` callsite (the same call the DIAG-01 test asserts), so before any test in the binary installs the global capture it keeps the pre-existing first-registration Interest exposure — an exposure that predates this campaign and is unchanged by the migration (post-migration, whichever test calls `capture()` first heals the callsite for the whole process). No later task consumes this; Task 6's gate re-runs the binary.
 
-- [ ] **Step 1: Write the failing worst-case-order regression proof**
+- [x] **Step 1: Write the failing worst-case-order regression proof**
 
 In `pane_ledger_tests.rs`, extend `load_index_dir_io_errors_disable_the_ledger_loudly` (currently at `:8837`): after `capture()`, force the worst-case order — a subscriber-less thread executes the same emission path BEFORE the guarded assertion (its own scan-faulted root, joined before the main constructor):
 
@@ -480,13 +480,13 @@ In `pane_ledger_tests.rs`, extend `load_index_dir_io_errors_disable_the_ledger_l
 
 (The remainder of the test's assertions are unchanged at this step; the poisoner thread's own root is distinct, and later the root filter added in Step 4 excludes it.)
 
-- [ ] **Step 2: Run it and verify the intended failure**
+- [x] **Step 2: Run it and verify the intended failure**
 
 Run: `cargo test -p freshell-ws --locked --lib load_index_dir_io_errors`
 
 Expected: FAIL — `got:` shows zero scan-fault events for our root: the poisoner thread registered the shared `pane_ledger.rs:~1530` callsite against `NoSubscriber` (`Interest::never` cached process-wide), so the main thread's `PaneLedger::new` emission short-circuits before dispatch. In this narrowed single-test run no sibling can pre-heal the callsite, so the failure is deterministic. (If it unexpectedly passes, the mechanism claim is wrong — STOP and re-diagnose.)
 
-- [ ] **Step 3: Migrate `capture()` to the process-global OnceLock pattern**
+- [x] **Step 3: Migrate `capture()` to the process-global OnceLock pattern**
 
 Replace the body of `capture()` in `crates/freshell-ws/src/invariants.rs` (e08g shape; the layer, visitor, and `CapturedEvent` stay as-is):
 
@@ -520,7 +520,7 @@ Add the `std::sync::OnceLock` import. There is NO `set_default` import to remove
 
 **Poisoning hardening — part of this step, mechanically:** `CaptureLayer::on_event` (`invariants.rs:415-426`) currently locks the shared vec with `.lock().expect("capture lock")`. Under one shared vec across the whole 748-test binary, a consumer that panics while holding the guard poisons the lock, and every subsequent log event from every thread then panics INSIDE `on_event` — one real test failure cascades into a flood of unrelated `capture lock` failures (under the old per-test captures, poisoning stayed inside one test). Replace the lock expression with recovery: `.lock().unwrap_or_else(|poisoned| poisoned.into_inner())` — recording continues after any poisoning and the cascade is impossible by construction. (Consumers get the complementary rule in Step 4: never hold this guard across an assertion in the first place.)
 
-- [ ] **Step 4: Convert every consumer to unique-field filtering**
+- [x] **Step 4: Convert every consumer to unique-field filtering**
 
 Mechanical rule for every site: `let events = capture();` (drop the `(events, _guard)` destructure — there is no guard), make every presence/count/negative assertion filter by a per-test-unique field, AND narrow every failure message that today dumps the whole vec via `{events:?}` to print the FILTERED hits instead (`{hits:?}` / a bound filtered slice) — the shared vec now holds every event from every test in the binary, so an unfiltered dump is unreadable noise working against the clear-failure-diagnostics goal. AND never hold the events guard across an assertion — the shared-lock poisoning rule (companion to Step 3's `on_event` recovery): collect the filtered hits into a local `Vec<CapturedEvent>` while holding the guard (`.cloned()` — `CapturedEvent` already derives Clone, `invariants.rs:375`), drop the guard, then assert on the local. A panicking assertion with the guard held would poison the shared lock for every other test in the binary; with the guard dropped before any assert, a test failure can never poison anything at all. Concretely: `let hits: Vec<_> = { let guard = events.lock().unwrap_or_else(|p| p.into_inner()); guard.iter().filter(<per-test-unique predicate>).cloned().collect() };` then assert on `hits`. Six `{events:?}` sites: `pane_ledger_tests.rs:8861,:8899` (both already bind `hits` — print it) and `tabs_persist_tests.rs:1228,:1313,:1367,:1415` (hoist each inline `.any()` predicate into a `hits` binding and print that). Verified emission fields and required edits:
 
@@ -543,7 +543,7 @@ Mechanical rule for every site: `let events = capture();` (drop the `(events, _g
 
 Any site not in this table that greps as `capture::capture()` — OR as a thread-local `tracing::subscriber::set_default` capture anywhere in the lib (`set_default`/`DefaultGuard` outside `invariants.rs`'s own `capture()`) — must get the same treatment. Stage-2's grep at base dbbfd0752 verified the full census: **26 `capture::capture()` call sites in 5 files** — `pane_ledger_tests.rs:8847,:8885`; `tabs_persist_tests.rs:1217,:1270,:1321,:1376`; `claude_signal.rs:440,:598`; `opencode_signal.rs:758,:816,:832`; and `invariants.rs` ×15 (`:544,:585,:610,:632,:661,:709,:760,:801,:835,:875,:902,:939,:992,:1154,:1234` — the seven beyond `:830` are the opencode probe-phase family, outside the 59nb report's original `:544-801` range) — PLUS the two thread-local `set_default` captures migrated by the last two table rows (`pane_ledger_tests.rs:2992` via `lock_failure_capture`, consumed at `:3100`; `create_dedupe.rs:949`, asserted at `:977`): 28 guarded capture sites across 6 files — AND three deliberate `with_default` NON-migrants recorded for census completeness: the scoped filter-shape captures at `terminal.rs:10008`, `:10067`, `:10093` (see Interfaces) stay thread-scoped BY DESIGN; they are not part of the 28, they must NOT be converted, and their pre-install Interest residual is the Interfaces-recorded one. The Step 6 re-grep remains the mechanical completeness gate — it greps `capture::capture()`, `set_default`/`DefaultGuard`, AND `tracing::subscriber::with_default`, expecting exactly the three terminal.rs hits as the sanctioned residue.
 
-- [ ] **Step 5: Run the focused proof and the consumer files green**
+- [x] **Step 5: Run the focused proof and the consumer files green**
 
 ```bash
 cargo test -p freshell-ws --locked --lib load_index_dir_io_errors
@@ -557,11 +557,11 @@ cargo test -p freshell-ws --locked --lib invariants
 
 Expected: PASS — the worst-case-order proof passes under the global capture (the poisoner thread's emission lands in the shared vec with its own root and is filtered out; the main thread's emission dispatches because the callsite registers against the live global dispatcher), and the two migrated thread-local sites pass (the lock test's root-filtered find; the DIAG-01 waiter's `terminal_id`+`path` find).
 
-- [ ] **Step 6: Refactor while green**
+- [x] **Step 6: Refactor while green**
 
 Remove the `tracing::subscriber::DefaultGuard` return type and every now-unused `(events, _guard)` guard binding across the six files (neither is an import — both are fully qualified in the source; there is no `set_default` import to remove). Re-grep `capture::capture()` AND `set_default`/`DefaultGuard` AND `tracing::subscriber::with_default` in `crates/freshell-ws/src/` to confirm every consumer was converted and no thread-local capture-util capture remains (`invariants.rs`'s global `capture()` is the only subscriber install; the whole `lock_log_capture` module and the create_dedupe inline layer are gone; the ONLY `with_default` hits are the three sanctioned filter-shape tests at `terminal.rs:10008`, `:10067`, `:10093` — any other hit is a missed site and must be converted) — AND audit filter uniqueness, which the call-site census alone cannot detect: every id literal used AS a shared-vec filter must identify exactly ONE test — the `terminal_id` literals asserted against the vec, the oversize test's renamed `dev-oversize` `device_id`, and every `temp_root` label in `pane_ledger_tests.rs` (the `dev-000`-series device ids appear in two tabs_persist tests by design and are fine — they are never vec filters there; those tests filter by per-test-unique tempdir `root`/`path`). The known collisions to confirm gone: `t-ev`, `t-late`, `t-young`, `t-idle` in `invariants.rs` (each was shared by two tests; see the Step 4 table), and the `term-1`/`term-hb-once` renames in `opencode_signal.rs`.
 
-- [ ] **Step 7: Impacted-test verification**
+- [x] **Step 7: Impacted-test verification**
 
 The whole lib binary shares the capture; the impacted set is the entire `freshell-ws` lib test suite, run repeatedly to mirror the original flake conditions:
 
@@ -573,7 +573,7 @@ for i in $(seq 1 30); do taskset -c 0,1 cargo test -p freshell-ws --locked --lib
 
 Expected: every run green (the pinned-combo taskset loop is the investigation's reproduction recipe — 1 failure in 30 pre-fix; 0/30 post-fix). Also run `cargo test -p freshell-ws --locked --lib capture` if the invariants internal tests are named accordingly (covered by the full-lib runs above regardless).
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/freshell-ws/src/invariants.rs crates/freshell-ws/src/pane_ledger_tests.rs crates/freshell-ws/src/tabs_persist_tests.rs crates/freshell-ws/src/claude_signal.rs crates/freshell-ws/src/opencode_signal.rs crates/freshell-ws/src/create_dedupe.rs

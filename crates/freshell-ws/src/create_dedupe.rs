@@ -904,49 +904,15 @@ mod tests {
     /// contract on the waiter path.
     #[test]
     fn settle_logs_a_waiter_join_event_with_the_waiters_connection_id() {
-        use std::collections::BTreeMap;
-        use tracing::field::{Field, Visit};
-        use tracing::{Event, Subscriber};
-        use tracing_subscriber::layer::{Context, SubscriberExt};
-        use tracing_subscriber::Layer;
-
-        #[derive(Default)]
-        struct V {
-            message: String,
-            fields: BTreeMap<String, String>,
-        }
-        impl Visit for V {
-            fn record_debug(&mut self, f: &Field, v: &dyn std::fmt::Debug) {
-                if f.name() == "message" {
-                    self.message = format!("{v:?}");
-                } else {
-                    self.fields.insert(f.name().to_string(), format!("{v:?}"));
-                }
-            }
-            fn record_str(&mut self, f: &Field, v: &str) {
-                if f.name() == "message" {
-                    self.message = v.to_string();
-                } else {
-                    self.fields.insert(f.name().to_string(), v.to_string());
-                }
-            }
-            fn record_u64(&mut self, f: &Field, v: u64) {
-                self.fields.insert(f.name().to_string(), v.to_string());
-            }
-        }
-        type CapturedEvent = (String, BTreeMap<String, String>);
-        struct L(Arc<Mutex<Vec<CapturedEvent>>>);
-        impl<S: Subscriber> Layer<S> for L {
-            fn on_event(&self, e: &Event<'_>, _ctx: Context<'_, S>) {
-                let mut v = V::default();
-                e.record(&mut v);
-                self.0.lock().unwrap().push((v.message, v.fields));
-            }
-        }
-
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::registry().with(L(Arc::clone(&events)));
-        let _guard = tracing::subscriber::set_default(subscriber);
+        // Kata 59nb: this test previously ran its own inline thread-local
+        // `set_default` capture; it now consumes the binary-wide process-global
+        // capture (invariants.rs OnceLock) and filters by this test's
+        // grep-unique terminal_id + path fields. The connection_id assertion
+        // transfers unchanged: the production emission records it as u64, and
+        // tracing's DEFAULT `Visit::record_u64` delegates to `record_debug`,
+        // so the global capture's Debug fallback renders `2u64` as "2" —
+        // identical to the old inline visitor's Display render.
+        let events = crate::invariants::capture::capture();
 
         let d = CreateDedupe::default();
         let (origin, _origin_frames) = recording_sink();
@@ -966,21 +932,34 @@ mod tests {
             1,
             "waiter control: the reply frame itself must still be forwarded"
         );
-        let captured = events.lock().expect("capture lock").clone();
-        let join = captured
-            .iter()
-            .find(|(msg, fields)| {
-                msg == "ws.terminal.create.settled"
-                    && fields.get("terminal_id").map(String::as_str) == Some("tX")
-                    && fields.get("path").map(String::as_str) == Some("duplicate_in_flight_waiter")
-            })
+        // Collect-then-assert (never hold the shared vec's guard across an
+        // assert); terminal_id "tX" + path "duplicate_in_flight_waiter" are
+        // grep-unique to this one test across the whole lib.
+        let hits: Vec<crate::invariants::capture::CapturedEvent> = {
+            let events = events.lock().unwrap_or_else(|p| p.into_inner());
+            events
+                .iter()
+                .filter(|e| {
+                    e.message == "ws.terminal.create.settled"
+                        && e.fields.get("terminal_id").map(String::as_str) == Some("tX")
+                        && e.fields.get("path").map(String::as_str)
+                            == Some("duplicate_in_flight_waiter")
+                })
+                .cloned()
+                .collect()
+        };
+        let join = hits
+            .first()
             .expect("settle must log a ws.terminal.create.settled join for the waiter");
         assert_eq!(
-            join.1.get("connection_id").map(String::as_str),
+            join.fields.get("connection_id").map(String::as_str),
             Some("2"),
             "the join event must name the WAITER's connection id, not the origin's"
         );
-        assert_eq!(join.1.get("request_id").map(String::as_str), Some("rX"));
+        assert_eq!(
+            join.fields.get("request_id").map(String::as_str),
+            Some("rX")
+        );
     }
 
     fn terminal_created_frame(request_id: &str, terminal_id: &str) -> ServerMessage {
