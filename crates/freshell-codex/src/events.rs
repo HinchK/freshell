@@ -3,21 +3,29 @@
 //! the thread-status normalization (`adapter.ts:246-264`) and the strictly-monotonic
 //! turn-complete clock (`server/fresh-agent/turn-complete-clock.ts`).
 //!
-//! ## The status guard (the crown jewel — `adapter.ts:911-928`)
+//! ## The unified status guard (the crown jewel — `adapter.ts:911-928`)
 //!
-//! `turn/completed` fires for interrupts and failures too
-//! (`CodexTurnStatusSchema = completed|interrupted|failed|inProgress`, `protocol.ts:104`),
-//! so the adapter emits the positive `sdk.turn.complete` edge ONLY when
-//! `params.turn?.status ?? params.status === 'completed'` (`adapter.ts:922-924`). On EVERY
-//! `turn/completed` for the subscribed thread it FIRST emits an idle snapshot so the client
-//! re-fetches the committed transcript (`adapter.ts:906-914`); the chime is additional and
-//! gated. A crash/disconnect (`onExit`) or `thread_closed` clears the pane to `exited`
-//! WITHOUT a chime (`adapter.ts:887-896,935-946`).
+//! `turn/completed` fires for every terminal status
+//! (`CodexTurnStatusSchema = completed|interrupted|failed|inProgress`, `protocol.ts:104`).
+//! The UNIFIED "needs attention" edge rings for every turn END the user may not have
+//! witnessed: `completed`, `failed`, an absent status (the turn ended, outcome
+//! unknown), and a NON-user `interrupted` (automation- or rollback-forced — opencode's
+//! `turn_aborted` precedent). Only a USER-initiated interrupt — the interrupt control
+//! lane arms the per-session `user_interrupt_pending` marker before issuing
+//! `turn/interrupt`, and the guard's `interrupted` branch consumes it — and the
+//! non-terminal `inProgress` status stay silent. On EVERY `turn/completed` for the
+//! subscribed thread the guard FIRST emits an idle snapshot so the client re-fetches
+//! the committed transcript (`adapter.ts:906-914`); the attention edge is additional
+//! and routed. A crash/disconnect (`onExit`) or `thread_closed` clears the pane to
+//! `exited` WITHOUT an edge (`adapter.ts:887-896,935-946`).
 //!
 //! The completion `at` is per-session strictly-monotonic
 //! ([`next_monotonic_turn_complete_at`]) so two turns in the same millisecond — or a
 //! backwards NTP step — never collide or regress within the process
 //! (`turn-complete-clock.ts:19-21`).
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -90,9 +98,10 @@ pub enum CodexAdapterEvent {
         status: CodexStatus,
         revision: Option<f64>,
     },
-    /// `sdk.turn.complete { at }` — the POSITIVE completion chime, emitted only on a
-    /// `completed` status (`adapter.ts:927`). This is the T2 `provider.emits-completion-signal`
-    /// edge.
+    /// `sdk.turn.complete { at }` — the UNIFIED "needs attention" edge, emitted for
+    /// every turn END except a USER-initiated interrupt (the marker-armed
+    /// `interrupted` the interrupt lane owns) and the non-terminal `inProgress`.
+    /// This is the T2 `provider.emits-completion-signal` edge.
     TurnComplete { session_id: String, at: i64 },
     /// `sdk.status { status: 'exited' }` — a terminal clear with NO chime, emitted on
     /// `thread_closed` (`adapter.ts:891-896`) and `onExit` crash/disconnect
@@ -105,12 +114,21 @@ pub enum CodexAdapterEvent {
 
 /// One codex thread subscription's completion/status reducer. Holds the per-thread
 /// monotonic clock and active-turn tracking that the reference keeps in
-/// `lastTurnCompleteAtByThread` / `activeTurnByThread` (`adapter.ts:794-800`).
+/// `lastTurnCompleteAtByThread` / `activeTurnByThread` (`adapter.ts:794-800`), plus
+/// the per-session user-interrupt marker the interrupt control lane arms.
 #[derive(Clone, Debug)]
 pub struct CodexSubscription {
     session_id: String,
     last_turn_complete_at: Option<i64>,
     active_turn_id: Option<String>,
+    /// The per-session USER-interrupt marker (opencode's `turn_aborted`
+    /// precedent): the interrupt control lane arms it BEFORE issuing
+    /// `turn/interrupt`, and [`Self::on_turn_completed`]'s `interrupted` branch
+    /// consumes it (load + clear). Only a USER-initiated interrupt is silent —
+    /// a non-user `interrupted` (automation/rollback-forced) is a turn end the
+    /// user didn't witness and rings. Shared by `Arc` so the session record the
+    /// interrupt lane reads and the reducer the consumer drives stay one flag.
+    user_interrupt_pending: Arc<AtomicBool>,
 }
 
 impl CodexSubscription {
@@ -119,7 +137,26 @@ impl CodexSubscription {
             session_id: session_id.into(),
             last_turn_complete_at: None,
             active_turn_id: None,
+            user_interrupt_pending: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Adopt the session's shared user-interrupt marker. The freshagent lane
+    /// threads ONE flag per session into both the interrupt control lane (which
+    /// arms it) and the notification consumer's subscription (which consumes
+    /// it); constructing the subscription with this builder keeps them the same
+    /// flag instead of the fresh default.
+    pub fn with_user_interrupt_pending(mut self, pending: Arc<AtomicBool>) -> Self {
+        self.user_interrupt_pending = pending;
+        self
+    }
+
+    /// Arm the user-interrupt marker: the next `interrupted` completion is
+    /// USER-initiated and stays silent (the guard consumes the marker on it).
+    /// The subscription-level arm handle the interrupt control lane (and the
+    /// low-level RPC-seam tests) use.
+    pub fn arm_user_interrupt(&self) {
+        self.user_interrupt_pending.store(true, Ordering::SeqCst);
     }
 
     pub fn session_id(&self) -> &str {
@@ -141,13 +178,16 @@ impl CodexSubscription {
         self.active_turn_id.as_deref()
     }
 
-    /// `onTurnCompleted` handler (`adapter.ts:911-928`) — the STATUS GUARD.
+    /// `onTurnCompleted` handler (`adapter.ts:911-928`) — the UNIFIED STATUS GUARD.
     ///
     /// For a `turn/completed` on THIS thread: clear the active turn, emit an idle snapshot
-    /// (always, so the client re-fetches the committed transcript), then emit the positive
-    /// `sdk.turn.complete` chime ONLY if `params.turn?.status ?? params.status === 'completed'`.
-    /// `interrupted` / `failed` / `inProgress` / absent statuses yield the snapshot but NO
-    /// chime. A `turn/completed` for a DIFFERENT thread yields nothing.
+    /// (always, so the client re-fetches the committed transcript), then emit the unified
+    /// `sdk.turn.complete` attention edge for every turn END the user may not have
+    /// witnessed: `completed`, `failed`, an absent status, and a NON-user `interrupted`
+    /// (automation/rollback-forced). Only a USER-initiated interrupt — the interrupt
+    /// control lane armed the `user_interrupt_pending` marker — and the non-terminal
+    /// `inProgress` stay snapshot-only. A `turn/completed` for a DIFFERENT thread yields
+    /// nothing.
     pub fn on_turn_completed(
         &mut self,
         event: &CodexTurnEvent,
@@ -169,9 +209,23 @@ impl CodexSubscription {
             revision: None,
         });
 
-        // adapter.ts:922-924 — the status guard. turn.status ?? status; chime only on 'completed'.
-        if turn_status(&event.params).as_deref() != Some("completed") {
-            return out;
+        // Unified "needs attention": every turn/completed that ENDED the turn rings
+        // except a USER-initiated interrupt (the interrupt lane arms the
+        // user_interrupt_pending marker; consume it here) and the non-terminal
+        // `inProgress` status. `completed`, `failed`, an absent status (the turn
+        // ended, outcome unknown), and a NON-user `interrupted` (automation- or
+        // rollback-forced) all ring identically — the user didn't witness any of
+        // them.
+        let status = turn_status(&event.params);
+        match status.as_deref() {
+            Some("inProgress") => return out,
+            // Consume the marker (load + clear): only a USER-initiated
+            // interrupt is silent — a non-user `interrupted` falls through and
+            // rings below.
+            Some("interrupted") if self.user_interrupt_pending.swap(false, Ordering::SeqCst) => {
+                return out;
+            }
+            _ => {}
         }
 
         // adapter.ts:925-927 — monotonic `at`, then the positive chime.
@@ -316,8 +370,11 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_status_emits_snapshot_but_never_chimes() {
+    fn interrupted_status_with_a_user_interrupt_marker_emits_snapshot_only() {
+        // The interrupt control lane arms the user-interrupt marker BEFORE
+        // issuing `turn/interrupt`; the guard consumes it here.
         let mut sub = CodexSubscription::new("thread-1");
+        sub.arm_user_interrupt();
         let out = sub.on_turn_completed(
             &turn_event(
                 "thread-1",
@@ -325,7 +382,7 @@ mod tests {
             ),
             1000,
         );
-        assert_eq!(out.len(), 1, "idle snapshot only, no chime");
+        assert_eq!(out.len(), 1, "idle snapshot only, no unified edge");
         assert!(matches!(
             out[0],
             CodexAdapterEvent::StatusSnapshot {
@@ -337,10 +394,57 @@ mod tests {
             .iter()
             .any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })));
         assert_eq!(sub.last_turn_complete_at(), None, "no completion recorded");
+        // The marker is CONSUMED by the matching interrupted completion: a
+        // second `interrupted` without a fresh user interrupt rings.
+        let second = sub.on_turn_completed(
+            &turn_event(
+                "thread-1",
+                json!({ "threadId": "thread-1", "turn": { "id": "t2", "status": "interrupted" } }),
+            ),
+            1001,
+        );
+        assert!(
+            second
+                .iter()
+                .any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })),
+            "the user-interrupt marker is one-shot: a later non-user interrupted rings"
+        );
     }
 
     #[test]
-    fn failed_status_never_chimes() {
+    fn interrupted_status_without_a_marker_emits_the_unified_edge() {
+        // A NON-user `interrupted` (automation/rollback-forced) is a turn end
+        // the user didn't witness — it rings identically to a completion.
+        let mut sub = CodexSubscription::new("thread-1");
+        let out = sub.on_turn_completed(
+            &turn_event(
+                "thread-1",
+                json!({ "threadId": "thread-1", "turn": { "id": "t", "status": "interrupted" } }),
+            ),
+            1000,
+        );
+        assert_eq!(out.len(), 2, "idle snapshot + the unified edge: {out:?}");
+        assert!(matches!(
+            out[0],
+            CodexAdapterEvent::StatusSnapshot {
+                status: CodexStatus::Idle,
+                ..
+            }
+        ));
+        assert!(matches!(
+            out[1],
+            CodexAdapterEvent::TurnComplete { at: 1000, .. }
+        ));
+        assert_eq!(
+            sub.last_turn_complete_at(),
+            Some(1000),
+            "a non-user interrupted records the completion"
+        );
+    }
+
+    #[test]
+    fn failed_status_emits_the_unified_edge() {
+        // A failed turn ENDED — the user didn't witness it — one identical edge.
         let mut sub = CodexSubscription::new("thread-1");
         let out = sub.on_turn_completed(
             &turn_event(
@@ -349,9 +453,13 @@ mod tests {
             ),
             1000,
         );
-        assert!(!out
-            .iter()
-            .any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })));
+        assert!(matches!(
+            out.as_slice(),
+            [
+                CodexAdapterEvent::StatusSnapshot { .. },
+                CodexAdapterEvent::TurnComplete { at: 1000, .. }
+            ]
+        ));
     }
 
     #[test]
@@ -370,18 +478,25 @@ mod tests {
     }
 
     #[test]
-    fn absent_status_never_chimes_but_still_snapshots() {
-        // codex-adapter.test.ts:1180 — params:{} still emits the idle snapshot, no chime.
+    fn absent_status_emits_the_unified_edge_and_still_snapshots() {
+        // codex-adapter.test.ts:1180 — params:{} still emits the idle snapshot;
+        // an absent status means the turn ENDED with the outcome unknown → the
+        // unified edge rings too.
         let mut sub = CodexSubscription::new("thread-1");
         let out = sub.on_turn_completed(&turn_event("thread-1", json!({})), 1000);
-        assert_eq!(out.len(), 1);
+        assert_eq!(out.len(), 2);
         assert!(matches!(out[0], CodexAdapterEvent::StatusSnapshot { .. }));
+        assert!(matches!(out[1], CodexAdapterEvent::TurnComplete { .. }));
     }
 
     #[test]
     fn inline_turn_status_wins_over_flat_status() {
         // `turn.status ?? status`: an inline 'interrupted' must suppress a flat 'completed'.
+        // The user-interrupt marker is armed so the inline 'interrupted' is the
+        // USER-initiated kind (silent under the unified guard); if the FLAT
+        // 'completed' won instead, the edge would ring even with the marker armed.
         let mut sub = CodexSubscription::new("thread-1");
+        sub.arm_user_interrupt();
         let out = sub.on_turn_completed(
             &turn_event(
                 "thread-1",

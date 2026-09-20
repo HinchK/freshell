@@ -125,6 +125,10 @@ const DEFAULT_CODEX_QUIET_WINDOW_MS: u64 = 600_000;
 struct CodexConsumerRuntime {
     thread_id: String,
     active_turn: Arc<StdMutex<Option<String>>>,
+    /// The session's USER-interrupt marker: the interrupt control lane arms it,
+    /// the consumer's subscription consumes it at the `interrupted` completion
+    /// (one shared `Arc` with [`CodexSession::user_interrupt_pending`]).
+    user_interrupt_pending: Arc<AtomicBool>,
     quiet_deadman: Arc<StdMutex<QuietDeadman>>,
     compact_in_flight: Arc<AtomicBool>,
     compact_turn_id: Arc<StdMutex<Option<String>>>,
@@ -306,6 +310,15 @@ struct CodexSession {
     /// `handle_interrupt` and whenever the notification consumer observes the turn/thread end
     /// (`reduce_notification`). Lets `freshAgent.interrupt` target the in-flight turn.
     active_turn: Arc<StdMutex<Option<String>>>,
+    /// The per-session USER-interrupt marker (opencode's `turn_aborted`
+    /// precedent): `handle_interrupt` arms it BEFORE issuing `turn/interrupt`
+    /// (and disarms it again when the RPC fails — the interrupt never landed),
+    /// and the consumer's subscription consumes it at the `interrupted`
+    /// completion. ONE `Arc` shared by this session record (the interrupt lane)
+    /// and the consumer's [`CodexSubscription`] (the guard), so a user
+    /// interrupt is silent while an automation/rollback-forced `interrupted`
+    /// still rings the unified attention edge.
+    user_interrupt_pending: Arc<AtomicBool>,
     /// Delta-r1 F2: the compact-window busy truth. `thread/compact/start`'s answer
     /// carries no turn id, and the REAL 0.147.0 sequence returns the RPC BEFORE
     /// `turn/started` — a posting window exists where `active_turn` is still
@@ -2253,6 +2266,7 @@ impl FreshCodexState {
         // Legacy `activeTurnByThread` mirror for THIS session (adapter.ts:295) -- set on
         // `handle_send`, read/cleared by `handle_interrupt`, cleared by the consumer below.
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let user_interrupt_pending: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         let quiet_deadman = QuietDeadman::new_shared();
 
         // ORDERING FIX (wireshape-oracle flake, ~1-in-3): the app-server can already have
@@ -2276,6 +2290,7 @@ impl FreshCodexState {
             CodexConsumerRuntime {
                 thread_id: thread_id.clone(),
                 active_turn: active_turn.clone(),
+                user_interrupt_pending: user_interrupt_pending.clone(),
                 quiet_deadman: quiet_deadman.clone(),
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
@@ -2315,6 +2330,7 @@ impl FreshCodexState {
                 sandbox: sandbox.clone(),
                 permission_mode: permission_mode.clone(),
                 active_turn,
+                user_interrupt_pending,
                 compact_in_flight,
                 compact_turn_id,
                 history_mode,
@@ -3103,18 +3119,26 @@ impl FreshCodexState {
     /// resulting `turn/completed{interrupted}` notification flows through the existing
     /// STATUS-GUARDED consumer (`reduce_notification` -> `CodexSubscription::on_turn_completed`),
     /// which emits the idle `freshAgent.session.snapshot` with NO `freshAgent.turn.complete`
-    /// chime (an interrupt is not a positive completion). Mirrors `ws-handler.ts:3503-3516`
-    /// (fire-and-forget; `INTERNAL_ERROR` on failure).
+    /// edge: the interrupt is USER-initiated, so this lane arms the per-session
+    /// `user_interrupt_pending` marker BEFORE the RPC (opencode's `turn_aborted`
+    /// precedent) and disarms it again when the RPC fails (the interrupt never
+    /// landed — a later NON-user `interrupted` must still ring the unified edge).
+    /// A completion the marker did not cover (automation/rollback-forced) rings.
+    /// Mirrors `ws-handler.ts:3503-3516` (fire-and-forget; `INTERNAL_ERROR` on failure).
     pub async fn handle_interrupt(&self, msg: FreshAgentInterrupt) {
         let session_id = msg.session_id.clone();
 
         let looked_up = {
             let guard = self.sessions.lock().await;
-            guard
-                .get(&session_id)
-                .map(|s| (s.client.clone(), s.active_turn.clone()))
+            guard.get(&session_id).map(|s| {
+                (
+                    s.client.clone(),
+                    s.active_turn.clone(),
+                    s.user_interrupt_pending.clone(),
+                )
+            })
         };
-        let Some((client, active_turn)) = looked_up else {
+        let Some((client, active_turn, user_interrupt_pending)) = looked_up else {
             self.send_error(&None, "SESSION_NOT_FOUND", "codex session not found");
             return;
         };
@@ -3130,6 +3154,11 @@ impl FreshCodexState {
             return;
         };
 
+        // Arm the USER-interrupt marker BEFORE the RPC: the resulting
+        // `turn/completed{interrupted}` consumes it in the guard and stays
+        // silent. Set-first closes the race with a completion the app-server
+        // pushes immediately after processing the interrupt.
+        user_interrupt_pending.store(true, Ordering::SeqCst);
         match client.interrupt_turn(&session_id, &turn_id).await {
             Ok(()) => {
                 // adapter.ts:1027 — the turn is over from this call's perspective; the
@@ -3137,6 +3166,10 @@ impl FreshCodexState {
                 *active_turn.lock().expect("active_turn mutex") = None;
             }
             Err(err) => {
+                // The interrupt never landed — disarm so a later NON-user
+                // `interrupted` completion is not silently swallowed (the
+                // opencode abort-failure discipline).
+                user_interrupt_pending.store(false, Ordering::SeqCst);
                 self.send_error(&None, "CODEX_INTERRUPT_FAILED", &err.to_string());
             }
         }
@@ -5690,6 +5723,7 @@ impl FreshCodexState {
         }
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let user_interrupt_pending: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         let quiet_deadman = QuietDeadman::new_shared();
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
@@ -5700,6 +5734,7 @@ impl FreshCodexState {
             CodexConsumerRuntime {
                 thread_id: session_id.to_string(),
                 active_turn: active_turn.clone(),
+                user_interrupt_pending: user_interrupt_pending.clone(),
                 quiet_deadman: quiet_deadman.clone(),
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
@@ -5741,6 +5776,7 @@ impl FreshCodexState {
                     sandbox: sandbox.clone(),
                     permission_mode: permission_mode.clone(),
                     active_turn,
+                    user_interrupt_pending,
                     compact_in_flight,
                     compact_turn_id,
                     // Kata 1wxv Task 2 (r3): the durable rollout meta is the SoT
@@ -5976,6 +6012,7 @@ impl FreshCodexState {
         );
 
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let user_interrupt_pending: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         let quiet_deadman = QuietDeadman::new_shared();
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
@@ -5986,6 +6023,7 @@ impl FreshCodexState {
             CodexConsumerRuntime {
                 thread_id: new_thread_id.clone(),
                 active_turn: active_turn.clone(),
+                user_interrupt_pending: user_interrupt_pending.clone(),
                 quiet_deadman: quiet_deadman.clone(),
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
@@ -6022,6 +6060,7 @@ impl FreshCodexState {
                     sandbox: sandbox.clone(),
                     permission_mode: permission_mode.clone(),
                     active_turn,
+                    user_interrupt_pending,
                     compact_in_flight,
                     compact_turn_id,
                     history_mode: Some(HistoryMode::Paginated),
@@ -6306,8 +6345,10 @@ impl FreshCodexState {
 
     /// Consume the app-server notification stream through the STATUS-GUARDED
     /// [`CodexSubscription`] reducer and broadcast the resulting `freshAgent.event` envelopes.
-    /// `turn/completed` yields an idle `freshAgent.session.snapshot` (always) then the positive
-    /// `freshAgent.turn.complete` chime ONLY on a `completed` status.
+    /// `turn/completed` yields an idle `freshAgent.session.snapshot` (always) then the
+    /// unified `freshAgent.turn.complete` attention edge for every turn END except a
+    /// USER-armed interrupt (the marker [`handle_interrupt`](Self::handle_interrupt) arms)
+    /// and the non-terminal `inProgress`.
     fn spawn_consumer(
         &self,
         notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
@@ -6334,6 +6375,7 @@ impl FreshCodexState {
         let CodexConsumerRuntime {
             thread_id,
             active_turn,
+            user_interrupt_pending,
             quiet_deadman,
             compact_in_flight,
             compact_turn_id,
@@ -6349,7 +6391,11 @@ impl FreshCodexState {
                 let _ = gate.await;
             }
             state.clear_controls(&thread_id).await;
-            let mut subscription = CodexSubscription::new(thread_id.clone());
+            // Adopt the session's shared user-interrupt marker so the interrupt
+            // control lane (which arms it through the session record) and this
+            // reducer's `interrupted` guard read ONE flag.
+            let mut subscription = CodexSubscription::new(thread_id.clone())
+                .with_user_interrupt_pending(user_interrupt_pending);
             while let Some(notification) = notifs.recv().await {
                 // `turn/started` has no wire output, but establishes state that later
                 // notifications depend on (notably the compact turn's ownership id).
@@ -7470,6 +7516,7 @@ impl FreshCodexState {
         provenance: Option<crate::BindProvenance>,
     ) -> Arc<StdMutex<Option<String>>> {
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        let user_interrupt_pending: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         let quiet_deadman = QuietDeadman::new_shared();
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
@@ -7480,6 +7527,7 @@ impl FreshCodexState {
             CodexConsumerRuntime {
                 thread_id: thread_id.to_string(),
                 active_turn: active_turn.clone(),
+                user_interrupt_pending: user_interrupt_pending.clone(),
                 quiet_deadman: quiet_deadman.clone(),
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
@@ -7512,6 +7560,7 @@ impl FreshCodexState {
                 sandbox,
                 permission_mode,
                 active_turn: active_turn.clone(),
+                user_interrupt_pending,
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
                 history_mode,
@@ -7588,6 +7637,7 @@ impl FreshCodexState {
                 sandbox: None,
                 permission_mode: None,
                 active_turn: Arc::new(StdMutex::new(active_turn)),
+                user_interrupt_pending: Arc::new(AtomicBool::new(false)),
                 compact_in_flight: Arc::new(AtomicBool::new(false)),
                 compact_turn_id: Arc::new(StdMutex::new(None)),
                 // This fixture models a thread freshell started (paginated).
@@ -10045,6 +10095,7 @@ pub(crate) mod tests {
                 sandbox: None,
                 permission_mode: None,
                 active_turn,
+                user_interrupt_pending: Arc::new(AtomicBool::new(false)),
                 compact_in_flight: Arc::new(AtomicBool::new(false)),
                 compact_turn_id: Arc::new(StdMutex::new(None)),
                 // These fixtures model threads freshell started (paginated).
@@ -10089,6 +10140,7 @@ pub(crate) mod tests {
         ownership_id: &str,
     ) -> tokio::sync::broadcast::Receiver<String> {
         let quiet_deadman = QuietDeadman::new_shared();
+        let user_interrupt_pending: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
@@ -10097,6 +10149,7 @@ pub(crate) mod tests {
             CodexConsumerRuntime {
                 thread_id: thread_id.to_string(),
                 active_turn: active_turn.clone(),
+                user_interrupt_pending: user_interrupt_pending.clone(),
                 quiet_deadman: quiet_deadman.clone(),
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
@@ -10129,6 +10182,7 @@ pub(crate) mod tests {
                 sandbox: None,
                 permission_mode: None,
                 active_turn,
+                user_interrupt_pending,
                 compact_in_flight,
                 compact_turn_id,
                 // These fixtures model threads freshell started (paginated).
@@ -11648,6 +11702,7 @@ pub(crate) mod tests {
                 sandbox: None,
                 permission_mode: None,
                 active_turn: Arc::new(StdMutex::new(None)),
+                user_interrupt_pending: Arc::new(AtomicBool::new(false)),
                 compact_in_flight: Arc::new(AtomicBool::new(false)),
                 compact_turn_id: Arc::new(StdMutex::new(None)),
                 history_mode: Some(HistoryMode::Paginated),
@@ -13599,56 +13654,172 @@ pub(crate) mod tests {
         );
     }
 
+    /// Unified "needs attention" (Task 2): a compact turn that ends `failed` is
+    /// a turn end the user didn't witness — it rings the unified edge exactly
+    /// like a `completed` compact, on top of the always-on idle snapshot.
     #[tokio::test]
-    async fn handle_compact_failed_or_interrupted_turn_produces_no_completion_chime() {
-        for status in ["failed", "interrupted"] {
-            let (st, _rx_boot) = state_with_bus();
-            let (peer, mut rx) = insert_idle_compact_session(&st, "thread-cx").await;
+    async fn handle_compact_failed_turn_emits_the_unified_edge() {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut rx) = insert_idle_compact_session(&st, "thread-cxf").await;
 
-            let driver = {
-                let st = st.clone();
-                tokio::spawn(async move {
-                    st.handle_compact(compact_msg("thread-cx")).await;
-                })
-            };
-            answer_initialize(&peer).await;
-            let (id, method, _params) = peer.expect_request().await;
-            assert_eq!(method, "thread/compact/start");
-            peer.respond(&id, json!({}));
-            driver.await.expect("compact task");
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cxf")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        peer.respond(&id, json!({}));
+        driver.await.expect("compact task");
 
-            // Same probed sequence, but the compact turn ends WITHOUT status:completed.
-            emit_compact_notification_sequence(&peer, "thread-cx", status);
+        // Same probed sequence, but the compact turn ends with status:failed.
+        emit_compact_notification_sequence(&peer, "thread-cxf", "failed");
 
-            let mut saw_idle = false;
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
-            loop {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
-                    break;
-                };
-                let frame: Value = serde_json::from_str(&raw).unwrap();
-                if frame["sessionId"] != "thread-cx" {
-                    continue;
-                }
-                match frame["event"]["type"].as_str() {
-                    Some("freshAgent.session.snapshot") if frame["event"]["status"] == "idle" => {
-                        saw_idle = true;
-                    }
-                    Some("freshAgent.turn.complete") => {
-                        panic!("a `{status}` compact turn must never chime")
-                    }
-                    _ => {}
-                }
+        let mut snapshots: Vec<String> = Vec::new();
+        let mut completes = 0usize;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
             }
-            assert!(
-                saw_idle,
-                "the idle snapshot still flows for a `{status}` compact turn"
-            );
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["sessionId"] != "thread-cxf" {
+                continue;
+            }
+            match frame["event"]["type"].as_str() {
+                Some("freshAgent.session.snapshot") => {
+                    snapshots.push(frame["event"]["status"].as_str().unwrap_or("?").to_string());
+                }
+                Some("freshAgent.turn.complete") => {
+                    completes += 1;
+                }
+                _ => {}
+            }
         }
+        assert_eq!(
+            completes, 1,
+            "a failed compact turn rings the unified attention edge exactly once, got {completes}"
+        );
+        assert!(
+            snapshots.iter().any(|s| s == "idle"),
+            "the idle snapshot still flows for a failed compact turn, got {snapshots:?}"
+        );
+    }
+
+    /// Unified "needs attention" (Task 2): a compact turn interrupted BY THE
+    /// USER — through the REAL `freshAgent.interrupt` lane, which arms the
+    /// user-interrupt marker before its `turn/interrupt` RPC — stays silent:
+    /// the idle snapshot flows, the unified edge does not.
+    #[tokio::test]
+    async fn handle_compact_interrupted_turn_with_a_user_interrupt_stays_silent() {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut rx) = insert_idle_compact_session(&st, "thread-cxi").await;
+
+        let driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-cxi")).await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        peer.respond(&id, json!({}));
+        driver.await.expect("compact task");
+
+        // Emit the probed sequence UP TO (excluding) the turn/completed, so the
+        // consumer folds the compact's `turn/started` (the active turn is
+        // tracked) before the user interrupts.
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-cxi", "status": { "type": "active" } }),
+        );
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": "thread-cxi", "turn": { "id": "turn-compact-1" } }),
+        );
+        peer.emit_notification(
+            "item/started",
+            json!({ "threadId": "thread-cxi", "turnId": "turn-compact-1", "item": { "id": "item-1", "type": "reasoning" } }),
+        );
+        peer.emit_notification(
+            "thread/tokenUsage/updated",
+            json!({ "threadId": "thread-cxi", "turnId": "turn-compact-1", "tokenUsage": {} }),
+        );
+        peer.emit_notification(
+            "item/completed",
+            json!({ "threadId": "thread-cxi", "turnId": "turn-compact-1", "item": { "id": "item-1", "type": "reasoning" } }),
+        );
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-cxi", "status": { "type": "idle" } }),
+        );
+        // The thread-level idle snapshot proves the consumer folded the whole
+        // prefix — in particular the compact's turn/started.
+        await_next_idle_snapshot(&mut rx, "thread-cxi").await;
+
+        // The USER interrupts through the REAL lane: handle_interrupt arms the
+        // user-interrupt marker and issues turn/interrupt for the tracked turn.
+        let interrupt = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_interrupt(FreshAgentInterrupt {
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thread-cxi".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    cwd: None,
+                })
+                .await;
+            })
+        };
+        let (interrupt_id, interrupt_method, interrupt_params) = peer.expect_request().await;
+        assert_eq!(interrupt_method, "turn/interrupt");
+        assert_eq!(interrupt_params["threadId"], json!("thread-cxi"));
+        assert_eq!(interrupt_params["turnId"], json!("turn-compact-1"));
+        peer.respond(&interrupt_id, json!({}));
+        interrupt.await.expect("interrupt task");
+
+        // The interrupted completion flows through the REAL consumer; the armed
+        // marker keeps it snapshot-only — the unified edge must NOT ring.
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cxi", "turn": { "id": "turn-compact-1", "status": "interrupted" } }),
+        );
+
+        let mut saw_idle = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["sessionId"] != "thread-cxi" {
+                continue;
+            }
+            match frame["event"]["type"].as_str() {
+                Some("freshAgent.session.snapshot") if frame["event"]["status"] == "idle" => {
+                    saw_idle = true;
+                }
+                Some("freshAgent.turn.complete") => {
+                    panic!("a user-interrupted compact turn must never ring the unified edge")
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_idle,
+            "the idle snapshot still flows for a user-interrupted compact turn"
+        );
     }
 
     #[tokio::test]

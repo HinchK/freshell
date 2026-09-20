@@ -3,7 +3,10 @@
 //! `interrupt(sessionId)`, `:1004-1021`): issuing `turn/interrupt` produces the exact wire
 //! frame the app-server expects, and the app-server's resulting
 //! `turn/completed{status:'interrupted'}` notification yields an idle
-//! `freshAgent.session.snapshot`-shaped event with NO positive chime (`:911-928`).
+//! `freshAgent.session.snapshot`-shaped event with NO unified attention edge (`:911-928`)
+//! — the interrupt lane's USER-interrupt marker is armed (the real control lane arms it
+//! before the RPC; this low-level seam arms the subscription-level handle directly), so
+//! this pins "a USER-armed interrupt is silent" at the RPC seam.
 
 use std::sync::Arc;
 
@@ -75,6 +78,11 @@ async fn interrupt_turn_rpc_then_interrupted_completion_snapshots_without_chime(
         json!({ "threadId": THREAD_ID, "turnId": "turn-1", "turn": { "id": "turn-1", "status": "interrupted" } }),
     );
     let mut sub = CodexSubscription::new(THREAD_ID);
+    // The interrupt above is USER-initiated: arm the user-interrupt marker the
+    // real control lane (`FreshCodexState::handle_interrupt`) arms before its
+    // `turn/interrupt` RPC — this low-level test bypasses that lane, so it arms
+    // the subscription-level handle directly.
+    sub.arm_user_interrupt();
     let notification = notifs.recv().await.expect("a notification");
     let events = match notification {
         CodexNotification::TurnCompleted(ev) => sub.on_turn_completed(&ev, 1_700_000_000_000),
@@ -90,6 +98,6 @@ async fn interrupt_turn_rpc_then_interrupted_completion_snapshots_without_chime(
         !events
             .iter()
             .any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })),
-        "an interrupt must NEVER chime: {events:?}"
+        "a USER-armed interrupt must NEVER ring: {events:?}"
     );
 }
