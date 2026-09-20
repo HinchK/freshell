@@ -1,6 +1,6 @@
 # Freshell pnpm Migration Implementation Plan
 
-> For agentic workers: execute only after implementation is requested. Use subagent-driven-development or executing-plans to carry out the tasks with review checkpoints. The unchecked steps below describe future work, not work completed during this planning request.
+> For agentic workers: this plan is being executed via the-usual. Carry out the tasks with that workflow's subagent-driven-development execution, task review checkpoints, and Fresh Eyes reviews exactly as the User Request block below requires. The unchecked steps below describe future work, not work completed during this planning request.
 
 ## User Request
 
@@ -462,8 +462,8 @@ At planning time FRESHELL_VITEST_BACKEND and FRESHELL_E2E_BACKEND were both clou
 | 5 | Replace npm-specific runtime dependency traversal with pnpm exports, preserve resource layout, extend verifier/receipts, and pass checkout-free runtime tests plus native Windows packaging proof. | Steps 2-4 |
 | 6 | Convert CI/cloud/sandbox/example Docker paths, caches, filters, and fingerprints. Prove actual image/runtime and backend behavior. | Steps 3-5 |
 | 7 | Update every active documentation/help/generator surface in section 8, including source-upgrade and first-pnpm-release paths. Review retained npm references by category. | Stable commands and packaging contract |
-| 8 | Run the full branch validation matrix, inspect artifacts, measure ready-to-run install cost, and review the complete diff independently. Remove superseded authoritative npm locks and finish with a clean, committed worktree. | Steps 3-7 |
-| 9 | Push the feature branch. After explicit PR-creation/landing approval, open the PR, wait for required checks, merge, fast-forward local main, and follow the separate adoption runbook. | Step 8 and required approval |
+| 8 | Run the full branch validation matrix locally and from the pushed branch where lane mechanics allow, inspect artifacts, measure ready-to-run install cost, and review the complete diff independently. Remove superseded authoritative npm locks and finish with a clean, committed worktree. The native macOS/Windows matrix lanes are dispatched in step 9, because the repository-provided cross-platform runner is the manually dispatched matrix workflow in .github/workflows/electron-build.yml, which requires the remote branch/ref to exist. | Steps 3-7 |
+| 9 | Push the feature branch, then dispatch the native macOS/Windows build matrix against the pushed ref and complete the remaining section-9 native evidence. After explicit PR-creation/landing approval, open the PR, wait for required checks, merge, fast-forward local main, and follow the separate adoption runbook. | Step 8 and required approval |
 
 Use focused commits for package metadata/lock conversion, command and test infrastructure, runtime packaging, CI/container support, and documentation. The branch may use intermediate commits during development, but the mergeable result must be coherent; do not land a half-migrated main with competing lock authorities.
 
@@ -471,7 +471,7 @@ Use focused commits for package metadata/lock conversion, command and test infra
 
 These tasks reference the file inventories and behavioral cases above. The early proof tasks deliberately precede final implementation code: the plan must not assume an untested deploy or Windows-launch design has already succeeded.
 
-- [ ] Record a green current-main base gate and create the implementation worktree without modifying another checkout's installed dependencies.
+- [ ] Create the implementation worktree from then-current origin/main without modifying another checkout's installed dependencies. The original green-base precondition is waived per the User Request block: the recorded red base is an accepted pre-existing condition, and this run introduces no new regressions (base failures count as pre-existing only with a reproduction receipt at base_ref).
 - [ ] Record the existing five npm lock inventories, Node versions, and current cold/warm ready-to-run install measurements.
 - [ ] Create the workspace and private MCP packaging manifest in the proof worktree; import locks and demonstrate that root and sidecar retain their distinct peer versions.
 - [ ] Demonstrate both normal deploy exports, then execute the SDK/model-catalog and MCP entrypoints with the checkout/store unavailable. Record the final resource layout and link/materialization decision.
