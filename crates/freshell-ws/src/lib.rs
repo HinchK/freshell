@@ -184,7 +184,7 @@ pub struct WsState {
     /// `freshAgent.create` / `freshAgent.send` (claude/kilroy) here, which spawns the ONE
     /// sanctioned Node sidecar wrapping `@anthropic-ai/claude-agent-sdk` and broadcasts
     /// `freshAgent.created` / `freshAgent.send.accepted` / `freshAgent.event`
-    /// (session.init + stream + assistant + result + the success-guarded turn.complete edge).
+    /// (session.init + stream + assistant + result + the unified turn.complete attention edge).
     /// Gated by the SHARED `settings.freshAgent.enabled` flag (owned by `fresh_codex`).
     pub fresh_claude: freshell_freshagent::FreshClaudeState,
     /// The freshopencode WS fresh-agent slice (Batch D PR-2): the post-handshake loop

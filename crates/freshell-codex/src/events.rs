@@ -204,7 +204,7 @@ impl CodexSubscription {
         &self.session_id
     }
 
-    /// The last positive-completion `at` this session emitted (for assertions / persistence).
+    /// The last turn-complete `at` this session emitted (for assertions / persistence).
     pub fn last_turn_complete_at(&self) -> Option<i64> {
         *self
             .last_turn_complete_at
@@ -316,7 +316,7 @@ impl CodexSubscription {
             _ => {}
         }
 
-        // adapter.ts:925-927 — monotonic `at`, then the positive chime. The clock
+        // adapter.ts:925-927 — monotonic `at`, then the unified attention edge. The clock
         // is the session's SHARED mutex-guarded clock (see the struct doc): a
         // synthesized edge minted outside this consumer (crash self-heal, quiet
         // deadman) takes the same lock and can never collide with or regress
@@ -391,8 +391,9 @@ impl CodexSubscription {
     }
 
     /// `onExit` handler (`adapter.ts:935-946`): a crash/disconnect clears the pane to `exited`
-    /// with NO chime (a crash is not a positive completion). The runtime is intentionally left
-    /// mapped for lazy restart (`adapter.ts:936-944`).
+    /// with NO edge of its own (the freshell-freshagent exit watcher rings the unified
+    /// crash-while-busy attention edge when a turn was in flight). The runtime is intentionally
+    /// left mapped for lazy restart (`adapter.ts:936-944`).
     pub fn on_exit(&self) -> CodexAdapterEvent {
         CodexAdapterEvent::Status {
             session_id: self.session_id.clone(),

@@ -2,7 +2,7 @@
 //! [`ChannelTransport`] — NO real app-server, NO live API calls. Proves the full CORE path
 //! the T2-over-rust step (3.8b) will later run live: connect → initialize→initialized
 //! handshake → `thread/start` → `turn/start` (**effort forwarded VERBATIM**, DEV-0003) →
-//! `turn/completed` notification → the STATUS-GUARDED positive completion edge.
+//! `turn/completed` notification → the unified turn-complete attention edge.
 //!
 //! The server side is scripted with the committed fake-app-server's message shapes
 //! (`test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs`).
@@ -106,7 +106,7 @@ async fn full_drive_completed_turn_emits_the_positive_edge_with_verbatim_effort(
         json!({ "threadId": THREAD_ID, "turnId": "turn-1", "turn": { "id": "turn-1", "status": "completed" } }),
     );
 
-    // The consumer classifies it; the subscription gate turns it into the positive edge.
+    // The consumer classifies it; the subscription guard turns it into the unified edge.
     let mut sub = CodexSubscription::new(THREAD_ID);
     let notification = notifs.recv().await.expect("a notification");
     let events = match notification {
@@ -117,7 +117,7 @@ async fn full_drive_completed_turn_emits_the_positive_edge_with_verbatim_effort(
         events
             .iter()
             .any(|e| matches!(e, CodexAdapterEvent::TurnComplete { .. })),
-        "completed → the positive sdk.turn.complete edge fired: {events:?}"
+        "completed → the unified sdk.turn.complete edge fired: {events:?}"
     );
 }
 

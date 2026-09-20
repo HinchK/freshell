@@ -4102,7 +4102,8 @@ impl FreshClaudeState {
 
     /// Handle a `freshAgent.send` for claude: push the user turn into the sidecar's SDK
     /// input stream, then broadcast `freshAgent.send.accepted`. The stdout consumer surfaces
-    /// the completion edge (`sdk.result subtype=success` → `freshAgent.turn.complete`).
+    /// the unified attention edge (sidecar `sdk.turn.complete` — minted for EVERY result
+    /// subtype except a user-interrupted turn's own → `freshAgent.turn.complete`).
     /// Claude's send returns void, so NO `submittedTurnId` and NO materialization.
     pub async fn handle_send(&self, msg: FreshAgentSend) {
         let request_id = msg.request_id.clone();
@@ -10345,7 +10346,9 @@ pub(crate) mod tests {
 
     #[test]
     fn turn_complete_frame_carries_the_success_edge() {
-        // The status-guarded chime the sidecar emits ONLY on result subtype=success.
+        // The sidecar's unified turn-complete attention edge (minted for EVERY
+        // result subtype except a user-interrupted turn's own), normalized to
+        // freshAgent.turn.complete.
         let line = json!({ "type": "sdk.turn.complete", "sessionId": "s-1", "at": 42 });
         let frame = sdk_line_to_frame(&line, "s-1", "freshclaude").unwrap();
         let wire: Value = serde_json::from_str(&frame).unwrap();

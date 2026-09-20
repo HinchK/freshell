@@ -16,11 +16,11 @@
 //! | `freshAgent.send {sessionId,text,…}` | **materialize-or-send** (`adapter.ts:324-361`): create the durable `ses_*` session ONLY the first time (THE continuity fix — see below), broadcast `freshAgent.session.materialized` exactly once, then broadcast `freshAgent.send.accepted` and run the turn |
 //! | `freshAgent.kill` | remove the session (both its placeholder and durable keys), abort any in-flight turn task, broadcast `freshAgent.killed` — the SHARED `opencode serve` sidecar is NEVER touched (`adapter.ts kill()` has no `serveManager.shutdown()` call) |
 //! | `freshAgent.interrupt` | best-effort: abort the in-flight turn task + issue `serveManager.abort()` against the real session (`adapter.ts interrupt()` / `abortForState`) |
-//! | `freshAgent.compact` | AGENT-04 (approval-respond Task 4): `POST /session/:id/summarize` with EXACTLY `{providerID, modelID}` (the VALIDATED 1.18.18 contract), sized between a running snapshot and an idle snapshot + gated turn-complete chime |
+//! | `freshAgent.compact` | AGENT-04 (approval-respond Task 4): `POST /session/:id/summarize` with EXACTLY `{providerID, modelID}` (the VALIDATED 1.18.18 contract), sized between a running snapshot and an idle snapshot + the turn-complete attention edge (gated only on a user-initiated interrupt) |
 //! | `freshAgent.fork` | AGENT-07 (approval-respond Task 5): `POST /session/:id/fork` (optional `messageID` when the client pins a `^msg` turn), then register the child (bridge + binding row) and answer `freshAgent.forked` ON THE REQUESTING CONNECTION — every failure path also answers on that sink, never silence |
 //!
 //! PR-3 bridges the serve SSE stream into `freshAgent.event` frames (status snapshots +
-//! the status-guarded `freshAgent.turn.complete` chime). PR-4 adds `freshAgent.attach`
+//! the `freshAgent.turn.complete` attention edge, gated only on a user-initiated interrupt). PR-4 adds `freshAgent.attach`
 //! (reload-rehydrate): a known session re-emits a status snapshot and restarts its
 //! serve-SSE bridge if it died; an unknown session emits the `INVALID_SESSION_ID` shape
 //! the client folds into `markSessionLost` instead of hanging.
@@ -6004,9 +6004,11 @@ impl FreshOpencodeState {
                                 session_id,
                                 message,
                             } => {
-                                // adapter.ts:278-282 -- a turn error means the in-flight
-                                // turn did not positively complete; consulted by the
-                                // send task's completion gating once idle resolves.
+                                // adapter.ts:278-282 -- a turn error ended the
+                                // in-flight turn without a clean outcome; under
+                                // the unified contract it gates nothing -- it
+                                // only feeds the settle tail's non-clean-outcome
+                                // debug marker (`settle_turn_outcome`).
                                 turn_errored.store(true, Ordering::SeqCst);
                                 error_event(session_id, message)
                             }
@@ -6014,8 +6016,9 @@ impl FreshOpencodeState {
                         fresh_agent.broadcast(&event_frame(&real_id, inner));
                     }
                     // The sidecar was lost; `run_turn`'s own `await_idle` independently
-                    // surfaces `ServeError::SidecarLost`, which already excludes the
-                    // turn from a positive completion. Nothing further to bridge here.
+                    // surfaces `ServeError::SidecarLost`, whose failed settle still
+                    // rings the unified attention edge (`settle_turn_outcome`,
+                    // succeeded=false). Nothing further to bridge here.
                     Ok(SessionSignal::Lost) => {}
                     Err(RecvError::Lagged(_)) => {}
                     Err(RecvError::Closed) => break,

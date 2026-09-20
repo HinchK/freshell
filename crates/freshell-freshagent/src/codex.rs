@@ -19,9 +19,10 @@
 //!
 //! The consumer maps codex app-server notifications through the STATUS-GUARDED
 //! [`freshell_codex::CodexSubscription`] reducer into `freshAgent.event` envelopes:
-//! `turn/completed` → an idle `freshAgent.session.snapshot` (always) THEN a positive
-//! `freshAgent.turn.complete` chime ONLY when `params.turn.status ?? params.status ===
-//! 'completed'`. That discrete, status-guarded edge is the T2
+//! `turn/completed` → an idle `freshAgent.session.snapshot` (always) THEN the unified
+//! `freshAgent.turn.complete` attention edge for every turn END except a USER-armed
+//! interrupt (the per-session marker [`FreshCodexState::handle_interrupt`] arms and the
+//! consumer consumes/clears) and the non-terminal `inProgress`. That discrete edge is the T2
 //! `provider.emits-completion-signal` invariant. The rollout `.jsonl` the app-server persists
 //! under the isolated `<CODEX_HOME>/sessions/…` corroborates it.
 //!
@@ -8646,7 +8647,9 @@ fn build_codex_turn_json(raw_turn: &Value, ordinal: usize) -> Result<Vec<Value>,
 ///
 /// - The child exits ON ITS OWN (crash / unexpected disconnect, never requested): self-heal
 ///   (adapter.ts:935-946) — reap via [`reap_owned_codex_sidecars`] and broadcast the terminal
-///   `exited` status with NO chime (a crash is not a positive completion). The session is
+///   `exited` status to clear BLUE; a crash with a turn in flight also rings the unified
+///   attention edge (the crash arm in [`spawn_exit_watcher`]; an idle crash stays silent).
+///   The session is
 ///   intentionally left mapped by the caller (this fn does not touch `sessions`) — matching
 ///   the reference's "leave the runtime mapped for lazy restart" invariant.
 /// - A `freshAgent.kill` REQUESTS teardown via `kill_rx`: gracefully `start_kill` + reap, with
@@ -10252,7 +10255,7 @@ pub(crate) mod tests {
 
     #[test]
     fn completed_turn_yields_snapshot_then_chime_frames() {
-        // End-to-end reducer → wire: an idle snapshot precedes the positive chime.
+        // End-to-end reducer → wire: an idle snapshot precedes the turn-complete edge.
         let mut sub = CodexSubscription::new("t-1");
         let events = sub.on_turn_completed(
             &CodexTurnEvent {
@@ -13608,7 +13611,7 @@ pub(crate) mod tests {
     /// An accepted `turn/completed` shape need only carry `threadId`; a delayed
     /// compact completion can therefore arrive without the compact's turn id
     /// after a newer send has installed its own active turn. It must not publish
-    /// idle or a positive completion for that newer turn, and it must retire the
+    /// idle or a completion edge for that newer turn, and it must retire the
     /// compact window so the newer turn's own matching completion can reopen the
     /// rollback gate.
     #[tokio::test]
