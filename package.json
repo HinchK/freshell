@@ -11,6 +11,7 @@
   "engines": {
     "node": ">=22.5.0"
   },
+  "packageManager": "pnpm@10.34.5",
   "scripts": {
     "predev": "npm run prepare:rust-runtime && tsx scripts/run-with-default-port.ts tsx scripts/precheck.ts",
     "dev": "tsx scripts/run-with-default-port.ts concurrently -n client,rust -c blue,green \"vite --config config/vite/vite.config.ts\" \"cargo run -p freshell-server --locked\"",
@@ -123,7 +124,8 @@
     "react-window": "^2.2.6",
     "remark-gfm": "^4.0.0",
     "ws": "^8.18.0",
-    "zod": "^4.0.0"
+    "zod": "^4.0.0",
+    "immer": "11.1.4"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.2",
@@ -163,6 +165,8 @@
     "typescript": "^5.7.2",
     "vite": "^6.4.1",
     "vitest": "^3.2.4",
-    "yaml": "^2.9.0"
+    "yaml": "^2.9.0",
+    "ajv": "6.14.0",
+    "zod-to-json-schema": "3.25.1"
   }
 }

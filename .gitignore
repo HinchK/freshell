@@ -72,3 +72,4 @@ test/e2e-browser/gate01-reports/
 !test/fixtures/distribution/
 !test/fixtures/distribution/**/
 !test/fixtures/distribution/**/*
+packages/freshell-mcp-runtime/generated/
