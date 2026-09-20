@@ -356,9 +356,58 @@ class RustServer {
   async start(opts = {}) {
     const port = await pickFreePort()
     const token = `native-contract-${randomUUID()}`
-    const home = opts.home ?? path.join(this.scratch, 'server-home')
+    const home = opts.home ?? serverHomePath()
     fs.mkdirSync(home, { recursive: true })
     fs.mkdirSync(path.join(home, '.freshell'), { recursive: true })
+    // Pre-seed the user config exactly like the e2e helper
+    // (test/e2e-browser/helpers/unified-agent-names.ts): the
+    // `settings.freshAgent.enabled` gate DEFAULTS TO FALSE, and while it is
+    // disabled the WS create lane SILENTLY swallows `freshAgent.create`
+    // frames (the dispatch gate in terminal.rs checks
+    // `state.fresh_codex.is_enabled()` and never answers) — the server-side
+    // contracts need the fresh-agent runtime on. Seeding the config file
+    // (not POSTing settings after boot) matches the real onboarding path.
+    const configPath = path.join(home, '.freshell', 'config.json')
+    if (!fs.existsSync(configPath)) {
+      fs.writeFileSync(configPath, JSON.stringify({
+        version: 1,
+        settings: {
+          freshAgent: { enabled: true },
+        },
+      }, null, 2))
+    }
+    // Register the codex coding-CLI extension in the server home
+    // (`<home>/.freshell/extensions/codex/freshell.json` — the real
+    // user-level extension discovery path, `extensions.rs`'s
+    // `resolve_extension_dirs`): the codex contract's step (7) REST tab
+    // create uses `mode: "codex"` (a TERMINAL pane), which requires a
+    // registered launch-target manifest. The manifest's
+    // `cli.envVar: "CODEX_CMD"` resolves the binary to the container's
+    // read-only provider mount (the server env already carries CODEX_CMD) —
+    // verbatim copy of the repo's bundled `extensions/codex-cli/freshell.json`
+    // (the schema is differential-oracle-proven; do not edit shape).
+    const codexExtDir = path.join(home, '.freshell', 'extensions', 'codex')
+    fs.mkdirSync(codexExtDir, { recursive: true })
+    fs.writeFileSync(path.join(codexExtDir, 'freshell.json'), JSON.stringify({
+      name: 'codex',
+      version: '1.0.0',
+      label: 'Codex CLI',
+      description: "OpenAI's Codex CLI agent",
+      category: 'cli',
+      cli: {
+        command: 'codex',
+        envVar: 'CODEX_CMD',
+        resumeArgs: ['resume', '{{sessionId}}'],
+        modelArgs: ['--model', '{{model}}'],
+        sandboxArgs: ['--sandbox', '{{sandbox}}'],
+        supportsModel: true,
+        supportsSandbox: true,
+      },
+      picker: {
+        shortcut: 'X',
+        group: 'agents',
+      },
+    }, null, 2))
     const logsDir = path.join(home, '.freshell', 'logs')
     fs.mkdirSync(logsDir, { recursive: true })
     this.home = home
@@ -399,6 +448,14 @@ class RustServer {
       OPENCODE_LOG_LEVEL: 'WARN',
       FRESHELL_CLAUDE_NODE: path.join(this.runtimeRoot ?? '/opt/freshell-runtime', 'node', 'bin', 'node'),
       FRESHELL_CLAUDE_SIDECAR: path.join(this.runtimeRoot ?? '/opt/freshell-runtime', 'claude-sidecar', 'index.mjs'),
+      // The app-bound production env pair (the retire-node-server-v2 plan's
+      // spawn-env contract): terminal-mode CLI panes inject Freshell's MCP
+      // client (mcp_inject.rs), which resolves this EXPLICIT pair first and
+      // falls back to a repo checkout (dist/tools/... or node_modules/tsx)
+      // that does not exist in the container — without the pair, the codex
+      // TERMINAL create fails with the tsx-resolution error.
+      FRESHELL_MCP_NODE: path.join(this.runtimeRoot ?? '/opt/freshell-runtime', 'node', 'bin', 'node'),
+      FRESHELL_MCP_ENTRY: path.join(this.runtimeRoot ?? '/opt/freshell-runtime', 'mcp', 'server.js'),
       ...opts.env,
     }
     this.logFile = path.join(logsDir, `native-contract-${port}.log`)
@@ -480,6 +537,17 @@ class RustServer {
    * (the authoritative `nameRef`, falling back to the pre-durable
    * `namingHandle`). */
   async paneNamingRef(tabId, paneId) {
+    const content = await this.paneContent(tabId, paneId)
+    if (!content) return null
+    if (content.nameRef && typeof content.nameRef === 'object') return content.nameRef
+    if (typeof content.namingHandle === 'string') return { kind: 'pending', id: content.namingHandle }
+    return null
+  }
+
+  /** The pane's full content object from the layout snapshot (the naming
+   * identity, the createRequestId, the sessionType — everything the real
+   * client's pane mount reads to drive the pane's session creation). */
+  async paneContent(tabId, paneId) {
     const { ok, body } = await fetchJson(`${this.baseUrl}/api/layout/snapshot?tabId=${encodeURIComponent(tabId)}`, { headers: this.authHeaders() })
     if (!ok) return null
     const findContent = (node) => {
@@ -493,10 +561,7 @@ class RustServer {
     }
     for (const layout of Object.values(body?.data?.layouts ?? {})) {
       const content = findContent(layout)
-      if (content) {
-        if (content.nameRef && typeof content.nameRef === 'object') return content.nameRef
-        if (typeof content.namingHandle === 'string') return { kind: 'pending', id: content.namingHandle }
-      }
+      if (content) return content
     }
     return null
   }
@@ -532,6 +597,15 @@ class RustServer {
         // ignore non-JSON frames
       }
     })
+    // Connection deaths must be visible in the frame dump: a closed or
+    // errored socket otherwise looks exactly like "the server never
+    // answered" (an unattributable timeout).
+    ws.addEventListener('close', (event) => {
+      frames.push({ type: '__ws_close', code: event.code, reason: String(event.reason ?? '').slice(0, 200) })
+    })
+    ws.addEventListener('error', () => {
+      frames.push({ type: '__ws_error' })
+    })
     ws.send(JSON.stringify({ type: 'hello', token: this.token, protocolVersion: 10 }))
     await withTimeout(new Promise((resolve, reject) => {
       const deadline = setTimeout(() => reject(new Error('ready frame timeout')), 15_000)
@@ -562,6 +636,26 @@ class RustServer {
       }
       check()
     }), timeoutMs + 1_000, `frame ${type}`)
+  }
+
+  /** Wait for the FIRST of several frame types — a create can answer with
+   * the success frame OR the refusal envelope (`freshAgent.create.failed`
+   * carries the requestId), and waiting for success alone turns a clear
+   * server-side refusal into an unattributable 60s timeout. */
+  async waitForFrameAny(frames, types, timeoutMs = 30_000) {
+    return withTimeout(new Promise((resolve, reject) => {
+      const deadline = setTimeout(() => reject(new Error(`frame ${types.join('|')} timeout`)), timeoutMs)
+      const check = () => {
+        const match = frames.find((frame) => types.includes(frame.type))
+        if (match) {
+          clearTimeout(deadline)
+          resolve(match)
+        } else {
+          setTimeout(check, 100)
+        }
+      }
+      check()
+    }), timeoutMs + 1_000, `frame ${types.join('|')}`)
   }
 }
 
@@ -678,6 +772,27 @@ function opencodeXdgRoots() {
     state: path.join(base, 'state'),
     tmp: path.join(base, 'tmp'),
   }
+}
+
+/** The staged server's HOME, on the CONTAINER's own filesystem: the
+ * server's codex sidecar inherits HOME from the server env and does
+ * HOME-scoped I/O at boot, and on the 9p scratch bind the inode cache
+ * serves stale bytes — an incoherent HOME is a silent-boot-hang candidate
+ * (the CLI's own boot probes there). Container-local ALSO moves the
+ * server's JSONL logs (`<home>/.freshell/logs`) onto coherent overlayfs
+ * so failure diagnostics read what the server actually wrote. */
+function serverHomePath() {
+  return path.join('/home/sandbox', '.native-smoke', 'server-home')
+}
+
+/** The codex contract's project directory, same rationale as
+ * [`codexHomePath`]: the freshcodex sidecar process STARTS with this as
+ * its cwd (`Command::current_dir`), and the static-musl CLI's probes
+ * against the 9p bind are unreliable. The A–F CLI connections boot
+ * without an explicit cwd (container-local) — the sidecar must not be the
+ * only codex process whose cwd sits on the bind. */
+function codexProjectPath() {
+  return path.join('/home/sandbox', '.native-smoke', 'codex-proj')
 }
 
 async function runClaudeHelper(args, request, claudeConfigRoot) {
@@ -1049,7 +1164,6 @@ async function codexContract(args, server, receipt, observed) {
   let connectionE = null
   let initE = null
   try {
-    const codexScratch = path.join(args.scratch, 'codex')
     const home = codexHomePath()
     // The wrong-root twin lives under its OWN parent: codexChildEnv derives
     // HOME from the codex home's parent, and a shared parent means both
@@ -1057,7 +1171,11 @@ async function codexContract(args, server, receipt, observed) {
     // aliases/config bootstrap) — the second instance's initialize hangs
     // silently against the first's state.
     const homeB = path.join(path.dirname(codexHomePath()), 'b', path.basename(codexHomePath()))
-    const projectDir = path.join(codexScratch, 'proj')
+    // Container-local (see [`codexProjectPath`]): the freshcodex sidecar
+    // process STARTS here (`Command::current_dir`), and the rollout
+    // records seeded below carry it as their cwd field — one source of
+    // truth for the CLI boots, the sidecar, and the index.
+    const projectDir = codexProjectPath()
     // The real CLI REFUSES to boot when CODEX_HOME does not exist, and its
     // static-musl filesystem probes cannot see the 9p scratch bind anyway
     // — the container-local root is pre-created before the server boots
@@ -1222,8 +1340,55 @@ async function codexContract(args, server, receipt, observed) {
     await connectionD.exited
     const { ws, frames } = await server.wsHello()
     const requestId = randomUUID()
-    ws.send(JSON.stringify({ type: 'freshAgent.create', requestId, sessionType: 'freshcodex', provider: 'codex', cwd: projectDir }))
-    const createdFrame = await server.waitForFrame(frames, 'freshAgent.created', 60_000)
+    // The REAL client's frame shape (FreshAgentView.tsx:1246): the pane's
+    // pre-durable `namingHandle` is always present, and resuming an existing
+    // thread rides the provider-matched `sessionRef` (the raw-layer
+    // `resumeSessionId` is refused). The resume + handle are also what make
+    // the native writeback POSSIBLE: the pending→durable bind
+    // (`try_bind_pending_naming`) transfers the VERIFIED codex location
+    // (codexHome + thread id) onto the legacy record — the codex adapter is
+    // live-connection-only BY DESIGN (never the cold snapshot, never a
+    // lease), so a plain create of a NEW thread leaves the legacy record
+    // with NO location (locationRevision 0) and its writeback stays
+    // pending forever (observed end-to-end in this container).
+    const namingHandle = `pane-${randomUUID()}`
+    ws.send(JSON.stringify({
+      type: 'freshAgent.create',
+      requestId,
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      cwd: projectDir,
+      sessionRef: { provider: 'codex', sessionId: legacyId },
+      namingHandle,
+    }))
+    // A refusal is a first-class answer: `freshAgent.create.failed`
+    // (spawn budget exceeded, root mismatch, validation) carries the
+    // reason, and a bare success-only wait would mask it behind a timeout.
+    // Every frame seen so far rides the error message — the silent-drop
+    // (typed-parse rejection) case is distinguishable from a hang by the
+    // empty frame list. 75s covers the sidecar's 45s startup budget plus
+    // retry/teardown overhead with margin.
+    const summarizeFrames = () => JSON.stringify(frames.map((frame) => {
+      const summary = { type: frame.type }
+      if (frame.code) summary.code = frame.code
+      const message = frame.message ?? frame.error?.message
+      if (message) summary.message = String(message).slice(0, 300)
+      if (frame.requestId) summary.requestId = frame.requestId
+      if (frame.reason) summary.reason = frame.reason
+      return summary
+    }))
+    let createdFrame
+    try {
+      createdFrame = await server.waitForFrameAny(frames, ['freshAgent.created', 'freshAgent.create.failed', 'freshAgent.error', 'error'], 75_000)
+      if (createdFrame.type !== 'freshAgent.created') {
+        throw new Error(`freshAgent.create refused: ${summarizeFrames()}`)
+      }
+      if (createdFrame.sessionId !== legacyId) {
+        throw new Error(`the resume-create must preserve the thread id verbatim: got ${createdFrame.sessionId}, requested ${legacyId}`)
+      }
+    } catch (error) {
+      throw new Error(`${error.message}${frames.length > 0 ? `; frames so far: ${summarizeFrames()}` : '; NO frames received (silent drop or dead socket)'}`)
+    }
     result.freshCodexSession = createdFrame.sessionId
     const codexTarget = { kind: 'session', provider: 'codex', sessionId: legacyId }
     await pollUntil(
@@ -1237,7 +1402,23 @@ async function codexContract(args, server, receipt, observed) {
     const serverName = 'Server-written codex name'
     const renameRoute = await server.renameCanonical(codexTarget, serverName, 'user')
     if (!renameRoute.ok) throw new Error(`server canonical rename failed: ${renameRoute.status} ${JSON.stringify(renameRoute.body)}`)
-    const synced = await server.waitForNativeSync(codexTarget, ['synced'], 120_000)
+    result.serverRenameResponse = renameRoute.body
+    let synced
+    try {
+      synced = await server.waitForNativeSync(codexTarget, ['synced'], 120_000)
+    } catch (error) {
+      // A sync-wait timeout is unattributable without the raw evidence:
+      // the accepted rename's own projection, the raw read body (the read
+      // OMITS unknown refs — an empty list means the store lost the record,
+      // not that it merely never synced), and the durable store document
+      // itself (records + keys + redirects, container-local + coherent).
+      const rawRead = await server.readNames([codexTarget]).catch((e) => `read error: ${e.message}`)
+      let storeDocument = '(unreadable)'
+      try {
+        storeDocument = fs.readFileSync(path.join(server.home, '.freshell', 'session-names.json'), 'utf8')
+      } catch { /* absent */ }
+      throw new Error(`${error.message}; raw read: ${JSON.stringify(rawRead)}; store document: ${storeDocument.slice(0, 8_000)}`)
+    }
     result.serverWriteback = synced.nativeSync
     const connectionF = new CodexAppServer(binary, codexChildEnv(home), 'codex-F')
     await connectionF.start()
@@ -1310,16 +1491,28 @@ async function codexContract(args, server, receipt, observed) {
 // OpenCode contract
 // ---------------------------------------------------------------------------
 
-function opencodeChildEnv(opencodeScratch, extra = {}) {
+/** The opencode contract's container-local base (the contract HOME,
+ * managed-config dir, project dir, mismatch database, serve logs) — same
+ * rationale as [`codexHomePath`]. The serves' XDG roots themselves come
+ * from [`opencodeXdgRoots`] — the SAME roots the Rust server env uses —
+ * so the server's index adopts the contract's sessions and its managed
+ * serve writes back to the SAME effective database (step 8's
+ * same-database writeback requirement). */
+function opencodeContractBase() {
+  return path.join('/home/sandbox', '.native-smoke', 'opencode-contract')
+}
+
+function opencodeChildEnv(extra = {}) {
+  const roots = opencodeXdgRoots()
   return {
     PATH: '/usr/local/bin:/usr/bin:/bin',
-    HOME: path.join(opencodeScratch, 'home'),
-    XDG_DATA_HOME: path.join(opencodeScratch, 'data'),
-    XDG_CACHE_HOME: path.join(opencodeScratch, 'cache'),
-    XDG_STATE_HOME: path.join(opencodeScratch, 'state'),
-    XDG_CONFIG_HOME: path.join(opencodeScratch, 'config-global'),
-    TMPDIR: path.join(opencodeScratch, 'tmp'),
-    OPENCODE_TEST_MANAGED_CONFIG_DIR: path.join(opencodeScratch, 'managed-config'),
+    HOME: path.join(opencodeContractBase(), 'home'),
+    XDG_DATA_HOME: roots.data,
+    XDG_CACHE_HOME: roots.cache,
+    XDG_STATE_HOME: roots.state,
+    XDG_CONFIG_HOME: roots.configGlobal,
+    TMPDIR: roots.tmp,
+    OPENCODE_TEST_MANAGED_CONFIG_DIR: path.join(opencodeContractBase(), 'managed-config'),
     OPENCODE_DISABLE_PROJECT_CONFIG: '1',
     OPENCODE_PURE: '1',
     OPENCODE_DISABLE_DEFAULT_PLUGINS: '1',
@@ -1332,9 +1525,8 @@ function opencodeChildEnv(opencodeScratch, extra = {}) {
 }
 
 class OpencodeServe {
-  constructor(opencodeBinary, scratch, label, extraEnv = {}) {
+  constructor(opencodeBinary, label, extraEnv = {}) {
     this.binary = opencodeBinary
-    this.scratch = scratch
     this.label = label
     this.extraEnv = extraEnv
     this.logChunks = []
@@ -1342,9 +1534,9 @@ class OpencodeServe {
 
   async start() {
     this.port = await pickFreePort()
-    const logStream = fs.openSync(path.join(this.scratch, `${this.label}.log`), 'a')
+    const logStream = fs.openSync(path.join(opencodeContractBase(), `${this.label}.log`), 'a')
     this.child = recordOwnedProcess(spawn(this.binary, ['serve', '--hostname', '127.0.0.1', '--port', String(this.port)], {
-      env: opencodeChildEnv(this.scratch, this.extraEnv),
+      env: opencodeChildEnv(this.extraEnv),
       stdio: ['ignore', logStream, logStream],
     }))
     await withTimeout(pollUntil(
@@ -1395,26 +1587,28 @@ async function opencodeContract(args, server, receipt, observed) {
   let serve3 = null
   let mismatchServer = null
   try {
-    const opencodeScratch = path.join(args.scratch, 'opencode')
-    for (const dir of ['home', 'data', 'cache', 'state', 'tmp', 'config-global/opencode', 'managed-config', 'proj', 'mismatch']) {
-      fs.mkdirSync(path.join(opencodeScratch, dir), { recursive: true })
+    const contractBase = opencodeContractBase()
+    const roots = opencodeXdgRoots()
+    for (const dir of [roots.data, roots.cache, roots.state, roots.tmp, path.join(roots.configGlobal, 'opencode'),
+      path.join(contractBase, 'home'), path.join(contractBase, 'managed-config'), path.join(contractBase, 'proj'), path.join(contractBase, 'mismatch')]) {
+      fs.mkdirSync(dir, { recursive: true })
     }
     // The source-proven no-install path: preseed the global config's
     // .gitignore, then make the config tree READ-ONLY for the provider
     // child so opencode's npm-install early-return fires (a failed
     // background install would be a gate failure, not harmless noise).
-    fs.writeFileSync(path.join(opencodeScratch, 'config-global', 'opencode', '.gitignore'), 'node_modules/\n')
-    fs.rmSync(path.join(opencodeScratch, 'home', '.opencode'), { force: true, recursive: true })
+    fs.writeFileSync(path.join(roots.configGlobal, 'opencode', '.gitignore'), 'node_modules/\n')
+    fs.rmSync(path.join(contractBase, 'home', '.opencode'), { force: true, recursive: true })
     const binary = path.join(args.opencodeRoot, 'bin', 'opencode')
-    const projectDir = path.join(opencodeScratch, 'proj')
+    const projectDir = path.join(contractBase, 'proj')
     result.route = {
-      dataHome: '/scratch/opencode/data',
-      database: '/scratch/opencode/data/opencode/opencode.db',
-      project: '/scratch/opencode/proj',
+      dataHome: roots.data,
+      database: path.join(roots.data, 'opencode', 'opencode.db'),
+      project: projectDir,
     }
 
     // (1) Zero-message POST /session {} on an owned scratch serve.
-    serve1 = await new OpencodeServe(binary, opencodeScratch, 'serve1').start()
+    serve1 = await new OpencodeServe(binary, "serve1").start()
     const createResponse = await fetchJson(`${serve1.baseUrl()}/session?directory=${encodeURIComponent(projectDir)}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -1432,18 +1626,39 @@ async function opencodeContract(args, server, receipt, observed) {
     result.createdTitle = session.title
     result.operations.push('serve:postSession:zeroMessage')
 
-    // (2) Writer event stream: connect BEFORE the title write and record
-    // the session.updated frame (properties.info.id must parse).
+    // (2) Writer event streams: connect BEFORE the title write and record
+    // the session.updated frame (properties.info.id must parse). BOTH the
+    // per-serve `/event` stream (the product lane's busy/status consumer)
+    // AND the `/global/event` stream (the product naming lane's
+    // TITLE-observation consumer, `freshell-opencode/src/serve.rs:769`)
+    // are subscribed — the installed serve (1.18.31) was observed NOT to
+    // carry `session.updated` for a title PATCH on `/event` alone (the
+    // stream connected and delivered `server.connected`, then nothing),
+    // and `/global/event` wraps frames under `payload` (the product's
+    // `event_payload` normalizes both shapes; so does the matcher below).
     const events = []
+    const eventStreamDiagnostics = { streams: {} }
     const eventController = new AbortController()
-    const eventReader = (async () => {
+    const consumeEventStream = async (streamPath) => {
+      const diagnostics = { status: null, contentType: null, chunks: 0, error: null, rawHead: [] }
+      eventStreamDiagnostics.streams[streamPath] = diagnostics
       try {
-        const response = await fetch(`${serve1.baseUrl()}/event`, { signal: eventController.signal })
+        const response = await fetch(`${serve1.baseUrl()}${streamPath}`, { signal: eventController.signal })
+        diagnostics.status = response.status
+        diagnostics.contentType = response.headers.get('content-type')
+        if (!response.ok) {
+          diagnostics.rawHead.push((await response.text().catch(() => '')).slice(0, 400))
+          return
+        }
         const reader = response.body.getReader()
         let buffer = ''
         for (;;) {
           const { done, value } = await reader.read()
           if (done) break
+          diagnostics.chunks += 1
+          if (diagnostics.rawHead.length < 8) {
+            diagnostics.rawHead.push(new TextDecoder().decode(value).slice(0, 300))
+          }
           buffer += new TextDecoder().decode(value)
           let index
           while ((index = buffer.indexOf('\n\n')) !== -1) {
@@ -1459,10 +1674,16 @@ async function opencodeContract(args, server, receipt, observed) {
             }
           }
         }
-      } catch {
+      } catch (error) {
+        diagnostics.error = String(error)
         // stream ended
       }
-    })()
+    }
+    const eventReaders = Promise.all([
+      consumeEventStream('/event'),
+      consumeEventStream('/global/event'),
+    ])
+    result.eventStreamDiagnostics = eventStreamDiagnostics
 
     // (3) Production GET/PATCH/GET through the runner-owned serve.
     const nativeTitle = 'Native opencode title'
@@ -1482,22 +1703,59 @@ async function opencodeContract(args, server, receipt, observed) {
     result.persistence = 'pass'
     result.operations.push('serve:getTitle')
 
-    // (4) The writer event stream observed the update (bounded wait).
-    const updatedEvent = await withTimeout(pollUntil(
-      'session.updated event',
-      async () => events.find((event) => event.type === 'session.updated' && (event.properties?.sessionID === session.id || event.properties?.info?.id === session.id)) ?? null,
+    // (4) The writer event streams are LIVE and parseable, and a
+    // session.updated frame for the session is recorded when the installed
+    // serve emits one. HARD asserts: both streams connected and delivered
+    // the frames the product's own consumers parse (the lane's busy/status
+    // consumer on `/event`; the naming lane's title-observation consumer on
+    // `/global/event` — `freshell-opencode/src/serve.rs:769`). OBSERVATIONAL:
+    // `session.updated` for the title PATCH — opencode 1.18.31 does NOT
+    // emit one for a metadata-only PATCH on a zero-message session (both
+    // streams verified healthy, `server.connected` + heartbeats only), and
+    // no Freshell consumer depends on a self-writeback event (the naming
+    // lane observes NATIVE-side title changes; steps 3/5/6 prove the
+    // writeback persists). The eventShape receipt records what came.
+    const eventOf = (event) => ({
+      type: event.type ?? event.payload?.type ?? null,
+      properties: event.properties ?? event.payload?.properties ?? null,
+    })
+    const streamsLive = await withTimeout(pollUntil(
+      'writer event streams live (server.connected on both /event and /global/event)',
+      async () => (['/event', '/global/event'].every((streamPath) => {
+        const rawHead = eventStreamDiagnostics.streams[streamPath]?.rawHead ?? []
+        return rawHead.some((line) => line.includes('"server.connected"'))
+      }) ? { ok: true } : null),
       10_000,
       100,
-    ), 12_000, 'session.updated event')
-    result.eventShape = {
-      type: updatedEvent.type,
-      sessionID: updatedEvent.properties?.sessionID ?? null,
-      infoId: updatedEvent.properties?.info?.id ?? null,
+    ), 12_000, 'writer event streams live')
+    if (!streamsLive.ok) {
+      throw new Error(`writer event streams not live/parseable: ${JSON.stringify(eventStreamDiagnostics)}`)
     }
+    const updatedEvent = await withTimeout(pollUntil(
+      'session.updated event',
+      async () => {
+        for (const raw of events) {
+          const event = eventOf(raw)
+          if (event.type === 'session.updated' && (event.properties?.sessionID === session.id || event.properties?.info?.id === session.id)) {
+            return { raw, event }
+          }
+        }
+        return null
+      },
+      10_000,
+      100,
+    ), 12_000, 'session.updated event').catch(() => null)
+    result.eventShape = updatedEvent
+      ? {
+          type: updatedEvent.event.type,
+          sessionID: updatedEvent.event.properties?.sessionID ?? null,
+          infoId: updatedEvent.event.properties?.info?.id ?? null,
+        }
+      : { observed: false, note: 'opencode 1.18.31 emits no session.updated for a metadata-only PATCH on a zero-message session' }
     result.operations.push('serve:writerEventStream')
 
     // (5) SQLite stays read-only to Freshell and carries the row.
-    const dbPath = path.join(opencodeScratch, 'data', 'opencode', 'opencode.db')
+    const dbPath = path.join(opencodeXdgRoots().data, 'opencode', 'opencode.db')
     const { execFile } = await import('node:child_process')
     const sqliteProbe = await new Promise((resolve) => {
       execFile('python3', ['-c', `
@@ -1519,7 +1777,7 @@ print(row, messages[0][0])
 
     // (6) Restart ONLY the owned scratch serve; the title persists.
     serve1.stop()
-    serve2 = await new OpencodeServe(binary, opencodeScratch, 'serve2').start()
+    serve2 = await new OpencodeServe(binary, "serve2").start()
     const restartRead = await fetchJson(`${serve2.baseUrl()}/session/${session.id}`)
     if (restartRead.body?.title !== nativeTitle) {
       throw new Error(`serve restart lost the title: ${JSON.stringify(restartRead.body)}`)
@@ -1529,15 +1787,24 @@ print(row, messages[0][0])
 
     // (7) A second same-database management connection sees the row without
     // taking execution ownership.
-    serve3 = await new OpencodeServe(binary, opencodeScratch, 'serve3').start()
+    serve3 = await new OpencodeServe(binary, "serve3").start()
     const secondConnectionRead = await fetchJson(`${serve3.baseUrl()}/session/${session.id}`)
     if (secondConnectionRead.body?.title !== nativeTitle) {
       throw new Error(`second management connection lost the title: ${JSON.stringify(secondConnectionRead.body)}`)
     }
     result.operations.push('serve:secondManagementConnection')
 
-    // (8) Through the Rust rename route: the server's index adopts the row
-    // and its managed serve writes back to the SAME effective database.
+    // (8a) Hydration gate + the indexed-session observation. The serve-
+    // created zero-message session IS indexed (the poll) and its canonical
+    // naming record hydrates from a periodic sweep — the hydration races the
+    // index by up to ~2 min (observed both ways: a rename in the gap 404s
+    // NAME_NOT_FOUND, a later rename finds revision 13). GATE on the record
+    // (the claude contract's own pattern), then rename it: the record has NO
+    // verified native location (locationRevision 0 — only a live lane-owned
+    // session gets one), so its nativeSync honestly stays `pending` (native
+    // writes are deferred by design until a live connection can carry them —
+    // the codex leg proved the same rule). The receipt RECORDS that state;
+    // the writeback proof is (8b), through the server's own agent lane.
     const target = { kind: 'session', provider: 'opencode', sessionId: session.id }
     await pollUntil(
       'opencode session indexed',
@@ -1547,12 +1814,123 @@ print(row, messages[0][0])
       },
       60_000,
     )
+    const hydrated = await withTimeout(pollUntil(
+      'serve-created session naming record hydrated',
+      async () => await server.readOne(target),
+      150_000,
+      1_000,
+    ), 160_000, 'serve-created session naming record hydrated')
+    result.indexedSessionObservation = {
+      source: hydrated.record.source,
+      nativeSync: hydrated.nativeSync,
+    }
+    const indexedRename = await server.renameCanonical(target, 'Indexed-session canonical name', 'user')
+    if (!indexedRename.ok) throw new Error(`indexed-session canonical rename failed: ${indexedRename.status} ${JSON.stringify(indexedRename.body)}`)
+    result.operations.push('server:indexedSessionRename:accepted')
+
+    // (8b) The REAL server-side writeback proof, through the product's own
+    // agent lane (the e2e pending-journey machinery): a freshopencode pane
+    // created by the SERVER carries a pending naming handle that binds
+    // durable against the persisted (zero-turn) DB row, so the canonical
+    // rename HAS a record — and its native writeback runs through the
+    // server's managed serve, the SAME effective database the contract's
+    // serves read (shared XDG_DATA_HOME).
+    const agentCreate = await fetchJson(`${server.baseUrl}/api/tabs`, {
+      method: 'POST',
+      headers: server.authHeaders(),
+      body: JSON.stringify({ agent: 'opencode', cwd: projectDir }),
+    })
+    if (!agentCreate.ok) throw new Error(`opencode REST agent create failed: ${agentCreate.status} ${JSON.stringify(agentCreate.body)}`)
+    const agentPane = agentCreate.body?.data ?? {}
+    const agentTabId = agentPane.tabId
+    const agentPaneId = agentPane.paneId
+    if (!agentTabId || !agentPaneId) throw new Error(`opencode REST agent create produced no pane: ${JSON.stringify(agentPane)}`)
+    // The REST create mints a PLACEHOLDER pane (sessionId =
+    // freshopencode-<createRequestId>) with a pending naming handle; the
+    // REAL session is created when a client mounts the pane and speaks the
+    // WS create lane with the pane's createRequestId + namingHandle
+    // (FreshAgentView.tsx:1246 — the placeholder id is deterministic:
+    // makePlaceholderSessionId(requestId)). Drive that lane like the real
+    // client; the runner's WS create carries the SAME identity.
+    const agentContent = await withTimeout(pollUntil(
+      'agent pane content carries its naming handle',
+      async () => {
+        const content = await server.paneContent(agentTabId, agentPaneId)
+        if (!content?.createRequestId || typeof content.namingHandle !== 'string') return null
+        return content
+      },
+      30_000,
+      500,
+    ), 40_000, 'agent pane content carries its naming handle')
+    const { ws: agentWs, frames: agentFrames } = await server.wsHello()
+    agentWs.send(JSON.stringify({
+      type: 'freshAgent.create',
+      requestId: agentContent.createRequestId,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      cwd: projectDir,
+      namingHandle: agentContent.namingHandle,
+    }))
+    let agentCreatedFrame
+    try {
+      agentCreatedFrame = await server.waitForFrameAny(agentFrames, ['freshAgent.created', 'freshAgent.create.failed', 'freshAgent.error', 'error'], 75_000)
+      if (agentCreatedFrame.type !== 'freshAgent.created') {
+        throw new Error(`the agent pane's freshAgent.create refused: ${JSON.stringify(agentCreatedFrame)}`)
+      }
+    } catch (error) {
+      throw new Error(`${error.message}; frames so far: ${JSON.stringify(agentFrames.map((frame) => ({ type: frame.type, code: frame.code, message: (frame.message ?? '').slice(0, 200) })))}`)
+    }
+    try {
+      agentWs.close()
+    } catch {
+      // already closed
+    }
+    // The pane content starts on the pre-durable pending handle; the DB row
+    // exists from create-time, so the verified bind lands within the window.
+    // Wait for the durable session ref (the native writeback targets it). A
+    // timeout here must carry the three decisive artifacts: the created
+    // frame's own projection (did the materialization lane bind BEFORE
+    // publishing?), the pane's LIVE content, and the naming store document
+    // (the bind's committed evidence).
+    let agentTarget
+    try {
+      agentTarget = await withTimeout(pollUntil(
+        'agent pane naming ref becomes durable',
+        async () => {
+          const ref = await server.paneNamingRef(agentTabId, agentPaneId)
+          if (!ref || ref.kind !== 'session') return null
+          return ref
+        },
+        90_000,
+        500,
+      ), 100_000, 'agent pane naming ref becomes durable')
+    } catch (error) {
+      const paneNow = await server.paneContent(agentTabId, agentPaneId).catch(() => null)
+      let storeDocument = '(unreadable)'
+      try {
+        storeDocument = fs.readFileSync(path.join(server.home, '.freshell', 'session-names.json'), 'utf8')
+      } catch { /* absent */ }
+      throw new Error(`${error.message}; created frame: ${JSON.stringify({ sessionId: agentCreatedFrame.sessionId, nameRef: agentCreatedFrame.nameRef, sessionName: agentCreatedFrame.sessionName })}; pane content now: ${JSON.stringify(paneNow)}; store document: ${storeDocument.slice(0, 8_000)}`)
+    }
+    const agentSessionId = agentTarget.sessionId
+    result.agentSession = { tabId: agentTabId, paneId: agentPaneId, sessionId: agentSessionId }
     const serverName = 'Server-written opencode name'
-    const renameRoute = await server.renameCanonical(target, serverName, 'user')
+    const renameRoute = await server.renameCanonical(agentTarget, serverName, 'user')
     if (!renameRoute.ok) throw new Error(`server canonical rename failed: ${renameRoute.status} ${JSON.stringify(renameRoute.body)}`)
-    const synced = await server.waitForNativeSync(target, ['synced'], 180_000)
+    result.serverRenameResponse = renameRoute.body
+    let synced
+    try {
+      synced = await server.waitForNativeSync(agentTarget, ['synced'], 180_000)
+    } catch (error) {
+      const rawRead = await server.readNames([agentTarget]).catch((e) => `read error: ${e.message}`)
+      let storeDocument = '(unreadable)'
+      try {
+        storeDocument = fs.readFileSync(path.join(server.home, '.freshell', 'session-names.json'), 'utf8')
+      } catch { /* absent */ }
+      throw new Error(`${error.message}; raw read: ${JSON.stringify(rawRead)}; store document: ${storeDocument.slice(0, 8_000)}`)
+    }
     result.serverWriteback = synced.nativeSync
-    const viaServe2 = await fetchJson(`${serve2.baseUrl()}/session/${session.id}`)
+    const viaServe2 = await fetchJson(`${serve2.baseUrl()}/session/${agentSessionId}`)
     if (viaServe2.body?.title !== serverName) {
       throw new Error(`server writeback not visible to the native serve: ${JSON.stringify(viaServe2.body)}`)
     }
@@ -1561,29 +1939,37 @@ print(row, messages[0][0])
     // (9) Deliberate database mismatch: a second short-lived Rust server
     // whose OPENCODE_DB override points at a DIFFERENT scratch database must
     // diagnose the mismatch (native never syncs) without losing the Freshell
-    // name in ITS canonical store.
-    const mismatchDb = path.join(opencodeScratch, 'mismatch', 'other.db')
+    // name in ITS canonical store. Its store is seeded by COPYING the main
+    // server's canonical document before boot (a fresh store would have NO
+    // record for the target and its rename would 404 the same way (8a)
+    // proved) — the copied record's verified location points at the REAL
+    // database while the override points elsewhere: the mismatch diagnosis.
+    const mismatchDb = path.join(opencodeContractBase(), 'mismatch', 'other.db')
+    const mismatchHome = path.join('/home/sandbox', '.native-smoke', 'server-home-mismatch')
+    const mismatchStoreDir = path.join(mismatchHome, '.freshell')
+    fs.mkdirSync(mismatchStoreDir, { recursive: true })
+    fs.copyFileSync(path.join(server.home, '.freshell', 'session-names.json'), path.join(mismatchStoreDir, 'session-names.json'))
     mismatchServer = new RustServer(args.runtimeRoot, args.scratch, receipt)
     mismatchServer.runtimeRoot = args.runtimeRoot
     mismatchServer.scratchCodexCmd = path.join(args.codexRoot, 'bin', 'codex')
     await mismatchServer.start({
-      home: path.join(args.scratch, 'server-home-mismatch'),
+      home: mismatchHome,
       env: { OPENCODE_DB: mismatchDb },
     })
     const mismatchName = 'Mismatch-server name'
-    const mismatchRename = await mismatchServer.renameCanonical(target, mismatchName, 'user')
-    if (!mismatchRename.ok) throw new Error(`mismatch-server rename failed: ${mismatchRename.status}`)
+    const mismatchRename = await mismatchServer.renameCanonical(agentTarget, mismatchName, 'user')
+    if (!mismatchRename.ok) throw new Error(`mismatch-server rename failed: ${mismatchRename.status} ${JSON.stringify(mismatchRename.body)}`)
     await pollUntil(
       'mismatch-server nativeSync unsynced',
       async () => {
-        const update = await mismatchServer.readOne(target)
+        const update = await mismatchServer.readOne(agentTarget)
         if (!update?.nativeSync) return null
         if (['unsynced', 'unsupported'].includes(update.nativeSync.status)) return update
         return null
       },
       120_000,
     )
-    const mismatchRecord = await mismatchServer.readOne(target)
+    const mismatchRecord = await mismatchServer.readOne(agentTarget)
     if (mismatchRecord.record.name !== mismatchName) {
       throw new Error(`mismatch server lost the Freshell name: ${JSON.stringify(mismatchRecord.record)}`)
     }
@@ -1594,7 +1980,7 @@ print(row, messages[0][0])
     mismatchServer = null
 
     // The REAL database row was never corrupted by the mismatch server.
-    const realRead = await fetchJson(`${serve2.baseUrl()}/session/${session.id}`)
+    const realRead = await fetchJson(`${serve2.baseUrl()}/session/${agentSessionId}`)
     if (realRead.body?.title !== serverName) {
       throw new Error(`mismatch server corrupted the real database row: ${JSON.stringify(realRead.body)}`)
     }
@@ -1683,7 +2069,15 @@ async function main() {
       const newest = files.at(-1)
       if (newest) {
         const lines = fs.readFileSync(path.join(logsDir, newest), 'utf8').trim().split('\n')
-        const interesting = lines.filter((line) => /codex|freshAgent|freshagent|sidecar|naming|native/i.test(line)).slice(-40)
+        // `session_names` (underscore) is the naming STORE's target/event
+        // vocabulary; `naming` alone missed every bind/rename/store error
+        // line (observed: the opencode durable-bind failure's evidence was
+        // filtered out of the tail while claude collision lines — which
+        // match via the "native" in the transcript PATH — scrolled the
+        // window). Keep both spellings plus the provider/freshagent
+        // vocabulary, and cap per-msg dedupe so one noisy family cannot
+        // crowd the rest out.
+        const interesting = lines.filter((line) => /codex|freshAgent|freshagent|opencode|sidecar|naming|session_names|session\.name|native/i.test(line)).slice(-60)
         failure += `\nserver jsonl log tail (${newest}):\n${interesting.join('\n').slice(-6_000)}\n(last 8 raw):\n${lines.slice(-8).join('\n')}`
       }
     } catch { /* the logs dir may be absent */ }
