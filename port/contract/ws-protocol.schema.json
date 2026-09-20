@@ -2,7 +2,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "schemaCount": 83,
+  "schemaCount": 84,
   "schemas": {
     "AmplifierActivityListResponseSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1340,6 +1340,43 @@
           "required": [
             "type",
             "terminalId"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "attachRequestId": {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            "consumedSeq": {
+              "maximum": 9007199254740991,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "streamId": {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            "terminalId": {
+              "maxLength": 512,
+              "minLength": 1,
+              "type": "string"
+            },
+            "type": {
+              "const": "terminal.replay.credit",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "terminalId",
+            "streamId",
+            "attachRequestId",
+            "consumedSeq"
           ],
           "type": "object"
         },
@@ -8697,6 +8734,44 @@
         "type",
         "upsert",
         "remove"
+      ],
+      "type": "object"
+    },
+    "TerminalReplayCreditSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "attachRequestId": {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        "consumedSeq": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "streamId": {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        "terminalId": {
+          "maxLength": 512,
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.replay.credit",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "terminalId",
+        "streamId",
+        "attachRequestId",
+        "consumedSeq"
       ],
       "type": "object"
     },

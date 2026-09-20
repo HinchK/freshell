@@ -51,7 +51,7 @@ use freshell_platform::SpawnSpec;
 use freshell_protocol::{
     GeometryAuthority, InventoryTerminal, OutputSource, ServerMessage, SessionLocator,
     TerminalAttachIntent, TerminalAttachReady, TerminalExit, TerminalModesSync, TerminalOutput,
-    TerminalRunStatus,
+    TerminalOutputGap, TerminalOutputGapReason, TerminalReplayResetReason, TerminalRunStatus,
 };
 
 use crate::barrier_scanner::{BarrierReason, BarrierScanner, ScannerState};
@@ -81,6 +81,15 @@ const MIN_SCROLLBACK_CHARS: i64 = 64 * 1024;
 const MAX_SCROLLBACK_CHARS: i64 = 4 * 1024 * 1024;
 /// `APPROX_CHARS_PER_LINE` (`terminal-registry.ts:60`).
 const APPROX_CHARS_PER_LINE: i64 = 300;
+/// Responsive-terminal-restore Workstream 1: the default serialized-byte
+/// budget of ONE paced replay page (the plan's "128 KiB initial terminal
+/// batch target" — a per-page delivery bound, NOT a claim about total
+/// reconstruction size). The budget covers the JSON envelope, escaping,
+/// and batch-segment metadata; a single frame whose own envelope exceeds it
+/// forms its own atomic single-frame page (guaranteed progress). Held as a
+/// registry-level atomic (like `scrollback_max_bytes`) so focused tests can
+/// shrink it per-instance without env races.
+pub const DEFAULT_PACED_PAGE_MAX_BYTES: i64 = 128 * 1024;
 
 /// `computeScrollbackMaxChars(settings)` (`terminal-registry.ts:1328-1333`):
 /// `settings.terminal.scrollback` LINES converted to an approximate **CHAR**
@@ -137,6 +146,103 @@ pub struct ReplayBounds {
     pub oldest_retained_seq: i64,
 }
 
+/// The ws pacing coordinator's session description for one paced replay
+/// (responsive-terminal-restore Workstream 1): everything the coordinator
+/// needs to gate continuation credits and drive page reads. Produced by the
+/// paced attach, owned by the connection (one session per
+/// (connection, terminal); a re-attach replaces it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PacedSessionDesc {
+    pub terminal_id: String,
+    pub stream_id: String,
+    /// The attach generation this session serves; stale-credit rejection key.
+    pub attach_request_id: String,
+    /// FIXED catch-up target: `head_seq` at attach time. Ongoing output never
+    /// extends it — frames past the target are tail-phase delivery.
+    pub target: i64,
+    /// The effective replay baseline (the requested `sinceSeq` clamped to
+    /// ≥ 0, reset to `oldest-1` on attach-time retention loss).
+    pub effective_since: i64,
+    /// The production cursor: the last seq sent in a page (== the first
+    /// page's last seq; `effective_since` when the first page is empty).
+    pub page_end: i64,
+    /// Serialized wire bytes of the first page (observability).
+    pub page_bytes: u64,
+}
+
+/// What a negotiated (paced) attach returns to the ws layer INSTEAD of an
+/// inline replay burst: the session description plus the FIRST page's wire
+/// messages. The ws layer sinks the page AFTER the terminal lock is
+/// released; subsequent pages are produced on continuation credit and the
+/// tail range `(target, head]` is drained as ordinary delivery.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PacedAttachStart {
+    pub session: PacedSessionDesc,
+    pub first_page: Vec<ServerMessage>,
+}
+
+/// Result of [`TerminalRegistry::next_replay_page`] — one bounded,
+/// ascending page of the `(from_seq, target]` window, the window's
+/// completion, an exact retention-loss report, or the session's
+/// disappearance.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub enum PacedPage {
+    /// One packed page: ascending wire messages, the page's last seq (the
+    /// session's new cursor), and the page's total serialized bytes.
+    Frames {
+        messages: Vec<ServerMessage>,
+        end_seq: i64,
+        serialized_bytes: u64,
+    },
+    /// `from_seq >= target` — the replay window is fully delivered.
+    Done,
+    /// Retention evicted the frames the session needs next. The exact lost
+    /// interval is `[lost_from, lost_to]` and the session continues from
+    /// `resume_from` (the new ring front − 1); `head_seq`/`oldest_retained_seq`
+    /// are the task-2 bounds fields for the negotiated gap frame.
+    Expired {
+        lost_from: i64,
+        lost_to: i64,
+        resume_from: i64,
+        head_seq: i64,
+        oldest_retained_seq: i64,
+    },
+    /// The terminal (or this connection's subscriber) is gone — cancel the
+    /// session; there is no deferral left to clear.
+    Gone,
+}
+
+/// Result of [`TerminalRegistry::next_paced_tail_page`] — the post-replay
+/// catch-up phase: pages over `(from_seq, head]` until the ring is drained,
+/// at which point the deferral clears ATOMICALLY under the same lock hold
+/// and live output resumes direct fan-out.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub enum PacedTailPage {
+    /// One packed page of the accumulated live range.
+    Frames {
+        messages: Vec<ServerMessage>,
+        end_seq: i64,
+        serialized_bytes: u64,
+    },
+    /// Retention evicted part of the tail range — the same exact-interval
+    /// report as [`PacedPage::Expired`].
+    Expired {
+        lost_from: i64,
+        lost_to: i64,
+        resume_from: i64,
+        head_seq: i64,
+        oldest_retained_seq: i64,
+    },
+    /// The ring is drained and the deferral is CLEARED (under this lock
+    /// hold): frames appended after this point fan out directly. The paced
+    /// session is complete.
+    CaughtUp,
+    /// The terminal or subscriber is gone — cancel the session.
+    Gone,
+}
+
 /// One attached connection's subscription to a terminal's live stream.
 struct Subscriber {
     /// Where this connection's frames go (its socket, via a tokio mpsc in `freshell-ws`).
@@ -152,13 +258,30 @@ struct Subscriber {
     terminal_output_batch_v1: bool,
     /// `hello.capabilities.pacedTerminalReplayV1` for this connection
     /// (responsive-terminal-restore Workstream 1): parked on the subscriber
-    /// exactly like `terminal_output_batch_v1`. The shared restore contract's
-    /// bounds reporting (`attach.ready.oldestRetainedSeq`) is driven by the
-    /// attach-time parameter in `attach_to_shared`; this per-subscriber copy
-    /// remains for the paced replay delivery core (registry pages +
-    /// coordinator, task 3), which has no reader yet.
-    #[allow(dead_code)] // consumed by Workstream 1 paced replay (task 3)
+    /// exactly like `terminal_output_batch_v1`. Gates the registry's paced
+    /// page reads — a subscriber that did not negotiate never serves them.
     paced_terminal_replay_v1: bool,
+    /// Restore contract (responsive-terminal-restore): while a paced replay
+    /// session is active for this (connection, terminal), [`ingest`] does NOT
+    /// fan output out to this subscriber — the retained ring IS the staging
+    /// and the session's pages deliver the range in seq order. Armed by the
+    /// paced attach, cleared ATOMICALLY under the per-terminal lock by the
+    /// tail read that finds the ring drained (`next_paced_tail_page`), so
+    /// the flag-clear + page-read boundary can neither lose nor duplicate a
+    /// frame: everything appended before the clear is paged, everything
+    /// appended after it is fanned out directly.
+    paced_deferred: bool,
+    /// TERM-07 seam: the attach's `maxReplayBytes` request, threaded through
+    /// BOTH attach paths and recorded here with NO delivery-behavior change
+    /// this increment. The plan's binding rule preserves the field's legacy
+    /// serialized-tail-budget meaning and forbids interpreting it under the
+    /// paced capability (no newest-tail selection exists until the
+    /// validated-baseline/screen-snapshot increment); the paced-start
+    /// observability event reports it (from the wire frame, in the ws
+    /// layer), and the increment-3 snapshot work consumes this record.
+    #[allow(dead_code)]
+    // the increment-3 snapshot work reads it; nothing may read it THIS increment
+    max_replay_bytes: Option<i64>,
 }
 
 /// One retained produced frame plus its persistent barrier classification (the ring's
@@ -652,6 +775,10 @@ pub struct TerminalRegistry {
     /// Captured into each new terminal's `max_replay_chars` at [`Self::create`]
     /// time (TERM-13) -- see [`compute_scrollback_max_bytes`].
     scrollback_max_bytes: Arc<AtomicI64>,
+    /// Responsive-terminal-restore Workstream 1: the serialized-byte budget
+    /// of ONE paced replay page ([`DEFAULT_PACED_PAGE_MAX_BYTES`]). Atomic so
+    /// focused tests shrink it per-instance without env races.
+    paced_page_max_bytes: Arc<AtomicI64>,
     /// TERM-15/TERM-16 activity tap (see [`ActivityEvent`]). Set once at boot
     /// by the activity hub; `None` (the default) keeps every fire point a
     /// cheap no-op. RwLock: read per event, written once.
@@ -756,7 +883,7 @@ impl Default for TerminalRegistry {
 /// `attach.ready` + replay were enqueued to the caller's sink) — `false` draws the
 /// reference's `INVALID_TERMINAL_ID` reply (attach to an unknown terminal; an
 /// exited-but-still-registered terminal is `found: true` + a synthetic exit).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 #[must_use]
 pub struct AttachOutcome {
     pub found: bool,
@@ -764,6 +891,12 @@ pub struct AttachOutcome {
     /// [`TerminalRegistry::attach_with_geometry`]. Plain [`TerminalRegistry::attach`]
     /// has no geometry input and returns `None`.
     pub geometry: Option<AttachResizeStatus>,
+    /// A negotiated (pacedTerminalReplayV1 + attachRequestId) attach to a
+    /// RUNNING terminal: the paced session start — the first page's wire
+    /// messages plus the session description — INSTEAD of an inline replay
+    /// burst. `None` on every legacy path (non-negotiated, missing
+    /// attachRequestId, already-exited terminal).
+    pub paced: Option<PacedAttachStart>,
 }
 
 /// Outcome of [`TerminalRegistry::input`]: whether the terminal existed (the
@@ -946,6 +1079,7 @@ impl TerminalRegistry {
             active_connections: Arc::new(AtomicI64::new(0)),
             auto_kill_idle_minutes: Arc::new(AtomicI64::new(DEFAULT_AUTO_KILL_IDLE_MINUTES)),
             scrollback_max_bytes: Arc::new(AtomicI64::new(DEFAULT_MAX_SCROLLBACK_CHARS)),
+            paced_page_max_bytes: Arc::new(AtomicI64::new(DEFAULT_PACED_PAGE_MAX_BYTES)),
             activity_observer: Arc::new(std::sync::RwLock::new(None)),
             respawn_liveness_window_ms: Arc::new(AtomicI64::new(
                 DEFAULT_RESPAWN_LIVENESS_WINDOW_MS,
@@ -1168,6 +1302,22 @@ impl TerminalRegistry {
     /// The byte cap NEW terminals are created with.
     pub fn scrollback_max_bytes(&self) -> i64 {
         self.scrollback_max_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Responsive-terminal-restore Workstream 1: update the serialized-byte
+    /// budget of one paced replay page. Applied to every page produced after
+    /// the call (the per-page read takes the terminal lock briefly, so a
+    /// live change is safe). Tests use small values for deterministic
+    /// multi-page fixtures.
+    pub fn set_paced_page_max_bytes(&self, max_bytes: i64) {
+        self.paced_page_max_bytes
+            .store(max_bytes, Ordering::Relaxed);
+    }
+
+    /// The current paced-page serialized-byte budget
+    /// ([`DEFAULT_PACED_PAGE_MAX_BYTES`] unless configured).
+    pub fn paced_page_max_bytes(&self) -> i64 {
+        self.paced_page_max_bytes.load(Ordering::Relaxed)
     }
 
     /// Reconciliation §7.5: shrink/grow the liveness window a generation must
@@ -1530,7 +1680,7 @@ impl TerminalRegistry {
     /// `reconcileTerminalSessionAssociation`, a repair channel that was dead
     /// while this frame hardcoded `None`).
     ///
-    /// 9 arguments (`clippy::too_many_arguments`): every one is a distinct,
+    /// 10 arguments (`clippy::too_many_arguments`): every one is a distinct,
     /// non-optional attach input with exactly one call site outside tests
     /// (`freshell_ws::terminal::handle_attach`, which forwards the parsed
     /// `terminal.attach` frame fields 1:1) — a params struct would just
@@ -1539,6 +1689,9 @@ impl TerminalRegistry {
     /// marker (mode replay-sync); when `Some(true)` and an
     /// `attach_request_id` is present, the tracker-synthesized mode preamble
     /// is emitted once, strictly between `attach.ready` and the replay.
+    /// `max_replay_bytes` is the attach's TERM-07 budget request — recorded
+    /// on the subscriber with no delivery-behavior change (see
+    /// [`Subscriber::max_replay_bytes`]).
     #[allow(clippy::too_many_arguments)]
     pub fn attach(
         &self,
@@ -1551,6 +1704,7 @@ impl TerminalRegistry {
         paced_terminal_replay_v1: bool,
         session_ref: Option<SessionLocator>,
         surface_reset: Option<bool>,
+        max_replay_bytes: Option<i64>,
     ) -> AttachOutcome {
         // Take the terminal's shared Arc under the registry lock, then drop the
         // registry lock so we hold ONLY the per-terminal lock during the handoff.
@@ -1562,6 +1716,7 @@ impl TerminalRegistry {
                     return AttachOutcome {
                         found: false,
                         geometry: None,
+                        paced: None,
                     }
                 }
             }
@@ -1577,6 +1732,7 @@ impl TerminalRegistry {
             paced_terminal_replay_v1,
             session_ref,
             surface_reset,
+            max_replay_bytes,
             shared,
             None,
         )
@@ -1602,6 +1758,7 @@ impl TerminalRegistry {
         paced_terminal_replay_v1: bool,
         session_ref: Option<SessionLocator>,
         surface_reset: Option<bool>,
+        max_replay_bytes: Option<i64>,
         intent: TerminalAttachIntent,
         cols: u16,
         rows: u16,
@@ -1611,6 +1768,7 @@ impl TerminalRegistry {
             return AttachOutcome {
                 found: false,
                 geometry: Some(AttachResizeStatus::Missing),
+                paced: None,
             };
         };
 
@@ -1624,6 +1782,7 @@ impl TerminalRegistry {
             paced_terminal_replay_v1,
             session_ref,
             surface_reset,
+            max_replay_bytes,
             Arc::clone(&handle.shared),
             Some((intent, cols, rows, handle.pty.as_ref())),
         )
@@ -1641,6 +1800,7 @@ impl TerminalRegistry {
         paced_terminal_replay_v1: bool,
         session_ref: Option<SessionLocator>,
         surface_reset: Option<bool>,
+        max_replay_bytes: Option<i64>,
         shared: Arc<Mutex<TerminalShared>>,
         geometry: Option<(TerminalAttachIntent, u16, u16, Option<&PtyTerminal>)>,
     ) -> AttachOutcome {
@@ -1648,6 +1808,34 @@ impl TerminalRegistry {
         let geometry = geometry.map(|(intent, cols, rows, pty)| {
             apply_attach_geometry(&mut s, intent, cols, rows, pty)
         });
+
+        // Responsive-terminal-restore Workstream 1: the paced path replaces
+        // the inline full-replay burst ONLY for negotiated connections — and
+        // only for a RUNNING terminal with an attachRequestId to correlate
+        // continuation credits (the already-Exited path keeps the frozen
+        // inline replay + synthetic exit, in their legacy order; a paced
+        // attach without an attachRequestId cannot be credited and falls
+        // back to the legacy inline replay, byte-identical to today).
+        let paced = paced_terminal_replay_v1
+            && attach_request_id.is_some()
+            && s.status == TerminalRunStatus::Running;
+
+        if paced {
+            return self.paced_attach_to_shared(
+                s,
+                terminal_id,
+                conn_id,
+                sink,
+                attach_request_id,
+                since_seq,
+                terminal_output_batch_v1,
+                session_ref,
+                surface_reset,
+                max_replay_bytes,
+                geometry,
+            );
+        }
+
         let effective_since = since_seq.max(0);
 
         // Snapshot the replay window: every retained frame newer than the client's
@@ -1685,6 +1873,8 @@ impl TerminalRegistry {
                 attach_request_id: attach_request_id.clone(),
                 terminal_output_batch_v1,
                 paced_terminal_replay_v1,
+                paced_deferred: false,
+                max_replay_bytes,
             },
         );
         // Somebody attached => this terminal is wanted. A later socket drop
@@ -1780,6 +1970,176 @@ impl TerminalRegistry {
         AttachOutcome {
             found: true,
             geometry,
+            paced: None,
+        }
+    }
+
+    /// The PACED attach handoff (responsive-terminal-restore Workstream 1):
+    /// the negotiated Running-terminal replacement for the inline
+    /// full-replay burst. Under the same per-terminal lock as the legacy
+    /// path: apply geometry, resolve the retention-adjusted baseline, arm
+    /// the subscriber's deferral (the ring becomes the staging), sink the
+    /// ready/sync/retention-gap prelude, and SELECT the first page's frames
+    /// (never a full-ring clone). The first page travels back to the ws
+    /// caller — it is sunk only after the lock is released; the ws pacing
+    /// coordinator owns the session (credits, tail drain, completion).
+    ///
+    /// Retention loss at attach (the requested baseline predates the
+    /// retained ring): emit the negotiated `terminal.output.gap` with reason
+    /// `replay_window_exceeded` for the exact lost interval
+    /// `[effective+1, oldest-1]` plus the task-2 bounds fields, stamp the
+    /// ready frame's `replayResetReason: retention_lost`, and CONTINUE from
+    /// what is retained (baseline `oldest-1`) — nothing is killed, nothing
+    /// stalls; the client shows the honest incomplete-history state.
+    /// Non-negotiated attaches keep today's silent behavior exactly (see
+    /// the legacy branch above).
+    #[allow(clippy::too_many_arguments)]
+    fn paced_attach_to_shared(
+        &self,
+        mut s: std::sync::MutexGuard<'_, TerminalShared>,
+        terminal_id: &str,
+        conn_id: u64,
+        sink: FrameSink,
+        attach_request_id: Option<String>,
+        since_seq: i64,
+        terminal_output_batch_v1: bool,
+        session_ref: Option<SessionLocator>,
+        surface_reset: Option<bool>,
+        max_replay_bytes: Option<i64>,
+        geometry: Option<AttachResizeStatus>,
+    ) -> AttachOutcome {
+        let effective_requested = since_seq.max(0);
+        let head_seq = s.head_seq;
+        let oldest = s.oldest_retained_seq();
+
+        // Retention loss: the first position the client needs
+        // (`effective+1`) predates the retained ring.
+        let retention_lost = effective_requested + 1 < oldest;
+        let baseline = if retention_lost {
+            oldest - 1
+        } else {
+            effective_requested
+        };
+        let arid = attach_request_id
+            .clone()
+            .expect("the paced path requires an attachRequestId");
+
+        // Arm the deferral with the subscriber installation: from this
+        // point until the session completes, ingest does NOT fan out to
+        // this subscriber — the pages and the tail deliver its range in
+        // seq order (the ring is the staging).
+        s.subscribers.insert(
+            conn_id,
+            Subscriber {
+                sink: Arc::clone(&sink),
+                attach_request_id: Some(arid.clone()),
+                terminal_output_batch_v1,
+                paced_terminal_replay_v1: true,
+                paced_deferred: true,
+                max_replay_bytes,
+            },
+        );
+        s.released_by_client = false;
+
+        // replayFrom/To describe the FULL window the session will deliver
+        // (the same first/last-span meaning as legacy, projected onto the
+        // paced range): `(baseline, head]`, or the empty span when the
+        // baseline already sits at the head.
+        let (replay_from, replay_to) = if baseline >= head_seq {
+            (head_seq + 1, head_seq)
+        } else {
+            (baseline + 1, head_seq)
+        };
+
+        let ready = ServerMessage::TerminalAttachReady(TerminalAttachReady {
+            head_seq,
+            replay_from_seq: replay_from,
+            replay_to_seq: replay_to,
+            stream_id: s.stream_id.clone(),
+            terminal_id: terminal_id.to_string(),
+            attach_request_id: Some(arid.clone()),
+            effective_since_seq: Some(baseline),
+            geometry_authority: Some(s.geometry_authority()),
+            geometry_epoch: Some(s.geometry_epoch),
+            oldest_retained_seq: Some(oldest),
+            replay_reset_reason: retention_lost.then_some(TerminalReplayResetReason::RetentionLost),
+            requested_since_seq: Some(since_seq),
+            session_ref,
+        });
+        sink(ready);
+
+        // The modes.sync preamble, byte-identical to the legacy block (a
+        // fresh surface still needs the emulator-mode prelude; the sync
+        // stays ahead of the pages by admission order — the first page is
+        // sunk only after this lock is released).
+        if surface_reset == Some(true) {
+            let data = s.modes.synthesize();
+            if !data.is_empty() {
+                sink(ServerMessage::TerminalModesSync(TerminalModesSync {
+                    terminal_id: terminal_id.to_string(),
+                    attach_request_id: arid.clone(),
+                    stream_id: s.stream_id.clone(),
+                    data,
+                }));
+            }
+        }
+
+        // The negotiated retention gap: ordered ahead of the pages by
+        // admission (sunk here under the lock; the pages are sunk after it).
+        if retention_lost {
+            sink(ServerMessage::TerminalOutputGap(TerminalOutputGap {
+                terminal_id: terminal_id.to_string(),
+                stream_id: s.stream_id.clone(),
+                attach_request_id: Some(arid.clone()),
+                from_seq: effective_requested + 1,
+                to_seq: oldest - 1,
+                reason: TerminalOutputGapReason::ReplayWindowExceeded,
+                head_seq: Some(head_seq),
+                oldest_retained_seq: Some(oldest),
+            }));
+        }
+
+        // Select the first page (bounded by the registry's page budget),
+        // cloning ONLY the selected frames — never the whole ring.
+        let budget = self.paced_page_max_bytes();
+        let first_page = if baseline < head_seq {
+            paced_page_build(
+                &s,
+                conn_id,
+                baseline,
+                head_seq,
+                budget,
+                OutputSource::Replay,
+            )
+            .map(|build| build.messages)
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let page_end = first_page
+            .last()
+            .and_then(page_last_seq)
+            .unwrap_or(baseline.max(head_seq));
+        let page_bytes = first_page
+            .iter()
+            .map(|m| serde_json::to_string(m).map(|j| j.len()).unwrap_or(0))
+            .sum::<usize>() as u64;
+
+        AttachOutcome {
+            found: true,
+            geometry,
+            paced: Some(PacedAttachStart {
+                session: PacedSessionDesc {
+                    terminal_id: terminal_id.to_string(),
+                    stream_id: s.stream_id.clone(),
+                    attach_request_id: arid,
+                    target: head_seq,
+                    effective_since: baseline,
+                    page_end,
+                    page_bytes,
+                },
+                first_page,
+            }),
         }
     }
 
@@ -1838,6 +2198,156 @@ impl TerminalRegistry {
             head_seq: s.head_seq,
             oldest_retained_seq: s.oldest_retained_seq(),
         })
+    }
+
+    /// Paced replay page read (responsive-terminal-restore Workstream 1):
+    /// ONE bounded, ascending page of the `(from_seq, target]` window for a
+    /// deferred subscriber's session, taking the per-terminal lock briefly
+    /// (never across pages). The page is packed until the serialized budget
+    /// (envelope + escaping + batch metadata, via the batch builder's
+    /// accounting) is reached; a single frame whose own envelope exceeds the
+    /// budget forms its own atomic single-frame page. Frames are selected
+    /// BEFORE cloning — no full-ring snapshot per page.
+    ///
+    /// `Done` when `from_seq >= target`; `Expired` when retention evicted the
+    /// next needed frames (exact lost interval `[from_seq+1, new_front-1]`,
+    /// `resume_from = new_front-1`); `Gone` when the terminal or the
+    /// subscriber disappeared (cancel the session).
+    ///
+    /// Callers must NOT hold the calling connection's writer admission lock
+    /// (same lock-order rule as [`Self::replay_bounds`]).
+    pub fn next_replay_page(
+        &self,
+        terminal_id: &str,
+        conn_id: u64,
+        from_seq: i64,
+        target: i64,
+        max_serialized_bytes: i64,
+    ) -> PacedPage {
+        let Some(shared) = self.shared_for(terminal_id) else {
+            return PacedPage::Gone;
+        };
+        let s = shared.lock().expect("terminal lock");
+        let Some(sub) = s.subscribers.get(&conn_id) else {
+            return PacedPage::Gone;
+        };
+        if !sub.paced_terminal_replay_v1 {
+            return PacedPage::Gone;
+        }
+        if from_seq >= target {
+            return PacedPage::Done;
+        }
+        let oldest = s.oldest_retained_seq();
+        if from_seq + 1 < oldest {
+            return PacedPage::Expired {
+                lost_from: from_seq + 1,
+                lost_to: oldest - 1,
+                resume_from: oldest - 1,
+                head_seq: s.head_seq,
+                oldest_retained_seq: oldest,
+            };
+        }
+        match paced_page_build(
+            &s,
+            conn_id,
+            from_seq,
+            target,
+            max_serialized_bytes,
+            OutputSource::Replay,
+        ) {
+            Some(build) => PacedPage::Frames {
+                messages: build.messages,
+                end_seq: build.end_seq,
+                serialized_bytes: build.serialized_bytes,
+            },
+            // Defensive: the window is non-empty and retained (checked
+            // above), so an empty build means nothing the walk could select —
+            // treat the window as delivered rather than stalling the session.
+            None => PacedPage::Done,
+        }
+    }
+
+    /// Paced replay TAIL page read: the post-replay catch-up phase. Pages the
+    /// accumulated live range `(from_seq, head]` through the same budget
+    /// mechanism, and — when the read finds the ring DRAINED (`from_seq >=
+    /// head`) — clears the subscriber's deferral UNDER THE SAME LOCK HOLD
+    /// and returns `CaughtUp`: every frame appended before the clear was
+    /// paged, every frame appended after it fans out directly, so the
+    /// flag-clear boundary can neither lose nor duplicate a frame, and live
+    /// output can never overtake an un-sent page (the clear only happens
+    /// when no page remains un-sunk).
+    pub fn next_paced_tail_page(
+        &self,
+        terminal_id: &str,
+        conn_id: u64,
+        from_seq: i64,
+        max_serialized_bytes: i64,
+    ) -> PacedTailPage {
+        let Some(shared) = self.shared_for(terminal_id) else {
+            return PacedTailPage::Gone;
+        };
+        let mut s = shared.lock().expect("terminal lock");
+        let negotiated = match s.subscribers.get(&conn_id) {
+            Some(sub) => sub.paced_terminal_replay_v1,
+            None => return PacedTailPage::Gone,
+        };
+        if !negotiated {
+            return PacedTailPage::Gone;
+        }
+        let head_seq = s.head_seq;
+        if from_seq >= head_seq {
+            // THE ATOMIC CLEAR: nothing is staged beyond `from_seq`, and the
+            // last page was sunk before this call — no un-sent page exists,
+            // so direct fan-out from here on can never overtake a page.
+            s.subscribers
+                .get_mut(&conn_id)
+                .expect("subscriber checked above")
+                .paced_deferred = false;
+            return PacedTailPage::CaughtUp;
+        }
+        let oldest = s.oldest_retained_seq();
+        if from_seq + 1 < oldest {
+            return PacedTailPage::Expired {
+                lost_from: from_seq + 1,
+                lost_to: oldest - 1,
+                resume_from: oldest - 1,
+                head_seq,
+                oldest_retained_seq: oldest,
+            };
+        }
+        match paced_page_build(
+            &s,
+            conn_id,
+            from_seq,
+            head_seq,
+            max_serialized_bytes,
+            OutputSource::Live,
+        ) {
+            Some(build) => PacedTailPage::Frames {
+                messages: build.messages,
+                end_seq: build.end_seq,
+                serialized_bytes: build.serialized_bytes,
+            },
+            None => {
+                // The ring drained between the head check and the walk (or
+                // holds nothing past `from_seq`): clear and complete.
+                s.subscribers
+                    .get_mut(&conn_id)
+                    .expect("subscriber checked above")
+                    .paced_deferred = false;
+                PacedTailPage::CaughtUp
+            }
+        }
+    }
+
+    /// Resolve a terminal's shared handle under the registry lock, then drop
+    /// the registry lock (the page reads hold ONLY the per-terminal lock).
+    fn shared_for(&self, terminal_id: &str) -> Option<Arc<Mutex<TerminalShared>>> {
+        let inner = self.inner.lock().expect("registry lock");
+        inner
+            .terminals
+            .get(terminal_id)
+            .map(|h| Arc::clone(&h.shared))
     }
 
     /// On socket close: sweep `conn_id` out of EVERY terminal's subscriber set. All
@@ -3535,6 +4045,13 @@ fn ingest(shared: &Arc<Mutex<TerminalShared>>, msg: ServerMessage) {
     // (source stays 'live'). A single live frame is one small batch — the merge logic
     // is the same as replay's (proven byte-exact by the deterministic crate goldens).
     for sub in s.subscribers.values() {
+        // Restore contract (responsive-terminal-restore): a subscriber with a
+        // paced session in flight receives NOTHING inline — the retained
+        // ring is the staging and the session's pages deliver its range in
+        // seq order (see `Subscriber::paced_deferred`).
+        if sub.paced_deferred {
+            continue;
+        }
         match (
             sub.terminal_output_batch_v1,
             sub.attach_request_id.as_deref(),
@@ -3606,6 +4123,187 @@ fn deliver_batches(
             }
         }
     }
+}
+
+// ── Paced replay page production (responsive-terminal-restore, W1) ──────────
+
+/// One built page: its ascending wire messages, the last seq it covers (the
+/// session's new production cursor), and the page's total serialized bytes.
+struct PacedPageBuild {
+    messages: Vec<ServerMessage>,
+    end_seq: i64,
+    serialized_bytes: u64,
+}
+
+/// The last sequence covered by a page wire message.
+fn page_last_seq(msg: &ServerMessage) -> Option<i64> {
+    match msg {
+        ServerMessage::TerminalOutput(o) => Some(o.seq_end),
+        ServerMessage::TerminalOutputBatch(b) => Some(b.seq_end),
+        _ => None,
+    }
+}
+
+/// Conservative per-frame wire-segment estimate for the batch projection:
+/// `{"seqStart":N,"seqEnd":M,"endOffset":E,"rawFrameCount":C}` plus the
+/// `serializedBytes` field's share. The exact per-segment wire size for
+/// realistic seq widths (≤11 digits — a frame per millisecond for a year)
+/// stays under this, so a walk that stops at the budget never undercounts.
+const SEGMENT_WIRE_OVERHEAD_ESTIMATE: i64 = 96;
+
+/// Select and project ONE bounded, ascending page of the
+/// `(from_seq, to_seq_inclusive]` window for `conn_id`'s subscriber. The
+/// caller holds the terminal lock; frames are selected BEFORE cloning (no
+/// full-ring snapshot per page). Packing accounts every frame at its
+/// STANDALONE envelope cost (the batch builder's own accounting, reusing
+/// `measure_serialized_json_bytes` via the incremental scaffold), plus the
+/// batch-segment overhead on batch-capable subscribers — an overestimate
+/// of the merged wire cost, so every produced page's real serialized bytes
+/// stay within the budget. A single frame whose own envelope exceeds the
+/// budget forms its own atomic single-frame page (guaranteed progress; the
+/// oversize result is explicit, never silently coalesced).
+fn paced_page_build(
+    s: &TerminalShared,
+    conn_id: u64,
+    from_seq: i64,
+    to_seq_inclusive: i64,
+    budget: i64,
+    source: OutputSource,
+) -> Option<PacedPageBuild> {
+    let sub = s.subscribers.get(&conn_id)?;
+    let batch_mode = sub.terminal_output_batch_v1 && sub.attach_request_id.is_some();
+    let arid = sub.attach_request_id.clone();
+    let source_str = match source {
+        OutputSource::Replay => "replay",
+        OutputSource::Live => "live",
+    };
+
+    // First ring index with seq_start > from_seq (the ring is seq-ascending;
+    // binary search avoids an O(ring) scan per page).
+    let (mut lo, mut hi) = (0usize, s.replay.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if s.replay[mid].output.seq_start <= from_seq {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let start = lo;
+    if start >= s.replay.len() || s.replay[start].output.seq_start > to_seq_inclusive {
+        return None;
+    }
+    let scaffold = crate::batch::legacy_envelope_scaffold_bytes(
+        &s.terminal_id,
+        &s.replay[start].output.stream_id,
+        arid.as_deref(),
+        Some(source_str),
+    ) as i64;
+
+    let mut selected: Vec<RetainedFrame> = Vec::new();
+    let mut page_bytes: i64 = 0;
+    let mut end_seq = from_seq;
+    // `range` starts at the binary-searched index in O(1) (unlike
+    // `iter().skip`, which re-advances from the ring's front).
+    for f in s.replay.range(start..) {
+        if f.output.seq_start > to_seq_inclusive {
+            break;
+        }
+        let escaped = crate::batch::json_escaped_len(&f.output.data) as i64;
+        let digits = (crate::batch::digit_count(f.output.seq_start)
+            + crate::batch::digit_count(f.output.seq_end)) as i64;
+        let cost = scaffold
+            + digits
+            + escaped
+            + if batch_mode {
+                SEGMENT_WIRE_OVERHEAD_ESTIMATE
+            } else {
+                0
+            };
+        if selected.is_empty() {
+            // Always include the first frame: an over-budget frame forms
+            // its own atomic single-frame page.
+            selected.push(f.clone());
+            page_bytes = cost;
+            end_seq = f.output.seq_end;
+            if cost > budget {
+                break;
+            }
+            continue;
+        }
+        if page_bytes + cost > budget {
+            break;
+        }
+        selected.push(f.clone());
+        page_bytes += cost;
+        end_seq = f.output.seq_end;
+    }
+
+    // Project the selected frames the same way the inline paths deliver them.
+    let messages: Vec<ServerMessage> = if batch_mode {
+        build_batch_messages(
+            &s.terminal_id,
+            &selected,
+            arid.as_deref().unwrap_or(""),
+            source_str,
+        )
+    } else {
+        selected
+            .iter()
+            .map(|f| {
+                let mut out = f.output.clone();
+                out.attach_request_id = arid.clone();
+                out.source = Some(source);
+                ServerMessage::TerminalOutput(out)
+            })
+            .collect()
+    };
+    let serialized_bytes = messages
+        .iter()
+        .map(|m| serde_json::to_string(m).map(|j| j.len()).unwrap_or(0))
+        .sum::<usize>() as u64;
+    Some(PacedPageBuild {
+        messages,
+        end_seq,
+        serialized_bytes,
+    })
+}
+
+/// The page projection's batch arm: `terminal.output.batch` wire payloads for
+/// a bounded page selection (same builder + repacking as
+/// [`deliver_batches`], which keeps its per-payload streaming shape for the
+/// legacy inline path; pages are budget-bounded, so materializing their
+/// messages is bounded by the page budget).
+fn build_batch_messages(
+    terminal_id: &str,
+    frames: &[RetainedFrame],
+    attach_request_id: &str,
+    source: &str,
+) -> Vec<ServerMessage> {
+    if frames.is_empty() {
+        return Vec::new();
+    }
+    let batch_max = terminal_stream_batch_max_bytes() as i64;
+    let inputs: Vec<BatchInputFrame> = frames.iter().map(|f| f.to_batch_input()).collect();
+    let batches = build_terminal_output_batches(&BatchBuildInput {
+        frames: &inputs,
+        max_serialized_bytes: batch_max,
+        max_total_serialized_bytes: None,
+        terminal_id: terminal_id.to_string(),
+        attach_request_id: Some(attach_request_id.to_string()),
+        source: Some(source.to_string()),
+    });
+    let mut messages = Vec::new();
+    for batch in &batches {
+        for payload in
+            build_batch_wire_payloads(terminal_id, batch, attach_request_id, source, batch_max)
+        {
+            if let Ok(msg) = serde_json::from_value::<ServerMessage>(payload) {
+                messages.push(msg);
+            }
+        }
+    }
+    messages
 }
 
 /// b8ke ext r30 F2 (test-only): the rekey's deterministic INTERLOCK —
@@ -4262,6 +4960,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         let legacy = outputs(&legacy_seen);
         assert!(
@@ -4293,6 +4992,7 @@ mod tests {
             0,
             true,
             false,
+            None,
             None,
             None,
         );
@@ -4342,7 +5042,18 @@ mod tests {
         reg.feed("T", frame(1, "a\u{1F600}b\r\n", "S")); // a😀b␍␊
 
         let (sink, seen) = collector();
-        let _ = reg.attach("T", 1, sink, Some("m".into()), 0, true, false, None, None);
+        let _ = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("m".into()),
+            0,
+            true,
+            false,
+            None,
+            None,
+            None,
+        );
         let bs = batches(&seen);
         assert_eq!(bs.len(), 1);
         let b = &bs[0];
@@ -4371,6 +5082,7 @@ mod tests {
             0,
             false,
             false,
+            None,
             None,
             None,
         );
@@ -4420,6 +5132,7 @@ mod tests {
             true,
             None,
             None,
+            None,
         );
         let ready = attach_ready(&seen).expect("attach.ready sent");
         assert_eq!(ready.head_seq, 2);
@@ -4453,6 +5166,7 @@ mod tests {
             true,
             None,
             None,
+            None,
         );
         let ready = attach_ready(&seen).expect("attach.ready sent");
         assert_eq!(
@@ -4482,6 +5196,7 @@ mod tests {
             0,
             false,
             true,
+            None,
             None,
             None,
         );
@@ -4531,6 +5246,911 @@ mod tests {
         assert_eq!(reg.replay_bounds("nope"), None);
     }
 
+    // ── Paced replay core (responsive-terminal-restore, Workstream 1) ────────
+    //
+    // The registry's page-read primitives + the attach-time session start.
+    // The ws pacing coordinator (credit gating, tail drain, events) drives
+    // these; its behavior is pinned by the `freshell-ws` integration suite.
+
+    /// Flatten one page's wire messages into `(seq, data)` pairs (legacy
+    /// per-frame and batch pages both reassemble to these).
+    fn page_seq_data(messages: &[ServerMessage]) -> Vec<(i64, String)> {
+        let mut out = Vec::new();
+        for msg in messages {
+            match msg {
+                ServerMessage::TerminalOutput(o) => out.push((o.seq_start, o.data.clone())),
+                ServerMessage::TerminalOutputBatch(b) => {
+                    // A merged batch is one seq span over its concatenated data.
+                    let mut prev = 0i64;
+                    for seg in &b.segments {
+                        let chunk = crate::batch::slice_utf16(&b.data, prev, seg.end_offset);
+                        out.push((seg.seq_start, chunk));
+                        prev = seg.end_offset;
+                    }
+                }
+                other => panic!("unexpected page message: {other:?}"),
+            }
+        }
+        out
+    }
+
+    fn page_serialized_bytes(messages: &[ServerMessage]) -> usize {
+        messages
+            .iter()
+            .map(|m| serde_json::to_string(m).expect("page serializes").len())
+            .sum()
+    }
+
+    /// The subscriber-side view of one paced attach: sink messages seen so
+    /// far (should be ONLY the control prelude — ready/sync/gap) plus the
+    /// returned first page and session description.
+    #[test]
+    fn paced_attach_returns_the_first_page_instead_of_an_inline_replay() {
+        let reg = TerminalRegistry::new();
+        reg.set_paced_page_max_bytes(1024);
+        reg.insert_headless("T", "S");
+        for seq in 1..=8 {
+            reg.feed("T", frame(seq, &format!("data-{seq:03}\r\n"), "S"));
+        }
+
+        let (sink, seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("paced-1".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+        );
+        assert!(out.found);
+        let start = out.paced.expect("negotiated attach starts a paced session");
+        assert_eq!(start.session.terminal_id, "T");
+        assert_eq!(start.session.stream_id, "S");
+        assert_eq!(start.session.attach_request_id, "paced-1");
+        assert_eq!(start.session.target, 8, "target is the head at attach time");
+        assert_eq!(start.session.effective_since, 0);
+
+        // The inline sink saw ONLY the control prelude — the replay frames
+        // travel as returned pages, never sunk under the attach lock.
+        for msg in seen.lock().unwrap().iter() {
+            assert!(
+                !matches!(msg, ServerMessage::TerminalOutput(_)),
+                "no replay output may be sunk inline: {msg:?}"
+            );
+        }
+
+        // The first page is a bounded ascending prefix of the replay window.
+        assert!(!start.first_page.is_empty(), "there is replay to page");
+        assert!(page_serialized_bytes(&start.first_page) <= 1024);
+        let page1 = page_seq_data(&start.first_page);
+        assert_eq!(
+            page1.first().unwrap().0,
+            1,
+            "the page starts at the baseline+1"
+        );
+        let last_seq = page1.last().unwrap().0;
+        assert_eq!(
+            start.session.page_end, last_seq,
+            "the session cursor is the first page's last seq"
+        );
+        assert!(
+            last_seq < 8,
+            "the first page is a bounded prefix, not the whole window"
+        );
+        assert_eq!(
+            start.session.page_bytes,
+            page_serialized_bytes(&start.first_page) as u64
+        );
+        for msg in &start.first_page {
+            match msg {
+                ServerMessage::TerminalOutput(o) => {
+                    assert_eq!(o.attach_request_id.as_deref(), Some("paced-1"));
+                    assert_eq!(
+                        o.source,
+                        Some(OutputSource::Replay),
+                        "replay pages are stamped source:'replay'"
+                    );
+                }
+                other => panic!("unexpected first-page message: {other:?}"),
+            }
+        }
+    }
+
+    /// A batch-capable negotiated subscriber gets `terminal.output.batch`
+    /// pages that reassemble to the same bytes as the per-frame projection.
+    #[test]
+    fn paced_batch_pages_reassemble_to_the_frame_bytes() {
+        let reg = TerminalRegistry::new();
+        reg.set_paced_page_max_bytes(4096);
+        reg.insert_headless("T", "S");
+        for seq in 1..=5 {
+            reg.feed("T", frame(seq, &format!("line-{seq}\r\n"), "S"));
+        }
+        let (sink, _seen) = collector();
+        let out = reg.attach(
+            "T",
+            2,
+            sink,
+            Some("batch-paced".into()),
+            0,
+            true,
+            true,
+            None,
+            None,
+            None,
+        );
+        let start = out.paced.expect("paced session");
+        assert!(
+            start
+                .first_page
+                .iter()
+                .all(|m| matches!(m, ServerMessage::TerminalOutputBatch(_))),
+            "a batch-capable subscriber gets batch pages"
+        );
+        // Drive any remaining pages (the first page may be a bounded prefix)
+        // and reassemble EVERYTHING the session delivers.
+        let mut page_messages = start.first_page.clone();
+        let mut cursor = start.session.page_end;
+        while cursor < start.session.target {
+            match reg.next_replay_page("T", 2, cursor, start.session.target, 4096) {
+                PacedPage::Frames {
+                    messages, end_seq, ..
+                } => {
+                    page_messages.extend(messages);
+                    cursor = end_seq;
+                }
+                other => panic!("unexpected replay read: {other:?}"),
+            }
+        }
+        let reassembled: String = {
+            let mut v: Vec<(i64, String)> = page_seq_data(&page_messages);
+            v.sort_by_key(|(s, _)| *s);
+            v.into_iter().map(|(_, d)| d).collect()
+        };
+        assert_eq!(
+            reassembled,
+            (1..=5).map(|i| format!("line-{i}\r\n")).collect::<String>()
+        );
+    }
+
+    /// Pages ascend within the serialized budget to the FIXED attach-time
+    /// target — output produced after the attach never extends the replay
+    /// range (it is tail-phase delivery instead).
+    #[test]
+    fn paced_replay_pages_stop_at_the_fixed_target_within_the_budget() {
+        let reg = TerminalRegistry::new();
+        reg.set_paced_page_max_bytes(1024);
+        reg.insert_headless("T", "S");
+        for seq in 1..=8 {
+            reg.feed("T", frame(seq, &format!("data-{seq:03}\r\n"), "S"));
+        }
+        let (sink, _seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("paced".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+        );
+        let start = out.paced.expect("paced session");
+        let mut cursor = start.session.page_end;
+        let mut collected = page_seq_data(&start.first_page);
+
+        // Concurrent output AFTER the attach must NOT extend the target.
+        for seq in 9..=12 {
+            reg.feed("T", frame(seq, &format!("post-{seq:03}\r\n"), "S"));
+        }
+
+        while cursor < 8 {
+            match reg.next_replay_page("T", 1, cursor, 8, 1024) {
+                PacedPage::Frames {
+                    messages,
+                    end_seq,
+                    serialized_bytes,
+                } => {
+                    assert!(
+                        serialized_bytes as usize <= 1024,
+                        "every replay page honors the serialized budget"
+                    );
+                    assert!(end_seq > cursor, "pages must make progress");
+                    assert!(end_seq <= 8, "pages never pass the fixed target");
+                    collected.extend(page_seq_data(&messages));
+                    cursor = end_seq;
+                }
+                PacedPage::Done => panic!("Done while cursor {cursor} < target 8"),
+                PacedPage::Expired { .. } => panic!("no retention loss in this fixture"),
+                PacedPage::Gone => panic!("terminal vanished mid-replay"),
+            }
+        }
+        assert_eq!(cursor, 8);
+        match reg.next_replay_page("T", 1, cursor, 8, 1024) {
+            PacedPage::Done => {}
+            other => panic!("a drained replay window reads Done, got {other:?}"),
+        }
+        let replayed: String = {
+            let mut v = collected.clone();
+            v.sort_by_key(|(s, _)| *s);
+            v.into_iter().map(|(_, d)| d).collect()
+        };
+        assert_eq!(
+            replayed,
+            (1..=8)
+                .map(|i| format!("data-{i:03}\r\n"))
+                .collect::<String>(),
+            "the replay pages cover the window exactly, in order, no loss/dup"
+        );
+
+        // The post-attach frames are TAIL delivery: pages from the target to
+        // the current head, then the deferral clears (CaughtUp).
+        let mut tail_cursor = cursor;
+        let mut tail_frames = Vec::new();
+        loop {
+            match reg.next_paced_tail_page("T", 1, tail_cursor, 1024) {
+                PacedTailPage::Frames {
+                    messages,
+                    end_seq,
+                    serialized_bytes,
+                } => {
+                    assert!(serialized_bytes as usize <= 1024);
+                    assert!(end_seq > tail_cursor);
+                    tail_frames.extend(page_seq_data(&messages));
+                    tail_cursor = end_seq;
+                }
+                PacedTailPage::Expired { .. } => panic!("no retention loss in this fixture"),
+                PacedTailPage::CaughtUp => break,
+                PacedTailPage::Gone => panic!("terminal vanished mid-tail"),
+            }
+        }
+        assert_eq!(tail_cursor, 12, "the tail drains to the current head");
+        let tail: String = {
+            let mut v = tail_frames;
+            v.sort_by_key(|(s, _)| *s);
+            v.into_iter().map(|(_, d)| d).collect()
+        };
+        assert_eq!(
+            tail,
+            (9..=12)
+                .map(|i| format!("post-{i:03}\r\n"))
+                .collect::<String>(),
+            "the tail delivers exactly the post-attach range"
+        );
+    }
+
+    /// A single frame whose own envelope exceeds the page budget forms its
+    /// own atomic single-frame page (guaranteed progress, never split, never
+    /// silently coalesced into a "budget" page).
+    #[test]
+    fn paced_replay_oversized_frame_forms_its_own_atomic_page() {
+        let reg = TerminalRegistry::new();
+        reg.set_paced_page_max_bytes(256);
+        reg.insert_headless("T", "S");
+        reg.feed("T", frame(1, "tiny-a\r\n", "S"));
+        reg.feed("T", frame(2, &"X".repeat(2048), "S"));
+        reg.feed("T", frame(3, "tiny-b\r\n", "S"));
+
+        let (sink, _seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("paced".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+        );
+        let start = out.paced.expect("paced session");
+        assert_eq!(
+            start.session.page_end, 1,
+            "the first page stops before the oversize frame"
+        );
+
+        match reg.next_replay_page("T", 1, 1, 3, 256) {
+            PacedPage::Frames {
+                messages,
+                end_seq,
+                serialized_bytes,
+            } => {
+                assert_eq!(end_seq, 2);
+                assert_eq!(
+                    messages.len(),
+                    1,
+                    "the oversize frame is ONE atomic message"
+                );
+                assert!(
+                    serialized_bytes as usize > 256,
+                    "the oversize frame honestly exceeds the budget as its own page"
+                );
+                match &messages[0] {
+                    ServerMessage::TerminalOutput(o) => {
+                        assert_eq!(o.seq_start, 2);
+                        assert_eq!(o.data.len(), 2048);
+                    }
+                    other => panic!("per-frame subscriber gets terminal.output: {other:?}"),
+                }
+            }
+            other => panic!("expected the atomic oversize page, got {other:?}"),
+        }
+        match reg.next_replay_page("T", 1, 2, 3, 256) {
+            PacedPage::Frames {
+                messages, end_seq, ..
+            } => {
+                assert_eq!(end_seq, 3);
+                assert_eq!(
+                    page_seq_data(&messages),
+                    vec![(3, "tiny-b\r\n".to_string())]
+                );
+            }
+            other => panic!("expected the final page, got {other:?}"),
+        }
+    }
+
+    /// Retention expiry mid-replay: the exact lost interval and the resume
+    /// position, both consistent with the ring's live bounds.
+    #[test]
+    fn paced_replay_expired_reports_the_exact_interval_and_resume() {
+        let reg = TerminalRegistry::new();
+        // Tiny CHAR ring so feeding evicts the front deterministically.
+        reg.set_scrollback_max_bytes(60);
+        reg.insert_headless("T", "S");
+        reg.set_paced_page_max_bytes(0); // per-frame pages: deterministic cursor control
+        for seq in 1..=3 {
+            reg.feed("T", frame(seq, "chunk123\r\n", "S")); // 10 chars each
+        }
+        let (sink, _seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("paced".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+        );
+        let start = out.paced.expect("paced session");
+        assert_eq!(start.session.page_end, 1, "budget 0 => one frame per page");
+
+        // Evict frames 2..: 10 more chunks (100 chars) pushes the front well
+        // past the session cursor.
+        for seq in 4..=13 {
+            reg.feed("T", frame(seq, "chunk123\r\n", "S"));
+        }
+        let bounds = reg.replay_bounds("T").expect("bounds");
+        assert!(
+            bounds.oldest_retained_seq > 2,
+            "the fixture evicted the frames the session needs next"
+        );
+
+        match reg.next_replay_page("T", 1, 1, bounds.head_seq, 0) {
+            PacedPage::Expired {
+                lost_from,
+                lost_to,
+                resume_from,
+                head_seq,
+                oldest_retained_seq,
+            } => {
+                assert_eq!(lost_from, 2, "the lost interval starts at cursor+1");
+                assert_eq!(
+                    lost_to,
+                    bounds.oldest_retained_seq - 1,
+                    "the lost interval ends just before the new ring front"
+                );
+                assert_eq!(resume_from, bounds.oldest_retained_seq - 1);
+                assert_eq!(head_seq, bounds.head_seq);
+                assert_eq!(oldest_retained_seq, bounds.oldest_retained_seq);
+            }
+            other => panic!("expected Expired, got {other:?}"),
+        }
+
+        // Continuation from the new baseline: the tail pages everything the
+        // ring still holds, then the deferral clears.
+        let mut tail_cursor = bounds.oldest_retained_seq - 1;
+        let mut drained = Vec::new();
+        loop {
+            match reg.next_paced_tail_page("T", 1, tail_cursor, 0) {
+                PacedTailPage::Frames {
+                    messages, end_seq, ..
+                } => {
+                    drained.extend(page_seq_data(&messages));
+                    tail_cursor = end_seq;
+                }
+                PacedTailPage::CaughtUp => break,
+                other => panic!("unexpected tail read: {other:?}"),
+            }
+        }
+        assert_eq!(tail_cursor, bounds.head_seq);
+        let drained_seqs: Vec<i64> = drained.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            drained_seqs,
+            (bounds.oldest_retained_seq..=bounds.head_seq).collect::<Vec<_>>(),
+            "the continuation covers exactly the retained range"
+        );
+    }
+
+    /// While a paced session is active the subscriber's live output is NOT
+    /// sunk by ingest (the ring is the staging); after the session catches
+    /// up (deferral cleared under the tail read's lock), ingest resumes
+    /// direct delivery. Concurrent production across the flag-clear
+    /// boundary is delivered exactly once — paged or direct, never both,
+    /// never neither.
+    #[test]
+    fn paced_deferral_stages_live_output_and_resumes_direct_delivery_exactly_once() {
+        let reg = TerminalRegistry::new();
+        reg.set_paced_page_max_bytes(0); // per-frame pages
+        reg.insert_headless("T", "S");
+        for seq in 1..=3 {
+            reg.feed("T", frame(seq, "early-1\r\n", "S"));
+        }
+        let (sink, seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("paced".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+        );
+        let start = out.paced.expect("paced session");
+        assert_eq!(start.session.page_end, 1);
+
+        // Live output while the session is active: staged in the ring, NOT
+        // sunk.
+        reg.feed("T", frame(4, "live-04\r\n", "S"));
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|m| !matches!(m, ServerMessage::TerminalOutput(_))),
+            "deferred subscriber receives nothing inline"
+        );
+
+        // Concurrent production racing the tail drain.
+        let feeder_reg = reg.clone();
+        let feeder = std::thread::spawn(move || {
+            for seq in 5..=40 {
+                feeder_reg.feed("T", frame(seq, &format!("race-{seq:02}\r\n"), "S"));
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+
+        // Drain: replay pages to the target, then tail pages to CaughtUp.
+        let mut collected = page_seq_data(&start.first_page);
+        let mut cursor = start.session.page_end;
+        while cursor < start.session.target {
+            match reg.next_replay_page("T", 1, cursor, start.session.target, 0) {
+                PacedPage::Frames {
+                    messages, end_seq, ..
+                } => {
+                    collected.extend(page_seq_data(&messages));
+                    cursor = end_seq;
+                }
+                other => panic!("unexpected replay read: {other:?}"),
+            }
+        }
+        loop {
+            match reg.next_paced_tail_page("T", 1, cursor, 0) {
+                PacedTailPage::Frames {
+                    messages, end_seq, ..
+                } => {
+                    collected.extend(page_seq_data(&messages));
+                    cursor = end_seq;
+                }
+                PacedTailPage::CaughtUp => break,
+                other => panic!("unexpected tail read: {other:?}"),
+            }
+        }
+        feeder.join().expect("feeder joins");
+
+        // Post-clear production flows DIRECTLY through ingest again. The
+        // feeder's tail may have landed either side of the clear (any split
+        // is valid); frame 41 is fed strictly AFTER the drain, so it must be
+        // a DIRECT delivery.
+        reg.feed("T", frame(41, "after-41\r\n", "S"));
+        let direct: Vec<(i64, String)> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|m| match m {
+                ServerMessage::TerminalOutput(o) => Some((o.seq_start, o.data.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            direct.last(),
+            Some(&(41, "after-41\r\n".to_string())),
+            "post-clear output is delivered directly by ingest: {direct:?}"
+        );
+
+        // The no-loss/no-dup invariant across the flag-clear boundary:
+        // pages + direct deliveries together are exactly frames 1..=41, once.
+        let mut all: Vec<(i64, String)> = collected;
+        all.extend(direct);
+        all.sort_by_key(|(s, _)| *s);
+        let seqs: Vec<i64> = all.iter().map(|(s, _)| *s).collect();
+        assert_eq!(
+            seqs,
+            (1..=41).collect::<Vec<_>>(),
+            "every produced frame delivered exactly once, in seq order"
+        );
+        assert_eq!(all.iter().map(|(_, d)| d.clone()).collect::<String>(), {
+            let mut s = String::new();
+            for _seq in 1..=3 {
+                s.push_str("early-1\r\n");
+            }
+            s.push_str("live-04\r\n");
+            for seq in 5..=40 {
+                s.push_str(&format!("race-{seq:02}\r\n"));
+            }
+            s.push_str("after-41\r\n");
+            s
+        });
+    }
+
+    /// A re-attach replaces the subscriber — an armed paced deferral does not
+    /// survive into the new subscription unless the new attach arms its own.
+    #[test]
+    fn reattach_replaces_the_paced_deferral() {
+        let reg = TerminalRegistry::new();
+        reg.set_paced_page_max_bytes(0);
+        reg.insert_headless("T", "S");
+        reg.feed("T", frame(1, "one\r\n", "S"));
+
+        let (sink, seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            sink.clone(),
+            Some("paced-a".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+        );
+        assert!(out.paced.is_some(), "the paced attach arms the deferral");
+        reg.feed("T", frame(2, "two\r\n", "S"));
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .all(|m| !matches!(m, ServerMessage::TerminalOutput(_))),
+            "staged while the first session is active"
+        );
+
+        // A non-paced re-attach (the fallback shape) cancels the session's
+        // deferral: the legacy re-attach replays the window INLINE (frames 1
+        // and 2 — including the one staged while deferred), and the NEXT
+        // produced frame flows directly by ingest, with no pages to drive.
+        let out2 = reg.attach(
+            "T",
+            1,
+            sink.clone(),
+            Some("legacy-b".into()),
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            out2.paced.is_none(),
+            "a non-negotiated re-attach stays legacy"
+        );
+        reg.feed("T", frame(3, "three\r\n", "S"));
+        let live: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|m| match m {
+                ServerMessage::TerminalOutput(o) if o.source == Some(OutputSource::Live) => {
+                    Some(o.data.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            live,
+            vec!["three\r\n".to_string()],
+            "after the deferral clears, live output flows directly"
+        );
+
+        // A paced re-attach arms a FRESH session whose first page includes
+        // everything staged since its own baseline.
+        let out3 = reg.attach(
+            "T",
+            1,
+            sink.clone(),
+            Some("paced-c".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+        );
+        let start = out3
+            .paced
+            .expect("the paced re-attach starts a fresh session");
+        assert_eq!(start.session.attach_request_id, "paced-c");
+        assert_eq!(start.session.target, 3);
+        // Budget 0 => per-frame pages: drive the fresh session to completion
+        // and assert it pages the WHOLE window (including frame 2, staged
+        // while the first session was deferred).
+        let mut paged: Vec<(i64, String)> = page_seq_data(&start.first_page);
+        let mut cursor = start.session.page_end;
+        while cursor < start.session.target {
+            match reg.next_replay_page("T", 1, cursor, start.session.target, 0) {
+                PacedPage::Frames {
+                    messages, end_seq, ..
+                } => {
+                    paged.extend(page_seq_data(&messages));
+                    cursor = end_seq;
+                }
+                other => panic!("unexpected replay read: {other:?}"),
+            }
+        }
+        let mut paged_seqs: Vec<i64> = paged.iter().map(|(s, _)| *s).collect();
+        paged_seqs.sort_unstable();
+        assert_eq!(
+            paged_seqs,
+            vec![1, 2, 3],
+            "the fresh session pages the whole window"
+        );
+    }
+
+    /// Retention loss AT ATTACH (requested since predates the retained
+    /// ring): the negotiated connection gets the retention gap with the
+    /// task-2 bounds fields, `replayResetReason: retention_lost`, and an
+    /// effective baseline of `oldest-1` — the session continues from what
+    /// is retained (nothing is killed, nothing stalls).
+    #[test]
+    fn paced_attach_with_retention_loss_emits_the_negotiated_gap_and_resets_the_baseline() {
+        let reg = TerminalRegistry::new();
+        reg.set_scrollback_max_bytes(60);
+        reg.insert_headless("T", "S");
+        for seq in 1..=13 {
+            reg.feed("T", frame(seq, "chunk123\r\n", "S"));
+        }
+        let bounds = reg.replay_bounds("T").expect("bounds");
+        assert!(
+            bounds.oldest_retained_seq > 1,
+            "the front has evicted past seq 1"
+        );
+
+        let (sink, seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("paced".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+        );
+        assert!(out.found);
+        let start = out
+            .paced
+            .expect("paced session continues from what is retained");
+        assert_eq!(
+            start.session.effective_since,
+            bounds.oldest_retained_seq - 1,
+            "the baseline resets to oldest-1"
+        );
+        assert_eq!(start.session.target, bounds.head_seq);
+        let first = page_seq_data(&start.first_page);
+        assert_eq!(
+            first.first().unwrap().0,
+            bounds.oldest_retained_seq,
+            "the first page starts at the retained front"
+        );
+
+        let ready = attach_ready(&seen).expect("attach.ready sent");
+        assert_eq!(
+            ready.replay_reset_reason,
+            Some(TerminalReplayResetReason::RetentionLost),
+            "the ready frame names the retention reset"
+        );
+        assert_eq!(ready.oldest_retained_seq, Some(bounds.oldest_retained_seq));
+        assert_eq!(
+            ready.effective_since_seq,
+            Some(bounds.oldest_retained_seq - 1)
+        );
+        assert_eq!(ready.requested_since_seq, Some(0));
+        assert_eq!(ready.replay_from_seq, bounds.oldest_retained_seq);
+        assert_eq!(ready.replay_to_seq, bounds.head_seq);
+
+        let gap = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|m| match m {
+                ServerMessage::TerminalOutputGap(g) => Some(g.clone()),
+                _ => None,
+            })
+            .expect("the retention gap is sunk with the ready prelude");
+        assert_eq!(
+            gap.reason,
+            freshell_protocol::TerminalOutputGapReason::ReplayWindowExceeded
+        );
+        assert_eq!(
+            gap.from_seq, 1,
+            "the lost interval starts at the requested baseline+1"
+        );
+        assert_eq!(gap.to_seq, bounds.oldest_retained_seq - 1);
+        assert_eq!(gap.attach_request_id.as_deref(), Some("paced"));
+        assert_eq!(gap.head_seq, Some(bounds.head_seq));
+        assert_eq!(gap.oldest_retained_seq, Some(bounds.oldest_retained_seq));
+    }
+
+    /// The compatibility twin: a NON-negotiated attach with the same
+    /// retention loss keeps today's silent behavior — no gap frame, no reset
+    /// reason, no retention bounds, replay silently starting at the ring
+    /// front.
+    #[test]
+    fn plain_attach_with_retention_loss_stays_silent_and_byte_identical() {
+        let reg = TerminalRegistry::new();
+        reg.set_scrollback_max_bytes(60);
+        reg.insert_headless("T", "S");
+        for seq in 1..=13 {
+            reg.feed("T", frame(seq, "chunk123\r\n", "S"));
+        }
+        let bounds = reg.replay_bounds("T").expect("bounds");
+
+        let (sink, seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("plain".into()),
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            out.paced.is_none(),
+            "non-negotiated never starts a paced session"
+        );
+        let ready = attach_ready(&seen).expect("attach.ready sent");
+        assert_eq!(ready.replay_reset_reason, None);
+        assert_eq!(ready.oldest_retained_seq, None);
+        assert_eq!(ready.replay_from_seq, bounds.oldest_retained_seq);
+        let frames = outputs(&seen);
+        assert_eq!(
+            frames.first().map(|f| f.seq_start),
+            Some(bounds.oldest_retained_seq),
+            "legacy replay silently starts at the retained front"
+        );
+        assert!(
+            !seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| matches!(m, ServerMessage::TerminalOutputGap(_))),
+            "no gap frame for a non-negotiated connection"
+        );
+    }
+
+    /// A negotiated attach to an ALREADY-EXITED terminal keeps the legacy
+    /// inline path (frozen-tail replay + synthetic exit, in their legacy
+    /// order): pacing arms only for Running terminals this increment.
+    #[test]
+    fn paced_negotiation_on_an_exited_terminal_keeps_the_legacy_inline_path() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.feed("T", frame(1, "tail\r\n", "S"));
+        assert!(reg.finish_pty_exit("T", 0));
+
+        let (sink, seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("paced".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+        );
+        assert!(
+            out.paced.is_none(),
+            "exited terminals stay on the legacy path"
+        );
+        let frames = outputs(&seen);
+        assert_eq!(frames.len(), 1, "the frozen tail replays inline");
+        assert_eq!(frames[0].source, Some(OutputSource::Replay));
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|m| matches!(m, ServerMessage::TerminalExit(_))),
+            "the synthetic exit follows the inline replay"
+        );
+    }
+
+    /// TERM-07 seam: the attach-threaded `maxReplayBytes` is recorded on the
+    /// subscriber with NO delivery-behavior change (it stays unread for
+    /// delivery decisions this increment; the increment-3 snapshot work
+    /// consumes it).
+    #[test]
+    fn attach_records_max_replay_bytes_on_the_subscriber() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.feed("T", frame(1, "one\r\n", "S"));
+        let (sink, _seen) = collector();
+        let _ = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("a".into()),
+            0,
+            false,
+            false,
+            None,
+            None,
+            Some(128 * 1024),
+        );
+        let recorded = {
+            let inner = reg.inner.lock().unwrap();
+            let handle = inner.terminals.get("T").unwrap();
+            let s = handle.shared.lock().unwrap();
+            s.subscribers
+                .get(&1)
+                .expect("subscriber installed")
+                .max_replay_bytes
+        };
+        assert_eq!(recorded, Some(128 * 1024));
+
+        // Absent stays absent; the legacy path threads it identically.
+        let (sink2, _seen2) = collector();
+        let _ = reg.attach(
+            "T",
+            2,
+            sink2,
+            Some("b".into()),
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
+        let recorded2 = {
+            let inner = reg.inner.lock().unwrap();
+            let handle = inner.terminals.get("T").unwrap();
+            let s = handle.shared.lock().unwrap();
+            s.subscribers.get(&2).expect("subscriber").max_replay_bytes
+        };
+        assert_eq!(recorded2, None);
+    }
+
     #[test]
     fn unpaced_attach_ready_pins_the_exact_wire_keys_for_both_negotiation_sides() {
         // Compatibility invariant (load-bearing): a connection that did NOT
@@ -4551,6 +6171,7 @@ mod tests {
             0,
             false,
             false,
+            None,
             None,
             None,
         );
@@ -4591,6 +6212,7 @@ mod tests {
             0,
             false,
             true,
+            None,
             None,
             None,
         );
@@ -4640,6 +6262,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         reg.feed("T", frame(1, "before\r\n", "S"));
         assert_eq!(outputs(&seen_a).len(), 1);
@@ -4664,6 +6287,7 @@ mod tests {
             0,
             false,
             false,
+            None,
             None,
             None,
         );
@@ -4691,6 +6315,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         // Second attach: geometry authority flips to multi_client_unknown.
         let _ = reg.attach(
@@ -4701,6 +6326,7 @@ mod tests {
             0,
             false,
             false,
+            None,
             None,
             None,
         );
@@ -4737,6 +6363,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         for i in 1..=5 {
             reg.feed("T", frame(i, &format!("line-{i}\r\n"), "S"));
@@ -4755,6 +6382,7 @@ mod tests {
             3,
             false,
             false,
+            None,
             None,
             None,
         );
@@ -4776,7 +6404,18 @@ mod tests {
         reg.feed("T", frame(1, "old\r\n", "S"));
 
         let (sink, seen) = collector();
-        let _ = reg.attach("T", 7, sink, Some("z".into()), 0, false, false, None, None);
+        let _ = reg.attach(
+            "T",
+            7,
+            sink,
+            Some("z".into()),
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
         // A live frame produced AFTER attach must arrive after the replayed one.
         reg.feed("T", frame(2, "new\r\n", "S"));
 
@@ -4798,7 +6437,7 @@ mod tests {
     fn attach_to_unknown_terminal_reports_not_found() {
         let reg = TerminalRegistry::new();
         let (sink, seen) = collector();
-        let out = reg.attach("nope", 1, sink, None, 0, false, false, None, None);
+        let out = reg.attach("nope", 1, sink, None, 0, false, false, None, None, None);
         assert!(!out.found);
         assert!(seen.lock().unwrap().is_empty());
     }
@@ -4828,7 +6467,18 @@ mod tests {
         reg.insert_headless("T", "S");
         let rev_before = reg.revision();
         let (sink, seen) = collector();
-        let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, false, None, None);
+        let _ = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("a".into()),
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
 
         assert!(reg.kill("T"));
         assert!(!reg.is_running("T"), "killed terminal is removed");
@@ -4856,8 +6506,8 @@ mod tests {
         reg.insert_headless("T-b", "S2");
         let (sink_a, seen_a) = collector();
         let (sink_b, seen_b) = collector();
-        let _ = reg.attach("T-a", 1, sink_a, None, 0, false, false, None, None);
-        let _ = reg.attach("T-b", 2, sink_b, None, 0, false, false, None, None);
+        let _ = reg.attach("T-a", 1, sink_a, None, 0, false, false, None, None, None);
+        let _ = reg.attach("T-b", 2, sink_b, None, 0, false, false, None, None, None);
         let rev_before = reg.revision();
 
         let killed = reg.kill_all();
@@ -5143,7 +6793,18 @@ mod tests {
         assert!(!dir[0].has_clients);
 
         let (sink, _seen) = collector();
-        let _ = reg.attach("T", 9, sink, Some("a".into()), 0, false, false, None, None);
+        let _ = reg.attach(
+            "T",
+            9,
+            sink,
+            Some("a".into()),
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
         assert!(reg.directory()[0].has_clients);
         reg.detach("T", 9);
         assert!(!reg.directory()[0].has_clients);
@@ -5264,6 +6925,7 @@ mod tests {
                     false,
                     None,
                     None,
+                    None,
                     TerminalAttachIntent::ViewportHydrate,
                     131,
                     48,
@@ -5284,6 +6946,7 @@ mod tests {
                     0,
                     false,
                     false,
+                    None,
                     None,
                     None,
                     TerminalAttachIntent::TransportReconnect,
@@ -5338,6 +7001,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
 
         // A secondary viewer must be able to attach without silently taking
@@ -5354,6 +7018,7 @@ mod tests {
             0,
             false,
             false,
+            None,
             None,
             None,
         );
@@ -5419,8 +7084,19 @@ mod tests {
         let reg = TerminalRegistry::new();
         reg.insert_headless("T", "S");
         let (sink, _seen) = collector();
-        let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, false, None, None); // conn 1 is attached
-                                                                                         // conn 2 reconnects with another socket attached and no prior attachment of its own.
+        let _ = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("a".into()),
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+        ); // conn 1 is attached
+           // conn 2 reconnects with another socket attached and no prior attachment of its own.
         let out = reg.resize_for_attach("T", 2, TerminalAttachIntent::TransportReconnect, 95, 41);
         assert_eq!(out, AttachResizeStatus::Skipped);
         assert_eq!(reg.geometry("T"), Some((120, 30, 1)));
@@ -5441,6 +7117,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
 
         // The first transport reconnect from B is replay-only while A views
@@ -5457,6 +7134,7 @@ mod tests {
             0,
             false,
             false,
+            None,
             None,
             None,
         );
@@ -5508,6 +7186,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         let _ = reg.attach(
             "T2",
@@ -5517,6 +7196,7 @@ mod tests {
             0,
             false,
             false,
+            None,
             None,
             None,
         );
@@ -5545,7 +7225,18 @@ mod tests {
         assert!(reg.finish_pty_exit("T", 7));
 
         let (sink, seen) = collector();
-        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, false, None, None);
+        let outcome = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("a".into()),
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
         assert!(outcome.found);
 
         let exit = seen.lock().unwrap().iter().find_map(|m| match m {
@@ -5599,6 +7290,7 @@ mod tests {
             false,
             None,
             Some(true),
+            None,
         );
         assert!(outcome.found);
 
@@ -5649,6 +7341,7 @@ mod tests {
             false,
             None,
             Some(true),
+            None,
         );
         assert!(outcome.found);
 
@@ -5689,6 +7382,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         // … and explicitly false: no sync either way (fixture f14's gating).
         let (sink_b, seen_b) = collector();
@@ -5702,6 +7396,7 @@ mod tests {
             false,
             None,
             Some(false),
+            None,
         );
 
         assert!(modes_syncs(&seen_a).is_empty(), "flag absent => no sync");
@@ -5727,6 +7422,7 @@ mod tests {
             false,
             None,
             Some(true),
+            None,
         );
         assert!(modes_syncs(&seen).is_empty(), "empty synthesis => no sync");
     }
@@ -5740,7 +7436,7 @@ mod tests {
         // The client fails closed on a sync lacking attachRequestId
         // (`missing_attach_request_id`), so the server never builds one.
         let (sink, seen) = collector();
-        let _ = reg.attach("T", 1, sink, None, 0, false, false, None, Some(true));
+        let _ = reg.attach("T", 1, sink, None, 0, false, false, None, Some(true), None);
         assert!(
             modes_syncs(&seen).is_empty(),
             "no attachRequestId => no sync"
@@ -5768,6 +7464,7 @@ mod tests {
             false,
             None,
             Some(true),
+            None,
         );
         assert!(outcome.found);
 
@@ -5843,7 +7540,18 @@ mod tests {
         let reg = TerminalRegistry::new();
         reg.insert_headless("T", "S");
         let (sink, _seen) = collector();
-        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, false, None, None);
+        let outcome = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("a".into()),
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
         assert!(outcome.found);
         reg.set_auto_kill_idle_minutes(1);
         // Far past any threshold, but a client is attached -- legacy:
@@ -6020,7 +7728,18 @@ mod tests {
         let reg = TerminalRegistry::new();
         reg.insert_headless("T", "S");
         let (sink, _seen) = collector();
-        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, false, None, None);
+        let outcome = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("a".into()),
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
         assert!(outcome.found);
         reg.set_auto_kill_idle_minutes(1);
         reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
@@ -6047,7 +7766,18 @@ mod tests {
         let reg = TerminalRegistry::new();
         reg.insert_headless("T", "S");
         let (sink, _seen) = collector();
-        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, false, None, None);
+        let outcome = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("a".into()),
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
         assert!(outcome.found);
         // A second, already-detached terminal whose countdown must NOT be
         // disturbed by conn 1's disconnect.
@@ -6078,8 +7808,19 @@ mod tests {
         reg.insert_headless("T", "S");
         let (sink, _seen) = collector();
         assert!(
-            reg.attach("T", 1, sink, Some("a".into()), 0, false, false, None, None)
-                .found
+            reg.attach(
+                "T",
+                1,
+                sink,
+                Some("a".into()),
+                0,
+                false,
+                false,
+                None,
+                None,
+                None
+            )
+            .found
         );
         reg.set_auto_kill_idle_minutes(15); // the shipped default
         reg.remove_connection(1); // socket drop, NOT an explicit detach
@@ -6104,8 +7845,19 @@ mod tests {
         reg.insert_headless("T", "S");
         let (sink, _seen) = collector();
         assert!(
-            reg.attach("T", 1, sink, Some("a".into()), 0, false, false, None, None)
-                .found
+            reg.attach(
+                "T",
+                1,
+                sink,
+                Some("a".into()),
+                0,
+                false,
+                false,
+                None,
+                None,
+                None
+            )
+            .found
         );
         reg.set_auto_kill_idle_minutes(15);
         reg.remove_connection(1);
@@ -6124,14 +7876,36 @@ mod tests {
         reg.insert_headless("T", "S");
         let (sink, _seen) = collector();
         assert!(
-            reg.attach("T", 1, sink, Some("a".into()), 0, false, false, None, None)
-                .found
+            reg.attach(
+                "T",
+                1,
+                sink,
+                Some("a".into()),
+                0,
+                false,
+                false,
+                None,
+                None,
+                None
+            )
+            .found
         );
         reg.detach("T", 1); // explicitly released — fast-reap eligible
         let (sink2, _seen2) = collector();
         assert!(
-            reg.attach("T", 2, sink2, Some("b".into()), 0, false, false, None, None)
-                .found
+            reg.attach(
+                "T",
+                2,
+                sink2,
+                Some("b".into()),
+                0,
+                false,
+                false,
+                None,
+                None,
+                None
+            )
+            .found
         );
         reg.set_auto_kill_idle_minutes(15);
         reg.remove_connection(2); // wanted again, then socket drop
@@ -6222,7 +7996,18 @@ mod tests {
         reg.feed("T", frame(2, "abcdefghij", "S")); // another 10 bytes -> over cap
 
         let (sink, seen) = collector();
-        let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, false, None, None);
+        let _ = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("a".into()),
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
         let replayed = outputs(&seen);
         // Whole-frame FIFO eviction keeps at least one frame; the FIRST frame
         // must have been evicted once the second pushed bytes over the cap.
@@ -6240,7 +8025,18 @@ mod tests {
         reg.feed("T", frame(2, "abcdefghij", "S"));
 
         let (sink, seen) = collector();
-        let _ = reg.attach("T", 1, sink, Some("a".into()), 0, false, false, None, None);
+        let _ = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("a".into()),
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
         let replayed = outputs(&seen);
         assert_eq!(
             replayed.len(),
@@ -6282,6 +8078,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         let ascii_chars: usize = outputs(&seen_a)
             .iter()
@@ -6309,6 +8106,7 @@ mod tests {
             0,
             false,
             false,
+            None,
             None,
             None,
         );
@@ -6571,7 +8369,18 @@ mod tests {
         }
 
         let (sink, seen) = collector();
-        let _ = reg.attach("T", 1, sink, Some("r".into()), 0, false, false, None, None);
+        let _ = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("r".into()),
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+        );
         let retained_chars: usize = outputs(&seen).iter().map(|f| f.data.chars().count()).sum();
         assert!(
             retained_chars as i64 <= cap,

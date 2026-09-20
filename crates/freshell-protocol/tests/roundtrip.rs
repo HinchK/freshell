@@ -734,6 +734,25 @@ fn output_gap_roundtrips_restore_bounds_and_omits_them_for_frozen_clients() {
 }
 
 #[test]
+fn terminal_replay_credit_roundtrips_and_conforms() {
+    // Responsive-terminal-restore Workstream 1 (paced replay): the
+    // continuation-credit message a pacedTerminalReplayV1 client sends after
+    // consuming an ordered replay page — additive optional, protocol version
+    // stays 10. Task 3 owns the Rust struct + Zod schema in lockstep; the
+    // client's sending behavior is task 4.
+    let wire = r#"{"type":"terminal.replay.credit","terminalId":"t1","streamId":"s1","attachRequestId":"a1","consumedSeq":41}"#;
+    match client_roundtrip(wire, "terminal.replay.credit") {
+        ClientMessage::TerminalReplayCredit(credit) => {
+            assert_eq!(credit.terminal_id, "t1");
+            assert_eq!(credit.stream_id, "s1");
+            assert_eq!(credit.attach_request_id, "a1");
+            assert_eq!(credit.consumed_seq, 41);
+        }
+        other => panic!("expected TerminalReplayCredit, got {other:?}"),
+    }
+}
+
+#[test]
 fn terminal_created_roundtrips_with_and_without_notice() {
     // Base shape: notice omitted — byte-identical to today's frame on the wire.
     let base = r#"{"type":"terminal.created","createdAt":1700000000000,"requestId":"req-1","terminalId":"t1"}"#;

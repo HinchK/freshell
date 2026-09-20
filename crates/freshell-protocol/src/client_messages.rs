@@ -32,6 +32,15 @@ pub enum ClientMessage {
     TerminalAttach(TerminalAttach),
     #[serde(rename = "terminal.interest")]
     TerminalInterest(TerminalInterest),
+    /// Responsive-terminal-restore Workstream 1 (paced replay): the
+    /// continuation credit a `pacedTerminalReplayV1` client sends after fully
+    /// consuming an ordered replay page — `consumedSeq` is the last sequence
+    /// it consumed, `attachRequestId` scopes it to one attach generation.
+    /// Additive optional; protocol version stays 10. Ignored by servers that
+    /// predate the capability (accept-and-strip) and by connections whose
+    /// own hello did not negotiate it.
+    #[serde(rename = "terminal.replay.credit")]
+    TerminalReplayCredit(TerminalReplayCredit),
     #[serde(rename = "terminal.autoResumeCancel")]
     TerminalAutoResumeCancel(TerminalAutoResumeCancel),
     #[serde(rename = "terminal.detach")]
@@ -121,7 +130,7 @@ pub enum ClientMessage {
 
 /// The exact `type` discriminants of every client→server message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const CLIENT_MESSAGE_TYPES: [&str; 41] = [
+pub const CLIENT_MESSAGE_TYPES: [&str; 42] = [
     "amplifier.activity.list",
     "claude.activity.list",
     "client.diagnostic",
@@ -160,6 +169,7 @@ pub const CLIENT_MESSAGE_TYPES: [&str; 41] = [
     "terminal.input",
     "terminal.interest",
     "terminal.kill",
+    "terminal.replay.credit",
     "terminal.resize",
     "ui.layout.sync",
     "ui.screenshot.result",
@@ -401,6 +411,21 @@ pub struct TerminalAttach {
     pub observed_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<u64>,
+}
+
+/// `terminal.replay.credit` (responsive-terminal-restore Workstream 1): one
+/// continuation credit for a paced replay session, granted after the prior
+/// page was consumed in order. `consumedSeq` must fall within the server's
+/// outstanding-page window `(credited, lastSentPageEnd]`; stale generations
+/// (a superseded `attachRequestId`) and out-of-window values are ignored.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalReplayCredit {
+    pub terminal_id: String,
+    pub stream_id: String,
+    pub attach_request_id: String,
+    /// The last sequence the client fully consumed in order.
+    pub consumed_seq: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -292,7 +292,11 @@ impl WriterSender {
                 return false;
             }
         };
-        if meta.is_none() && !exit {
+        // Restore contract: a directly pushed `terminal.output.gap` (the paced
+        // replay core's retention gaps) joins the OUTPUT queue as a sequenced
+        // control like `terminal.exit` — see the gap arm below.
+        let sequenced_gap = matches!(&msg, ServerMessage::TerminalOutputGap(_));
+        if meta.is_none() && !exit && !sequenced_gap {
             return self
                 .push_control(Message::Text(json.into()), None, supersedes.as_deref())
                 .is_ok();
@@ -328,11 +332,8 @@ impl WriterSender {
                 self.fail(WriterExit::OutputCapacityExceeded);
                 return false;
             }
-        } else {
+        } else if let ServerMessage::TerminalExit(exit) = &msg {
             // Preserve final-output -> exit. It must not use the control lane.
-            let ServerMessage::TerminalExit(exit) = msg else {
-                unreachable!("sequenced exit only")
-            };
             let priority = queues.interest.priority(&exit.terminal_id);
             // Sequenced exits are zero-weight, exactly as legacy queued them:
             // they can never force an eviction nor close the connection, and
@@ -356,6 +357,36 @@ impl WriterSender {
             }
             // A dead terminal never needs its attach fallback again.
             queues.interest.detach(&exit.terminal_id);
+        } else {
+            // Restore contract (responsive-terminal-restore): a
+            // `terminal.output.gap` pushed DIRECTLY by the paced replay core
+            // (retention loss at attach / mid-replay expiry) is sequenced
+            // WITH the terminal's output — exactly the `terminal.exit`
+            // zero-weight non-evictable control treatment. The control lane
+            // would preempt it AHEAD of already-admitted pages, breaking
+            // per-terminal sequence order (the queue's own gap markers, by
+            // contrast, materialize at lease time from eviction and never
+            // pass through here).
+            let ServerMessage::TerminalOutputGap(gap) = &msg else {
+                unreachable!("meta-less output frames are exit or gap only")
+            };
+            let priority = queues.interest.priority(&gap.terminal_id);
+            if queues
+                .output
+                .push(
+                    &gap.terminal_id,
+                    priority,
+                    Message::Text(json.into()),
+                    0,
+                    None,
+                    seq,
+                )
+                .is_err()
+            {
+                drop(queues);
+                self.fail(WriterExit::OutputCapacityExceeded);
+                return false;
+            }
         }
         drop(queues);
         self.shared.ready.notify_one();

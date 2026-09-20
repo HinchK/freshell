@@ -639,3 +639,117 @@ async fn queue_overflow_gap_without_paced_negotiation_keeps_the_frozen_shape() {
     );
     pump.finish_frame(next.output_bytes, next.control_bytes);
 }
+
+/// A directly pushed `terminal.output.gap` (the paced path emits retention
+/// gaps through `push_server`, unlike the queue's own lease-time gap
+/// materialization): the gap is sequenced WITH the terminal's output — it
+/// must lease strictly AFTER output admitted before it, never jumping ahead
+/// on the preemptive control lane, and it must never be evictable or
+/// byte-charged.
+#[tokio::test]
+async fn server_pushed_restore_gap_stays_ordered_with_the_terminals_output() {
+    let (sender, pump) = WriterSender::new(100_000, 4096, Duration::from_secs(10));
+    assert!(sender.push_server(output(1)));
+    let gap = ServerMessage::TerminalOutputGap(freshell_protocol::TerminalOutputGap {
+        terminal_id: "term".into(),
+        stream_id: "stream".into(),
+        attach_request_id: Some("attach".into()),
+        from_seq: 1,
+        to_seq: 9,
+        reason: freshell_protocol::TerminalOutputGapReason::ReplayWindowExceeded,
+        head_seq: Some(12),
+        oldest_retained_seq: Some(10),
+    });
+    assert!(sender.push_server(gap));
+
+    let first = pump.take_next().unwrap().unwrap();
+    assert!(
+        leased_text(&first.frame).contains("data-1"),
+        "output admitted BEFORE the gap leases first"
+    );
+    pump.finish_frame(first.output_bytes, first.control_bytes);
+
+    let second = pump.take_next().unwrap().unwrap();
+    let gap_json: serde_json::Value = serde_json::from_str(&leased_text(&second.frame)).unwrap();
+    assert_eq!(gap_json["type"], "terminal.output.gap");
+    assert_eq!(
+        second.output_bytes, 0,
+        "the gap leases as a zero-weight sequenced control (never byte-charged)"
+    );
+    pump.finish_frame(second.output_bytes, second.control_bytes);
+}
+
+/// The server-pushed restore gap must survive queue overflow eviction: like
+/// `terminal.exit`, it is a non-evictable sequenced control — the byte cap
+/// evicts payload frames, never the gap.
+#[tokio::test]
+async fn server_pushed_restore_gap_is_not_evictable_under_overflow() {
+    let (sender, pump) = overflow_writer();
+    assert!(sender.push_server(output(1)));
+    let gap = ServerMessage::TerminalOutputGap(freshell_protocol::TerminalOutputGap {
+        terminal_id: "term".into(),
+        stream_id: "stream".into(),
+        attach_request_id: Some("attach".into()),
+        from_seq: 2,
+        to_seq: 2,
+        reason: freshell_protocol::TerminalOutputGapReason::ReplayWindowExceeded,
+        head_seq: None,
+        oldest_retained_seq: None,
+    });
+    assert!(sender.push_server(gap));
+    // Overflow: output(2) does not fit and evicts the OLDEST EVICTABLE entry —
+    // output(1) — never the non-evictable gap.
+    assert!(sender.push_server(output(2)));
+
+    let first = pump.take_next().unwrap().unwrap();
+    let first_json: serde_json::Value = serde_json::from_str(&leased_text(&first.frame)).unwrap();
+    assert_eq!(
+        first_json["type"], "terminal.output.gap",
+        "the queue-overflow gap head leases first (the evicted output(1))"
+    );
+    pump.finish_frame(first.output_bytes, first.control_bytes);
+
+    let second = pump.take_next().unwrap().unwrap();
+    let second_json: serde_json::Value = serde_json::from_str(&leased_text(&second.frame)).unwrap();
+    assert_eq!(
+        second_json["type"], "terminal.output.gap",
+        "the server-pushed restore gap survives the overflow eviction"
+    );
+    assert_eq!(second_json["fromSeq"], 2);
+    pump.finish_frame(second.output_bytes, second.control_bytes);
+
+    let third = pump.take_next().unwrap().unwrap();
+    assert!(leased_text(&third.frame).contains("data-2"));
+    pump.finish_frame(third.output_bytes, third.control_bytes);
+}
+
+/// Task-2 review follow-up (Minor 2): a writer stop that lands while the Gap
+/// arm has RELEASED the admission lock to resolve negotiated bounds (after
+/// the pop, before the materialize) must yield NO flushed frame — the
+/// re-acquire re-check of `closed` aborts the lease and the pump exits via
+/// the stop watch, leaving the popped gap unflushed.
+#[tokio::test]
+async fn writer_stop_landing_during_gap_bounds_resolution_flushes_no_frame() {
+    let (sender, pump) = overflow_writer();
+    let stopping = sender.clone();
+    sender.set_paced_replay_gap_bounds(Arc::new(move |_| {
+        // The stop lands mid-resolution: the gap was already popped and the
+        // admission lock released.
+        stopping.stop_without_close();
+        Some(freshell_terminal::ReplayBounds {
+            head_seq: 9,
+            oldest_retained_seq: 2,
+        })
+    }));
+    assert!(sender.push_server(output(1)));
+    assert!(sender.push_server(output(2))); // evicts output(1) -> queue gap
+
+    let capture = Arc::new(Capture::default());
+    let task = tokio::spawn(pump.run(TestSink(Arc::clone(&capture))));
+    assert_eq!(join(task).await, WriterExit::Stopped);
+    assert!(
+        text_frames(&capture).is_empty(),
+        "a stop before the lease must leave nothing flushed"
+    );
+    assert_eq!(sender.pending_output_bytes(), 0);
+}

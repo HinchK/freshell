@@ -387,6 +387,11 @@ async fn run_loop(
     let mut writer_task = tokio::spawn(writer.run(socket_tx).instrument(tracing::Span::current()));
     let _writer_lifetime = connection_writer::AbortWriterOnDrop(writer_task.abort_handle());
     let mut writer_finished = false;
+    // Responsive-terminal-restore W1: this connection's paced replay
+    // sessions. Owned by the loop — a socket drop discards them (the
+    // registry-side deferrals die with the subscribers remove_connection
+    // sweeps), a detach cancels one, a re-attach replaces it.
+    let mut paced_sessions = crate::paced_replay::PacedSessions::default();
     let conn_sink: FrameSink = {
         let sender = ws_tx.clone();
         Arc::new(move |msg| {
@@ -530,6 +535,7 @@ async fn run_loop(
                             &create_cancel_rx,
                             &mut host_stats_last_refresh_at,
                             &mut conn_identity,
+                            &mut paced_sessions,
                         )
                         .await
                         {
@@ -778,6 +784,9 @@ async fn handle_client_text(
     // D8: the connection's hello-stamped client identity (refreshed by
     // `tabs.sync.push` below) — the provenance source for ledger stamps.
     conn_identity: &mut ConnectionIdentity,
+    // Responsive-terminal-restore W1: this connection's paced replay
+    // sessions (one per attached terminal; the pacing coordinator's state).
+    paced_sessions: &mut crate::paced_replay::PacedSessions,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
     // runtime's tolerance; the handshake already gated auth).
@@ -1477,6 +1486,9 @@ async fn handle_client_text(
                 // session lost before its first snapshot.
                 let asserted_at = now_ms();
                 maybe_restamp_on_attach(&attach, state, conn_identity, asserted_at).await;
+                // Observability inputs captured before the attach moves.
+                let requested_since_seq = attach.since_seq.unwrap_or(0);
+                let attach_max_replay_bytes = attach.max_replay_bytes;
                 let attached = match handle_attach(
                     attach,
                     state,
@@ -1485,8 +1497,25 @@ async fn handle_client_text(
                     terminal_output_batch_v1,
                     paced_terminal_replay_v1,
                 ) {
-                    Some(err) => send(ws_tx, &err).await,
-                    None => true,
+                    AttachReply::Error(err) => send(ws_tx, &err).await,
+                    AttachReply::Legacy => true,
+                    AttachReply::Paced(start) => {
+                        // The paced replay core (responsive-terminal-restore
+                        // W1): sink the first page (the registry produced it
+                        // under the attach lock), emit the session start, and
+                        // drain to quiet — a short replay can complete here
+                        // without ever needing a credit.
+                        crate::paced_replay::start_session(
+                            &state.registry,
+                            conn_id,
+                            conn_sink,
+                            paced_sessions,
+                            *start,
+                            requested_since_seq,
+                            attach_max_replay_bytes,
+                        );
+                        true
+                    }
                 };
                 // The window closes with the guard (exactly-once).
                 drop(attach_guard);
@@ -1562,7 +1591,28 @@ async fn handle_client_text(
             }
         }
         ClientMessage::TerminalDetach(detach) => {
+            // Responsive-terminal-restore: an explicit detach cancels the
+            // connection's paced session for this terminal (the registry-side
+            // deferral dies with the subscriber the detach removes).
+            paced_sessions.cancel(&detach.terminal_id);
             handle_detach(&detach, ws_tx, state, conn_id).await
+        }
+        // Responsive-terminal-restore Workstream 1: the paced replay
+        // continuation credit. All rules sit under the connection's
+        // negotiated capability — a non-negotiated connection's credits are
+        // inert (logged, then ignored).
+        ClientMessage::TerminalReplayCredit(replay_credit) => {
+            if !paced_terminal_replay_v1 {
+                tracing::info!(
+                    terminal_id = %replay_credit.terminal_id,
+                    consumed_seq = replay_credit.consumed_seq,
+                    status = crate::paced_replay::CreditVerdict::NonNegotiated.as_str(),
+                    "ws.restore.credit"
+                );
+                true
+            } else {
+                handle_replay_credit(&replay_credit, state, conn_id, conn_sink, paced_sessions)
+            }
         }
         ClientMessage::TerminalKill(kill) => {
             // b8ke ext r24 F2: the kill's coordinator transitions record
@@ -6926,13 +6976,32 @@ async fn maybe_restamp_on_attach(
 }
 
 /// `terminal.attach` — resolve the terminal in the shared registry and attach THIS
-/// connection to it: the registry enqueues `terminal.attach.ready`, replays the
-/// scrollback (seq-ordered, stamped with this attach's id + `source:'replay'`), and
-/// registers the connection so live output fans out — all onto `conn_sink`, which
-/// the select loop drains to the socket. Attaching to an unknown terminal returns
-/// the reference's `error{INVALID_TERMINAL_ID, "Terminal not running"}` frame for
-/// the caller to send (`ws-handler.ts:2730-2735`; restored by kata dtfn — the SPA's
-/// recovery ladder recreates the pane). `None` = attached.
+/// connection to it: the registry enqueues `terminal.attach.ready` and replays the
+/// scrollback (seq-ordered, stamped with this attach's id + `source:'replay'`) onto
+/// `conn_sink`, which the select loop drains to the socket. Attaching to an
+/// unknown terminal returns the reference's `error{INVALID_TERMINAL_ID,
+/// "Terminal not running"}` frame for the caller to send
+/// (`ws-handler.ts:2730-2735`; restored by kata dtfn — the SPA's recovery ladder
+/// recreates the pane). `Ok(None)` = attached with no reply.
+///
+/// Responsive-terminal-restore Workstream 1: a NEGOTIATED
+/// (`pacedTerminalReplayV1`) attach to a Running terminal with an
+/// attachRequestId returns the paced session start instead — the registry
+/// armed the subscriber's deferral and produced the FIRST page under the
+/// attach lock; the caller sinks that page after the lock is released and
+/// owns the pacing session (credits, tail drain, completion).
+///
+/// TERM-07: the attach's `maxReplayBytes` threads through BOTH
+/// geometry-authorized and geometry-skipped paths into the registry call,
+/// where it is recorded on the subscriber with no delivery-behavior change
+/// (the paced-start observability event reports it; the increment-3
+/// snapshot work consumes it).
+enum AttachReply {
+    Legacy,
+    Error(Box<ServerMessage>),
+    Paced(Box<freshell_terminal::PacedAttachStart>),
+}
+
 fn handle_attach(
     attach: TerminalAttach,
     state: &WsState,
@@ -6940,10 +7009,10 @@ fn handle_attach(
     conn_sink: &FrameSink,
     terminal_output_batch_v1: bool,
     paced_terminal_replay_v1: bool,
-) -> Option<ServerMessage> {
+) -> AttachReply {
     // STATE-SYNC FIX 1 increment 2a: stamp the canonical identity onto
     // `attach.ready` from the shared identity registry (create-time
-    // resume ids AND locator-associated ids both live there); the
+    // resume ids AND locator-associated ids both live here); the
     // registry crate is identity-agnostic, so it's resolved here.
     let canonical_session_ref = state.identity.session_ref_for(&attach.terminal_id);
 
@@ -6957,13 +7026,15 @@ fn handle_attach(
         attach.expected_session_ref.as_ref(),
         canonical_session_ref.as_ref(),
     );
+    // TERM-07 seam: the client's replay-budget request rides both paths.
+    let max_replay_bytes = attach.max_replay_bytes;
     let outcome = if geometry_identity_ok {
         let cols = attach.cols.clamp(0, u16::MAX as i64) as u16;
         let rows = attach.rows.clamp(0, u16::MAX as i64) as u16;
-        // `paced_terminal_replay_v1` parks the negotiated capability on the
-        // attach's subscriber (alongside `terminal_output_batch_v1`);
-        // Workstream 1's paced replay core (registry pages + coordinator,
-        // task 3) consumes it to gate paced restore delivery.
+        // `paced_terminal_replay_v1` gates the paced replay core
+        // (responsive-terminal-restore): a negotiated attach with an
+        // attachRequestId to a Running terminal returns the paced session
+        // start; every other shape keeps the legacy inline replay.
         state.registry.attach_with_geometry(
             &attach.terminal_id,
             conn_id,
@@ -6977,6 +7048,7 @@ fn handle_attach(
             // (xterm recreation / user reset). Forwards the wire field 1:1; the
             // registry owns the emit-vs-skip gating.
             attach.surface_reset,
+            max_replay_bytes,
             attach.intent,
             cols,
             rows,
@@ -6992,10 +7064,14 @@ fn handle_attach(
             paced_terminal_replay_v1,
             canonical_session_ref,
             attach.surface_reset,
+            max_replay_bytes,
         )
     };
     if outcome.found {
-        return None;
+        return match outcome.paced {
+            Some(start) => AttachReply::Paced(Box::new(start)),
+            None => AttachReply::Legacy,
+        };
     }
     // Kata dtfn: `AttachOutcome{found:false}` was silently discarded here,
     // wedging any attach against an unknown id (stale pre-restart id, typo'd
@@ -7004,7 +7080,7 @@ fn handle_attach(
     // gate accepts it (attachRequestIds live in the `pane:N:nanoid` namespace,
     // never colliding with createRequestIds — see ws-client's
     // clearTrackedCreate-on-error behavior).
-    Some(ServerMessage::Error(ErrorMsg {
+    AttachReply::Error(Box::new(ServerMessage::Error(ErrorMsg {
         owner_kind: None,
         owner_generation: None,
         owner_epoch: None,
@@ -7018,7 +7094,52 @@ fn handle_attach(
         terminal_id: Some(attach.terminal_id),
         terminal_exit_code: None,
         live_terminal_id: None,
-    }))
+    })))
+}
+
+/// One `terminal.replay.credit` on a negotiated connection
+/// (responsive-terminal-restore Workstream 1): validate against the active
+/// session's generation + outstanding-page window, and on acceptance
+/// produce the next page (or the negotiated retention gap + continuation,
+/// or — once the cursor reaches the target — the tail drain that completes
+/// the session). Every non-accepted verdict is inert (observed via
+/// `ws.restore.credit`, never a client-visible error).
+fn handle_replay_credit(
+    replay_credit: &freshell_protocol::TerminalReplayCredit,
+    state: &WsState,
+    conn_id: u64,
+    conn_sink: &FrameSink,
+    paced_sessions: &mut crate::paced_replay::PacedSessions,
+) -> bool {
+    use crate::paced_replay::DriveOutcome;
+    // Identifiers/measurements only, per the restore observability contract.
+    let observe = |verdict: crate::paced_replay::CreditVerdict| {
+        tracing::info!(
+            terminal_id = %replay_credit.terminal_id,
+            consumed_seq = replay_credit.consumed_seq,
+            status = verdict.as_str(),
+            "ws.restore.credit"
+        );
+    };
+    let Some(session) = paced_sessions.get_mut(&replay_credit.terminal_id) else {
+        // No active session accepts this credit (completed, detached, or a
+        // terminal never paced): a stale generation.
+        observe(crate::paced_replay::CreditVerdict::StaleGeneration);
+        return true;
+    };
+    let verdict = crate::paced_replay::validate_credit(session, replay_credit);
+    observe(verdict);
+    if verdict != crate::paced_replay::CreditVerdict::Accepted {
+        return true;
+    }
+    let budget = state.registry.paced_page_max_bytes();
+    match crate::paced_replay::drive_session(&state.registry, conn_id, conn_sink, session, budget) {
+        DriveOutcome::Active => {}
+        DriveOutcome::Completed | DriveOutcome::Gone => {
+            paced_sessions.remove(&replay_credit.terminal_id);
+        }
+    }
+    true
 }
 
 /// Node's `resizeIfSessionMatches` identity guard
@@ -10357,6 +10478,7 @@ mod pane_reconcile_gate_tests {
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
+            &mut Default::default(),
         )
         .await;
         assert!(
@@ -10382,6 +10504,7 @@ mod pane_reconcile_gate_tests {
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
+            &mut Default::default(),
         )
         .await;
         assert!(pong_ok);
@@ -10427,6 +10550,7 @@ mod pane_reconcile_gate_tests {
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
+            &mut Default::default(),
         )
         .await;
         assert!(ok);
@@ -10452,6 +10576,7 @@ mod pane_reconcile_gate_tests {
                 &create_cancel_rx,
                 &mut host_stats_last_refresh_at,
                 &mut conn_identity,
+                &mut Default::default(),
             )
             .await;
             assert!(ok, "attempt {attempt}: a full queue must be answered");
@@ -10794,6 +10919,7 @@ mod host_stats_dispatch_tests {
                 &create_cancel_rx,
                 &mut host_stats_last_refresh_at,
                 &mut conn_identity,
+                &mut Default::default(),
             )
             .await;
             assert!(ok);
@@ -10826,6 +10952,7 @@ mod host_stats_dispatch_tests {
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
+            &mut Default::default(),
         )
         .await;
         assert!(ok);
@@ -10848,6 +10975,7 @@ mod host_stats_dispatch_tests {
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
+            &mut Default::default(),
         )
         .await;
         assert!(pong_ok);
@@ -10891,6 +11019,7 @@ mod host_stats_dispatch_tests {
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
+            &mut Default::default(),
         )
         .await;
         assert!(ok);
@@ -10919,6 +11048,7 @@ mod host_stats_dispatch_tests {
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
+            &mut Default::default(),
         )
         .await;
         assert!(ok);
@@ -10965,6 +11095,7 @@ mod host_stats_dispatch_tests {
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
+            &mut Default::default(),
         )
         .await;
         assert!(ok);

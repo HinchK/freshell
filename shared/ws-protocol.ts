@@ -1087,6 +1087,23 @@ export const TerminalInterestSchema = z.object({
 })
 export type TerminalInterestMessage = z.infer<typeof TerminalInterestSchema>
 
+/**
+ * Paced replay continuation credit (responsive-terminal-restore Workstream 1):
+ * sent by a client whose hello negotiated `pacedTerminalReplayV1` after it
+ * fully consumed an ordered replay page. `consumedSeq` is the last sequence
+ * consumed in order; `attachRequestId` scopes the credit to one attach
+ * generation. Additive optional — older servers accept-and-strip it and
+ * protocol version stays 10.
+ */
+export const TerminalReplayCreditSchema = z.object({
+  type: z.literal('terminal.replay.credit'),
+  terminalId: z.string().min(1).max(512),
+  streamId: z.string().min(1).max(512),
+  attachRequestId: z.string().min(1).max(512),
+  consumedSeq: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+})
+export type TerminalReplayCreditMessage = z.infer<typeof TerminalReplayCreditSchema>
+
 // ── Client message discriminated union ──
 
 export const ClientMessageSchema = z.discriminatedUnion('type', [
@@ -1107,6 +1124,7 @@ export const ClientMessageSchema = z.discriminatedUnion('type', [
   TerminalInputSchema,
   TerminalResizeSchema,
   TerminalKillSchema,
+  TerminalReplayCreditSchema,
   CodexActivityListSchema,
   OpencodeActivityListSchema,
   ClaudeActivityListSchema,
