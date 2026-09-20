@@ -32,7 +32,7 @@
 //! (`turn-complete-clock.ts:19-21`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
@@ -123,10 +123,17 @@ pub enum CodexAdapterEvent {
 /// monotonic clock and active-turn tracking that the reference keeps in
 /// `lastTurnCompleteAtByThread` / `activeTurnByThread` (`adapter.ts:794-800`), plus
 /// the per-session user-interrupt marker the interrupt control lane arms.
+///
+/// The monotonic clock lives behind ONE shared `Arc<Mutex<Option<i64>>>` per
+/// session: the freshagent lane threads the session's clock into this
+/// subscription (ordinary consumer edges) AND into the synthesized-edge
+/// minters outside the consumer (the crash self-heal, the wedged-sidecar quiet
+/// deadman), so ordinary and synthesized `at`s share a single
+/// strictly-monotonic timeline and can never collide or regress.
 #[derive(Clone, Debug)]
 pub struct CodexSubscription {
     session_id: String,
-    last_turn_complete_at: Option<i64>,
+    last_turn_complete_at: Arc<Mutex<Option<i64>>>,
     active_turn_id: Option<String>,
     /// The per-session USER-interrupt marker (opencode's `turn_aborted`
     /// precedent): the interrupt control lane arms it BEFORE issuing
@@ -146,10 +153,20 @@ impl CodexSubscription {
     pub fn new(session_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
-            last_turn_complete_at: None,
+            last_turn_complete_at: Arc::new(Mutex::new(None)),
             active_turn_id: None,
             user_interrupt_pending: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Adopt the session's shared monotonic turn-complete clock. The freshagent
+    /// lane threads ONE clock per session into both the consumer's subscription
+    /// (ordinary completion edges) and the crash/deadman synthesized-edge
+    /// minters; constructing the subscription with this builder keeps them on
+    /// the same strictly-monotonic `at` timeline instead of fresh defaults.
+    pub fn with_last_turn_complete_at(mut self, clock: Arc<Mutex<Option<i64>>>) -> Self {
+        self.last_turn_complete_at = clock;
+        self
     }
 
     /// Adopt the session's shared user-interrupt marker. The freshagent lane
@@ -189,7 +206,10 @@ impl CodexSubscription {
 
     /// The last positive-completion `at` this session emitted (for assertions / persistence).
     pub fn last_turn_complete_at(&self) -> Option<i64> {
-        self.last_turn_complete_at
+        *self
+            .last_turn_complete_at
+            .lock()
+            .expect("last_turn_complete_at mutex")
     }
 
     /// Record the active provider turn id from a `send`/`turn/started`
@@ -296,9 +316,20 @@ impl CodexSubscription {
             _ => {}
         }
 
-        // adapter.ts:925-927 — monotonic `at`, then the positive chime.
-        let at = next_monotonic_turn_complete_at(self.last_turn_complete_at, now);
-        self.last_turn_complete_at = Some(at);
+        // adapter.ts:925-927 — monotonic `at`, then the positive chime. The clock
+        // is the session's SHARED mutex-guarded clock (see the struct doc): a
+        // synthesized edge minted outside this consumer (crash self-heal, quiet
+        // deadman) takes the same lock and can never collide with or regress
+        // below this `at`.
+        let at = {
+            let mut guard = self
+                .last_turn_complete_at
+                .lock()
+                .expect("last_turn_complete_at mutex");
+            let at = next_monotonic_turn_complete_at(*guard, now);
+            *guard = Some(at);
+            at
+        };
         out.push(CodexAdapterEvent::TurnComplete {
             session_id: self.session_id.clone(),
             at,

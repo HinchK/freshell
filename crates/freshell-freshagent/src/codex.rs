@@ -61,11 +61,11 @@ use freshell_codex::launch_lifecycle::{
 use freshell_codex::launch_plan::{codex_sidecar_spawn_spec, CodexSidecarLaunchContext};
 use freshell_codex::transport::{reap_owned_codex_sidecars, TungsteniteTransport};
 use freshell_codex::{
-    mint_ownership_id, normalize_codex_thread_status, normalize_freshcodex_effort,
-    normalize_freshcodex_model, read_rollout_history_mode, to_codex_reasoning_effort,
-    CodexAdapterEvent, CodexAppServerClient, CodexAppServerError, CodexNotification, CodexStatus,
-    CodexSubscription, HistoryMode, StartThreadParams, StartTurnParams, ThreadForkParams,
-    CODEX_SIDECAR_OWNERSHIP_ENV,
+    mint_ownership_id, next_monotonic_turn_complete_at, normalize_codex_thread_status,
+    normalize_freshcodex_effort, normalize_freshcodex_model, read_rollout_history_mode,
+    to_codex_reasoning_effort, CodexAdapterEvent, CodexAppServerClient, CodexAppServerError,
+    CodexNotification, CodexStatus, CodexSubscription, HistoryMode, StartThreadParams,
+    StartTurnParams, ThreadForkParams, CODEX_SIDECAR_OWNERSHIP_ENV,
 };
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentConfigure,
@@ -132,6 +132,15 @@ struct CodexConsumerRuntime {
     /// (one shared `Arc` with [`CodexSession::user_interrupt_pending`]).
     user_interrupt_pending: Arc<AtomicBool>,
     quiet_deadman: Arc<StdMutex<QuietDeadman>>,
+    /// The session's turn-in-flight latch (one shared `Arc` with
+    /// [`CodexSession::turn_in_flight`]): the consumer mirrors its
+    /// SET/CLEAR points onto the latch and feeds the quiet deadman off it.
+    turn_in_flight: Arc<AtomicBool>,
+    /// The session's shared monotonic turn-complete clock (one shared `Arc`
+    /// with [`CodexSession::last_turn_complete_at`]): adopted by the consumer's
+    /// [`CodexSubscription`] so ordinary and synthesized edges share ONE
+    /// strictly-monotonic `at` timeline.
+    last_turn_complete_at: Arc<StdMutex<Option<i64>>>,
     compact_in_flight: Arc<AtomicBool>,
     compact_turn_id: Arc<StdMutex<Option<String>>>,
     event_emission_gate: Arc<TokioMutex<()>>,
@@ -405,6 +414,26 @@ struct CodexSession {
     /// into the consumer ([`reduce_notification`]), the exit watcher
     /// ([`spawn_exit_watcher`]), and the snapshot path ([`FreshCodexState::get_snapshot`]).
     quiet_deadman: Arc<StdMutex<QuietDeadman>>,
+    /// The lane's turn-in-flight AUTHORITY (the round-2 review finding): armed at
+    /// `start_turn` DISPATCH -- BEFORE awaiting the response -- so the
+    /// independently-running exit watcher and quiet deadman classify the turn as
+    /// in flight even while the response is still outstanding (a post-response
+    /// arm would miss a crash in that window). Mirrored at every `active_turn`
+    /// mutation so it is always a superset: SET alongside the consumer's
+    /// `turn/started` adoption and the snapshot's mid-flight seed, CLEARED at
+    /// every turn-end observation (the thread leaving running/starting, the
+    /// active turn's completion, `thread_closed`, a successful user
+    /// interrupt) and on a failed dispatch. The crash self-heal arm reads and
+    /// retires it (the crash IS the turn end it observes); a requested kill
+    /// retires it silently (the user initiated that turn end).
+    turn_in_flight: Arc<AtomicBool>,
+    /// The session's ONE monotonic turn-complete clock, shared by the
+    /// notification consumer's [`CodexSubscription`] (ordinary edges) and the
+    /// synthesized attention edges minted OUTSIDE the consumer (the crash
+    /// self-heal, the quiet-deadman fire) -- one strictly-monotonic `at`
+    /// timeline per session, so synthesized and ordinary edges can never
+    /// collide or regress.
+    last_turn_complete_at: Arc<StdMutex<Option<i64>>>,
     /// D8 (restore-open-sessions-only, focused-ep1-r3/-r4): the LATEST
     /// connection-scoped provenance this session was attached under — parked by
     /// [`FreshCodexState::finish_create`] from the create's threaded stamps,
@@ -435,15 +464,18 @@ enum CodexTeardownSettlement {
 }
 
 /// Per-session state of the wedged-sidecar quiet deadman: while a turn is in flight
-/// (`active_turn` set), a window is armed; if no lane-visible push notification feeds it
-/// before the deadline elapses, the pane is flagged `stuck` (via a `freshAgent.status`
-/// broadcast -- NEVER a fabricated turn-complete). Any feed resets the window
-/// (generation bump) and resolves a flagged state; every mutation bumps `generation`,
-/// so a stale waiter task observes the mismatch and exits without firing.
+/// (the turn-in-flight latch armed), a window is armed; if no lane-visible push
+/// notification feeds it before the deadline elapses, the pane is flagged `stuck`
+/// (via a `freshAgent.status` broadcast) AND the unified `freshAgent.turn.complete`
+/// attention edge rings on the session's shared clock — a wedged turn ENDED as far
+/// as the user can tell, the same binary "needs attention" signal as any other
+/// unwitnessed turn end. Any feed resets the window (generation bump) and resolves a
+/// flagged state; every mutation bumps `generation`, so a stale waiter task observes
+/// the mismatch and exits without firing.
 ///
 /// LOCK DISCIPLINE: this is a plain `std::sync::Mutex` that is only ever held briefly --
 /// never across an `.await`, never while broadcasting. When it is nested with the
-/// session's `active_turn` mutex (the feed and fire checks), `quiet_deadman` is ALWAYS
+/// session's `active_turn` mutex (the U-1 mid-flight seed), `quiet_deadman` is ALWAYS
 /// the outer lock and `active_turn` the inner one (the file-wide order).
 ///
 /// `pub(crate)` only because the `pub(crate)` [`spawn_exit_watcher`] names it in its
@@ -2272,6 +2304,11 @@ impl FreshCodexState {
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let user_interrupt_pending: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         let quiet_deadman = QuietDeadman::new_shared();
+        // The turn-in-flight latch starts disarmed (armed at the first dispatch) and
+        // the turn-complete clock starts unwound; both are shared per-session handles
+        // threaded into the consumer, the exit watcher, and the deadman waiter.
+        let turn_in_flight: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let last_turn_complete_at: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
 
         // ORDERING FIX (wireshape-oracle flake, ~1-in-3): the app-server can already have
         // pushed a `ThreadStarted` notification onto `notifs` (the fake app-server
@@ -2296,6 +2333,8 @@ impl FreshCodexState {
                 active_turn: active_turn.clone(),
                 user_interrupt_pending: user_interrupt_pending.clone(),
                 quiet_deadman: quiet_deadman.clone(),
+                turn_in_flight: turn_in_flight.clone(),
+                last_turn_complete_at: last_turn_complete_at.clone(),
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
@@ -2320,6 +2359,8 @@ impl FreshCodexState {
             exited.clone(),
             Arc::clone(&self.leases),
             quiet_deadman.clone(),
+            turn_in_flight.clone(),
+            last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
         );
@@ -2347,6 +2388,8 @@ impl FreshCodexState {
                 sidecar_pid,
                 sidecar_ownership_id,
                 quiet_deadman,
+                turn_in_flight,
+                last_turn_complete_at,
                 // D8 (focused-ep1-r3 — the parking invariant): park the creating
                 // connection's provenance ON the session so downstream readers
                 // (the fork child row + child record) assert the CURRENT
@@ -2775,13 +2818,21 @@ impl FreshCodexState {
                 (
                     s.client.clone(),
                     s.active_turn.clone(),
+                    s.turn_in_flight.clone(),
                     s.turn_lock.clone(),
                     s.event_emission_gate.clone(),
                     s.quiet_deadman.clone(),
                 )
             })
         };
-        let Some((client, active_turn, turn_lock, event_emission_gate, quiet_deadman)) = looked_up
+        let Some((
+            client,
+            active_turn,
+            turn_in_flight,
+            turn_lock,
+            event_emission_gate,
+            quiet_deadman,
+        )) = looked_up
         else {
             self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
             return;
@@ -2878,16 +2929,32 @@ impl FreshCodexState {
         // request-correlated submittedTurnId and then the completion-derived frames.
         let _event_emission = event_emission_gate.lock().await;
 
+        // The turn-in-flight latch + quiet window arm at DISPATCH time -- BEFORE
+        // awaiting the response: the independently-running exit watcher and the
+        // quiet-deadman waiter must classify this turn as in flight even while
+        // the response is still outstanding (a crash in that window ends a real
+        // dispatched turn; a post-response arm would classify it idle and miss
+        // the crash edge, or arm the deadman after the sidecar is already
+        // gone). The response-failure arm below disarms both.
+        turn_in_flight.store(true, Ordering::SeqCst);
+        note_codex_activity(self, &session_id, &turn_in_flight, &quiet_deadman);
+
         let submitted_turn_id = match client.start_turn(params).await {
             Ok(started) => {
                 // adapter.ts:980 -- track the active turn immediately (before any
                 // turn/started notification), so a fast-follow interrupt has a target.
                 *active_turn.lock().expect("active_turn mutex") = Some(started.turn_id.clone());
-                // A turn is now in flight: arm the wedged-sidecar quiet window.
-                note_codex_activity(self, &session_id, &active_turn, &quiet_deadman);
+                // A turn is now in flight: refresh the quiet window off the
+                // response (the sidecar has provably accepted the turn; the
+                // deadline resets from this lane-visible proof).
+                note_codex_activity(self, &session_id, &turn_in_flight, &quiet_deadman);
                 started.turn_id
             }
             Err(err) => {
+                // The dispatch/response failed: no turn is in flight. Retire
+                // the latch and disarm the window armed at dispatch time.
+                turn_in_flight.store(false, Ordering::SeqCst);
+                note_codex_activity(self, &session_id, &turn_in_flight, &quiet_deadman);
                 self.send_error(&request_id, "CODEX_TURN_START_FAILED", &err.to_string());
                 return;
             }
@@ -3142,11 +3209,12 @@ impl FreshCodexState {
                 (
                     s.client.clone(),
                     s.active_turn.clone(),
+                    s.turn_in_flight.clone(),
                     s.user_interrupt_pending.clone(),
                 )
             })
         };
-        let Some((client, active_turn, user_interrupt_pending)) = looked_up else {
+        let Some((client, active_turn, turn_in_flight, user_interrupt_pending)) = looked_up else {
             self.send_error(&None, "SESSION_NOT_FOUND", "codex session not found");
             return;
         };
@@ -3171,7 +3239,10 @@ impl FreshCodexState {
             Ok(()) => {
                 // adapter.ts:1027 — the turn is over from this call's perspective; the
                 // resulting turn/completed notification also clears it (redundant, harmless).
-                *active_turn.lock().expect("active_turn mutex") = None;
+                // The user-initiated interrupt ends the turn SILENTLY: retire the
+                // in-flight latch too, so a later idle crash cannot ring for a turn
+                // that already ended at the user's own hand.
+                retire_observed_turn_end(&active_turn, &turn_in_flight);
             }
             Err(err) => {
                 // The interrupt never landed — disarm so a later NON-user
@@ -5733,6 +5804,8 @@ impl FreshCodexState {
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let user_interrupt_pending: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         let quiet_deadman = QuietDeadman::new_shared();
+        let turn_in_flight: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let last_turn_complete_at: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
@@ -5744,6 +5817,8 @@ impl FreshCodexState {
                 active_turn: active_turn.clone(),
                 user_interrupt_pending: user_interrupt_pending.clone(),
                 quiet_deadman: quiet_deadman.clone(),
+                turn_in_flight: turn_in_flight.clone(),
+                last_turn_complete_at: last_turn_complete_at.clone(),
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
@@ -5762,6 +5837,8 @@ impl FreshCodexState {
             exited.clone(),
             Arc::clone(&self.leases),
             quiet_deadman.clone(),
+            turn_in_flight.clone(),
+            last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
         );
@@ -5801,6 +5878,8 @@ impl FreshCodexState {
                     sidecar_pid,
                     sidecar_ownership_id,
                     quiet_deadman,
+                    turn_in_flight,
+                    last_turn_complete_at,
                     // D8 (focused-ep1-r3): CARRY the crashed session's parked
                     // provenance onto the rebuilt record (the same logical
                     // session continues) so a post-recovery fork stays
@@ -6022,6 +6101,8 @@ impl FreshCodexState {
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let user_interrupt_pending: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         let quiet_deadman = QuietDeadman::new_shared();
+        let turn_in_flight: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let last_turn_complete_at: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
@@ -6033,6 +6114,8 @@ impl FreshCodexState {
                 active_turn: active_turn.clone(),
                 user_interrupt_pending: user_interrupt_pending.clone(),
                 quiet_deadman: quiet_deadman.clone(),
+                turn_in_flight: turn_in_flight.clone(),
+                last_turn_complete_at: last_turn_complete_at.clone(),
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
@@ -6051,6 +6134,8 @@ impl FreshCodexState {
             exited.clone(),
             Arc::clone(&self.leases),
             quiet_deadman.clone(),
+            turn_in_flight.clone(),
+            last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
         );
@@ -6081,6 +6166,8 @@ impl FreshCodexState {
                     sidecar_pid,
                     sidecar_ownership_id,
                     quiet_deadman,
+                    turn_in_flight,
+                    last_turn_complete_at,
                     // D8 (focused-ep1-r3): the parked provenance rides the
                     // OLD→NEW re-key (carried from the crashed session).
                     provenance,
@@ -6387,6 +6474,8 @@ impl FreshCodexState {
             active_turn,
             user_interrupt_pending,
             quiet_deadman,
+            turn_in_flight,
+            last_turn_complete_at,
             compact_in_flight,
             compact_turn_id,
             event_emission_gate,
@@ -6403,9 +6492,14 @@ impl FreshCodexState {
             state.clear_controls(&thread_id).await;
             // Adopt the session's shared user-interrupt marker so the interrupt
             // control lane (which arms it through the session record) and this
-            // reducer's `interrupted` guard read ONE flag.
+            // reducer's `interrupted` guard read ONE flag. Adopt the session's
+            // shared monotonic turn-complete clock the same way, so the ordinary
+            // edges minted here and the synthesized edges minted outside this
+            // consumer (crash self-heal, quiet deadman) share ONE strictly-
+            // monotonic `at` timeline per session.
             let mut subscription = CodexSubscription::new(thread_id.clone())
-                .with_user_interrupt_pending(user_interrupt_pending);
+                .with_user_interrupt_pending(user_interrupt_pending)
+                .with_last_turn_complete_at(last_turn_complete_at);
             while let Some(notification) = notifs.recv().await {
                 // `turn/started` has no wire output, but establishes state that later
                 // notifications depend on (notably the compact turn's ownership id).
@@ -6419,6 +6513,7 @@ impl FreshCodexState {
                         &mut subscription,
                         notification,
                         &active_turn,
+                        &turn_in_flight,
                         &quiet_deadman,
                         &state,
                         &compact_in_flight,
@@ -6442,13 +6537,14 @@ impl FreshCodexState {
                     // lane-visible proof the sidecar is alive: feed the
                     // wedged-sidecar quiet deadman here too, or a turn parked on
                     // a pending approval past the window would read as wedged.
-                    note_codex_activity(&state, &thread_id, &active_turn, &quiet_deadman);
+                    note_codex_activity(&state, &thread_id, &turn_in_flight, &quiet_deadman);
                     continue;
                 }
                 let events = reduce_notification(
                     &mut subscription,
                     notification,
                     &active_turn,
+                    &turn_in_flight,
                     &quiet_deadman,
                     &state,
                     &compact_in_flight,
@@ -6470,16 +6566,28 @@ impl FreshCodexState {
         })
     }
 
-    /// Brief sessions-map lookup of a session's quiet-deadman + active-turn handles
-    /// (the map lock is never held across an await).
+    /// Brief sessions-map lookup of a session's quiet-deadman + turn-state handles
+    /// (the map lock is never held across an await): the active-turn tracker, the
+    /// deadman, the turn-in-flight latch (the lane's in-flight authority), and the
+    /// shared turn-complete clock — every caller gets the SAME incarnation's set.
     async fn quiet_handles(
         &self,
         thread_id: &str,
-    ) -> Option<(Arc<StdMutex<Option<String>>>, Arc<StdMutex<QuietDeadman>>)> {
+    ) -> Option<(
+        Arc<StdMutex<Option<String>>>,
+        Arc<StdMutex<QuietDeadman>>,
+        Arc<AtomicBool>,
+        Arc<StdMutex<Option<i64>>>,
+    )> {
         let guard = self.sessions.lock().await;
-        guard
-            .get(thread_id)
-            .map(|s| (s.active_turn.clone(), s.quiet_deadman.clone()))
+        guard.get(thread_id).map(|s| {
+            (
+                s.active_turn.clone(),
+                s.quiet_deadman.clone(),
+                s.turn_in_flight.clone(),
+                s.last_turn_complete_at.clone(),
+            )
+        })
     }
 
     /// Arm the quiet window ONLY if none is armed (snapshot polls must never reset an
@@ -6513,7 +6621,9 @@ impl FreshCodexState {
     async fn watch_codex_quiet_deadline(self, thread_id: String, generation: u64) {
         // Snapshot the per-session handles + the armed deadline WITHOUT holding the
         // sessions lock across the sleep (it is never held across an await).
-        let Some((active_turn, quiet)) = self.quiet_handles(&thread_id).await else {
+        let Some((_active_turn, quiet, turn_in_flight, last_turn_complete_at)) =
+            self.quiet_handles(&thread_id).await
+        else {
             return;
         };
         let Some(deadline) = quiet.lock().expect("quiet deadman lock").deadline else {
@@ -6521,11 +6631,11 @@ impl FreshCodexState {
         };
         tokio::time::sleep_until(deadline).await;
         // Fire iff NOTHING changed since the arm: same generation, same armed deadline,
-        // turn still in flight, not already flagged. Locks: `quiet` (outer) then
-        // `active_turn` (inner) — the file-wide order.
+        // turn still in flight (the dispatch-time latch — the lane's turn-in-flight
+        // authority), not already flagged.
         let fired = {
             let mut q = quiet.lock().expect("quiet deadman lock");
-            let has_turn = active_turn.lock().expect("active_turn mutex").is_some();
+            let has_turn = turn_in_flight.load(Ordering::SeqCst);
             if has_turn
                 && q.generation == generation
                 && q.deadline == Some(deadline)
@@ -6542,8 +6652,6 @@ impl FreshCodexState {
         }
         let quiet_window_ms = self.codex_quiet_window_ms();
         tracing::warn!(provider = PROVIDER, session_id = %thread_id, phase = "fired", quiet_window_ms, "freshagent.codex.quiet_deadman");
-        // The `Status` arm of `adapter_event_to_frame` structurally cannot emit a
-        // turn-complete edge: a deadman fire NEVER rings the idle/green chime.
         let event = CodexAdapterEvent::Status {
             session_id: thread_id.clone(),
             status: CodexStatus::Stuck,
@@ -6551,6 +6659,16 @@ impl FreshCodexState {
         if let Some(frame) = adapter_event_to_frame(&event, &thread_id) {
             let _ = self.broadcast_tx.send(frame);
         }
+        // A wedged turn ENDED as far as the user can tell: ring the unified
+        // attention edge on the session's SHARED clock. The latch stays armed —
+        // a later genuine completion still rings its own edge, and a
+        // user-requested restart retires it silently.
+        mint_synthesized_attention_edge(
+            &last_turn_complete_at,
+            &thread_id,
+            &self.broadcast_tx,
+            "quiet_deadman",
+        );
     }
 
     // ── GET /api/fresh-agent/threads/freshcodex/codex/:threadId (Batch D PR-5) ──
@@ -6619,7 +6737,7 @@ impl FreshCodexState {
         // A later snapshot poll must NEVER reset an armed window (arm-if-absent only);
         // RPC traffic otherwise never feeds the deadman.
         let handles = self.quiet_handles(thread_id).await;
-        if let Some((active_turn, quiet)) = &handles {
+        if let Some((active_turn, quiet, turn_in_flight, _last_turn_complete_at)) = &handles {
             let thread = raw.get("thread").cloned().unwrap_or_else(|| json!({}));
             let fresh_running =
                 normalize_codex_thread_status(thread.get("status").unwrap_or(&Value::Null))
@@ -6642,16 +6760,20 @@ impl FreshCodexState {
                     let mut guard = active_turn.lock().expect("active_turn mutex");
                     if guard.is_none() {
                         *guard = Some(turn_id);
+                        // Mirror the seed onto the turn-in-flight latch (the
+                        // authority): an externally-observed in-flight turn is
+                        // in flight for the crash edge and the deadman too.
+                        turn_in_flight.store(true, Ordering::SeqCst);
                     }
                 }
-                if active_turn.lock().expect("active_turn mutex").is_some() {
+                if turn_in_flight.load(Ordering::SeqCst) {
                     self.arm_codex_quiet_if_absent(thread_id, quiet);
                 }
             }
         }
         // The snapshot overlay mirrors the wire contract: `stuck` while the deadman
         // has flagged the session and the fresh read still shows it running.
-        let stuck = handles.as_ref().is_some_and(|(_, quiet)| {
+        let stuck = handles.as_ref().is_some_and(|(_, quiet, _, _)| {
             quiet
                 .lock()
                 .expect("quiet deadman lock")
@@ -7528,6 +7650,8 @@ impl FreshCodexState {
         let active_turn: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let user_interrupt_pending: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         let quiet_deadman = QuietDeadman::new_shared();
+        let turn_in_flight: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        let last_turn_complete_at: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
@@ -7539,6 +7663,8 @@ impl FreshCodexState {
                 active_turn: active_turn.clone(),
                 user_interrupt_pending: user_interrupt_pending.clone(),
                 quiet_deadman: quiet_deadman.clone(),
+                turn_in_flight: turn_in_flight.clone(),
+                last_turn_complete_at: last_turn_complete_at.clone(),
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
@@ -7557,6 +7683,8 @@ impl FreshCodexState {
             exited.clone(),
             Arc::clone(&self.leases),
             quiet_deadman.clone(),
+            turn_in_flight.clone(),
+            last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
         );
@@ -7583,6 +7711,8 @@ impl FreshCodexState {
                 sidecar_pid,
                 sidecar_ownership_id,
                 quiet_deadman,
+                turn_in_flight,
+                last_turn_complete_at,
                 provenance,
             },
         );
@@ -7622,6 +7752,10 @@ impl FreshCodexState {
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
         let quiet_deadman = QuietDeadman::new_shared();
+        // The fixture's in-flight truth mirrors its `active_turn` seed: a
+        // session inserted mid-turn is in flight for the crash edge too.
+        let turn_in_flight = Arc::new(AtomicBool::new(active_turn.is_some()));
+        let last_turn_complete_at: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         // b8ke focused round-2 R2-1: the condemned-prior identity (pid + tag).
         let sidecar_pid = child.id();
         let sidecar_ownership_id = format!("codex-sidecar-test-snapshot-router-{thread_id}");
@@ -7634,6 +7768,8 @@ impl FreshCodexState {
             exited.clone(),
             Arc::clone(&self.leases),
             quiet_deadman.clone(),
+            turn_in_flight.clone(),
+            last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
         );
@@ -7661,6 +7797,8 @@ impl FreshCodexState {
                 sidecar_pid,
                 sidecar_ownership_id,
                 quiet_deadman,
+                turn_in_flight,
+                last_turn_complete_at,
                 provenance: None,
             },
         );
@@ -8637,6 +8775,12 @@ pub(crate) fn spawn_exit_watcher(
     exited: Arc<AtomicBool>,
     leases: Arc<crate::session_lease::FreshAgentSessionLeases>,
     quiet_deadman: Arc<StdMutex<QuietDeadman>>,
+    // The session's turn-in-flight latch (the dispatch-time authority) + its
+    // shared turn-complete clock: the crash self-heal arm mints the unified
+    // attention edge for a turn in flight at crash time on the session's ONE
+    // clock; a requested kill retires the latch silently.
+    turn_in_flight: Arc<AtomicBool>,
+    last_turn_complete_at: Arc<StdMutex<Option<i64>>>,
     condemned_priors: Arc<
         StdMutex<HashMap<String, crate::session_lease::CondemnedRuntimeIdentity>>,
     >,
@@ -8671,6 +8815,11 @@ pub(crate) fn spawn_exit_watcher(
                 // Torn down on request -- the quiet deadman must never fire for a
                 // session that is going away (resolves a flagged stuck state).
                 disarm_codex_quiet(&quiet_deadman, &thread_id, "kill");
+                // A requested teardown ENDS any in-flight turn SILENTLY (the
+                // user initiated that turn end — the interrupt-silence
+                // discipline): retire the latch so a later idle crash of the
+                // respawned incarnation cannot ring for it, and mint NO edge.
+                turn_in_flight.store(false, Ordering::SeqCst);
                 let _ = child.start_kill();
                 let wait_result = child.wait().await;
                 let confirmed = if cfg!(target_os = "linux") {
@@ -8847,15 +8996,47 @@ pub(crate) fn spawn_exit_watcher(
                 if let Some(frame) = adapter_event_to_frame(&event, &thread_id) {
                     let _ = broadcast_tx.send(frame);
                 }
+                // The crash ends any in-flight turn — a turn end the
+                // notification consumer never saw (the sidecar died with it).
+                // Retire the latch (the crash IS the observed turn end) and
+                // ring the unified attention edge for it on the session's ONE
+                // shared clock, so a later genuine/ordinary edge can never
+                // collide with or regress below this `at`.
+                let turn_was_in_flight = turn_in_flight.swap(false, Ordering::SeqCst);
+                if turn_was_in_flight {
+                    mint_synthesized_attention_edge(
+                        &last_turn_complete_at,
+                        &thread_id,
+                        &broadcast_tx,
+                        "crash_self_heal",
+                    );
+                }
                 stop_result
             }
         }
     })
 }
 
-/// Clear the shared active-turn field (the `activeTurnByThread.delete(sessionId)` mirror).
-fn clear_active_turn(active_turn: &Arc<StdMutex<Option<String>>>) {
+/// Retire the lane's in-flight-turn state at a turn end it OBSERVED (a terminal
+/// thread status, `thread_closed`, or a successful user interrupt): clear the
+/// active-turn tracker (the `activeTurnByThread.delete(sessionId)` mirror) and
+/// its turn-in-flight latch mirror together, so the crash/deadman authority can
+/// never disagree with the tracker about whether a turn is in flight. The
+/// `turn/completed` retired arm clears the latch on its own — its active-turn
+/// clear happens inside the scoped lock block above it.
+fn retire_observed_turn_end(
+    active_turn: &Arc<StdMutex<Option<String>>>,
+    turn_in_flight: &Arc<AtomicBool>,
+) {
     *active_turn.lock().expect("active_turn mutex") = None;
+    turn_in_flight.store(false, Ordering::SeqCst);
+}
+
+/// Retire the turn-in-flight latch at a turn end the lane observed (the
+/// consumer's `turn/completed` retired arm — the active-turn clear owns its
+/// scoped lock block). The crash/kill arms own their latch retirement directly.
+fn clear_turn_in_flight(turn_in_flight: &Arc<AtomicBool>) {
+    turn_in_flight.store(false, Ordering::SeqCst);
 }
 
 // ── wedged-sidecar quiet deadman ───────────────────────────────────────────
@@ -8865,8 +9046,9 @@ fn clear_active_turn(active_turn: &Arc<StdMutex<Option<String>>>) {
 // flight, [`note_codex_activity`] arms a quiet window; a waiter
 // ([`FreshCodexState::watch_codex_quiet_deadline`]) fires iff the window elapses with
 // zero lane-visible feeds, flagging the session `stuck` via a `freshAgent.status`
-// broadcast. The deadman NEVER fabricates a completion: the `Status` arm of
-// [`adapter_event_to_frame`] structurally cannot emit `freshAgent.turn.complete`.
+// broadcast and ringing the unified `freshAgent.turn.complete` attention edge on
+// the session's shared clock (a wedged turn ended as far as the user can tell —
+// one binary "needs attention" signal, no outcome distinction on the wire).
 // Only lane-visible push notifications feed the window; request/response RPC traffic
 // (incl. the client's busy snapshot polling) never resets it, except the snapshot
 // read's arm-if-absent seed for a turn observed mid-flight that no notification was
@@ -8876,19 +9058,23 @@ fn clear_active_turn(active_turn: &Arc<StdMutex<Option<String>>>) {
 /// a flagged stuck state FIRST, then re-arms the window while a turn is in flight or
 /// disarms when none is. Every state mutation bumps the generation so outstanding
 /// waiters observe a mismatch and exit without firing.
+///
+/// "A turn is in flight" reads the turn-in-flight LATCH — the lane's authority,
+/// armed at `start_turn` dispatch and mirrored at every `active_turn` mutation —
+/// so a turn whose response is still outstanding is already armable here (an
+/// atomic load; the pre-latch `active_turn` inner lock is gone).
 fn note_codex_activity(
     state: &FreshCodexState,
     thread_id: &str,
-    active_turn: &Arc<StdMutex<Option<String>>>,
+    turn_in_flight: &Arc<AtomicBool>,
     quiet: &Arc<StdMutex<QuietDeadman>>,
 ) {
     let window_ms = state.codex_quiet_window_ms();
     let window = Duration::from_millis(window_ms);
     let (was_stuck, arm) = {
-        // Locks: `quiet` (outer) then `active_turn` (inner) — the file-wide order.
         let mut q = quiet.lock().expect("quiet deadman lock");
         let was_stuck = q.stuck_since.take().is_some();
-        let has_turn = active_turn.lock().expect("active_turn mutex").is_some();
+        let has_turn = turn_in_flight.load(Ordering::SeqCst);
         let arm = if has_turn {
             // A reset of an already-armed window is NOT a fresh arming; `armed` logs
             // only on the disarmed→armed transition (no per-feed log spam).
@@ -8980,10 +9166,12 @@ fn disarm_codex_quiet(
 /// discipline); and the SUPERSEDED leg of the `turn/completed` arm runs the
 /// guard for bookkeeping only (`on_superseded_turn_completed`), never consuming
 /// a marker that can only be armed for a NEWER turn's user interrupt.
+#[allow(clippy::too_many_arguments)] // the per-session handle set, threaded from `CodexConsumerRuntime`
 fn reduce_notification(
     subscription: &mut CodexSubscription,
     notification: CodexNotification,
     active_turn: &Arc<StdMutex<Option<String>>>,
+    turn_in_flight: &Arc<AtomicBool>,
     quiet_deadman: &Arc<StdMutex<QuietDeadman>>,
     state: &FreshCodexState,
     compact_in_flight: &Arc<AtomicBool>,
@@ -8991,7 +9179,12 @@ fn reduce_notification(
 ) -> Vec<CodexAdapterEvent> {
     // Lane-visible activity: resolves a flagged stuck state first, then resets the
     // armed window (or disarms once no turn is in flight).
-    note_codex_activity(state, subscription.session_id(), active_turn, quiet_deadman);
+    note_codex_activity(
+        state,
+        subscription.session_id(),
+        turn_in_flight,
+        quiet_deadman,
+    );
     match notification {
         CodexNotification::ThreadStarted { thread } => {
             let thread_id = thread.get("id").and_then(Value::as_str);
@@ -9021,7 +9214,9 @@ fn reduce_notification(
                     && normalized != CodexStatus::Starting
                     && !compact_in_flight.load(Ordering::SeqCst)
                 {
-                    clear_active_turn(active_turn);
+                    // The observed turn end retires the active-turn tracker and
+                    // its in-flight-latch mirror together.
+                    retire_observed_turn_end(active_turn, turn_in_flight);
                     // The terminal status also disarms (adapter.ts:1015): the entry
                     // feed re-armed the window while the turn was still tracked, and
                     // a stale deadline would block a later snapshot-observed arm.
@@ -9110,6 +9305,10 @@ fn reduce_notification(
                 // `arm_codex_quiet_if_absent` must not honor a stale deadline for a
                 // later externally-started turn whose `turn/started` we never saw).
                 if retired {
+                    // The active turn's completion retires the in-flight latch
+                    // (the crash/deadman authority) — the same mirror as
+                    // `active_turn` above.
+                    clear_turn_in_flight(turn_in_flight);
                     disarm_codex_quiet(quiet_deadman, subscription.session_id(), "turn_complete");
                 }
 
@@ -9159,6 +9358,11 @@ fn reduce_notification(
                     let mut active = active_turn.lock().expect("active_turn mutex");
                     if active.as_deref().is_none_or(|id| id == turn_id) {
                         *active = Some(turn_id.clone());
+                        // Mirror the adoption onto the in-flight latch: an
+                        // externally-started turn is in flight for the crash
+                        // edge and the deadman too (a dispatched turn's latch
+                        // is already armed from dispatch time).
+                        turn_in_flight.store(true, Ordering::SeqCst);
                     }
                     drop(active);
                     // ep1-r3 F4: capture the compact turn's OWNERSHIP id — the FIRST
@@ -9176,7 +9380,7 @@ fn reduce_notification(
                     note_codex_activity(
                         state,
                         subscription.session_id(),
-                        active_turn,
+                        turn_in_flight,
                         quiet_deadman,
                     );
                 }
@@ -9185,9 +9389,10 @@ fn reduce_notification(
         }
         CodexNotification::ThreadClosed { thread_id } => {
             if thread_id == subscription.session_id() {
-                clear_active_turn(active_turn);
-                // The thread is gone (adapter.ts:1002): disarm so no stale deadline
-                // outlives it (same stale-arm hole as the completion path).
+                // The thread is gone: the observed end retires the in-flight
+                // state, and disarms so no stale deadline outlives it (same
+                // stale-arm hole as the completion path).
+                retire_observed_turn_end(active_turn, turn_in_flight);
                 disarm_codex_quiet(quiet_deadman, subscription.session_id(), "thread_closed");
             }
             subscription
@@ -9239,6 +9444,40 @@ fn adapter_event_to_frame(event: &CodexAdapterEvent, thread_id: &str) -> Option<
         session_type: SESSION_TYPE.to_string(),
     });
     serde_json::to_string(&msg).ok()
+}
+
+/// Mint + broadcast the unified `freshAgent.turn.complete` attention edge for a
+/// turn end minted OUTSIDE the notification consumer — the crash self-heal (a
+/// sidecar that died with a turn in flight) and the quiet-deadman fire (a
+/// wedged turn the user can only read as ended). The `at` comes from the
+/// session's ONE shared turn-complete clock (the same `Arc` the consumer's
+/// [`CodexSubscription`] mints on), so synthesized and ordinary edges share a
+/// single strictly-monotonic timeline per session and can never collide or
+/// regress.
+fn mint_synthesized_attention_edge(
+    last_turn_complete_at: &Arc<StdMutex<Option<i64>>>,
+    thread_id: &str,
+    broadcast_tx: &tokio::sync::broadcast::Sender<String>,
+    source: &'static str,
+) {
+    let at = {
+        let mut guard = last_turn_complete_at
+            .lock()
+            .expect("last_turn_complete_at mutex");
+        let at = next_monotonic_turn_complete_at(*guard, now_ms());
+        *guard = Some(at);
+        at
+    };
+    // DIAG-01: the attention edge only -- session_id + source, never the
+    // turn's text/response content.
+    tracing::info!(provider = PROVIDER, session_id = %thread_id, source, "freshagent.turn.complete");
+    let event = CodexAdapterEvent::TurnComplete {
+        session_id: thread_id.to_string(),
+        at,
+    };
+    if let Some(frame) = adapter_event_to_frame(&event, thread_id) {
+        let _ = broadcast_tx.send(frame);
+    }
 }
 
 /// The `freshAgent.error{code:'INVALID_SESSION_ID'}` shape (`sdk-events.ts:37`) the client
@@ -10104,6 +10343,14 @@ pub(crate) mod tests {
         let (kill_tx, kill_rx) = oneshot::channel();
         let exited = Arc::new(AtomicBool::new(false));
         let quiet_deadman = QuietDeadman::new_shared();
+        // The fixture's in-flight truth mirrors its `active_turn` seed: a
+        // session inserted mid-turn is in flight for the crash edge too (the
+        // production latch invariant — every `active_turn` set has its latch
+        // mirror).
+        let turn_in_flight = Arc::new(AtomicBool::new(
+            active_turn.lock().expect("active_turn mutex").is_some(),
+        ));
+        let last_turn_complete_at: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         let sidecar_pid = child.id();
         let sidecar_ownership_id = ownership_id.to_string();
         let watcher = spawn_exit_watcher(
@@ -10115,6 +10362,8 @@ pub(crate) mod tests {
             exited.clone(),
             Arc::clone(&state.leases),
             quiet_deadman.clone(),
+            turn_in_flight.clone(),
+            last_turn_complete_at.clone(),
             Arc::clone(&state.condemned_priors),
             None,
         );
@@ -10142,6 +10391,8 @@ pub(crate) mod tests {
                 sidecar_pid,
                 sidecar_ownership_id,
                 quiet_deadman,
+                turn_in_flight,
+                last_turn_complete_at,
                 provenance: None,
             },
         );
@@ -10174,6 +10425,12 @@ pub(crate) mod tests {
     ) -> tokio::sync::broadcast::Receiver<String> {
         let quiet_deadman = QuietDeadman::new_shared();
         let user_interrupt_pending: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+        // The fixture's in-flight truth mirrors its `active_turn` seed (the
+        // production latch invariant).
+        let turn_in_flight = Arc::new(AtomicBool::new(
+            active_turn.lock().expect("active_turn mutex").is_some(),
+        ));
+        let last_turn_complete_at: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
@@ -10184,6 +10441,8 @@ pub(crate) mod tests {
                 active_turn: active_turn.clone(),
                 user_interrupt_pending: user_interrupt_pending.clone(),
                 quiet_deadman: quiet_deadman.clone(),
+                turn_in_flight: turn_in_flight.clone(),
+                last_turn_complete_at: last_turn_complete_at.clone(),
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
                 event_emission_gate: event_emission_gate.clone(),
@@ -10202,6 +10461,8 @@ pub(crate) mod tests {
             exited.clone(),
             Arc::clone(&state.leases),
             quiet_deadman.clone(),
+            turn_in_flight.clone(),
+            last_turn_complete_at.clone(),
             Arc::clone(&state.condemned_priors),
             None,
         );
@@ -10229,6 +10490,8 @@ pub(crate) mod tests {
                 sidecar_pid,
                 sidecar_ownership_id,
                 quiet_deadman,
+                turn_in_flight,
+                last_turn_complete_at,
                 provenance: None,
             },
         );
@@ -10387,7 +10650,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn quiet_deadman_fires_stuck_status_without_fabricating_a_turn_complete() {
+    async fn quiet_deadman_fires_stuck_and_rings_the_unified_attention_edge() {
         let (st, mut frame_rx) = state_with_bus();
         st.set_codex_quiet_window_ms_for_tests(150);
         let capture = tracing_capture::capture_by_session("thread-quiet-stuck");
@@ -10421,8 +10684,7 @@ pub(crate) mod tests {
         );
         send.await.expect("send task");
 
-        // The stuck status must arrive within the budget; no turn-complete edge may
-        // EVER be emitted by the deadman (checked over the whole observed window).
+        // The stuck status must arrive within the budget.
         let collect = collect_frames_until(&mut frame_rx, std::time::Duration::from_secs(2), |w| {
             w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "stuck"
         })
@@ -10432,18 +10694,42 @@ pub(crate) mod tests {
             "deadman must surface the stuck status: {:?}",
             collect.frames
         );
+        // The fire RINGS the unified attention edge: a wedged turn ENDED as far
+        // as the user can tell -- the same binary "needs attention" signal as
+        // any other unwitnessed turn end, with a finite numeric `at`.
+        let edge = collect_frames_until(&mut frame_rx, std::time::Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert!(
+            edge.matched,
+            "the deadman fire must ring the unified attention edge: {:?}",
+            collect.frames
+        );
+        let edge_frame = edge.frames.last().expect("the matched edge frame");
+        assert_eq!(edge_frame["sessionId"], "thread-quiet-stuck");
+        assert_eq!(edge_frame["event"]["sessionId"], "thread-quiet-stuck");
+        assert!(
+            edge_frame["event"]["at"].is_i64(),
+            "finite numeric `at` on the deadman-minted edge: {edge_frame}"
+        );
+        // Exactly ONE deadman-minted edge across the whole observed window (no
+        // repeat/flap edges).
         let post =
             collect_frames_until(&mut frame_rx, std::time::Duration::from_millis(300), |_| {
                 false
             })
             .await;
         let mut observed = collect.frames;
+        observed.extend(edge.frames);
         observed.extend(post.frames);
-        assert!(
-            observed
-                .iter()
-                .all(|w| w["event"]["type"] != "freshAgent.turn.complete"),
-            "deadman must never fabricate a completion edge: {observed:?}"
+        let edges = observed
+            .iter()
+            .filter(|w| w["event"]["type"] == "freshAgent.turn.complete")
+            .count();
+        assert_eq!(
+            edges, 1,
+            "exactly one deadman-minted attention edge: {observed:?}"
         );
 
         // The REST snapshot overlay agrees with the wire status.
@@ -10531,6 +10817,13 @@ pub(crate) mod tests {
             "no fire before the reset deadline: {:?}",
             pre.frames
         );
+        assert!(
+            pre.frames
+                .iter()
+                .all(|w| w["event"]["type"] != "freshAgent.turn.complete"),
+            "lane feeds reset the window but never mint an edge: {:?}",
+            pre.frames
+        );
 
         // Boundary + 1: the window elapses after the last feed -> fire.
         let post = collect_frames_until(&mut frame_rx, std::time::Duration::from_secs(2), |w| {
@@ -10542,6 +10835,26 @@ pub(crate) mod tests {
             "fire after the reset deadline: {:?}",
             post.frames
         );
+
+        // The fire rings the unified attention edge ONCE (the deadman's own
+        // mint); drain it here so the completion leg below counts only its own.
+        let deadman_edge =
+            collect_frames_until(&mut frame_rx, std::time::Duration::from_secs(2), |w| {
+                w["event"]["type"] == "freshAgent.turn.complete"
+            })
+            .await;
+        assert!(
+            deadman_edge.matched,
+            "the deadman fire rings the unified attention edge: {:?}",
+            post.frames
+        );
+        let deadman_edge_frame = deadman_edge.frames.last().expect("the matched edge frame");
+        let deadman_at = deadman_edge_frame["event"]["at"]
+            .as_i64()
+            .expect("finite numeric at");
+        let mut all_frames = pre.frames;
+        all_frames.extend(post.frames);
+        all_frames.extend(deadman_edge.frames);
 
         // A genuine completion resolves the flagged state and restores idle.
         peer.emit_notification(
@@ -10558,10 +10871,8 @@ pub(crate) mod tests {
             idle.frames
         );
         // Exactly one stuck fire across the whole run, no repeat flapping.
-        let stuck_fires = pre
-            .frames
+        let stuck_fires = all_frames
             .iter()
-            .chain(post.frames.iter())
             .chain(idle.frames.iter())
             .filter(|w| w["event"]["status"] == "stuck")
             .count();
@@ -10575,6 +10886,41 @@ pub(crate) mod tests {
             flap.frames.iter().all(|w| w["event"]["status"] != "stuck"),
             "no repeat stuck fire after resolution: {:?}",
             flap.frames
+        );
+        // The resolution leg rings the (Task-2 widened) genuine completion
+        // exactly once -- NO second edge from the deadman -- and its `at` is
+        // strictly greater than the deadman's on the session's ONE shared
+        // turn-complete clock.
+        let flap_edges: Vec<&Value> = flap
+            .frames
+            .iter()
+            .filter(|w| w["event"]["type"] == "freshAgent.turn.complete")
+            .collect();
+        assert_eq!(
+            flap_edges.len(),
+            1,
+            "the genuine completion rings exactly once, and the deadman never \
+             re-rings on resolution: {:?}",
+            flap.frames
+        );
+        let completion_at = flap_edges[0]["event"]["at"]
+            .as_i64()
+            .expect("finite numeric at");
+        assert!(
+            completion_at > deadman_at,
+            "shared-clock monotonicity: completion at {completion_at} must exceed \
+             the deadman edge at {deadman_at}"
+        );
+        all_frames.extend(idle.frames);
+        all_frames.extend(flap.frames);
+        let total_edges = all_frames
+            .iter()
+            .filter(|w| w["event"]["type"] == "freshAgent.turn.complete")
+            .count();
+        assert_eq!(
+            total_edges, 2,
+            "exactly two attention edges across the run (one deadman fire + one \
+             genuine completion): {all_frames:?}"
         );
         // The resolve is observable in the tracing stream.
         assert!(
@@ -11380,6 +11726,8 @@ pub(crate) mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
             QuietDeadman::new_shared(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(StdMutex::new(None)),
             Arc::new(StdMutex::new(HashMap::new())),
             None,
         );
@@ -11746,6 +12094,8 @@ pub(crate) mod tests {
                 watcher,
                 exited,
                 quiet_deadman: QuietDeadman::new_shared(),
+                turn_in_flight: Arc::new(AtomicBool::new(false)),
+                last_turn_complete_at: Arc::new(StdMutex::new(None)),
                 provenance: None,
             },
         );
@@ -16194,7 +16544,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn onexit_self_heal_emits_exited_status_with_no_chime_and_keeps_session_mapped() {
+    async fn onexit_self_heal_emits_exited_and_rings_the_unified_edge_when_a_turn_was_in_flight() {
         let (transport, _peer) = freshell_codex::new_channel_transport();
         let (client, _notifs) = CodexAppServerClient::connect(transport);
         let client = Arc::new(client);
@@ -16202,7 +16552,86 @@ pub(crate) mod tests {
         let (st, mut rx) = state_with_bus();
 
         // A child that exits ON ITS OWN almost immediately -- the UNREQUESTED-exit / crash
-        // path (never signaled via kill_tx).
+        // path (never signaled via kill_tx) -- while a turn is IN FLIGHT: the crash ends a
+        // turn whose end the notification consumer never observed, so the self-heal must
+        // ring the unified attention edge for it (identical wire treatment to a completed or
+        // errored turn end -- one binary "needs attention" signal).
+        let mut cmd = tokio::process::Command::new("true");
+        cmd.kill_on_drop(true);
+        let child = cmd.spawn().expect("spawn true fixture");
+
+        insert_fake_session(
+            &st,
+            "thread-1",
+            client,
+            Arc::new(StdMutex::new(Some("turn-in-flight".to_string()))),
+            child,
+            "codex-sidecar-test-exit",
+        )
+        .await;
+
+        let frame: Value = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(raw) = rx.recv().await {
+                    return serde_json::from_str::<Value>(&raw).unwrap();
+                }
+            }
+        })
+        .await
+        .expect("the watcher self-heals within the budget");
+
+        assert_eq!(frame["type"], "freshAgent.event");
+        assert_eq!(frame["provider"], "codex");
+        assert_eq!(frame["sessionId"], "thread-1");
+        assert_eq!(frame["event"]["type"], "freshAgent.status");
+        assert_eq!(frame["event"]["status"], "exited");
+
+        // The unified attention edge for the turn end the consumer never saw: a
+        // `freshAgent.turn.complete` for the SAME session with a finite numeric `at`.
+        let edge: Value = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(raw) = rx.recv().await {
+                    let parsed: Value = serde_json::from_str(&raw).unwrap();
+                    if parsed["event"]["type"] == "freshAgent.turn.complete" {
+                        return parsed;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("a crash with a turn in flight rings the unified attention edge");
+        assert_eq!(edge["provider"], "codex");
+        assert_eq!(edge["sessionId"], "thread-1");
+        assert_eq!(edge["event"]["sessionId"], "thread-1");
+        assert!(
+            edge["event"]["at"].is_i64(),
+            "finite numeric `at` on the crash-minted edge: {edge}"
+        );
+
+        // The session STAYS mapped (adapter.ts:937-944 invariant -- PR-1 leaves the
+        // actual lazy-restart-on-next-send unimplemented; see report), and nothing
+        // else rides along: one status frame + one attention edge.
+        assert!(
+            rx.try_recv().is_err(),
+            "exited + exactly one attention edge, no more frames: {edge:?}"
+        );
+        assert!(
+            st.sessions.lock().await.contains_key("thread-1"),
+            "the session stays mapped after an unrequested exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn onexit_self_heal_emits_exited_without_an_edge_when_idle() {
+        let (transport, _peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, mut rx) = state_with_bus();
+
+        // An idle crash: no turn is in flight, so the self-heal is the terminal
+        // `exited` clear ONLY -- no attention edge (nothing ended that the user
+        // could have missed).
         let mut cmd = tokio::process::Command::new("true");
         cmd.kill_on_drop(true);
         let child = cmd.spawn().expect("spawn true fixture");
@@ -16233,16 +16662,101 @@ pub(crate) mod tests {
         assert_eq!(frame["event"]["type"], "freshAgent.status");
         assert_eq!(frame["event"]["status"], "exited");
 
-        // No accompanying chime, and the session STAYS mapped (adapter.ts:937-944 invariant
-        // -- PR-1 leaves the actual lazy-restart-on-next-send unimplemented; see report).
+        // No attention edge, and the session STAYS mapped (adapter.ts:937-944
+        // invariant).
         assert!(
             rx.try_recv().is_err(),
-            "no turn.complete chime alongside the exit status"
+            "no turn.complete edge alongside the exit status for an idle crash"
         );
         assert!(
             st.sessions.lock().await.contains_key("thread-1"),
             "the session stays mapped after an unrequested exit"
         );
+    }
+
+    #[tokio::test]
+    async fn onexit_self_heal_rings_the_edge_for_a_crash_during_the_start_turn_dispatch_window() {
+        // The round-2 review's core crash scenario: the sidecar dies AFTER the
+        // `turn/start` dispatch was written but BEFORE its response is processed
+        // -- `active_turn` is never set, so ONLY the turn-in-flight latch armed
+        // at DISPATCH time (before awaiting the response) can classify the turn
+        // as in flight at crash time. A post-response arm would silently miss
+        // this crash's turn end.
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, mut rx) = state_with_bus();
+
+        // The child must be alive through the send's ensure-alive check and the
+        // dispatch, then die mid-RPC (an unrequested exit -- never kill_tx).
+        let child = spawn_sleeper();
+        let pid = child.id().expect("sleeper pid");
+
+        insert_fake_session(
+            &st,
+            "thread-dispatch-crash",
+            client,
+            Arc::new(StdMutex::new(None)),
+            child,
+            "codex-sidecar-test-dispatch-crash",
+        )
+        .await;
+
+        // Dispatch a turn; the peer sees the request but NEVER answers it.
+        let send = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(send_msg("thread-dispatch-crash", "run"))
+                    .await
+            })
+        };
+        answer_initialize(&peer).await;
+        let (_id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "turn/start", "the dispatch reached the sidecar");
+
+        // The sidecar dies with the turn dispatched but unanswered.
+        // Safety: a targeted SIGKILL of this test's own fixture child (a
+        // `sleep` process spawned above) -- never a broad kill pattern.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+
+        let exited: Value = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(raw) = rx.recv().await {
+                    let parsed: Value = serde_json::from_str(&raw).unwrap();
+                    if parsed["event"]["type"] == "freshAgent.status"
+                        && parsed["event"]["status"] == "exited"
+                    {
+                        return parsed;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the watcher self-heals within the budget");
+        assert_eq!(exited["sessionId"], "thread-dispatch-crash");
+
+        // The dispatched-but-unanswered turn's end rings the unified edge.
+        let edge: Value = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(raw) = rx.recv().await {
+                    let parsed: Value = serde_json::from_str(&raw).unwrap();
+                    if parsed["event"]["type"] == "freshAgent.turn.complete" {
+                        return parsed;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("a crash during the start_turn dispatch window rings the unified edge");
+        assert_eq!(edge["sessionId"], "thread-dispatch-crash");
+        assert!(
+            edge["event"]["at"].is_i64(),
+            "finite numeric `at` on the crash-minted edge: {edge}"
+        );
+
+        // The hung start_turn never returns; the send task is cleanup-only.
+        send.abort();
     }
 
     // ── freshAgent.undo / freshAgent.redo (kata 1wxv Task 2) ────────────────
