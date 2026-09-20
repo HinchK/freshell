@@ -185,6 +185,18 @@ describe('package-manager', () => {
     expect(resolved).toEqual({ command: process.execPath, args: [entrypoint, ...runArgs] })
   })
 
+  it('resolves a win32 shim dir whose only adjacent entrypoint is pnpm.cjs', () => {
+    const runArgs = ['run', 'test:vitest']
+    const env = managerEnv({})
+    const shimDir = path.join(fixture.root, 'win-shim-adjacent')
+    fs.mkdirSync(shimDir)
+    fs.writeFileSync(path.join(shimDir, 'pnpm.cmd'), '@echo off\r\n')
+    fs.writeFileSync(path.join(shimDir, 'pnpm.cjs'), '')
+
+    const resolved = resolveManagerCommand({ manager: 'pnpm', args: runArgs, env, platform: 'win32', envPath: shimDir })
+    expect(resolved).toEqual({ command: process.execPath, args: [path.join(shimDir, 'pnpm.cjs'), ...runArgs] })
+  })
+
   it('detects the project manager from the packageManager field and the lock fallback', () => {
     const pnpmProject = path.join(fixture.root, 'project-pnpm')
     fs.mkdirSync(pnpmProject)
