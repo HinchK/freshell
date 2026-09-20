@@ -60,6 +60,7 @@ fn real_sidecar_dispatches_interrupt_frames_to_handle_interrupt() {
         "index.mjs",
         "permission-channel.mjs",
         "session-settings.mjs",
+        "turn-complete-gate.mjs",
     ] {
         std::fs::write(dir.path().join(module), real_sidecar_source(module))
             .unwrap_or_else(|e| panic!("copy real {module} verbatim: {e}"));

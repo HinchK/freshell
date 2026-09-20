@@ -660,6 +660,7 @@ function copySidecar(
     'index.mjs',
     'permission-channel.mjs',
     'session-settings.mjs',
+    'turn-complete-gate.mjs',
     'model-catalog.mjs',
     'package.json',
     'package-lock.json',

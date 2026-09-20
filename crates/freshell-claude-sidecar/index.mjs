@@ -31,7 +31,12 @@
 //     { type:'sdk.assistant',           sessionId, content, model }
 //     { type:'sdk.stream',              sessionId, event, parentToolUseId }
 //     { type:'sdk.result',              sessionId, result, durationMs, costUsd, usage }
-//     { type:'sdk.turn.complete',       sessionId, at }                   // ONLY on result subtype==='success'
+//     { type:'sdk.turn.complete',       sessionId, at }                   // EVERY result (any subtype) except
+//                                  the interrupted turn's own (an accepted user interrupt's mark consumes
+//                                  it — turn-complete-gate.mjs); also minted from consumeStream's finally
+//                                  when a turn ends with NO result frame (stream exception or natural EOF
+//                                  with a send still pending) — the abort/sdk.exit requested-teardown path
+//                                  stays silent
 //     { type:'sdk.turn.waiting',        sessionId, at }                   // 0->>=1 pending edge (claude only)
 //     { type:'sdk.status',              sessionId, status }               // compacting / idle (stream end)
 //     { type:'sdk.error',               sessionId, message }
@@ -46,10 +51,15 @@
 // envelope — so this sidecar is the faithful analog of server/sdk-bridge.ts's
 // SdkBridge (it emits the SAME `sdk.*` shapes SdkBridge broadcasts).
 //
-// A sidecar death mid-turn can therefore NEVER produce a false completion: a
-// `sdk.turn.complete` is emitted ONLY when the SDK `result` carries
-// subtype==='success' — if the process dies, stdout simply ends and no completion
-// is ever written. That is the new failure mode the ADR (Decision 2.1) requires.
+// A sidecar death mid-turn can therefore NEVER produce a false completion
+// from this process's own stdout: `sdk.turn.complete` rides every SDK
+// `result` (the unified needs-attention edge — the interrupted turn's own
+// result is consumed silently by the accepted-interrupt mark) plus the
+// consumeStream finally mint for a result-less turn end (stream exception or
+// natural EOF with a send pending; never the aborted/sdk.exit teardown). If
+// the PROCESS dies mid-turn, stdout simply ends and no completion is ever
+// written — that unrequested death is what the Rust-side death synthesis
+// (ADR Decision 2.1) rings for.
 //
 // Scope discipline (ADR "keep it minimal — only what the claude T2 invariant set
 // needs"): the freshell MCP-server injection (createClaudeSdkMcpServers) is
@@ -66,6 +76,7 @@
 import { createInterface } from 'node:readline'
 import { randomBytes } from 'node:crypto'
 import { configureSession, userMessageContent, resultErrorMessage } from './session-settings.mjs'
+import { createTurnCompleteGate } from './turn-complete-gate.mjs'
 import {
   canUseTool as routeCanUseTool,
   cancelPending,
@@ -171,7 +182,7 @@ function nextMonotonic(last, now) {
   return last != null && now <= last ? last + 1 : now
 }
 
-/** @type {Map<string, {inputStream:{push:Function,end:Function}, abort:AbortController, permissionMode?:string, cliSessionId?:string, lastTurnCompleteAt?:number, lastWaitingAt?:number, pendingPermissions?:Map<string,any>, pendingQuestions?:Map<string,any>}>} */
+/** @type {Map<string, {inputStream:{push:Function,end:Function}, abort:AbortController, permissionMode?:string, cliSessionId?:string, lastTurnCompleteAt?:number, lastWaitingAt?:number, pendingPermissions?:Map<string,any>, pendingQuestions?:Map<string,any>, turnCompleteGate?:{noteInterruptRequest:Function,noteInterruptSettled:Function,resultEmitsAttention:Function}, pendingResults?:number}>} */
 const sessions = new Map()
 
 function normalizeCommands(rows, strict = false) {
@@ -277,6 +288,9 @@ function handleSdkMessage(sessionId, msg) {
       break
     }
     case 'result': {
+      // The awaited turn's terminal frame arrived: drop one pending send
+      // (clamped at 0 — an unsolicited result must not underflow the counter).
+      st.pendingResults = Math.max(0, st.pendingResults - 1)
       const usage = msg.usage
         ? {
             input_tokens: msg.usage.input_tokens,
@@ -288,10 +302,11 @@ function handleSdkMessage(sessionId, msg) {
       emit({ type: 'sdk.result', sessionId, result: msg.subtype, durationMs: msg.duration_ms, costUsd: msg.total_cost_usd, usage })
       const failure = resultErrorMessage(msg)
       if (failure) emit({ type: 'sdk.error', sessionId, message: failure, turnFailure: true })
-      // Server-authoritative completion edge: ONLY a positively-completed turn
-      // ('success') chimes. Interrupts yield no result at all; errored turns carry
-      // a non-success subtype — so this never fires green on an aborted/errored turn.
-      if (msg.subtype === 'success') {
+      // Unified attention edge: any turn end rings unless this result is the
+      // interrupted turn's own (the SDK contract orders the settle receipt
+      // before it). No outcome rides the wire — the client treats all ends
+      // identically.
+      if (st.turnCompleteGate.resultEmitsAttention()) {
         const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
         st.lastTurnCompleteAt = at
         emit({ type: 'sdk.turn.complete', sessionId, at })
@@ -322,6 +337,18 @@ async function consumeStream(sessionId, sdkQuery) {
     if (st) {
       cancelPending(st, emit, sessionId, { resolveDeny: false })
     }
+    // A turn that ends with NO result frame — stream exception OR natural
+    // EOF with a result still pending — IS a turn end the user didn't
+    // witness: ring the unified edge (the abort/sdk.exit path is a
+    // REQUESTED teardown and deliberately stays silent). pendingResults
+    // covers the accept→first-message window turnOpen cannot see, and
+    // counts queued sends a boolean would lose. The gate consult is LAST in
+    // the guard so a no-mint path never consumes an interrupt mark.
+    if (st && st.pendingResults > 0 && !st.abort.signal.aborted && st.turnCompleteGate.resultEmitsAttention()) {
+      const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
+      st.lastTurnCompleteAt = at
+      emit({ type: 'sdk.turn.complete', sessionId, at })
+    }
     // Mirror SdkBridge: an aborted session surfaces sdk.exit; a natural end
     // surfaces an idle status. NEITHER is a completion chime, so a mid-turn
     // death cannot fake a turn.complete.
@@ -349,6 +376,13 @@ function handleCreate(req) {
       settings: { model: req.model, effort: req.effort, permissionMode: req.permissionMode, cwd: req.cwd },
       turnOpen: false,
       handedCompactLikely: false,
+      // Unified attention bookkeeping: the gate suppresses exactly the
+      // interrupted turn's own result (ordering-scoped, NO reset-at-send —
+      // see turn-complete-gate.mjs); pendingResults counts ACCEPTED sends
+      // still awaiting their terminal result frame, so consumeStream's
+      // finally can mint the edge for a result-less turn end.
+      turnCompleteGate: createTurnCompleteGate(),
+      pendingResults: 0,
     }
     const { iterable, handle } = createInputStream((isCompact) => {
       if (isCompact) state.handedCompactLikely = true
@@ -434,6 +468,14 @@ function handleSend(req) {
     },
     isCompact,
   )
+  // Unified attention bookkeeping: this send is now ACCEPTED (the input-stream
+  // push succeeded) and awaits exactly one terminal frame — a COUNTER, not a
+  // boolean: two queued sends leave it at 2 and the first result must drop it
+  // to 1, not 0 (a boolean would lose the second queued turn and its
+  // stream-exception ring). Deliberately NOT turnOpen, which only arms after
+  // the first assistant/system frame and cannot see the accept→first-message
+  // window. The gate is NOT reset here — see turn-complete-gate.mjs.
+  st.pendingResults += 1
 }
 
 async function handleConfigure(req) {
@@ -497,9 +539,19 @@ function handleInterrupt(req) {
     emit({ type: 'sdk.interrupt_settled', sessionId: req.sessionId, ok: false, message: 'no in-flight SDK query' })
     return
   }
+  // Unified attention gate: arm the mark BEFORE the interrupt call — the SDK
+  // contract (sdk.d.ts:3765) orders the settle receipt BEFORE the interrupted
+  // turn's own result, so the mark deterministically consumes exactly that
+  // result. A REJECTED interrupt (the turn kept running) clears the mark; a
+  // no-in-flight query never arms one.
+  st.turnCompleteGate.noteInterruptRequest()
   st.query.interrupt()
-    .then(() => emit({ type: 'sdk.interrupt_settled', sessionId: req.sessionId, ok: true }))
+    .then(() => {
+      st.turnCompleteGate.noteInterruptSettled(true)
+      emit({ type: 'sdk.interrupt_settled', sessionId: req.sessionId, ok: true })
+    })
     .catch((err) => {
+      st.turnCompleteGate.noteInterruptSettled(false)
       logerr(`interrupt failed: ${err?.message || err}`)
       emit({ type: 'sdk.interrupt_settled', sessionId: req.sessionId, ok: false, message: String(err?.message || err) })
     })
