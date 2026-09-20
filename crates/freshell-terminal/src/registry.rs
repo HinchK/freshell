@@ -4151,17 +4151,32 @@ fn page_last_seq(msg: &ServerMessage) -> Option<i64> {
 /// stays under this, so a walk that stops at the budget never undercounts.
 const SEGMENT_WIRE_OVERHEAD_ESTIMATE: i64 = 96;
 
+/// Fixed part of the once-per-batch envelope delta over the legacy
+/// scaffold for the `terminal.output.batch` wire projection: the `.batch`
+/// type suffix (7), the `,"serializedBytes":` key (20), and the
+/// `,"segments":[` + `]` array wrapper (14). The variable part — the
+/// digits of `serializedBytes` itself — is bounded by
+/// [`crate::batch::digit_count`] of the page budget for any page that fits
+/// it, so the walk charges `41 + digits(budget)` per batch-mode frame.
+/// Charged on EVERY batch-mode frame because every produced batch contains
+/// at least one frame (a multi-batch page — e.g. barrier-separated frames —
+/// pays one envelope PER batch): merged frames were already over-charged
+/// their full standalone envelope, so this only narrows their slack.
+const BATCH_ENVELOPE_FIXED_BYTES: i64 = 41;
+
 /// Select and project ONE bounded, ascending page of the
 /// `(from_seq, to_seq_inclusive]` window for `conn_id`'s subscriber. The
 /// caller holds the terminal lock; frames are selected BEFORE cloning (no
 /// full-ring snapshot per page). Packing accounts every frame at its
 /// STANDALONE envelope cost (the batch builder's own accounting, reusing
 /// `measure_serialized_json_bytes` via the incremental scaffold), plus the
-/// batch-segment overhead on batch-capable subscribers — an overestimate
-/// of the merged wire cost, so every produced page's real serialized bytes
-/// stay within the budget. A single frame whose own envelope exceeds the
-/// budget forms its own atomic single-frame page (guaranteed progress; the
-/// oversize result is explicit, never silently coalesced).
+/// batch-segment overhead and the once-per-batch envelope delta
+/// (`serializedBytes` + the `segments[]` wrapper + the `.batch` type
+/// suffix) on batch-capable subscribers — an overestimate of the merged
+/// wire cost, so every produced page's real serialized bytes stay within
+/// the budget. A single frame whose own envelope exceeds the budget forms
+/// its own atomic single-frame page (guaranteed progress; the oversize
+/// result is explicit, never silently coalesced).
 fn paced_page_build(
     s: &TerminalShared,
     conn_id: u64,
@@ -4176,6 +4191,18 @@ fn paced_page_build(
     let source_str = match source {
         OutputSource::Replay => "replay",
         OutputSource::Live => "live",
+    };
+    // The batch-mode per-frame charge adds the once-per-batch envelope
+    // delta: a page that fits the budget serializes every payload at or
+    // under it, so its `serializedBytes` digits never exceed
+    // `digit_count(budget)` (an over-budget page is the explicit atomic
+    // oversize result, which is allowed to exceed).
+    let batch_mode_charge = if batch_mode {
+        SEGMENT_WIRE_OVERHEAD_ESTIMATE
+            + BATCH_ENVELOPE_FIXED_BYTES
+            + crate::batch::digit_count(budget.max(0)) as i64
+    } else {
+        0
     };
 
     // First ring index with seq_start > from_seq (the ring is seq-ascending;
@@ -4212,14 +4239,7 @@ fn paced_page_build(
         let escaped = crate::batch::json_escaped_len(&f.output.data) as i64;
         let digits = (crate::batch::digit_count(f.output.seq_start)
             + crate::batch::digit_count(f.output.seq_end)) as i64;
-        let cost = scaffold
-            + digits
-            + escaped
-            + if batch_mode {
-                SEGMENT_WIRE_OVERHEAD_ESTIMATE
-            } else {
-                0
-            };
+        let cost = scaffold + digits + escaped + batch_mode_charge;
         if selected.is_empty() {
             // Always include the first frame: an over-budget frame forms
             // its own atomic single-frame page.
@@ -5415,6 +5435,123 @@ mod tests {
             reassembled,
             (1..=5).map(|i| format!("line-{i}\r\n")).collect::<String>()
         );
+    }
+
+    /// Page-budget honesty at the boundary: the batch-mode charge must
+    /// cover the one-frame batch ENVELOPE delta — the `.batch` type suffix,
+    /// the `serializedBytes` field, and the `segments[]` wrapper, which the
+    /// legacy-scaffold + segment estimate alone never accounted. Two
+    /// BARRIER frames (BEL ⇒ `turn_complete`) each form their own
+    /// single-frame batch, so a page carrying both pays TWO batch
+    /// envelopes; the budget is tuned so the pre-delta accounting admits
+    /// both frames while their real wire bytes exceed it. With the delta
+    /// charged, the walk emits each frame as its own single-frame page —
+    /// every page the walk believes fits the budget really fits.
+    #[test]
+    fn paced_batch_page_accounting_covers_the_envelope_at_the_budget_boundary() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let data_a = format!("{}{}", "a".repeat(120), '\u{0007}');
+        let data_b = format!("{}{}", "b".repeat(120), '\u{0007}');
+        reg.feed("T", frame(1, &data_a, "S"));
+        reg.feed("T", frame(2, &data_b, "S"));
+
+        // Size the budget from the crate's own envelope accounting: the
+        // pre-delta per-frame charge (scaffold + seq digits + escaped data +
+        // the segment estimate) for BOTH frames plus a 5-byte margin — the
+        // exact boundary corner where an un-accounted envelope delta can
+        // push a page's real serialized bytes over the budget.
+        let scaffold = crate::batch::legacy_envelope_scaffold_bytes(
+            "T",
+            "S",
+            Some("batch-paced"),
+            Some("replay"),
+        ) as i64;
+        let accounted_pre_delta = |data: &str| {
+            scaffold
+                + crate::batch::digit_count(1) as i64
+                + crate::batch::digit_count(2) as i64
+                + crate::batch::json_escaped_len(data) as i64
+                + SEGMENT_WIRE_OVERHEAD_ESTIMATE
+        };
+        let budget = accounted_pre_delta(&data_a) + accounted_pre_delta(&data_b) + 5;
+        reg.set_paced_page_max_bytes(budget);
+
+        let (sink, _seen) = collector();
+        let out = reg.attach(
+            "T",
+            2,
+            sink,
+            Some("batch-paced".into()),
+            0,
+            true,
+            true,
+            None,
+            None,
+            None,
+        );
+        let start = out.paced.expect("paced session");
+
+        // The first page honors the budget with REAL serialized bytes.
+        assert!(
+            start.session.page_bytes as i64 <= budget,
+            "the first page's real serialized bytes ({}) must stay within the \
+             budget ({budget}) — the batch envelope delta must be accounted",
+            start.session.page_bytes
+        );
+        assert_eq!(
+            page_serialized_bytes(&start.first_page) as i64,
+            start.session.page_bytes as i64,
+            "the session's page_bytes is the page's real serialized size"
+        );
+        // The envelope corner is real for this fixture: one single-frame
+        // batch page's wire cost exceeds the pre-delta accounted charge.
+        assert!(
+            page_serialized_bytes(&start.first_page) as i64 > accounted_pre_delta(&data_a),
+            "the fixture must actually exercise the envelope delta corner"
+        );
+        // The walk stopped before frame 2: the first page is a single
+        // frame's own single-frame batch page.
+        let page1 = page_seq_data(&start.first_page);
+        assert_eq!(
+            page1.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+            vec![1],
+            "the delta-inclusive charge leaves frame 2 for its own page"
+        );
+        assert!(
+            start.first_page.len() == 1,
+            "one single-frame batch payload"
+        );
+        assert!(matches!(
+            start.first_page[0],
+            ServerMessage::TerminalOutputBatch(_)
+        ));
+
+        // Frame 2 arrives as its own bounded single-frame page.
+        match reg.next_replay_page("T", 2, start.session.page_end, start.session.target, budget) {
+            PacedPage::Frames {
+                messages,
+                end_seq,
+                serialized_bytes,
+            } => {
+                assert_eq!(end_seq, 2);
+                assert_eq!(messages.len(), 1, "one single-frame batch payload");
+                assert!(
+                    serialized_bytes as i64 <= budget,
+                    "every page the walk emits within its accounting stays \
+                     within the budget: {serialized_bytes} > {budget}"
+                );
+                assert!(
+                    serialized_bytes as i64 > accounted_pre_delta(&data_b),
+                    "frame 2's real page cost also exceeds the pre-delta charge"
+                );
+            }
+            other => panic!("expected frame 2's page, got {other:?}"),
+        }
+        match reg.next_replay_page("T", 2, 2, start.session.target, budget) {
+            PacedPage::Done => {}
+            other => panic!("a drained window reads Done, got {other:?}"),
+        }
     }
 
     /// Pages ascend within the serialized budget to the FIXED attach-time
@@ -6925,7 +7062,10 @@ mod tests {
                     false,
                     None,
                     None,
-                    None,
+                    // TERM-07 seam: the geometry-authorized path threads the
+                    // client's replay-budget request just like the plain
+                    // path (pinned by the subscriber-recording assert below).
+                    Some(256 * 1024),
                     TerminalAttachIntent::ViewportHydrate,
                     131,
                     48,
@@ -6977,6 +7117,31 @@ mod tests {
         assert!(
             matches!(geometry, (131, 48, 1) | (67, 30, 1)),
             "the final dimensions must belong to the one successful first claim: {geometry:?}"
+        );
+        // TERM-07 seam on the GEOMETRY-AUTHORIZED path (attach_with_geometry
+        // threads max_replay_bytes into the same attach_to_shared as the
+        // plain path): each subscriber records its own attach's value —
+        // a's request verbatim, b's absence as None — with no
+        // delivery-behavior change.
+        let (recorded_a, recorded_b) = {
+            let inner = reg.inner.lock().unwrap();
+            let handle = inner.terminals.get("T").unwrap();
+            let s = handle.shared.lock().unwrap();
+            (
+                s.subscribers
+                    .get(&1)
+                    .expect("conn 1 subscriber")
+                    .max_replay_bytes,
+                s.subscribers
+                    .get(&2)
+                    .expect("conn 2 subscriber")
+                    .max_replay_bytes,
+            )
+        };
+        assert_eq!(recorded_a, Some(256 * 1024));
+        assert_eq!(
+            recorded_b, None,
+            "an attach without maxReplayBytes records absence"
         );
     }
 

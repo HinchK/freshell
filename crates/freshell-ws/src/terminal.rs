@@ -1489,6 +1489,21 @@ async fn handle_client_text(
                 // Observability inputs captured before the attach moves.
                 let requested_since_seq = attach.since_seq.unwrap_or(0);
                 let attach_max_replay_bytes = attach.max_replay_bytes;
+                // Responsive-terminal-restore binding point 6 (supersede):
+                // EVERY successful re-attach for the same (connection,
+                // terminal) cancels the connection's previous paced session
+                // for that terminal — a cancelled session's late credits are
+                // ignored as a stale generation. This must cover the LEGACY
+                // reply too (an arid-less re-attach from a negotiated
+                // connection, or an attach to an exited terminal): the
+                // registry already replaced the subscriber, so a surviving
+                // ws-layer session would be fed by a NEW subscriber's ring
+                // reads and could still produce phantom pages for a
+                // stale-generation credit. A FAILED attach (Error) cancels
+                // nothing — the previous session still matches its live
+                // subscriber and deferral. Each arm cancels BEFORE the paced
+                // insert below, so the new session is never the one removed.
+                let attach_terminal_id = attach.terminal_id.clone();
                 let attached = match handle_attach(
                     attach,
                     state,
@@ -1498,8 +1513,12 @@ async fn handle_client_text(
                     paced_terminal_replay_v1,
                 ) {
                     AttachReply::Error(err) => send(ws_tx, &err).await,
-                    AttachReply::Legacy => true,
+                    AttachReply::Legacy => {
+                        paced_sessions.cancel(&attach_terminal_id);
+                        true
+                    }
                     AttachReply::Paced(start) => {
+                        paced_sessions.cancel(&attach_terminal_id);
                         // The paced replay core (responsive-terminal-restore
                         // W1): sink the first page (the registry produced it
                         // under the attach lock), emit the session start, and

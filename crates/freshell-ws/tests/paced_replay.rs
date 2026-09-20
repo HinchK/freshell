@@ -19,6 +19,7 @@
 //! baseline; a re-attach supersedes the old session; a disconnect
 //! mid-replay leaves the terminal running and re-attachable.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,6 +28,162 @@ use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use freshell_ws::WsState;
+
+// ── capturing tracing layer (dev-only test facility). PROCESS-GLOBAL by
+// deliberate choice (the diag01_lifecycle_events.rs `global_capture` /
+// invariants.rs e08g pattern, extended with `record_u64` so the paced
+// events' u64 fields — `page_bytes`, `pages` — are captured too): a
+// thread-local `set_default` capture is UNSOUND for callsites shared with
+// sibling tests running in parallel — tracing-core caches each callsite's
+// Interest process-wide on first registration, and a subscriber-less
+// sibling thread executing a shared emission site first (e.g.
+// `credit_on_a_non_negotiated_connection_is_inert` firing the
+// `non_negotiated` callsite) caches `Interest::never`, so a thread-local
+// capture then never sees its OWN thread's emissions (kata 59nb). One
+// global subscriber sees every thread's events; every read below MUST
+// filter by the per-test-unique `terminal_id` because ALL tests in this
+// binary share the vec. ─────────────────────────────────────────────────
+
+use std::sync::Mutex;
+use tracing::field::{Field, Visit};
+use tracing::{Event, Subscriber};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::Layer;
+
+#[derive(Debug, Clone, Default)]
+struct CapturedEvent {
+    message: String,
+    fields: BTreeMap<String, String>,
+}
+
+#[derive(Default)]
+struct FieldVisitor {
+    message: String,
+    fields: BTreeMap<String, String>,
+}
+
+impl Visit for FieldVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        let rendered = format!("{value:?}");
+        if field.name() == "message" {
+            self.message = rendered;
+        } else {
+            self.fields.insert(field.name().to_string(), rendered);
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+}
+
+struct CaptureLayer {
+    events: Arc<Mutex<Vec<CapturedEvent>>>,
+}
+
+impl<S: Subscriber> Layer<S> for CaptureLayer {
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let mut visitor = FieldVisitor::default();
+        event.record(&mut visitor);
+        self.events
+            .lock()
+            .expect("capture lock")
+            .push(CapturedEvent {
+                message: visitor.message,
+                fields: visitor.fields,
+            });
+    }
+}
+
+/// Process-global capture for this test binary (first caller installs;
+/// `get_or_init` is the synchronization). This binary installs no other
+/// global subscriber; `.expect()` turns any future second installer into an
+/// immediate diagnosable panic instead of a silently-empty capture.
+fn global_capture() -> Arc<Mutex<Vec<CapturedEvent>>> {
+    static EVENTS: std::sync::OnceLock<Arc<Mutex<Vec<CapturedEvent>>>> = std::sync::OnceLock::new();
+    Arc::clone(EVENTS.get_or_init(|| {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let layer = CaptureLayer {
+            events: Arc::clone(&events),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("this test binary installs exactly one global subscriber");
+        events
+    }))
+}
+
+/// Poll the capture until an event for THIS test's terminal (the vec is
+/// shared by every test in the binary — the unique `terminal_id` is the
+/// per-test discriminator) with this message AND `fields[field] == value`
+/// lands (or the 5s deadline passes). The `ws.restore.credit` events share
+/// one message name, so the verdict `status` field is the selector.
+async fn wait_for_restore_event(
+    events: &Arc<Mutex<Vec<CapturedEvent>>>,
+    terminal_id: &str,
+    message: &str,
+    field: &str,
+    value: &str,
+) -> Option<CapturedEvent> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        {
+            let captured = events.lock().unwrap();
+            if let Some(found) = captured.iter().find(|e| {
+                e.message == message
+                    && e.fields.get("terminal_id").map(String::as_str) == Some(terminal_id)
+                    && e.fields.get(field).map(String::as_str) == Some(value)
+            }) {
+                return Some(found.clone());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// [`wait_for_restore_event`] without the extra field selector — for the
+/// one-event-per-terminal messages (`ws.restore.paced_start`,
+/// `ws.restore.paced_complete`).
+async fn wait_for_restore_event_of_terminal(
+    events: &Arc<Mutex<Vec<CapturedEvent>>>,
+    terminal_id: &str,
+    message: &str,
+) -> Option<CapturedEvent> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        {
+            let captured = events.lock().unwrap();
+            if let Some(found) = captured.iter().find(|e| {
+                e.message == message
+                    && e.fields.get("terminal_id").map(String::as_str) == Some(terminal_id)
+            }) {
+                return Some(found.clone());
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
 
 const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 /// Deliberately small page budget: deterministic multi-page fixtures with
@@ -184,14 +341,28 @@ async fn next_json(ws: &mut WsClient) -> serde_json::Value {
     serde_json::from_str(&text).expect("frame is JSON")
 }
 
-/// Read the next JSON frame, or `None` if nothing arrives within `window`.
+/// Read the next JSON frame, or `None` if no frame at all arrives within
+/// `window`. A keepalive Ping/Pong landing INSIDE the window is NOT
+/// silence — the burst-complete heuristic treats only text frames as
+/// signal, so a server ping mid-read cannot truncate a page read (the
+/// 30s ping interval makes this rare vs the ~1-2s bursts, but the harness
+/// must not depend on that timing).
 async fn next_json_or_timeout(ws: &mut WsClient, window: Duration) -> Option<serde_json::Value> {
-    match tokio::time::timeout(window, ws.next()).await {
-        Ok(Some(Ok(WsMessage::Text(text)))) => {
-            Some(serde_json::from_str(&text).expect("frame is JSON"))
+    let deadline = tokio::time::Instant::now() + window;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
         }
-        Ok(Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_)))) => None,
-        _ => None,
+        match tokio::time::timeout(remaining, ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                return Some(serde_json::from_str(&text).expect("frame is JSON"));
+            }
+            // Control frames never count as the burst's end: keep waiting
+            // for text until the window actually elapses.
+            Ok(Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_)))) => continue,
+            _ => return None,
+        }
     }
 }
 
@@ -239,6 +410,25 @@ async fn attach(ws: &mut WsClient, terminal_id: &str, attach_request_id: &str) {
     ))
     .await
     .expect("send terminal.attach");
+}
+
+/// Send `terminal.attach` WITHOUT an `attachRequestId` — the uncorrelated
+/// legacy shape: even a negotiated connection falls back to the inline
+/// full-replay path (credits cannot be correlated without a generation key).
+async fn attach_without_arid(ws: &mut WsClient, terminal_id: &str) {
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.attach",
+            "terminalId": terminal_id,
+            "intent": "viewport_hydrate",
+            "cols": 80,
+            "rows": 24,
+            "sinceSeq": 0,
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send arid-less terminal.attach");
 }
 
 /// Send one continuation credit.
@@ -367,6 +557,40 @@ async fn paced_attach_first_page(
                     ready = Some(value);
                 }
                 Some("terminal.output") => outputs.push(value),
+                _ => {}
+            },
+        }
+    }
+    let ready = ready.expect("attach.ready never arrived");
+    (ready, outputs)
+}
+
+/// The LEGACY (non-paced) attach burst: the ready frame (matched by
+/// terminalId — this attach carries no `attachRequestId` to match) plus
+/// every output frame the server sends spontaneously (the full inline
+/// replay), read to the first quiet gap after the ready.
+async fn legacy_attach_inline_replay(
+    ws: &mut WsClient,
+    terminal_id: &str,
+) -> (serde_json::Value, Vec<serde_json::Value>) {
+    let mut ready = None;
+    let mut outputs = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        match next_json_or_timeout(ws, Duration::from_millis(400)).await {
+            None => {
+                if ready.is_some() {
+                    break; // the inline burst is complete
+                }
+                continue;
+            }
+            Some(value) => match value.get("type").and_then(|v| v.as_str()) {
+                Some("terminal.attach.ready")
+                    if value.get("terminalId").and_then(|v| v.as_str()) == Some(terminal_id) =>
+                {
+                    ready = Some(value);
+                }
+                Some("terminal.output") | Some("terminal.output.batch") => outputs.push(value),
                 _ => {}
             },
         }
@@ -763,6 +987,85 @@ async fn reattach_supersedes_the_old_paced_session() {
     );
 }
 
+/// The binding supersede rule covers EVERY successful re-attach, not just
+/// the paced one: an arid-less LEGACY re-attach (the negotiated fallback
+/// shape) must also cancel the connection's previous paced session for the
+/// terminal — a credit for the superseded generation must produce NOTHING
+/// (no `terminal.output`, no `terminal.output.batch`), and the connection
+/// must keep working afterwards.
+#[tokio::test]
+async fn legacy_reattach_cancels_the_stale_paced_session() {
+    let ring = 512 * 1024;
+    let url = spawn_server(ring).await;
+    let mut driver = connect(&url).await;
+    hello(&mut driver, false).await;
+    let terminal_id = create_shell_terminal(&mut driver, "create-legacy-supersede").await;
+    flood_until_complete(&url, &mut driver, &terminal_id, 400).await;
+
+    // Generation 1: the paced attach starts a session whose first page is
+    // a bounded prefix (the session is ACTIVE, mid-replay).
+    let mut paced = connect(&url).await;
+    hello(&mut paced, true).await;
+    let (ready1, page1) = paced_attach_first_page(&mut paced, &terminal_id, "attach-gen-1").await;
+    let last1 = page1
+        .iter()
+        .map(|f| f["seqEnd"].as_i64().unwrap_or(0))
+        .max()
+        .expect("gen-1 first page");
+    assert!(
+        last1 < ready1["headSeq"].as_i64().unwrap(),
+        "the session is mid-replay (supersede-able)"
+    );
+
+    // The arid-less LEGACY re-attach: the whole window replays inline.
+    attach_without_arid(&mut paced, &terminal_id).await;
+    let (ready2, outputs) = legacy_attach_inline_replay(&mut paced, &terminal_id).await;
+    assert!(
+        ready2
+            .get("attachRequestId")
+            .and_then(|v| v.as_str())
+            .is_none(),
+        "the re-attach carried no attachRequestId: {ready2}"
+    );
+    let head = ready2["headSeq"].as_i64().unwrap();
+    let max_seq = outputs
+        .iter()
+        .map(|f| f["seqEnd"].as_i64().unwrap_or(0))
+        .max()
+        .unwrap_or(0);
+    assert_eq!(
+        max_seq, head,
+        "the legacy re-attach replays the whole window inline"
+    );
+
+    // The superseded generation's credit (its arid + in-window consumedSeq):
+    // it must be ignored — no output frame of ANY kind may be produced.
+    credit(&mut paced, &terminal_id, "attach-gen-1", last1).await;
+    let stale = next_json_or_timeout(&mut paced, Duration::from_millis(1500)).await;
+    let is_output_frame = |v: &serde_json::Value| {
+        matches!(
+            v.get("type").and_then(|t| t.as_str()),
+            Some("terminal.output") | Some("terminal.output.batch")
+        )
+    };
+    assert!(
+        stale.as_ref().map(|v| !is_output_frame(v)).unwrap_or(true),
+        "a credit for the session superseded by the legacy re-attach must \
+         produce nothing, got {stale:?}"
+    );
+
+    // The connection is not wedged by the cancel: live output keeps
+    // flowing to the re-attached (legacy) subscriber.
+    let marker = "FLOOD-DONE-MARKER";
+    send_input(&mut driver, &terminal_id, &flood_command(30, marker)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let (acc, _) = drain_until_marker(&mut paced, marker, deadline).await;
+    assert!(
+        acc.contains(marker),
+        "live output flows normally after the superseded credit"
+    );
+}
+
 /// A credit on a NON-NEGOTIATED connection is inert: no pacing machinery
 /// engages, inline delivery continues to work exactly as before.
 #[tokio::test]
@@ -857,4 +1160,218 @@ async fn disconnect_mid_replay_leaves_the_terminal_running_and_reattachable() {
         acc.contains(marker),
         "live output flows after the re-attach"
     );
+}
+
+/// The `ws.restore.*` observability contract, pinned end-to-end on the real
+/// dispatch: `ws.restore.paced_start` carries its identifiers/measurements
+/// (including `maxReplayBytes`), `ws.restore.paced_complete` closes the
+/// session, and all FOUR `ws.restore.credit` verdicts (accepted /
+/// stale_generation / beyond_window / non_negotiated) are emitted with their
+/// status field — and NO event ever carries terminal CONTENT (identifiers
+/// and measurements only).
+#[tokio::test]
+async fn restore_observability_events_are_emitted_content_free() {
+    let events = global_capture();
+    let ring = 512 * 1024;
+    let url = spawn_server(ring).await;
+    let mut driver = connect(&url).await;
+    hello(&mut driver, false).await;
+    let terminal_id = create_shell_terminal(&mut driver, "create-observability").await;
+    flood_until_complete(&url, &mut driver, &terminal_id, 100).await;
+
+    // The negotiated attach carries a maxReplayBytes request (the TERM-07
+    // seam) — it must ride the paced_start event.
+    let mut paced = connect(&url).await;
+    hello(&mut paced, true).await;
+    paced
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "terminal.attach",
+                "terminalId": terminal_id,
+                "intent": "viewport_hydrate",
+                "cols": 80,
+                "rows": 24,
+                "attachRequestId": "attach-ev",
+                "sinceSeq": 0,
+                "maxReplayBytes": 262144,
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send attach with maxReplayBytes");
+    let (ready, page1) = paced_attach_first_page(&mut paced, &terminal_id, "attach-ev").await;
+    let head = ready["headSeq"].as_i64().expect("headSeq");
+    let last_seq = page1
+        .iter()
+        .map(|f| f["seqEnd"].as_i64().unwrap_or(0))
+        .max()
+        .expect("first page");
+    let page_bytes: u64 = page1.iter().map(|f| f.to_string().len() as u64).sum();
+
+    // paced_start: identifiers + measurements, maxReplayBytes included.
+    let start_ev =
+        wait_for_restore_event_of_terminal(&events, &terminal_id, "ws.restore.paced_start")
+            .await
+            .expect("ws.restore.paced_start is emitted on the negotiated attach");
+    assert_eq!(
+        start_ev.fields.get("attach_request_id").map(String::as_str),
+        Some("attach-ev")
+    );
+    assert_eq!(
+        start_ev.fields.get("requested_since").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        start_ev.fields.get("effective_since").map(String::as_str),
+        Some("0")
+    );
+    assert_eq!(
+        start_ev.fields.get("target").map(String::as_str),
+        Some(head.to_string().as_str()),
+        "target is the attach-time head"
+    );
+    assert_eq!(
+        start_ev.fields.get("max_replay_bytes").map(String::as_str),
+        Some("Some(262144)"),
+        "the TERM-07 seam value rides the event (Debug of Option<i64>)"
+    );
+    assert_eq!(
+        start_ev.fields.get("page_bytes").map(String::as_str),
+        Some(page_bytes.to_string().as_str()),
+        "page_bytes is the first page's real serialized size"
+    );
+
+    // beyond_window: a consumedSeq past the last-sent page's end is ignored.
+    credit(&mut paced, &terminal_id, "attach-ev", last_seq + 100_000).await;
+    let beyond = wait_for_restore_event(
+        &events,
+        &terminal_id,
+        "ws.restore.credit",
+        "status",
+        "beyond_window",
+    )
+    .await
+    .expect("the beyond-window credit is observed");
+    assert_eq!(
+        beyond.fields.get("terminal_id").map(String::as_str),
+        Some(terminal_id.as_str())
+    );
+    assert_eq!(
+        beyond
+            .fields
+            .get("consumed_seq")
+            .and_then(|v| v.parse::<i64>().ok()),
+        Some(last_seq + 100_000)
+    );
+
+    // stale_generation: a credit for an attachRequestId no active session
+    // holds is a stale generation.
+    credit(&mut paced, &terminal_id, "attach-bogus", last_seq).await;
+    let stale = wait_for_restore_event(
+        &events,
+        &terminal_id,
+        "ws.restore.credit",
+        "status",
+        "stale_generation",
+    )
+    .await
+    .expect("the stale-generation credit is observed");
+    assert_eq!(
+        stale.fields.get("terminal_id").map(String::as_str),
+        Some(terminal_id.as_str())
+    );
+
+    // accepted: a valid credit produces the next page...
+    credit(&mut paced, &terminal_id, "attach-ev", last_seq).await;
+    let accepted = wait_for_restore_event(
+        &events,
+        &terminal_id,
+        "ws.restore.credit",
+        "status",
+        "accepted",
+    )
+    .await
+    .expect("the valid credit is observed as accepted");
+    assert_eq!(
+        accepted
+            .fields
+            .get("consumed_seq")
+            .and_then(|v| v.parse::<i64>().ok()),
+        Some(last_seq)
+    );
+    // ...and the page actually arrives (the event describes real behavior).
+    let next = next_json(&mut paced).await;
+    assert_eq!(next["type"], "terminal.output");
+
+    // Drive the session to completion; the tail drains un-credited and the
+    // registry's atomic clear completes the session.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut credited = next["seqEnd"].as_i64().unwrap_or(last_seq);
+    credit(&mut paced, &terminal_id, "attach-ev", credited).await;
+    while tokio::time::Instant::now() < deadline {
+        let Some(value) = next_json_or_timeout(&mut paced, Duration::from_secs(5)).await else {
+            break;
+        };
+        if value.get("type").and_then(|v| v.as_str()) == Some("terminal.output") {
+            let end = value["seqEnd"].as_i64().unwrap_or(0);
+            if end > credited {
+                credited = end;
+                credit(&mut paced, &terminal_id, "attach-ev", end).await;
+            }
+        }
+    }
+    let complete =
+        wait_for_restore_event_of_terminal(&events, &terminal_id, "ws.restore.paced_complete")
+            .await
+            .expect("ws.restore.paced_complete closes the session");
+    assert_eq!(
+        complete.fields.get("attach_request_id").map(String::as_str),
+        Some("attach-ev")
+    );
+    assert_eq!(
+        complete.fields.get("last_seq").map(String::as_str),
+        Some(credited.to_string().as_str()),
+        "last_seq is the session's final cursor"
+    );
+    assert!(
+        complete
+            .fields
+            .get("pages")
+            .and_then(|v| v.parse::<u64>().ok())
+            .is_some_and(|pages| pages >= 2),
+        "pages counts every page the session produced"
+    );
+
+    // non_negotiated: a credit from a connection that never negotiated the
+    // paced capability is inert and observed as such.
+    credit(&mut driver, &terminal_id, "attach-ev", 0).await;
+    let non_negotiated = wait_for_restore_event(
+        &events,
+        &terminal_id,
+        "ws.restore.credit",
+        "status",
+        "non_negotiated",
+    )
+    .await
+    .expect("the non-negotiated connection's credit is observed as inert");
+    assert_eq!(
+        non_negotiated.fields.get("terminal_id").map(String::as_str),
+        Some(terminal_id.as_str())
+    );
+
+    // Identifiers/measurements only: NO terminal content ever leaks into a
+    // ws.restore.* event for this terminal (the flood payload and its
+    // marker must be absent from every event field).
+    let captured = events.lock().unwrap();
+    for event in captured.iter().filter(|e| {
+        e.message.starts_with("ws.restore.")
+            && e.fields.get("terminal_id").map(String::as_str) == Some(terminal_id.as_str())
+    }) {
+        for (name, value) in &event.fields {
+            assert!(
+                !value.contains("STREAMDATA") && !value.contains("FLOOD-DONE-MARKER"),
+                "terminal content leaked into ws.restore.{name}={value}"
+            );
+        }
+    }
 }
