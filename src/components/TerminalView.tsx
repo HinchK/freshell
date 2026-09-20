@@ -120,6 +120,14 @@ import {
   type AttachSeqState,
   type OutputBatchAcceptedSegment,
 } from '@/lib/terminal-attach-seq-state'
+import {
+  beginPacedReplayConsumption,
+  pacedReplayConsumeThrough,
+  pacedReplayMarkReceived,
+  pacedReplayNextCredit,
+  pacedReplayOnReady,
+  type PacedReplayConsumptionState,
+} from '@/lib/paced-replay-consumption'
 import { useMobile } from '@/hooks/useMobile'
 import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
 import { useKeyboardInset } from '@/hooks/useKeyboardInset'
@@ -218,7 +226,11 @@ const TOUCH_SCROLL_PIXELS_PER_LINE = 18
 const LIGHT_THEME_MIN_CONTRAST_RATIO = 4.5
 const DEFAULT_MIN_CONTRAST_RATIO = 1
 const MAX_LAST_SENT_VIEWPORT_CACHE_ENTRIES = 200
-const TRUNCATED_REPLAY_BYTES = 128 * 1024
+// One replay page (responsive-terminal-restore Workstream 1): the legacy
+// maxReplayBytes truncation budget and the paced replayPageBytes request are
+// deliberately the same 128 KiB — the paced path pages what the legacy path
+// truncated.
+const REPLAY_PAGE_BYTES = 128 * 1024
 const INPUT_BLOCKED_NOTICE_THROTTLE_MS = 2000
 const TERMINAL_OUTPUT_BATCH_BARRIER_REASONS = new Set([
   'control',
@@ -275,10 +287,18 @@ const xtermLogger: ILogger = {
   },
 }
 
-function viewportHydrateReplayOptions(content?: TerminalPaneContent | null): { maxReplayBytes: number } | undefined {
+function viewportHydrateReplayOptions(
+  content?: TerminalPaneContent | null,
+  pacedReplay?: boolean,
+): { maxReplayBytes: number } | { replayPageBytes: number } | undefined {
+  if (pacedReplay) {
+    // Negotiated: page-sized replay delivery on every hydrate, no byte-budget
+    // truncation (the paced path pages the whole retained window).
+    return { replayPageBytes: REPLAY_PAGE_BYTES }
+  }
   return content?.mode === 'opencode'
     ? undefined
-    : { maxReplayBytes: TRUNCATED_REPLAY_BYTES }
+    : { maxReplayBytes: REPLAY_PAGE_BYTES }
 }
 
 function buildSessionAssociationContentUpdates(
@@ -488,6 +508,9 @@ type AttachTerminalOptions = {
   suppressNextMatchingResize?: boolean
   skipPreAttachFit?: boolean
   maxReplayBytes?: number
+  /** Negotiated paced attaches only (viewportHydrateReplayOptions): the
+   *  page-size request carried instead of maxReplayBytes. */
+  replayPageBytes?: number
   priority?: TerminalAttachPriority
   sinceSeq?: number
 }
@@ -656,6 +679,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     && window.__FRESHELL_TEST_HARNESS__?.isTerminalNetworkEffectsSuppressed?.(paneId) === true
   const [isAttaching, setIsAttaching] = useState(false)
   const [truncatedHistoryGap, setTruncatedHistoryGap] = useState<{ fromSeq: number; toSeq: number } | null>(null)
+  // Honest incomplete-history state (responsive-terminal-restore): a
+  // NEGOTIATED retention gap's visible, accessible notice. `headSeq` /
+  // `oldestRetainedSeq` are null when the gap omitted them — absence means
+  // UNKNOWN BOUNDS, never non-negotiation.
+  const [retentionLossNotice, setRetentionLossNotice] = useState<{
+    fromSeq: number
+    toSeq: number
+    headSeq: number | null
+    oldestRetainedSeq: number | null
+  } | null>(null)
   const [backgroundHydrationTriggered, setBackgroundHydrationTriggered] = useState(false)
   const wasCreatedFreshRef = useRef(paneContent.kind === 'terminal' && paneContent.status === 'creating')
   const [pendingLinkUri, setPendingLinkUri] = useState<string | null>(null)
@@ -1106,6 +1139,80 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     quarantineRepairRef.current = null
   }, [])
 
+  // ── Paced terminal replay consumption (responsive-terminal-restore
+  // Workstream 1, client side) ──
+  // All paced behavior is gated on the CURRENT connection's capability echo;
+  // absent (or a ws client without the accessor) → today's exact wire
+  // behavior everywhere.
+  const isPacedReplayNegotiated = useCallback((): boolean => {
+    const capabilities = typeof ws.getServerCapabilities === 'function'
+      ? ws.getServerCapabilities()
+      : undefined
+    return capabilities?.pacedTerminalReplayV1 === true
+  }, [ws])
+
+  // The consumption frontier for the CURRENT attach generation only — replaced
+  // by the next attach, absent for non-negotiated attaches.
+  const pacedReplayRef = useRef<PacedReplayConsumptionState | null>(null)
+
+  const advancePacedReplayConsumption = useCallback((attachRequestId: string | undefined, seqEnd: number) => {
+    const paced = pacedReplayRef.current
+    if (!paced || !attachRequestId || paced.attachRequestId !== attachRequestId) return
+    const next = pacedReplayConsumeThrough(paced, seqEnd)
+    if (next !== paced) {
+      pacedReplayRef.current = next
+    }
+  }, [])
+
+  const markPacedReplayReceived = useCallback((attachRequestId: string | undefined, seqEnd: number) => {
+    const paced = pacedReplayRef.current
+    if (!paced || !attachRequestId || paced.attachRequestId !== attachRequestId) return
+    const next = pacedReplayMarkReceived(paced, seqEnd)
+    if (next !== paced) {
+      pacedReplayRef.current = next
+    }
+  }, [])
+
+  const flushPacedReplayCredit = useCallback(() => {
+    const paced = pacedReplayRef.current
+    if (!paced) return
+    const activeAttach = currentAttachRef.current
+    if (!activeAttach || activeAttach.requestId !== paced.attachRequestId) return
+    const streamId = activeAttach.streamId
+    if (typeof streamId !== 'string' || streamId.length === 0) return
+    const decision = pacedReplayNextCredit(paced)
+    if (decision.state !== paced) {
+      pacedReplayRef.current = decision.state
+    }
+    if (!decision.credit) return
+    ws.send({
+      type: 'terminal.replay.credit',
+      terminalId: decision.credit.terminalId,
+      streamId,
+      attachRequestId: decision.credit.attachRequestId,
+      consumedSeq: decision.credit.consumedSeq,
+    })
+  }, [ws])
+
+  // A consumption advance with no write of its own (a fully pre-filtered
+  // frame) rides the write queue as a task so the SAME drain-tick coalescing
+  // applies: the credit flushes once per drain, never per frame. Armed for
+  // the current paced attach generation only — non-negotiated panes keep
+  // today's queue traffic byte-identical.
+  const schedulePacedReplayCreditFlush = useCallback((
+    outputSource: TerminalOutputSource,
+    attachRequestId: string | undefined,
+  ) => {
+    const paced = pacedReplayRef.current
+    if (!paced || !attachRequestId || paced.attachRequestId !== attachRequestId) return
+    const queue = writeQueueRef.current
+    if (!queue) {
+      flushPacedReplayCredit()
+      return
+    }
+    queue.enqueueTask(() => {}, { mode: outputSource, generation: attachRequestId })
+  }, [flushPacedReplayCredit])
+
   const recordTerminalPerfAuditEvent = useCallback((event: string, data: Record<string, unknown> = {}) => {
     const payload = Object.fromEntries(Object.entries({
       event,
@@ -1142,7 +1249,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         clearQuarantineRepair(attachRequestId)
         attachTerminalRef.current?.(terminalId, 'viewport_hydrate', {
           clearViewportFirst: true,
-          ...viewportHydrateReplayOptions(contentRef.current),
+          ...viewportHydrateReplayOptions(contentRef.current, isPacedReplayNegotiated()),
         })
         return
       }
@@ -1174,7 +1281,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       timedOut: false,
       timer: setTimeout(poll, QUARANTINE_REPAIR_POLL_MS),
     }
-  }, [clearQuarantineRepair, recordTerminalPerfAuditEvent])
+  }, [clearQuarantineRepair, isPacedReplayNegotiated, recordTerminalPerfAuditEvent])
 
   const markParserAppliedFrame = useCallback((terminalId: string | undefined, seq: number, attachContext?: {
     requestId: string
@@ -2281,6 +2388,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     surfaceWritesSinceFreshRef.current = 0
     const writeQueue = createTerminalWriteQueue({
       terminalInstanceId,
+      // One paced-replay credit per drain tick (Workstream 1): the flush is
+      // idempotent (lastSentCreditSeq guard), so non-paced panes and drains
+      // with no frontier movement are no-ops.
+      onDrain: () => {
+        flushPacedReplayCredit()
+      },
       onItemApplied: (item) => {
         surfaceWritesSinceFreshRef.current += 1
         // Coupled clear (plan round-3): the marker-bearing attach's own
@@ -3082,6 +3195,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
 
     setIsAttaching(true)
     setTruncatedHistoryGap(null)
+    setRetentionLossNotice(null)
 
     // Startup probes must not leak across attach generations.
     resetStartupProbeParser()
@@ -3109,6 +3223,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       pendingSinceSeq: sinceSeq,
       pendingReason: opts?.priority === 'background' ? 'background_catchup' : 'initial_hydrate',
     }
+
+    // Paced replay consumption (Workstream 1): arm the frontier for THIS
+    // generation only on a negotiated connection — the next attach replaces
+    // it; non-negotiated attaches never arm one.
+    const pacedReplayNegotiated = isPacedReplayNegotiated()
+    pacedReplayRef.current = pacedReplayNegotiated
+      ? beginPacedReplayConsumption({ terminalId: tid, attachRequestId, sinceSeq })
+      : null
 
     currentAttachRef.current = {
       requestId: attachRequestId,
@@ -3175,7 +3297,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       // fence — terminal.attach participates in the coordinator (a queued
       // cross-device attach is generation-fenced server-side).
       ownerFence: selectPaneOwnerFence(appStore.getState(), contentRef.current ?? {}) ?? undefined,
-      ...(opts?.maxReplayBytes ? { maxReplayBytes: opts.maxReplayBytes } : {}),
+      // Paced replay negotiation (Workstream 1): negotiated attaches —
+      // fresh AND delta, with or without explicit options — request
+      // page-sized delivery and never carry the legacy truncation budget.
+      // Non-negotiated stays byte-identical to today.
+      ...(pacedReplayNegotiated
+        ? { replayPageBytes: opts?.replayPageBytes ?? REPLAY_PAGE_BYTES }
+        : opts?.maxReplayBytes ? { maxReplayBytes: opts.maxReplayBytes } : {}),
       ...(claimSurfaceReset ? { surfaceReset: true } : {}),
     }))
     rememberSentViewport(tid, cols, rows)
@@ -3199,6 +3327,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     clearQuarantineRepair,
     getCheckpointDeltaReplayDecision,
     getTerminalCheckpointStreamId,
+    isPacedReplayNegotiated,
     recordTerminalPerfAuditEvent,
     resetParserAppliedSurface,
     scheduleQuarantineRepair,
@@ -3239,13 +3368,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     } else {
       attachTerminal(tid, 'viewport_hydrate', {
         clearViewportFirst: true,
-        ...viewportHydrateReplayOptions(currentContent),
+        ...viewportHydrateReplayOptions(currentContent, isPacedReplayNegotiated()),
       })
     }
 
     dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: request.requestId }))
     return true
-  }, [attachTerminal, dispatch, paneId, registerForBackgroundHydration, suppressNetworkEffects, tabId, ws])
+  }, [attachTerminal, dispatch, isPacedReplayNegotiated, paneId, registerForBackgroundHydration, suppressNetworkEffects, tabId, ws])
 
   // Apply settings changes
   useEffect(() => {
@@ -3298,14 +3427,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           suppressNextMatchingResize: true,
           skipPreAttachFit: true,
           ...(revealPlan.intent === 'viewport_hydrate'
-            ? viewportHydrateReplayOptions(contentRef.current)
+            ? viewportHydrateReplayOptions(contentRef.current, isPacedReplayNegotiated())
             : undefined),
         })
         return
       }
       requestTerminalLayout({ fit: true, resize: true })
     }
-  }, [hidden, isTerminal, paneId, requestTerminalLayout, tabId, attachTerminal, getCheckpointDeltaReplayDecision])
+  }, [hidden, isTerminal, paneId, requestTerminalLayout, tabId, attachTerminal, getCheckpointDeltaReplayDecision, isPacedReplayNegotiated])
 
   // Background hydration: triggered by the hydration queue for hidden tabs
   useEffect(() => {
@@ -3325,9 +3454,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     attachTerminal(tid, 'viewport_hydrate', {
       clearViewportFirst: true,
       priority: 'background',
-      ...viewportHydrateReplayOptions(contentRef.current),
+      ...viewportHydrateReplayOptions(contentRef.current, isPacedReplayNegotiated()),
     })
-  }, [backgroundHydrationTriggered, attachTerminal, getCheckpointDeltaReplayDecision])
+  }, [backgroundHydrationTriggered, attachTerminal, getCheckpointDeltaReplayDecision, isPacedReplayNegotiated])
 
   // Create or attach to backend terminal
   useEffect(() => {
@@ -3880,6 +4009,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           const nextSeqState = markParserAppliedSeq(seqStateRef.current, input.parserAppliedSeq)
           applySeqState(nextSeqState)
           markParserAppliedFrame(tid, nextSeqState.parserAppliedSeq, activeAttach)
+          // Paced replay consumption (Workstream 1): the write-queue applied
+          // this frame — the consumption frontier advances independent of the
+          // parser-applied checkpoint's quarantine clamping (the checkpoint
+          // still refuses filtered/lost ranges; the frontier is about
+          // consumption, not surface state).
+          advancePacedReplayConsumption(input.attachRequestId, input.parserAppliedSeq)
           if (input.completedAttach) {
             completeAttachGeneration({
               attachRequestId: input.attachRequestId,
@@ -4004,6 +4139,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             || !inputBytesEqualSubmission
             || !submission.submittedBytesEqualInput
           ) {
+            // Paced replay consumption (Workstream 1): a frame the
+            // null-screen-effect pre-parsers fully consumed (nothing reached
+            // the queue, no replay-discard mutation) IS consumed — the
+            // frontier advances without any xterm write. Partial or unknown
+            // mutations keep today's quarantine and forfeit the range's
+            // credit (the server's retention/expiry handling covers it).
+            if (!submission.submittedWrite && inputBytesEqualSubmission) {
+              advancePacedReplayConsumption(input.attachRequestId, input.seqEnd)
+              schedulePacedReplayCreditFlush(input.outputSource, input.attachRequestId)
+            }
             applySeqState(markOutputRangeUnapplied(seqStateRef.current, {
               fromSeq: input.seqStart,
               toSeq: input.seqEnd,
@@ -4210,6 +4355,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           const completedAttachOnBatch = !batchDecision.state.pendingReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           applySeqState(batchDecision.state)
+          markPacedReplayReceived(msg.attachRequestId, batchSeqEnd)
 
           const containsBarrier = batchSegments.some((segment) => segment.barrier)
           if (!containsBarrier) {
@@ -4301,6 +4447,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           const completedAttachOnFrame = !frameDecision.state.pendingReplay
             && (Boolean(previousSeqState.pendingReplay) || previousSeqState.awaitingFreshSequence)
           applySeqState(frameDecision.state)
+          markPacedReplayReceived(msg.attachRequestId, msg.seqEnd)
           submitAcceptedOutput({
             raw: msg.data || '',
             seqStart: msg.seqStart,
@@ -4332,9 +4479,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
 
           // Only show "load more" when the server confirms the gap is from
           // byte-budget truncation (recoverable), not ring overflow (data gone).
+          const pacedReplayNegotiated = isPacedReplayNegotiated()
           const isTruncatedReplay = msg.reason === 'replay_budget_exceeded'
             && seqStateRef.current.pendingReplay
-          const isUnrecoverableOpenCodeViewportHydrate = msg.reason === 'replay_window_exceeded'
+          // Negotiated retention gaps NEVER trigger the opencode replacement
+          // kill (responsive-terminal-restore): the paced server continues
+          // from what is retained and the pane shows the honest
+          // incomplete-history notice instead. The kill stays for old servers
+          // (no echo ⇒ no new restore semantics).
+          const isUnrecoverableOpenCodeViewportHydrate = !pacedReplayNegotiated
+            && msg.reason === 'replay_window_exceeded'
             && currentAttachRef.current?.intent === 'viewport_hydrate'
             && currentAttachRef.current.sinceSeq === 0
             && contentRef.current?.mode === 'opencode'
@@ -4345,6 +4499,27 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
 
           if (isTruncatedReplay) {
             setTruncatedHistoryGap({ fromSeq: msg.fromSeq, toSeq: msg.toSeq })
+          } else if (pacedReplayNegotiated && msg.reason === 'replay_window_exceeded') {
+            // Honest incomplete-history state on the paced path: some earlier
+            // output is gone; live output continues. Absent bounds fields
+            // mean UNKNOWN BOUNDS (the terminal may have vanished at gap
+            // emission) — never non-negotiation.
+            const gapHeadSeq = typeof msg.headSeq === 'number' ? msg.headSeq : null
+            const gapOldestRetainedSeq = typeof msg.oldestRetainedSeq === 'number' ? msg.oldestRetainedSeq : null
+            setRetentionLossNotice({
+              fromSeq: msg.fromSeq,
+              toSeq: msg.toSeq,
+              headSeq: gapHeadSeq,
+              oldestRetainedSeq: gapOldestRetainedSeq,
+            })
+            recordTerminalPerfAuditEvent('terminal.restore.retention_gap', {
+              terminalId: tid,
+              attachRequestId: msg.attachRequestId,
+              fromSeq: msg.fromSeq,
+              toSeq: msg.toSeq,
+              headSeq: gapHeadSeq,
+              oldestRetainedSeq: gapOldestRetainedSeq,
+            })
           } else {
             const reason = msg.reason === 'replay_window_exceeded'
               ? 'reconnect window exceeded'
@@ -4355,6 +4530,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           const gapDecision = onOutputGap(previousSeqState, { fromSeq: msg.fromSeq, toSeq: msg.toSeq })
           const nextSeqState = gapDecision.state
           applySeqState(nextSeqState)
+          markPacedReplayReceived(msg.attachRequestId, msg.toSeq)
           resetParserAppliedSurface(parserAppliedSeqRef.current)
           if (gapDecision.requiresSurfaceQuarantine) {
             recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
@@ -4480,7 +4656,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             updateContent({ streamId: undefined })
             attachTerminal(tid, 'viewport_hydrate', {
               clearViewportFirst: true,
-              ...viewportHydrateReplayOptions(contentRef.current),
+              ...viewportHydrateReplayOptions(contentRef.current, isPacedReplayNegotiated()),
             })
             return
           }
@@ -4515,7 +4691,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             resetParserAppliedSurface(parserAppliedSeqRef.current)
             attachTerminal(tid, 'viewport_hydrate', {
               clearViewportFirst: true,
-              ...viewportHydrateReplayOptions(contentRef.current),
+              ...viewportHydrateReplayOptions(contentRef.current, isPacedReplayNegotiated()),
             })
             return
           }
@@ -4567,6 +4743,29 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             replayToSeq: msg.replayToSeq,
           })
           applySeqState(nextSeqState)
+          // Paced replay consumption (Workstream 1): record the session
+          // window end (replayToSeq on a paced ready describes the SESSION
+          // window — the fixed catch-up target — never a single page's
+          // bounds) and the restore-contract fields. Legacy-path ready frames
+          // on a negotiated connection (an already-Exited terminal) carry the
+          // contract fields too; their credits are inert server-side.
+          const pacedReadyState = pacedReplayRef.current
+          if (pacedReadyState && msg.attachRequestId === pacedReadyState.attachRequestId) {
+            pacedReplayRef.current = pacedReplayOnReady(pacedReadyState, {
+              replayToSeq: msg.replayToSeq,
+            })
+            recordTerminalPerfAuditEvent('terminal.restore.paced_ready', {
+              terminalId: tid,
+              attachRequestId: msg.attachRequestId,
+              requestedSinceSeq: msg.requestedSinceSeq,
+              effectiveSinceSeq: msg.effectiveSinceSeq,
+              oldestRetainedSeq: msg.oldestRetainedSeq,
+              replayResetReason: msg.replayResetReason,
+              headSeq: msg.headSeq,
+              replayFromSeq: msg.replayFromSeq,
+              replayToSeq: msg.replayToSeq,
+            })
+          }
           setIsAttaching(Boolean(nextSeqState.pendingReplay))
           if (!nextSeqState.pendingReplay) {
             // Completion-clear edge for empty-tracker / no-replay attaches
@@ -5628,7 +5827,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             ? 'keepalive_delta'
             : 'viewport_hydrate'
           attachTerminal(currentTerminalId, intent, intent === 'viewport_hydrate'
-            ? viewportHydrateReplayOptions(contentRef.current)
+            ? viewportHydrateReplayOptions(contentRef.current, isPacedReplayNegotiated())
             : undefined)
           // One-shot reconcile notice (attach/corrected/duplicate verdicts):
           // render it on the attach that the verdict fold re-fired, then
@@ -6086,8 +6285,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           </span>
         </div>
       )}
+      {retentionLossNotice && (
+        // Honest incomplete-history state (responsive-terminal-restore): a
+        // negotiated retention gap's accessible notice — live output keeps
+        // flowing below it.
+        <div
+          role="status"
+          aria-live="polite"
+          data-testid="restore-retention-loss-notice"
+          className="pointer-events-none absolute inset-x-0 top-0 z-10 bg-amber-100/90 px-3 py-1 text-xs text-amber-900 dark:bg-amber-900/80 dark:text-amber-100"
+        >
+          Some earlier terminal output is no longer available on the server. Live output continues.
+        </div>
+      )}
       {truncatedHistoryGap && (
-        <div className="absolute inset-x-0 top-0 z-10 flex justify-center">
+        <div
+          className={`absolute inset-x-0 ${retentionLossNotice ? 'top-9' : 'top-0'} z-10 flex justify-center`}
+        >
           <button
             type="button"
             className="rounded-b bg-muted/90 px-3 py-1 text-xs text-muted-foreground shadow-sm ring-1 ring-border/60 hover:bg-muted hover:text-foreground transition-colors"

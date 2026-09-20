@@ -40,6 +40,10 @@ const wsMocks = vi.hoisted(() => ({
   // WsClient `get isReady()` (ws-client.ts). Defaults true so the suite's
   // existing send assertions keep their pass-through behavior.
   isReady: true,
+  // The per-connection server capability echo (`getServerCapabilities()`,
+  // ws-client.ts). Empty by default = old server: every paced-replay branch
+  // must fall back to today's wire behavior.
+  capabilities: {} as Record<string, unknown>,
 }))
 
 const terminalThemeMocks = vi.hoisted(() => ({
@@ -71,6 +75,7 @@ vi.mock('@/lib/ws-client', async (importOriginal) => {
       connect: wsMocks.connect,
       onMessage: wsMocks.onMessage,
       onReconnect: wsMocks.onReconnect,
+      getServerCapabilities: () => wsMocks.capabilities,
       get isReady() {
         return wsMocks.isReady
       },
@@ -370,6 +375,7 @@ describe('TerminalView lifecycle updates', () => {
     latestAttachRequestIdByTerminal.clear()
     latestStreamIdByTerminal.clear()
     wsMocks.isReady = true
+    wsMocks.capabilities = {}
     wsMocks.send.mockClear()
     wsMocks.send.mockImplementation((msg: any) => {
       if (
@@ -10663,6 +10669,450 @@ describe('TerminalView lifecycle updates', () => {
     })
   })
 
+  describe('paced terminal replay consumption (pacedTerminalReplayV1)', () => {
+    const PACED_CAPABILITIES = { pacedTerminalReplayV1: true }
+    const OSC52_ONLY_FRAME = '\u001b]52;c;aGVsbG8=\u0007'
+    const PACED_PAGE_BYTES = 128 * 1024
+
+    async function setupPacedPane(opts?: {
+      suffix?: string
+      mode?: TerminalPaneContent['mode']
+      sessionRef?: TerminalPaneContent['sessionRef']
+      negotiated?: boolean
+    }) {
+      const suffix = opts?.suffix ?? `t${Math.floor(Math.random() * 1e9)}`
+      const tabId = `tab-paced-${suffix}`
+      const paneId = `pane-paced-${suffix}`
+      const requestId = `req-paced-${suffix}`
+      const terminalId = `term-paced-${suffix}`
+      wsMocks.capabilities = opts?.negotiated === false ? {} : PACED_CAPABILITIES
+
+      const paneContent: TerminalPaneContent = {
+        kind: 'terminal',
+        createRequestId: requestId,
+        status: 'running',
+        mode: opts?.mode ?? 'shell',
+        shell: 'system',
+        terminalId,
+        ...(opts?.sessionRef ? { sessionRef: opts.sessionRef } : {}),
+      }
+
+      const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
+      const store = configureStore({
+        reducer: {
+          tabs: tabsReducer,
+          panes: panesReducer,
+          settings: settingsReducer,
+          connection: connectionReducer,
+        },
+        preloadedState: {
+          tabs: {
+            tabs: [{
+              id: tabId,
+              mode: paneContent.mode,
+              status: 'running',
+              title: 'Shell',
+              titleSetByUser: false,
+              createRequestId: requestId,
+              terminalId,
+            }],
+            activeTabId: tabId,
+          },
+          panes: {
+            layouts: { [tabId]: root },
+            activePane: { [tabId]: paneId },
+            paneTitles: {},
+          },
+          settings: createSettingsState(),
+          connection: { status: 'connected', error: null, serverInstanceId: 'srv-paced' },
+        },
+      })
+
+      render(
+        <Provider store={store}>
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+        </Provider>,
+      )
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+      })
+      await waitFor(() => {
+        expect(terminalInstances.length).toBeGreaterThan(0)
+      })
+      await waitFor(() => {
+        expect(sentMessages().some((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)).toBe(true)
+      })
+
+      const term = terminalInstances[terminalInstances.length - 1]
+      return { store, tabId, paneId, terminalId, term }
+    }
+
+    function creditMessages() {
+      return sentMessages().filter((msg) => msg?.type === 'terminal.replay.credit')
+    }
+
+    function attachMessagesFor(terminalId: string) {
+      return sentMessages().filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+    }
+
+    function captureRaf() {
+      const callbacks: FrameRequestCallback[] = []
+      requestAnimationFrameSpy!.mockImplementation((cb) => {
+        callbacks.push(cb)
+        return callbacks.length
+      })
+      return () => {
+        while (callbacks.length > 0) {
+          callbacks.shift()!(0)
+        }
+      }
+    }
+
+    it('negotiated attaches send replayPageBytes and omit maxReplayBytes (fresh, refresh, and reconnect attaches)', async () => {
+      const { store, tabId, paneId, terminalId } = await setupPacedPane({ suffix: 'params' })
+
+      const mountAttach = attachMessagesFor(terminalId).at(-1)
+      expect(mountAttach).toMatchObject({ replayPageBytes: PACED_PAGE_BYTES })
+      expect(mountAttach).not.toHaveProperty('maxReplayBytes')
+
+      act(() => {
+        store.dispatch(requestPaneRefresh({ tabId, paneId }))
+      })
+      await waitFor(() => {
+        expect(attachMessagesFor(terminalId).length).toBeGreaterThan(1)
+      })
+      const refreshAttach = attachMessagesFor(terminalId).at(-1)
+      expect(refreshAttach).toMatchObject({ replayPageBytes: PACED_PAGE_BYTES, sinceSeq: 0 })
+      expect(refreshAttach).not.toHaveProperty('maxReplayBytes')
+
+      wsMocks.send.mockClear()
+      reconnectHandler?.()
+      await waitFor(() => {
+        expect(attachMessagesFor(terminalId).length).toBeGreaterThan(0)
+      })
+      const reconnectAttach = attachMessagesFor(terminalId).at(-1)
+      expect(reconnectAttach).toMatchObject({ replayPageBytes: PACED_PAGE_BYTES })
+      expect(reconnectAttach).not.toHaveProperty('maxReplayBytes')
+    })
+
+    it('negotiated opencode hydrates carry replayPageBytes too (the legacy opencode budget omission is paced-path moot)', async () => {
+      const { terminalId } = await setupPacedPane({
+        suffix: 'oc-params',
+        mode: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'ses-paced-oc' },
+      })
+
+      const mountAttach = attachMessagesFor(terminalId).at(-1)
+      expect(mountAttach).toMatchObject({ replayPageBytes: PACED_PAGE_BYTES })
+      expect(mountAttach).not.toHaveProperty('maxReplayBytes')
+    })
+
+    it('old server (no echo): attach payloads are byte-identical to today and no credit is ever sent', async () => {
+      const { terminalId, term } = await setupPacedPane({ suffix: 'legacy-shell', negotiated: false })
+
+      const mountAttach = attachMessagesFor(terminalId).at(-1)
+      expect(mountAttach).toMatchObject({ maxReplayBytes: PACED_PAGE_BYTES })
+      expect(mountAttach).not.toHaveProperty('replayPageBytes')
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 4,
+          replayFromSeq: 1,
+          replayToSeq: 4,
+        })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 2, data: 'AB' })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 3, seqEnd: 4, data: 'CD' })
+      })
+
+      expectTerminalWriteContaining(term, 'AB')
+      expectTerminalWriteContaining(term, 'CD')
+      expect(creditMessages()).toEqual([])
+    })
+
+    it('old server opencode hydrates keep the budgetless legacy shape', async () => {
+      const { terminalId } = await setupPacedPane({
+        suffix: 'legacy-oc',
+        negotiated: false,
+        mode: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'ses-paced-legacy-oc' },
+      })
+
+      const mountAttach = attachMessagesFor(terminalId).at(-1)
+      expect(mountAttach).not.toHaveProperty('maxReplayBytes')
+      expect(mountAttach).not.toHaveProperty('replayPageBytes')
+    })
+
+    it('falls back to legacy wire behavior after the capability echo disappears (negotiation lifecycle)', async () => {
+      const { store, tabId, paneId, terminalId } = await setupPacedPane({ suffix: 'lifecycle' })
+
+      act(() => {
+        store.dispatch(requestPaneRefresh({ tabId, paneId }))
+      })
+      await waitFor(() => {
+        expect(attachMessagesFor(terminalId).length).toBeGreaterThan(1)
+      })
+      expect(attachMessagesFor(terminalId).at(-1)).toMatchObject({ replayPageBytes: PACED_PAGE_BYTES })
+
+      // The capability is per-connection and resets on disconnect: the next
+      // ready arrives WITHOUT the echo (a downgraded server).
+      wsMocks.capabilities = {}
+      act(() => {
+        store.dispatch(requestPaneRefresh({ tabId, paneId }))
+      })
+      await waitFor(() => {
+        const latest = attachMessagesFor(terminalId).at(-1)
+        expect(latest).toMatchObject({ maxReplayBytes: PACED_PAGE_BYTES })
+      })
+      expect(attachMessagesFor(terminalId).at(-1)).not.toHaveProperty('replayPageBytes')
+    })
+
+    it('withheld write consumption sends no credit; release sends exactly one coalesced credit at the correct frontier', async () => {
+      const { terminalId, term } = await setupPacedPane({ suffix: 'withhold' })
+
+      const withheldWriteCallbacks: Array<() => void> = []
+      term.write.mockImplementation((_data: string, onWritten?: () => void) => {
+        if (onWritten) withheldWriteCallbacks.push(onWritten)
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 6,
+          replayFromSeq: 1,
+          replayToSeq: 6,
+        })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 3, data: 'abc' })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 4, seqEnd: 6, data: 'def' })
+      })
+
+      expect(creditMessages()).toEqual([])
+      expect(withheldWriteCallbacks.length).toBeGreaterThan(0)
+
+      act(() => {
+        while (withheldWriteCallbacks.length > 0) {
+          withheldWriteCallbacks.splice(0).forEach((cb) => cb())
+        }
+      })
+
+      const credits = creditMessages()
+      expect(credits).toHaveLength(1)
+      expect(credits[0]).toMatchObject({
+        type: 'terminal.replay.credit',
+        terminalId,
+        attachRequestId: latestAttachRequestIdForTerminal(terminalId),
+        streamId: expect.any(String),
+        consumedSeq: 6,
+      })
+    })
+
+    it('fully pre-filtered frames advance consumption without an xterm write and still credit', async () => {
+      const { terminalId, term } = await setupPacedPane({ suffix: 'filtered-only' })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 5,
+          replayFromSeq: 1,
+          replayToSeq: 5,
+        })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 5, data: OSC52_ONLY_FRAME })
+      })
+
+      expect(term.write).not.toHaveBeenCalled()
+
+      const credits = creditMessages()
+      expect(credits).toHaveLength(1)
+      expect(credits[0]).toMatchObject({
+        terminalId,
+        attachRequestId: latestAttachRequestIdForTerminal(terminalId),
+        consumedSeq: 5,
+      })
+    })
+
+    it('mixed page: filtered + applied frames coalesce into one credit at the page frontier with no duplicate output', async () => {
+      const { terminalId, term } = await setupPacedPane({ suffix: 'mixed' })
+      const pumpRaf = captureRaf()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 8,
+          replayFromSeq: 1,
+          replayToSeq: 8,
+        })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 4, data: OSC52_ONLY_FRAME })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 5, seqEnd: 8, data: 'hello' })
+      })
+      pumpRaf()
+
+      const writes = term.write.mock.calls.map(([data]: [string]) => String(data))
+      expect(writes).toEqual(['hello'])
+
+      const credits = creditMessages()
+      expect(credits).toHaveLength(1)
+      expect(credits[0]).toMatchObject({
+        terminalId,
+        attachRequestId: latestAttachRequestIdForTerminal(terminalId),
+        consumedSeq: 8,
+      })
+    })
+
+    it('negotiated retention gap renders the accessible notice, never the opencode replacement kill, and live output continues', async () => {
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
+      const { store, tabId, terminalId, term } = await setupPacedPane({
+        suffix: 'gap-notice',
+        mode: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'ses-paced-gap' },
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 100,
+          replayFromSeq: 1,
+          replayToSeq: 100,
+          requestedSinceSeq: 0,
+          effectiveSinceSeq: 0,
+          oldestRetainedSeq: 1,
+        })
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 1,
+          toSeq: 90,
+          reason: 'replay_window_exceeded',
+          headSeq: 100,
+          oldestRetainedSeq: 91,
+        })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 91, seqEnd: 95, data: 'LIVE TAIL' })
+      })
+
+      const notice = screen.getByTestId('restore-retention-loss-notice')
+      expect(notice).toHaveAttribute('role', 'status')
+      expect(notice).toHaveAttribute('aria-live', 'polite')
+      expect(notice.textContent).toContain('no longer available')
+
+      expect(sentMessages().some((msg) => msg?.type === 'terminal.kill')).toBe(false)
+      expectTerminalWriteContaining(term, 'LIVE TAIL')
+
+      const layout = store.getState().panes.layouts[tabId]
+      expect(layout?.type === 'leaf' && layout.content.kind === 'terminal' && layout.content.status).toBe('running')
+
+      const readyEvent = bridge.snapshot().perfEvents.find((event) => event.event === 'terminal.restore.paced_ready')
+      expect(readyEvent).toMatchObject({
+        terminalId,
+        requestedSinceSeq: 0,
+        effectiveSinceSeq: 0,
+        oldestRetainedSeq: 1,
+        headSeq: 100,
+      })
+      expect(readyEvent?.replayResetReason).toBeUndefined()
+
+      const gapEvent = bridge.snapshot().perfEvents.find((event) => event.event === 'terminal.restore.retention_gap')
+      expect(gapEvent).toMatchObject({
+        terminalId,
+        fromSeq: 1,
+        toSeq: 90,
+        headSeq: 100,
+        oldestRetainedSeq: 91,
+      })
+    })
+
+    it('negotiated retention gap without bounds fields records unknown bounds and keeps the pane live', async () => {
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
+      const { terminalId, term } = await setupPacedPane({ suffix: 'gap-unknown' })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 60,
+          replayFromSeq: 1,
+          replayToSeq: 60,
+        })
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 1,
+          toSeq: 50,
+          reason: 'replay_window_exceeded',
+        })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 51, seqEnd: 51, data: 'AFTER GAP' })
+      })
+
+      // Absence means UNKNOWN BOUNDS on a negotiated connection — never a
+      // silent fall back to non-paced handling.
+      expect(screen.getByTestId('restore-retention-loss-notice')).toBeTruthy()
+      expectTerminalWriteContaining(term, 'AFTER GAP')
+
+      const gapEvent = bridge.snapshot().perfEvents.find((event) => event.event === 'terminal.restore.retention_gap')
+      expect(gapEvent).toMatchObject({ terminalId, fromSeq: 1, toSeq: 50 })
+      expect(gapEvent?.headSeq).toBeNull()
+      expect(gapEvent?.oldestRetainedSeq).toBeNull()
+    })
+
+    it('an exit mid-replay withholds the credit for already-admitted writes; late arid frames neither crash, resurrect, nor credit', async () => {
+      const { store, tabId, terminalId, term } = await setupPacedPane({ suffix: 'late-exit' })
+
+      const withheldWriteCallbacks: Array<() => void> = []
+      term.write.mockImplementation((_data: string, onWritten?: () => void) => {
+        if (onWritten) withheldWriteCallbacks.push(onWritten)
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 6,
+          replayFromSeq: 1,
+          replayToSeq: 6,
+        })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 3, data: 'PRE' })
+        messageHandler!({ type: 'terminal.exit', terminalId, exitCode: 0 })
+      })
+      expect(withheldWriteCallbacks.length).toBeGreaterThan(0)
+      expect(creditMessages()).toEqual([])
+
+      // The already-admitted write completes AFTER the exit: its consumption
+      // may render, but the superseded generation never credits.
+      act(() => {
+        withheldWriteCallbacks.splice(0).forEach((cb) => cb())
+      })
+      expectTerminalWriteContaining(term, 'PRE')
+      expect(creditMessages()).toEqual([])
+
+      // A late arid-stamped replay frame after the exit is dropped by the
+      // existing exited-terminal handling — no crash, no resurrection, no
+      // credit.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 4,
+          seqEnd: 6,
+          data: 'LATE',
+          attachRequestId: latestAttachRequestIdForTerminal(terminalId),
+          streamId: latestStreamIdByTerminal.get(terminalId) ?? `test-stream:${terminalId}`,
+        })
+      })
+      expect(creditMessages()).toEqual([])
+      expect(terminalWriteStrings(term).some((entry) => entry.includes('LATE'))).toBe(false)
+
+      const layout = store.getState().panes.layouts[tabId]
+      expect(layout?.type === 'leaf' && layout.content.kind === 'terminal' && layout.content.status).toBe('exited')
+      expect(layout?.type === 'leaf' && layout.content.kind === 'terminal' && layout.content.terminalId).toBeUndefined()
+    })
+  })
+
   describe('snapshot replay sanitization', () => {
     function setupTerminal() {
       const tabId = 'tab-1'
@@ -10870,6 +11320,7 @@ describe('terminal.modes.sync (surface-reset mode preamble)', () => {
     latestAttachRequestIdByTerminal.clear()
     latestStreamIdByTerminal.clear()
     wsMocks.isReady = true
+    wsMocks.capabilities = {}
     wsMocks.send.mockClear()
     wsMocks.send.mockImplementation((msg: any) => {
       if (
@@ -11262,6 +11713,7 @@ describe('replay phantom focus report silencing (kata 9gy8)', () => {
     latestAttachRequestIdByTerminal.clear()
     latestStreamIdByTerminal.clear()
     wsMocks.isReady = true
+    wsMocks.capabilities = {}
     wsMocks.send.mockClear()
     wsMocks.send.mockImplementation((msg: any) => {
       if (

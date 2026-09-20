@@ -440,3 +440,97 @@ describe('onItemApplied marker hook', () => {
     expect(applied).toEqual([])
   })
 })
+
+describe('onDrain (paced-replay credit flush tick)', () => {
+  it('fires exactly once after a withheld write burst is released in order', () => {
+    const rafCallbacks: FrameRequestCallback[] = []
+    const pendingWritten: Array<() => void> = []
+    const drains: number[] = []
+    let nowMs = 0
+
+    const queue = createTerminalWriteQueue({
+      terminalInstanceId: 'surface-drain-burst',
+      write: (_chunk, onWritten) => {
+        if (onWritten) pendingWritten.push(onWritten)
+      },
+      onDrain: () => {
+        drains.push(nowMs)
+      },
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+      now: () => nowMs,
+    })
+
+    queue.setActiveGeneration('attach-paced')
+    queue.enqueue('one', undefined, { mode: 'replay', generation: 'attach-paced', coalesce: false })
+    queue.enqueue('two', undefined, { mode: 'replay', generation: 'attach-paced', coalesce: false })
+    queue.enqueue('three', undefined, { mode: 'replay', generation: 'attach-paced', coalesce: false })
+
+    rafCallbacks.shift()?.(0)
+    expect(pendingWritten).toHaveLength(1)
+    expect(drains).toEqual([])
+
+    // Release in order: each completion schedules the next submit; only the
+    // LAST completion finds the queue empty and fires the drain.
+    nowMs += 1
+    pendingWritten.shift()?.()
+    rafCallbacks.shift()?.(0)
+    nowMs += 1
+    pendingWritten.shift()?.()
+    rafCallbacks.shift()?.(0)
+    nowMs += 1
+    pendingWritten.shift()?.()
+
+    expect(pendingWritten).toEqual([])
+    expect(drains).toEqual([3])
+  })
+
+  it('drains a task enqueued while writes are withheld in the same single drain', () => {
+    const rafCallbacks: FrameRequestCallback[] = []
+    const pendingWritten: Array<() => void> = []
+    const tasks: string[] = []
+    const drains: number[] = []
+    let nowMs = 0
+
+    const queue = createTerminalWriteQueue({
+      terminalInstanceId: 'surface-drain-task-ride',
+      write: (_chunk, onWritten) => {
+        if (onWritten) pendingWritten.push(onWritten)
+      },
+      onDrain: () => {
+        drains.push(nowMs)
+      },
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+      now: () => nowMs,
+    })
+
+    queue.setActiveGeneration('attach-paced')
+    queue.enqueue('one', undefined, { mode: 'replay', generation: 'attach-paced', coalesce: false })
+    rafCallbacks.shift()?.(0)
+    // A frontier flush task rides behind the withheld write.
+    queue.enqueueTask(() => tasks.push('flush'), { mode: 'replay', generation: 'attach-paced' })
+    // ...and a second page's write behind that.
+    queue.enqueue('two', undefined, { mode: 'replay', generation: 'attach-paced', coalesce: false })
+
+    expect(drains).toEqual([])
+    expect(tasks).toEqual([])
+
+    nowMs += 1
+    pendingWritten.shift()?.()
+    // The completion submits the task and the next write in one flush.
+    rafCallbacks.shift()?.(0)
+    expect(tasks).toEqual(['flush'])
+    nowMs += 1
+    pendingWritten.shift()?.()
+
+    expect(pendingWritten).toEqual([])
+    expect(drains).toEqual([2])
+  })
+})
