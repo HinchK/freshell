@@ -7,6 +7,21 @@ export type TerminalSurfaceCheckpoint = {
   serverInstanceId: string
   serverBootId?: string
   surfaceEpoch: number
+  /**
+   * Per-surface-instance discriminator (responsive-terminal-restore WS2,
+   * reload contract): the id of the exact xterm surface instance that
+   * rendered this checkpoint (mount-stable AND recreation-stable — a
+   * remount or an in-mount renderer recreation mints a fresh instance id).
+   * A same-pane REMOUNT re-enters with the same store key and a colliding
+   * surface epoch (both mounts restart the epoch at 0), so the epoch alone
+   * cannot tell the mounts apart; the instance id does. Validated on load
+   * and merge-gated on save so a stale previous-mount entry can neither be
+   * resumed past the new surface's rendered position nor poison the new
+   * mount's saves. Absent on legacy entries persisted before the field
+   * existed (an id-carrying caller rejects those — one honest full hydrate
+   * after upgrade, then saves carry ids).
+   */
+  surfaceInstanceId?: string
   attachRequestId: string
   parserAppliedSeq: number
   /**
@@ -36,6 +51,9 @@ export type CheckpointDeltaReplayInput = {
   serverInstanceId: string
   serverBootId?: string
   surfaceEpoch: number
+  /** The CURRENT surface instance's id — must match the checkpoint's (see
+   * TerminalSurfaceCheckpoint.surfaceInstanceId). */
+  surfaceInstanceId?: string
   cols: number
   rows: number
   geometryEpoch: number
@@ -93,12 +111,15 @@ function normalizeCheckpoint(input: TerminalSurfaceCheckpoint): TerminalSurfaceC
     surfaceEpoch: normalizeNonNegativeInteger(input.surfaceEpoch),
     parserAppliedSeq,
     // Coverage is normalized against the applied position: absent → the
-    // applied position (legacy resume behavior); present → clamped to ≥ 0.
-    // It is intentionally NOT clamped down to parserAppliedSeq — the coverage
-    // cursor legitimately runs AHEAD of applied past null-screen-effect
-    // filtered ranges.
+    // applied position (legacy resume behavior); present → clamped to ≥ 0
+    // and UP to the applied position (N-1) — an honest shape always has
+    // coverage ≥ applied (applied bytes are rendered bytes), so the clamp
+    // only heals a storage-corrupted entry and never moves a real cursor.
+    // It is intentionally NOT clamped down to parserAppliedSeq — the
+    // coverage cursor legitimately runs AHEAD of applied past
+    // null-screen-effect filtered ranges.
     surfaceCoverageSeq: typeof surfaceCoverageSeq === 'number' && Number.isFinite(surfaceCoverageSeq)
-      ? Math.max(0, Math.floor(surfaceCoverageSeq))
+      ? Math.max(parserAppliedSeq, Math.floor(surfaceCoverageSeq))
       : parserAppliedSeq,
     cols: normalizeNonNegativeInteger(input.cols),
     rows: normalizeNonNegativeInteger(input.rows),
@@ -152,6 +173,13 @@ export function canUseCheckpointForDeltaReplay(
     return { ok: false, reason: 'server_changed' }
   }
   if (saved.surfaceEpoch !== current.surfaceEpoch) {
+    return { ok: false, reason: 'surface_changed' }
+  }
+  // Surface-instance discriminator (WS2 reload contract): a checkpoint from
+  // a different surface instance (page reload / pane remount / renderer
+  // recreation) never resumes onto this surface — its claimed progress
+  // describes bytes this surface never rendered.
+  if ((saved.surfaceInstanceId ?? null) !== (current.surfaceInstanceId ?? null)) {
     return { ok: false, reason: 'surface_changed' }
   }
   if (

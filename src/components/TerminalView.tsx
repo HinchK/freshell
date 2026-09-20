@@ -521,6 +521,14 @@ type AttachTerminalOptions = {
   replayPageBytes?: number
   priority?: TerminalAttachPriority
   sinceSeq?: number
+  /**
+   * Internal recovery-accounting hint (never on the wire): the reconcile
+   * episode this attach belongs to (M-1). Every attach of ONE episode
+   * collapses into a single counted recovery attempt — the episode's
+   * deliberate re-attaches (pending-mark re-fire, verdict-fold re-fire)
+   * are pane lifecycle, not recovery cycling.
+   */
+  recoveryAttemptKey?: string
 }
 
 type SentViewport = {
@@ -652,6 +660,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   )
   const reconcilePendingSinceRef = useRef<number | undefined>(reconcilePendingSince)
   reconcilePendingSinceRef.current = reconcilePendingSince
+  // Reconcile-episode anchor for the recovery accounting (M-1): the last
+  // reconcile-pending/reconcile-epoch pair this attach effect consumed. A
+  // change in either re-fires the effect for a RECONCILE-DRIVEN attach
+  // (the pending mark or the verdict fold) — deliberate pane lifecycle,
+  // not recovery cycling. The derived per-episode key collapses every
+  // attach of ONE reconcile episode into a single counted attempt.
+  const reconcileDriveStateRef = useRef<{ pendingSince: number | undefined; epoch: number } | null>(null)
   // Branch-5 / reconcile-verdict interaction (design invariant 7): a pane
   // listed in the dead-session adjudication panel is owned by the user's
   // explicit panel decision -- the INVALID_TERMINAL_ID auto-recovery must
@@ -1114,6 +1129,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       streamId: getTerminalCheckpointStreamId(),
       serverInstanceId,
       surfaceEpoch: surfaceEpochRef.current,
+      // Surface-instance discriminator (WS2 reload contract): the id of the
+      // exact xterm surface instance this component currently renders on —
+      // mount-stable AND renderer-recreation-stable. Checkpoint loads
+      // validate it and saves carry it, so a remounted pane (same store
+      // key, colliding epoch) can never resume the previous mount's cursor
+      // past the new surface's rendered position.
+      surfaceInstanceId: terminalInstanceIdRef.current,
       cols: normalizeDimension(dimensions?.cols, term?.cols ?? 80),
       rows: normalizeDimension(dimensions?.rows, term?.rows ?? 24),
       geometryEpoch: geometryEpochRef.current,
@@ -1138,6 +1160,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     const checkpoint = loadTerminalSurfaceCheckpoint(terminalId, {
       streamId: checkpointInput.streamId,
       serverInstanceId: checkpointInput.serverInstanceId,
+      surfaceInstanceId: checkpointInput.surfaceInstanceId,
     }, { paneId: paneIdRef.current })
     return canUseCheckpointForDeltaReplay(checkpoint, checkpointInput)
   }, [buildCheckpointReplayInput])
@@ -1290,31 +1313,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         return
       }
       if (!pending.queue.hasInFlightWrites()) {
-        // The frozen window closed with the queue drained: NOW decide
-        // checkpoint usability (WS2 — never decide while an earlier write
-        // can still mutate the surface). The quarantined attach deferred the
-        // applied-surface reset, so the pre-quarantine checkpoint survives
-        // when nothing was applied during the window — resume the remainder
-        // from it; any mutation (completedWrites > 0) leaves the checkpoint
-        // under-describing the surface, so rebuild from a full hydrate.
-        const surfaceMutatedDuringQuarantine = pending.completedWrites > 0
-        const checkpointDecision = surfaceMutatedDuringQuarantine
-          ? { ok: false as const, reason: 'missing_checkpoint' as const }
-          : getCheckpointDeltaReplayDecision(terminalId)
+        // The frozen window closed with the queue drained: NOW repair
+        // (WS2 — never decide while an earlier write can still mutate the
+        // surface). The quarantined attach deferred the applied-surface
+        // reset, so the repair ALWAYS rebuilds from a full hydrate: a
+        // quarantine arms only while a write is in flight, that write's
+        // completion always lands in the completedWrites ledger (the write
+        // wrapper reports every completion, including a disposed-surface
+        // throw), and the drain only happens after in-flight writes
+        // complete — so the window provably mutated the surface and the
+        // pre-quarantine checkpoint under-describes it. The former
+        // completedWrites === 0 resume branch was unreachable in
+        // production shapes and was removed (M-2); the ledger stays in the
+        // audit event as the honest evidence.
         clearQuarantineRepair(attachRequestId)
         recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantine_repair', {
           terminalId,
           attachRequestId,
-          resumable: checkpointDecision.ok,
+          resumable: false,
           completedWritesDuringQuarantine: pending.completedWrites,
         })
-        if (checkpointDecision.ok) {
-          attachTerminalRef.current?.(terminalId, 'transport_reconnect', {
-            sinceSeq: checkpointDecision.sinceSeq,
-            priority: 'foreground',
-          })
-          return
-        }
         attachTerminalRef.current?.(terminalId, 'viewport_hydrate', {
           clearViewportFirst: true,
           ...viewportHydrateReplayOptions(contentRef.current, isPacedReplayNegotiated()),
@@ -1350,7 +1368,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       completedWrites: 0,
       timer: setTimeout(poll, QUARANTINE_REPAIR_POLL_MS),
     }
-  }, [clearQuarantineRepair, getCheckpointDeltaReplayDecision, isPacedReplayNegotiated, recordTerminalPerfAuditEvent])
+  }, [clearQuarantineRepair, isPacedReplayNegotiated, recordTerminalPerfAuditEvent])
 
   // Persist the current surface checkpoint (applied + coverage) for the given
   // attach context. Shared by the applied-frame save path and the
@@ -1383,6 +1401,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       streamId: checkpointInput.streamId,
       serverInstanceId: checkpointInput.serverInstanceId,
       surfaceEpoch: checkpointInput.surfaceEpoch,
+      surfaceInstanceId: checkpointInput.surfaceInstanceId,
       attachRequestId: attach.requestId,
       parserAppliedSeq,
       surfaceCoverageSeq: surfaceCoverageSeqRef.current,
@@ -3269,6 +3288,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     const recoveryDecision = beginRecoveryAttempt(recoveryAccountingRef.current, {
       coverageSeq: surfaceCoverageSeqRef.current,
       now: Date.now(),
+      attemptKey: opts?.recoveryAttemptKey,
     })
     recoveryAccountingRef.current = recoveryDecision.state
     if (!recoveryDecision.allowed) {
@@ -3910,6 +3930,37 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     async function ensure() {
       clearRateLimitRetry()
       // Connection is owned by App.tsx; messages will queue until ready
+
+      // Reconcile-episode key derivation (M-1), BEFORE any early return so
+      // the anchor updates on EVERY effect run: an attach fired because the
+      // pending window OPENED, because the verdict FOLDED (pending cleared +
+      // epoch bumped), or because a fold landed without a pending window,
+      // carries the episode's key into the recovery gate. Keyless runs
+      // (mount, transport reconnects, other dep changes) count normally.
+      const reconcileEpoch = terminalContent?.reconcileEpoch ?? 0
+      const previousReconcileDrive = reconcileDriveStateRef.current
+      let reconcileAttemptKey: string | undefined
+      if (previousReconcileDrive) {
+        if (reconcilePendingSince !== undefined && reconcilePendingSince !== previousReconcileDrive.pendingSince) {
+          // A new reconcile pending window opened (setReconcilePendingPanes)
+          // — the episode key is the window's startedAt.
+          reconcileAttemptKey = `pending:${reconcilePendingSince}`
+        } else if (
+          reconcilePendingSince === undefined
+          && previousReconcileDrive.pendingSince !== undefined
+          && reconcileEpoch !== previousReconcileDrive.epoch
+        ) {
+          // The verdict fold (applyReconcileAttach): pending cleared + epoch
+          // bumped — the SAME episode's closing attach.
+          reconcileAttemptKey = `pending:${previousReconcileDrive.pendingSince}`
+        } else if (reconcileEpoch !== previousReconcileDrive.epoch) {
+          // A fold without a pending window (the exhaustion reconcile, the
+          // D7 revival / restore-offer fold): each fold is its own
+          // one-count episode.
+          reconcileAttemptKey = `epoch:${reconcileEpoch}`
+        }
+      }
+      reconcileDriveStateRef.current = { pendingSince: reconcilePendingSince, epoch: reconcileEpoch }
 
       const failLaunch = (message: string, restore: boolean, terminalId?: string) => {
         clearRateLimitRetry()
@@ -6012,9 +6063,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           const intent: AttachIntent = deferredAttachStateRef.current.mode === 'live'
             ? 'keepalive_delta'
             : 'viewport_hydrate'
-          attachTerminal(currentTerminalId, intent, intent === 'viewport_hydrate'
-            ? viewportHydrateReplayOptions(contentRef.current, isPacedReplayNegotiated())
-            : undefined)
+          attachTerminal(currentTerminalId, intent, {
+            ...(intent === 'viewport_hydrate'
+              ? viewportHydrateReplayOptions(contentRef.current, isPacedReplayNegotiated())
+              : undefined),
+            ...(reconcileAttemptKey !== undefined ? { recoveryAttemptKey: reconcileAttemptKey } : {}),
+          })
           // One-shot reconcile notice (attach/corrected/duplicate verdicts):
           // render it on the attach that the verdict fold re-fired, then
           // clear it from the store.

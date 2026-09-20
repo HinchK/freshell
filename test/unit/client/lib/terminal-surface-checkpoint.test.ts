@@ -282,6 +282,38 @@ describe('terminal surface checkpoint', () => {
       expect(canUseCheckpointForDeltaReplay(checkpoint, baseReplayInput()))
         .toMatchObject({ ok: false, reason: 'no_applied_sequence' })
     })
+
+    it('accepts a checkpoint from the same surface instance and resumes from its coverage', () => {
+      const checkpoint = baseCheckpoint({
+        parserAppliedSeq: 5,
+        surfaceCoverageSeq: 12,
+        surfaceInstanceId: 'surface-a',
+      })
+
+      expect(canUseCheckpointForDeltaReplay(checkpoint, baseReplayInput({ surfaceInstanceId: 'surface-a' })))
+        .toMatchObject({ ok: true, sinceSeq: 12 })
+    })
+
+    it('rejects a checkpoint saved by a DIFFERENT surface instance (remount/reload reuse)', () => {
+      const checkpoint = baseCheckpoint({ surfaceInstanceId: 'surface-previous-mount' })
+
+      expect(canUseCheckpointForDeltaReplay(checkpoint, baseReplayInput({ surfaceInstanceId: 'surface-new-mount' })))
+        .toMatchObject({ ok: false, reason: 'surface_changed' })
+    })
+
+    it('clamps a storage-corrupted coverage below the applied position up to applied (N-1)', () => {
+      // A well-formed but storage-corrupted entry with coverage < applied
+      // must normalize its coverage UP to the applied position: resuming
+      // from below applied would re-deliver bytes the surface already
+      // rendered (duplicate content). In-memory invariants keep coverage
+      // >= applied in every honest shape, so the clamp only heals the
+      // corrupted one.
+      const checkpoint = baseCheckpoint({ parserAppliedSeq: 42, surfaceCoverageSeq: 7 })
+
+      expect(checkpoint.surfaceCoverageSeq).toBe(42)
+      expect(canUseCheckpointForDeltaReplay(checkpoint, baseReplayInput()))
+        .toMatchObject({ ok: true, sinceSeq: 42 })
+    })
   })
 
   describe('identity/geometry rejection battery (each field change rejects)', () => {
@@ -292,6 +324,7 @@ describe('terminal surface checkpoint', () => {
       ['server_changed', { serverInstanceId: 'server-b' }],
       ['server_changed', { serverBootId: 'boot-a' }],
       ['surface_changed', { surfaceEpoch: 3 }],
+      ['surface_changed', { surfaceInstanceId: 'surface-other' }],
       ['geometry_changed', { cols: 100 }],
       ['geometry_changed', { rows: 30 }],
       ['geometry_changed', { geometryEpoch: 4 }],

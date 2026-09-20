@@ -20,6 +20,14 @@ export type TerminalSurfaceCheckpointIdentity = {
   streamId: string | null
   serverInstanceId: string
   serverBootId?: string
+  /**
+   * The CURRENT surface instance's id (see
+   * TerminalSurfaceCheckpoint.surfaceInstanceId). When present, a stored
+   * entry must carry the exact same id to load — a remounted surface (same
+   * pane, same store key, colliding epoch) can never adopt the previous
+   * mount's cursor.
+   */
+  surfaceInstanceId?: string
 }
 
 /**
@@ -102,6 +110,9 @@ function sanitizeCheckpoint(
     serverInstanceId: candidate.serverInstanceId,
     serverBootId: optionalString(candidate.serverBootId),
     surfaceEpoch: normalizeSeq(candidate.surfaceEpoch),
+    ...(optionalString(candidate.surfaceInstanceId) !== undefined
+      ? { surfaceInstanceId: candidate.surfaceInstanceId as string }
+      : {}),
     attachRequestId: candidate.attachRequestId,
     parserAppliedSeq: normalizeSeq(candidate.parserAppliedSeq),
     ...(typeof candidate.surfaceCoverageSeq === 'number'
@@ -250,7 +261,14 @@ function sameCheckpointSurface(
   a: TerminalSurfaceCheckpoint,
   b: TerminalSurfaceCheckpoint,
 ): boolean {
-  return a.terminalId === b.terminalId
+  // Surface-instance merge gate (WS2 reload contract): keep-highest merging
+  // is only valid WITHIN one surface instance. A save from a different
+  // instance (a remount's honest lower-position save vs the previous
+  // mount's stale higher-coverage entry) is a DIFFERENT surface — it
+  // replaces the entry instead of merging, or the store would claim
+  // progress the new surface never rendered.
+  return (a.surfaceInstanceId ?? null) === (b.surfaceInstanceId ?? null)
+    && a.terminalId === b.terminalId
     && a.streamId === b.streamId
     && a.serverInstanceId === b.serverInstanceId
     && a.serverBootId === b.serverBootId
@@ -319,10 +337,11 @@ function saveCheckpointEntry(
   schedulePersist()
 }
 
-export function loadTerminalSurfaceCheckpoint(
+function loadCheckpointEntry(
   terminalId: string,
   identity: TerminalSurfaceCheckpointIdentity,
-  scope?: TerminalSurfaceScope,
+  scope: TerminalSurfaceScope | undefined,
+  options: { requireSurfaceInstanceMatch: boolean },
 ): TerminalSurfaceCheckpoint | null {
   if (!terminalId) return null
   const entry = ensureLoaded()[surfaceStoreKey(scope, terminalId)]
@@ -333,8 +352,40 @@ export function loadTerminalSurfaceCheckpoint(
   if (checkpoint.streamId !== (identity.streamId ?? null)) return null
   if (checkpoint.serverInstanceId !== identity.serverInstanceId) return null
   if ((checkpoint.serverBootId ?? null) !== (identity.serverBootId ?? null)) return null
+  if (options.requireSurfaceInstanceMatch) {
+    // Surface-instance validation (WS2 reload contract): the entry must
+    // have been rendered by THIS surface instance. A remount re-enters
+    // with the same store key and a colliding epoch — only the instance id
+    // separates the mounts, so a mismatch (including an id-less legacy
+    // entry vs an id-carrying caller) never loads.
+    if ((checkpoint.surfaceInstanceId ?? null) !== (identity.surfaceInstanceId ?? null)) return null
+  }
 
   return { ...checkpoint }
+}
+
+export function loadTerminalSurfaceCheckpoint(
+  terminalId: string,
+  identity: TerminalSurfaceCheckpointIdentity,
+  scope?: TerminalSurfaceScope,
+): TerminalSurfaceCheckpoint | null {
+  return loadCheckpointEntry(terminalId, identity, scope, { requireSurfaceInstanceMatch: true })
+}
+
+/**
+ * TEST-ONLY store inspection: the legacy load semantics (terminal/stream/
+ * server identity validation on the scoped key) WITHOUT the
+ * surface-instance discriminator — component tests assert what the pane
+ * SAVED and cannot know the mount's internal instance id. Production
+ * resumes always go through loadTerminalSurfaceCheckpoint +
+ * canUseCheckpointForDeltaReplay, both of which validate the instance id.
+ */
+export function __readTerminalSurfaceCheckpointForTests(
+  terminalId: string,
+  identity: TerminalSurfaceCheckpointIdentity,
+  scope?: TerminalSurfaceScope,
+): TerminalSurfaceCheckpoint | null {
+  return loadCheckpointEntry(terminalId, identity, scope, { requireSurfaceInstanceMatch: false })
 }
 
 export function saveTerminalSurfaceCheckpoint(

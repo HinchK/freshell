@@ -17,10 +17,11 @@ import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { useAppSelector } from '@/store/hooks'
 import type { PaneNode, TerminalPaneContent } from '@/store/paneTypes'
 import {
+  __readTerminalSurfaceCheckpointForTests,
   __resetTerminalCursorCacheForTests,
-  loadTerminalSurfaceCheckpoint,
   saveTerminalSurfaceCheckpoint,
 } from '@/lib/terminal-cursor'
+import { TERMINAL_RECOVERY_NO_PROGRESS_DEADLINE_MS } from '@/lib/terminal-recovery-accounting'
 import { getHydrationQueue, resetHydrationQueueForTests } from '@/lib/hydration-queue'
 import { getTerminalActions } from '@/lib/pane-action-registry'
 import { createPerfAuditBridge, installPerfAuditBridge } from '@/lib/perf-audit-bridge'
@@ -6035,11 +6036,11 @@ describe('TerminalView lifecycle updates', () => {
       expect(layout.type).toBe('leaf')
       expect(layout.content.kind).toBe('terminal')
       expect(layout.content.streamId).toBe('stream-from-ready')
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'stream-from-ready',
         serverInstanceId: 'server-attach-stream',
       }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(1)
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: null,
         serverInstanceId: 'server-attach-stream',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -6079,7 +6080,7 @@ describe('TerminalView lifecycle updates', () => {
         })
       })
 
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'stream-before-change',
         serverInstanceId: 'server-active-stream-change',
       }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(1)
@@ -6111,11 +6112,11 @@ describe('TerminalView lifecycle updates', () => {
       expect(layout.type).toBe('leaf')
       expect(layout.content.kind).toBe('terminal')
       expect(layout.content.streamId).toBe('stream-after-change')
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'stream-before-change',
         serverInstanceId: 'server-active-stream-change',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'stream-after-change',
         serverInstanceId: 'server-active-stream-change',
       }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(2)
@@ -6202,7 +6203,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(writes).not.toContain('STALE REPLAY SHOULD NOT RENDER')
       expect(writes).toContain('LIVE AFTER STREAM CHANGE')
       expect(queryByText('Recovering terminal output...')).toBeNull()
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'stream-after-change',
         serverInstanceId: 'server-stale-replay-stream-change',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -6244,7 +6245,7 @@ describe('TerminalView lifecycle updates', () => {
         })
       })
 
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'stream-before-rotation',
         serverInstanceId: 'server-stream-rotation',
       }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(1)
@@ -6287,7 +6288,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(layout.content.kind).toBe('terminal')
       expect(layout.content.streamId).toBeUndefined()
       expect(terminalWriteStrings(term).join('')).not.toContain('STREAM B SHOULD NOT RENDER')
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'stream-after-rotation',
         serverInstanceId: 'server-stream-rotation',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -6358,7 +6359,7 @@ describe('TerminalView lifecycle updates', () => {
         })
       })
 
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'stream-geometry',
         serverInstanceId: 'server-geometry-authority',
       }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(1)
@@ -6476,7 +6477,7 @@ describe('TerminalView lifecycle updates', () => {
       const writes = term.write.mock.calls.map(([data]) => String(data)).join('')
       expect(writes).not.toContain('STALE STREAM')
       expect(writes).toContain('ACTIVE STREAM')
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'stream-active',
         serverInstanceId: 'server-stream-mismatch',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -6719,7 +6720,7 @@ describe('TerminalView lifecycle updates', () => {
         })
       })
       expect(terminalWriteStrings(term)).toContain('accepted-after-hole')
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-hole',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -6790,7 +6791,7 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       expect(term.write).not.toHaveBeenCalled()
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-malformed-numbers',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -6807,7 +6808,7 @@ describe('TerminalView lifecycle updates', () => {
         })
       })
       expect(terminalWriteStrings(term)).toContain('accepted-after-malformed-batch')
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-malformed-numbers',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -6854,7 +6855,7 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       expect(term.write).not.toHaveBeenCalled()
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-surrogate-split',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -6932,7 +6933,7 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       expect(terminalWriteStrings(term)).toEqual(['c'])
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-invalid-fail-closed',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -6982,7 +6983,7 @@ describe('TerminalView lifecycle updates', () => {
         })
       })
 
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-invalid-overlap-tail',
       }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(10)
@@ -7017,7 +7018,7 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       expect(terminalWriteStrings(term)).toEqual(['l'])
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-invalid-overlap-tail',
       }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(10)
@@ -7077,7 +7078,7 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       expect(delayedCallbacks).toEqual([])
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-barrier-coalesced',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -7087,7 +7088,7 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       expect(delayedCallbacks.map(({ data }) => data)).toEqual(['aBc'])
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-barrier-coalesced',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -7096,7 +7097,7 @@ describe('TerminalView lifecycle updates', () => {
         delayedCallbacks[0]?.callback()
       })
 
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-barrier-coalesced',
       }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(3)
@@ -7147,7 +7148,7 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       expect(delayedCallbacks).toEqual([])
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-stripped-middle-coalesced',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -7157,7 +7158,7 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       expect(delayedCallbacks.map(({ data }) => data)).toEqual(['AB'])
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-stripped-middle-coalesced',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -7166,7 +7167,7 @@ describe('TerminalView lifecycle updates', () => {
         delayedCallbacks[0]?.callback()
       })
 
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-stripped-middle-coalesced',
       }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(1)
@@ -7258,7 +7259,7 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       expect(term.write).not.toHaveBeenCalled()
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-opencode-heavy-replay',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -7270,7 +7271,7 @@ describe('TerminalView lifecycle updates', () => {
       const submittedReplay = delayedCallbacks.map(({ data: chunk }) => chunk).join('')
       expect(submittedReplay).toBe(data)
       expect(delayedCallbacks.length).toBeLessThanOrEqual(2)
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-opencode-heavy-replay',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -7283,7 +7284,7 @@ describe('TerminalView lifecycle updates', () => {
       await waitFor(() => {
         expect(queryByText('Recovering terminal output...')).toBeNull()
       })
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-opencode-heavy-replay',
       }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(chunks.length)
@@ -7324,7 +7325,7 @@ describe('TerminalView lifecycle updates', () => {
       // The strict APPLIED position never crosses the stripped BEL segment;
       // the COVERAGE cursor does (a null-screen-effect completion signal) and
       // is the resume position (responsive-terminal-restore WS2).
-      const strippedBelCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
+      const strippedBelCheckpoint = __readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-stripped-bel',
       }, { paneId: 'pane-v2-stream' })
@@ -7399,7 +7400,7 @@ describe('TerminalView lifecycle updates', () => {
       // No false APPLIED record (nothing rendered), but the completion
       // signal IS consumed coverage: the resume position is 1, not a
       // full-baseline rebuild (responsive-terminal-restore WS2).
-      const belOnlyCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
+      const belOnlyCheckpoint = __readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-replay-stripped-complete',
       }, { paneId: 'pane-v2-stream' })
@@ -7475,7 +7476,7 @@ describe('TerminalView lifecycle updates', () => {
 
       expect(delayedCallbacks.map(({ data }) => data)).toEqual(['A'])
       expect(queryByText('Recovering terminal output...')).not.toBeNull()
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-replay-stripped-tail',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -7487,7 +7488,7 @@ describe('TerminalView lifecycle updates', () => {
       await waitFor(() => {
         expect(queryByText('Recovering terminal output...')).toBeNull()
       })
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-replay-stripped-tail',
       }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(1)
@@ -7535,7 +7536,7 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       expect(terminalWriteStrings(term)).toEqual(['A'])
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-mixed-stripped-bel',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -7589,7 +7590,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(terminalWriteStrings(term)).toEqual(['B'])
       // No false APPLIED record (the BEL blocks the strict cursor at zero);
       // the coverage cursor spans the filtered BEL and the applied tail.
-      const legacyStrippedCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
+      const legacyStrippedCheckpoint = __readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-legacy-stripped-bel',
       }, { paneId: 'pane-v2-stream' })
@@ -7656,7 +7657,7 @@ describe('TerminalView lifecycle updates', () => {
       await waitFor(() => {
         expect(queryByText('Recovering terminal output...')).toBeNull()
       })
-      const legacyBelOnlyCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
+      const legacyBelOnlyCheckpoint = __readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-legacy-replay-stripped-complete',
       }, { paneId: 'pane-v2-stream' })
@@ -7735,7 +7736,7 @@ describe('TerminalView lifecycle updates', () => {
 
       expect(delayedCallbacks.map(({ data }) => data)).toEqual(['A'])
       expect(queryByText('Recovering terminal output...')).not.toBeNull()
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-legacy-replay-stripped-tail',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -7747,7 +7748,7 @@ describe('TerminalView lifecycle updates', () => {
       await waitFor(() => {
         expect(queryByText('Recovering terminal output...')).toBeNull()
       })
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-legacy-replay-stripped-tail',
       }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(1)
@@ -7790,7 +7791,7 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       expect(terminalWriteStrings(term)).toEqual(['A'])
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId,
         serverInstanceId: 'server-output-legacy-mixed-stripped-bel',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -7853,7 +7854,7 @@ describe('TerminalView lifecycle updates', () => {
       const writes = term.write.mock.calls.map(([data]) => String(data)).join('')
       expect(writes).not.toContain('MISSING STREAM')
       expect(writes).toContain('ACTIVE AFTER MISSING')
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'stream-active',
         serverInstanceId: 'server-missing-output-stream',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -7918,7 +7919,7 @@ describe('TerminalView lifecycle updates', () => {
       const writes = term.write.mock.calls.map(([data]) => String(data)).join('')
       expect(writes).not.toContain('Output gap 1-5')
       expect(writes).toContain('ACTIVE AFTER MISSING GAP')
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'stream-active',
         serverInstanceId: 'server-missing-gap-stream',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -8016,11 +8017,11 @@ describe('TerminalView lifecycle updates', () => {
       const writes = terminalWriteStrings(term).join('')
       expect(writes).not.toContain('UNTAGGED AFTER BAD READY')
       expect(writes).not.toContain('Output gap 2-3')
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'stored-stale-stream',
         serverInstanceId: 'server-missing-ready-stream',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: null,
         serverInstanceId: 'server-missing-ready-stream',
       }, { paneId: 'pane-v2-stream' })).toBeNull()
@@ -8058,7 +8059,7 @@ describe('TerminalView lifecycle updates', () => {
         bufferType: 'unknown',
         parserIdle: true,
       }, { paneId: 'pane-v2-stream' })
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      expect(__readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: null,
         serverInstanceId,
       }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(17)
@@ -8220,7 +8221,7 @@ describe('TerminalView lifecycle updates', () => {
         })
       })
 
-      const initialCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
+      const initialCheckpoint = __readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'stream-1',
         serverInstanceId: 'server-a',
       }, { paneId: 'pane-v2-stream' })
@@ -8292,7 +8293,7 @@ describe('TerminalView lifecycle updates', () => {
         'current replay text',
       ])
 
-      const checkpointAfterStaleCallback = loadTerminalSurfaceCheckpoint(terminalId, {
+      const checkpointAfterStaleCallback = __readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'stream-1',
         serverInstanceId: 'server-a',
       }, { paneId: 'pane-v2-stream' })
@@ -8322,7 +8323,7 @@ describe('TerminalView lifecycle updates', () => {
       })
       expect(term.clear).toHaveBeenCalledTimes(1)
 
-      const checkpointAfterCurrentCallback = loadTerminalSurfaceCheckpoint(terminalId, {
+      const checkpointAfterCurrentCallback = __readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'stream-1',
         serverInstanceId: 'server-a',
       }, { paneId: 'pane-v2-stream' })
@@ -8357,7 +8358,7 @@ describe('TerminalView lifecycle updates', () => {
         })
       })
 
-      const initialCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
+      const initialCheckpoint = __readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'stream-delta',
         serverInstanceId: 'server-a',
       }, { paneId: 'pane-v2-stream' })
@@ -8475,7 +8476,7 @@ describe('TerminalView lifecycle updates', () => {
       })
       expect(term.clear).toHaveBeenCalledTimes(1)
 
-      const checkpointAfterCallbacks = loadTerminalSurfaceCheckpoint(terminalId, {
+      const checkpointAfterCallbacks = __readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'stream-delta',
         serverInstanceId: 'server-a',
       }, { paneId: 'pane-v2-stream' })
@@ -8747,7 +8748,7 @@ describe('TerminalView lifecycle updates', () => {
         })
       })
 
-      const trustedCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
+      const trustedCheckpoint = __readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'stream-in-flight',
         serverInstanceId: 'server-a',
       }, { paneId: 'pane-v2-stream' })
@@ -10483,7 +10484,7 @@ describe('TerminalView lifecycle updates', () => {
         )
       })
 
-      const checkpointAfterReplay = loadTerminalSurfaceCheckpoint(terminalId, {
+      const checkpointAfterReplay = __readTerminalSurfaceCheckpointForTests(terminalId, {
         streamId: 'stream-local-notice',
         serverInstanceId: 'server-local-notice',
       }, { paneId: 'pane-v2-stream' })
@@ -10814,7 +10815,7 @@ describe('TerminalView lifecycle updates', () => {
 
         // The checkpoint reflects only the new generation's applied frames —
         // the dropped OLD range contributed no false progress.
-        const checkpoint = loadTerminalSurfaceCheckpoint(terminalId, {
+        const checkpoint = __readTerminalSurfaceCheckpointForTests(terminalId, {
           streamId: 'stream-resume-pre-callback',
           serverInstanceId: 'srv-v2-stream',
         }, { paneId: 'pane-v2-stream' })
@@ -10959,16 +10960,92 @@ describe('TerminalView lifecycle updates', () => {
         expect(resumeB).toMatchObject({ intent: 'transport_reconnect', sinceSeq: 2 })
 
         // Both panes keep their own scoped progress.
-        const checkpointA = loadTerminalSurfaceCheckpoint(terminalId, {
+        const checkpointA = __readTerminalSurfaceCheckpointForTests(terminalId, {
           streamId,
           serverInstanceId: 'srv-v2-stream',
         }, { paneId: 'pane-v2-stream' })
         expect(checkpointA?.parserAppliedSeq).toBe(10)
-        const checkpointB = loadTerminalSurfaceCheckpoint(terminalId, {
+        const checkpointB = __readTerminalSurfaceCheckpointForTests(terminalId, {
           streamId,
           serverInstanceId: 'srv-v2-stream',
         }, { paneId: paneBId })
         expect(checkpointB?.parserAppliedSeq).toBe(2)
+      })
+
+      it('a remount of the same pane never reuses the previous mount\u2019s checkpoint — the resume never exceeds the new surface\u2019s rendered position (reload contract)', async () => {
+        const { terminalId, ...first } = await renderResumablePane('remount-stale')
+        const storeKey = `pane-v2-stream::${terminalId}`
+
+        // Mount 1: a full hydrate renders through seq 10 — its scoped
+        // checkpoint claims coverage 10 under this pane's store key.
+        act(() => {
+          messageHandler!({
+            type: 'terminal.attach.ready',
+            terminalId,
+            headSeq: 10,
+            replayFromSeq: 1,
+            replayToSeq: 10,
+          })
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 10, data: 'FULL-PAGE' })
+        })
+        let previousSurfaceInstanceId = ''
+        await waitFor(() => {
+          const raw = (globalThis.localStorage as Storage).getItem(TERMINAL_CURSOR_STORAGE_KEY)
+          expect(raw).toBeTruthy()
+          const entry = JSON.parse(raw!)[storeKey]
+          expect(entry?.checkpoint?.surfaceCoverageSeq).toBe(10)
+          expect(typeof entry?.checkpoint?.surfaceInstanceId).toBe('string')
+          previousSurfaceInstanceId = entry.checkpoint.surfaceInstanceId
+        })
+
+        // Remount (page reload / layout remount): the SAME pane id, so the
+        // same store key and a colliding per-mount surface epoch (both
+        // mounts start their epoch at 0 → 1 after the first forced
+        // hydrate). The hydrate is interrupted after seq 2.
+        first.unmount()
+        wsMocks.send.mockClear()
+        render(
+          <Provider store={first.store}>
+            <TerminalViewFromStore tabId={first.tabId} paneId={first.paneId} />
+          </Provider>,
+        )
+        await waitFor(() => {
+          expect(messageHandler).not.toBeNull()
+          expect(attachMessagesFor(terminalId).length).toBeGreaterThan(0)
+        })
+        const remountedTerm = terminalInstances[terminalInstances.length - 1]
+        act(() => {
+          messageHandler!({
+            type: 'terminal.attach.ready',
+            terminalId,
+            headSeq: 10,
+            replayFromSeq: 1,
+            replayToSeq: 10,
+          })
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 2, data: 'NE' })
+        })
+        expect(remountedTerm.write.mock.calls.map(([data]: [string]) => String(data)).join('')).toBe('NE')
+
+        wsMocks.send.mockClear()
+        act(() => { reconnectHandler?.() })
+
+        // The resume must never exceed the new surface's OWN rendered
+        // position (2) — the stale previous-mount entry claims 10, and a
+        // delta resume from it would permanently skip frames 3-10.
+        const resumeAttach = attachMessagesFor(terminalId).at(-1)
+        expect(resumeAttach).toMatchObject({ intent: 'transport_reconnect', sinceSeq: 2 })
+
+        // And the store now reflects the new surface instance's honest
+        // progress — the stale higher-coverage entry was replaced, not kept.
+        await waitFor(() => {
+          const raw = (globalThis.localStorage as Storage).getItem(TERMINAL_CURSOR_STORAGE_KEY)
+          expect(raw).toBeTruthy()
+          const entry = JSON.parse(raw!)[storeKey]
+          expect(entry?.checkpoint?.surfaceCoverageSeq).toBe(2)
+          expect(typeof entry?.checkpoint?.surfaceInstanceId).toBe('string')
+          // The entry belongs to the NEW mount's surface instance.
+          expect(entry.checkpoint.surfaceInstanceId).not.toBe(previousSurfaceInstanceId)
+        })
       })
 
     it('recovery bounding: repeated progressless attaches stop at the bound, show the accessible retry state, preserve content, and explicit retry resumes', async () => {
@@ -11045,16 +11122,46 @@ describe('TerminalView lifecycle updates', () => {
       expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
     })
 
+    it('recovery bounding: the no-progress deadline reaches the retry state through the wired timer path (M-4)', async () => {
+      const { terminalId } = await renderResumablePane('deadline')
+
+      const attachCount = () => attachMessagesFor(terminalId).length
+      // The mount attach is the pane's initial hydration (never counted).
+      expect(attachCount()).toBe(1)
+
+      const base = Date.now()
+      vi.useFakeTimers()
+      try {
+        vi.setSystemTime(base)
+        // Two counted progressless attempts open the streak (the deadline
+        // requires both).
+        act(() => { reconnectHandler?.() })
+        expect(attachCount()).toBe(2)
+        act(() => { reconnectHandler?.() })
+        expect(attachCount()).toBe(3)
+
+        // 30s of no progress with only TWO attempts sent: the next
+        // automatic attempt must be stopped by the DEADLINE alone (the
+        // attempt bound is 3 and has not fired) and show the retry state.
+        act(() => { vi.advanceTimersByTime(TERMINAL_RECOVERY_NO_PROGRESS_DEADLINE_MS + 1) })
+        act(() => { reconnectHandler?.() })
+        expect(attachCount()).toBe(3)
+        expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
       it('quarantine freeze: an in-flight-write reconnect defers the decision and the drained repair rebuilds honestly when the surface moved', async () => {
         const bridge = createPerfAuditBridge()
         installPerfAuditBridge(bridge)
         const { terminalId, term } = await renderResumablePane('quarantine')
 
-        const withheldWriteCallbacks: Array<() => void> = []
-        term.write.mockImplementation((_data: string, onWritten?: () => void) => {
-          if (onWritten) withheldWriteCallbacks.push(onWritten)
-        })
-
+        // Frames 1-2 apply and checkpoint NORMALLY — the pane enters the
+        // quarantine with a VALID resumable checkpoint (applied/coverage 2).
+        // The drained repair must rebuild anyway: the frozen window's
+        // completed write moved the surface beyond it (M-2 — the repair
+        // never resumes a checkpoint the window provably outgrew).
         act(() => {
           messageHandler!({
             type: 'terminal.attach.ready',
@@ -11063,7 +11170,22 @@ describe('TerminalView lifecycle updates', () => {
             replayFromSeq: 1,
             replayToSeq: 10,
           })
-          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 4, data: 'PRE' })
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 2, data: 'OK' })
+        })
+        const preQuarantineCheckpoint = __readTerminalSurfaceCheckpointForTests(terminalId, {
+          streamId: 'stream-resume-quarantine',
+          serverInstanceId: 'srv-v2-stream',
+        }, { paneId: 'pane-v2-stream' })
+        expect(preQuarantineCheckpoint?.parserAppliedSeq).toBe(2)
+        expect(preQuarantineCheckpoint?.surfaceCoverageSeq).toBe(2)
+
+        // Frames 3-4 go in flight and STAY in flight across the reconnect.
+        const withheldWriteCallbacks: Array<() => void> = []
+        term.write.mockImplementation((_data: string, onWritten?: () => void) => {
+          if (onWritten) withheldWriteCallbacks.push(onWritten)
+        })
+        act(() => {
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 3, seqEnd: 4, data: 'PRE' })
         })
         expect(withheldWriteCallbacks.length).toBeGreaterThan(0)
 
@@ -11101,6 +11223,9 @@ describe('TerminalView lifecycle updates', () => {
       })
       const repairAttach = attachMessagesFor(terminalId).at(-1)
       expect(repairAttach).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0 })
+      // Never a delta resume out of the drained repair — the surface
+      // provably moved during the frozen window.
+      expect(repairAttach).not.toMatchObject({ intent: 'transport_reconnect' })
       })
     })
 

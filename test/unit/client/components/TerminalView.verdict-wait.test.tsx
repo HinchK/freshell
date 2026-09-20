@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, render } from '@testing-library/react'
+import { act, cleanup, render, screen } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider, useSelector } from 'react-redux'
 import tabsReducer from '@/store/tabsSlice'
@@ -278,6 +278,41 @@ describe('TerminalView pre-verdict create wait (reload-path race, terminal leg)'
     expect(attaches.map((attach) => attach.terminalId)).toEqual(['term-1', 'term-1', 'term-1'])
     expect(new Set(attaches.map((attach) => attach.attachRequestId)).size).toBe(3)
     expect(sentOfType('terminal.create')).toHaveLength(0)
+  })
+
+  it('a legitimate reconcile episode does not exhaust the recovery bound (M-1): one reconnect + one episode + one further re-attach never shows the retry strip', async () => {
+    const { store } = await renderTerminalPane({ terminalId: 'term-1', status: 'running' })
+    wsHarness.send.mockClear() // exclude the mount attach (initial hydration, exempt)
+
+    // One transport reconnect plus a full legitimate reconcile-verdict
+    // episode on an idle pane: three deliberate live-terminal attaches,
+    // none with coverage progress.
+    wsHarness.fireReconnect()
+    await flushEffects()
+    act(() => {
+      store.dispatch(setReconcilePendingPanes({ paneKeys: [PANE_KEY], startedAt: Date.now() }))
+    })
+    await flushEffects()
+    act(() => {
+      store.dispatch(applyReconcileAttach({ tabId: TAB_ID, paneId: PANE_ID, terminalId: 'term-1' }))
+    })
+    await flushEffects()
+    expect(sentOfType('terminal.attach')).toHaveLength(3)
+
+    // ONE further progressless re-attach: the episode collapsed into a
+    // single counted attempt, so this is only the third — a healthy pane
+    // must NOT hit the retry strip here.
+    wsHarness.fireReconnect()
+    await flushEffects()
+    expect(sentOfType('terminal.attach')).toHaveLength(4)
+    expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+
+    // The accounting stays bounded: a further progressless round reaches
+    // the strip honestly.
+    wsHarness.fireReconnect()
+    await flushEffects()
+    expect(sentOfType('terminal.attach')).toHaveLength(4)
+    expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
   })
 
   it('a mid-window reconnect does NOT fire the ungated re-drive while the pane is reconcile-pending', async () => {

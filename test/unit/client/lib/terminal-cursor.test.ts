@@ -347,6 +347,112 @@ describe('terminal-cursor', () => {
     })
   })
 
+  describe('surface-instance scoping (cross-mount remount isolation, WS2 reload contract)', () => {
+    const identityFor = (surfaceInstanceId: string) => ({
+      streamId: 'stream-1',
+      serverInstanceId: 'server-a',
+      surfaceInstanceId,
+    })
+
+    it('loads only the entry saved by the same surface instance', () => {
+      saveTerminalSurfaceCheckpoint(
+        createCheckpoint({ parserAppliedSeq: 10, surfaceCoverageSeq: 10, surfaceInstanceId: 'surface-a' }),
+        { paneId: 'pane-a' },
+      )
+
+      // The owning surface instance reads its own progress.
+      expect(loadTerminalSurfaceCheckpoint('term-1', identityFor('surface-a'), { paneId: 'pane-a' })
+        ?.surfaceCoverageSeq).toBe(10)
+
+      // A REMOUNT of the same pane (same store key, colliding surface
+      // epoch, NEW surface instance) must not reuse the previous mount's
+      // cursor — resuming past the new surface's rendered position would
+      // permanently skip content.
+      expect(loadTerminalSurfaceCheckpoint('term-1', identityFor('surface-b'), { paneId: 'pane-a' })).toBeNull()
+    })
+
+    it('a surface-instance-carrying caller cannot adopt a legacy id-less entry, and an id-less caller cannot read an instance-scoped entry', () => {
+      saveTerminalSurfaceCheckpoint(
+        createCheckpoint({ parserAppliedSeq: 10, surfaceCoverageSeq: 10 }),
+        { paneId: 'pane-a' },
+      )
+      // Id-less entry + id-carrying load: cannot prove the entry belongs to
+      // this surface instance — reject (one honest full hydrate after the
+      // upgrade, then saves carry ids).
+      expect(loadTerminalSurfaceCheckpoint('term-1', identityFor('surface-b'), { paneId: 'pane-a' })).toBeNull()
+      // Id-less load + id-less entry: the legacy pairing keeps working.
+      expect(loadTerminalSurfaceCheckpoint('term-1', {
+        streamId: 'stream-1',
+        serverInstanceId: 'server-a',
+      }, { paneId: 'pane-a' })?.parserAppliedSeq).toBe(10)
+
+      saveTerminalSurfaceCheckpoint(
+        createCheckpoint({ parserAppliedSeq: 12, surfaceCoverageSeq: 12, surfaceInstanceId: 'surface-c' }),
+        { paneId: 'pane-b' },
+      )
+      expect(loadTerminalSurfaceCheckpoint('term-1', {
+        streamId: 'stream-1',
+        serverInstanceId: 'server-a',
+      }, { paneId: 'pane-b' })).toBeNull()
+    })
+
+    it('a save from a different surface instance REPLACES the stale entry instead of merging (chooseCheckpoint gate)', () => {
+      saveTerminalSurfaceCheckpoint(
+        createCheckpoint({ parserAppliedSeq: 10, surfaceCoverageSeq: 10, surfaceInstanceId: 'surface-a' }),
+        { paneId: 'pane-a' },
+      )
+      // The remount's honest save at a LOWER position must REPLACE the
+      // previous mount's higher-coverage entry — keep-highest must never
+      // span surface instances, or the store would claim progress the new
+      // surface never rendered.
+      saveTerminalSurfaceCheckpoint(
+        createCheckpoint({ parserAppliedSeq: 2, surfaceCoverageSeq: 2, surfaceInstanceId: 'surface-b' }),
+        { paneId: 'pane-a' },
+      )
+
+      const loaded = loadTerminalSurfaceCheckpoint('term-1', identityFor('surface-b'), { paneId: 'pane-a' })
+      expect(loaded?.surfaceInstanceId).toBe('surface-b')
+      expect(loaded?.parserAppliedSeq).toBe(2)
+      expect(loaded?.surfaceCoverageSeq).toBe(2)
+    })
+
+    it('keeps the keep-highest merge WITHIN one surface instance', () => {
+      saveTerminalSurfaceCheckpoint(
+        createCheckpoint({ parserAppliedSeq: 8, surfaceCoverageSeq: 8, surfaceInstanceId: 'surface-a' }),
+        { paneId: 'pane-a' },
+      )
+      // A coverage-only advance (filtered frames move coverage past the
+      // unchanged applied position — the honest in-instance merge shape).
+      saveTerminalSurfaceCheckpoint(
+        createCheckpoint({ parserAppliedSeq: 8, surfaceCoverageSeq: 12, surfaceInstanceId: 'surface-a' }),
+        { paneId: 'pane-a' },
+      )
+
+      const loaded = loadTerminalSurfaceCheckpoint('term-1', identityFor('surface-a'), { paneId: 'pane-a' })
+      expect(loaded?.parserAppliedSeq).toBe(8)
+      expect(loaded?.surfaceCoverageSeq).toBe(12)
+    })
+
+    it('round-trips surfaceInstanceId through storage sanitization', () => {
+      vi.useFakeTimers()
+      try {
+        saveTerminalSurfaceCheckpoint(
+          createCheckpoint({ parserAppliedSeq: 10, surfaceCoverageSeq: 10, surfaceInstanceId: 'surface-a' }),
+          { paneId: 'pane-a' },
+        )
+        // Flush the debounced persist, then reload from raw storage.
+        vi.advanceTimersByTime(250)
+      } finally {
+        vi.useRealTimers()
+      }
+      __resetTerminalCursorCacheForTests()
+
+      const loaded = loadTerminalSurfaceCheckpoint('term-1', identityFor('surface-a'), { paneId: 'pane-a' })
+      expect(loaded?.surfaceInstanceId).toBe('surface-a')
+      expect(loaded?.surfaceCoverageSeq).toBe(10)
+    })
+  })
+
   it('flushes immediately when clearing a cursor with pending debounced writes', () => {
     vi.useFakeTimers()
     const setItemSpy = vi.spyOn(Storage.prototype, 'setItem')

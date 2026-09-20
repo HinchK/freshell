@@ -35,6 +35,18 @@ export type TerminalRecoveryAccounting = {
    * several deliberate re-attaches right after it).
    */
   initialAttachConsumed: boolean
+  /**
+   * Reconcile-episode key of the last COUNTED attempt (M-1): a reconcile
+   * episode (pending window → verdict fold) deliberately re-attaches a
+   * live-terminal pane several times with no coverage progress; every
+   * attach carrying the SAME key collapses into the single attempt that
+   * opened the episode. A NEW key counts as its own attempt, so repeated
+   * progressless episodes stay bounded. Null when the last counted attempt
+   * was keyless (a transport reconnect) or after a progress/retry reset —
+   * keyless attempts never clear it, so an episode survives an interleaved
+   * ws flap.
+   */
+  lastAttemptKey: string | null
 }
 
 export function createTerminalRecoveryAccounting(): TerminalRecoveryAccounting {
@@ -44,6 +56,7 @@ export function createTerminalRecoveryAccounting(): TerminalRecoveryAccounting {
     streakStartedAt: null,
     exhausted: false,
     initialAttachConsumed: false,
+    lastAttemptKey: null,
   }
 }
 
@@ -64,6 +77,7 @@ export function recordRecoveryProgress(
     attempts: 0,
     streakStartedAt: null,
     exhausted: false,
+    lastAttemptKey: null,
   }
 }
 
@@ -72,11 +86,14 @@ export function recordRecoveryProgress(
  * progress-since-last-attempt first. `allowed: false` means the bound was
  * reached: the caller stops automatic re-attach cycling and shows the
  * visible retry state (the accounting stays exhausted until progress or an
- * explicit retry resets it).
+ * explicit retry resets it). `input.attemptKey` (when present) identifies
+ * the reconcile episode the attach belongs to: same-key attaches are
+ * allowed without consuming the budget again (see
+ * TerminalRecoveryAccounting.lastAttemptKey).
  */
 export function beginRecoveryAttempt(
   state: TerminalRecoveryAccounting,
-  input: { coverageSeq: number; now: number },
+  input: { coverageSeq: number; now: number; attemptKey?: string },
 ): { state: TerminalRecoveryAccounting; allowed: boolean } {
   const progressed = recordRecoveryProgress(state, input.coverageSeq, input.now)
   if (!state.initialAttachConsumed) {
@@ -92,6 +109,12 @@ export function beginRecoveryAttempt(
   if (state.exhausted) {
     return { state, allowed: false }
   }
+  // Reconcile-episode collapse (M-1): every attach of the episode that
+  // already consumed its single counted attempt is allowed without
+  // counting again.
+  if (input.attemptKey !== undefined && input.attemptKey === state.lastAttemptKey) {
+    return { state, allowed: true }
+  }
   const attempts = state.attempts
   const streakStartedAt = state.streakStartedAt ?? input.now
   const deadlineExceeded = attempts >= 2
@@ -104,6 +127,10 @@ export function beginRecoveryAttempt(
       ...state,
       attempts: attempts + 1,
       streakStartedAt,
+      // Keyless attempts keep the previous episode's key (an interleaved
+      // ws flap must not refund it); keyed attempts become the new
+      // episode's anchor.
+      ...(input.attemptKey !== undefined ? { lastAttemptKey: input.attemptKey } : {}),
     },
     allowed: true,
   }
@@ -124,6 +151,7 @@ export function resetRecoveryAccounting(
     attempts: 0,
     streakStartedAt: null,
     exhausted: false,
+    lastAttemptKey: null,
     // An explicit retry happens on an already-hydrated pane: the initial
     // attach exemption stays consumed.
     initialAttachConsumed: true,

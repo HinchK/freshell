@@ -153,4 +153,88 @@ describe('terminal-recovery-accounting', () => {
     expect(TERMINAL_RECOVERY_MAX_ATTEMPTS).toBe(3)
     expect(TERMINAL_RECOVERY_NO_PROGRESS_DEADLINE_MS).toBe(30_000)
   })
+
+  describe('reconcile-episode calibration (M-1)', () => {
+    it('collapses every attach of ONE reconcile episode into a single counted attempt', () => {
+      let state = createTerminalRecoveryAccounting()
+      state = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1000 }).state
+
+      // One transport reconnect, then a legitimate reconcile-verdict
+      // episode: the pending-mark attach and the verdict-fold attach are
+      // deliberate pane lifecycle on an idle pane (no coverage progress).
+      state = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1001 }).state
+      expect(state.attempts).toBe(1)
+      const episodePending = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1002, attemptKey: 'pending:5000' })
+      expect(episodePending.allowed).toBe(true)
+      expect(episodePending.state.attempts).toBe(2)
+      state = episodePending.state
+
+      const episodeFold = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1003, attemptKey: 'pending:5000' })
+      expect(episodeFold.allowed).toBe(true)
+      // The episode consumed ONE attempt, not two — a healthy pane must
+      // need more than a single reconcile episode plus one reconnect to
+      // reach the retry strip.
+      expect(episodeFold.state.attempts).toBe(2)
+    })
+
+    it('a ws flap between an episode\u2019s attaches does not refund the episode key', () => {
+      let state = createTerminalRecoveryAccounting()
+      state = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1000 }).state
+      state = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1001 }).state
+
+      const episodePending = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1002, attemptKey: 'pending:5000' })
+      state = episodePending.state
+      expect(state.attempts).toBe(2)
+
+      // An interleaved transport reconnect (no episode key) counts as its
+      // own attempt but must not clear the episode key.
+      const flap = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1003 })
+      expect(flap.state.attempts).toBe(3)
+      state = flap.state
+
+      // The episode's closing (fold) attach still collapses into the
+      // episode's single counted attempt.
+      const episodeFold = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1004, attemptKey: 'pending:5000' })
+      expect(episodeFold.allowed).toBe(true)
+      expect(episodeFold.state.attempts).toBe(3)
+    })
+
+    it('a NEW reconcile episode counts again — the accounting stays bounded for no-progress storms', () => {
+      let state = createTerminalRecoveryAccounting()
+      state = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1000 }).state
+      state = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1001 }).state
+      state = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1002, attemptKey: 'pending:5000' }).state
+      state = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1003, attemptKey: 'pending:5000' }).state
+      expect(state.attempts).toBe(2)
+
+      // A second full episode (new pending window → new key) counts once…
+      state = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1104, attemptKey: 'pending:6000' }).state
+      expect(state.attempts).toBe(3)
+      state = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1105, attemptKey: 'pending:6000' }).state
+      expect(state.attempts).toBe(3)
+
+      // …and the third episode's first attach exceeds the bound: the strip
+      // shows. Repeated progressless episodes still reach it honestly.
+      const third = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1206, attemptKey: 'pending:7000' })
+      expect(third.allowed).toBe(false)
+      expect(third.state.exhausted).toBe(true)
+    })
+
+    it('genuine progress and explicit retry clear the episode key', () => {
+      let state = createTerminalRecoveryAccounting()
+      state = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1000 }).state
+      state = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1001, attemptKey: 'pending:5000' }).state
+      expect(state.lastAttemptKey).toBe('pending:5000')
+
+      // Live output resets the streak AND the episode key: a later attach
+      // with the same key cannot ride a dead episode.
+      state = recordRecoveryProgress(state, 9, 1002)
+      expect(state.lastAttemptKey).toBeNull()
+      const afterProgress = beginRecoveryAttempt(state, { coverageSeq: 9, now: 1003, attemptKey: 'pending:5000' })
+      expect(afterProgress.state.attempts).toBe(1)
+
+      state = resetRecoveryAccounting(afterProgress.state, 9, 1004)
+      expect(state.lastAttemptKey).toBeNull()
+    })
+  })
 })
