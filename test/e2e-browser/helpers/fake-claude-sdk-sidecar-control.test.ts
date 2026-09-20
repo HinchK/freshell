@@ -407,6 +407,25 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
     }
   })
 
+  it('an interrupt against a dead session answers the session-not-found error, never a settle (real-sidecar parity, task-008)', async () => {
+    const fx = launch({ rules: [] })
+    try {
+      // No create ever ran: the session id is unknown. The REAL sidecar's
+      // handleInterrupt answers the session-scoped error frame
+      // (index.mjs: `if (!st) { emit sdk.error sessionNotFound } }`) and
+      // returns — never a fabricated ok:true settle. The kilroy fake already
+      // mirrors this; the claude fake must too.
+      fx.send({ type: 'interrupt', sessionId: 'never-created' })
+      const err = await fx.waitLine((o) => o.type === 'sdk.error', 'dead-session interrupt error')
+      expect(err).toMatchObject({ sessionId: 'never-created', sessionNotFound: true })
+      const out = fx.stdoutLines()
+      expect(out.filter((o) => o.type === 'sdk.interrupt_settled'), 'no settle for a dead session').toEqual([])
+      expect(out.filter((o) => o.type === 'sdk.status'), 'no fabricated activity for a dead session').toEqual([])
+    } finally {
+      await fx.stop()
+    }
+  })
+
   it('a completion against a session that no longer exists is dropped entirely (real-sidecar parity, task-004 F-M2)', async () => {
     const fx = launch({
       rules: [

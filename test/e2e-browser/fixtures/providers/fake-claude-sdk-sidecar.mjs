@@ -497,6 +497,12 @@ async function handleInput(line) {
   } else if (msg.type === 'interrupt') {
     activeSessionId = msg.sessionId ?? activeSessionId
     const st = sessions.get(msg.sessionId)
+    if (!st) {
+      // Real-sidecar parity (index.mjs handleInterrupt): an interrupt against
+      // an unknown session is a session-scoped error frame, never a settle.
+      emit({ type: 'sdk.error', sessionId: msg.sessionId, message: 'session not found', sessionNotFound: true })
+      return
+    }
     let interruptedInFlight = false
     if (st) {
       // Mirror the real sidecar's interrupt path (index.mjs — the transport is
