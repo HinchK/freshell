@@ -843,19 +843,57 @@ async fn run_child_role(role: &str) {
                 },
             );
         }
+        // Task 8 (T1-M5 combined fence case): rename the ARG-named pending
+        // record and report the outcome — the parent drives the post-replace
+        // hook through HOOKS_ENV so this child's commit lands on disk but its
+        // post-replace durability step fails (a REAL second process's
+        // uncertain replacement, normal child exit).
+        "uncertain_arg" => {
+            let store = open_store(&dir);
+            let target = pending(&arg);
+            let outcome = rename_user(&store, target, "Uncertain replacement name").await;
+            record_line(
+                &result_path,
+                match outcome {
+                    Ok(update) => json!({
+                        "op": "uncertain_rename",
+                        "ok": true,
+                        "name": update.record.name,
+                        "revision": update.record.revision,
+                    }),
+                    Err(e) => json!({"op": "uncertain_rename", "ok": false, "error": e.code()}),
+                },
+            );
+        }
         other => panic!("unknown child role {other}"),
     }
     std::process::exit(0);
 }
 
 fn spawn_child(role: &str, dir: &Path, arg: &str, hooks: &str) -> (std::process::Child, PathBuf) {
+    spawn_child_for_selector(
+        role,
+        dir,
+        arg,
+        hooks,
+        "session_names::tests::cross_process_transactions",
+    )
+}
+
+/// [`spawn_child`] with an explicit test selector: each cross-process test
+/// re-executes ITS OWN selector in the child (the child's role check runs
+/// `run_child_role` and exits before the parent assertions).
+fn spawn_child_for_selector(
+    role: &str,
+    dir: &Path,
+    arg: &str,
+    hooks: &str,
+    selector: &str,
+) -> (std::process::Child, PathBuf) {
     let result_path = dir.join(format!(".child-result-{role}-{}", uuid::Uuid::new_v4()));
     let exe = std::env::current_exe().expect("test binary path");
     let child = std::process::Command::new(exe)
-        .args([
-            "--exact",
-            "session_names::tests::cross_process_transactions",
-        ])
+        .args(["--exact", selector])
         .env(ROLE_ENV, role)
         .env(DIR_ENV, dir)
         .env(ARG_ENV, arg)
@@ -2218,5 +2256,306 @@ async fn publisher_directory_invalidation_tracks_title_overriding_changes() {
     assert!(
         sessions_revision.load(std::sync::atomic::Ordering::SeqCst) >= 3,
         "every pushed update still bumps the unified revision"
+    );
+}
+
+/// Task 8 (T1-M5 — the deferred combined case): a REAL second process's
+/// UNCERTAIN REPLACEMENT fences the FIRST process's adoption until
+/// durability reconciliation succeeds, in ONE test. The second process
+/// (child role `uncertain_arg`) commits a replacement whose post-replace
+/// durability step fails and exits normally reporting uncertainty; the
+/// FIRST process (this parent) then attempts adoption under a FORCED
+/// reconciliation failure — fenced, nothing published — and only the
+/// successful reconciliation lifts the fence and converges both processes
+/// on the replaced state. Destructive process death stays out of this
+/// lane (the child exits normally); the death/restart variants remain
+/// container-only per the plan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cross_process_uncertain_replacement_fences_adoption_until_reconciled() {
+    if let Ok(role) = std::env::var(ROLE_ENV) {
+        if !role.is_empty() {
+            run_child_role(&role).await;
+        }
+    }
+
+    let dir = temp_data_dir();
+    let data_dir = dir.path().to_path_buf();
+    let parent_store = open_store(&data_dir);
+    let target = pending("h-xproc-fence");
+
+    // The pre-uncertainty established state: a committed manual rename.
+    ensure(
+        &parent_store,
+        "h-xproc-fence",
+        NamedProvider::Claude,
+        Some("/w/xproc"),
+    )
+    .await
+    .expect("ensure pending");
+    rename_user(&parent_store, target.clone(), "Established name")
+        .await
+        .expect("established rename commits");
+    let mut subscriber = parent_store.subscribe();
+
+    // The REAL second process: its replacement lands on disk but its
+    // post-replace durability step fails, so IT reports uncertainty and the
+    // installed generation is NOT established.
+    let (child, child_result) = spawn_child_for_selector(
+        "uncertain_arg",
+        &data_dir,
+        "h-xproc-fence",
+        "post_replace",
+        "session_names::tests::cross_process_uncertain_replacement_fences_adoption_until_reconciled",
+    );
+    let uncertain = finish_child(child, &child_result);
+    assert!(
+        !uncertain[0]["ok"].as_bool().unwrap() && uncertain[0]["error"] == "NAME_COMMIT_UNCERTAIN",
+        "the second process reports the uncertain replacement: {uncertain:?}"
+    );
+    let raw = read_raw_document(&data_dir);
+    let on_disk = raw
+        .records
+        .get(&name_ref_key(&target))
+        .expect("the replacement is installed on disk");
+    assert_eq!(on_disk.name, "Uncertain replacement name");
+
+    // The FIRST process's adoption attempt, with reconciliation FORCED to
+    // fail: the fence holds — no adoption, no publication, no mutation from
+    // the unestablished generation, and the last established snapshot is
+    // retained.
+    set_test_hooks(&data_dir, vec![TestHook::FailReconcile]);
+    let fenced_read = parent_store.get(vec![target.clone()]).await;
+    assert!(
+        matches!(fenced_read, Err(NameError::CommitUncertain(_))),
+        "the first process cannot adopt the unestablished replacement: {fenced_read:?}"
+    );
+    let fenced_rename = rename_user(&parent_store, target.clone(), "Must not land").await;
+    assert!(
+        matches!(fenced_rename, Err(NameError::CommitUncertain(_))),
+        "the first process cannot mutate from the unestablished generation: {fenced_rename:?}"
+    );
+    assert!(
+        subscriber.try_recv().is_err(),
+        "the fence publishes nothing"
+    );
+
+    // Durability reconciliation succeeds: the fence lifts and BOTH processes
+    // converge on the replaced state (the parent adopts and can mutate
+    // again).
+    clear_test_hooks(&data_dir);
+    let adopted = get_one(&parent_store, target.clone())
+        .await
+        .expect("adoption succeeds after reconciliation");
+    assert_eq!(adopted.record.name, "Uncertain replacement name");
+    assert_eq!(adopted.record.source, NameSource::Manual);
+    let after = rename_user(&parent_store, target.clone(), "Lands after reconcile")
+        .await
+        .expect("mutations resume after the fence lifts");
+    assert_eq!(after.record.name, "Lands after reconcile");
+}
+
+/// Task 8 (T4-M3 concern 2 — the sweep-vs-tick coexistence pin): the
+/// auto-title sweep's index hydration and the 2s naming tick's pending-bind
+/// lane both process the same scoped session. Their coexistence is
+/// IDEMPOTENT: repeated sweep passes never touch the installed record,
+/// repeated tick binds are a Read after the first transfer, the two lanes
+/// compose onto ONE durable record (the manual pending name wins the rank
+/// merge), and the activity arm happens exactly once for one event
+/// identity (no double-eligibility).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sweep_hydration_and_tick_bind_coexist_idempotently() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let handle = "h-sweep-tick";
+    let target = session(NamedProvider::Claude, "sess-sweep-tick");
+    let key = name_ref_key(&target);
+
+    // The create lane: a pending handle carrying a MANUAL name.
+    ensure(&store, handle, NamedProvider::Claude, Some("/w/sweepproj"))
+        .await
+        .expect("ensure pending");
+    rename_user(&store, pending(handle), "Manual pre-durable")
+        .await
+        .expect("pre-durable rename");
+
+    // The SWEEP lane: the first index pass installs the durable fallback
+    // record from the observed first message (no absorb — a genuinely new
+    // observation arms through the activity feed right after).
+    let hydrate_input = crate::session_name_generation::IndexedNameInput {
+        provider: NamedProvider::Claude,
+        session_id: "sess-sweep-tick".to_string(),
+        cwd: Some("/w/sweepproj".to_string()),
+        first_user_message: Some("Index the sardine ledger".to_string()),
+        provider_title: None,
+    };
+    let hydrated = store
+        .hydrate_indexed(hydrate_input.clone(), false)
+        .await
+        .expect("sweep hydration installs the fallback");
+    assert!(hydrated.changed, "the first sweep pass installs the record");
+    assert_eq!(hydrated.record.source, NameSource::FirstMessage);
+    // A repeated sweep pass is a pure Read — an established record is never
+    // touched by hydration.
+    for pass in 0..3 {
+        let repeat = store
+            .hydrate_indexed(hydrate_input.clone(), false)
+            .await
+            .expect("repeat sweep pass");
+        assert!(
+            !repeat.changed,
+            "sweep pass {} must not rewrite the installed record",
+            pass + 2
+        );
+        assert_eq!(repeat.record.name, "Index the sardine ledger");
+    }
+
+    // The TICK lane: the pending bind transfers the MANUAL name onto the
+    // durable identity (rank decides the merge), exactly once.
+    let acquisition = freshell_protocol::native_location::NativeAcquisition {
+        location: freshell_protocol::native_location::NativeLocation::Claude {
+            config_root: "/w/sweepproj/.claude".to_string(),
+            transcript_path: Some("/w/sweepproj/.claude/transcript.jsonl".to_string()),
+            project_directory_key: None,
+            transcript_cwd: Some("/w/sweepproj".to_string()),
+            effective_project_key_override: None,
+        },
+        evidence: freshell_protocol::native_location::NativeEvidenceKind::SelectedTranscript,
+        persistence: freshell_protocol::native_location::NativePersistence::Verified,
+    };
+    let bound = store
+        .bind_pending(BindNameInput {
+            pending: pending(handle),
+            target: target.clone(),
+            acquisition,
+        })
+        .await
+        .expect("the tick bind transfers the record");
+    assert_eq!(bound.record.name, "Manual pre-durable");
+    assert_eq!(bound.record.source, NameSource::Manual);
+    // Repeated tick binds are a Read — bind-arming idempotence.
+    for attempt in 0..3 {
+        let again = store
+            .bind_pending(BindNameInput {
+                pending: pending(handle),
+                target: target.clone(),
+                acquisition: freshell_protocol::native_location::NativeAcquisition {
+                    location: freshell_protocol::native_location::NativeLocation::Claude {
+                        config_root: "/w/sweepproj/.claude".to_string(),
+                        transcript_path: Some("/w/sweepproj/.claude/transcript.jsonl".to_string()),
+                        project_directory_key: None,
+                        transcript_cwd: Some("/w/sweepproj".to_string()),
+                        effective_project_key_override: None,
+                    },
+                    evidence:
+                        freshell_protocol::native_location::NativeEvidenceKind::SelectedTranscript,
+                    persistence: freshell_protocol::native_location::NativePersistence::Verified,
+                },
+            })
+            .await
+            .expect("repeat tick bind resolves");
+        assert!(
+            !again.changed,
+            "tick bind attempt {} must be an idempotent Read",
+            attempt + 2
+        );
+        assert_eq!(again.record.name, "Manual pre-durable");
+    }
+
+    // The sweep lane after the bind: still a Read (the redirect resolves the
+    // bound identity; hydration never touches the manual winner).
+    let post_bind_sweep = store
+        .hydrate_indexed(hydrate_input.clone(), false)
+        .await
+        .expect("sweep after bind");
+    assert!(!post_bind_sweep.changed);
+    assert_eq!(post_bind_sweep.record.name, "Manual pre-durable");
+
+    // The activity arm (the tick's accepted-input feed) arms the ONE
+    // generation series for a FALLBACK record exactly once per event
+    // identity — repeated delivery of the SAME event id never re-arms or
+    // double-arms. (A MANUAL winner stops generation by policy — the
+    // session_names::tests::manual_survives_reload_and_ai_race family pins
+    // that — so the arm lane is proven on the sweep-installed fallback
+    // record of a SECOND session, exactly how the two lanes coexist for
+    // never-renamed sessions.)
+    let arm_target = session(NamedProvider::Claude, "sess-sweep-arm");
+    let arm_key = name_ref_key(&arm_target);
+    store
+        .hydrate_indexed(
+            crate::session_name_generation::IndexedNameInput {
+                provider: NamedProvider::Claude,
+                session_id: "sess-sweep-arm".to_string(),
+                cwd: Some("/w/sweepproj".to_string()),
+                first_user_message: Some("Index the arm ledger".to_string()),
+                provider_title: None,
+            },
+            false,
+        )
+        .await
+        .expect("the sweep installs the arm lane's fallback record");
+    // Non-vacuity: the absorb=false sweep pass created NO series — only the
+    // accepted-input arm may create it.
+    assert!(
+        read_raw_document(dir.path())
+            .generation
+            .get(&arm_key)
+            .is_none(),
+        "the sweep pass alone must not arm generation"
+    );
+    let armed = store
+        .activity(NameActivity {
+            target: arm_target.clone(),
+            mode: "claude".to_string(),
+            event_id: "evt-sweep-tick-1".to_string(),
+            reason: NameActivityReason::AcceptedUserMessage,
+            first_user_message: Some("Index the arm ledger".to_string()),
+            cwd: Some("/w/sweepproj".to_string()),
+        })
+        .await
+        .expect("the activity arms the series");
+    // The arm is a bookkeeping commit: `changed` stays false (no visible
+    // name moved — the publisher's title-override gate depends on exactly
+    // this), so the ARM's proof is the series' appearance in the durable
+    // document, not the update flag.
+    assert!(
+        !armed.changed,
+        "arming a generation series is bookkeeping, never a visible name change"
+    );
+    let raw = read_raw_document(dir.path());
+    let series = raw.generation.get(&arm_key).expect("the series exists");
+    assert_eq!(series.status, GenerationStatus::Eligible);
+    assert_eq!(series.consumed, 0, "arming consumed nothing");
+    for repeat in 0..3 {
+        let again = store
+            .activity(NameActivity {
+                target: arm_target.clone(),
+                mode: "claude".to_string(),
+                event_id: "evt-sweep-tick-1".to_string(),
+                reason: NameActivityReason::AcceptedUserMessage,
+                first_user_message: Some("Index the arm ledger".to_string()),
+                cwd: Some("/w/sweepproj".to_string()),
+            })
+            .await
+            .expect("duplicate activity delivery resolves");
+        assert!(
+            !again.changed,
+            "duplicate event delivery {} never re-arms",
+            repeat + 2
+        );
+    }
+    // The durable document still holds exactly ONE series for the record,
+    // and the manual lane's record has none (protection and arming never mix).
+    let raw = read_raw_document(dir.path());
+    assert_eq!(
+        raw.generation
+            .get(&arm_key)
+            .expect("the series still exists")
+            .status,
+        GenerationStatus::Eligible,
+        "the one armed series is unchanged by duplicate deliveries"
+    );
+    assert!(
+        raw.generation.get(&key).is_none(),
+        "the manual winner's record carries no generation series"
     );
 }

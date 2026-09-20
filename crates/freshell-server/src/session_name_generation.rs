@@ -222,6 +222,47 @@ impl SessionNameGenerator {
             "session_names.generation_started: attempt {} of the bounded series",
             claim.consumed
         );
+        self.dispatch_claimed_attempt(names, &claim).await;
+    }
+
+    /// Dispatch ONE claimed attempt: re-check the winner, call the provider
+    /// outside any document transaction under the 20-second request bound,
+    /// then fold the classified outcome back through the document with the
+    /// captured series id and input fingerprint. Split from
+    /// [`Self::run_due_attempt`] so the claim→dispatch window is testable
+    /// (the materialization race below).
+    pub(crate) async fn dispatch_claimed_attempt(
+        &self,
+        names: &Arc<SessionNames>,
+        claim: &GenerationClaim,
+    ) {
+        // The materialization race: a MANUAL pending winner can bind
+        // between the claim and the dispatch (the sweep armed the durable
+        // session's series before the naming bind transferred the pending
+        // record). A protected winner stops generation — re-check before
+        // paying the provider call; the fold's protected arm then closes
+        // the series without a retry.
+        if names.generation_blocked_by_protected_winner(&claim.target) {
+            tracing::info!(
+                target: "freshell_server::session_name_generation",
+                op = "generation_superseded",
+                name_ref = %freshell_freshagent::naming::name_ref_debug_key(&claim.target),
+                series = %claim.series_id,
+                attempt = %claim.attempt_id,
+                consumed = claim.consumed,
+                class = "superseded",
+                "session_names.generation_superseded: a protected winner landed after the claim; the call is skipped"
+            );
+            let _ = names
+                .fold_generation_outcome(
+                    claim.target.clone(),
+                    claim.series_id.clone(),
+                    claim.input_fingerprint.clone(),
+                    GenerationOutcome::Empty,
+                )
+                .await;
+            return;
+        }
         let excerpt = claim.excerpt.clone().unwrap_or_default();
         let outcome = if excerpt.trim().is_empty() {
             // An armed series always carries an excerpt; an empty one is an

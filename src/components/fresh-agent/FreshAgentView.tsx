@@ -1232,6 +1232,17 @@ export function FreshAgentView({
     const legacyRestoreContext = content.provider === 'opencode'
       ? buildLegacyRestoreContext(tabRestoreSource)
       : undefined
+    // Unified agent names (T6-R3 sender repair): a NEW scoped fresh
+    // conversation carries its pre-durable namingHandle on the create —
+    // minted before the send and persisted in the pane content, so the
+    // pane's rename capture resolves the PENDING record while no durable
+    // identity exists, and create retries re-send the SAME handle. A
+    // resume/switch create (a sessionRef) targets the durable record and
+    // deliberately sends no handle.
+    const namingHandle = !content.sessionRef && !content.resumeSessionId
+      && isUnifiedAgentMode(undefined, content.sessionType)
+      ? content.namingHandle ?? `nh-${nanoid()}`
+      : undefined
     return {
       type: 'freshAgent.create',
       requestId: content.createRequestId,
@@ -1249,6 +1260,7 @@ export function FreshAgentView({
       // D8 (restore-open-sessions-only): the server composes the ledger row's
       // tabKey as `deviceId:tabId` from the connection identity + this field.
       tabId,
+      ...(namingHandle ? { namingHandle } : {}),
     } as const
   }, [providerDefaults, tabRestoreSource, tabId])
 
@@ -1302,6 +1314,12 @@ export function FreshAgentView({
           createError: undefined,
           status: 'creating',
           pendingLocalEcho: undefined,
+          // Unified agent names: a deliberate NEW conversation never
+          // inherits the previous conversation's pre-durable identity or
+          // canonical projection — the new conversation mints its own
+          // handle and gets its own name lifecycle.
+          namingHandle: undefined,
+          nameRef: undefined,
         },
       }))
     })()
@@ -1438,7 +1456,17 @@ export function FreshAgentView({
         sessionRef: current.sessionRef,
         cwd: current.initialCwd,
       })
-      sendFreshAgentMessage(buildCreateMessage(current))
+      const createMessage = buildCreateMessage(current)
+      if (createMessage.namingHandle && !current.namingHandle) {
+        // T6-R3 sender repair: persist the minted pre-durable handle BEFORE
+        // the send so create retries re-send the SAME handle.
+        dispatch(updatePaneContent({
+          tabId,
+          paneId,
+          content: { ...current, namingHandle: createMessage.namingHandle },
+        }))
+      }
+      sendFreshAgentMessage(createMessage)
     }
 
     dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: refreshRequest.requestId }))
@@ -1634,7 +1662,17 @@ export function FreshAgentView({
         releasePendingRebind()
         pendingRebindReleaseRef.current = release
       }
-      sendFreshAgentMessage(buildCreateMessage(current))
+      const createMessage = buildCreateMessage(current)
+      if (createMessage.namingHandle && !current.namingHandle) {
+        // T6-R3 sender repair: persist the minted pre-durable handle BEFORE
+        // the send so create retries re-send the SAME handle.
+        dispatch(updatePaneContent({
+          tabId,
+          paneId,
+          content: { ...current, namingHandle: createMessage.namingHandle },
+        }))
+      }
+      sendFreshAgentMessage(createMessage)
     }
     if (hiddenRef.current) {
       getRebindQueue().enqueue({

@@ -9,14 +9,50 @@
 # Usage:
 #   scripts/sandbox-test.sh "cargo test -p freshell-ws"
 #   scripts/sandbox-test.sh --corpus "cargo test -p freshell-sessions -- --ignored perf"
+#   scripts/sandbox-test.sh --native-tools <manifest-path> --receipt-dir <absolute-directory>
 #
 # --corpus mounts ~/.codex/sessions and ~/.claude/projects READ-ONLY at their
 # natural paths inside the container, for realistic-data perf tests. Without
 # it, no real user data is mounted at all.
+#
+# --native-tools is the EARLY native-only branch (unified-agent-names Task 8):
+# it never runs the repo-mount sandbox path. It delegates to the Node wrapper
+# (scripts/testing/native-session-names-sandbox.mjs), which validates the
+# closed input list (optionally relocated by the manifest), then runs the
+# native session-names contract runner read-only in an owned disposable
+# container — no corpus, no operator home, no package installation. The
+# wrapper's exit codes pass through unchanged (0 all providers passed,
+# 1 contract failure, 2 missing prerequisite before any Docker mutation).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE_TAG="freshell-sandbox:latest"
+
+if [ "${1:-}" = "--native-tools" ]; then
+  NATIVE_MANIFEST="${2:-}"
+  if [ -z "${NATIVE_MANIFEST}" ]; then
+    echo "usage: $0 --native-tools <manifest-path> [--receipt-dir <absolute-directory>]" >&2
+    exit 2
+  fi
+  shift 2
+  NATIVE_RECEIPT_DIR="/tmp"
+  if [ "${1:-}" = "--receipt-dir" ]; then
+    NATIVE_RECEIPT_DIR="${2:-}"
+    if [ -z "${NATIVE_RECEIPT_DIR}" ]; then
+      echo "usage: $0 --native-tools <manifest-path> --receipt-dir <absolute-directory>" >&2
+      exit 2
+    fi
+    shift 2
+  fi
+  if [ ! -d "${NATIVE_RECEIPT_DIR}" ]; then
+    echo "[sandbox] --receipt-dir is not an existing directory: ${NATIVE_RECEIPT_DIR}" >&2
+    exit 2
+  fi
+  exec node "${REPO_ROOT}/scripts/testing/native-session-names-sandbox.mjs" \
+    --require-all \
+    --manifest "${NATIVE_MANIFEST}" \
+    --output "${NATIVE_RECEIPT_DIR%/}/native-session-names.json"
+fi
 
 MOUNT_CORPUS=0
 if [ "${1:-}" = "--corpus" ]; then

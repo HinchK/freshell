@@ -828,7 +828,25 @@ pub(crate) mod test_support {
             renames.push(input.clone());
             drop(renames);
             let (revision, mut record) = match current {
-                Some(record) => (record.revision + 1, record),
+                Some(record) => {
+                    // The compare-and-set contract the real store enforces:
+                    // a stale `ifRevision` answers the conflict with the
+                    // CURRENT record (the editor's documented refresh input).
+                    if let Some(expected) = input.if_revision {
+                        if expected != record.revision {
+                            let actual = record.revision;
+                            return Box::pin(async move {
+                                Err(NameError::Conflict {
+                                    message: format!(
+                                        "the record moved to revision {actual} while the editor held {expected}"
+                                    ),
+                                    current: Some(record),
+                                })
+                            });
+                        }
+                    }
+                    (record.revision + 1, record)
+                }
                 None => {
                     return Box::pin(async move {
                         Err(NameError::NotFound(format!(

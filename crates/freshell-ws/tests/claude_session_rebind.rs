@@ -1118,6 +1118,47 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
         "the tick's transfer creates the durable record"
     );
 
+    // ── Phase 11 — unified agent names: A RECOVERY CREATE RE-STAMPS THE
+    // PERSISTED PRE-DURABLE HANDLE. A zero-turn pane's server restart
+    // recovers its terminal with BOTH the preallocated (prospective)
+    // sessionRef and the pane content's persisted namingHandle on the
+    // create frame. The durable branch's sessionRef targets a
+    // PROSPECTIVE id — no record exists — so the admission must fall
+    // back to the PENDING handle (the fresh branch): the restored
+    // terminal's registry row carries Pending{handle} and the sweep's
+    // verified bind can transfer the record. Without it the restored row
+    // has NO binding and the pre-durable rename is orphaned forever.
+    let capture_p11 = capture_for("pane11");
+    let _ = std::fs::remove_file(&capture_p11);
+    std::env::set_var("CLAUDE_ARGV_CAPTURE_PATH", &capture_p11);
+    let pre11 = "77777777-8888-4999-8aaa-cccccccc0011".to_string();
+    let created11 = send_create(
+        &mut ws,
+        json!({
+            "type": "terminal.create",
+            "requestId": "req-claude-rebind-11",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": pre11 },
+            "restore": true,
+            "namingHandle": "nh-persisted-restore",
+        }),
+    )
+    .await;
+    let tid11 = created11["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    assert_eq!(
+        registry.name_ref_of(&tid11),
+        Some(SessionNameRef::Pending {
+            id: "nh-persisted-restore".to_string()
+        }),
+        "a recovery create against a PROSPECTIVE (record-less) sessionRef \
+         must re-stamp the persisted pre-durable handle"
+    );
+
     state.fresh_claude.shutdown().await; // reap the fake node child
 
     registry.kill(&tid2);
@@ -1126,6 +1167,7 @@ async fn session_start_signal_rebinds_and_restores_the_new_id() {
     registry.kill(&tid6);
     registry.kill(&tid8);
     registry.kill(&tid10);
+    registry.kill(&tid11);
     let _ = std::fs::remove_dir_all(&signal_root);
     std::env::remove_var("CLAUDE_ARGV_CAPTURE_PATH");
     std::env::remove_var("CLAUDE_CMD");

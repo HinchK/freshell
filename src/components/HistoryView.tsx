@@ -7,8 +7,8 @@ import { api } from '@/lib/api'
 import { activateSessionSurface, fetchSessionWindow } from '@/store/sessionsThunks'
 import { openSessionTab } from '@/store/tabsSlice'
 import { applySessionRenameCascade } from '@/store/titleSync'
-import { receiveSessionNames } from '@/store/sessionNamesSlice'
-import { renameSessionName, parseSessionNameUpdate } from '@/lib/session-names'
+import { receiveSessionNameProjections, receiveSessionNames } from '@/store/sessionNamesSlice'
+import { renameSessionName } from '@/lib/session-names'
 import { isScopedSessionRow, selectSessionNameRecord, selectSessionNativeSync, selectSessionRowRecord } from '@/store/selectors/sessionNameSelectors'
 import type { SessionNameRef } from '@shared/session-names'
 import { cn } from '@/lib/utils'
@@ -162,9 +162,12 @@ export default function HistoryView({ onOpenSession }: { onOpenSession?: () => v
           dispatch(receiveSessionNames([accepted]))
         } catch (error: any) {
           // A conflict carries the server's accepted record: fold it so the
-          // winning name is visible everywhere.
-          const accepted = parseSessionNameUpdate(error?.data?.sessionName)
-          if (accepted) dispatch(receiveSessionNames([accepted]))
+          // winning name is visible everywhere. `renameSessionName` throws
+          // the typed `SessionNameRenameError` whose `acceptedRecord` is
+          // the parsed CURRENT record (the routes answer it as a bare
+          // `sessionName`, never a `.data` field).
+          const accepted = error?.acceptedRecord
+          if (accepted) dispatch(receiveSessionNameProjections([{ record: accepted, ref: accepted.ref }]))
         }
       }
       if (summaryOverride !== undefined) {

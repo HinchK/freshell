@@ -1123,6 +1123,32 @@ impl FreshCodexState {
             FreshAgentCreateOutcome::Proceed(guard) => guard,
         };
 
+        // Unified agent names (Task 8 acceptance): the pending RECORD for the
+        // frame's handle exists from REQUEST RECEIPT — the pane content and
+        // the client's rename capture carry the handle immediately, while
+        // the cold sidecar spawn + `thread/start` handshake below takes
+        // seconds. A pane-header rename committed inside that window must
+        // resolve the record the server already accepted on the wire (the
+        // pre-fix shape answered 404 NAME_NOT_FOUND and silently lost the
+        // manual pre-durable name to the first-message fallback).
+        // Idempotent with the post-`thread/start` re-ensure
+        // (`admit_create_handle_named`, which also stashes the thread key
+        // and writes the prospective acquisition evidence).
+        if let Some(handle) = naming_handle
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+        {
+            let sink = self.naming();
+            let _ = crate::naming::admit_pending_projection(
+                &sink,
+                handle,
+                freshell_protocol::session_names::NamedProvider::Codex,
+                msg.cwd.as_deref(),
+            )
+            .await;
+        }
+
         // The resume thread id: the legacy `resumeSessionId` first, else the
         // provider-matched `sessionRef` (Node parity: `runtime-manager.ts:106-108`
         // promotes the sessionRef into the adapter's resume input the same way) --
@@ -8005,6 +8031,72 @@ pub(crate) mod tests {
         );
     }
 
+    /// Unified agent names (Task 8 acceptance): the pre-durable pending
+    /// record is admitted at REQUEST RECEIPT, not after the app-server
+    /// answers `thread/start`. The pane content (and the client's rename
+    /// capture) carries the handle from the moment the create frame is
+    /// sent, and the cold sidecar spawn + `thread/start` handshake takes
+    /// seconds — a pane-header rename committed inside that window
+    /// targeted a record the server had accepted on the wire but not yet
+    /// admitted (404 NAME_NOT_FOUND), silently losing the manual
+    /// pre-durable name to the first-message fallback. Admission is
+    /// idempotent, so the post-`thread/start` re-ensure in
+    /// `admit_create_handle_named` answers the same record and adds the
+    /// stash/acquisition evidence unchanged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_admits_the_pending_record_before_the_sidecar_answers_thread_start() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd(
+            r#"{"threadStartThreadId":"thread-early-admit","delayMethodsMs":{"thread/start":1500}}"#,
+        );
+        let (st, _rx) = state_with_bus();
+        let sink = crate::naming::test_support::RecordingSink::new();
+        st.set_session_naming(sink.clone());
+        let create = FreshAgentCreate {
+            naming_handle: Some("handle-codex-early".to_string()),
+            request_id: "req-codex-early".to_string(),
+            session_type: freshell_protocol::SessionType::Freshcodex,
+            provider: Some(freshell_protocol::AgentProvider::Codex),
+            cwd: None,
+            legacy_restore_context: None,
+            resume_session_id: None,
+            session_ref: None,
+            model: None,
+            model_selection: None,
+            permission_mode: None,
+            sandbox: None,
+            effort: None,
+            plugins: None,
+            tab_id: None,
+        };
+
+        // Park the create inside its deferred `thread/start` handshake.
+        let joined = tokio::spawn(async move { st.handle_create(create, None).await });
+        // We are inside the window: the deferred answer is 1500ms out, and
+        // the record — admitted at REQUEST RECEIPT — must already exist.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        use crate::naming::SessionNaming as _;
+        let updates = sink
+            .get(vec![
+                freshell_protocol::session_names::SessionNameRef::Pending {
+                    id: "handle-codex-early".to_string(),
+                },
+            ])
+            .await
+            .expect("get resolves");
+        assert_eq!(
+            updates.len(),
+            1,
+            "the pending record must exist before `thread/start` answers"
+        );
+
+        // Cleanup: let the deferred handshake finish so no spawned sidecar
+        // outlives the test.
+        let _ = joined.await;
+        std::env::remove_var("CODEX_CMD");
+        std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
+    }
+
     // ── wedged-sidecar quiet deadman (the wedged-but-ALIVE sidecar case) ────────
     //
     // These tests drive the production paths (`handle_send` / `get_snapshot` /
@@ -8067,6 +8159,56 @@ pub(crate) mod tests {
             }
         }
         FrameCollection { matched, frames }
+    }
+
+    /// Unified agent names (Task 8 — the T2-M3/T4-M3 per-runtime lane pin):
+    /// the shared accepted-input callback — an accepted freshcodex send feeds
+    /// the naming authority ONE activity carrying the prompt text once
+    /// `turn/start` is acked; the pre-durable handle is the activity target
+    /// until the rollout bind consumes the stash.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn send_feeds_the_naming_authority_once_with_the_accepted_text() {
+        let _guard = ENV_LOCK.lock().await;
+        configure_fake_codex_cmd("{}");
+        let (st, mut rx) = state_with_bus();
+        let sink = crate::naming::test_support::RecordingSink::new();
+        st.set_session_naming(sink.clone());
+        let session_id =
+            create_real_fake_session_with_naming_handle(&st, &mut rx, "handle-codex-naming-send")
+                .await;
+
+        st.handle_send(send_msg(&session_id, "Fix the sardine crash"))
+            .await;
+
+        // The feed fires after the turn/start ack; poll the sink bounded.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if !sink.activities.lock().unwrap().is_empty() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the accepted send feeds the naming authority");
+        let activities = sink.activities.lock().unwrap().clone();
+        assert_eq!(activities.len(), 1, "{activities:?}");
+        assert_eq!(
+            activities[0].target,
+            freshell_protocol::session_names::SessionNameRef::Pending {
+                id: "handle-codex-naming-send".to_string()
+            }
+        );
+        assert_eq!(activities[0].mode, "freshcodex");
+        assert_eq!(
+            activities[0].first_user_message.as_deref(),
+            Some("Fix the sardine crash")
+        );
+        assert_eq!(
+            activities[0].reason,
+            crate::naming::NameActivityReason::AcceptedUserMessage
+        );
+        st.shutdown().await;
     }
 
     #[tokio::test]
@@ -16239,6 +16381,54 @@ pub(crate) mod tests {
         )
         .await;
 
+        let created: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();
+                if frame["type"] == "freshAgent.created"
+                    || frame["type"] == "freshAgent.create.failed"
+                {
+                    return frame;
+                }
+            }
+        })
+        .await
+        .expect("the fake app-server responds within the budget");
+        assert_eq!(
+            created["type"], "freshAgent.created",
+            "fixture create failed: {created}"
+        );
+        created["sessionId"].as_str().unwrap().to_string()
+    }
+
+    /// [`create_real_fake_session`] with a NAMING HANDLE on the create frame
+    /// (the Task-8 accepted-input lane pin): the real create lane stashes the
+    /// pre-durable handle against the thread id via `admit_create_handle_named`.
+    async fn create_real_fake_session_with_naming_handle(
+        st: &FreshCodexState,
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        naming_handle: &str,
+    ) -> String {
+        st.handle_create(
+            FreshAgentCreate {
+                naming_handle: Some(naming_handle.to_string()),
+                request_id: "req-naming-send".to_string(),
+                session_type: freshell_protocol::SessionType::Freshcodex,
+                provider: Some(freshell_protocol::AgentProvider::Codex),
+                cwd: None,
+                legacy_restore_context: None,
+                resume_session_id: None,
+                session_ref: None,
+                model: None,
+                model_selection: None,
+                permission_mode: None,
+                sandbox: None,
+                effort: None,
+                plugins: None,
+                tab_id: None,
+            },
+            None,
+        )
+        .await;
         let created: Value = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 let frame: Value = serde_json::from_str(&rx.recv().await.unwrap()).unwrap();

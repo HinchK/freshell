@@ -54,7 +54,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use freshell_protocol::native_location::NativeLocation;
+use freshell_freshagent::naming::SessionNaming;
+use freshell_protocol::native_location::{
+    NativeAcquisition, NativeEvidenceKind, NativeLocation, NativePersistence,
+};
 use freshell_protocol::session_names::{NameRevision, NameSource, SessionNameRef};
 use uuid::Uuid;
 
@@ -343,6 +346,68 @@ pub(crate) fn select_work(
     }
 }
 
+/// Unified agent names (Task 8 acceptance): on-demand route discovery for
+/// an ARMED claude native series with no location — the index-adopted
+/// flow (the auto-title sweep's hydration creates the record; nothing
+/// attaches a location until a pane's runtime lane runs, so a session
+/// renamed from the sidebar/history would otherwise pause its native
+/// writeback forever — the native smoke's live-observed gap). Resolves the
+/// transcript by session id through `locate_transcript_selected`'s ordered
+/// candidates (the same evidence definition the attach arm trusts) and
+/// attaches the acquisition. `true` when the acquisition landed.
+pub(crate) async fn discover_claude_route(
+    names: &Arc<SessionNames>,
+    target: &SessionNameRef,
+) -> bool {
+    let SessionNameRef::Session {
+        provider: freshell_protocol::session_names::NamedProvider::Claude,
+        session_id,
+    } = target
+    else {
+        return false;
+    };
+    let session_id = session_id.to_string();
+    let selected = tokio::task::spawn_blocking(move || {
+        freshell_freshagent::locate_transcript_selected(&session_id)
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(selected) = selected else {
+        return false;
+    };
+    if selected
+        .transcript_cwd
+        .as_deref()
+        .filter(|cwd| !cwd.is_empty())
+        .is_none()
+    {
+        // The claude adapter's helper validates the request's `dir`
+        // against the transcript's original cwd — a cwd-less transcript
+        // (the fixture's create-time touch, a crash window's partial
+        // write) cannot route.
+        return false;
+    }
+    let location = NativeLocation::Claude {
+        config_root: selected.config_root.display().to_string(),
+        transcript_path: Some(selected.transcript_path.display().to_string()),
+        project_directory_key: None,
+        transcript_cwd: selected.transcript_cwd.clone(),
+        effective_project_key_override: None,
+    };
+    names
+        .record_acquisition(
+            target.clone(),
+            NativeAcquisition {
+                location,
+                evidence: NativeEvidenceKind::PersistedMetadata,
+                persistence: NativePersistence::Verified,
+            },
+        )
+        .await
+        .is_ok()
+}
+
 async fn run(
     names: Arc<SessionNames>,
     native: Arc<dyn NativeNameBackend>,
@@ -368,6 +433,15 @@ async fn run(
         } else {
             Vec::new()
         };
+        // On-demand route discovery for index-adopted claude series (the
+        // sweep's hydration attaches no location): resolve at most one
+        // series per poll pass — the 500ms poll bounds the rate, and a
+        // found acquisition unpauses the series for the NEXT snapshot.
+        for target in names.paused_claude_series_without_route() {
+            if discover_claude_route(&names, &target).await {
+                break;
+            }
+        }
         let native_items = names.native_work_snapshot();
         let selection = select_work(
             &native_items,

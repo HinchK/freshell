@@ -139,7 +139,7 @@ function transcriptPath(cliSessionId, cwd) {
 const lastUuidBySession = new Map()
 
 /** Append one transcript line in parse_transcript_turns' accepted shape. */
-function appendTranscript(cliSessionId, cwd, role, text) {
+function appendTranscript(cliSessionId, cwd, role, text, transcriptOverride) {
   const parentUuid = lastUuidBySession.get(cliSessionId) ?? null
   const uuid = randomUUID()
   lastUuidBySession.set(cliSessionId, uuid)
@@ -151,7 +151,7 @@ function appendTranscript(cliSessionId, cwd, role, text) {
     cwd: cwd ?? process.cwd(),
     message: { role, content: [{ type: 'text', text }] },
   }
-  appendJsonl(transcriptPath(cliSessionId, cwd), line)
+  appendJsonl(transcriptOverride ?? transcriptPath(cliSessionId, cwd), line)
 }
 
 // ── pending-request tracking (mirrors the real sidecar's permission-channel) ──
@@ -247,7 +247,7 @@ async function render(event) {
         model: sessions.get(sessionId)?.settings.model ?? 'fixture-model',
       })
       const st = sessions.get(sessionId)
-      if (st) appendTranscript(st.cliSessionId, st.cwd, 'assistant', data.text ?? 'Fixture turn')
+      if (st) appendTranscript(st.cliSessionId, st.cwd, 'assistant', data.text ?? 'Fixture turn', st.transcriptOverride)
       const subtype = data.subtype ?? 'success'
       // AGENTS.md invariant (real sidecar index.mjs:177-185): sdk.result rides
       // EVERY turn result; sdk.turn.complete is the positive edge ONLY on
@@ -302,16 +302,29 @@ async function handleInput(line) {
     // kata 1wxv Task 7 (fork-at-point, s2rk correction): a `forkSession:true`
     // create mints a NEW durable cliSessionId — real `claude --fork-session`
     // NEVER reuses the parent's id; plain resume keeps the same-id behavior.
+    // A PATH-shaped resumeSessionId (the server's cwd-gone fallback lane:
+    // `--resume <path>.jsonl` bypasses the CLI's project-slug scoping) names
+    // the transcript file to CONTINUE — the session's durable id stays the
+    // file's stem, and every record lands in THAT file (never a
+    // path-flattened `<...>.jsonl.jsonl` phantom).
     const forking = msg.forkSession === true
+    const resumeRaw = typeof msg.resumeSessionId === 'string' ? msg.resumeSessionId : null
+    const resumeIsPath = resumeRaw !== null
+      && (resumeRaw.includes('/') || resumeRaw.endsWith('.jsonl'))
+    const resumePath = !forking && resumeIsPath ? resumeRaw : null
     const cliSessionId = forking
       ? randomUUID()
-      : (msg.resumeSessionId ?? program.sessionId ?? randomUUID())
+      : (resumePath
+        ? path.basename(resumePath).replace(/\.jsonl$/, '')
+        : (resumeRaw ?? program.sessionId ?? randomUUID()))
     const cwd = msg.cwd ?? process.cwd()
     sessions.set(sessionId, { cliSessionId, cwd, pending: 0, pendingEntries: [],
+      transcriptOverride: resumePath,
       settings: { model: msg.model, effort: msg.effort, permissionMode: msg.permissionMode, cwd } })
     // A durable transcript EXISTS from create on (the reload-while-pending
     // snapshot route reads it before any turn completes) — touch, no bogus row.
-    const transcript = transcriptPath(cliSessionId, cwd)
+    // A path-resumed session's transcript IS the named file.
+    const transcript = resumePath ?? transcriptPath(cliSessionId, cwd)
     fs.mkdirSync(path.dirname(transcript), { recursive: true })
     if (forking && msg.resumeSessionId) {
       // created FIRST — a real consumer discards anything earlier. The
@@ -386,7 +399,7 @@ async function handleInput(line) {
   } else if (msg.type === 'send') {
     activeSessionId = msg.sessionId ?? activeSessionId
     const st = sessions.get(msg.sessionId)
-    if (st) appendTranscript(st.cliSessionId, st.cwd, 'user', msg.text)
+    if (st) appendTranscript(st.cliSessionId, st.cwd, 'user', msg.text, st.transcriptOverride)
     // Turn-open bookkeeping is unconditional (the real bridge always goes busy).
     await engine.emitEvent('activity', { status: 'running' }, 'msg:send:open')
     const emitted = await engine.handleMessage(msg)

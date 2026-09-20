@@ -15,8 +15,8 @@ import {
   updatePaneTitleByTerminalId,
 } from '@/store/panesSlice'
 import { applySessionRenameCascade, clearSessionTitleOverride } from '@/store/titleSync'
-import { receiveSessionNames } from '@/store/sessionNamesSlice'
-import { renameSessionName, parseSessionNameUpdate } from '@/lib/session-names'
+import { receiveSessionNameProjections, receiveSessionNames } from '@/store/sessionNamesSlice'
+import { parseSessionNameRecordOrUpdate, renameSessionName, parseSessionNameUpdate } from '@/lib/session-names'
 import { isScopedSessionRow, selectSessionNameRecord } from '@/store/selectors/sessionNameSelectors'
 import type { SessionNameRef } from '@shared/session-names'
 import { removeSessionFromProjects, setProjectExpanded } from '@/store/sessionsSlice'
@@ -521,7 +521,31 @@ export function ContextMenuProvider({
   }, [tabsState.activeTabId, dispatch, getSessionInfo, openSessionInNewTab, menuState?.target, appSettings, persistSessionMetadataOnTab])
 
   const renameSession = useCallback(async (sessionId: string, provider?: string, withSummary?: boolean) => {
-    const info = getSessionInfo(sessionId, provider, menuState?.target)
+    const target = menuState?.target
+    // The right-clicked ROW is authoritative for its own identity. A LIVE
+    // registry row (a running terminal's session) can exist while no
+    // directory collection carries the session — a single-turn transcript
+    // is filtered from the directory listing (non-interactive), and a fresh
+    // pane's registry row can precede any directory row. When the
+    // directory collections miss, the rename proceeds from the row's own
+    // fields instead of silently no-oping (the prompt's default text falls
+    // back to the canonical record's current name).
+    const directoryInfo = getSessionInfo(sessionId, provider, target)
+    const rowDerived = target && (target.kind === 'sidebar-session' || target.kind === 'history-session') && target.sessionId === sessionId
+      ? {
+          sessionId,
+          provider: (provider ?? target.provider ?? 'claude') as CodingCliProviderName,
+          sessionType: target.kind === 'sidebar-session' ? target.sessionType : undefined,
+          title: selectSessionNameRecord(appStore.getState(), {
+            kind: 'session',
+            provider: (provider ?? target.provider ?? 'claude') as 'claude' | 'codex' | 'opencode',
+            sessionId,
+          })?.name ?? '',
+          nameRef: undefined,
+          summary: undefined,
+        }
+      : null
+    const info = directoryInfo ?? (rowDerived ? { session: rowDerived } : null)
     if (!info) return
     const title = window.prompt('Rename session', info.session.title || '')
     if (title === null) return
@@ -577,9 +601,15 @@ export function ContextMenuProvider({
     } catch (error: any) {
       // A conflict carries the server's accepted record: fold it so the
       // winning name is visible everywhere; other failures stay quiet like
-      // the legacy flow (the refresh still lands).
-      const accepted = parseSessionNameUpdate(error?.data?.sessionName)
-      if (accepted) dispatch(receiveSessionNames([accepted]))
+      // the legacy flow (the refresh still lands). The canonical rename's
+      // SessionNameRenameError carries it as `acceptedRecord`; a raw
+      // ApiError (the legacy session route) carries the response body in
+      // `details` — the real ApiError never had a `.data` field. The
+      // scoped routes answer the accepted CURRENT record as a bare
+      // `sessionName` (the record-or-update extraction).
+      const accepted = error?.acceptedRecord
+        ?? parseSessionNameRecordOrUpdate(error?.details?.sessionName)
+      if (accepted) dispatch(receiveSessionNameProjections([{ record: accepted, ref: accepted.ref }]))
     }
   }, [dispatch, appStore, getSessionInfo, menuState?.target])
 
@@ -901,9 +931,14 @@ export function ContextMenuProvider({
       }
     } catch (error: any) {
       // A conflict carries the server's accepted record: fold it so the
-      // winning name is visible everywhere.
-      const accepted = parseSessionNameUpdate(error?.data?.sessionName)
-      if (accepted) dispatch(receiveSessionNames([accepted]))
+      // winning name is visible everywhere. `acceptedRecord` is the
+      // canonical rename error's carrier; `details.sessionName` is the raw
+      // ApiError's (the real ApiError never had a `.data` field). The
+      // scoped routes answer the accepted CURRENT record as a bare
+      // `sessionName` (the record-or-update extraction).
+      const accepted = error?.acceptedRecord
+        ?? parseSessionNameRecordOrUpdate(error?.details?.sessionName)
+      if (accepted) dispatch(receiveSessionNameProjections([{ record: accepted, ref: accepted.ref }]))
     }
   }, [dispatch, findTabByTerminalId])
 

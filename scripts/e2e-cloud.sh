@@ -590,14 +590,20 @@ cmd_run() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
 
+  # 4 CPU / 4Gi (the coordinator's pre-authorized escalation for the
+  # unified-agent-names acceptance lane): the 2-CPU instances' cold-attempt
+  # convergence — the pending-name journeys' verified bind + the five-surface
+  # shared-name reads — exceeded the per-case budgets across three
+  # consecutive focused runs (retry-passing flakes), while the same specs
+  # are 44/44 green locally at 3 workers.
   gcloud run jobs create $(gcloud_flags) "$RUN_JOB_NAME" \
     --image="$IMAGE_REMOTE" \
     --tasks="$shards" \
     --task-timeout="$timeout" \
     --max-retries=0 \
     --env-vars-file="$RUN_ENV_FILE" \
-    --memory=2Gi \
-    --cpu=2
+    --memory=4Gi \
+    --cpu=4
 
   # Execute this run's job and wait for completion, capturing the exit
   # status: an execute failure (quota, permissions, template error) MAY NOT

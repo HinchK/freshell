@@ -2890,12 +2890,36 @@ async fn admit_create_naming(
                     "session_names.operation_failed: {error}"
                 );
             })
-            .ok()?;
-        let update = updates.into_iter().next()?;
-        state
-            .registry
-            .update_session_name(terminal_id, &update.record);
-        return Some((update.record.name_ref.clone(), update.record));
+            .ok();
+        match updates.and_then(|found| found.into_iter().next()) {
+            Some(update) => {
+                state
+                    .registry
+                    .update_session_name(terminal_id, &update.record);
+                return Some((update.record.name_ref.clone(), update.record));
+            }
+            None => {
+                // A recovery create against a PROSPECTIVE (record-less)
+                // sessionRef — a zero-turn pane whose server restarted —
+                // must re-stamp the PERSISTED pre-durable handle (the pane
+                // content's own namingHandle) instead of leaving the
+                // restored row bound to a dead durable ref: only a pending
+                // binding puts the row on the sweep's reconcile list, so
+                // the verified bind can transfer the record once the
+                // transcript materializes. Without this fallthrough the
+                // pre-durable rename is orphaned behind a spent handle
+                // forever. A record-less durable create WITHOUT a handle
+                // keeps the previous behavior (durable binding, unnamed).
+                let has_persisted_handle = create
+                    .naming_handle
+                    .as_deref()
+                    .map(|handle| !handle.trim().is_empty())
+                    .unwrap_or(false);
+                if !has_persisted_handle {
+                    return None;
+                }
+            }
+        }
     }
     // Fresh scoped create: admit the pre-durable handle (client-sent, else
     // server-minted — the nanoid-style uuid facility).

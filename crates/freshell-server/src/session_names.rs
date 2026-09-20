@@ -872,6 +872,22 @@ impl SessionNames {
         }
     }
 
+    /// Task 4 dispatch re-check: whether the target's CURRENT accepted
+    /// record is a protected winner (manual / migration-protected /
+    /// accepted Freshell AI). The generation worker consults this between
+    /// its claim and the provider call — a MANUAL pending winner can bind
+    /// in that window (the materialization race), and a protected winner
+    /// stops generation, so the paid call is skipped and the fold's
+    /// protected arm closes the series.
+    pub(crate) fn generation_blocked_by_protected_winner(&self, target: &SessionNameRef) -> bool {
+        let view = self.core.current_view();
+        let (resolved, _) = view.document.resolve_ref(target);
+        view.document
+            .record_at(&name_ref_key(&resolved))
+            .map(|record| source_is_protected(record.source))
+            .unwrap_or(false)
+    }
+
     /// Task 4: index hydration for one scoped CLI session — install the free
     /// fallbacks (provider title > first message > directory basename) as a
     /// durable record when absent, WITHOUT scheduling any paid title across
@@ -967,6 +983,47 @@ impl SessionNames {
             });
         }
         items
+    }
+
+    /// Unified agent names (Task 8 acceptance): claude session refs whose
+    /// native write series is ARMED but has NO route (no verified or
+    /// prospective location). The index-adopted flow — the auto-title
+    /// sweep's hydration creates the record — attaches no location; only a
+    /// pane's runtime lane does. The native worker's on-demand discovery
+    /// resolves these by session id before the series can run.
+    pub(crate) fn paused_claude_series_without_route(&self) -> Vec<SessionNameRef> {
+        let view = self.core.current_view();
+        let document = &view.document;
+        let mut refs = Vec::new();
+        for (key, state) in &document.native_write {
+            if state.settled || state.cycles_consumed >= MAX_NATIVE_CYCLES {
+                continue;
+            }
+            if state.status == NativeSyncStatus::Synced
+                || state.status == NativeSyncStatus::Unsupported
+            {
+                continue;
+            }
+            let Some(record) = document.records.get(key) else {
+                continue;
+            };
+            if !matches!(
+                record.name_ref,
+                SessionNameRef::Session {
+                    provider: NamedProvider::Claude,
+                    ..
+                }
+            ) {
+                continue;
+            }
+            if document.locations.get(key).is_some_and(|location| {
+                location.verified.is_some() || location.prospective.is_some()
+            }) {
+                continue;
+            }
+            refs.push(record.name_ref.clone());
+        }
+        refs
     }
 
     /// Task 3: charge one native cycle before dispatch — persisting the

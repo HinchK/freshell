@@ -274,6 +274,433 @@ async fn seed_durable_record(sink: &Arc<RecordingSink>, handle: &str, session_id
     .unwrap();
 }
 
+/// Unified agent names (Task 8 acceptance): a pre-bind rename on a fresh
+/// claude pane whose content carries the PROSPECTIVE preallocated
+/// `sessionRef` (the WS/REST fresh-claude create contract) resolves
+/// through the pane's own pre-durable binding when the store has no
+/// session record yet — the claude CLI journey's pane-header rename before
+/// the first message materializes the transcript. The pending binding is
+/// read from the terminal registry row (both create doors stamp it via
+/// `set_naming`), and the client's captured `expectedNameRef` (the session
+/// ref — its only visible form pre-bind) is accepted: a 404-on-session
+/// proves no established conversation exists to have switched from.
+#[tokio::test]
+async fn pre_bind_claude_pane_rename_falls_back_to_the_pending_binding() {
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+    let registry = freshell_terminal::TerminalRegistry::new();
+    let state = state_with(tx.clone()).with_terminal_registry(registry.clone());
+    let sink = wire_recording_sink(&state);
+    // ONLY the create-time pending admission exists — no durable record for
+    // the preallocated session id yet.
+    sink.ensure_pending(PendingNameInput {
+        handle: "nh-prebind".into(),
+        provider: NamedProvider::Claude,
+        cwd: Some("/work/prebind".into()),
+    })
+    .await
+    .unwrap();
+
+    let terminal_id = create_registry_terminal(crate::router(state.clone())).await;
+    // The pre-bind binding BOTH create doors stamp on the terminal row.
+    registry.set_naming(
+        &terminal_id,
+        Some(SessionNameRef::Pending {
+            id: "nh-prebind".into(),
+        }),
+        Some("nh-prebind".into()),
+    );
+    seed_layout(
+        &state,
+        lone_pane_layout(json!({
+            "kind": "terminal",
+            "mode": "claude",
+            "terminalId": terminal_id,
+            "sessionRef": { "provider": "claude", "sessionId": "prealloc-prospective" },
+        })),
+    );
+
+    // The client's editor captured the session ref (its only visible form).
+    let req = Request::builder()
+        .method("PATCH")
+        .uri("/api/panes/p1")
+        .header("content-type", "application/json")
+        .header("x-auth-token", "tok")
+        .body(Body::from(
+            json!({
+                "name": "Pre-durable keep me",
+                "nameIntent": "user",
+                "expectedNameRef": { "kind": "session", "provider": "claude", "sessionId": "prealloc-prospective" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = crate::router(state.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The accepted record is the pending one, under the user intent.
+    assert_eq!(
+        body["data"]["nameRef"],
+        json!({ "kind": "pending", "id": "nh-prebind" }),
+        "{body}"
+    );
+    assert_eq!(
+        body["data"]["sessionName"]["record"]["name"],
+        json!("Pre-durable keep me"),
+        "{body}"
+    );
+    // The primary session attempt missed (no record yet); the pending
+    // fallback accepted the rename.
+    let recorded_renames = sink.renames.lock().unwrap().clone();
+    assert_eq!(recorded_renames.len(), 2, "{recorded_renames:?}");
+    assert_eq!(
+        recorded_renames[0].target,
+        SessionNameRef::Session {
+            provider: NamedProvider::Claude,
+            session_id: "prealloc-prospective".into(),
+        }
+    );
+    assert_eq!(
+        recorded_renames[1].target,
+        SessionNameRef::Pending {
+            id: "nh-prebind".into()
+        }
+    );
+    assert_eq!(recorded_renames[1].name, "Pre-durable keep me");
+    assert_eq!(recorded_renames[1].intent, NameIntent::User);
+}
+
+/// Unified agent names (Task 8, the T6-R3 sender-repair consequence): a
+/// pane whose CONTENT carries the pre-durable `namingHandle` (what the
+/// view-layer create senders stamp — the client's own rungs) resolves its
+/// rename target as the PENDING record DIRECTLY, even while the content
+/// also carries the PROSPECTIVE preallocated sessionRef. The client's
+/// captured `expectedNameRef` follows the same rungs, so the capture
+/// matches the server-resolved target — pre-flip this shape refused with
+/// a spurious NAME_TARGET_MOVED (session-first resolution vs the
+/// pending-first capture), which is exactly what the pre-durable
+/// pane-header journey demonstrated.
+#[tokio::test]
+async fn pane_rename_prefers_the_content_handle_over_a_prospective_session_ref() {
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+    let registry = freshell_terminal::TerminalRegistry::new();
+    let state = state_with(tx.clone()).with_terminal_registry(registry.clone());
+    let sink = wire_recording_sink(&state);
+    sink.ensure_pending(PendingNameInput {
+        handle: "nh-sender-stamped".into(),
+        provider: NamedProvider::Claude,
+        cwd: Some("/work/sender-stamped".into()),
+    })
+    .await
+    .unwrap();
+
+    let terminal_id = create_registry_terminal(crate::router(state.clone())).await;
+    seed_layout(
+        &state,
+        lone_pane_layout(json!({
+            "kind": "terminal",
+            "mode": "claude",
+            "terminalId": terminal_id,
+            "namingHandle": "nh-sender-stamped",
+            "sessionRef": { "provider": "claude", "sessionId": "prealloc-prospective-2" },
+        })),
+    );
+
+    // The client's editor captured the pane's pre-durable binding — the
+    // same rungs the sender stamped into its content.
+    let req = Request::builder()
+        .method("PATCH")
+        .uri("/api/panes/p1")
+        .header("content-type", "application/json")
+        .header("x-auth-token", "tok")
+        .body(Body::from(
+            json!({
+                "name": "Pre-durable keep me",
+                "nameIntent": "user",
+                "expectedNameRef": { "kind": "pending", "id": "nh-sender-stamped" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = crate::router(state.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["data"]["nameRef"],
+        json!({ "kind": "pending", "id": "nh-sender-stamped" }),
+        "{body}"
+    );
+    // ONE rename, targeted at the pending record — no session-first
+    // attempt, no fallback, no spurious capture conflict.
+    let recorded_renames = sink.renames.lock().unwrap().clone();
+    assert_eq!(recorded_renames.len(), 1, "{recorded_renames:?}");
+    assert_eq!(
+        recorded_renames[0].target,
+        SessionNameRef::Pending {
+            id: "nh-sender-stamped".into()
+        }
+    );
+    assert_eq!(recorded_renames[0].name, "Pre-durable keep me");
+    assert_eq!(recorded_renames[0].intent, NameIntent::User);
+}
+
+/// Unified agent names (Task 8 acceptance): a pane-header rename carries the
+/// editor's CAPTURED binding (`expectedNameRef`) — the client's assertion
+/// that the pane is scoped with that naming target. The layout mirror is a
+/// REPLICA that lags a freshly created agent pane: the ui.layout.sync
+/// carrying the picker→agent content switch lands seconds after the editor
+/// could open, and a rename committed inside that window resolved the pane
+/// through its STALE pre-selection content — silently downgrading the
+/// scoped rename to the legacy layout label (the manual pre-durable name
+/// was lost; the first-message fallback later won). The capture must never
+/// be silently downgraded: a mirror that resolves unscoped while the
+/// request carries a scoped capture targets the CAPTURED binding through
+/// the naming authority, not the layout alias.
+#[tokio::test]
+async fn pane_rename_with_capture_never_downgrades_to_the_legacy_label() {
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+    let registry = freshell_terminal::TerminalRegistry::new();
+    let state = state_with(tx.clone()).with_terminal_registry(registry.clone());
+    let sink = wire_recording_sink(&state);
+    sink.ensure_pending(PendingNameInput {
+        handle: "nh-stale-mirror".into(),
+        provider: NamedProvider::Claude,
+        cwd: Some("/work/stale-mirror".into()),
+    })
+    .await
+    .unwrap();
+
+    // The mirror's LAST adopted sync predates the picker→agent selection:
+    // the pane is still adopted as its pre-selection PICKER content.
+    seed_layout(
+        &state,
+        lone_pane_layout(json!({ "kind": "picker", "title": "New Tab" })),
+    );
+
+    // The editor's captured binding — the pre-durable handle the sender
+    // stamped and the pane header rename asserts.
+    let req = Request::builder()
+        .method("PATCH")
+        .uri("/api/panes/p1")
+        .header("content-type", "application/json")
+        .header("x-auth-token", "tok")
+        .body(Body::from(
+            json!({
+                "name": "Pre-durable keep me",
+                "nameIntent": "user",
+                "expectedNameRef": { "kind": "pending", "id": "nh-stale-mirror" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = crate::router(state.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The SCOPED response shape — never the legacy
+    // `{tabId, paneId, tabRenamed}` layout-label write.
+    assert_eq!(
+        body["data"]["nameRef"],
+        json!({ "kind": "pending", "id": "nh-stale-mirror" }),
+        "{body}"
+    );
+    assert_eq!(
+        body["data"]["sessionName"]["record"]["name"],
+        json!("Pre-durable keep me"),
+        "{body}"
+    );
+    assert_eq!(
+        body["data"]["sessionName"]["record"]["source"],
+        json!("manual"),
+        "{body}"
+    );
+    assert!(body["data"].get("tabRenamed").is_none(), "{body}");
+    // ONE rename through the naming authority, targeted at the capture —
+    // the same single-rename/no-fallback shape as the fresh-mirror test.
+    let recorded_renames = sink.renames.lock().unwrap().clone();
+    assert_eq!(recorded_renames.len(), 1, "{recorded_renames:?}");
+    assert_eq!(
+        recorded_renames[0].target,
+        SessionNameRef::Pending {
+            id: "nh-stale-mirror".into()
+        }
+    );
+    assert_eq!(recorded_renames[0].name, "Pre-durable keep me");
+    assert_eq!(recorded_renames[0].intent, NameIntent::User);
+    // And NO legacy `ui.command{pane.rename}` alias frame.
+    let mut rx = tx.subscribe();
+    let frames = drain_frames(&mut rx);
+    assert!(
+        !frames.iter().any(|frame| {
+            frame["command"] == json!("pane.rename") || frame["type"] == json!("pane.rename")
+        }),
+        "{frames:?}"
+    );
+}
+
+/// The same capture-wins rule when the mirror has never adopted the pane at
+/// all (a rename racing the FIRST sync): a missing mirror resolution must
+/// not answer `pane not found` (the legacy miss shape) when the request
+/// carries a scoped capture the naming authority can resolve.
+#[tokio::test]
+async fn pane_rename_with_capture_targets_the_capture_when_the_pane_is_unmirrored() {
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+    let registry = freshell_terminal::TerminalRegistry::new();
+    let state = state_with(tx.clone()).with_terminal_registry(registry.clone());
+    let sink = wire_recording_sink(&state);
+    sink.ensure_pending(PendingNameInput {
+        handle: "nh-unsynced".into(),
+        provider: NamedProvider::Claude,
+        cwd: Some("/work/unsynced".into()),
+    })
+    .await
+    .unwrap();
+
+    // No layout seed at all: the pane exists only in the (unsynced) client.
+    let req = Request::builder()
+        .method("PATCH")
+        .uri("/api/panes/p1")
+        .header("content-type", "application/json")
+        .header("x-auth-token", "tok")
+        .body(Body::from(
+            json!({
+                "name": "Pre-durable keep me",
+                "nameIntent": "user",
+                "expectedNameRef": { "kind": "pending", "id": "nh-unsynced" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = crate::router(state.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["data"]["nameRef"],
+        json!({ "kind": "pending", "id": "nh-unsynced" }),
+        "{body}"
+    );
+    assert_eq!(
+        body["data"]["sessionName"]["record"]["source"],
+        json!("manual"),
+        "{body}"
+    );
+}
+
+/// Unified agent names (Task 8 acceptance): the tab route's Session
+/// source-pointer gate is fed by the SAME lagging mirror as the pane
+/// resolution — the ui.layout.sync carrying the tab's post-selection
+/// `nameSource: Session{pane}` (and the pane's agent content) lands seconds
+/// after the editor could open. A tab rename committed inside that window
+/// answered the LEGACY tab-title write. The capture on the request is the
+/// client's assertion that the tab's name IS a session's name with that
+/// binding; it must reach the naming authority through the same
+/// capture-wins rule as the pane route.
+#[tokio::test]
+async fn tab_rename_with_capture_never_downgrades_to_the_legacy_title() {
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+    let registry = freshell_terminal::TerminalRegistry::new();
+    let state = state_with(tx.clone()).with_terminal_registry(registry.clone());
+    let sink = wire_recording_sink(&state);
+    sink.ensure_pending(PendingNameInput {
+        handle: "nh-tab-stale".into(),
+        provider: NamedProvider::Claude,
+        cwd: Some("/work/tab-stale".into()),
+    })
+    .await
+    .unwrap();
+
+    // The mirror's LAST adopted sync predates the selection: the tab's lone
+    // pane is still the pre-selection PICKER (its nameSource is the
+    // unresolved derivation, never Session).
+    seed_layout(
+        &state,
+        lone_pane_layout(json!({ "kind": "picker", "title": "New Tab" })),
+    );
+
+    let req = Request::builder()
+        .method("PATCH")
+        .uri("/api/tabs/t1")
+        .header("content-type", "application/json")
+        .header("x-auth-token", "tok")
+        .body(Body::from(
+            json!({
+                "name": "Pre-durable keep me",
+                "nameIntent": "user",
+                "expectedNameRef": { "kind": "pending", "id": "nh-tab-stale" },
+            })
+            .to_string(),
+        ))
+        .unwrap();
+    let resp = crate::router(state.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["data"]["nameRef"],
+        json!({ "kind": "pending", "id": "nh-tab-stale" }),
+        "{body}"
+    );
+    assert_eq!(
+        body["data"]["sessionName"]["record"]["name"],
+        json!("Pre-durable keep me"),
+        "{body}"
+    );
+    assert_eq!(
+        body["data"]["sessionName"]["record"]["source"],
+        json!("manual"),
+        "{body}"
+    );
+    // The response envelope still carries the sole pane the client's editor
+    // captured (renamePaneAfterMirrorReady checks `data.paneId`).
+    assert_eq!(body["data"]["paneId"], json!("p1"), "{body}");
+    // ONE rename through the naming authority; NO legacy alias frame.
+    let recorded_renames = sink.renames.lock().unwrap().clone();
+    assert_eq!(recorded_renames.len(), 1, "{recorded_renames:?}");
+    assert_eq!(
+        recorded_renames[0].target,
+        SessionNameRef::Pending {
+            id: "nh-tab-stale".into()
+        }
+    );
+    let mut rx = tx.subscribe();
+    let frames = drain_frames(&mut rx);
+    assert!(
+        !frames.iter().any(|frame| {
+            frame["command"] == json!("tab.rename") || frame["type"] == json!("tab.rename")
+        }),
+        "{frames:?}"
+    );
+}
+
+/// Unified agent names (Task 8 acceptance): the pre-bind fallback is a
+/// FALLBACK — a pane with NO pending binding anywhere (no content
+/// `namingHandle`, no registry-row binding, no stash) keeps the honest
+/// 404 NAME_NOT_FOUND, never a silent success.
+#[tokio::test]
+async fn pre_bind_rename_without_any_pending_binding_stays_404() {
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+    let registry = freshell_terminal::TerminalRegistry::new();
+    let state = state_with(tx.clone()).with_terminal_registry(registry.clone());
+    let _sink = wire_recording_sink(&state);
+
+    let terminal_id = create_registry_terminal(crate::router(state.clone())).await;
+    seed_layout(
+        &state,
+        lone_pane_layout(json!({
+            "kind": "terminal",
+            "mode": "claude",
+            "terminalId": terminal_id,
+            "sessionRef": { "provider": "claude", "sessionId": "prealloc-unbound" },
+        })),
+    );
+
+    let (status, body) = patch_pane(crate::router(state.clone()), "p1", "Nothing To Target").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"], json!("NAME_NOT_FOUND"), "{body}");
+}
+
 /// Unified agent names (Task 2): renaming a SCOPED pane routes to the ONE
 /// naming authority — the durable session record — and never writes the
 /// layout alias: NO `ui.command{pane.rename}` frame, no registry title
@@ -721,7 +1148,9 @@ async fn naming_accepted_input_intent_and_revision_pass_through() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // Explicit user intent + a compare-and-set revision.
+    // Explicit user intent + a compare-and-set revision. The sink honors
+    // the CAS (the real store's contract): the seed binds at revision 2,
+    // the first rename above moved it to 3, so the matching revision is 3.
     let router = crate::router(state.clone());
     let resp = router
         .oneshot(
@@ -731,7 +1160,7 @@ async fn naming_accepted_input_intent_and_revision_pass_through() {
                 .header("x-auth-token", "tok")
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    json!({ "name": "User Intent", "nameIntent": "user", "ifRevision": 7 })
+                    json!({ "name": "User Intent", "nameIntent": "user", "ifRevision": 3 })
                         .to_string(),
                 ))
                 .unwrap(),
@@ -745,8 +1174,69 @@ async fn naming_accepted_input_intent_and_revision_pass_through() {
     assert_eq!(renames[0].intent, NameIntent::Automatic);
     assert_eq!(renames[0].if_revision, None);
     assert_eq!(renames[1].intent, NameIntent::User);
-    assert_eq!(renames[1].if_revision, Some(7));
+    assert_eq!(renames[1].if_revision, Some(3));
     drop(renames);
+}
+
+/// Unified agent names (Task 8 acceptance): a stale `ifRevision` conflict
+/// must answer the CURRENT record as `sessionName` — the client editor's
+/// documented conflict contract (the accepted winner is folded for display
+/// AND the editor's capture is refreshed from it so the user's resubmit
+/// can succeed). The canonical/session/terminal routes already carry it
+/// (`name_error_response`); the pane route must answer the same shape —
+/// without it the pane editor is STUCK: every resubmit re-sends the same
+/// stale revision and re-conflicts forever (observed live: "the record
+/// moved to revision 2 while the editor held 1" persisting across every
+/// resubmit of a pre-durable rename racing its own materialization).
+#[tokio::test]
+async fn stale_revision_conflict_answers_the_current_record() {
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+    let state = state_with(tx.clone());
+    let sink = wire_recording_sink(&state);
+    // The seed binds the durable record at revision 2 (pending admission
+    // allocates 1, the verified bind moves it to 2) — the exact live
+    // sequence of a pre-durable pane rename racing its materialization.
+    seed_durable_record(&sink, "handle-conflict", "sess-conflict").await;
+    seed_layout(
+        &state,
+        lone_pane_layout(json!({
+            "kind": "terminal", "mode": "claude",
+            "sessionRef": { "provider": "claude", "sessionId": "sess-conflict" },
+        })),
+    );
+
+    let router = crate::router(state.clone());
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/panes/p1")
+                .header("x-auth-token", "tok")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({ "name": "Stale Edit", "nameIntent": "user", "ifRevision": 1 })
+                        .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    let answered = body_json(resp).await;
+    assert_eq!(
+        answered["error"],
+        json!("NAME_REVISION_CONFLICT"),
+        "the conflict class must be the uniform code: {answered}"
+    );
+    assert!(
+        answered["sessionName"].is_object(),
+        "the conflict must answer the CURRENT record as sessionName (the editor's          capture-refresh contract — without it the pane editor re-conflicts the          same stale revision forever): {answered}"
+    );
+    assert_eq!(
+        answered["sessionName"]["revision"],
+        json!(2),
+        "the answered record is the accepted current one: {answered}"
+    );
 }
 
 /// Unified agent names (Task 2): a zero-turn fresh-agent pane (restarted

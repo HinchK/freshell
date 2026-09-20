@@ -20,6 +20,22 @@
 // (codex.rs) — the real bridge has no approval surface to mirror — so the
 // controllable events render as fixture-namespaced notifications
 // `freshell.fixture/approval` / `freshell.fixture/question` (params = data).
+//
+// Unified agent names (Task 8) — the metadata events the naming lanes need:
+//   - `thread/name/set` persists the thread's name in-process and answers
+//     `{}` + a `thread/name/updated` notification (the real app-server's
+//     own observation event); `thread/read` answers the stored name. With
+//     FAKE_CODEX_HOLD_NAME_SET_FILE=<path> set, a name/set whose hold file
+//     exists does NOT answer until the file disappears (the in-flight
+//     native write the restart case needs).
+//   - `turn/start` appends the prompt's user records (`response_item` user
+//     `input_text` + `event_msg` `user_message`) to the thread's rollout —
+//     the durable metadata the server's rollout parser reads for the
+//     first-message fallback and generation arming.
+//   - With FAKE_CODEX_DEFER_ROLLOUT=1, `thread/start` returns its
+//     id/path WITHOUT writing the rollout (the REAL app-server's
+//     prospective-start semantics — F08: the fresh thread's returned path
+//     does not yet exist); the first `turn/start` materializes it.
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -124,10 +140,84 @@ function writeRollout(threadId) {
     `${JSON.stringify({
       timestamp: now.toISOString(),
       type: 'session_meta',
-      payload: { id: threadId, cwd: process.cwd(), createdAt: now.toISOString() },
+      payload: { id: threadId, cwd: process.cwd() },
     })}\n`,
   )
   return file
+}
+
+/**
+ * Locate the thread's EXISTING rollout anywhere under the
+ * <CODEX_HOME>/sessions year/month/day tree (rollout-<ts>-<threadId>.jsonl).
+ * A REAL app-server process resumed by id reads the durable thread FROM DISK
+ * and continues THAT file — a restarted app-server never mints a second
+ * rollout for the same id (two would collide in freshell's identity
+ * quarantine, hiding the session from the directory).
+ */
+function findRollout(threadId) {
+  const sessionsRoot = path.join(codexHome(), 'sessions')
+  if (!fs.existsSync(sessionsRoot)) return null
+  const years = fs.readdirSync(sessionsRoot).sort().reverse()
+  for (const year of years) {
+    const yearDir = path.join(sessionsRoot, year)
+    if (!fs.statSync(yearDir).isDirectory()) continue
+    for (const month of fs.readdirSync(yearDir).sort().reverse()) {
+      const monthDir = path.join(yearDir, month)
+      if (!fs.statSync(monthDir).isDirectory()) continue
+      for (const day of fs.readdirSync(monthDir).sort().reverse()) {
+        const dayDir = path.join(monthDir, day)
+        if (!fs.statSync(dayDir).isDirectory()) continue
+        const match = fs.readdirSync(dayDir)
+          .find((name) => name.endsWith(`-${threadId}.jsonl`))
+        if (match) return path.join(dayDir, match)
+      }
+    }
+  }
+  return null
+}
+
+/** Unified agent names (Task 8): append the prompt's user records — the
+ * metadata pair the server's rollout parser reads for the first-message
+ * fallback and generation arming. */
+function appendUserRecords(rolloutPath, text) {
+  const prompt = String(text ?? '').trim()
+  if (!rolloutPath || prompt.length === 0) return
+  const now = new Date().toISOString()
+  const lines = [
+    JSON.stringify({
+      timestamp: now,
+      type: 'response_item',
+      payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: prompt }] },
+    }),
+    JSON.stringify({
+      timestamp: now,
+      type: 'event_msg',
+      payload: { type: 'user_message', message: prompt, kind: 'plain' },
+    }),
+  ]
+  fs.appendFileSync(rolloutPath, `${lines.join('\n')}\n`)
+}
+
+// Unified agent names (Task 8): the in-process thread-name store (the
+// metadata `thread/read` answers) keyed by thread id.
+const threadNames = new Map()
+// threadId -> the rollout path this fixture wrote (or deferred).
+const threadRollouts = new Map()
+const deferRollout = env.FAKE_CODEX_DEFER_ROLLOUT === '1'
+const nameSetHoldFile = env.FAKE_CODEX_HOLD_NAME_SET_FILE
+
+/** The rollout path `thread/start` WOULD write (deferred mode returns it
+ * without creating it — the real app-server's prospective path). */
+function deferredRolloutPath(threadId) {
+  const now = new Date()
+  const dir = path.join(
+    codexHome(),
+    'sessions',
+    String(now.getUTCFullYear()),
+    String(now.getUTCMonth() + 1).padStart(2, '0'),
+    String(now.getUTCDate()).padStart(2, '0'),
+  )
+  return path.join(dir, `rollout-${now.toISOString().slice(0, 19).replace(/:/g, '-')}-${threadId}.jsonl`)
 }
 
 function threadResult(threadId, rolloutPath) {
@@ -191,7 +281,14 @@ wss.on('connection', (socket) => {
         if (emitted.has('crash')) return
         const threadId = program.sessionId ?? `thread-${randomUUID()}`
         activeThreadId = threadId
-        const rolloutPath = writeRollout(threadId)
+        // Unified agent names (Task 8): by default this fixture writes the
+        // rollout eagerly (its historical contract); FAKE_CODEX_DEFER_ROLLOUT=1
+        // restores the REAL app-server's prospective-start semantics — the
+        // returned path does not exist until the first turn materializes it.
+        const rolloutPath = deferRollout
+          ? deferredRolloutPath(threadId)
+          : writeRollout(threadId)
+        threadRollouts.set(threadId, rolloutPath)
         if (!emitted.has('session')) {
           await engine.emitEvent('session', { id: threadId }, 'rpc:thread/start:default')
         }
@@ -203,13 +300,53 @@ wss.on('connection', (socket) => {
         if (emitted.has('crash')) return
         const threadId = message.params?.threadId ?? `thread-${randomUUID()}`
         activeThreadId = threadId
-        const rolloutPath = writeRollout(threadId)
+        // A resumed thread CONTINUES its existing rollout (the real
+        // app-server reads the durable thread from disk); only a thread
+        // with no rollout on disk gets a fresh file.
+        const rolloutPath = findRollout(threadId) ?? writeRollout(threadId)
+        threadRollouts.set(threadId, rolloutPath)
         await engine.emitResume(threadId, 'rpc:thread/resume')
         respond(threadResult(threadId, rolloutPath))
         break
       }
       case 'thread/read': {
-        respond({ thread: { id: message.params?.threadId ?? activeThreadId, ephemeral: false } })
+        respond({
+          thread: {
+            id: message.params?.threadId ?? activeThreadId,
+            ephemeral: false,
+            ...(threadNames.get(message.params?.threadId ?? activeThreadId) !== undefined
+              ? { name: threadNames.get(message.params?.threadId ?? activeThreadId) }
+              : {}),
+          },
+        })
+        break
+      }
+      case 'thread/name/set': {
+        // Unified agent names (Task 8): the real metadata surface — set the
+        // thread's name, observe it back on thread/read, and emit the
+        // app-server's own thread/name/updated observation event. The hold
+        // gate models an in-flight native write (the restart case).
+        const threadId = message.params?.threadId ?? activeThreadId
+        const name = String(message.params?.name ?? '')
+        const applyAndAnswer = () => {
+          threadNames.set(threadId, name)
+          respond({})
+          broadcast({
+            method: 'thread/name/updated',
+            params: { threadId, threadName: name },
+          })
+        }
+        if (nameSetHoldFile && fs.existsSync(nameSetHoldFile)) {
+          const poll = setInterval(() => {
+            if (!fs.existsSync(nameSetHoldFile)) {
+              clearInterval(poll)
+              applyAndAnswer()
+            }
+          }, 25)
+          poll.unref?.()
+          return
+        }
+        applyAndAnswer()
         break
       }
       case 'turn/start': {
@@ -218,6 +355,20 @@ wss.on('connection', (socket) => {
         activeThreadId = message.params?.threadId ?? activeThreadId
         activeTurnId = `turn-${randomUUID()}`
         respond({ turn: { id: activeTurnId, status: 'inProgress' } })
+        // Unified agent names (Task 8): the prompt's user records land in the
+        // rollout (the naming metadata), materializing a deferred rollout.
+        const rolloutPath = threadRollouts.get(activeThreadId)
+        if (rolloutPath && !fs.existsSync(rolloutPath)) {
+          const now = new Date()
+          const dir = path.dirname(rolloutPath)
+          fs.mkdirSync(dir, { recursive: true })
+          fs.writeFileSync(rolloutPath, `${JSON.stringify({
+            timestamp: now.toISOString(),
+            type: 'session_meta',
+            payload: { id: activeThreadId, cwd: process.cwd() },
+          })}\n`)
+        }
+        appendUserRecords(rolloutPath, message.params?.input ?? message.params?.prompt ?? '')
         // Turn-open bookkeeping is unconditional (the real server always
         // broadcasts turn/started); a matching rule then owns the middle.
         await engine.emitEvent('activity', { state: 'busy' }, 'rpc:turn/start:open')

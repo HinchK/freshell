@@ -647,6 +647,37 @@ impl FreshClaudeState {
     /// out of scope (its `naming_handle` is ignored); a create WITHOUT a
     /// handle simply proceeds unnamed. Returns the frame projection when a
     /// handle was admitted.
+    /// Unified agent names (Task 8 acceptance): the pending RECORD for the
+    /// create frame's handle, admitted at REQUEST RECEIPT — BEFORE the
+    /// sidecar spawn/`created` handshake (seconds) during which the pane
+    /// content and the client's rename capture already carry the handle.
+    /// A rename committed inside that window must resolve the same record
+    /// the server accepted on the wire (the pre-fix shape answered 404
+    /// NAME_NOT_FOUND and silently lost the manual pre-durable name).
+    /// Idempotent: the post-`created` re-ensure in [`Self::admit_create_handle`]
+    /// answers the same record and adds the placeholder-keyed stash.
+    async fn admit_create_handle_early(&self, msg: &FreshAgentCreate, session_type: &str) {
+        if session_type == "kilroy" {
+            return;
+        }
+        let Some(handle) = msg
+            .naming_handle
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+        else {
+            return;
+        };
+        let sink = self.naming();
+        let _ = crate::naming::admit_pending_projection(
+            &sink,
+            handle,
+            freshell_protocol::session_names::NamedProvider::Claude,
+            msg.cwd.as_deref(),
+        )
+        .await;
+    }
+
     async fn admit_create_handle(
         &self,
         msg: &FreshAgentCreate,
@@ -802,6 +833,14 @@ impl FreshClaudeState {
             }
             FreshAgentCreateOutcome::Proceed(guard) => guard,
         };
+
+        // Unified agent names (Task 8 acceptance): the pending record for
+        // the frame's handle exists from REQUEST RECEIPT — the pane content
+        // and the client's rename capture carry the handle immediately,
+        // while the sidecar spawn + `created` handshake below takes seconds.
+        // Idempotent with the post-`created` re-ensure
+        // (`admit_create_handle`, which also stashes the placeholder key).
+        self.admit_create_handle_early(&msg, session_type).await;
 
         // Task 12 (D8 for fresh agents): a create-with-resume claims the per-sessionRef
         // lease BEFORE any spawn -- exactly one in-flight resume (and one live writer)
@@ -2243,26 +2282,52 @@ impl FreshClaudeState {
         // drop the feed; the store's redirect resolution decides, and
         // the next send addresses the adopted id anyway. Kilroy is out
         // of scope; a failed feed never blocks the turn.
-        let naming_target = self
-            .naming_handles
-            .lock()
-            .await
-            .get(&session_id)
-            .cloned()
-            .map(|handle| freshell_protocol::session_names::SessionNameRef::Pending { id: handle })
-            .or_else(|| {
-                is_canonical_claude_uuid(&session_id).then(|| {
-                    freshell_protocol::session_names::SessionNameRef::Session {
-                        provider: freshell_protocol::session_names::NamedProvider::Claude,
-                        session_id: session_id.clone(),
-                    }
+        //
+        // Task 8 acceptance: once the init ADOPTION consumed the stash and
+        // recorded the session's durable `cli_session_id`, a placeholder-
+        // addressed send targets the ADOPTED durable record — the old
+        // pending-<placeholder> fallback can never resolve in the real
+        // store (no record is keyed by a placeholder id), and the
+        // first-message fallback upgrade was silently lost for exactly
+        // these sends.
+        let naming_target = {
+            // Sequential lock reads (never nested): the pre-durable stash,
+            // then the session row's adopted durable id.
+            let stashed_handle = self.naming_handles.lock().await.get(&session_id).cloned();
+            let adopted_cli_id = self
+                .sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .and_then(|s| s.cli_session_id.clone());
+            stashed_handle
+                .map(
+                    |handle| freshell_protocol::session_names::SessionNameRef::Pending {
+                        id: handle,
+                    },
+                )
+                .or_else(|| {
+                    adopted_cli_id.map(|cli_id| {
+                        freshell_protocol::session_names::SessionNameRef::Session {
+                            provider: freshell_protocol::session_names::NamedProvider::Claude,
+                            session_id: cli_id,
+                        }
+                    })
                 })
-            })
-            .or_else(|| {
-                Some(freshell_protocol::session_names::SessionNameRef::Pending {
-                    id: session_id.clone(),
+                .or_else(|| {
+                    is_canonical_claude_uuid(&session_id).then(|| {
+                        freshell_protocol::session_names::SessionNameRef::Session {
+                            provider: freshell_protocol::session_names::NamedProvider::Claude,
+                            session_id: session_id.clone(),
+                        }
+                    })
                 })
-            });
+                .or_else(|| {
+                    Some(freshell_protocol::session_names::SessionNameRef::Pending {
+                        id: session_id.clone(),
+                    })
+                })
+        };
         if session_type != "kilroy" {
             if let Some(target) = naming_target {
                 crate::naming::report_accepted_input(
@@ -4166,15 +4231,29 @@ impl FreshClaudeState {
         // (ledger A15) -- resume with the cwd recorded in the transcript itself.
         // If that directory is gone, fall back to path-based resume
         // (`--resume <path>.jsonl` bypasses slug scoping -- verified cli.js 2.1.220),
-        // keeping the attach cwd for the process itself.
+        // keeping the attach cwd for the process itself. The path form is
+        // reserved for a transcript WITH records: a zero-turn transcript
+        // (touched at create, no records) has no cwd to resolve and NOTHING
+        // to path-resume — and the sidecar protocol's `resumeSessionId` is a
+        // SESSION ID (the real sidecar forwards it verbatim to the SDK's
+        // `resume` option), so a path there would make the recovered session
+        // write under a path-flattened phantom file. An empty transcript
+        // resumes by id.
         let original_cwd = crate::claude_snapshot::transcript_cwd(&transcript)
             .filter(|c| std::path::Path::new(c).is_dir());
+        let transcript_has_records = std::fs::metadata(&transcript)
+            .map(|meta| meta.len() > 0)
+            .unwrap_or(false);
         let (resume_value, resume_cwd) = match original_cwd {
             Some(cwd) => (json!(durable), json!(cwd)),
+            None if transcript_has_records => (
+                json!(transcript.to_string_lossy()),
+                json!(msg.cwd.clone().or_else(|| rec.cwd.clone())),
+            ),
             // Attach cwd stays primary; the ledger record's cwd is a FINAL
             // fallback only when both existing sources are absent (Task 10).
             None => (
-                json!(transcript.to_string_lossy()),
+                json!(durable),
                 json!(msg.cwd.clone().or_else(|| rec.cwd.clone())),
             ),
         };
@@ -6149,6 +6228,7 @@ fn now_iso() -> String {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::naming::SessionNaming as _;
 
     fn state() -> FreshClaudeState {
         let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
@@ -7487,6 +7567,62 @@ rl.on('line', (line) => {
         );
     }
 
+    /// Unified agent names (Task 8 acceptance): the pre-durable pending
+    /// record is admitted at REQUEST RECEIPT, not after the sidecar answers
+    /// `created`. The pane content (and the client's rename capture)
+    /// carries the handle from the moment the create frame is sent, and
+    /// the sidecar spawn + `created` handshake takes seconds — a
+    /// pane-header rename committed inside that window targeted a record
+    /// the server had accepted on the wire but not yet admitted (404
+    /// NAME_NOT_FOUND), silently losing the manual pre-durable name to the
+    /// first-message fallback. Admission is idempotent, so the
+    /// post-`created` re-ensure answers the same record unchanged.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn create_admits_the_pending_record_before_the_sidecar_answers_created() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install_with_knobs(Some(1_500), false);
+        let (state, _rx) = state_with_bus();
+        let sink = crate::naming::test_support::RecordingSink::new();
+        state.set_session_naming(sink.clone());
+        let mut create = dedup_create_msg("naming-early-admit");
+        create.naming_handle = Some("handle-early-admit".into());
+
+        // Park the create inside its deferred `created` handshake.
+        let joined = tokio::spawn(async move { state.handle_create(create, None).await });
+        // The create request reached the sidecar (the spawn log is written
+        // immediately, BEFORE the deferred answer) — we are INSIDE the
+        // window where the pane exists but `created` has not answered.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        while env.spawn_count() == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "create never reached the sidecar"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // The pending record for the create frame's handle EXISTS while the
+        // sidecar is still parking `created` — a pane-header rename in this
+        // window targets a record the server already knows.
+        let updates = sink
+            .get(vec![
+                freshell_protocol::session_names::SessionNameRef::Pending {
+                    id: "handle-early-admit".to_string(),
+                },
+            ])
+            .await
+            .expect("get resolves");
+        assert_eq!(
+            updates.len(),
+            1,
+            "the pending record must exist before `created` answers"
+        );
+
+        // Cleanup: let the deferred handshake finish (the task must end so
+        // no spawned session outlives the test).
+        let _ = joined.await;
+    }
+
     /// Unified agent names (Task 4, review N1): a send RACING the init
     /// adoption — the stash entry already consumed by the adoption's
     /// bound cleanup, the addressed id still the placeholder (the
@@ -7512,7 +7648,19 @@ rl.on('line', (line) => {
         // (`bind_naming_handle_at_init` removes it once the handle is
         // redirected to the durable record) — this send is still
         // addressed to the placeholder and is not a canonical UUID.
+        // Model the TRUE racing moment: BEFORE the adoption recorded the
+        // durable id on the session row, neither the stash nor the adopted
+        // id can answer, and the feed falls back to the pending ref for
+        // the addressed id itself (the store's redirect resolution
+        // decides); the next send addresses the adopted id anyway.
         state.naming_handles.lock().await.remove(&session_id);
+        state
+            .sessions
+            .lock()
+            .await
+            .get_mut(&session_id)
+            .expect("the created session row")
+            .cli_session_id = None;
 
         state
             .handle_send(send_msg(&session_id, "Race the adoption"))
@@ -7535,6 +7683,67 @@ rl.on('line', (line) => {
         assert_eq!(
             activities[0].first_user_message.as_deref(),
             Some("Race the adoption")
+        );
+    }
+
+    /// Unified agent names (Task 8 acceptance): once the init ADOPTION has
+    /// consumed the pre-durable stash and recorded the session's durable
+    /// `cli_session_id`, a send still addressed to the PLACEHOLDER (the
+    /// client has not yet learned the adopted id) must feed the activity to
+    /// the ADOPTED durable record — the pending-<placeholder> fallback of
+    /// the racing-send shape can never resolve in the real store (no naming
+    /// record is keyed by a placeholder id), and the first-message fallback
+    /// upgrade was silently lost for exactly these sends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_post_adoption_send_targets_the_adopted_durable_record() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (state, mut rx) = state_with_bus();
+        let sink = crate::naming::test_support::RecordingSink::new();
+        state.set_session_naming(sink.clone());
+        let mut create = dedup_create_msg("naming-adopted");
+        create.naming_handle = Some("handle-naming-adopted".into());
+        state.handle_create(create, None).await;
+        let created = await_claude_created(&mut rx, "naming-adopted").await;
+        let session_id = created["sessionId"].as_str().unwrap().to_string();
+
+        // The real post-adoption shape, set directly (the unit lane's fake
+        // sidecar emits init asynchronously and the racing-send precedent
+        // models the state the same way): the stash is consumed (the init
+        // bind's cleanup) and the session row carries the adopted durable
+        // id — the client is still addressing the placeholder.
+        let adopted_cli_id = "11111111-2222-4333-8444-555555555555".to_string();
+        {
+            let mut sessions = state.sessions.lock().await;
+            sessions
+                .get_mut(&session_id)
+                .expect("the created session row")
+                .cli_session_id = Some(adopted_cli_id.clone());
+        }
+        state.naming_handles.lock().await.remove(&session_id);
+
+        state
+            .handle_send(send_msg(&session_id, "Feed the adopted record"))
+            .await;
+        let _ = env.respond_log_frames(1).await;
+
+        let activities = sink.activities.lock().unwrap();
+        assert_eq!(
+            activities.len(),
+            1,
+            "the post-adoption send must not silently drop the activity feed: {activities:?}"
+        );
+        assert_eq!(
+            activities[0].target,
+            freshell_protocol::session_names::SessionNameRef::Session {
+                provider: freshell_protocol::session_names::NamedProvider::Claude,
+                session_id: adopted_cli_id,
+            },
+            "the activity targets the ADOPTED durable record, not the unresolvable placeholder"
+        );
+        assert_eq!(
+            activities[0].first_user_message.as_deref(),
+            Some("Feed the adopted record")
         );
     }
 
@@ -11716,6 +11925,56 @@ rl.on('line', (line) => {
         assert_eq!(create_req["model"], "opus-x");
         assert_eq!(create_req["permissionMode"], "plan");
         assert_eq!(create_req["effort"], "high");
+        drop(env);
+    }
+
+    /// Unified agent names (zero-turn recovery): a fresh pane's pre-restart
+    /// create TOUCHES its transcript (the file exists with zero records).
+    /// After a restart, attach's resume lane finds that empty transcript —
+    /// its cwd lookup answers nothing — and the path-based resume fallback
+    /// must NOT fire: the sidecar protocol's `resumeSessionId` is a SESSION
+    /// ID (the real sidecar forwards it verbatim to the SDK's `resume`
+    /// option), and a transcript PATH there makes the recovered session
+    /// write its conversation under a path-flattened phantom file (observed
+    /// `<slug>/<abs-path>.jsonl.jsonl` in the discovery index — a duplicate
+    /// session row that steals the generation name). An empty transcript
+    /// resumes by id; the sidecar continues the same `<id>.jsonl`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_zero_turn_transcript_resumes_by_id_not_by_path() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let home = tempfile::tempdir().unwrap();
+        const DURABLE: &str = "abababab-abab-4bab-8bab-abababababab";
+        // TOUCH ONLY — the zero-turn pre-restart transcript: present, empty.
+        let dir = home.path().join("projects").join("-t");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{DURABLE}.jsonl")), "").unwrap();
+        std::env::set_var("CLAUDE_CONFIG_DIR", home.path());
+
+        let (state, _rx) = state_with_bus();
+        state.set_identity_sink(std::sync::Arc::new(
+            crate::identity_sink::FakeIdentitySink::default(),
+        ));
+
+        state
+            .handle_attach(attach_msg_with_resume(
+                "client-nanoid-empty-resume",
+                DURABLE,
+            ))
+            .await;
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+        let log = std::fs::read_to_string(env.spawn_log_path()).unwrap();
+        let create_req: serde_json::Value =
+            serde_json::from_str(log.lines().next().expect("one spawn-logged create request"))
+                .unwrap();
+        assert_eq!(
+            create_req["resumeSessionId"]
+                .as_str()
+                .expect("resumeSessionId on the wire"),
+            DURABLE,
+            "an empty zero-turn transcript must resume by session id, never by transcript path"
+        );
         drop(env);
     }
 

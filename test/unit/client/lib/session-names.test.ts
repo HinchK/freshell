@@ -14,7 +14,14 @@ const apiMocks = vi.hoisted(() => ({
   },
 }))
 
-vi.mock('@/lib/api', () => ({ api: { post: apiMocks.post, patch: apiMocks.patch }, ApiError: apiMocks.ApiError }))
+vi.mock('@/lib/api', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/api')>()),
+  api: { post: apiMocks.post, patch: apiMocks.patch },
+}))
+
+// The shared 429-retry helper `instanceof`-checks the REAL ApiError — the
+// tests that exercise retry reject with THIS class, not the mock's shape twin.
+const realApi = await import('@/lib/api')
 
 import {
   bootstrapSessionNames,
@@ -92,11 +99,41 @@ describe('bootstrapSessionNames', () => {
     await bootstrapSessionNames([sessionRef('s1')], { signal: controller.signal })
     expect(apiMocks.post).toHaveBeenCalled()
   })
+
+  it('retries a rate-limited read (the reconnect burst) and still bootstraps', async () => {
+    // The ready/reconnect batch bootstrap races the reconnect storm's own
+    // API burst (sessions, directory, settings) on the ONE shared bucket: a
+    // 429 there must not silently strand the client's canonical cache.
+    const update = acceptedUpdate('Bursty boot name', 2)
+    apiMocks.post
+      .mockRejectedValueOnce(new realApi.ApiError(429, 'rate limited'))
+      .mockResolvedValueOnce({ names: [update] })
+
+    const updates = await bootstrapSessionNames([sessionRef('s1')])
+
+    expect(apiMocks.post).toHaveBeenCalledTimes(2)
+    expect(updates).toEqual([update])
+  })
+
+  it('stops retrying a rate-limited read after a bounded number of attempts and propagates', async () => {
+    apiMocks.post.mockImplementation(
+      () => Promise.reject(new realApi.ApiError(429, 'rate limited')),
+    )
+    await expect(bootstrapSessionNames([sessionRef('s1')])).rejects.toMatchObject({ status: 429 })
+    const maxAttempts = apiMocks.post.mock.calls.length
+    expect(maxAttempts).toBeGreaterThanOrEqual(1)
+    expect(maxAttempts).toBeLessThanOrEqual(6)
+  })
+
+  it('does not retry a non-rate-limit failure', async () => {
+    apiMocks.post.mockRejectedValueOnce(new realApi.ApiError(500, 'server error'))
+    await expect(bootstrapSessionNames([sessionRef('s1')])).rejects.toMatchObject({ status: 500 })
+    expect(apiMocks.post).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('collectSessionNameRefs', () => {
-  it('collects refs from open panes, session-directory windows, and terminal-directory windows, deduped', () => {
-    const refs = collectSessionNameRefs({
+  it('collects refs from open panes, session-directory windows, and terminal-directory windows, deduped', () => {    const refs = collectSessionNameRefs({
       panes: {
         layouts: {
           'tab-1': {
@@ -173,6 +210,56 @@ describe('collectSessionNameRefs', () => {
   })
 })
 
+describe('uncachedSessionNameRefs', () => {
+  it('returns collected refs the cache lacks, once per ref (attempted set guards re-reads)', async () => {
+    const { uncachedSessionNameRefs } = await import('@/lib/session-names')
+    const state = {
+      sessions: {
+        windows: {
+          history: {
+            projects: [
+              { sessions: [{ nameRef: sessionRef('s1') }, { nameRef: sessionRef('cached') }] },
+            ],
+          },
+        },
+      },
+      sessionNames: {
+        records: { [sessionNameRefKey(sessionRef('cached'))]: { name: 'Already known' } },
+        redirects: {},
+      },
+    }
+    const attempted = new Set<string>()
+
+    const first = uncachedSessionNameRefs(state as never, attempted)
+    expect(first).toEqual([sessionRef('s1')])
+    // The attempted set now covers the ref: a fresh page's post-ready
+    // projections never re-read a ref the bootstrap already attempted.
+    const second = uncachedSessionNameRefs(state as never, attempted)
+    expect(second).toEqual([])
+  })
+
+  it('follows pending redirects through the cache when checking coverage', async () => {
+    const { uncachedSessionNameRefs } = await import('@/lib/session-names')
+    const state = {
+      sessions: {
+        windows: {
+          history: {
+            projects: [
+              { sessions: [{ nameRef: pendingRef('nh-redirected') }] },
+            ],
+          },
+        },
+      },
+      sessionNames: {
+        records: { [sessionNameRefKey(sessionRef('s-adopted'))]: { name: 'Adopted' } },
+        redirects: { [sessionNameRefKey(pendingRef('nh-redirected'))]: { toKey: sessionNameRefKey(sessionRef('s-adopted')), revision: 3 } },
+      },
+    }
+    const attempted = new Set<string>()
+    expect(uncachedSessionNameRefs(state as never, attempted)).toEqual([])
+  })
+})
+
 describe('renameSessionName', () => {
   beforeEach(() => {
     apiMocks.patch.mockReset()
@@ -202,20 +289,19 @@ describe('renameSessionName', () => {
     expect(result).toEqual(update)
   })
 
-  it('retains the server error code and accepted record on a conflict', async () => {
-    apiMocks.patch.mockRejectedValue(new apiMocks.ApiError(409, 'conflict: another rename won', {
+  it('retains the server error code and accepted record on a conflict (the bare-record payload the scoped routes really answer)', async () => {
+    // The scoped rename routes answer a conflict with the CURRENT record
+    // as a bare `sessionName` — not the update envelope (an envelope
+    // would fabricate documentGeneration/redirects the conflict path
+    // does not maintain). The typed error must parse the REAL shape.
+    apiMocks.patch.mockRejectedValue(new realApi.ApiError(409, 'conflict: another rename won', {
       error: 'NAME_REVISION_CONFLICT',
       message: 'another rename won',
       sessionName: {
-        record: {
-          ref: { kind: 'session', provider: 'claude', sessionId: 's1' },
-          name: 'Other browser name',
-          source: 'manual',
-          revision: 5,
-        },
-        documentGeneration: 40,
-        redirects: [],
-        changed: true,
+        ref: { kind: 'session', provider: 'claude', sessionId: 's1' },
+        name: 'Other browser name',
+        source: 'manual',
+        revision: 5,
       },
       nameRef: { kind: 'session', provider: 'claude', sessionId: 's1' },
     }))
@@ -229,8 +315,34 @@ describe('renameSessionName', () => {
       await renameSessionName({ target: sessionRef('s1'), name: 'Loser', nameIntent: 'user' })
     } catch (error: any) {
       // The accepted record survives for the error UI.
-      expect(error.acceptedUpdate?.record.name).toBe('Other browser name')
-      expect(error.acceptedUpdate?.record.revision).toBe(5)
+      expect(error.acceptedRecord?.name).toBe('Other browser name')
+      expect(error.acceptedRecord?.revision).toBe(5)
+      expect(error.acceptedRecord?.ref).toEqual({ kind: 'session', provider: 'claude', sessionId: 's1' })
+    }
+  })
+
+  it('also accepts the update-envelope conflict payload (cross-version tolerance)', async () => {
+    // A mixed-version server (or the success-path shape reused on a
+    // conflict) still folds — the extraction accepts both.
+    apiMocks.patch.mockRejectedValue(new realApi.ApiError(409, 'conflict: another rename won', {
+      error: 'NAME_REVISION_CONFLICT',
+      sessionName: {
+        record: {
+          ref: { kind: 'session', provider: 'claude', sessionId: 's1' },
+          name: 'Envelope winner',
+          source: 'manual',
+          revision: 7,
+        },
+        documentGeneration: 40,
+        redirects: [],
+        changed: true,
+      },
+    }))
+    try {
+      await renameSessionName({ target: sessionRef('s1'), name: 'Loser', nameIntent: 'user' })
+    } catch (error: any) {
+      expect(error.acceptedRecord?.name).toBe('Envelope winner')
+      expect(error.acceptedRecord?.revision).toBe(7)
     }
   })
 })

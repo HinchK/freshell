@@ -306,6 +306,121 @@ async fn armed_pending(store: &Arc<SessionNames>, handle: &str, root: &str) -> S
 }
 
 // ---------------------------------------------------------------------------
+// On-demand route discovery (the index-adopted flow)
+// ---------------------------------------------------------------------------
+
+/// `locate_transcript_selected` reads process-global env (the ordered
+/// candidate roots) — serialize every discovery test and restore the prior
+/// values (the repo's ENV_LOCK convention).
+static CLAUDE_DISCOVERY_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Unified agent names (Task 8 acceptance): a session adopted ONLY through
+/// the index (the auto-title sweep's hydration — the sidebar/history rename
+/// flow) has NO runtime lane attaching a location. Without on-demand
+/// discovery its armed native series pauses forever (the native smoke's
+/// live-observed gap: `nativeSync: null` after a successful canonical
+/// rename). The worker must resolve the transcript by session id and
+/// attach the acquisition so the series runs to `synced`.
+#[tokio::test]
+async fn an_index_adopted_claude_series_discovers_its_route_on_demand() {
+    let _guard = CLAUDE_DISCOVERY_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().expect("claude home tempdir");
+    let session_id = "4a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
+    let project_cwd = home.path().join("proj");
+    std::fs::create_dir_all(&project_cwd).expect("project dir");
+    let mangled = project_cwd
+        .to_string_lossy()
+        .replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+    let transcript_dir = home.path().join("projects").join(&mangled);
+    std::fs::create_dir_all(&transcript_dir).expect("mangled project dir");
+    std::fs::write(
+        transcript_dir.join(format!("{session_id}.jsonl")),
+        format!(
+            concat!(
+                r#"{{"parentUuid":null,"isSidechain":false,"type":"user","uuid":"m1","sessionId":"{session_id}","#,
+                r#""timestamp":"2026-09-18T07:00:00.000Z","cwd":"{cwd}","message":{{"role":"user","content":"Probe the sardine factory"}}}}"#,
+                "\n",
+            ),
+            cwd = project_cwd.to_string_lossy(),
+            session_id = session_id,
+        ),
+    )
+    .expect("transcript");
+
+    let saved_home = std::env::var_os("CLAUDE_HOME");
+    let saved_config = std::env::var_os("CLAUDE_CONFIG_DIR");
+    std::env::set_var("CLAUDE_HOME", home.path());
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+    let result = async {
+        let dir = temp_data_dir();
+        let store = open_store(dir.path());
+        let target = session(
+            freshell_protocol::session_names::NamedProvider::Claude,
+            session_id,
+        );
+        // The sweep's own hydration + a manual rename: the record + an
+        // ARMED native series, and NO location anywhere.
+        store
+            .hydrate_indexed(
+                crate::session_name_generation::IndexedNameInput {
+                    provider: freshell_protocol::session_names::NamedProvider::Claude,
+                    session_id: session_id.to_string(),
+                    cwd: Some(project_cwd.to_string_lossy().to_string()),
+                    first_user_message: Some("Probe the sardine factory".to_string()),
+                    provider_title: None,
+                },
+                false,
+            )
+            .await
+            .expect("hydrate");
+        rename_user(&store, target.clone(), "Manual Title")
+            .await
+            .expect("manual rename");
+        assert!(
+            store.native_work_snapshot().is_empty(),
+            "no route: the series pauses before consuming a cycle"
+        );
+
+        // The discovery attaches the acquisition from the on-disk
+        // transcript, and the series becomes runnable work.
+        assert!(
+            super::discover_claude_route(&store, &target).await,
+            "the discoverable transcript must attach the route"
+        );
+        let items = store.native_work_snapshot();
+        assert_eq!(items.len(), 1, "the unpaused series holds ready work");
+        assert_eq!(items[0].target, target);
+
+        // The cycle synchronizes like any armed series (the scripted
+        // backend answers a divergent pre-write read then confirms).
+        let backend = ScriptedBackend::new(vec![WriteStep::Confirm]);
+        backend.set_title(Some("Something Else"));
+        super::run_cycle(
+            &store,
+            backend.as_ref() as &dyn NativeNameBackend,
+            &items[0].target,
+        )
+        .await;
+        let sync = native_sync_of(&store, target.clone())
+            .await
+            .expect("series");
+        assert_eq!(sync.status, NativeSyncStatus::Synced);
+    }
+    .await;
+
+    match saved_home {
+        Some(value) => std::env::set_var("CLAUDE_HOME", value),
+        None => std::env::remove_var("CLAUDE_HOME"),
+    }
+    match saved_config {
+        Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+        None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
 // The finite cycle machine
 // ---------------------------------------------------------------------------
 

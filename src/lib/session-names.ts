@@ -4,14 +4,16 @@
  * the captured-target rename. HTTP failures retain the server's error code
  * and the accepted record for the error UI.
  */
-import { api, ApiError } from '@/lib/api'
+import { api, ApiError, with429Retry } from '@/lib/api'
 import { createLogger } from '@/lib/client-logger'
 import {
+  SessionNameRecordSchema,
   SessionNameUpdateSchema,
   sessionNameRefKey,
   type NameIntent,
   type RenameSessionNameRequest,
   type SessionNameRef,
+  type SessionNameRecord,
   type SessionNameUpdate,
 } from '@shared/session-names'
 
@@ -25,9 +27,22 @@ export class SessionNameRenameError extends Error {
   status?: number
   /** The server's machine-readable error code (`error` field of the body). */
   serverCode?: string
-  /** The accepted canonical update the server carried on a conflict — the
+  /** The accepted canonical record the server carried on a conflict — the
    * error UI folds this so the winner is visible everywhere. */
-  acceptedUpdate?: SessionNameUpdate
+  acceptedRecord?: SessionNameRecord
+}
+
+/** The accepted record from either conflict-payload shape: the scoped
+ * rename routes answer the CURRENT record as a bare `sessionName` (the
+ * honest conflict semantics — an envelope would have to fabricate
+ * documentGeneration/redirects the conflict path does not maintain), so
+ * a conflict extractor must accept the bare record AND the full update
+ * envelope (the success-path shape) for cross-version tolerance. */
+export function parseSessionNameRecordOrUpdate(value: unknown): SessionNameRecord | undefined {
+  const update = SessionNameUpdateSchema.safeParse(value)
+  if (update.success) return update.data.record
+  const record = SessionNameRecordSchema.safeParse(value)
+  return record.success ? record.data : undefined
 }
 
 /** POST /api/session-names/read — batch bootstrap. Unknown refs are omitted
@@ -39,9 +54,8 @@ export async function bootstrapSessionNames(
   const updates: SessionNameUpdate[] = []
   for (let index = 0; index < refs.length; index += SESSION_NAMES_READ_CHUNK) {
     const chunk = refs.slice(index, index + SESSION_NAMES_READ_CHUNK)
-    const body = await api.post<{ names?: unknown }>(
-      '/api/session-names/read',
-      { refs: chunk },
+    const body = await with429Retry(
+      () => api.post<{ names?: unknown }>('/api/session-names/read', { refs: chunk }, options),
       options,
     )
     for (const raw of Array.isArray(body?.names) ? body.names : []) {
@@ -85,12 +99,16 @@ export function toRenameError(error: unknown): SessionNameRenameError {
   )
   if (error instanceof ApiError) {
     renameError.status = error.status
-    const data = (error as unknown as { data?: unknown }).data
-    if (data && typeof data === 'object') {
-      const body = data as { error?: unknown; sessionName?: unknown }
-      if (typeof body.error === 'string') renameError.serverCode = body.error
-      const accepted = SessionNameUpdateSchema.safeParse(body.sessionName)
-      if (accepted.success) renameError.acceptedUpdate = accepted.data
+    // The real ApiError carries the parsed response body in `details` (the
+    // legacy unit mock's `data` twin masked this for the conflict lane —
+    // a production 409 never populated serverCode/acceptedRecord), and
+    // the scoped routes answer the accepted CURRENT record as a bare
+    // `sessionName`.
+    const body = (error as ApiError & { details?: unknown }).details
+    if (body && typeof body === 'object') {
+      const parsedBody = body as { error?: unknown; sessionName?: unknown }
+      if (typeof parsedBody.error === 'string') renameError.serverCode = parsedBody.error
+      renameError.acceptedRecord = parseSessionNameRecordOrUpdate(parsedBody.sessionName)
     }
   }
   return renameError
@@ -133,6 +151,46 @@ export function collectSessionNameRefs(state: {
     }
   }
   return refs
+}
+
+/** A fresh page's ready-time bootstrap races its own state hydration: the
+ * layout restore, the sessions fetch, and the terminal inventory land AFTER
+ * ready, so refs they carry were not collectible when the batch read ran.
+ * This filter selects the refs that STILL lack a cached record once they
+ * become collectible — following the cache's pending→durable redirects —
+ * and marks each attempted ref in `attempted` so a ref the bootstrap has
+ * already read (or the server has no record for) never re-reads. */
+export function uncachedSessionNameRefs(
+  state: Parameters<typeof collectSessionNameRefs>[0] & {
+    sessionNames?: {
+      records?: Record<string, { name?: unknown }>
+      redirects?: Record<string, { toKey?: unknown }>
+    }
+  },
+  attempted: Set<string>,
+): SessionNameRef[] {
+  const records = state.sessionNames?.records ?? {}
+  const redirects = state.sessionNames?.redirects ?? {}
+  const resolvesToCachedRecord = (ref: SessionNameRef): boolean => {
+    let key = sessionNameRefKey(ref)
+    for (let hops = 0; hops < 8; hops += 1) {
+      if (records[key]) return true
+      const redirect = redirects[key]
+      const toKey = typeof redirect?.toKey === 'string' ? redirect.toKey : null
+      if (!toKey || toKey === key) return false
+      key = toKey
+    }
+    return false
+  }
+  const out: SessionNameRef[] = []
+  for (const ref of collectSessionNameRefs(state)) {
+    const key = sessionNameRefKey(ref)
+    if (attempted.has(key)) continue
+    attempted.add(key)
+    if (resolvesToCachedRecord(ref)) continue
+    out.push(ref)
+  }
+  return out
 }
 
 function collectPaneRefs(

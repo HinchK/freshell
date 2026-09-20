@@ -17,8 +17,8 @@ import { MobileTabStrip } from './MobileTabStrip'
 import { TabSwitcher } from './TabSwitcher'
 import { api } from '@/lib/api'
 import { renamePaneAfterMirrorReady } from '@/lib/pane-rename'
-import { parseSessionNameUpdate } from '@/lib/session-names'
-import { receiveSessionNames } from '@/store/sessionNamesSlice'
+import { parseSessionNameRecordOrUpdate, parseSessionNameUpdate } from '@/lib/session-names'
+import { receiveSessionNameProjections, receiveSessionNames } from '@/store/sessionNamesSlice'
 import {
   resolvePaneRenameCapture,
   selectTabNameSourcePaneId,
@@ -431,16 +431,19 @@ export default function TabBar({ sidebarCollapsed, onToggleSidebar }: TabBarProp
         // and REFRESH the editor's capture from the accepted record (its
         // new revision) so a resubmit from the still-open editor can
         // succeed — the stale edit-start revision would conflict forever.
-        // The editor seeds the accepted text.
-        const accepted = parseSessionNameUpdate(error?.data?.sessionName)
+        // The editor seeds the accepted text. The real ApiError carries
+        // the parsed body in `details` (never `.data`), and the scoped
+        // routes answer the accepted CURRENT record as a bare
+        // `sessionName` (the record-or-update extraction).
+        const accepted = parseSessionNameRecordOrUpdate(error?.details?.sessionName)
         if (accepted) {
-          dispatch(receiveSessionNames([accepted]))
+          dispatch(receiveSessionNameProjections([{ record: accepted, ref: accepted.ref }]))
           if (tabRenameCaptureRef.current?.paneId === capture.paneId) {
             tabRenameCaptureRef.current = {
               paneId: capture.paneId,
               ...resolvePaneRenameCapture(appStore.getState(), tab.id, capture.paneId),
             }
-            setRenameValue(accepted.record.name)
+            setRenameValue(accepted.name)
           }
         }
         setTabRenameError({

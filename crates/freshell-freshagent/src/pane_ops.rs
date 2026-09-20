@@ -44,7 +44,10 @@ use freshell_protocol::{ServerMessage, UiCommand, LEGACY_RESUME_IDENTITY_REFUSAL
 use crate::layout_store::RenameOutcome;
 use crate::target_resolver::{resolve_target, ResolvedTarget};
 use crate::terminal_tabs::{spawn_terminal_pane, TerminalSpawnResult};
-use crate::{approx_json, authorized, fail_json, ok_json, parse_required_name, FreshAgentState};
+use crate::{
+    approx_json, authorized, fail_json, ok_json, parse_required_name, FreshAgentState,
+    PaneNameResolution,
+};
 
 /// Mount the pane + tab lifecycle routes onto an existing router. Split out of
 /// [`crate::router`] so `lib.rs`'s route table stays a single glance-able list;
@@ -463,6 +466,20 @@ pub(crate) async fn rename_tab(
     // helper owns the scoped blank/reset refusal (`NAME_RESET_UNSUPPORTED`),
     // so this resolution runs BEFORE the legacy `name required` gate. Legacy
     // tabs keep the existing layout rename.
+    //
+    // Task 8 acceptance: the Session source pointer AND the source pane's
+    // content come from the SAME lagging mirror — the ui.layout.sync carrying
+    // the post-selection pointer lands seconds after the editor could open.
+    // Two capture-wins rules keep a stale mirror from downgrading the rename
+    // to the legacy tab-title write (the tab route's twin of
+    // `effective_pane_name_resolution`): (1) a Session pointer with a scoped
+    // pane whose binding rungs are missing falls back to the request's
+    // capture; (2) with the pointer itself still stale (the pre-selection
+    // window), a scoped capture asserts session ownership for this tab. A
+    // pointer that EXISTS while its pane resolves unscoped is a REAL kind
+    // switch, not staleness — that tab keeps its legacy rename, capture or
+    // not (the tab's name is no longer the captured conversation's).
+    let captured = crate::scoped_capture_of(&body);
     if let Some(freshell_protocol::session_names::TabNameSource::Session {
         pane_id: source_pane_id,
     }) = state.layout.tab_name_source(&tab_id)
@@ -471,7 +488,10 @@ pub(crate) async fn rename_tab(
             if resolution.scoped {
                 return crate::rename_scoped_session(
                     &state,
-                    &resolution,
+                    &PaneNameResolution {
+                        scoped: true,
+                        target: resolution.target.clone().or(captured),
+                    },
                     Some(&tab_id),
                     Some(&source_pane_id),
                     &body,
@@ -479,6 +499,23 @@ pub(crate) async fn rename_tab(
                 .await;
             }
         }
+    } else if let Some(target) = captured {
+        // The stale-pointer window: the capture is the client's assertion
+        // that this tab's name is a session's name with that binding. The
+        // response envelope carries the tab's sole pane so the client's
+        // rename receipt check (`data.paneId`) still passes.
+        let pane_id = state.layout.get_single_pane_id(&tab_id);
+        return crate::rename_scoped_session(
+            &state,
+            &PaneNameResolution {
+                scoped: true,
+                target: Some(target),
+            },
+            Some(&tab_id),
+            pane_id.as_deref(),
+            &body,
+        )
+        .await;
     }
 
     let Some(name) = parse_required_name(body.get("name")) else {

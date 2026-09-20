@@ -750,6 +750,86 @@ async fn a_pending_bind_during_dispatch_folds_through_the_redirect() {
     assert_eq!(after.record.name, "Redirected AI name");
 }
 
+/// A MANUAL pending winner that binds AFTER the generation claim — the
+/// materialization race: the sweep armed the durable session's series
+/// before the naming bind transferred the pending record — must not pay
+/// the provider call. The dispatch re-check sees the bound record's
+/// protected source, folds without dispatch, and the manual winner keeps
+/// the name (the series closes without a retry).
+#[tokio::test]
+async fn a_manual_winner_binding_after_the_claim_skips_the_provider_call() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let transport = CountingTransport::new("Must never be requested");
+    let generator = generator_with(dir.path(), Some("gen-key"), transport.clone());
+    // The durable session: hydration installs the fallback record, and the
+    // sweep's later pass ARMS the series (a genuinely new message) — the
+    // fallback record is claimable.
+    let durable = session(NamedProvider::Codex, "ses_manualclaim");
+    store
+        .hydrate_indexed(
+            IndexedNameInput {
+                provider: NamedProvider::Codex,
+                session_id: "ses_manualclaim".to_string(),
+                cwd: Some("/w/manualclaim".to_string()),
+                first_user_message: None,
+                provider_title: None,
+            },
+            true,
+        )
+        .await
+        .expect("hydrate");
+    arm_with_message(&store, durable.clone(), "freshcodex", "Race arm message").await;
+    let claim = store
+        .claim_generation_start(durable.clone(), "attempt-manualclaim".to_string())
+        .await
+        .expect("claim transaction runs")
+        .expect("the fallback series is claimable");
+    // The user's PRE-DURABLE manual rename binds MID-DISPATCH: the manual
+    // winner is now the session's accepted record.
+    let pending_ref = pending("h-manualclaim");
+    ensure_pending(
+        &store,
+        "h-manualclaim",
+        NamedProvider::Codex,
+        Some("/w/manualclaim"),
+    )
+    .await
+    .expect("ensure");
+    rename_user(&store, pending_ref.clone(), "Manual winner name")
+        .await
+        .expect("manual rename");
+    store
+        .bind_pending(BindNameInput {
+            pending: pending_ref.clone(),
+            target: durable.clone(),
+            acquisition: verified_acquisition(NativeLocation::Codex {
+                codex_home: "/w/homes/codex".to_string(),
+                native_thread_id: Some("ses_manualclaim".to_string()),
+                rollout_path: None,
+                persistence_evidence: None,
+            }),
+        })
+        .await
+        .expect("bind");
+    // The dispatch: the protected winner cancels the provider call.
+    generator.dispatch_claimed_attempt(&store, &claim).await;
+    assert_eq!(
+        transport.calls(),
+        0,
+        "a protected winner landing after the claim must not pay the provider call"
+    );
+    let after = get_one(&store, durable.clone()).await.expect("record");
+    assert_eq!(after.record.name, "Manual winner name");
+    assert_eq!(after.record.source, NameSource::Manual);
+    let doc = document_json(dir.path());
+    assert_eq!(
+        generation_status(&doc, &durable).as_deref(),
+        Some("idle"),
+        "the superseded series closes without a retry"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // The bounded retry series (clock-controlled — never wall-clock waits)
 // ---------------------------------------------------------------------------

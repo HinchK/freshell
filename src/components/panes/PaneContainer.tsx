@@ -53,14 +53,14 @@ import type { ProjectGroup } from '@/store/types'
 import type { ClientExtensionEntry } from '@shared/extension-types'
 import { ErrorBoundary } from '@/components/ui/error-boundary'
 import { applyPaneRename } from '@/store/titleSync'
-import { receiveSessionNames } from '@/store/sessionNamesSlice'
+import { receiveSessionNameProjections, receiveSessionNames } from '@/store/sessionNamesSlice'
 import {
   isScopedPaneContent,
   resolvePaneRenameCapture,
   selectPaneDisplayName,
   selectPaneNativeSync,
 } from '@/store/selectors/sessionNameSelectors'
-import { parseSessionNameUpdate } from '@/lib/session-names'
+import { parseSessionNameRecordOrUpdate, parseSessionNameUpdate } from '@/lib/session-names'
 import type { SessionNameRef } from '@shared/session-names'
 import { saveServerSettingsPatch } from '@/store/settingsThunks'
 import { getPreferredResumeSessionId } from '@/store/persistControl'
@@ -343,13 +343,16 @@ export default function PaneContainer({ tabId, node, hidden }: PaneContainerProp
         // and REFRESH the editor's capture from the accepted record (its
         // new revision) so a resubmit from the still-open editor can
         // succeed — the stale edit-start revision would conflict forever.
-        // The editor seeds the accepted text.
-        const accepted = parseSessionNameUpdate(error?.data?.sessionName)
+        // The editor seeds the accepted text. The real ApiError carries
+        // the parsed body in `details` (never `.data`), and the scoped
+        // routes answer the accepted CURRENT record as a bare
+        // `sessionName` (the record-or-update extraction).
+        const accepted = parseSessionNameRecordOrUpdate(error?.details?.sessionName)
         if (accepted) {
-          dispatch(receiveSessionNames([accepted]))
+          dispatch(receiveSessionNameProjections([{ record: accepted, ref: accepted.ref }]))
           if (scoped) {
             renameCaptureRef.current = resolvePaneRenameCapture(appStore.getState(), tabId, paneId)
-            setRenameValue(accepted.record.name)
+            setRenameValue(accepted.name)
           }
         }
         const message = typeof error?.message === 'string' && error.message

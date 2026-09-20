@@ -4463,6 +4463,70 @@ mod tests {
         );
     }
 
+    /// Unified agent names (Task 8 — the T2-M3/T4-M3 per-runtime lane pin):
+    /// the shared accepted-input callback — an accepted freshopencode send
+    /// feeds the naming authority ONE activity carrying the prompt text. The
+    /// materialization bind consumes the stashed handle BEFORE the feed, so
+    /// the first send's activity target is the pane's DURABLE `ses_*` id (the
+    /// correct fallback — a wrong stash key or a missed fallback would redden
+    /// this pin).
+    #[tokio::test]
+    async fn send_feeds_the_naming_authority_once_with_the_accepted_text() {
+        let (st, killed) = state().await;
+        let _ = &killed;
+        let sink = crate::naming::test_support::RecordingSink::new();
+        st.set_session_naming(sink.clone());
+
+        let mut create = create_msg("req-opencode-naming-send");
+        create.naming_handle = Some("handle-opencode-naming-send".to_string());
+        st.handle_create(create, None).await;
+        let placeholder = "freshopencode-req-opencode-naming-send";
+        st.handle_send(send_msg(placeholder, "Fix the sardine crash"))
+            .await;
+
+        // The feed fires once the turn was accepted; poll the sink bounded.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if !sink.activities.lock().unwrap().is_empty() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the accepted send feeds the naming authority");
+        let sessions = st.sessions.lock().await;
+        let session_arc = sessions
+            .get(placeholder)
+            .expect("placeholder session tracked after create")
+            .clone();
+        drop(sessions);
+        let durable_id = session_arc
+            .lock()
+            .await
+            .real_session_id
+            .clone()
+            .expect("send must have materialized a durable session");
+        let activities = sink.activities.lock().unwrap();
+        assert_eq!(activities.len(), 1, "{activities:?}");
+        assert_eq!(
+            activities[0].target,
+            freshell_protocol::session_names::SessionNameRef::Session {
+                provider: freshell_protocol::session_names::NamedProvider::Opencode,
+                session_id: durable_id.clone(),
+            }
+        );
+        assert_eq!(activities[0].mode, "freshopencode");
+        assert_eq!(
+            activities[0].first_user_message.as_deref(),
+            Some("Fix the sardine crash")
+        );
+        assert_eq!(
+            activities[0].reason,
+            crate::naming::NameActivityReason::AcceptedUserMessage
+        );
+    }
+
     /// The concurrent variant: two GENUINELY CONCURRENT creates sharing a `requestId`
     /// must still construct exactly ONE session object (never two, racing to overwrite
     /// each other in the `sessions` map).

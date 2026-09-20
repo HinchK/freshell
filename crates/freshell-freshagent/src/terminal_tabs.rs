@@ -2289,6 +2289,16 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                             state.stash_naming_handle(&terminal_id, &handle);
                             pane_content["namingHandle"] = json!(handle);
                             naming_handle = Some(handle);
+                            // Task 8 acceptance (WS parity): report the
+                            // Pending binding as the row's name_ref too —
+                            // `freshell-server`'s hook wiring writes it onto
+                            // the shared identity registry, where the 2s
+                            // tick's `pending_naming_binds()` lane reads it.
+                            // Without it, a REST-created scoped pane's
+                            // record can never transfer at materialization
+                            // (the WS door's `admit_create_naming` stamps
+                            // exactly this).
+                            naming_name_ref = Some(pending.clone());
                             // Unified agent names (Task 2 review, I3): the
                             // CLI-supplied `name` seeds the admitted record
                             // with the SAME intent default as the fresh-agent
@@ -4553,6 +4563,66 @@ if (args.includes('app-server')) {{
         assert!(
             !argv.iter().any(|a| a == "--resume"),
             "fresh create must not resume: {argv:?}"
+        );
+
+        registry.kill(&terminal_id);
+        let _ = std::fs::remove_file(&argv_capture_path);
+    }
+
+    /// Unified agent names (Task 8 acceptance): a fresh REST claude create
+    /// must hand the terminal-created hook the SAME pre-bind binding the
+    /// WS door stamps — `name_ref` = the Pending handle (WS parity:
+    /// `admit_create_naming`'s `set_name_binding(terminal_id, Pending,
+    /// handle)`). `freshell-server`'s hook wiring writes that name_ref onto
+    /// the shared identity registry, where the 2s tick's
+    /// `pending_naming_binds()` lane reads it — without it, a REST-created
+    /// claude pane's pending record can never transfer at materialization.
+    #[tokio::test]
+    async fn create_fresh_claude_tab_reports_the_pending_binding_through_the_hook() {
+        use freshell_protocol::session_names::SessionNameRef;
+
+        let (state, registry, argv_capture_path) =
+            state_with_claude_capture_spec("claude-hook-nameref");
+        let sink = crate::naming::test_support::RecordingSink::new();
+        state.set_session_naming(sink.clone());
+        let captured: Arc<std::sync::Mutex<Vec<crate::TerminalCreatedEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook_captured = Arc::clone(&captured);
+        let state = state.with_terminal_created_hook(Arc::new(move |event| {
+            hook_captured.lock().unwrap().push(event);
+        }));
+
+        let (status, body) = post(
+            app(state.clone()),
+            "/api/tabs",
+            serde_json::json!({
+                "mode": "claude",
+                "cwd": std::env::temp_dir().to_string_lossy(),
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "create failed: {body}");
+        let terminal_id = body["data"]["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1, "exactly one hook call per create");
+        let event = &events[0];
+        // The pending handle the admission minted (also the paneContent's
+        // namingHandle + the create-lane stash entry).
+        let handle = state
+            .peek_naming_handle(&terminal_id)
+            .expect("the create stashed its pending handle");
+        assert_eq!(event.naming_handle.as_deref(), Some(handle.as_str()));
+        // THE parity gap under test: the row's name_ref must be the SAME
+        // Pending binding, not None.
+        assert_eq!(
+            event.name_ref,
+            Some(SessionNameRef::Pending { id: handle.clone() }),
+            "the hook must carry the Pending name_ref so the identity row enters the bind lane"
         );
 
         registry.kill(&terminal_id);
