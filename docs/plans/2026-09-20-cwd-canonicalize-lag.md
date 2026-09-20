@@ -71,7 +71,10 @@ fn memoized_cwd_resolution_resolves_a_symlink_once_then_serves_retargets_from_th
 
     let reg = TerminalIdentityRegistry::new();
     let first = reg.normalize_scoped_cwd_cached(&link_str);
-    assert_eq!(first, real_a.to_str().expect("utf8 path"));
+    assert_eq!(
+        first,
+        std::fs::canonicalize(&real_a).expect("canonicalize expected").to_str().expect("utf8")
+    );
 
     // Retarget the symlink: the memo deliberately serves the FIRST
     // resolution (the accepted tradeoff). Both matching sides share the
@@ -130,9 +133,11 @@ pub struct TerminalIdentityRegistry {
     /// cloud-sync-backed cwds (the FRESHELL host-stats `lagging` toggle root
     /// cause). Deliberately unbounded: keyed by distinct cwd strings, which
     /// a machine produces at most in the hundreds. Values are stable per
-    /// key: a symlink retarget after first resolution keeps serving the
-    /// first target (accepted tradeoff; both comparison sides share this
-    /// memo, so matching stays internally consistent).
+    /// raw key: a symlink retarget after first resolution keeps serving the
+    /// first target for that raw spelling. Sides spelled differently (link
+    /// vs target) can therefore diverge from eager-canonicalize behavior
+    /// after a retarget — a permanent match miss for that pair until the
+    /// raw strings change, accepted over reintroducing the per-call stall.
     cwd_memo: Arc<Mutex<HashMap<String, String>>>,
 }
 ```
@@ -584,11 +589,15 @@ Expected: PASS for every spec that actually ran — the auto-title e2e net prove
 
 - [ ] **Step 4: Run the coordinated full suite (branch gate)**
 
-This is the whole-branch gate for stage completion; it goes through the shared coordinator gate (check `npm run test:status` first; wait for any foreign holder).
+This is the whole-branch gate for stage completion; it goes through the shared coordinator gate (check `npm run test:status` first; wait for any foreign holder). The worktree has no `node_modules` yet — install first (needed for the `tsx`-driven pipeline; the cloud e2e step above is bash-only and unaffected):
+
+Run: `npm install --no-audit --no-fund`
 
 Run: `FRESHELL_TEST_SUMMARY="the-usual cwd-canonicalize-lag branch gate" npm test`
 
-Expected: green in every lane EXCEPT the enumerated kata-b46d family in the rust lane (4-5 freshagent fencing failures, waived by the user 2026-09-20 and recorded in the run-state baseline ledger). Any OTHER failure is this run's to fix before proceeding.
+Expected: the sequential pipeline aborts at the rust stage with exit 1, and the failure set is EXACTLY the enumerated kata-b46d family (4-5 freshagent fencing failures, waived by the user 2026-09-20, recorded in the run-state baseline ledger). The vitest (cloud) and source-runtime lanes before it must be green. The electron lane does NOT run (the `&&`-chained pipeline stops at the red rust stage) — under the waiver that is the accepted gate shape; do not treat the missing electron run as a failure of this change (a Rust-only identity/sweep change cannot affect it, and the PR's CI checks cover the client build). Any OTHER failure, or any b46d-family failure in a lane other than the workspace rust stage, is this run's to fix before proceeding.
+
+Landing note: the PR's required `rust-gate` check (workspace `cargo test`) will be red from the pre-existing b46d family at base; per the repo's documented merge policy the merge uses the owner-account ruleset bypass (`gh pr merge <n> --merge` from the owner account, pull_request-mode bypass actor). The targeted pre-push gate (`-p freshell-server -p freshell-ws`) excludes the family and must be green.
 
 - [ ] **Step 5: Record evidence**
 
