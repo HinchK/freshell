@@ -58,6 +58,7 @@ fn real_sidecar_dispatches_interrupt_frames_to_handle_interrupt() {
     let dir = tempfile::tempdir().expect("create temp dir");
     for module in [
         "index.mjs",
+        "monotonic-clock.mjs",
         "permission-channel.mjs",
         "session-settings.mjs",
         "turn-complete-gate.mjs",

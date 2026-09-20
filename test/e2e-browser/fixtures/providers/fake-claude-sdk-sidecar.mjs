@@ -50,14 +50,21 @@
 // (the Rust dispatch validates against its own pending set first).
 //
 // Interrupt semantics: every parked entry gets ONE sdk.permission.cancelled /
-// sdk.question.cancelled frame and the pending counter resets. With NO turn in
-// flight the settle is ok:false ('no in-flight SDK query') and the turn ends
-// with sdk.status idle — NEVER an sdk.exit (the real sidecar keeps the session
-// alive across interrupt; AGENT-03's interrupt/kill separation). With a turn
-// IN FLIGHT the settle is ok:true and the interrupted turn's own NON-SUCCESS
+// sdk.question.cancelled frame and the pending counter resets. The arm
+// condition mirrors the real sidecar exactly: a turn plausibly awaiting a
+// terminal frame (pendingResults > 0) arms the gate BEFORE the "interrupt()"
+// call, the settle is ok:true, and the interrupted turn's own NON-SUCCESS
 // sdk.result follows (the real SDK contract orders the receipt BEFORE the
 // result — sdk.d.ts:3765); the armed gate consumes that result's ring, so an
-// interrupt stays silent while the next turn rings again.
+// interrupt stays silent while the next turn rings again. With NOTHING
+// pending the settle is STILL ok:true — the SDK contract documents
+// RESOLUTION, not rejection, for interrupting with nothing in flight
+// (sdk.d.ts:2384-2394; the real sidecar's ok:false 'no in-flight SDK query'
+// shape fires only when the SDK surface lacks the interrupt method entirely)
+// — and NOTHING arms, so no stray mark survives to eat the NEXT unrelated
+// turn's ring. Either way the turn ends with sdk.status idle — NEVER an
+// sdk.exit (the real sidecar keeps the session alive across interrupt;
+// AGENT-03's interrupt/kill separation).
 //
 // Raw-stdin audit (AGENT-05/06 e2e): when FRESHELL_FAKE_STDIN=<path> is set,
 // EVERY raw stdin line is appended there as a JSONL row {t, pid, line} —
@@ -106,6 +113,7 @@ import { randomUUID } from 'node:crypto'
 import readline from 'node:readline'
 import { appendJsonl, appendLaunchLedger, EVENTS_ENV, FixtureEngine, keepAlive, loadProgram } from './fixture-core.mjs'
 import { createTurnCompleteGate } from '../../../../crates/freshell-claude-sidecar/turn-complete-gate.mjs'
+import { nextMonotonic } from '../../../../crates/freshell-claude-sidecar/monotonic-clock.mjs'
 
 const provider = process.env.FRESHELL_FAKE_PROVIDER ?? 'kilroy'
 const env = process.env
@@ -251,30 +259,41 @@ async function render(event) {
       break
     }
     case 'completion': {
+      const st = sessions.get(sessionId)
+      // Real-sidecar parity (index.mjs handleSdkMessage drops the whole
+      // message for a missing session): a completion targeting a session
+      // that no longer exists (e.g. after the stream-error lane's teardown)
+      // is dropped ENTIRELY — no assistant, no result, no edge, no idle.
+      // The fake must not invent frames the real sidecar never emits.
+      if (!st) return
       emit({
         type: 'sdk.assistant',
         sessionId,
         content: [{ type: 'text', text: data.text ?? 'Fixture turn' }],
-        model: sessions.get(sessionId)?.settings.model ?? 'fixture-model',
+        model: st.settings.model ?? 'fixture-model',
       })
-      const st = sessions.get(sessionId)
-      if (st) appendTranscript(st.cliSessionId, st.cwd, 'assistant', data.text ?? 'Fixture turn')
+      appendTranscript(st.cliSessionId, st.cwd, 'assistant', data.text ?? 'Fixture turn')
       let subtype = data.subtype ?? 'success'
-      if (st?.interrupted) {
+      if (st.interrupted) {
         // An in-flight interrupt deferred to this scripted completion: the
         // interrupted turn's own terminal result is non-success (real SDK
         // contract — an interrupted turn never ends 'success').
         subtype = 'error_during_execution'
         st.interrupted = false
       }
-      if (st) st.pendingResults = Math.max(0, st.pendingResults - 1)
+      st.pendingResults = Math.max(0, st.pendingResults - 1)
       emit({ type: 'sdk.result', sessionId, result: subtype })
       // Unified attention edge (the REAL gate): every result subtype rings
-      // except one consumed by a pending accepted user-interrupt mark.
-      if (!st || st.turnCompleteGate.resultEmitsAttention()) {
-        emit({ type: 'sdk.turn.complete', sessionId, at: Date.now() })
+      // except one consumed by a pending accepted user-interrupt mark. The
+      // `at` mint clamps through the REAL sidecar's shared clock
+      // (monotonic-clock.mjs) — two same-ms edges stay strictly increasing,
+      // or the client's `at <= last` dedupe silently drops the second ring.
+      if (st.turnCompleteGate.resultEmitsAttention()) {
+        const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
+        st.lastTurnCompleteAt = at
+        emit({ type: 'sdk.turn.complete', sessionId, at })
       }
-      if (st) st.turnOpen = false
+      st.turnOpen = false
       emit({ type: 'sdk.status', sessionId, status: 'idle' })
       break
     }
@@ -298,7 +317,9 @@ async function render(event) {
         }
         st.pending = 0
         if (st.pendingResults > 0 && st.turnCompleteGate.resultEmitsAttention()) {
-          emit({ type: 'sdk.turn.complete', sessionId, at: Date.now() })
+          const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
+          st.lastTurnCompleteAt = at
+          emit({ type: 'sdk.turn.complete', sessionId, at })
         }
       }
       emit({ type: 'sdk.status', sessionId, status: 'idle' })
@@ -356,9 +377,11 @@ async function handleInput(line) {
     sessions.set(sessionId, { cliSessionId, cwd, pending: 0, pendingEntries: [],
       settings: { model: msg.model, effort: msg.effort, permissionMode: msg.permissionMode, cwd },
       // Unified attention bookkeeping (mirrors the real sidecar's per-session
-      // state): the gate, the accepted-sends counter, and the in-flight turn
-      // model the interrupt arm and stream-error lane consult.
+      // state): the gate, the accepted-sends counter, and the last minted
+      // monotonic `at` — the interrupt arm, the stream-error lane, and every
+      // turn-complete mint consult them.
       turnCompleteGate: createTurnCompleteGate(), pendingResults: 0,
+      lastTurnCompleteAt: undefined,
       turnOpen: false, sendInFlight: false, interrupted: false })
     // A durable transcript EXISTS from create on (the reload-while-pending
     // snapshot route reads it before any turn completes) — touch, no bogus row.
@@ -487,10 +510,12 @@ async function handleInput(line) {
         })
       }
       st.pending = 0
-      if (st.turnOpen) {
-        // A turn IS in flight: arm the REAL gate BEFORE the "interrupt()"
-        // call, exactly like the real sidecar — the SDK contract orders the
-        // settle receipt BEFORE the interrupted turn's own result
+      if (st.pendingResults > 0) {
+        // A turn is plausibly awaiting a terminal frame — arm the REAL gate
+        // BEFORE the "interrupt()" call, exactly like the real sidecar
+        // (index.mjs: `if (st.pendingResults > 0)
+        // st.turnCompleteGate.noteInterruptRequest()`); the SDK contract
+        // orders the settle receipt BEFORE the interrupted turn's own result
         // (sdk.d.ts:3765), so the mark deterministically consumes that
         // result's ring (the interrupt stays silent; the next turn rings).
         st.turnCompleteGate.noteInterruptRequest()
@@ -513,8 +538,12 @@ async function handleInput(line) {
       if (st.sendInFlight) return
       // Parked/plain in-flight turn: nothing else will end it, so synthesize
       // the interrupted turn's own non-success terminal result — the armed
-      // gate consumes its ring — then idle. Still NEVER an sdk.exit.
-      st.pendingResults = Math.max(0, st.pendingResults - 1)
+      // gate consumes its ring — then idle. Still NEVER an sdk.exit. The
+      // counter goes to ZERO, not minus one: the fake models ONE in-flight
+      // turn, so the interrupt ends everything pending — a stale-positive
+      // counter here would let a later stream-error lane mint a phantom ring
+      // (task-004-review F-N1).
+      st.pendingResults = 0
       emit({ type: 'sdk.result', sessionId: msg.sessionId, result: 'error_during_execution' })
       st.turnCompleteGate.resultEmitsAttention()
       st.turnOpen = false
@@ -522,16 +551,15 @@ async function handleInput(line) {
       emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' })
       return
     }
-    // No turn in flight — kata 1wxv ep4 (roll-back quiesce protocol): the
-    // settled receipt answers 'no in-flight SDK query', matching the real
-    // sidecar. This must precede any of the frames below in stream order (the
-    // consumer folds the receipt only after provably-earlier evidence).
-    emit({
-      type: 'sdk.interrupt_settled',
-      sessionId: msg.sessionId,
-      ok: false,
-      message: 'no in-flight SDK query',
-    })
+    // No turn awaits a terminal frame — real-sidecar parity: the SDK RESOLVES
+    // an idle-session interrupt (sdk.d.ts:2384-2394 — resolution, not
+    // rejection; the ok:false 'no in-flight SDK query' shape fires only when
+    // the SDK surface lacks the interrupt method entirely), so the settle
+    // lands ok:true and NOTHING armed — no stray mark can eat the NEXT
+    // unrelated turn's ring. The receipt must precede any of the frames
+    // below in stream order (the consumer folds the receipt only after
+    // provably-earlier evidence).
+    emit({ type: 'sdk.interrupt_settled', sessionId: msg.sessionId, ok: true })
     const emitted = await engine.handleMessage(msg)
     if (emitted.has('crash')) return
     if (!emitted.has('activity') && !emitted.has('marker')) {

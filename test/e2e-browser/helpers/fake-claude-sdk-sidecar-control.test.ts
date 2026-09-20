@@ -359,6 +359,68 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
     }
   })
 
+  it('an interrupt on an idle session settles ok:true (SDK resolution) and the next turn ring survives (task-004 F-I1)', async () => {
+    const fx = launch({ rules: [] })
+    try {
+      fx.send({ type: 'create', requestId: 'req-1', cwd: tmp })
+      const created = await fx.waitLine((o) => o.type === 'created', 'created')
+      const sessionId = created.sessionId as string
+      await fx.waitLine((o) => o.type === 'sdk.status' && o.status === 'idle', 'initial idle')
+
+      // Nothing awaits a terminal frame. The real SDK RESOLVES an
+      // idle-session interrupt (sdk.d.ts:2384-2394 — resolution, not
+      // rejection; the ok:false 'no in-flight SDK query' shape fires only
+      // when the SDK surface lacks the interrupt method entirely), so the
+      // real sidecar settles ok:true and arms NOTHING. The fake must mirror
+      // that shape — and no stray mark may eat the NEXT unrelated turn ring.
+      fx.send({ type: 'interrupt', sessionId })
+      const settle = await fx.waitLine((o) => o.type === 'sdk.interrupt_settled', 'idle interrupt settle')
+      expect(settle).toMatchObject({ sessionId, ok: true })
+
+      fx.send({ type: 'send', sessionId, text: 'next unrelated turn' })
+      await fx.waitLine((o) => o.type === 'sdk.turn.complete', 'the next turn still rings')
+    } finally {
+      await fx.stop()
+    }
+  })
+
+  it('a completion against a session that no longer exists is dropped entirely (real-sidecar parity, task-004 F-M2)', async () => {
+    const fx = launch({
+      rules: [
+        { on: 'msg:send', match: { text: 'DIE' }, emit: [{ kind: 'stream-error' }] },
+        { on: 'msg:send', match: { text: 'WITNESS' }, emit: [{ kind: 'activity', data: { status: 'compacting' } }] },
+      ],
+    })
+    try {
+      fx.send({ type: 'create', requestId: 'req-1', cwd: tmp })
+      const created = await fx.waitLine((o) => o.type === 'created', 'created')
+      const sessionId = created.sessionId as string
+
+      // The stream-error lane tears the session down mid-turn; its
+      // finally-mint edge fires (the send was accepted, pendingResults > 0).
+      fx.send({ type: 'send', sessionId, text: 'DIE' })
+      await fx.waitLine((o) => o.type === 'sdk.error', 'stream-error sdk.error')
+      await fx.waitLine((o) => o.type === 'sdk.turn.complete', 'the stream-error finally-mint edge')
+
+      // Deterministic settle: a follow-up send against the dead session
+      // renders the WITNESS activity, proving the engine kept processing —
+      // while the default completion renders behind BOTH sends stay DROPPED.
+      // The real sidecar drops the whole message for a missing session
+      // (index.mjs:215-216): no assistant, no result, no second edge.
+      fx.send({ type: 'send', sessionId, text: 'WITNESS' })
+      await fx.waitLine((o) => o.type === 'sdk.status' && o.status === 'compacting', 'witness activity')
+      const out = fx.stdoutLines()
+      expect(out.filter((o) => o.type === 'sdk.assistant'), 'no assistant frame for a dead session').toEqual([])
+      expect(out.filter((o) => o.type === 'sdk.result'), 'no result frame for a dead session').toEqual([])
+      expect(
+        out.filter((o) => o.type === 'sdk.turn.complete'),
+        'exactly the stream-error edge — no completion-render edge for the corpse',
+      ).toHaveLength(1)
+    } finally {
+      await fx.stop()
+    }
+  })
+
   it('writes the durable claude transcript the snapshot route reads (create-touch, user on send, assistant on completion)', async () => {
     const fx = launch(RAISE_PROGRAM)
     try {

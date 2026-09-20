@@ -35,4 +35,19 @@ describe('freshell-claude-sidecar turn-complete gate', () => {
     expect(gate.resultEmitsAttention()).toBe(false) // interrupted turn's late result
     expect(gate.resultEmitsAttention()).toBe(true)  // the queued turn's own result
   })
+
+  it('an interrupt with nothing pending never arms (the arm site skips the arm when no turn awaits a terminal frame)', () => {
+    // The gate stays pure; the ARM-SITE policy it serves (index.mjs
+    // handleInterrupt) is `if (st.pendingResults > 0)
+    // st.turnCompleteGate.noteInterruptRequest()`. Modeled here the same way
+    // the arm site does it: with NOTHING pending, the SDK RESOLVES the
+    // interrupt (settle ok:true, no result ever follows — sdk.d.ts:2384-2394
+    // documents RESOLUTION, not rejection, for the nothing-in-flight case),
+    // so no mark may survive to eat the NEXT unrelated turn's result.
+    const gate = createTurnCompleteGate()
+    const pendingResults = 0
+    if (pendingResults > 0) gate.noteInterruptRequest()
+    gate.noteInterruptSettled(true)
+    expect(gate.resultEmitsAttention()).toBe(true) // the next turn's result still rings
+  })
 })

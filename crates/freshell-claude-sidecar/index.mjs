@@ -77,6 +77,7 @@ import { createInterface } from 'node:readline'
 import { randomBytes } from 'node:crypto'
 import { configureSession, userMessageContent, resultErrorMessage } from './session-settings.mjs'
 import { createTurnCompleteGate } from './turn-complete-gate.mjs'
+import { nextMonotonic } from './monotonic-clock.mjs'
 import {
   canUseTool as routeCanUseTool,
   cancelPending,
@@ -177,10 +178,9 @@ function createInputStream(onHandoff) {
   return { iterable, handle }
 }
 
-// ── per-session monotonic turn-complete/waiting clock (turn-complete-clock.ts) ─
-function nextMonotonic(last, now) {
-  return last != null && now <= last ? last + 1 : now
-}
+// ── per-session monotonic turn-complete/waiting clock ────────────────────────
+// nextMonotonic lives in monotonic-clock.mjs (shared with the e2e fake so the
+// fixture clamps identically — ONE implementation of the clamp).
 
 /** @type {Map<string, {inputStream:{push:Function,end:Function}, abort:AbortController, permissionMode?:string, cliSessionId?:string, lastTurnCompleteAt?:number, lastWaitingAt?:number, pendingPermissions?:Map<string,any>, pendingQuestions?:Map<string,any>, turnCompleteGate?:{noteInterruptRequest:Function,noteInterruptSettled:Function,resultEmitsAttention:Function}, pendingResults?:number}>} */
 const sessions = new Map()
@@ -539,12 +539,22 @@ function handleInterrupt(req) {
     emit({ type: 'sdk.interrupt_settled', sessionId: req.sessionId, ok: false, message: 'no in-flight SDK query' })
     return
   }
-  // Unified attention gate: arm the mark BEFORE the interrupt call — the SDK
-  // contract (sdk.d.ts:3765) orders the settle receipt BEFORE the interrupted
-  // turn's own result, so the mark deterministically consumes exactly that
-  // result. A REJECTED interrupt (the turn kept running) clears the mark; a
-  // no-in-flight query never arms one.
-  st.turnCompleteGate.noteInterruptRequest()
+  // Unified attention gate: arm the mark BEFORE the interrupt call — and ONLY
+  // while a turn is plausibly awaiting a terminal frame (pendingResults > 0).
+  // The SDK contract documents RESOLUTION — not rejection — for interrupting
+  // with NOTHING in flight (sdk.d.ts:2384-2394: "Interrupt the current query
+  // execution ... Older CLIs resolve to `undefined`"), so an idle-session
+  // interrupt (a late Stop click racing the busy-clear, or a double-click's
+  // second Stop) must arm NOTHING: a stray mark there would survive and eat
+  // the NEXT unrelated turn's result, silently suppressing exactly the ring
+  // this feature exists to produce. While a turn IS pending, the settle
+  // receipt (sdk.d.ts:3765) lands BEFORE the interrupted turn's own result,
+  // so the mark deterministically consumes exactly that result (including the
+  // crash-order case where the result wins the race to the wire — the mark
+  // was armed at request time and is still there to consume it). A REJECTED
+  // interrupt (the turn kept running) clears the mark; noteInterruptSettled
+  // stays in both promise arms — settle(true) without a mark is a no-op.
+  if (st.pendingResults > 0) st.turnCompleteGate.noteInterruptRequest()
   st.query.interrupt()
     .then(() => {
       st.turnCompleteGate.noteInterruptSettled(true)

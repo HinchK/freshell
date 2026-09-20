@@ -658,6 +658,7 @@ function copySidecar(
 ): void {
   for (const name of [
     'index.mjs',
+    'monotonic-clock.mjs',
     'permission-channel.mjs',
     'session-settings.mjs',
     'turn-complete-gate.mjs',
