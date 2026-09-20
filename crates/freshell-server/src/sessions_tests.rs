@@ -729,7 +729,16 @@ async fn patch_override_is_visible_through_session_directory_overlay() {
         freshell_sessions::directory_index::SessionIndex::with_ttl_and_cache_path(
             vec![
                 std::sync::Arc::new(freshell_sessions::directory_index::ClaudeSource::new(
-                    crate::session_directory::claude_home(&home),
+                    // Pin the temp home's claude root DIRECTLY, never through
+                    // `claude_home(&home)` (which lets the process-global
+                    // CLAUDE_HOME env var win over the explicit home — the
+                    // production override parity). Parallel test modules
+                    // mutate CLAUDE_HOME process-globally while holding
+                    // their OWN lock, so a test that does not take that
+                    // lock can resolve a FOREIGN temp home at construction
+                    // and scan the wrong root forever (the observed
+                    // full-parallelism flake; green solo and at 4 threads).
+                    home.join(".claude"),
                 ))
                     as std::sync::Arc<dyn freshell_sessions::directory_index::SessionSource>,
             ],
@@ -998,7 +1007,16 @@ async fn deleted_session_disappears_from_session_directory_overlay() {
     let session_index =
         std::sync::Arc::new(freshell_sessions::directory_index::SessionIndex::new(vec![
             std::sync::Arc::new(freshell_sessions::directory_index::ClaudeSource::new(
-                crate::session_directory::claude_home(&home),
+                // Pin the temp home's claude root DIRECTLY, never through
+                // `claude_home(&home)` (which lets the process-global
+                // CLAUDE_HOME env var win over the explicit home — the
+                // production override parity). Parallel test modules
+                // mutate CLAUDE_HOME process-globally while holding their
+                // OWN lock, so a test that does not take that lock can
+                // resolve a FOREIGN temp home at construction and scan the
+                // wrong root forever (the observed full-parallelism flake;
+                // green solo and at 4 threads).
+                home.join(".claude"),
             )) as std::sync::Arc<dyn freshell_sessions::directory_index::SessionSource>,
         ]));
     let dir_app =
@@ -1213,7 +1231,16 @@ async fn generate_title_provider_generated_short_circuits_without_write() {
         freshell_sessions::directory_index::SessionIndex::with_ttl_and_cache_path(
             vec![
                 std::sync::Arc::new(freshell_sessions::directory_index::ClaudeSource::new(
-                    crate::session_directory::claude_home(&home),
+                    // Pin the temp home's claude root DIRECTLY, never through
+                    // `claude_home(&home)` (which lets the process-global
+                    // CLAUDE_HOME env var win over the explicit home — the
+                    // production override parity). Parallel test modules
+                    // mutate CLAUDE_HOME process-globally while holding
+                    // their OWN lock, so a test that does not take that
+                    // lock can resolve a FOREIGN temp home at construction
+                    // and scan the wrong root forever (the observed
+                    // full-parallelism flake; green solo and at 4 threads).
+                    home.join(".claude"),
                 ))
                     as std::sync::Arc<dyn freshell_sessions::directory_index::SessionSource>,
             ],
