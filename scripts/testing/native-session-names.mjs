@@ -1569,6 +1569,86 @@ class OpencodeServe {
   }
 }
 
+// Materialize a freshopencode pane through the REAL wire, the way the
+// product's own client does. The REST create mints a PLACEHOLDER pane
+// (sessionId = freshopencode-<createRequestId>) with a pending naming
+// handle (FreshAgentView.tsx:1246 — makePlaceholderSessionId(requestId));
+// the durable ses_* session is created only when the FIRST message is sent
+// (`bind_naming_handle_at_materialization` — opencode_ws.rs: "the binding
+// row is written at materialization (first send), well after this create
+// returns"). The model turn itself may fail (no provider in the sandbox) —
+// the serve's session creation and the naming bind PRECEDE the turn, so
+// the send's frame is observed but not asserted. This is ALSO the only
+// lane that creates the server's shared opencode serve: the native naming
+// adapter resolves the shared manager PER OPERATION (a boot-time snapshot
+// would freeze its None), so a server with native-writeback work needs a
+// materialized pane before its series can run at all.
+async function materializeOpencodePane(server, projectDir) {
+  const agentCreate = await fetchJson(`${server.baseUrl}/api/tabs`, {
+    method: 'POST',
+    headers: server.authHeaders(),
+    body: JSON.stringify({ agent: 'opencode', cwd: projectDir }),
+  })
+  if (!agentCreate.ok) throw new Error(`opencode REST agent create failed: ${agentCreate.status} ${JSON.stringify(agentCreate.body)}`)
+  const agentPane = agentCreate.body?.data ?? {}
+  const agentTabId = agentPane.tabId
+  const agentPaneId = agentPane.paneId
+  if (!agentTabId || !agentPaneId) throw new Error(`opencode REST agent create produced no pane: ${JSON.stringify(agentPane)}`)
+  const content = await withTimeout(pollUntil(
+    'agent pane content carries its naming handle',
+    async () => {
+      const paneNow = await server.paneContent(agentTabId, agentPaneId)
+      if (!paneNow?.createRequestId || typeof paneNow.namingHandle !== 'string') return null
+      return paneNow
+    },
+    30_000,
+    500,
+  ), 40_000, 'agent pane content carries its naming handle')
+  const { ws: createWs, frames: createFrames } = await server.wsHello()
+  createWs.send(JSON.stringify({
+    type: 'freshAgent.create',
+    requestId: content.createRequestId,
+    sessionType: 'freshopencode',
+    provider: 'opencode',
+    cwd: projectDir,
+    namingHandle: content.namingHandle,
+  }))
+  let createdFrame
+  try {
+    createdFrame = await server.waitForFrameAny(createFrames, ['freshAgent.created', 'freshAgent.create.failed', 'freshAgent.error', 'error'], 75_000)
+    if (createdFrame.type !== 'freshAgent.created') {
+      throw new Error(`the agent pane's freshAgent.create refused: ${JSON.stringify(createdFrame)}`)
+    }
+  } catch (error) {
+    throw new Error(`${error.message}; frames so far: ${JSON.stringify(createFrames.map((frame) => ({ type: frame.type, code: frame.code, message: (frame.message ?? '').slice(0, 200) })))}`)
+  }
+  try {
+    createWs.close()
+  } catch {
+    // already closed
+  }
+  const { ws: sendWs, frames: sendFrames } = await server.wsHello()
+  sendWs.send(JSON.stringify({
+    type: 'freshAgent.send',
+    requestId: `materialize-${randomUUID()}`,
+    sessionType: 'freshopencode',
+    provider: 'opencode',
+    sessionId: createdFrame.sessionId,
+    cwd: projectDir,
+    text: 'Materialize the session for the naming writeback contract',
+  }))
+  // The send's own outcome (accepted or errored on the provider call) is
+  // not asserted — only the materialization it triggers is. Bound the
+  // wait so a wedged lane cannot hang the contract.
+  await server.waitForFrameAny(sendFrames, ['freshAgent.send.accepted', 'freshAgent.error', 'error'], 90_000).catch(() => null)
+  try {
+    sendWs.close()
+  } catch {
+    // already closed
+  }
+  return { tabId: agentTabId, paneId: agentPaneId, content, createdFrame }
+}
+
 async function opencodeContract(args, server, receipt, observed) {
   const provider = 'opencode'
   const result = {
@@ -1834,88 +1914,11 @@ print(row, messages[0][0])
     // durable against the persisted (zero-turn) DB row, so the canonical
     // rename HAS a record — and its native writeback runs through the
     // server's managed serve, the SAME effective database the contract's
-    // serves read (shared XDG_DATA_HOME).
-    const agentCreate = await fetchJson(`${server.baseUrl}/api/tabs`, {
-      method: 'POST',
-      headers: server.authHeaders(),
-      body: JSON.stringify({ agent: 'opencode', cwd: projectDir }),
-    })
-    if (!agentCreate.ok) throw new Error(`opencode REST agent create failed: ${agentCreate.status} ${JSON.stringify(agentCreate.body)}`)
-    const agentPane = agentCreate.body?.data ?? {}
-    const agentTabId = agentPane.tabId
-    const agentPaneId = agentPane.paneId
-    if (!agentTabId || !agentPaneId) throw new Error(`opencode REST agent create produced no pane: ${JSON.stringify(agentPane)}`)
-    // The REST create mints a PLACEHOLDER pane (sessionId =
-    // freshopencode-<createRequestId>) with a pending naming handle; the
-    // REAL session is created when a client mounts the pane and speaks the
-    // WS create lane with the pane's createRequestId + namingHandle
-    // (FreshAgentView.tsx:1246 — the placeholder id is deterministic:
-    // makePlaceholderSessionId(requestId)). Drive that lane like the real
-    // client; the runner's WS create carries the SAME identity.
-    const agentContent = await withTimeout(pollUntil(
-      'agent pane content carries its naming handle',
-      async () => {
-        const content = await server.paneContent(agentTabId, agentPaneId)
-        if (!content?.createRequestId || typeof content.namingHandle !== 'string') return null
-        return content
-      },
-      30_000,
-      500,
-    ), 40_000, 'agent pane content carries its naming handle')
-    const { ws: agentWs, frames: agentFrames } = await server.wsHello()
-    agentWs.send(JSON.stringify({
-      type: 'freshAgent.create',
-      requestId: agentContent.createRequestId,
-      sessionType: 'freshopencode',
-      provider: 'opencode',
-      cwd: projectDir,
-      namingHandle: agentContent.namingHandle,
-    }))
-    let agentCreatedFrame
-    try {
-      agentCreatedFrame = await server.waitForFrameAny(agentFrames, ['freshAgent.created', 'freshAgent.create.failed', 'freshAgent.error', 'error'], 75_000)
-      if (agentCreatedFrame.type !== 'freshAgent.created') {
-        throw new Error(`the agent pane's freshAgent.create refused: ${JSON.stringify(agentCreatedFrame)}`)
-      }
-    } catch (error) {
-      throw new Error(`${error.message}; frames so far: ${JSON.stringify(agentFrames.map((frame) => ({ type: frame.type, code: frame.code, message: (frame.message ?? '').slice(0, 200) })))}`)
-    }
-    try {
-      agentWs.close()
-    } catch {
-      // already closed
-    }
-    // A freshopencode create answers `created` with the PLACEHOLDER id BY
-    // DESIGN ("the binding row is written at materialization (first send),
-    // well after this create returns" — opencode_ws.rs): the shared serve
-    // creates the durable ses_* session only when the FIRST message is
-    // sent, and `bind_naming_handle_at_materialization` transfers the
-    // pending handle onto it there. Materialize through the REAL wire:
-    // send the first message (the model turn itself may fail — there is
-    // no provider in the sandbox — but the serve's session creation and
-    // the verified bind PRECEDE the turn). A timeout here must carry the
-    // three decisive artifacts: the created frame's own projection, the
-    // pane's LIVE content, and the naming store document (the bind's
-    // committed evidence).
-    const { ws: sendWs, frames: sendFrames } = await server.wsHello()
-    sendWs.send(JSON.stringify({
-      type: 'freshAgent.send',
-      requestId: `materialize-${randomUUID()}`,
-      sessionType: 'freshopencode',
-      provider: 'opencode',
-      sessionId: agentCreatedFrame.sessionId,
-      cwd: projectDir,
-      text: 'Materialize the session for the naming writeback contract',
-    }))
-    // The send's own outcome (accepted or errored on the provider call) is
-    // not asserted — only the materialization it triggers is. Bound the
-    // wait so a wedged lane cannot hang the contract.
-    await server.waitForFrameAny(sendFrames, ['freshAgent.send.accepted', 'freshAgent.error', 'error'], 90_000).catch(() => null)
-    try {
-      sendWs.close()
-    } catch {
-      // already closed
-    }
+    // serves read (shared XDG_DATA_HOME). The materialization helper drives
+    // the REST create, the WS create lane, and the first send — the same
+    // wire the real client speaks.
+    const { tabId: agentTabId, paneId: agentPaneId, content: agentContent, createdFrame: agentCreatedFrame } = await materializeOpencodePane(server, projectDir)
+    result.agentPane = { tabId: agentTabId, paneId: agentPaneId, createdPlaceholder: agentCreatedFrame.sessionId }
     // The bind's DURABLE target: the pane CONTENT's nameRef only advances
     // when a real CLIENT syncs its layout (the raw-WS pane has no
     // layout-syncing client — observed end-to-end: the first send
@@ -1978,6 +1981,16 @@ print(row, messages[0][0])
       home: mismatchHome,
       env: { OPENCODE_DB: mismatchDb },
     })
+    // The mismatch server's shared opencode serve must EXIST for its
+    // native writeback to reach the diagnosis: the naming adapter resolves
+    // the shared manager PER OPERATION, and a server with no materialized
+    // pane has no serve — its armed series would PAUSE (capability absent,
+    // zero cycles) instead of being diagnosed. Materializing a pane spawns
+    // the serve under THIS server's env, so the manager's evaluated
+    // effective database is the MISMATCHED pin while the copied record's
+    // verified location points at the REAL database: the pre-dispatch
+    // context gate must reject every operation.
+    await materializeOpencodePane(mismatchServer, projectDir)
     const mismatchName = 'Mismatch-server name'
     const mismatchRename = await mismatchServer.renameCanonical(agentTarget, mismatchName, 'user')
     if (!mismatchRename.ok) throw new Error(`mismatch-server rename failed: ${mismatchRename.status} ${JSON.stringify(mismatchRename.body)}`)
