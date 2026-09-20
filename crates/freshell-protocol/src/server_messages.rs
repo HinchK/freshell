@@ -339,6 +339,22 @@ pub enum TerminalOutputGapReason {
     ReplayBudgetExceeded,
 }
 
+/// `terminal.attach.ready.replayResetReason` — why the attach's effective
+/// replay position was reset instead of honoring the requested one
+/// (responsive-terminal-restore shared contract).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalReplayResetReason {
+    /// The geometry-authority check rejected the requested position (the
+    /// only pre-restore-contract value; const on the wire).
+    GeometryAuthorityUnknown,
+    /// The requested position predates the retained replay window
+    /// (retention loss). Emitted ONLY on connections that negotiated
+    /// `pacedTerminalReplayV1` — task 3's negotiated retention-gap emission;
+    /// this increment only extends the value space, no emitter sets it yet.
+    RetentionLost,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputSource {
@@ -1182,9 +1198,16 @@ pub struct TerminalAttachReady {
     pub geometry_authority: Option<GeometryAuthority>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub geometry_epoch: Option<i64>,
-    /// const `"geometry_authority_unknown"`.
+    /// Restore contract (responsive-terminal-restore): the earliest sequence
+    /// position still available for replay — the retained ring's front
+    /// `seqStart`, or `head_seq + 1` when nothing older than the head is
+    /// retained. Emitted ONLY on connections that negotiated
+    /// `pacedTerminalReplayV1`; omitted otherwise so the frozen client's
+    /// frame stays byte-identical.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub replay_reset_reason: Option<String>,
+    pub oldest_retained_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replay_reset_reason: Option<TerminalReplayResetReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_since_seq: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1357,6 +1380,18 @@ pub struct TerminalOutputGap {
     pub to_seq: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attach_request_id: Option<String>,
+    /// Restore contract (responsive-terminal-restore): the terminal's current
+    /// `headSeq` at gap-emission time. Emitted ONLY on connections that
+    /// negotiated `pacedTerminalReplayV1`; omitted otherwise so the frozen
+    /// client's gap frame stays byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_seq: Option<i64>,
+    /// Restore contract (responsive-terminal-restore): the earliest sequence
+    /// position still available for replay (the retained ring's front
+    /// `seqStart`, or `head_seq + 1` when the ring is empty) at
+    /// gap-emission time. Emitted ONLY on negotiated connections.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_retained_seq: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

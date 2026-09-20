@@ -3435,11 +3435,17 @@
         "headSeq": {
           "type": "number"
         },
+        "oldestRetainedSeq": {
+          "type": "number"
+        },
         "replayFromSeq": {
           "type": "number"
         },
         "replayResetReason": {
-          "const": "geometry_authority_unknown",
+          "enum": [
+            "geometry_authority_unknown",
+            "retention_lost"
+          ],
           "type": "string"
         },
         "replayToSeq": {
@@ -4369,6 +4375,12 @@
         "fromSeq": {
           "type": "number"
         },
+        "headSeq": {
+          "type": "number"
+        },
+        "oldestRetainedSeq": {
+          "type": "number"
+        },
         "reason": {
           "enum": [
             "queue_overflow",
@@ -4524,9 +4536,9 @@
         },
         "reason": {
           "enum": [
+            "retention_lost",
             "new_pty_session",
             "codex_pty_recovery",
-            "retention_lost",
             "server_restart_incompatible_retention"
           ],
           "type": "string"

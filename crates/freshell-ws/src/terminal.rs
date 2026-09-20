@@ -370,6 +370,20 @@ async fn run_loop(
     if terminal_interest_v1 {
         ws_tx.enable_terminal_interest();
     }
+    if paced_terminal_replay_v1 {
+        // Restore contract (responsive-terminal-restore): a negotiated
+        // connection's queue-overflow gaps carry the terminal's CURRENT
+        // replay-retention bounds, resolved from the registry at
+        // gap-emission time. Installed BEFORE the pump is spawned (the same
+        // pre-spawn setup rule as `enable_terminal_interest`), so a gap can
+        // never be leased before the source exists. Non-negotiated
+        // connections leave the source unset and their gaps stay
+        // byte-identical to the pre-capability wire shape.
+        let registry = state.registry.clone();
+        ws_tx.set_paced_replay_gap_bounds(Arc::new(move |terminal_id: &str| {
+            registry.replay_bounds(terminal_id)
+        }));
+    }
     let mut writer_task = tokio::spawn(writer.run(socket_tx).instrument(tracing::Span::current()));
     let _writer_lifetime = connection_writer::AbortWriterOnDrop(writer_task.abort_handle());
     let mut writer_finished = false;

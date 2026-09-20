@@ -1240,7 +1240,9 @@ export type TerminalAttachReadyMessage = {
   geometryAuthority?: TerminalGeometryAuthority
   requestedSinceSeq?: number
   effectiveSinceSeq?: number
-  replayResetReason?: 'geometry_authority_unknown'
+  /** Restore contract (negotiated pacedTerminalReplayV1 only): earliest sequence position still available for replay (headSeq+1 when nothing older is retained). */
+  oldestRetainedSeq?: number
+  replayResetReason?: 'geometry_authority_unknown' | 'retention_lost'
   headSeq: number
   replayFromSeq: number
   replayToSeq: number
@@ -1431,6 +1433,10 @@ export type TerminalOutputGapMessage = {
   toSeq: number
   reason: 'queue_overflow' | 'replay_window_exceeded' | 'replay_budget_exceeded'
   attachRequestId?: string
+  /** Restore contract (negotiated pacedTerminalReplayV1 only): the terminal's current headSeq at gap-emission time. */
+  headSeq?: number
+  /** Restore contract (negotiated pacedTerminalReplayV1 only): earliest sequence position still available for replay at gap-emission time. */
+  oldestRetainedSeq?: number
 }
 
 export type TerminalTitleUpdatedMessage = {

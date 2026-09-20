@@ -190,6 +190,31 @@ async fn complete_handshake(ws: &mut TestWs) {
     }
 }
 
+/// Same as [`complete_handshake`], but the hello carries a capabilities
+/// object (the restore-contract negotiation tests need it).
+async fn complete_handshake_with_capabilities(ws: &mut TestWs, capabilities: serde_json::Value) {
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "hello",
+            "token": AUTH_TOKEN,
+            "protocolVersion": freshell_protocol::WS_PROTOCOL_VERSION,
+            "capabilities": capabilities,
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send hello");
+
+    for _ in 0..4u8 {
+        let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("handshake message within timeout")
+            .expect("stream not ended")
+            .expect("no ws error");
+        assert!(matches!(msg, WsMessage::Text(_)));
+    }
+}
+
 async fn create_shell_terminal(ws: &mut TestWs, request_id: &str) -> String {
     ws.send(WsMessage::Text(
         serde_json::json!({
@@ -394,5 +419,130 @@ async fn slow_client_does_not_block_fast_client_and_is_bounded() {
         "a slow client that missed a flood past the queue cap must observe either \
          a terminal.output.gap (drop-oldest fired) or a closed connection \
          (catastrophic backpressure fired); observed neither"
+    );
+}
+
+/// Read frames until the first `terminal.output.gap` arrives, returning its
+/// JSON. Callers resume a previously-stuck client: the delivery queue serves
+/// the terminal's pending gap ahead of its remaining frames, so the gap
+/// surfaces within the stuck backlog.
+async fn first_gap_frame(ws: &mut TestWs, deadline: tokio::time::Instant) -> serde_json::Value {
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining.max(Duration::from_millis(1)), ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if value.get("type").and_then(|v| v.as_str()) == Some("terminal.output.gap") {
+                        return value;
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => break,
+        }
+    }
+    panic!("no terminal.output.gap arrived before the deadline");
+}
+
+/// Restore-contract negotiation gating, end to end on real sockets + a real
+/// PTY (responsive-terminal-restore): two slow clients attach to the SAME
+/// flooding terminal — one whose hello negotiated `pacedTerminalReplayV1`,
+/// one not. The negotiated client's queue-overflow gap carries
+/// `headSeq`/`oldestRetainedSeq` resolved from the registry at
+/// gap-emission time; the non-negotiated client's gap omits BOTH keys —
+/// byte-identical to the pre-contract wire.
+#[tokio::test]
+async fn queue_overflow_gap_bounds_follow_negotiation() {
+    // Tiny queue so overflow fires almost immediately; catastrophic
+    // backpressure threshold far above it so the connection stays OPEN and
+    // the observed loss is the queue-overflow gap (not a 4008 close).
+    let term09 = Term09Config {
+        queue_max_bytes: 8 * 1024,
+        catastrophic_buffered_bytes: 8 * 1024 * 1024,
+        catastrophic_stall_ms: 60_000,
+    };
+    let url = spawn_server(term09).await;
+
+    let mut creator = connect_and_complete_handshake(&url).await;
+    let terminal_id = create_shell_terminal(&mut creator, "create-gap").await;
+
+    // Negotiated slow client: tiny SO_RCVBUF. It reads NOTHING from flood
+    // start until the fast client below has seen the flood complete — the
+    // deterministic TERM-09 slow-reader shape (a client that reads along can
+    // keep the writer draining and no overflow ever fires).
+    let mut paced = connect_with_tiny_recv_buffer(&url, 4096).await;
+    complete_handshake_with_capabilities(
+        &mut paced,
+        serde_json::json!({ "pacedTerminalReplayV1": true }),
+    )
+    .await;
+    attach(&mut paced, &terminal_id, "attach-paced").await;
+
+    // Non-negotiated slow client on the SAME terminal, same stuck shape.
+    let mut plain = connect_with_tiny_recv_buffer(&url, 4096).await;
+    complete_handshake(&mut plain).await;
+    attach(&mut plain, &terminal_id, "attach-plain").await;
+
+    // A fast, always-reading client proves when the flood has fully run.
+    let mut fast = connect_and_complete_handshake(&url).await;
+    attach(&mut fast, &terminal_id, "attach-fast").await;
+
+    // Let the attach.ready frames settle before flooding.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let marker = "FLOOD-DONE-MARKER";
+    // ~90 bytes/line * 20_000 lines =~ 1.8 MB: comfortably overruns both
+    // stuck clients' 8 KB writer queues long before the 60 s send timeout.
+    let flood = flood_command(20_000, marker);
+    creator
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "terminal.input",
+                "terminalId": terminal_id,
+                "data": flood,
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send flood input");
+
+    // Wait for the flood to COMPLETE on the fast client: by then both stuck
+    // clients' queues have overflowed and their queue-overflow gaps exist.
+    let fast_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let (fast_acc, _fast_gap, fast_closed) =
+        drain_until_marker_or_deadline(&mut fast, marker, fast_deadline).await;
+    assert!(
+        !fast_closed && fast_acc.contains(marker),
+        "the fast client must see the flood complete before the slow clients resume"
+    );
+
+    // NOW resume each stuck client and capture its first queue-overflow gap.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let paced_gap = first_gap_frame(&mut paced, deadline).await;
+    assert_eq!(
+        paced_gap["reason"], "queue_overflow",
+        "the negotiated client's observed loss is the queue-overflow gap: {paced_gap}"
+    );
+    let paced_head = paced_gap["headSeq"]
+        .as_i64()
+        .expect("negotiated gap carries headSeq");
+    let paced_oldest = paced_gap["oldestRetainedSeq"]
+        .as_i64()
+        .expect("negotiated gap carries oldestRetainedSeq");
+    assert!(paced_head >= 1, "honest current head: {paced_gap}");
+    assert!(
+        paced_oldest >= 1 && paced_oldest <= paced_head + 1,
+        "oldestRetainedSeq is an honest retention bound (front of the ring, \
+         head+1 when empty): {paced_gap}"
+    );
+
+    let plain_gap = first_gap_frame(&mut plain, deadline).await;
+    assert_eq!(
+        plain_gap["reason"], "queue_overflow",
+        "the non-negotiated client's observed loss is the queue-overflow gap: {plain_gap}"
+    );
+    assert!(
+        plain_gap.get("headSeq").is_none() && plain_gap.get("oldestRetainedSeq").is_none(),
+        "a non-negotiated gap must not gain any new key: {plain_gap}"
     );
 }

@@ -655,6 +655,85 @@ fn client_sessions_prefs_roundtrips_and_conforms() {
 }
 
 #[test]
+fn attach_ready_roundtrips_restore_bounds_and_retention_lost_reset_reason() {
+    // Responsive-terminal-restore shared contract: negotiated connections get
+    // the sequence-bounds fields additively — `oldestRetainedSeq` (earliest
+    // sequence position still available for replay) and the extended
+    // `replayResetReason` value space.
+    let wire = r#"{"type":"terminal.attach.ready","terminalId":"t1","streamId":"s1","headSeq":41,"replayFromSeq":7,"replayToSeq":41,"attachRequestId":"a1","requestedSinceSeq":0,"effectiveSinceSeq":0,"oldestRetainedSeq":7}"#;
+    match server_roundtrip(wire, "terminal.attach.ready") {
+        ServerMessage::TerminalAttachReady(r) => {
+            assert_eq!(r.oldest_retained_seq, Some(7));
+            assert_eq!(r.replay_reset_reason, None);
+        }
+        other => panic!("expected TerminalAttachReady, got {other:?}"),
+    }
+
+    // The new `retention_lost` reset-reason value round-trips through the
+    // typed field (task 3 emits it with the negotiated retention gap; this
+    // contract increment only extends the value space).
+    let wire = r#"{"type":"terminal.attach.ready","terminalId":"t1","streamId":"s1","headSeq":41,"replayFromSeq":42,"replayToSeq":41,"replayResetReason":"retention_lost","oldestRetainedSeq":42}"#;
+    match server_roundtrip(wire, "terminal.attach.ready") {
+        ServerMessage::TerminalAttachReady(r) => {
+            assert_eq!(
+                r.replay_reset_reason,
+                Some(TerminalReplayResetReason::RetentionLost)
+            );
+            assert_eq!(r.oldest_retained_seq, Some(42));
+        }
+        other => panic!("expected TerminalAttachReady, got {other:?}"),
+    }
+
+    // The pre-existing reset-reason value keeps round-tripping.
+    let wire = r#"{"type":"terminal.attach.ready","terminalId":"t1","streamId":"s1","headSeq":9,"replayFromSeq":1,"replayToSeq":9,"replayResetReason":"geometry_authority_unknown"}"#;
+    match server_roundtrip(wire, "terminal.attach.ready") {
+        ServerMessage::TerminalAttachReady(r) => {
+            assert_eq!(
+                r.replay_reset_reason,
+                Some(TerminalReplayResetReason::GeometryAuthorityUnknown)
+            );
+        }
+        other => panic!("expected TerminalAttachReady, got {other:?}"),
+    }
+
+    // The frozen-client shape stays byte-identical: no new keys are invented
+    // for a connection that did not negotiate the restore contract.
+    let wire = r#"{"type":"terminal.attach.ready","terminalId":"t1","streamId":"s1","headSeq":3,"replayFromSeq":1,"replayToSeq":3}"#;
+    match server_roundtrip(wire, "terminal.attach.ready") {
+        ServerMessage::TerminalAttachReady(r) => {
+            assert_eq!(r.oldest_retained_seq, None);
+            assert_eq!(r.replay_reset_reason, None);
+        }
+        other => panic!("expected TerminalAttachReady, got {other:?}"),
+    }
+}
+
+#[test]
+fn output_gap_roundtrips_restore_bounds_and_omits_them_for_frozen_clients() {
+    // Negotiated shape: a queue-overflow gap carries the terminal's current
+    // `headSeq` and earliest-replayable `oldestRetainedSeq` at emission time.
+    let wire = r#"{"type":"terminal.output.gap","terminalId":"t1","streamId":"s1","fromSeq":1,"toSeq":9,"reason":"queue_overflow","attachRequestId":"a1","headSeq":12,"oldestRetainedSeq":2}"#;
+    match server_roundtrip(wire, "terminal.output.gap") {
+        ServerMessage::TerminalOutputGap(g) => {
+            assert_eq!(g.head_seq, Some(12));
+            assert_eq!(g.oldest_retained_seq, Some(2));
+        }
+        other => panic!("expected TerminalOutputGap, got {other:?}"),
+    }
+
+    // Non-negotiated shape: both fields stay absent — the frozen client's
+    // gap frame is byte-identical to the pre-contract wire.
+    let wire = r#"{"type":"terminal.output.gap","terminalId":"t1","streamId":"s1","fromSeq":1,"toSeq":9,"reason":"queue_overflow"}"#;
+    match server_roundtrip(wire, "terminal.output.gap") {
+        ServerMessage::TerminalOutputGap(g) => {
+            assert_eq!(g.head_seq, None);
+            assert_eq!(g.oldest_retained_seq, None);
+        }
+        other => panic!("expected TerminalOutputGap, got {other:?}"),
+    }
+}
+
+#[test]
 fn terminal_created_roundtrips_with_and_without_notice() {
     // Base shape: notice omitted — byte-identical to today's frame on the wire.
     let base = r#"{"type":"terminal.created","createdAt":1700000000000,"requestId":"req-1","terminalId":"t1"}"#;

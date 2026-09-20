@@ -206,3 +206,128 @@ async fn capability_free_hello_ready_has_no_capabilities_object() {
         "a capability-free hello must not change ready's shape: {ready}"
     );
 }
+
+/// Read the next JSON text frame from the socket (bounded).
+async fn next_json(ws: &mut WsClient) -> serde_json::Value {
+    let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())
+        .await
+        .expect("frame within timeout")
+        .expect("stream not ended")
+        .expect("no ws error");
+    let WsMessage::Text(text) = msg else {
+        panic!("expected a text frame, got {msg:?}");
+    };
+    serde_json::from_str(&text).expect("frame is JSON")
+}
+
+/// Send `terminal.create` (shell) and return the created terminalId.
+async fn create_shell_terminal(ws: &mut WsClient, request_id: &str) -> String {
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.create",
+            "requestId": request_id,
+            "mode": "shell",
+            "shell": "system",
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send terminal.create");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let value = next_json(ws).await;
+        if value.get("type").and_then(|v| v.as_str()) == Some("terminal.created")
+            && value.get("requestId").and_then(|v| v.as_str()) == Some(request_id)
+        {
+            return value
+                .get("terminalId")
+                .and_then(|v| v.as_str())
+                .expect("terminal.created carries terminalId")
+                .to_string();
+        }
+    }
+    panic!("terminal.created never arrived");
+}
+
+/// Send `terminal.attach` and return the matching `terminal.attach.ready`
+/// frame's JSON (skipping any frames in between).
+async fn attach_and_read_ready(
+    ws: &mut WsClient,
+    terminal_id: &str,
+    attach_request_id: &str,
+) -> serde_json::Value {
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.attach",
+            "terminalId": terminal_id,
+            "intent": "viewport_hydrate",
+            "cols": 80,
+            "rows": 24,
+            "attachRequestId": attach_request_id,
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send terminal.attach");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        let value = next_json(ws).await;
+        if value.get("type").and_then(|v| v.as_str()) == Some("terminal.attach.ready")
+            && value.get("attachRequestId").and_then(|v| v.as_str()) == Some(attach_request_id)
+        {
+            return value;
+        }
+    }
+    panic!("terminal.attach.ready never arrived");
+}
+
+/// Negotiation gating e2e (restore contract): a `pacedTerminalReplayV1`
+/// hello attaching over the REAL socket must see `oldestRetainedSeq` on
+/// `terminal.attach.ready` — the full rail (raw hello JSON extraction →
+/// `handle_attach` → registry population) that in-file unit tests cannot
+/// reach. A fresh terminal reports 1 either way the ring sits (empty ring:
+/// headSeq 0 + 1; retained first frame: seqStart 1).
+#[tokio::test]
+async fn negotiated_attach_ready_carries_oldest_retained_seq() {
+    let url = spawn_server().await;
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("ws connect");
+    let _ready = hello_ready(
+        &mut ws,
+        serde_json::json!({ "pacedTerminalReplayV1": true }),
+    )
+    .await;
+
+    let terminal_id = create_shell_terminal(&mut ws, "create-paced").await;
+    let ready = attach_and_read_ready(&mut ws, &terminal_id, "attach-paced").await;
+    assert_eq!(
+        ready["oldestRetainedSeq"], 1,
+        "a negotiated attach's ready frame must carry the retention bound: {ready}"
+    );
+    assert!(
+        ready["headSeq"].as_i64().is_some_and(|h| h >= 0),
+        "headSeq remains the honest current head: {ready}"
+    );
+}
+
+/// The compatibility twin: a hello WITHOUT the capability must see a ready
+/// frame with NO `oldestRetainedSeq` key at all — byte-identical to the
+/// pre-contract shape on the real socket.
+#[tokio::test]
+async fn plain_attach_ready_omits_oldest_retained_seq() {
+    let url = spawn_server().await;
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("ws connect");
+    let _ready = hello_ready(&mut ws, serde_json::json!({})).await;
+
+    let terminal_id = create_shell_terminal(&mut ws, "create-plain").await;
+    let ready = attach_and_read_ready(&mut ws, &terminal_id, "attach-plain").await;
+    assert!(
+        ready.get("oldestRetainedSeq").is_none(),
+        "a non-negotiated ready frame must not gain any new key: {ready}"
+    );
+}

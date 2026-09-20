@@ -123,6 +123,20 @@ fn now_ms() -> i64 {
     freshell_platform::clock::now_ms()
 }
 
+/// Current restore-contract sequence bounds for one terminal's retained
+/// replay ring (responsive-terminal-restore shared contract): the
+/// terminal's head sequence and the earliest sequence position still
+/// available for replay. Payload-free by design — the writer's gap frames
+/// stamp these bounds without copying any retained output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplayBounds {
+    /// Highest produced `seqEnd` (drives `attach.ready.headSeq`).
+    pub head_seq: i64,
+    /// The retained ring's front `seqStart`, or `head_seq + 1` when the ring
+    /// is empty (nothing older than the head is retained).
+    pub oldest_retained_seq: i64,
+}
+
 /// One attached connection's subscription to a terminal's live stream.
 struct Subscriber {
     /// Where this connection's frames go (its socket, via a tokio mpsc in `freshell-ws`).
@@ -138,10 +152,11 @@ struct Subscriber {
     terminal_output_batch_v1: bool,
     /// `hello.capabilities.pacedTerminalReplayV1` for this connection
     /// (responsive-terminal-restore Workstream 1): parked on the subscriber
-    /// exactly like `terminal_output_batch_v1`. The paced replay core
-    /// (registry pages + coordinator, task 3) consumes it to gate paced
-    /// restore delivery; this increment establishes only the negotiation
-    /// rail, so no reader exists yet.
+    /// exactly like `terminal_output_batch_v1`. The shared restore contract's
+    /// bounds reporting (`attach.ready.oldestRetainedSeq`) is driven by the
+    /// attach-time parameter in `attach_to_shared`; this per-subscriber copy
+    /// remains for the paced replay delivery core (registry pages +
+    /// coordinator, task 3), which has no reader yet.
     #[allow(dead_code)] // consumed by Workstream 1 paced replay (task 3)
     paced_terminal_replay_v1: bool,
 }
@@ -293,6 +308,17 @@ struct TerminalShared {
 }
 
 impl TerminalShared {
+    /// The earliest sequence position still available for replay (restore
+    /// contract, responsive-terminal-restore): the retained ring's front
+    /// `seqStart`, or `head_seq + 1` when the ring is empty (nothing older
+    /// than the head is retained). Caller holds the terminal lock.
+    fn oldest_retained_seq(&self) -> i64 {
+        self.replay
+            .front()
+            .map(|f| f.output.seq_start)
+            .unwrap_or(self.head_seq + 1)
+    }
+
     /// `single_client` while at most one socket is attached; `multi_client_unknown`
     /// once a second attaches (`§5.3`, `broker.ts:394-395`). The client uses this to
     /// decide checkpoint/delta-replay validity, so it must reflect reality.
@@ -1640,6 +1666,15 @@ impl TerminalRegistry {
             _ => (head_seq + 1, head_seq),
         };
 
+        // Restore contract (responsive-terminal-restore): on NEGOTIATED
+        // attaches only, report the earliest sequence position still
+        // available for replay — the RING's front (not the attach's replay
+        // slice), or head+1 when nothing older than the head is retained.
+        // Captured under the same lock as the replay snapshot so the bound is
+        // consistent with it. Non-negotiated attaches leave it `None` (the
+        // frozen client's ready frame stays byte-identical).
+        let oldest_retained_seq = paced_terminal_replay_v1.then(|| s.oldest_retained_seq());
+
         // Register BEFORE enqueuing so any live frame the reader appends after we
         // release the lock is delivered strictly after this replay (the reader is
         // blocked on this same lock until we return).
@@ -1668,6 +1703,7 @@ impl TerminalRegistry {
             effective_since_seq: Some(effective_since),
             geometry_authority: Some(s.geometry_authority()),
             geometry_epoch: Some(s.geometry_epoch),
+            oldest_retained_seq,
             replay_reset_reason: None,
             requested_since_seq: Some(since_seq),
             session_ref,
@@ -1777,6 +1813,31 @@ impl TerminalRegistry {
                 s.released_by_client = true;
             }
         }
+    }
+
+    /// Restore-contract sequence bounds for one terminal's retained replay
+    /// ring (responsive-terminal-restore): current `head_seq` plus the
+    /// earliest sequence position still available for replay. Takes the
+    /// per-terminal lock briefly and copies NO payloads. `None` when the
+    /// terminal does not exist.
+    ///
+    /// Callers must NOT hold the calling connection's writer admission lock:
+    /// the terminal side (subscriber fan-out, attach replay) acquires that
+    /// lock while holding THIS per-terminal lock, so resolving bounds under
+    /// the admission lock would invert the established lock order.
+    pub fn replay_bounds(&self, terminal_id: &str) -> Option<ReplayBounds> {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
+        }?;
+        let s = shared.lock().expect("terminal lock");
+        Some(ReplayBounds {
+            head_seq: s.head_seq,
+            oldest_retained_seq: s.oldest_retained_seq(),
+        })
     }
 
     /// On socket close: sweep `conn_id` out of EVERY terminal's subscriber set. All
@@ -4336,6 +4397,231 @@ mod tests {
             assert_eq!(f.attach_request_id.as_deref(), Some("att-1"));
             assert_eq!(f.source, Some(OutputSource::Replay));
         }
+    }
+
+    #[test]
+    fn paced_attach_ready_carries_oldest_retained_seq_from_the_ring_front() {
+        // Restore contract (responsive-terminal-restore): a NEGOTIATED attach
+        // (pacedTerminalReplayV1) reports the earliest sequence position still
+        // available for replay — the retained ring's front seqStart.
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.feed("T", frame(1, "one\r\n", "S"));
+        reg.feed("T", frame(2, "two\r\n", "S"));
+
+        let (sink, seen) = collector();
+        let _ = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("fresh".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+        );
+        let ready = attach_ready(&seen).expect("attach.ready sent");
+        assert_eq!(ready.head_seq, 2);
+        assert_eq!(
+            ready.oldest_retained_seq,
+            Some(1),
+            "a negotiated fresh attach reports the ring front as the retention bound"
+        );
+    }
+
+    #[test]
+    fn paced_delta_attach_reports_ring_front_not_the_replay_slice() {
+        // A delta attach (sinceSeq > 0) replays only the newer frames, but the
+        // retention bound it reports is the RING's front — the earliest
+        // position still available for a future re-attach, not this attach's
+        // replay slice.
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.feed("T", frame(1, "one\r\n", "S"));
+        reg.feed("T", frame(2, "two\r\n", "S"));
+        reg.feed("T", frame(3, "three\r\n", "S"));
+
+        let (sink, seen) = collector();
+        let _ = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("delta".into()),
+            2,
+            false,
+            true,
+            None,
+            None,
+        );
+        let ready = attach_ready(&seen).expect("attach.ready sent");
+        assert_eq!(
+            ready.replay_from_seq, 3,
+            "delta attach replays only frame 3"
+        );
+        assert_eq!(
+            ready.oldest_retained_seq,
+            Some(1),
+            "the retention bound is the ring front even when the replay slice starts later"
+        );
+    }
+
+    #[test]
+    fn paced_attach_ready_on_empty_ring_reports_head_plus_one() {
+        // Nothing older than the head is retained => the earliest replayable
+        // position is headSeq+1 (fresh headless terminal: head 0 => 1).
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+
+        let (sink, seen) = collector();
+        let _ = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("empty".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+        );
+        let ready = attach_ready(&seen).expect("attach.ready sent");
+        assert_eq!(ready.head_seq, 0);
+        assert_eq!(
+            ready.oldest_retained_seq,
+            Some(1),
+            "an empty ring retains nothing older than the head: the bound is headSeq+1"
+        );
+    }
+
+    #[test]
+    fn replay_bounds_reports_head_and_ring_front_without_payloads() {
+        // The writer-facing accessor: current head plus the earliest
+        // still-replayable position, in one brief per-terminal lock pass.
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.feed("T", frame(1, "one\r\n", "S"));
+        reg.feed("T", frame(2, "two\r\n", "S"));
+        reg.feed("T", frame(3, "three\r\n", "S"));
+        assert_eq!(
+            reg.replay_bounds("T"),
+            Some(ReplayBounds {
+                head_seq: 3,
+                oldest_retained_seq: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn replay_bounds_on_empty_ring_reports_head_plus_one() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        assert_eq!(
+            reg.replay_bounds("T"),
+            Some(ReplayBounds {
+                head_seq: 0,
+                oldest_retained_seq: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn replay_bounds_for_unknown_terminal_is_none() {
+        let reg = TerminalRegistry::new();
+        assert_eq!(reg.replay_bounds("nope"), None);
+    }
+
+    #[test]
+    fn unpaced_attach_ready_pins_the_exact_wire_keys_for_both_negotiation_sides() {
+        // Compatibility invariant (load-bearing): a connection that did NOT
+        // negotiate sees a ready frame byte-identical to the pre-contract
+        // shape — `oldestRetainedSeq` is ABSENT from the wire (not null), and
+        // `replayResetReason` is still absent. The negotiated side adds
+        // exactly one key: `oldestRetainedSeq`.
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.feed("T", frame(1, "one\r\n", "S"));
+
+        let (plain_sink, plain_seen) = collector();
+        let _ = reg.attach(
+            "T",
+            1,
+            plain_sink,
+            Some("plain".into()),
+            0,
+            false,
+            false,
+            None,
+            None,
+        );
+        let plain_ready = attach_ready(&plain_seen).expect("attach.ready sent");
+        assert_eq!(plain_ready.oldest_retained_seq, None);
+        let json = serde_json::to_value(ServerMessage::TerminalAttachReady(plain_ready)).unwrap();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "attachRequestId",
+                "effectiveSinceSeq",
+                "geometryAuthority",
+                "geometryEpoch",
+                "headSeq",
+                "replayFromSeq",
+                "replayToSeq",
+                "requestedSinceSeq",
+                "streamId",
+                "terminalId",
+                "type",
+            ],
+            "the non-negotiated ready frame keeps the pre-contract key set: {json}"
+        );
+
+        let (paced_sink, paced_seen) = collector();
+        let _ = reg.attach(
+            "T",
+            2,
+            paced_sink,
+            Some("paced".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+        );
+        let paced_ready = attach_ready(&paced_seen).expect("attach.ready sent");
+        assert_eq!(paced_ready.oldest_retained_seq, Some(1));
+        let json = serde_json::to_value(ServerMessage::TerminalAttachReady(paced_ready)).unwrap();
+        let mut keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "attachRequestId",
+                "effectiveSinceSeq",
+                "geometryAuthority",
+                "geometryEpoch",
+                "headSeq",
+                "oldestRetainedSeq",
+                "replayFromSeq",
+                "replayToSeq",
+                "requestedSinceSeq",
+                "streamId",
+                "terminalId",
+                "type",
+            ],
+            "the negotiated ready frame adds exactly oldestRetainedSeq: {json}"
+        );
     }
 
     #[test]

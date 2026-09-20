@@ -108,12 +108,27 @@ struct Queues {
     closed: bool,
 }
 
+/// Emission-time resolver for one terminal's current restore-contract
+/// replay-retention bounds (responsive-terminal-restore): installed ONLY on
+/// connections whose `hello` negotiated `pacedTerminalReplayV1`, backed by
+/// the registry's [`freshell_terminal::TerminalRegistry::replay_bounds`].
+/// Generic over the registry so the writer's unit tests can drive the pump
+/// deterministically without a PTY.
+type GapBoundsSource = Arc<dyn Fn(&str) -> Option<freshell_terminal::ReplayBounds> + Send + Sync>;
+
 struct Shared {
     queues: Mutex<Queues>,
     output_limit: usize,
     control_limit: usize,
     ready: Notify,
     stop: watch::Sender<Option<Stop>>,
+    /// Restore-contract bounds for materialized `terminal.output.gap`
+    /// frames: set ONLY on negotiated connections, ONCE, by the connection
+    /// setup BEFORE the pump is spawned (the same pre-spawn setup rule as
+    /// `enable_terminal_interest`) — a gap can never be leased before the
+    /// source exists. Unset keeps gap frames byte-identical to the
+    /// pre-capability wire shape.
+    gap_bounds: std::sync::OnceLock<GapBoundsSource>,
 }
 
 /// A nonblocking, bounded outbox. Its Sink flush means "accepted by this
@@ -161,6 +176,7 @@ impl WriterSender {
             control_limit: control_limit.max(1),
             ready: Notify::new(),
             stop: stop_tx,
+            gap_bounds: std::sync::OnceLock::new(),
         });
         (
             Self {
@@ -355,6 +371,18 @@ impl WriterSender {
             .enable();
     }
 
+    /// Restore contract (responsive-terminal-restore): install the
+    /// negotiated-connection gap-bounds source. Called ONCE by the
+    /// connection setup, BEFORE the writer pump is spawned (a gap can never
+    /// be leased before the source exists). The source resolves a
+    /// terminal's current `head_seq`/earliest-replayable position at
+    /// gap-emission time; connections that never negotiated leave the
+    /// source unset and their gap frames stay byte-identical to the
+    /// pre-capability wire shape.
+    pub(super) fn set_paced_replay_gap_bounds(&self, source: GapBoundsSource) {
+        let _ = self.shared.gap_bounds.set(source);
+    }
+
     /// Apply one full presentation-interest snapshot. A rejected snapshot is
     /// returned without replacing the last accepted state; scheduling changes
     /// are queued-data-only (no attach, resize, spawn, or kill).
@@ -488,6 +516,31 @@ impl WriterPump {
             let (frame, bytes) = match delivery {
                 Delivery::Frame { payload, bytes } => (payload, bytes),
                 Delivery::Gap { terminal_id, range } => {
+                    // Restore contract (responsive-terminal-restore): a
+                    // negotiated connection's gap carries the terminal's
+                    // CURRENT bounds, resolved at emission time. The source
+                    // (registry-backed) takes the per-terminal lock, whose
+                    // holders — subscriber fan-out, attach replays — acquire
+                    // THIS admission lock under theirs, so resolving under
+                    // the admission lock would invert the established lock
+                    // order and can deadlock: release, resolve, re-acquire.
+                    let bounds = match self.shared.gap_bounds.get() {
+                        Some(source) => {
+                            drop(queues);
+                            let bounds = source(&terminal_id);
+                            queues = self.shared.queues.lock().expect("writer queue lock");
+                            if queues.closed {
+                                // A concurrent stop won the race while the
+                                // admission lock was released. The queue is
+                                // dead (Drop clears it) and the pump returns
+                                // via the stop watch — never lease output
+                                // past a stop.
+                                return Ok(None);
+                            }
+                            bounds
+                        }
+                        None => None,
+                    };
                     let message =
                         ServerMessage::TerminalOutputGap(freshell_protocol::TerminalOutputGap {
                             terminal_id,
@@ -496,6 +549,8 @@ impl WriterPump {
                             from_seq: range.from_seq,
                             to_seq: range.to_seq,
                             reason: freshell_protocol::TerminalOutputGapReason::QueueOverflow,
+                            head_seq: bounds.map(|b| b.head_seq),
+                            oldest_retained_seq: bounds.map(|b| b.oldest_retained_seq),
                         });
                     let json = serde_json::to_string(&message)
                         .map_err(|_| WriterExit::SerializationFailed)?;

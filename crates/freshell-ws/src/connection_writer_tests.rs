@@ -562,3 +562,80 @@ async fn attach_priority_works_for_clients_without_interest_capability() {
     sender.push_server(named_output("visible", 1));
     assert_eq!(taken_terminal(&pump), "visible");
 }
+
+/// Force exactly one queue-overflow eviction: the output limit admits the
+/// first frame alone, so the second push evicts the first and materializes
+/// its gap. The limit is derived from the probe frame's serialized size so
+/// the eviction is deterministic without hardcoding byte counts.
+fn overflow_writer() -> (WriterSender, WriterPump) {
+    let probe = serde_json::to_string(&output(1)).unwrap().len();
+    WriterSender::new(probe, 4096, Duration::from_secs(10))
+}
+
+#[tokio::test]
+async fn queue_overflow_gap_carries_restore_bounds_on_paced_connections() {
+    // Restore contract (responsive-terminal-restore): a connection that
+    // negotiated pacedTerminalReplayV1 (modeled here by an installed
+    // gap-bounds source) sees its queue-overflow gaps stamped with the
+    // terminal's CURRENT headSeq + oldestRetainedSeq, resolved at
+    // gap-emission (lease) time.
+    let (sender, pump) = overflow_writer();
+    sender.set_paced_replay_gap_bounds(Arc::new(|_| {
+        Some(freshell_terminal::ReplayBounds {
+            head_seq: 421,
+            oldest_retained_seq: 7,
+        })
+    }));
+    assert!(sender.push_server(output(1)));
+    assert!(sender.push_server(output(2))); // evicts output(1) -> queue_overflow gap
+    let next = pump.take_next().unwrap().unwrap();
+    let gap: serde_json::Value = serde_json::from_str(&leased_text(&next.frame)).unwrap();
+    assert_eq!(gap["type"], "terminal.output.gap");
+    assert_eq!(gap["reason"], "queue_overflow");
+    assert_eq!(gap["fromSeq"], 1);
+    assert_eq!(gap["toSeq"], 1);
+    assert_eq!(gap["headSeq"], 421, "negotiated gap carries headSeq: {gap}");
+    assert_eq!(
+        gap["oldestRetainedSeq"], 7,
+        "negotiated gap carries oldestRetainedSeq: {gap}"
+    );
+    pump.finish_frame(next.output_bytes, next.control_bytes);
+    // The evicted frame's successor still delivers.
+    let next = pump.take_next().unwrap().unwrap();
+    assert!(leased_text(&next.frame).contains("data-2"));
+    pump.finish_frame(next.output_bytes, next.control_bytes);
+}
+
+#[tokio::test]
+async fn queue_overflow_gap_without_paced_negotiation_keeps_the_frozen_shape() {
+    // Compatibility invariant (load-bearing): a connection that did NOT
+    // negotiate sees gap frames byte-identical to the pre-contract wire —
+    // no headSeq, no oldestRetainedSeq, and exactly the frozen key set.
+    let (sender, pump) = overflow_writer();
+    assert!(sender.push_server(output(1)));
+    assert!(sender.push_server(output(2))); // evicts output(1) -> queue_overflow gap
+    let next = pump.take_next().unwrap().unwrap();
+    let gap: serde_json::Value = serde_json::from_str(&leased_text(&next.frame)).unwrap();
+    assert_eq!(gap["type"], "terminal.output.gap");
+    let mut keys: Vec<&str> = gap
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "attachRequestId",
+            "fromSeq",
+            "reason",
+            "streamId",
+            "terminalId",
+            "toSeq",
+            "type",
+        ],
+        "the non-negotiated gap frame keeps the pre-contract key set: {gap}"
+    );
+    pump.finish_frame(next.output_bytes, next.control_bytes);
+}
