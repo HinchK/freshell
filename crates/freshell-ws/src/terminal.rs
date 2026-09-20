@@ -65,7 +65,7 @@ use freshell_protocol::{
     PaneClosed, PaneClosedResult, PanesClosedResult, Pong, ServerMessage, SessionLocator,
     SessionType, Shell, TerminalAttach, TerminalAutoResumeCancel, TerminalCreate, TerminalCreated,
     TerminalDetach, TerminalIdOnly, TerminalInputBlocked, TerminalInputBlockedReason, TerminalKill,
-    TerminalResize, LEGACY_RESUME_IDENTITY_REFUSAL,
+    TerminalResize, FRESH_AGENT_DISABLED_REFUSAL, LEGACY_RESUME_IDENTITY_REFUSAL,
 };
 use freshell_terminal::{build_child_env_from_process, FrameSink};
 
@@ -1173,6 +1173,23 @@ async fn handle_client_text(
                     }
                     _ => {}
                 }
+            } else {
+                // A create against the DISABLED gate must REFUSE, not
+                // swallow: the frame carries a requestId, and silence
+                // hangs every programmatic driver (the native contract
+                // runner, any agent bridging the raw WS protocol) with zero
+                // attribution — the observed native-smoke failure was a
+                // created-frame timeout with no reply of any kind. Same
+                // envelope as the raw-layer refusals above; `retryable:
+                // true` matches the legacy disabled-gate rejection
+                // (`ws-handler.ts:3334`, the parity note on `fail_create`).
+                let reply = ServerMessage::FreshAgentCreateFailed(FreshAgentCreateFailed {
+                    code: "FRESH_AGENT_DISABLED".to_string(),
+                    message: FRESH_AGENT_DISABLED_REFUSAL.to_string(),
+                    request_id: create.request_id.clone(),
+                    retryable: Some(true),
+                });
+                return send(ws_tx, &reply).await;
             }
             true
         }
