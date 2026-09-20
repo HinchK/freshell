@@ -11,6 +11,19 @@ import {
   type WorkspaceGraph,
 } from '../../../scripts/hooks/rust-test-targets.js'
 
+// The real tsx executable that the pre-push routing fixture stubs in. The
+// derivation must survive a checkout with NO git metadata: the Cloud Run
+// vitest image copies the source tree without `.git` (.dockerignore), so
+// the git common-dir probe fails there. A relative fallback path is not
+// merely wrong — the fixture stub `exec`s this path from the fixture repo,
+// so a relative path re-execs the stub itself in an infinite loop and
+// silently hangs the shard until the 30-minute job timeout.
+function owningTsxPath(gitCommonDirStdout: string, testDir: string): string {
+  const gitRoot = gitCommonDirStdout.trim().replace(/\/\.git$/, '')
+  const root = gitRoot || path.resolve(testDir, '..', '..', '..')
+  return path.resolve(root, 'node_modules', '.bin', 'tsx')
+}
+
 // Workspace fixture mirroring the real dependency directions:
 // server -> {ws, terminal, sessions, freshagent, protocol}
 // freshagent -> {ws, terminal, protocol}
@@ -36,6 +49,23 @@ const graph: WorkspaceGraph = {
     'freshell-tauri': ['freshell-server'],
   },
 }
+
+describe('owningTsxPath', () => {
+  it('uses the git common dir root when git metadata is available', () => {
+    expect(owningTsxPath('/repo/.git\n', '/repo/test/unit/scripts')).toBe(
+      '/repo/node_modules/.bin/tsx',
+    )
+  })
+
+  it('falls back to the checkout root containing the test file when git metadata is absent (the cloud vitest image ships no .git)', () => {
+    expect(owningTsxPath('', '/app/test/unit/scripts')).toBe('/app/node_modules/.bin/tsx')
+  })
+
+  it('never returns a relative path (a relative tsx stub self-exec-loops in the fixture)', () => {
+    expect(path.isAbsolute(owningTsxPath('', '/app/test/unit/scripts'))).toBe(true)
+    expect(path.isAbsolute(owningTsxPath('/repo/.git\n', '/repo/test/unit/scripts'))).toBe(true)
+  })
+})
 
 describe('computeRustTestPlan', () => {
   it('skips when nothing changed', () => {
@@ -216,15 +246,14 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
   // then exercise the hook's full chain regardless of the worktree's
   // install state (the hook passes the real rust-test-targets.ts path as
   // the script argument, so the stub only supplies the runtime).
-  const owningRoot = (() => {
+  const realTsx = (() => {
     const commonDir = spawnSync(
       'git',
       ['rev-parse', '--path-format=absolute', '--git-common-dir'],
-      { cwd: import.meta.dirname, encoding: 'utf8' },
+      { cwd: import.meta.dirname, encoding: 'utf8', timeout: 15_000 },
     )
-    return (commonDir.stdout ?? '').trim().replace(/\/\.git$/, '')
+    return owningTsxPath(commonDir.stdout ?? '', import.meta.dirname)
   })()
-  const realTsx = path.join(owningRoot, 'node_modules', '.bin', 'tsx')
 
   let fixtureRoot: string
   let baseSha: string
@@ -235,7 +264,7 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
   let cargoConfigSha: string
 
   function git(args: string[], opts: { cwd: string; stdin?: string } = { cwd: '' }): string {
-    const res = spawnSync('git', args, { cwd: opts.cwd, encoding: 'utf8' })
+    const res = spawnSync('git', args, { cwd: opts.cwd, encoding: 'utf8', timeout: 30_000 })
     if (res.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${res.stderr}`)
     return (res.stdout ?? '').trim()
   }
@@ -336,6 +365,9 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
       env: { ...process.env, ...extraEnv, FRESHELL_PREPUSH_DEBUG: '1' },
       encoding: 'utf8',
       cwd: fixtureRoot,
+      // A wedged hook child (the pre-fix tsx stub loop) must fail the test in
+      // bounded time, not hang the shard until the 30-minute job timeout.
+      timeout: 120_000,
     })
     return { status: res.status ?? -1, stderr: res.stderr ?? '' }
   }
