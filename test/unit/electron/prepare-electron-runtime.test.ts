@@ -117,6 +117,8 @@ function sidecarDeployFixture(destination: string): void {
   mkdirSync(sdkDir, { recursive: true })
   writeFileSync(path.join(sdkDir, 'package.json'), JSON.stringify({ name: '@anthropic-ai/claude-agent-sdk', version: '0.3.237' }))
   writeBinShim(destination, 'which', 'node-which', 'bin/node-which')
+  mkdirSync(path.join(destination, 'node_modules', '.pnpm'), { recursive: true })
+  writeFileSync(path.join(destination, 'node_modules', '.pnpm', 'lock.yaml'), 'inert pnpm install state\n')
 }
 
 function mcpDeployFixture(destination: string, generatedSource: string): void {
@@ -151,6 +153,8 @@ function mcpDeployFixture(destination: string, generatedSource: string): void {
   mkdirSync(zodDir, { recursive: true })
   writeFileSync(path.join(zodDir, 'package.json'), JSON.stringify({ name: 'zod', version: '4.3.6' }))
   writeBinShim(destination, 'which', 'node-which', 'bin/node-which')
+  mkdirSync(path.join(destination, 'node_modules', '.pnpm'), { recursive: true })
+  writeFileSync(path.join(destination, 'node_modules', '.pnpm', 'lock.yaml'), 'inert pnpm install state\n')
 }
 
 function createRecordingDeploySeam(root: string): { calls: DeployRuntimeArgs[]; deployRuntime: (args: DeployRuntimeArgs) => void } {
@@ -308,7 +312,9 @@ describe('prepare-electron-runtime staging', () => {
     })
 
     const stagedFiles = collectFiles(outputRoot)
-    expect(stagedFiles.filter((file) => file.endsWith('package-lock.json') || file.endsWith('pnpm-lock.yaml'))).toEqual([])
+    expect(stagedFiles.filter((file) =>
+      file.endsWith('package-lock.json') || file.endsWith('pnpm-lock.yaml') || file.includes('/.pnpm/'))).toEqual([])
+    expect(stagedFiles.some((file) => file.includes('.pnpm'))).toBe(false)
     expect(collectLinks(outputRoot)).toEqual([])
     expect(lstatSync(path.join(outputRoot, 'mcp', 'node_modules', '@modelcontextprotocol', 'sdk')).isSymbolicLink()).toBe(false)
     expect(lstatSync(path.join(outputRoot, 'claude-sidecar', 'node_modules', '@anthropic-ai', 'claude-agent-sdk')).isSymbolicLink()).toBe(false)

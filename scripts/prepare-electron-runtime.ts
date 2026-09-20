@@ -540,6 +540,24 @@ function stageGeneratedRuntimeTree(rootDir: string, mcpDistDir: string): void {
 }
 
 /**
+ * Stage a deploy export's node_modules while dropping pnpm's install-state
+ * directory: in a hoisted deploy `node_modules/.pnpm` holds only the
+ * modules-state lock.yaml, not runtime content, and the installed runtime
+ * must not carry lock machinery (plan section 6.2, item 5).
+ */
+function stageDeployNodeModules(
+  source: string,
+  destination: string,
+  deployRoot: string,
+  packageName: DeployableRuntimePackage,
+): void {
+  for (const entry of readdirSync(source, { withFileTypes: true })) {
+    if (entry.name === '.pnpm') continue
+    materializeEntry(path.join(source, entry.name), path.join(destination, entry.name), deployRoot, packageName)
+  }
+}
+
+/**
  * Map the sidecar deploy export onto claude-sidecar/.  Every root-level
  * entry is copied except the deploy lock; node_modules is materialized so
  * the staged sidecar has zero links.
@@ -552,7 +570,7 @@ function stageSidecarFromDeploy(
   for (const entry of readdirSync(deployDir, { withFileTypes: true })) {
     if (entry.name === 'pnpm-lock.yaml') continue
     if (entry.name === 'node_modules') {
-      materializeTree(path.join(deployDir, entry.name), path.join(destinationDir, 'node_modules'), deployRoot, 'freshell-claude-sidecar')
+      stageDeployNodeModules(path.join(deployDir, entry.name), path.join(destinationDir, 'node_modules'), deployRoot, 'freshell-claude-sidecar')
       continue
     }
     materializeEntry(path.join(deployDir, entry.name), path.join(destinationDir, entry.name), deployRoot, 'freshell-claude-sidecar')
@@ -563,14 +581,6 @@ function stageSidecarFromDeploy(
 }
 
 /**
- * Map the MCP runtime deploy export onto mcp/ and node-client-runtime/.
- * The deploy's own package.json is the private packaging manifest; the
- * staged metadata rewrites the public identity to name "freshell" with the
- * release version so the MCP handshake keeps reporting the application
- * version (the compiled server discovers its version by searching for that
- * name).
- */
-/**
  * pnpm's deploy writes peer-resolution annotations like "1.30.0(zod@4.3.6)"
  * into the exported manifest's dependency specs.  The staged public metadata
  * keeps plain specs; peer resolution is proven by execution, not by the
@@ -580,6 +590,14 @@ function stripPeerSuffixAnnotation(spec: string): string {
   return spec.replace(/\([^)]*\)$/, '')
 }
 
+/**
+ * Map the MCP runtime deploy export onto mcp/ and node-client-runtime/.
+ * The deploy's own package.json is the private packaging manifest; the
+ * staged metadata rewrites the public identity to name "freshell" with the
+ * release version so the MCP handshake keeps reporting the application
+ * version (the compiled server discovers its version by searching for that
+ * name).
+ */
 function stageMcpFromDeploy(
   deployDir: string,
   mcpDestinationDir: string,
@@ -597,7 +615,7 @@ function stageMcpFromDeploy(
   }
   materializeTree(mcpGenerated, mcpDestinationDir, deployRoot, 'freshell-mcp-runtime')
   materializeTree(nodeClientGenerated, nodeClientRuntimeDir, deployRoot, 'freshell-mcp-runtime')
-  materializeTree(path.join(deployDir, 'node_modules'), path.join(mcpDestinationDir, 'node_modules'), deployRoot, 'freshell-mcp-runtime')
+  stageDeployNodeModules(path.join(deployDir, 'node_modules'), path.join(mcpDestinationDir, 'node_modules'), deployRoot, 'freshell-mcp-runtime')
 
   const packaging = readJson(path.join(deployDir, 'package.json'))
   const dependencies = packaging.dependencies && typeof packaging.dependencies === 'object'
