@@ -181,7 +181,25 @@ fn write_raw_document(dir: &Path, document: &StoredDocument) {
 /// sidecar lock, mirroring the strict path's discipline.
 fn write_raw_document_bytes(dir: &Path, bytes: &[u8]) {
     let lock = open_lock_file(&dir.join(LOCK_FILE_NAME)).expect("open lock for raw write");
-    lock.try_lock().expect("lock for raw write");
+    // Mirror `acquire_document_lock`'s bounded-retry discipline — a bare
+    // try_lock panics on transient contention with an in-flight store
+    // transaction (observed as a WouldBlock flake in full-parallelism
+    // binary runs); the strict path retries for one second, so the fixture
+    // must too.
+    let deadline = Instant::now() + LOCK_RETRY_BUDGET;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "lock for raw write stayed busy past the retry budget"
+                );
+                std::thread::sleep(LOCK_POLL_INTERVAL);
+            }
+            Err(error) => panic!("lock for raw write: {error}"),
+        }
+    }
     std::fs::write(dir.join(DOCUMENT_FILE_NAME), bytes).expect("write raw document");
 }
 
