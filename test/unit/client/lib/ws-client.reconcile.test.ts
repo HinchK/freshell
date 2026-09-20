@@ -87,15 +87,35 @@ describe('WsClient pane-reconcile capability', () => {
     await p
   })
 
+  it('hello advertises pacedTerminalReplayV1', async () => {
+    const c = new WsClient('ws://example/ws')
+    const p = c.connect()
+    expect(MockWebSocket.instances).toHaveLength(1)
+    MockWebSocket.instances[0]._open()
+
+    const hello = JSON.parse(MockWebSocket.instances[0].sent[0])
+    expect(hello.type).toBe('hello')
+    expect(hello.capabilities).toMatchObject({
+      pacedTerminalReplayV1: true,
+    })
+
+    MockWebSocket.instances[0]._message({ type: 'ready' })
+    await p
+  })
+
   it('surfaces ready.capabilities and resets them on disconnect', async () => {
     const client = getWsClient()
     expect(client.getServerCapabilities()).toEqual({})
 
-    await connectAndReady(client, { capabilities: { paneReconcileV1: true } })
+    await connectAndReady(client, {
+      capabilities: { paneReconcileV1: true, pacedTerminalReplayV1: true },
+    })
     expect(client.getServerCapabilities().paneReconcileV1).toBe(true)
+    expect(client.getServerCapabilities().pacedTerminalReplayV1).toBe(true)
 
     MockWebSocket.instances[0]._close(1006, 'drop')
     expect(client.getServerCapabilities().paneReconcileV1).toBeUndefined()
+    expect(client.getServerCapabilities().pacedTerminalReplayV1).toBeUndefined()
     expect(client.getServerCapabilities()).toEqual({})
   })
 

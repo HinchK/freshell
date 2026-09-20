@@ -419,6 +419,11 @@ export const HelloSchema = z.object({
     // STRIP unknown keys, so without this the capability would silently no-op.
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
+    // Paced terminal restore (responsive-terminal-restore Workstream 1): the
+    // client understands bounded, ascending paced replay batches with
+    // continuation credit. Additive optional — declared, not just sent (same
+    // strip hazard as above); absent for the frozen client shape.
+    pacedTerminalReplayV1: z.literal(true).optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
@@ -1065,6 +1070,9 @@ export const ReadyCapabilitiesSchema = z
     terminalInterestV1: z.literal(true).optional(),
     paneReconcileV1: z.literal(true).optional(),
     paneReconcileFreshAgentV1: z.literal(true).optional(),
+    // Paced terminal restore (Workstream 1): echoed only for a hello that
+    // opted in via capabilities.pacedTerminalReplayV1.
+    pacedTerminalReplayV1: z.literal(true).optional(),
   })
   .optional()
 

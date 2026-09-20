@@ -543,7 +543,7 @@ pub fn spawn_idle_monitor(
 /// would lose scrollback). On a truly fresh boot the registry is empty, so this stays
 /// byte-identical to the clean-boot handshake the oracle's T0/determinism tiers pin.
 pub async fn build_handshake(state: &WsState) -> Vec<ServerMessage> {
-    build_handshake_with_capabilities(state, false, false, false).await
+    build_handshake_with_capabilities(state, false, false, false, false).await
 }
 
 /// [`build_handshake`], parameterized on the connection's negotiated
@@ -566,6 +566,7 @@ pub async fn build_handshake_with_capabilities(
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
     terminal_interest_v1: bool,
+    paced_terminal_replay_v1: bool,
 ) -> Vec<ServerMessage> {
     let boot_id = state.boot_id.as_ref().clone();
     // kata b8ke Task 4 (reconnect-owner discovery, T1 rec A3): replay current
@@ -619,11 +620,13 @@ pub async fn build_handshake_with_capabilities(
             build_id: ready_build_id(),
             capabilities: (pane_reconcile_v1
                 || pane_reconcile_fresh_agent_v1
-                || terminal_interest_v1)
+                || terminal_interest_v1
+                || paced_terminal_replay_v1)
                 .then_some(freshell_protocol::ReadyCapabilities {
                     pane_reconcile_v1: pane_reconcile_v1.then_some(true),
                     pane_reconcile_fresh_agent_v1: pane_reconcile_fresh_agent_v1.then_some(true),
                     terminal_interest_v1: terminal_interest_v1.then_some(true),
+                    paced_terminal_replay_v1: paced_terminal_replay_v1.then_some(true),
                 }),
         }),
         ServerMessage::SettingsUpdated(SettingsUpdated {
@@ -843,6 +846,16 @@ async fn handle_socket(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
 
+    // Responsive-terminal-restore Workstream 1 (paced replay negotiation):
+    // same opt-in gate as `paneReconcileV1` — the `ready` echo appears only
+    // when the client's `hello` opted in, so a frozen client's handshake
+    // stays byte-for-byte unchanged.
+    let paced_terminal_replay_v1 = value
+        .get("capabilities")
+        .and_then(|c| c.get("pacedTerminalReplayV1"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     // Authenticated: emit the ordered handshake. CFG-12: the builder is
     // async + per-connection so its `settings.updated` frame resolves the
     // LIVE settings tree (see `build_handshake_with_capabilities`).
@@ -851,6 +864,7 @@ async fn handle_socket(
         pane_reconcile_v1,
         pane_reconcile_fresh_agent_v1,
         terminal_interest_v1,
+        paced_terminal_replay_v1,
     )
     .await
     {
@@ -906,6 +920,7 @@ async fn handle_socket(
         &state,
         bcast_rx,
         terminal_output_batch_v1,
+        paced_terminal_replay_v1,
         ui_screenshot_v1,
         pane_reconcile_v1,
         pane_reconcile_fresh_agent_v1,
@@ -1095,7 +1110,7 @@ mod tests {
     #[tokio::test]
     async fn handshake_advertises_pane_reconcile_only_when_negotiated() {
         let s = state();
-        let negotiated = build_handshake_with_capabilities(&s, true, false, false).await;
+        let negotiated = build_handshake_with_capabilities(&s, true, false, false, false).await;
         let ready = serde_json::to_value(&negotiated[0]).unwrap();
         assert_eq!(
             ready["capabilities"],
@@ -1109,9 +1124,42 @@ mod tests {
             "non-negotiating hello must not change ready's shape: {ready}"
         );
         // Same shape as an explicit `false` negotiation.
-        let unnegotiated = build_handshake_with_capabilities(&s, false, false, false).await;
+        let unnegotiated = build_handshake_with_capabilities(&s, false, false, false, false).await;
         let ready2 = serde_json::to_value(&unnegotiated[0]).unwrap();
         assert!(ready2.get("capabilities").is_none());
+    }
+
+    /// Responsive-terminal-restore Workstream 1 (paced replay negotiation):
+    /// `ready.capabilities.pacedTerminalReplayV1` is advertised ONLY for a
+    /// hello that opted in — a non-negotiating client's handshake stays
+    /// byte-identical to the pre-capability shape (frozen-client inertness).
+    #[tokio::test]
+    async fn handshake_advertises_paced_terminal_replay_only_when_negotiated() {
+        let s = state();
+        let negotiated = build_handshake_with_capabilities(&s, false, false, false, true).await;
+        let ready = serde_json::to_value(&negotiated[0]).unwrap();
+        assert_eq!(
+            ready["capabilities"],
+            serde_json::json!({ "pacedTerminalReplayV1": true })
+        );
+
+        // Non-paced negotiations keep the capabilities object byte-identical
+        // to today's output — no paced key is invented.
+        let pane_only = build_handshake_with_capabilities(&s, true, false, false, false).await;
+        let ready = serde_json::to_value(&pane_only[0]).unwrap();
+        assert_eq!(
+            ready["capabilities"],
+            serde_json::json!({ "paneReconcileV1": true }),
+            "a non-paced negotiation must not invent pacedTerminalReplayV1: {ready}"
+        );
+
+        // No negotiation at all: no capabilities object on the wire.
+        let default = build_handshake(&s).await;
+        let ready = serde_json::to_value(&default[0]).unwrap();
+        assert!(
+            ready.get("capabilities").is_none(),
+            "non-negotiating hello must not change ready's shape: {ready}"
+        );
     }
 
     #[tokio::test]

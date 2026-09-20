@@ -2656,6 +2656,9 @@
         "capabilities": {
           "additionalProperties": false,
           "properties": {
+            "pacedTerminalReplayV1": {
+              "type": "boolean"
+            },
             "paneReconcileFreshAgentV1": {
               "type": "boolean"
             },

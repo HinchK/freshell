@@ -279,6 +279,7 @@ pub async fn run(
     state: &WsState,
     bcast_rx: tokio::sync::broadcast::Receiver<String>,
     terminal_output_batch_v1: bool,
+    paced_terminal_replay_v1: bool,
     ui_screenshot_v1: bool,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
@@ -319,6 +320,7 @@ pub async fn run(
         state,
         bcast_rx,
         terminal_output_batch_v1,
+        paced_terminal_replay_v1,
         ui_screenshot_v1,
         pane_reconcile_v1,
         pane_reconcile_fresh_agent_v1,
@@ -341,6 +343,7 @@ async fn run_loop(
     state: &WsState,
     mut bcast_rx: tokio::sync::broadcast::Receiver<String>,
     terminal_output_batch_v1: bool,
+    paced_terminal_replay_v1: bool,
     ui_screenshot_v1: bool,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
@@ -506,6 +509,7 @@ async fn run_loop(
                             conn_id,
                             &conn_sink,
                             terminal_output_batch_v1,
+                            paced_terminal_replay_v1,
                             pane_reconcile_v1,
                             pane_reconcile_fresh_agent_v1,
                             &interactive_create_tx,
@@ -750,6 +754,7 @@ async fn handle_client_text(
     conn_id: u64,
     conn_sink: &FrameSink,
     terminal_output_batch_v1: bool,
+    paced_terminal_replay_v1: bool,
     pane_reconcile_v1: bool,
     pane_reconcile_fresh_agent_v1: bool,
     interactive_create_tx: &mpsc::Sender<interactive_creates::Job>,
@@ -1464,6 +1469,7 @@ async fn handle_client_text(
                     conn_id,
                     conn_sink,
                     terminal_output_batch_v1,
+                    paced_terminal_replay_v1,
                 ) {
                     Some(err) => send(ws_tx, &err).await,
                     None => true,
@@ -6919,6 +6925,7 @@ fn handle_attach(
     conn_id: u64,
     conn_sink: &FrameSink,
     terminal_output_batch_v1: bool,
+    paced_terminal_replay_v1: bool,
 ) -> Option<ServerMessage> {
     // STATE-SYNC FIX 1 increment 2a: stamp the canonical identity onto
     // `attach.ready` from the shared identity registry (create-time
@@ -6939,6 +6946,10 @@ fn handle_attach(
     let outcome = if geometry_identity_ok {
         let cols = attach.cols.clamp(0, u16::MAX as i64) as u16;
         let rows = attach.rows.clamp(0, u16::MAX as i64) as u16;
+        // `paced_terminal_replay_v1` parks the negotiated capability on the
+        // attach's subscriber (alongside `terminal_output_batch_v1`);
+        // Workstream 1's paced replay core (registry pages + coordinator,
+        // task 3) consumes it to gate paced restore delivery.
         state.registry.attach_with_geometry(
             &attach.terminal_id,
             conn_id,
@@ -6946,6 +6957,7 @@ fn handle_attach(
             attach.attach_request_id.clone(),
             attach.since_seq.unwrap_or(0),
             terminal_output_batch_v1,
+            paced_terminal_replay_v1,
             canonical_session_ref,
             // Mode replay-sync: the client's positive surface-fresh marker
             // (xterm recreation / user reset). Forwards the wire field 1:1; the
@@ -6963,6 +6975,7 @@ fn handle_attach(
             attach.attach_request_id.clone(),
             attach.since_seq.unwrap_or(0),
             terminal_output_batch_v1,
+            paced_terminal_replay_v1,
             canonical_session_ref,
             attach.surface_reset,
         )
@@ -10323,6 +10336,7 @@ mod pane_reconcile_gate_tests {
             1,
             &conn_sink,
             false,
+            false,
             false, // pane_reconcile_v1: NOT negotiated on this connection
             false,
             &interactive_create_tx,
@@ -10346,6 +10360,7 @@ mod pane_reconcile_gate_tests {
             &state,
             1,
             &conn_sink,
+            false,
             false,
             false,
             false,
@@ -10393,6 +10408,7 @@ mod pane_reconcile_gate_tests {
             false,
             false,
             false,
+            false,
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
@@ -10414,6 +10430,7 @@ mod pane_reconcile_gate_tests {
                 &state,
                 1,
                 &conn_sink,
+                false,
                 false,
                 false,
                 false,
@@ -10758,6 +10775,7 @@ mod host_stats_dispatch_tests {
                 false,
                 false,
                 false,
+                false,
                 &interactive_create_tx,
                 &create_cancel_rx,
                 &mut host_stats_last_refresh_at,
@@ -10789,6 +10807,7 @@ mod host_stats_dispatch_tests {
             false,
             false,
             false,
+            false,
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
@@ -10807,6 +10826,7 @@ mod host_stats_dispatch_tests {
             &state,
             1,
             &conn_sink,
+            false,
             false,
             false,
             false,
@@ -10852,6 +10872,7 @@ mod host_stats_dispatch_tests {
             false,
             false,
             false,
+            false,
             &interactive_create_tx,
             &create_cancel_rx,
             &mut host_stats_last_refresh_at,
@@ -10876,6 +10897,7 @@ mod host_stats_dispatch_tests {
             &state,
             1,
             &conn_sink,
+            false,
             false,
             false,
             false,
@@ -10921,6 +10943,7 @@ mod host_stats_dispatch_tests {
             &state,
             1,
             &conn_sink,
+            false,
             false,
             false,
             false,

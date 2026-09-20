@@ -936,6 +936,12 @@ pub struct ReadyCapabilities {
     pub pane_reconcile_fresh_agent_v1: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_interest_v1: Option<bool>,
+    /// Paced terminal restore (responsive-terminal-restore Workstream 1):
+    /// `Some(true)` iff the connection's `hello` opted in via
+    /// `capabilities.pacedTerminalReplayV1` — omitted from the wire entirely
+    /// otherwise (frozen-client inertness).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paced_terminal_replay_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

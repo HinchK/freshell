@@ -194,6 +194,69 @@ fn ready_carries_build_id_and_omits_it_when_absent() {
 }
 
 #[test]
+fn hello_roundtrips_paced_terminal_replay_v1_opt_in() {
+    // Workstream 1 (responsive terminal restore) negotiation: the client opt-in
+    // rides `hello.capabilities.pacedTerminalReplayV1`. Additive optional — a
+    // negotiating hello round-trips byte-identically...
+    let wire = r#"{"type":"hello","protocolVersion":10,"token":"t","capabilities":{"terminalOutputBatchV1":true,"pacedTerminalReplayV1":true}}"#;
+    match client_roundtrip(wire, "hello") {
+        ClientMessage::Hello(h) => {
+            assert_eq!(
+                h.capabilities.and_then(|c| c.paced_terminal_replay_v1),
+                Some(true),
+                "the paced-replay opt-in must parse through the typed struct"
+            );
+        }
+        other => panic!("expected Hello, got {other:?}"),
+    }
+
+    // ...and a non-negotiating hello never invents the key (the frozen
+    // client's wire shape is unchanged).
+    let wire = r#"{"type":"hello","protocolVersion":10,"token":"t","capabilities":{"terminalOutputBatchV1":true}}"#;
+    match client_roundtrip(wire, "hello") {
+        ClientMessage::Hello(h) => {
+            assert_eq!(
+                h.capabilities.and_then(|c| c.paced_terminal_replay_v1),
+                None,
+                "an absent pacedTerminalReplayV1 must stay absent (skip_serializing_if)"
+            );
+        }
+        other => panic!("expected Hello, got {other:?}"),
+    }
+}
+
+#[test]
+fn ready_roundtrips_paced_terminal_replay_v1_echo_and_omission() {
+    // The negotiated echo rides `ready.capabilities` — only for a connection
+    // whose hello opted in.
+    let wire = r#"{"type":"ready","timestamp":"2026-09-19T00:00:00.000Z","serverInstanceId":"srv-abc","bootId":"boot-1","capabilities":{"pacedTerminalReplayV1":true}}"#;
+    match server_roundtrip(wire, "ready") {
+        ServerMessage::Ready(r) => {
+            assert_eq!(
+                r.capabilities.and_then(|c| c.paced_terminal_replay_v1),
+                Some(true),
+                "the negotiated paced-replay echo must parse through the typed struct"
+            );
+        }
+        other => panic!("expected Ready, got {other:?}"),
+    }
+
+    // A non-negotiating capabilities object stays byte-identical to today's
+    // output — no paced key is invented for the frozen client.
+    let wire = r#"{"type":"ready","timestamp":"2026-09-19T00:00:00.000Z","serverInstanceId":"srv-abc","bootId":"boot-1","capabilities":{"paneReconcileV1":true}}"#;
+    match server_roundtrip(wire, "ready") {
+        ServerMessage::Ready(r) => {
+            assert_eq!(
+                r.capabilities.and_then(|c| c.paced_terminal_replay_v1),
+                None,
+                "a non-paced negotiation must not invent pacedTerminalReplayV1"
+            );
+        }
+        other => panic!("expected Ready, got {other:?}"),
+    }
+}
+
+#[test]
 fn terminal_inventory_and_settings_parse_from_transcript() {
     let transcript = read_json("port/oracle/fixtures/handshake-transcript.json");
     let entries = transcript["transcript"].as_array().unwrap();

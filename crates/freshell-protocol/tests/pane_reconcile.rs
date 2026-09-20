@@ -81,6 +81,7 @@ fn ready_capabilities_advertise_pane_reconcile_v1_when_negotiated() {
             pane_reconcile_v1: Some(true),
             pane_reconcile_fresh_agent_v1: None,
             terminal_interest_v1: None,
+            paced_terminal_replay_v1: None,
         }),
         runtime_owners: None,
     };

@@ -187,6 +187,12 @@ pub struct HelloCapabilities {
     /// advertises the capability back (§4.2). Absent for the frozen client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_reconcile_v1: Option<bool>,
+    /// Paced terminal restore opt-in (responsive-terminal-restore Workstream
+    /// 1): the client understands bounded, ascending paced replay batches with
+    /// continuation credit. Additive optional — absent on the frozen client
+    /// and stripped-tolerant on older servers (no version bump).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paced_terminal_replay_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
