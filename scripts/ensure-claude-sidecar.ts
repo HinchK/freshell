@@ -1,26 +1,32 @@
 /**
- * Install and verify the isolated Claude SDK sidecar dependencies.
+ * Readiness and repair gate for the Claude SDK sidecar dependencies.
  *
- * The sidecar is intentionally a separate npm package because it is the one
- * sanctioned Node client in the Rust application. Its node_modules directory
- * is a build artifact, so every clean source or Electron checkout must
- * recreate it from the committed lockfile before the Rust runtime starts or
- * the desktop runtime is staged.
+ * The sidecar is a pnpm workspace member whose dependencies are installed
+ * by the root workspace install. Before the Rust runtime starts, this
+ * script verifies the installed tree (exact SDK version pin, required
+ * SDK entrypoint, and the target-platform native package) against a
+ * recorded fingerprint of the sidecar manifest, the workspace lockfile,
+ * and the workspace config. A current installation returns a readiness
+ * receipt without installing anything; a missing or stale installation is
+ * repaired with one frozen, sidecar-filtered pnpm install at the workspace
+ * root. Failures happen before server spawn and never fall back to a
+ * mutable install.
  */
 
 import { execFileSync as defaultExecFileSync } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+import { detectProjectManager, resolveManagerCommand } from './lib/package-manager.js'
+
 const SIDECAR_PACKAGE_NAME = 'freshell-claude-sidecar'
 const SDK_PACKAGE_NAME = '@anthropic-ai/claude-agent-sdk'
-const INSTALL_ARGS = ['ci', '--ignore-scripts', '--no-audit', '--no-fund'] as const
-
-export type NpmExecFileCommand = {
-  command: string
-  args: string[]
-}
+const FROZEN_FILTERED_INSTALL_ARGS = ['install', '--filter', SIDECAR_PACKAGE_NAME, '--frozen-lockfile']
+const READY_RECEIPT_FILENAME = '.claude-sidecar-ready.json'
+const NATIVE_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32'])
 
 export interface ClaudeSidecarInstallReceipt {
   severity: 'info'
@@ -29,12 +35,22 @@ export interface ClaudeSidecarInstallReceipt {
   packageName: string
   packageVersion: string
   installCommand: string[]
+  packageManagerVersion?: string
+  fingerprint?: {
+    manifestMd5: string
+    lockMd5: string
+    workspaceMd5: string
+  }
+  repaired?: boolean
 }
 
 export interface EnsureClaudeSidecarDependenciesOptions {
   /** Sidecar package directory; defaults to the repository sidecar. */
   sidecarDir?: string
+  /** Workspace root that owns the pnpm lockfile; defaults to sidecarDir/../... */
+  repoRoot?: string
   env?: NodeJS.ProcessEnv
+  envPath?: string
   platform?: NodeJS.Platform
   nodeExecPath?: string
   execFileSync?: typeof defaultExecFileSync
@@ -42,43 +58,147 @@ export interface EnsureClaudeSidecarDependenciesOptions {
 
 type JsonObject = Record<string, unknown>
 
-function readJson(filePath: string): JsonObject {
+type InstallIntegrity = { ok: true; sdkVersion: string } | { ok: false; reason: string }
+
+interface Fingerprint {
+  manifestMd5: string
+  lockMd5: string
+  workspaceMd5: string
+}
+
+function readJsonOrNull(filePath: string): JsonObject | undefined {
   try {
-    return JSON.parse(readFileSync(filePath, 'utf8')) as JsonObject
-  } catch (error) {
-    throw new Error(`Unable to read JSON file ${filePath}: ${error instanceof Error ? error.message : String(error)}`)
+    const parsed = JSON.parse(readFileSync(filePath, 'utf8')) as unknown
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return undefined
+    }
+    return parsed as JsonObject
+  } catch {
+    return undefined
   }
 }
 
-function packageDependency(packageJson: JsonObject, packageName: string): string | undefined {
-  const dependencies = packageJson.dependencies
+function dependencyVersion(manifest: JsonObject, packageName: string): string | undefined {
+  const dependencies = manifest.dependencies
   if (!dependencies || typeof dependencies !== 'object' || Array.isArray(dependencies)) return undefined
   const version = (dependencies as Record<string, unknown>)[packageName]
   return typeof version === 'string' ? version : undefined
 }
 
-/**
- * Resolve npm without invoking a shell. npm_execpath is used by npm itself and
- * is the most reliable way to select the native CLI on Windows installations.
- */
-export function resolveNpmExecFileCommand(
-  args: string[],
-  env: NodeJS.ProcessEnv,
-  platform: NodeJS.Platform,
-  nodeExecPath = process.execPath,
-): NpmExecFileCommand {
-  const npmExecPath = env.npm_execpath
-  if (npmExecPath && /\.js$/i.test(npmExecPath)) {
+function md5OfFile(filePath: string): string | undefined {
+  try {
+    return createHash('md5').update(readFileSync(filePath)).digest('hex')
+  } catch {
+    return undefined
+  }
+}
+
+function computeFingerprint(
+  manifestPath: string,
+  lockPath: string,
+  workspacePath: string,
+): Fingerprint | undefined {
+  const manifestMd5 = md5OfFile(manifestPath)
+  const lockMd5 = md5OfFile(lockPath)
+  const workspaceMd5 = md5OfFile(workspacePath)
+  if (manifestMd5 === undefined || lockMd5 === undefined || workspaceMd5 === undefined) {
+    return undefined
+  }
+  return { manifestMd5, lockMd5, workspaceMd5 }
+}
+
+function sdkEntryTarget(sdkManifest: JsonObject): string | undefined {
+  const exportsField = sdkManifest.exports
+  if (exportsField !== undefined && exportsField !== null && typeof exportsField === 'object' && !Array.isArray(exportsField)) {
+    const dotExport = (exportsField as Record<string, unknown>)['.']
+    if (typeof dotExport === 'string') {
+      return dotExport
+    }
+    if (dotExport !== undefined && dotExport !== null && typeof dotExport === 'object' && !Array.isArray(dotExport)) {
+      const conditions = dotExport as Record<string, unknown>
+      const target = conditions.import ?? conditions.default
+      if (typeof target === 'string') {
+        return target
+      }
+    }
+  }
+  const main = sdkManifest.main
+  return typeof main === 'string' && main.length > 0 ? main : undefined
+}
+
+function resolveNativePackageManifest(sdkManifestPath: string, nativeName: string): string | undefined {
+  try {
+    const requireFromSdk = createRequire(realpathSync(sdkManifestPath))
+    return requireFromSdk.resolve(`${nativeName}/package.json`)
+  } catch {
+    return undefined
+  }
+}
+
+function inspectInstallIntegrity(sidecarDir: string, platform: NodeJS.Platform): InstallIntegrity {
+  const manifestPath = path.join(sidecarDir, 'package.json')
+  const manifest = readJsonOrNull(manifestPath)
+  if (manifest === undefined) {
+    return { ok: false, reason: `the sidecar manifest is missing or unreadable at ${manifestPath}` }
+  }
+  if (manifest.name !== SIDECAR_PACKAGE_NAME) {
+    return { ok: false, reason: `the sidecar manifest must name ${SIDECAR_PACKAGE_NAME} (found ${String(manifest.name)})` }
+  }
+  const declaredSdkVersion = dependencyVersion(manifest, SDK_PACKAGE_NAME)
+  if (declaredSdkVersion === undefined || declaredSdkVersion.length === 0) {
+    return { ok: false, reason: `the sidecar manifest does not declare a ${SDK_PACKAGE_NAME} dependency` }
+  }
+
+  const sdkDir = path.join(sidecarDir, 'node_modules', ...SDK_PACKAGE_NAME.split('/'))
+  const sdkManifestPath = path.join(sdkDir, 'package.json')
+  const sdkManifest = readJsonOrNull(sdkManifestPath)
+  if (sdkManifest === undefined) {
+    return { ok: false, reason: `${SDK_PACKAGE_NAME} is not installed in the sidecar node_modules` }
+  }
+  if (sdkManifest.name !== SDK_PACKAGE_NAME) {
+    return { ok: false, reason: `the installed SDK package at ${sdkManifestPath} must name ${SDK_PACKAGE_NAME}` }
+  }
+  if (sdkManifest.version !== declaredSdkVersion) {
     return {
-      command: nodeExecPath,
-      args: [npmExecPath, ...args],
+      ok: false,
+      reason: `installed ${SDK_PACKAGE_NAME} version ${String(sdkManifest.version)} does not match the sidecar manifest pin ${declaredSdkVersion}`,
     }
   }
 
-  return {
-    command: platform === 'win32' ? 'npm.cmd' : 'npm',
-    args: [...args],
+  const entryTarget = sdkEntryTarget(sdkManifest)
+  if (entryTarget === undefined) {
+    return { ok: false, reason: `${SDK_PACKAGE_NAME} declares no resolvable entrypoint` }
   }
+  if (!existsSync(path.join(sdkDir, entryTarget))) {
+    return { ok: false, reason: `${SDK_PACKAGE_NAME} entrypoint ${entryTarget} is missing on disk` }
+  }
+
+  if (NATIVE_PLATFORMS.has(platform)) {
+    const nativeName = `${SDK_PACKAGE_NAME}-${platform}-${process.arch}`
+    if (resolveNativePackageManifest(sdkManifestPath, nativeName) === undefined) {
+      return { ok: false, reason: `the platform native package ${nativeName} is not installed` }
+    }
+  }
+
+  return { ok: true, sdkVersion: sdkManifest.version as string }
+}
+
+function readCurrentReceiptPnpmVersion(receiptPath: string, fingerprint: Fingerprint): string | undefined {
+  const receiptFile = readJsonOrNull(receiptPath)
+  if (receiptFile === undefined) return undefined
+  if (receiptFile.manifestMd5 !== fingerprint.manifestMd5) return undefined
+  if (receiptFile.lockMd5 !== fingerprint.lockMd5) return undefined
+  if (receiptFile.workspaceMd5 !== fingerprint.workspaceMd5) return undefined
+  if (typeof receiptFile.pnpmVersion !== 'string' || receiptFile.pnpmVersion.length === 0) return undefined
+  if (typeof receiptFile.sdkVersion !== 'string' || receiptFile.sdkVersion.length === 0) return undefined
+  return receiptFile.pnpmVersion
+}
+
+function writeReadyReceipt(receiptPath: string, contents: Record<string, string>): void {
+  mkdirSync(path.dirname(receiptPath), { recursive: true })
+  const tempPath = `${receiptPath}.tmp`
+  writeFileSync(tempPath, `${JSON.stringify(contents, null, 2)}\n`)
+  renameSync(tempPath, receiptPath)
 }
 
 function defaultSidecarDir(): string {
@@ -86,94 +206,139 @@ function defaultSidecarDir(): string {
   return path.resolve(scriptDir, '..', 'crates', 'freshell-claude-sidecar')
 }
 
-function validateSidecarLock(sidecarDir: string): { packageName: string; packageVersion: string } {
-  const packagePath = path.join(sidecarDir, 'package.json')
-  const lockPath = path.join(sidecarDir, 'package-lock.json')
-  const packageJson = readJson(packagePath)
-  const lockJson = readJson(lockPath)
-
-  if (packageJson.name !== SIDECAR_PACKAGE_NAME) {
-    throw new Error(`Claude sidecar package.json must name ${SIDECAR_PACKAGE_NAME}`)
-  }
-  if (lockJson.lockfileVersion !== 3) {
-    throw new Error('Claude sidecar package-lock.json must use lockfileVersion 3')
-  }
-
-  const lockPackages = lockJson.packages
-  if (!lockPackages || typeof lockPackages !== 'object' || Array.isArray(lockPackages)) {
-    throw new Error('Claude sidecar package-lock.json is missing its packages table')
-  }
-  const lockRoot = (lockPackages as Record<string, unknown>)['']
-  const lockSdk = (lockPackages as Record<string, unknown>)[`node_modules/${SDK_PACKAGE_NAME}`]
-  if (!lockRoot || typeof lockRoot !== 'object' || Array.isArray(lockRoot)) {
-    throw new Error('Claude sidecar package-lock.json is missing its root package metadata')
-  }
-  if (!lockSdk || typeof lockSdk !== 'object' || Array.isArray(lockSdk)) {
-    throw new Error(`Claude sidecar lockfile is missing ${SDK_PACKAGE_NAME}`)
-  }
-
-  const root = lockRoot as JsonObject
-  if (root.name !== packageJson.name || root.version !== packageJson.version) {
-    throw new Error('Claude sidecar package.json and package-lock.json root metadata differ')
-  }
-
-  const declaredSdkVersion = packageDependency(packageJson, SDK_PACKAGE_NAME)
-  const lockedRootSdkVersion = packageDependency(root, SDK_PACKAGE_NAME)
-  const lockedSdkVersion = (lockSdk as JsonObject).version
-  if (!declaredSdkVersion || lockedRootSdkVersion !== declaredSdkVersion || typeof lockedSdkVersion !== 'string') {
-    throw new Error(`Claude sidecar package-lock.json does not lock ${SDK_PACKAGE_NAME} to the declared dependency`)
-  }
-
+function buildReadyReceipt(params: {
+  sidecarDir: string
+  packageVersion: string
+  installCommand: string[]
+  pnpmVersion: string
+  fingerprint: Fingerprint
+  repaired: boolean
+}): ClaudeSidecarInstallReceipt {
   return {
+    severity: 'info',
+    event: 'claude_sidecar_dependencies_ready',
+    sidecarDir: params.sidecarDir,
     packageName: SDK_PACKAGE_NAME,
-    packageVersion: lockedSdkVersion,
+    packageVersion: params.packageVersion,
+    installCommand: params.installCommand,
+    packageManagerVersion: params.pnpmVersion,
+    fingerprint: params.fingerprint,
+    repaired: params.repaired,
   }
-}
-
-function installedSdkPackage(sidecarDir: string): JsonObject {
-  const packagePath = path.join(sidecarDir, 'node_modules', ...SDK_PACKAGE_NAME.split('/'), 'package.json')
-  if (!existsSync(packagePath)) {
-    throw new Error(`Claude sidecar dependency is missing after npm ci: ${SDK_PACKAGE_NAME}`)
-  }
-  return readJson(packagePath)
 }
 
 export function ensureClaudeSidecarDependencies(
   options: EnsureClaudeSidecarDependenciesOptions = {},
 ): ClaudeSidecarInstallReceipt {
   const sidecarDir = path.resolve(options.sidecarDir ?? defaultSidecarDir())
-  const { packageName, packageVersion } = validateSidecarLock(sidecarDir)
+  const repoRoot = path.resolve(options.repoRoot ?? path.join(sidecarDir, '..', '..'))
   const env = options.env ?? process.env
   const platform = options.platform ?? process.platform
-  const npm = resolveNpmExecFileCommand(
-    [...INSTALL_ARGS],
-    env,
-    platform,
-    options.nodeExecPath ?? process.execPath,
-  )
   const execFileSync = options.execFileSync ?? defaultExecFileSync
 
-  execFileSync(npm.command, npm.args, {
-    cwd: sidecarDir,
-    env,
-    stdio: 'inherit',
-  })
+  const manifestPath = path.join(sidecarDir, 'package.json')
+  const lockPath = path.join(repoRoot, 'pnpm-lock.yaml')
+  const workspacePath = path.join(repoRoot, 'pnpm-workspace.yaml')
+  const receiptPath = path.join(sidecarDir, 'node_modules', READY_RECEIPT_FILENAME)
 
-  const installed = installedSdkPackage(sidecarDir)
-  if (installed.name !== packageName || installed.version !== packageVersion) {
+  const integrity = inspectInstallIntegrity(sidecarDir, platform)
+  const fingerprint = computeFingerprint(manifestPath, lockPath, workspacePath)
+
+  if (integrity.ok && fingerprint !== undefined) {
+    const currentPnpmVersion = readCurrentReceiptPnpmVersion(receiptPath, fingerprint)
+    if (currentPnpmVersion !== undefined) {
+      return buildReadyReceipt({
+        sidecarDir,
+        packageVersion: integrity.sdkVersion,
+        installCommand: ['pnpm', ...FROZEN_FILTERED_INSTALL_ARGS],
+        pnpmVersion: currentPnpmVersion,
+        fingerprint,
+        repaired: false,
+      })
+    }
+  }
+
+  const selection = detectProjectManager(repoRoot)
+  if (selection.manager !== 'pnpm') {
     throw new Error(
-      `Claude sidecar dependency version mismatch: expected ${packageName}@${packageVersion}, got ${String(installed.name)}@${String(installed.version)}`,
+      `The Claude sidecar is a pnpm workspace member, but the workspace root at ${repoRoot} resolves to ` +
+      `${selection.manager} (${selection.source}). Declare "packageManager": "pnpm@10.34.5" in the root package.json.`,
     )
   }
 
-  return {
-    severity: 'info',
-    event: 'claude_sidecar_dependencies_ready',
-    sidecarDir,
-    packageName,
-    packageVersion,
-    installCommand: [npm.command, ...npm.args],
+  const managerInputs = {
+    manager: 'pnpm' as const,
+    env,
+    ...(options.envPath !== undefined ? { envPath: options.envPath } : {}),
+    platform,
+    nodeExecPath: options.nodeExecPath ?? process.execPath,
   }
+
+  const versionSpec = resolveManagerCommand({ ...managerInputs, args: ['--version'] })
+  const pnpmVersion = execFileSync(versionSpec.command, versionSpec.args, {
+    cwd: repoRoot,
+    env,
+    encoding: 'utf8',
+    shell: versionSpec.viaShell ?? false,
+  }).trim()
+  if (pnpmVersion.length === 0) {
+    throw new Error('The resolved pnpm reported no version; unable to fingerprint the package manager.')
+  }
+
+  const installSpec = resolveManagerCommand({ ...managerInputs, args: [...FROZEN_FILTERED_INSTALL_ARGS] })
+  try {
+    execFileSync(installSpec.command, installSpec.args, {
+      cwd: repoRoot,
+      env,
+      stdio: 'inherit',
+      shell: installSpec.viaShell ?? false,
+    })
+  } catch (error) {
+    const status = (error as { status?: unknown }).status
+    if (typeof status !== 'number') {
+      throw error
+    }
+    throw new Error(
+      `Claude sidecar frozen pnpm install failed with exit code ${status}: ` +
+      `pnpm ${FROZEN_FILTERED_INSTALL_ARGS.join(' ')} at ${repoRoot}. ` +
+      'No mutable recovery is attempted; repair the workspace with a full frozen install ' +
+      '(pnpm install --frozen-lockfile) and retry.',
+    )
+  }
+
+  const repairedIntegrity = inspectInstallIntegrity(sidecarDir, platform)
+  if (!repairedIntegrity.ok) {
+    throw new Error(
+      `Claude sidecar preparation still fails after the frozen install: ${repairedIntegrity.reason}. ` +
+      'No readiness receipt was written.',
+    )
+  }
+
+  const repairedFingerprint = computeFingerprint(manifestPath, lockPath, workspacePath)
+  if (repairedFingerprint === undefined) {
+    throw new Error(
+      `Unable to fingerprint the workspace after the frozen install ` +
+      `(${manifestPath}, ${lockPath}, ${workspacePath}). No readiness receipt was written.`,
+    )
+  }
+
+  writeReadyReceipt(receiptPath, {
+    sdkVersion: repairedIntegrity.sdkVersion,
+    pnpmVersion,
+    manifestMd5: repairedFingerprint.manifestMd5,
+    lockMd5: repairedFingerprint.lockMd5,
+    workspaceMd5: repairedFingerprint.workspaceMd5,
+    at: new Date().toISOString(),
+  })
+
+  return buildReadyReceipt({
+    sidecarDir,
+    packageVersion: repairedIntegrity.sdkVersion,
+    installCommand: [installSpec.command, ...installSpec.args],
+    pnpmVersion,
+    fingerprint: repairedFingerprint,
+    repaired: true,
+  })
 }
 
 function isDirectInvocation(): boolean {

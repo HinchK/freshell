@@ -12,7 +12,10 @@ describe('prepareRustRuntime', () => {
       sidecarDir: '/tmp/sidecar',
       packageName: '@anthropic-ai/claude-agent-sdk',
       packageVersion: '0.3.237',
-      installCommand: ['npm', 'ci'],
+      installCommand: ['pnpm', 'install', '--filter', 'freshell-claude-sidecar', '--frozen-lockfile'],
+      packageManagerVersion: '10.34.5',
+      fingerprint: { manifestMd5: 'a', lockMd5: 'b', workspaceMd5: 'c' },
+      repaired: false,
     })
     const env: NodeJS.ProcessEnv = {}
 
