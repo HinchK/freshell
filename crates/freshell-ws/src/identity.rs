@@ -23,7 +23,7 @@
 //!   and the session-directory join's live-terminal set (`service.ts:77-151`).
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use freshell_freshagent::naming::{NamingSink, SessionNaming};
 use freshell_protocol::session_names::SessionNameRef;
@@ -125,6 +125,21 @@ pub struct TerminalIdentityRegistry {
     /// naming bind lane's rollout walk and the native-name adapter's
     /// root-match policy.
     codex_homes: Arc<RwLock<HashMap<String, String>>>,
+    /// Per-registry memo: raw cwd string -> normalized cwd string
+    /// ([`normalize_scoped_cwd`]). Shared across clones like `inner`, so one
+    /// registry instance (the process-wide `WsState` clone family) resolves
+    /// each distinct cwd on disk ONCE instead of once per session per ~5s
+    /// auto-title sweep pass — eager per-call canonicalization stalled the
+    /// async runtime 0.4-2s per resolution on WSL2 9P-mounted,
+    /// cloud-sync-backed cwds (the FRESHELL host-stats `lagging` toggle root
+    /// cause). Deliberately unbounded: keyed by distinct cwd strings, which
+    /// a machine produces at most in the hundreds. Values are stable per
+    /// raw key: a symlink retarget after first resolution keeps serving the
+    /// first target for that raw spelling. Sides spelled differently (link
+    /// vs target) can therefore diverge from eager-canonicalize behavior
+    /// after a retarget — a permanent match miss for that pair until the
+    /// raw strings change, accepted over reintroducing the per-call stall.
+    cwd_memo: Arc<Mutex<HashMap<String, String>>>,
 }
 
 /// The durable session name ref for a scoped provider id (the named
@@ -542,6 +557,33 @@ impl TerminalIdentityRegistry {
                 }
             })
             .collect()
+    }
+
+    /// [`normalize_scoped_cwd`] behind the per-registry memo: the first lookup
+    /// of a raw cwd pays the on-disk canonicalize; every later lookup of the
+    /// same raw string returns the memoized normalized value without touching
+    /// the filesystem. Lock discipline: the filesystem resolution happens
+    /// OUTSIDE the lock, so a slow path (9P stall) never holds the memo lock.
+    pub(crate) fn normalize_scoped_cwd_cached(&self, cwd: &str) -> String {
+        if let Some(hit) = self
+            .cwd_memo
+            .lock()
+            .expect("cwd memo lock poisoned")
+            .get(cwd)
+        {
+            return hit.clone();
+        }
+        let normalized = normalize_scoped_cwd(cwd);
+        self.cwd_memo
+            .lock()
+            .expect("cwd memo lock poisoned")
+            .insert(cwd.to_string(), normalized.clone());
+        normalized
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cwd_memo_len_for_tests(&self) -> usize {
+        self.cwd_memo.lock().expect("cwd memo lock poisoned").len()
     }
 }
 
@@ -1433,5 +1475,60 @@ mod tests {
             .map(|t| t.terminal_id)
             .collect();
         assert_eq!(codex, vec!["t5".to_string()]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn memoized_cwd_resolution_resolves_a_symlink_once_then_serves_retargets_from_the_memo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real_a = dir.path().join("a");
+        let real_b = dir.path().join("b");
+        std::fs::create_dir_all(&real_a).expect("mkdir a");
+        std::fs::create_dir_all(&real_b).expect("mkdir b");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real_a, &link).expect("symlink");
+        let link_str = link.to_str().expect("utf8 path").to_string();
+
+        let reg = TerminalIdentityRegistry::new();
+        let first = reg.normalize_scoped_cwd_cached(&link_str);
+        assert_eq!(
+            first,
+            std::fs::canonicalize(&real_a)
+                .expect("canonicalize expected")
+                .to_str()
+                .expect("utf8")
+        );
+
+        // Retarget the symlink: the memo deliberately serves the FIRST
+        // resolution (the accepted tradeoff). Both matching sides share the
+        // same memo, so cwd-scoped matching stays internally consistent.
+        std::fs::remove_file(&link).expect("unlink");
+        std::os::unix::fs::symlink(&real_b, &link).expect("retarget symlink");
+        let second = reg.normalize_scoped_cwd_cached(&link_str);
+        assert_eq!(
+            second, first,
+            "memoized resolution must be stable across retargets"
+        );
+        assert_eq!(reg.cwd_memo_len_for_tests(), 1);
+    }
+
+    #[test]
+    fn memoized_cwd_resolution_memoizes_the_lexical_fallback_for_missing_paths() {
+        let reg = TerminalIdentityRegistry::new();
+        let first = reg.normalize_scoped_cwd_cached("/definitely/not/here/");
+        assert_eq!(first, "/definitely/not/here"); // lexical fallback + trailing slash strip
+        let second = reg.normalize_scoped_cwd_cached("/definitely/not/here/");
+        assert_eq!(second, first);
+        assert_eq!(reg.cwd_memo_len_for_tests(), 1);
+    }
+
+    #[test]
+    fn memoized_cwd_resolution_is_shared_across_registry_clones() {
+        let reg = TerminalIdentityRegistry::new();
+        reg.normalize_scoped_cwd_cached("/x");
+        let clone = reg.clone();
+        assert_eq!(clone.cwd_memo_len_for_tests(), 1);
+        clone.normalize_scoped_cwd_cached("/x");
+        assert_eq!(reg.cwd_memo_len_for_tests(), 1);
     }
 }
