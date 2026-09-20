@@ -286,6 +286,7 @@ pub async fn run(
     origin_kind: &'static str,
     conn_identity: ConnectionIdentity,
     terminal_interest_v1: bool,
+    terminal_lifetime_claim_v1: bool,
 ) {
     let (ws_tx, ws_rx) = socket.split();
 
@@ -328,6 +329,7 @@ pub async fn run(
         origin_kind,
         conn_identity,
         terminal_interest_v1,
+        terminal_lifetime_claim_v1,
     )
     .instrument(span)
     .await;
@@ -351,6 +353,7 @@ async fn run_loop(
     origin_kind: &'static str,
     mut conn_identity: ConnectionIdentity,
     terminal_interest_v1: bool,
+    terminal_lifetime_claim_v1: bool,
 ) {
     // One independently supervised socket writer. The read/dispatch path
     // never awaits socket capacity; output is reconsidered one frame at a time.
@@ -369,6 +372,13 @@ async fn run_loop(
     );
     if terminal_interest_v1 {
         ws_tx.enable_terminal_interest();
+    }
+    if terminal_lifetime_claim_v1 {
+        // Hidden-pane lifetime claims (responsive-terminal-restore WS1): this
+        // connection's terminal.interest snapshots may carry
+        // claimedTerminalIds. A connection that never negotiated keeps its
+        // claim fields ignored server-side.
+        ws_tx.enable_terminal_lifetime_claims();
     }
     if paced_terminal_replay_v1 {
         // Restore contract (responsive-terminal-restore): a negotiated
@@ -933,7 +943,25 @@ async fn handle_client_text(
     }
     match message {
         ClientMessage::TerminalInterest(interest) => match ws_tx.set_terminal_interest(&interest) {
-            Ok(()) => true,
+            // Hidden-pane lifetime claims (responsive-terminal-restore WS1):
+            // the accepted snapshot's claim diff is applied to the registry —
+            // claims never attach, never grant replay, and never change
+            // delivery priority (the priority recompute happened inside
+            // set_terminal_interest). A connection that did not negotiate
+            // `terminalLifetimeClaimV1` produces an empty diff here, so its
+            // claimedTerminalIds (if any) are ignored server-side.
+            Ok(Some(claims)) => {
+                if !claims.is_empty() {
+                    for terminal_id in &claims.added {
+                        state.registry.claim_terminal(terminal_id, conn_id);
+                    }
+                    for terminal_id in &claims.removed {
+                        state.registry.withdraw_claim(terminal_id, conn_id);
+                    }
+                }
+                true
+            }
+            Ok(None) => true,
             Err(message) => {
                 send(
                     ws_tx,

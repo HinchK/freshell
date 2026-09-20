@@ -424,6 +424,13 @@ export const HelloSchema = z.object({
     // continuation credit. Additive optional — declared, not just sent (same
     // strip hazard as above); absent for the frozen client shape.
     pacedTerminalReplayV1: z.literal(true).optional(),
+    // Hidden-pane lifetime claims (responsive-terminal-restore Workstream 1):
+    // the client understands non-hydrating per-connection terminal lifetime
+    // claims carried on `terminal.interest.claimedTerminalIds`, sent only
+    // after the `ready` echo advertises the capability. Additive optional —
+    // declared, not just sent (same strip hazard as above); absent for the
+    // frozen client shape.
+    terminalLifetimeClaimV1: z.literal(true).optional(),
   }).optional(),
   client: z.object({
     mobile: z.boolean().optional(),
@@ -1073,6 +1080,10 @@ export const ReadyCapabilitiesSchema = z
     // Paced terminal restore (Workstream 1): echoed only for a hello that
     // opted in via capabilities.pacedTerminalReplayV1.
     pacedTerminalReplayV1: z.literal(true).optional(),
+    // Hidden-pane lifetime claims (Workstream 1): echoed only for a hello
+    // that opted in via capabilities.terminalLifetimeClaimV1. Present iff the
+    // client may send `terminal.interest.claimedTerminalIds`.
+    terminalLifetimeClaimV1: z.literal(true).optional(),
   })
   .optional()
 
@@ -1084,6 +1095,13 @@ export const TerminalInterestSchema = z.object({
   revision: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
   focusedTerminalId: z.string().min(1).max(512).nullable().optional(),
   visibleTerminalIds: z.array(z.string().min(1).max(512)).max(1024),
+  /** Hidden-pane lifetime claims (negotiated `terminalLifetimeClaimV1` only):
+   *  terminals this connection wants kept alive WITHOUT attaching. The claim
+   *  never grants replay or output delivery and never touches geometry or
+   *  stream identity; a later snapshot omitting an id is the explicit
+   *  withdrawal (release). The client sends the field only after the ready
+   *  echo; older clients never send it. */
+  claimedTerminalIds: z.array(z.string().min(1).max(512)).max(1024).optional(),
 })
 export type TerminalInterestMessage = z.infer<typeof TerminalInterestSchema>
 

@@ -10,7 +10,23 @@ export function TerminalInterestReporter({ workspaceVisible = true }: { workspac
   useEffect(() => {
     const ws = getWsClient()
     const publisher = createInterestPublisher({
-      read: () => selectTerminalInterest(store.getState(), document.hidden || !workspaceVisible),
+      read: () => {
+        const snapshot = selectTerminalInterest(store.getState(), document.hidden || !workspaceVisible)
+        if (snapshot === null) return null
+        // Hidden-pane lifetime claims (responsive-terminal-restore WS1) are a
+        // negotiated field: strip them unless the CURRENT connection's ready
+        // echoed `terminalLifetimeClaimV1`. The stripped snapshot is
+        // byte-identical to today's — an old server never sees the field,
+        // and the dedupe key tracks exactly what is sendable.
+        const claimEcho = typeof ws.getServerCapabilities === 'function'
+          ? ws.getServerCapabilities().terminalLifetimeClaimV1 === true
+          : false
+        if (!claimEcho) {
+          const { claimedTerminalIds: _claims, ...wire } = snapshot
+          return wire
+        }
+        return snapshot
+      },
       send: (snapshot) => ws.sendTerminalInterest(snapshot),
       scheduleTask: (task) => {
         const timer = window.setTimeout(task, 0)
@@ -21,8 +37,11 @@ export function TerminalInterestReporter({ workspaceVisible = true }: { workspac
     const onState = () => {
       const state = store.getState()
       const tab = state.tabs.activeTabId
-      const dependencies = [tab, tab ? state.panes.layouts[tab] : undefined,
-        tab ? state.panes.activePane[tab] : undefined,
+      // Claims aggregate EVERY tab's layout (hidden panes claim their
+      // terminals), so the dependency set watches all layouts, not just the
+      // active tab's — a hidden tab's terminalId assignment or pane close
+      // must republish the claim set.
+      const dependencies = [tab, state.panes.layouts, tab ? state.panes.activePane[tab] : undefined,
         tab ? state.panes.zoomedPane?.[tab] : undefined]
       if (previous && dependencies.every((value, index) => value === previous![index])) return
       previous = dependencies

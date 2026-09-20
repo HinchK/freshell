@@ -402,6 +402,20 @@ impl WriterSender {
             .enable();
     }
 
+    /// Hidden-pane lifetime claims (responsive-terminal-restore Workstream 1):
+    /// arm the connection's `terminal.interest.claimedTerminalIds` handling.
+    /// Called ONCE by the connection setup when the hello negotiated
+    /// `terminalLifetimeClaimV1`; a connection that never negotiated keeps
+    /// its snapshots' claim fields ignored server-side.
+    pub(super) fn enable_terminal_lifetime_claims(&self) {
+        self.shared
+            .queues
+            .lock()
+            .expect("writer queue lock")
+            .interest
+            .enable_claims();
+    }
+
     /// Restore contract (responsive-terminal-restore): install the
     /// negotiated-connection gap-bounds source. Called ONCE by the
     /// connection setup, BEFORE the writer pump is spawned (a gap can never
@@ -416,24 +430,30 @@ impl WriterSender {
 
     /// Apply one full presentation-interest snapshot. A rejected snapshot is
     /// returned without replacing the last accepted state; scheduling changes
-    /// are queued-data-only (no attach, resize, spawn, or kill).
+    /// are queued-data-only (no attach, resize, spawn, or kill). On
+    /// acceptance, the negotiated claim-set diff is handed back to the
+    /// dispatcher, which applies it to the terminal registry (the writer owns
+    /// only the connection-local interest state).
     pub(super) fn set_terminal_interest(
         &self,
         snapshot: &freshell_protocol::client_messages::TerminalInterest,
-    ) -> Result<(), &'static str> {
+    ) -> Result<Option<terminal_interest::InterestClaimChange>, &'static str> {
         let mut queues = self.shared.queues.lock().expect("writer queue lock");
         if queues.closed {
             return Err("Connection writer is closed");
         }
-        if queues.interest.apply(snapshot)? {
+        if let Some(change) = queues.interest.apply(snapshot)? {
             let Queues {
                 output, interest, ..
             } = &mut *queues;
             output.update_priorities(|id| interest.priority(id));
+            drop(queues);
+            self.shared.ready.notify_one();
+            Ok(Some(change))
+        } else {
+            drop(queues);
+            Ok(None)
         }
-        drop(queues);
-        self.shared.ready.notify_one();
-        Ok(())
     }
 
     /// Pre-snapshot fallback: a client that never negotiated terminalInterestV1

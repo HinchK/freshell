@@ -207,6 +207,51 @@ async fn capability_free_hello_ready_has_no_capabilities_object() {
     );
 }
 
+/// A hello WITH `terminalLifetimeClaimV1: true` gets the echo advertised back
+/// in `ready.capabilities` (responsive-terminal-restore Workstream 1: the
+/// hidden-pane lifetime-claim negotiation rail) — raw-JSON extraction →
+/// handshake builder gate at the real socket.
+#[tokio::test]
+async fn negotiated_hello_gets_terminal_lifetime_claim_echo_in_ready() {
+    let url = spawn_server().await;
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("ws connect");
+
+    let ready = hello_ready(
+        &mut ws,
+        serde_json::json!({ "terminalInterestV1": true, "terminalLifetimeClaimV1": true }),
+    )
+    .await;
+    assert_eq!(
+        ready["capabilities"],
+        serde_json::json!({ "terminalInterestV1": true, "terminalLifetimeClaimV1": true }),
+        "a negotiated hello must get exactly the lifetime-claim echo: {ready}"
+    );
+}
+
+/// A hello that negotiates other capabilities but NOT the lifetime-claim one
+/// gets a `ready.capabilities` object byte-identical to today's output — the
+/// new key never leaks to a non-opting client.
+#[tokio::test]
+async fn non_claim_negotiation_keeps_capabilities_byte_identical() {
+    let url = spawn_server().await;
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("ws connect");
+
+    let ready = hello_ready(
+        &mut ws,
+        serde_json::json!({ "paneReconcileV1": true, "terminalInterestV1": true, "pacedTerminalReplayV1": true }),
+    )
+    .await;
+    assert_eq!(
+        ready["capabilities"],
+        serde_json::json!({ "paneReconcileV1": true, "terminalInterestV1": true, "pacedTerminalReplayV1": true }),
+        "a non-claim negotiation must keep today's capabilities shape: {ready}"
+    );
+}
+
 /// Read the next JSON text frame from the socket (bounded).
 async fn next_json(ws: &mut WsClient) -> serde_json::Value {
     let msg = tokio::time::timeout(Duration::from_secs(5), ws.next())

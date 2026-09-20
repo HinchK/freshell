@@ -11,18 +11,56 @@ function state(): InterestState {
 describe('terminal presentation interest', () => {
   it('distinguishes focused, visible, and hidden without changing the layout', () => {
     const input = state()
-    expect(selectTerminalInterest(input, false)).toEqual({ focusedTerminalId: 'A', visibleTerminalIds: ['A', 'B'] })
-    expect(selectTerminalInterest(input, true)).toEqual({ focusedTerminalId: null, visibleTerminalIds: [] })
+    expect(selectTerminalInterest(input, false)).toEqual({ focusedTerminalId: 'A', visibleTerminalIds: ['A', 'B'], claimedTerminalIds: ['A', 'B'] })
+    expect(selectTerminalInterest(input, true)).toEqual({ focusedTerminalId: null, visibleTerminalIds: [], claimedTerminalIds: ['A', 'B'] })
     expect(input).toEqual(state())
   })
   it('reflects zoom without creating another attachment', () => {
     const input = state(); input.panes.zoomedPane = { tab: 'b' }
-    expect(selectTerminalInterest(input, false)).toEqual({ focusedTerminalId: 'B', visibleTerminalIds: ['B'] })
+    expect(selectTerminalInterest(input, false)).toEqual({ focusedTerminalId: 'B', visibleTerminalIds: ['B'], claimedTerminalIds: ['A', 'B'] })
   })
   it('aggregates multiple panes showing the same terminal', () => {
     const input = state(); input.panes.layouts.tab = { type: 'split', id: 'root', children: [leaf('a', 'A'), leaf('b', 'A')] }
-    expect(selectTerminalInterest(input, false)).toEqual({ focusedTerminalId: 'A', visibleTerminalIds: ['A'] })
+    expect(selectTerminalInterest(input, false)).toEqual({ focusedTerminalId: 'A', visibleTerminalIds: ['A'], claimedTerminalIds: ['A'] })
   })
+
+  // ── Hidden-pane lifetime claims (responsive-terminal-restore WS1) ──
+
+  it('claims every terminal across ALL tab layouts, including hidden tabs', () => {
+    const input = state()
+    input.panes.layouts['tab-hidden-1'] = { type: 'leaf', id: 'c', content: { kind: 'terminal', terminalId: 'C' } }
+    input.panes.layouts['tab-hidden-2'] = { type: 'split', id: 'root2', children: [leaf('d', 'D'), leaf('e', 'E')] }
+    expect(selectTerminalInterest(input, false)).toEqual({
+      focusedTerminalId: 'A',
+      visibleTerminalIds: ['A', 'B'],
+      claimedTerminalIds: ['A', 'B', 'C', 'D', 'E'],
+    })
+  })
+
+  it('skips panes without a terminal id (creating, picker, non-terminal kinds)', () => {
+    const input = state()
+    input.panes.layouts['tab-hidden-1'] = {
+      type: 'leaf',
+      id: 'c',
+      content: { kind: 'terminal', terminalId: undefined },
+    } as unknown as InterestPane
+    expect(selectTerminalInterest(input, false)).toEqual({
+      focusedTerminalId: 'A',
+      visibleTerminalIds: ['A', 'B'],
+      claimedTerminalIds: ['A', 'B'],
+    })
+  })
+
+  it('refuses the whole snapshot when a hidden layout is cyclic or oversized', () => {
+    // A cyclic layout anywhere must refuse the whole snapshot (the server
+    // keeps the last accepted state) rather than misclassify terminals.
+    const cyclic: InterestPane = { type: 'split', id: 'root-c', children: [] } as unknown as InterestPane
+    cyclic.children = [leaf('x', 'X'), cyclic]
+    const input = state()
+    input.panes.layouts['tab-hidden-1'] = cyclic
+    expect(selectTerminalInterest(input, false)).toBeNull()
+  })
+
   it('keeps failed sends retryable and reasserts state after ready', () => {
     const sent: unknown[] = []; let allowed = false
     const publisher = createInterestPublisher({

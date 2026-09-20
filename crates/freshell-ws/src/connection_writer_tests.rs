@@ -483,6 +483,7 @@ fn interest(
         revision,
         focused_terminal_id: focused.map(str::to_string),
         visible_terminal_ids: visible.iter().map(|s| s.to_string()).collect(),
+        claimed_terminal_ids: None,
     }
 }
 fn taken_terminal(pump: &WriterPump) -> String {

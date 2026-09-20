@@ -538,6 +538,10 @@
                   "const": true,
                   "type": "boolean"
                 },
+                "terminalLifetimeClaimV1": {
+                  "const": true,
+                  "type": "boolean"
+                },
                 "terminalOutputBatchV1": {
                   "type": "boolean"
                 },
@@ -1055,6 +1059,15 @@
         {
           "additionalProperties": false,
           "properties": {
+            "claimedTerminalIds": {
+              "items": {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              },
+              "maxItems": 1024,
+              "type": "array"
+            },
             "focusedTerminalId": {
               "anyOf": [
                 {
@@ -4837,6 +4850,10 @@
               "const": true,
               "type": "boolean"
             },
+            "terminalLifetimeClaimV1": {
+              "const": true,
+              "type": "boolean"
+            },
             "terminalOutputBatchV1": {
               "type": "boolean"
             },
@@ -7821,6 +7838,10 @@
         "terminalInterestV1": {
           "const": true,
           "type": "boolean"
+        },
+        "terminalLifetimeClaimV1": {
+          "const": true,
+          "type": "boolean"
         }
       },
       "type": "object"
@@ -8443,6 +8464,15 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "claimedTerminalIds": {
+          "items": {
+            "maxLength": 512,
+            "minLength": 1,
+            "type": "string"
+          },
+          "maxItems": 1024,
+          "type": "array"
+        },
         "focusedTerminalId": {
           "anyOf": [
             {

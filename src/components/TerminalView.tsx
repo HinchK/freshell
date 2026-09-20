@@ -1218,6 +1218,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     return capabilities?.pacedTerminalReplayV1 === true
   }, [ws])
 
+  // Hidden-pane lifetime claims (responsive-terminal-restore Workstream 1):
+  // the CURRENT connection's ready echoed `terminalLifetimeClaimV1` — hidden
+  // panes claim their terminals in the interest snapshot instead of attaching.
+  // Both flags must be present: claims ride `terminal.interest` snapshots, so
+  // an interest-capable echo without the claim echo (or vice versa) cannot
+  // deliver claims and must fall back to today's hidden attach. Absent (or a
+  // ws client without the accessor) → today's exact wire behavior everywhere.
+  const isLifetimeClaimNegotiated = useCallback((): boolean => {
+    const capabilities = typeof ws.getServerCapabilities === 'function'
+      ? ws.getServerCapabilities()
+      : undefined
+    return capabilities?.terminalLifetimeClaimV1 === true
+      && capabilities?.terminalInterestV1 === true
+  }, [ws])
+
   // The consumption frontier for the CURRENT attach generation only — replaced
   // by the next attach, absent for non-negotiated attaches.
   const pacedReplayRef = useRef<PacedReplayConsumptionState | null>(null)
@@ -3096,6 +3111,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     }, options)
   }, [tabId])
 
+  // Hidden-pane lifetime claims (responsive-terminal-restore WS1): a
+  // claim-negotiated hidden pane never holds a background-hydration
+  // registration — a stale OLD-SERVER registration (armed before the
+  // connection re-negotiated with claims) must not attach on a late grant
+  // under the negotiated regime.
+  const unregisterBackgroundHydration = useCallback(() => {
+    if (hydrationRegisteredRef.current) {
+      getHydrationQueue().unregister(paneIdRef.current)
+      hydrationRegisteredRef.current = false
+    }
+  }, [])
+
   const isCurrentAttachMessage = useCallback((msg: {
     type: string
     terminalId: string
@@ -3615,10 +3642,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         pendingReason: 'explicit_refresh',
       }
       setIsAttaching(false)
-      // F8: the detach was already sent above -- re-arm the attach via the
-      // background hydration queue so a hidden refresh cannot strand the
-      // pane detached until reveal. Same three-step sequence as the
-      // terminal.created site (see its comment for why each line exists).
+      // Lifetime (responsive-terminal-restore WS1): a claim-negotiated hidden
+      // pane does not re-arm the hydration queue — the terminal is claimed in
+      // the interest snapshot, and the deferred intent above re-hydrates at
+      // reveal.
+      if (isLifetimeClaimNegotiated()) return
+      // F8 (old-server fallback): the detach was already sent above -- re-arm
+      // the attach via the background hydration queue so a hidden refresh
+      // cannot strand the pane detached until reveal. Same three-step
+      // sequence as the terminal.created site (see its comment for why each
+      // line exists).
       getHydrationQueue().onHydrationComplete(paneIdRef.current)
       hydrationRegisteredRef.current = false
       registerForBackgroundHydration({ queueIfStarted: true })
@@ -3631,7 +3664,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
 
     dispatch(consumePaneRefreshRequest({ tabId, paneId, requestId: request.requestId }))
     return true
-  }, [attachTerminal, dispatch, isPacedReplayNegotiated, paneId, registerForBackgroundHydration, suppressNetworkEffects, tabId, ws])
+  }, [attachTerminal, dispatch, isLifetimeClaimNegotiated, isPacedReplayNegotiated, paneId, registerForBackgroundHydration, suppressNetworkEffects, tabId, ws])
 
   // Explicit retry of bounded recovery (WS2): the visible retry state's
   // control. Resets the accounting and resumes recovery — never a kill, a
@@ -3687,10 +3720,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       const deferred = deferredAttachStateRef.current
       if (tid && deferred.mode === 'waiting_for_geometry' && deferred.pendingIntent) {
         // Unregister from background queue — this tab is now being directly hydrated
-        if (hydrationRegisteredRef.current) {
-          getHydrationQueue().unregister(paneId)
-          hydrationRegisteredRef.current = false
-        }
+        unregisterBackgroundHydration()
         getHydrationQueue().onActiveTabChanged(tabId, tabOrderRef.current)
         const checkpointDecision = getCheckpointDeltaReplayDecision(tid)
         const revealPlan = resolveRevealAttachPlan({
@@ -3712,14 +3742,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       }
       requestTerminalLayout({ fit: true, resize: true })
     }
-  }, [hidden, isTerminal, paneId, requestTerminalLayout, tabId, attachTerminal, getCheckpointDeltaReplayDecision, isPacedReplayNegotiated])
+  }, [hidden, isTerminal, requestTerminalLayout, tabId, attachTerminal, getCheckpointDeltaReplayDecision, isPacedReplayNegotiated, unregisterBackgroundHydration])
 
-  // Background hydration: triggered by the hydration queue for hidden tabs
+  // Background hydration: triggered by the hydration queue for hidden tabs.
+  // OLD-SERVER FALLBACK ONLY (responsive-terminal-restore WS1): a
+  // claim-negotiated hidden pane never registers, so a grant here means a
+  // stale pre-renegotiation registration — drop it and attach nothing.
   useEffect(() => {
     if (!backgroundHydrationTriggered) return
     setBackgroundHydrationTriggered(false)
     const tid = terminalIdRef.current
     if (!tid || !hiddenRef.current) return
+    if (isLifetimeClaimNegotiated()) {
+      unregisterBackgroundHydration()
+      return
+    }
     const checkpointDecision = getCheckpointDeltaReplayDecision(tid)
     if (checkpointDecision.ok) {
       attachTerminal(tid, 'keepalive_delta', {
@@ -3734,7 +3771,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       priority: 'background',
       ...viewportHydrateReplayOptions(contentRef.current, isPacedReplayNegotiated()),
     })
-  }, [backgroundHydrationTriggered, attachTerminal, getCheckpointDeltaReplayDecision, isPacedReplayNegotiated])
+  }, [backgroundHydrationTriggered, attachTerminal, getCheckpointDeltaReplayDecision, isPacedReplayNegotiated, isLifetimeClaimNegotiated, unregisterBackgroundHydration])
 
   // Create or attach to backend terminal
   useEffect(() => {
@@ -5180,11 +5217,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               pendingReason: 'terminal_created',
             }
             setIsAttaching(false)
-            // F8: a hidden pane still owes the server an attach. Drive it
-            // through the background hydration queue (one-at-a-time stagger)
-            // instead of waiting for reveal -- otherwise the terminal sits
-            // detached server-side and is idle-reaped after 15 minutes.
-            // Order matters (verified queue semantics):
+            // Lifetime (responsive-terminal-restore WS1): a claim-negotiated
+            // hidden pane NEVER attaches while hidden — its terminalId is
+            // claimed in the interest snapshot (TerminalInterestReporter) and
+            // the deferred intent above arms the reveal hydrate. The
+            // server-side claim keeps the terminal alive without replay.
+            if (isLifetimeClaimNegotiated()) {
+              unregisterBackgroundHydration()
+              return
+            }
+            // F8 (old-server fallback — no claim echo): a hidden pane still
+            // owes the server an attach. Drive it through the background
+            // hydration queue (one-at-a-time stagger) instead of waiting for
+            // reveal -- otherwise the terminal sits detached server-side and
+            // is idle-reaped after 15 minutes. Order matters (verified queue
+            // semantics):
             // 1) clear this pane's stale active slot -- a background
             //    hydration that died with the old connection otherwise
             //    wedges the whole queue (no-op when not the active pane);
@@ -6001,9 +6048,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
                 pendingSinceSeq: 0,
                 pendingReason: 'hidden_reveal',
               }
-          // Same three-step re-register as the terminal.created hidden path
-          // (~:4506): a stale active slot or a consumed registration guard
-          // otherwise wedges this pane out of the post-reconnect pump entirely.
+          // Lifetime (responsive-terminal-restore WS1): a claim-negotiated
+          // hidden pane reconnects WITHOUT attaching — the fresh connection's
+          // interest snapshot re-claims its terminalId (the ready-frame
+          // re-flush carries the claim set), and the deferred intent above
+          // arms the reveal attach.
+          if (isLifetimeClaimNegotiated()) {
+            unregisterBackgroundHydration()
+            return
+          }
+          // Old-server fallback: same three-step re-register as the
+          // terminal.created hidden path (~:4506): a stale active slot or a
+          // consumed registration guard otherwise wedges this pane out of the
+          // post-reconnect pump entirely.
           getHydrationQueue().onHydrationComplete(paneIdRef.current)
           hydrationRegisteredRef.current = false
           // Always queueIfStarted: a hidden pane's reattach must not wait for
@@ -6057,7 +6114,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               }
           setIsAttaching(false)
 
-          // Register with hydration queue for progressive background hydration
+          // Lifetime (responsive-terminal-restore WS1): a claim-negotiated
+          // hidden pane does NOT register for background hydration — its
+          // terminalId is claimed in the interest snapshot, and the deferred
+          // intent above arms the reveal attach.
+          if (isLifetimeClaimNegotiated()) {
+            unregisterBackgroundHydration()
+            return
+          }
+          // Old-server fallback: register with hydration queue for
+          // progressive background hydration.
           registerForBackgroundHydration()
         } else {
           const intent: AttachIntent = deferredAttachStateRef.current.mode === 'live'
@@ -6215,6 +6281,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     getTerminalCheckpointStreamId,
     isCurrentAttachMessage,
     isCurrentAttachStreamMessage,
+    isLifetimeClaimNegotiated,
     markAttachComplete,
     markParserAppliedFrame,
     markTerminalOutputRangeLost,

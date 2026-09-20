@@ -958,6 +958,13 @@ pub struct ReadyCapabilities {
     /// otherwise (frozen-client inertness).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paced_terminal_replay_v1: Option<bool>,
+    /// Hidden-pane lifetime claims (responsive-terminal-restore Workstream 1):
+    /// `Some(true)` iff the connection's `hello` opted in via
+    /// `capabilities.terminalLifetimeClaimV1` — omitted from the wire entirely
+    /// otherwise (frozen-client inertness). Present iff the client may send
+    /// `terminal.interest.claimedTerminalIds`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_lifetime_claim_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

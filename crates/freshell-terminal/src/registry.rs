@@ -42,7 +42,7 @@
 //! this crate keeps its no-tokio boundary (`freshell-ws` backs the sink with a tokio
 //! mpsc sender feeding the socket).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -144,6 +144,18 @@ pub struct ReplayBounds {
     /// The retained ring's front `seqStart`, or `head_seq + 1` when the ring
     /// is empty (nothing older than the head is retained).
     pub oldest_retained_seq: i64,
+}
+
+/// Hidden-pane lifetime-claim observability
+/// ([`TerminalRegistry::claim_state`], responsive-terminal-restore Workstream
+/// 1): the claim set size and the row's fast-reap eligibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimState {
+    /// Distinct connections currently claiming this terminal's lifetime.
+    pub claimers: usize,
+    /// Whether the row is configured-threshold reap-eligible (explicitly
+    /// released — or never attached/claimed).
+    pub released_by_client: bool,
 }
 
 /// The ws pacing coordinator's session description for one paced replay
@@ -413,6 +425,16 @@ struct TerminalShared {
     create_request_id: Option<String>,
     /// Attached connections, keyed by connection id (multi-client fan-out, `§7.3`).
     subscribers: HashMap<u64, Subscriber>,
+    /// Connections claiming this terminal's LIFETIME (responsive-terminal-
+    /// restore Workstream 1) without attaching — negotiated hidden panes.
+    /// Membership is per-connection and sweeps away with the socket
+    /// (`remove_connection`); a dropped claimer does NOT restore
+    /// `released_by_client` (transport loss is not release — identical to a
+    /// dropped subscriber). Only an explicit withdrawal
+    /// ([`TerminalRegistry::withdraw_claim`]) of the LAST claim (with no
+    /// subscribers) re-marks the row released, mirroring detach's
+    /// last-reference logic.
+    claims: BTreeSet<u64>,
     /// Whether the client EXPLICITLY released its last reference to this
     /// terminal (`terminal.detach` emptying `subscribers`) — as opposed to
     /// merely losing its socket (`remove_connection`: browser closed, laptop
@@ -1561,6 +1583,7 @@ impl TerminalRegistry {
             resume_session_id: resume_session_id.map(str::to_string),
             create_request_id: create_request_id.map(str::to_string),
             subscribers: HashMap::new(),
+            claims: BTreeSet::new(),
             released_by_client: true,
         }));
 
@@ -2158,6 +2181,12 @@ impl TerminalRegistry {
             let mut s = shared.lock().expect("terminal lock");
             if s.subscribers.remove(&conn_id).is_some()
                 && s.subscribers.is_empty()
+                // A connection may still CLAIM this terminal's lifetime
+                // (hidden pane, responsive-terminal-restore WS1): an explicit
+                // detach releases only when the last reference of EVERY kind
+                // is gone. Without claims this is always true, so the
+                // pre-claim detach semantics are byte-identical.
+                && s.claims.is_empty()
                 && s.status == TerminalRunStatus::Running
             {
                 // DEV-0009: a freshly-detached terminal gets a full idle
@@ -2173,6 +2202,65 @@ impl TerminalRegistry {
                 s.released_by_client = true;
             }
         }
+    }
+
+    /// Hidden-pane lifetime claim (responsive-terminal-restore Workstream 1):
+    /// mark `terminal_id` wanted for `conn_id` WITHOUT attaching. Clears
+    /// `released_by_client` under the terminal lock (if currently true) and
+    /// records the claim per-connection. Never adds a subscriber, never
+    /// grants replay or output delivery, never touches geometry or stream
+    /// identity. Unknown ids are a no-op (`false`) — stale client layouts may
+    /// claim rows that died server-side. Claims coexist with subscriptions:
+    /// an attach to a claimed terminal behaves exactly as any attach, and
+    /// the claim stays recorded until a later interest snapshot supersedes it
+    /// or the socket sweeps it.
+    pub fn claim_terminal(&self, terminal_id: &str, conn_id: u64) -> bool {
+        let Some(shared) = self.shared_for(terminal_id) else {
+            return false;
+        };
+        let mut s = shared.lock().expect("terminal lock");
+        s.claims.insert(conn_id);
+        // Wanted, exactly as a successful attach would mark it.
+        s.released_by_client = false;
+        true
+    }
+
+    /// Explicit withdrawal of a hidden-pane lifetime claim (a later interest
+    /// snapshot no longer lists the id). Mirrors detach's last-reference
+    /// release logic: when the LAST claim goes away and no subscribers
+    /// remain, the terminal is genuinely orphaned — restore
+    /// `released_by_client` with the same DEV-0009 fresh-idle-grace bump
+    /// detach grants. A withdrawal that leaves other claimers (or any
+    /// subscriber) keeps the terminal wanted.
+    pub fn withdraw_claim(&self, terminal_id: &str, conn_id: u64) {
+        let Some(shared) = self.shared_for(terminal_id) else {
+            return;
+        };
+        let mut s = shared.lock().expect("terminal lock");
+        if s.claims.remove(&conn_id)
+            && s.claims.is_empty()
+            && s.subscribers.is_empty()
+            && s.status == TerminalRunStatus::Running
+        {
+            // DEV-0009: the release transition grants one full idle threshold
+            // of grace (same rationale as detach).
+            s.last_meaningful_activity_at = s.last_meaningful_activity_at.max(now_ms());
+            s.released_by_client = true;
+        }
+    }
+
+    /// Lifetime-claim observability (responsive-terminal-restore Workstream
+    /// 1): how many distinct connections currently claim `terminal_id`, and
+    /// whether the row is fast-reap eligible (`released_by_client`). `None`
+    /// when the terminal does not exist. Test/diagnostic seam — no production
+    /// decision path reads this.
+    pub fn claim_state(&self, terminal_id: &str) -> Option<ClaimState> {
+        let shared = self.shared_for(terminal_id)?;
+        let s = shared.lock().expect("terminal lock");
+        Some(ClaimState {
+            claimers: s.claims.len(),
+            released_by_client: s.released_by_client,
+        })
     }
 
     /// Restore-contract sequence bounds for one terminal's retained replay
@@ -2350,8 +2438,12 @@ impl TerminalRegistry {
             .map(|h| Arc::clone(&h.shared))
     }
 
-    /// On socket close: sweep `conn_id` out of EVERY terminal's subscriber set. All
-    /// PTYs keep running (background sessions), reattachable by a future socket.
+    /// On socket close: sweep `conn_id` out of EVERY terminal's subscriber set
+    /// and lifetime-claim set. All PTYs keep running (background sessions),
+    /// reattachable by a future socket. Transport loss is NOT release: the
+    /// sweep never restores `released_by_client` — a terminal left with no
+    /// subscribers and no claims by a socket drop stays wanted (24-hour hard
+    /// cap only), exactly like an attached-then-disconnected one.
     pub fn remove_connection(&self, conn_id: u64) {
         self.active_connections.fetch_sub(1, Ordering::Relaxed);
         let shareds: Vec<Arc<Mutex<TerminalShared>>> = {
@@ -2364,14 +2456,17 @@ impl TerminalRegistry {
         };
         for shared in shareds {
             let mut s = shared.lock().expect("terminal lock");
-            if s.subscribers.remove(&conn_id).is_some()
+            let removed_subscriber = s.subscribers.remove(&conn_id).is_some();
+            let removed_claim = s.claims.remove(&conn_id);
+            if (removed_subscriber || removed_claim)
                 && s.subscribers.is_empty()
+                && s.claims.is_empty()
                 && s.status == TerminalRunStatus::Running
             {
                 // DEV-0009: a freshly-detached terminal gets a full idle
                 // threshold of grace — its meaningful clock may have expired
                 // while a watcher was attached (attached => reaper-exempt).
-                // The `.is_some()` gate is essential here: this sweep visits
+                // The removal gate is essential here: this sweep visits
                 // EVERY terminal, and an unconditional bump would reset the
                 // countdown of unrelated, already-detached terminals on
                 // every socket close.
@@ -2910,6 +3005,7 @@ impl TerminalRegistry {
             resume_session_id: opts.resume_session_id,
             create_request_id,
             subscribers: HashMap::new(),
+            claims: BTreeSet::new(),
             released_by_client: true,
         }));
         {
@@ -8029,6 +8125,211 @@ mod tests {
         // 25 hours stale — past the 24-hour hard cap.
         reg.backdate_last_activity("T", now_ms() - 25 * 60 * 60_000);
 
+        assert_eq!(reg.enforce_idle_kills(), vec!["T".to_string()]);
+    }
+
+    // ── Hidden-pane lifetime claims (responsive-terminal-restore WS1) ──
+
+    /// A claim marks the terminal wanted for a connection WITHOUT attaching:
+    /// it clears `released_by_client` under the terminal lock, adds no
+    /// subscriber, and delivers no replay (there is no sink to deliver to).
+    #[test]
+    fn claim_clears_released_by_client_without_attaching() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        // A never-attached row starts fast-reap eligible (released == true).
+        assert_eq!(
+            reg.claim_state("T"),
+            Some(ClaimState {
+                claimers: 0,
+                released_by_client: true
+            })
+        );
+
+        assert!(reg.claim_terminal("T", 7));
+
+        let state = reg.claim_state("T").expect("terminal exists");
+        assert_eq!(state.claimers, 1);
+        assert!(
+            !state.released_by_client,
+            "a claim must clear released_by_client (the terminal is wanted)"
+        );
+        // No attach happened: the row still has zero subscribers (hasClients
+        // stays false) — the claim never granted replay or output delivery.
+        assert!(!reg.directory()[0].has_clients);
+        // Unknown ids are a no-op (stale client layouts may claim dead rows).
+        assert!(!reg.claim_terminal("nope", 7));
+    }
+
+    /// Explicit withdrawal of the last claim (no subscribers left) restores
+    /// configured-threshold reapability with the same fresh-idle-grace bump
+    /// detach uses (DEV-0009): spared immediately, reaped once stale again.
+    #[test]
+    fn explicit_withdrawal_of_last_claim_restores_threshold_eligibility_with_grace() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.claim_terminal("T", 7);
+        reg.set_auto_kill_idle_minutes(1);
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+
+        reg.withdraw_claim("T", 7);
+        let state = reg.claim_state("T").expect("terminal exists");
+        assert_eq!(state.claimers, 0);
+        assert!(
+            state.released_by_client,
+            "withdrawal of the last claim must restore fast-reap eligibility"
+        );
+        // DEV-0009: the withdrawal just happened — one full threshold of
+        // grace, so the stale pre-withdrawal clock does not reap immediately.
+        assert!(reg.enforce_idle_kills().is_empty());
+
+        // Once stale again AFTER the withdrawal, the configured threshold
+        // applies (the claim is gone; this is the explicit release path).
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+        assert_eq!(reg.enforce_idle_kills(), vec!["T".to_string()]);
+    }
+
+    /// Claim membership is per-connection and sweeps away with its socket
+    /// (`remove_connection`), but transport loss is NOT release: a dropped
+    /// claiming connection keeps the terminal wanted (24h hard cap only —
+    /// identical to attached-then-disconnected today). A reconnected client
+    /// re-claims and the terminal stays wanted.
+    #[test]
+    fn claim_connection_drop_keeps_terminal_wanted_and_reconnect_reclaims() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.set_auto_kill_idle_minutes(1);
+        reg.claim_terminal("T", 1);
+
+        reg.remove_connection(1); // transport loss, NOT an explicit release
+        let state = reg.claim_state("T").expect("terminal exists");
+        assert_eq!(state.claimers, 0);
+        assert!(
+            !state.released_by_client,
+            "a dropped socket must not restore fast-reap eligibility"
+        );
+
+        // Past the configured threshold (but far under 24h): still wanted.
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+        assert!(reg.enforce_idle_kills().is_empty());
+
+        // The reconnected client re-claims the hidden terminal (reconnect-
+        // hidden re-claims) and it survives again.
+        assert!(reg.claim_terminal("T", 2));
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+        assert!(reg.enforce_idle_kills().is_empty());
+
+        // The 24h hard cap stays the cleanup backstop for an abandoned claim.
+        reg.remove_connection(2);
+        reg.backdate_last_activity("T", now_ms() - 25 * 60 * 60_000);
+        assert_eq!(reg.enforce_idle_kills(), vec!["T".to_string()]);
+    }
+
+    /// A claimed terminal that is then ATTACHED and whose socket drops stays
+    /// wanted — no regression of the attached-then-disconnected contract
+    /// (transport loss is not release) when claims coexist with subscriptions.
+    #[test]
+    fn claimed_then_attached_terminal_survives_socket_drop() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.set_auto_kill_idle_minutes(1);
+        reg.claim_terminal("T", 2);
+        let (sink, _seen) = collector();
+        assert!(
+            reg.attach(
+                "T",
+                1,
+                sink,
+                Some("a".into()),
+                0,
+                false,
+                false,
+                None,
+                None,
+                None
+            )
+            .found
+        );
+
+        reg.remove_connection(1); // the ATTACHED connection drops
+        let state = reg.claim_state("T").expect("terminal exists");
+        assert_eq!(state.claimers, 1, "the claiming connection still holds it");
+        assert!(!state.released_by_client);
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+        assert!(reg.enforce_idle_kills().is_empty());
+    }
+
+    /// Detach reconciler interplay: a claimed+attached terminal leaving every
+    /// pane layout is released — but only once BOTH the last subscriber and
+    /// the last claim are gone. The claim is the explicit withdrawal path.
+    #[test]
+    fn detach_releases_only_when_the_last_claim_is_also_gone() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.set_auto_kill_idle_minutes(1);
+        reg.claim_terminal("T", 1);
+        let (sink, _seen) = collector();
+        assert!(
+            reg.attach(
+                "T",
+                2,
+                sink,
+                Some("a".into()),
+                0,
+                false,
+                false,
+                None,
+                None,
+                None
+            )
+            .found
+        );
+
+        // The detach reconciler acts (terminal left every pane layout) while
+        // the claim is still recorded: still wanted — the other connection's
+        // claim keeps it alive.
+        reg.detach("T", 2);
+        let state = reg.claim_state("T").expect("terminal exists");
+        assert_eq!(state.claimers, 1);
+        assert!(
+            !state.released_by_client,
+            "detach must not release a terminal another connection still claims"
+        );
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+        assert!(reg.enforce_idle_kills().is_empty());
+
+        // The interest snapshot withdraws the claim (the pane is gone): NOW
+        // the terminal is genuinely orphaned and reap-eligible at the
+        // threshold, with the DEV-0009 grace bump on the release transition.
+        reg.withdraw_claim("T", 1);
+        assert!(reg.enforce_idle_kills().is_empty());
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+        assert_eq!(reg.enforce_idle_kills(), vec!["T".to_string()]);
+    }
+
+    /// Reaper lifecycle for a created-hidden terminal (never attached,
+    /// released starts true): held only by the negotiated claim it survives
+    /// the configured threshold; explicit withdrawal (no subscribers) reaps
+    /// it at the threshold.
+    #[test]
+    fn created_hidden_terminal_held_only_by_claim_survives_then_withdrawal_reaps() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        reg.set_auto_kill_idle_minutes(1);
+
+        // Created-hidden: the client claims it in its interest snapshot
+        // instead of attaching.
+        assert!(reg.claim_terminal("T", 1));
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
+        assert!(
+            reg.enforce_idle_kills().is_empty(),
+            "a claim-only terminal must survive the configured idle threshold"
+        );
+
+        // Explicit withdrawal with no subscribers: back to fast-reap
+        // eligibility, reaped at the threshold once past the grace bump.
+        reg.withdraw_claim("T", 1);
+        reg.backdate_last_activity("T", now_ms() - 10 * 60_000);
         assert_eq!(reg.enforce_idle_kills(), vec!["T".to_string()]);
     }
 

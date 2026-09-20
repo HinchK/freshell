@@ -2667,6 +2667,9 @@
             },
             "terminalInterestV1": {
               "type": "boolean"
+            },
+            "terminalLifetimeClaimV1": {
+              "type": "boolean"
             }
           },
           "type": "object"

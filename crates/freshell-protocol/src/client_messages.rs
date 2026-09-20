@@ -203,6 +203,13 @@ pub struct HelloCapabilities {
     /// and stripped-tolerant on older servers (no version bump).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paced_terminal_replay_v1: Option<bool>,
+    /// Hidden-pane lifetime claims (responsive-terminal-restore Workstream 1):
+    /// the client sends `terminal.interest.claimedTerminalIds` only after the
+    /// `ready` echo advertises the capability back. Additive optional — absent
+    /// on the frozen client and stripped-tolerant on older servers (no version
+    /// bump).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_lifetime_claim_v1: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -256,6 +263,14 @@ pub struct TerminalInterest {
     pub revision: u64,
     pub focused_terminal_id: Option<String>,
     pub visible_terminal_ids: Vec<String>,
+    /// Hidden-pane lifetime claims (responsive-terminal-restore Workstream 1,
+    /// negotiated `terminalLifetimeClaimV1` only): terminals this connection
+    /// wants kept alive WITHOUT attaching. `None` carries no claim information
+    /// (the frozen shape); `Some(set)` supersedes the connection's previous
+    /// claim set snapshot-by-snapshot — omitting an id from a later snapshot
+    /// is the explicit withdrawal (release).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claimed_terminal_ids: Option<Vec<String>>,
 }
 
 // --- client.diagnostic ------------------------------------------------------
