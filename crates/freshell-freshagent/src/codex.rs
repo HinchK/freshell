@@ -419,13 +419,19 @@ struct CodexSession {
     /// independently-running exit watcher and quiet deadman classify the turn as
     /// in flight even while the response is still outstanding (a post-response
     /// arm would miss a crash in that window). Mirrored at every `active_turn`
-    /// mutation so it is always a superset: SET alongside the consumer's
+    /// mutation, so it is a superset of `active_turn` between dispatch and the
+    /// crash/kill retirement points: SET alongside the consumer's
     /// `turn/started` adoption and the snapshot's mid-flight seed, CLEARED at
     /// every turn-end observation (the thread leaving running/starting, the
     /// active turn's completion, `thread_closed`, a successful user
-    /// interrupt) and on a failed dispatch. The crash self-heal arm reads and
-    /// retires it (the crash IS the turn end it observes); a requested kill
-    /// retires it silently (the user initiated that turn end).
+    /// interrupt) and on a failed dispatch the sidecar survived (the
+    /// kill/crash arms retire the latch WITHOUT clearing `active_turn`, so a
+    /// post-kill/post-crash `active_turn` can outlive the latch; an
+    /// exit-induced dispatch failure instead leaves the latch armed for the
+    /// crash arm's swap-and-mint — a bare Err-arm retirement would land
+    /// before the crash arm and swallow the crash edge). The crash self-heal
+    /// arm reads and retires it (the crash IS the turn end it observes); a
+    /// requested kill retires it silently (the user initiated that turn end).
     turn_in_flight: Arc<AtomicBool>,
     /// The session's ONE monotonic turn-complete clock, shared by the
     /// notification consumer's [`CodexSubscription`] (ordinary edges) and the
@@ -2822,6 +2828,7 @@ impl FreshCodexState {
                     s.turn_lock.clone(),
                     s.event_emission_gate.clone(),
                     s.quiet_deadman.clone(),
+                    s.exited.clone(),
                 )
             })
         };
@@ -2832,6 +2839,7 @@ impl FreshCodexState {
             turn_lock,
             event_emission_gate,
             quiet_deadman,
+            exited,
         )) = looked_up
         else {
             self.send_error(&request_id, "SESSION_NOT_FOUND", "codex session not found");
@@ -2935,7 +2943,8 @@ impl FreshCodexState {
         // the response is still outstanding (a crash in that window ends a real
         // dispatched turn; a post-response arm would classify it idle and miss
         // the crash edge, or arm the deadman after the sidecar is already
-        // gone). The response-failure arm below disarms both.
+        // gone). The response-failure arm below disarms both ONLY when the
+        // sidecar is not known-dead.
         turn_in_flight.store(true, Ordering::SeqCst);
         note_codex_activity(self, &session_id, &turn_in_flight, &quiet_deadman);
 
@@ -2951,10 +2960,29 @@ impl FreshCodexState {
                 started.turn_id
             }
             Err(err) => {
-                // The dispatch/response failed: no turn is in flight. Retire
-                // the latch and disarm the window armed at dispatch time.
-                turn_in_flight.store(false, Ordering::SeqCst);
-                note_codex_activity(self, &session_id, &turn_in_flight, &quiet_deadman);
+                // The dispatch/response failed. Retire the latch + disarm the
+                // dispatch-time window ONLY when the sidecar is NOT known-dead:
+                // an exit-induced failure (the production crash shape — the
+                // sidecar dies mid-dispatch and the transport's read loop fails
+                // the pending request with a connection-closed error) must
+                // LEAVE the latch armed so the exit watcher's crash arm owns
+                // the turn-end classification. This arm has no awaits, so a
+                // bare retirement would land before the crash arm's swap
+                // (which sits behind disarm + the `exited` broadcast + an
+                // awaited kill-and-confirm) and swallow the crash edge with
+                // near-certainty. The crash arm is guaranteed to run for a
+                // dead child; if it already ran, its swap minted the edge and
+                // leaving the now-false latch untouched is harmless. A
+                // requested kill also retires the latch silently and
+                // unconditionally, so a close-induced failure can never
+                // out-live it. Ordinary rejections (a live sidecar's RPC
+                // error, a timeout) still retire promptly.
+                let exit_induced = exited.load(Ordering::SeqCst)
+                    || matches!(err, CodexAppServerError::Closed { .. });
+                if !exit_induced {
+                    turn_in_flight.store(false, Ordering::SeqCst);
+                    note_codex_activity(self, &session_id, &turn_in_flight, &quiet_deadman);
+                }
                 self.send_error(&request_id, "CODEX_TURN_START_FAILED", &err.to_string());
                 return;
             }
@@ -6618,6 +6646,12 @@ impl FreshCodexState {
     /// further work, and a feed always supersedes the previous waiter under a new
     /// generation, so waiters don't accumulate unboundedly beyond the feeds in a
     /// window.
+    ///
+    /// CROSS-FILE INVARIANT: whoever replaces a session record must disarm the old
+    /// record's `QuietDeadman` Arc first — the fire check validates only the captured
+    /// deadman state, never that the sessions map still holds this incarnation, so an
+    /// orphaned waiter on stale per-session Arcs would broadcast a phantom stuck
+    /// status AND a phantom attention edge after the deadline.
     async fn watch_codex_quiet_deadline(self, thread_id: String, generation: u64) {
         // Snapshot the per-session handles + the armed deadline WITHOUT holding the
         // sessions lock across the sleep (it is never held across an await).
@@ -16757,6 +16791,114 @@ pub(crate) mod tests {
 
         // The hung start_turn never returns; the send task is cleanup-only.
         send.abort();
+    }
+
+    #[tokio::test]
+    async fn onexit_self_heal_rings_the_edge_when_the_transport_fails_the_pending_on_death() {
+        // Finding 1's PRODUCTION shape: when the sidecar dies mid-dispatch, the
+        // transport's read loop FAILS the pending request (app_server.rs
+        // `read_loop` → `fail_all_pending` → `CodexAppServerError::Closed`)
+        // before the exit watcher's crash arm can swap-and-mint — the send Err
+        // arm has no awaits, while the crash arm sits behind disarm + the
+        // `exited` broadcast + an awaited kill-and-confirm. The Err arm must
+        // NOT retire the latch for that exit-induced failure: the crash arm
+        // owns the classification (guaranteed to run for a dead child; if it
+        // already ran, its swap minted the edge and leaving the latch
+        // untouched is harmless). A never-failing pending (the sibling
+        // dispatch-window test) pins only the arming timing; THIS fixture is
+        // the only one that pins the failure ordering.
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, _notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, mut rx) = state_with_bus();
+
+        let child = spawn_sleeper();
+        let pid = child.id().expect("sleeper pid");
+
+        insert_fake_session(
+            &st,
+            "thread-crash-failed-pending",
+            client,
+            Arc::new(StdMutex::new(None)),
+            child,
+            "codex-sidecar-test-crash-failed-pending",
+        )
+        .await;
+
+        // Dispatch a turn; the peer sees the request but NEVER answers it.
+        let send = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_send(send_msg("thread-crash-failed-pending", "run"))
+                    .await
+            })
+        };
+        answer_initialize(&peer).await;
+        let (_id, method, _params) = peer.expect_request().await;
+        assert_eq!(method, "turn/start", "the dispatch reached the sidecar");
+
+        // The sidecar's death closes the connection: the transport fails the
+        // pending request (the production `fail_all_pending` mechanics — the
+        // peer dropping the server→client channel IS the channel transport's
+        // connection close). Awaiting the send proves the Err arm ran to
+        // completion while the child is still alive — the exact production
+        // ordering where the Err arm's classification lands BEFORE the crash
+        // arm's swap.
+        peer.disconnect();
+        send.await
+            .expect("the failed dispatch resolves the send (CODEX_TURN_START_FAILED)");
+
+        // NOW the sidecar dies (an unrequested exit — never kill_tx).
+        // Safety: a targeted SIGKILL of this test's own fixture child (a
+        // `sleep` process spawned above) — never a broad kill pattern.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+
+        let exited: Value = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(raw) = rx.recv().await {
+                    let parsed: Value = serde_json::from_str(&raw).unwrap();
+                    if parsed["event"]["type"] == "freshAgent.status"
+                        && parsed["event"]["status"] == "exited"
+                    {
+                        return parsed;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the watcher self-heals within the budget");
+        assert_eq!(exited["sessionId"], "thread-crash-failed-pending");
+
+        // The crash arm's classification wins over the send Err arm: the
+        // dispatched turn's death rings the unified edge even though the
+        // transport failed the pending request first.
+        let edge: Value = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(raw) = rx.recv().await {
+                    let parsed: Value = serde_json::from_str(&raw).unwrap();
+                    if parsed["event"]["type"] == "freshAgent.turn.complete" {
+                        return parsed;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("a crash whose transport failed the pending request still rings the unified edge");
+        assert_eq!(edge["sessionId"], "thread-crash-failed-pending");
+        assert!(
+            edge["event"]["at"].is_i64(),
+            "finite numeric `at` on the crash-minted edge: {edge}"
+        );
+
+        // The session stays mapped (the adapter.ts:937-944 invariant).
+        assert!(
+            st.sessions
+                .lock()
+                .await
+                .contains_key("thread-crash-failed-pending"),
+            "the session stays mapped after an unrequested exit"
+        );
     }
 
     // ── freshAgent.undo / freshAgent.redo (kata 1wxv Task 2) ────────────────
