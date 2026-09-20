@@ -6038,11 +6038,11 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-from-ready',
         serverInstanceId: 'server-attach-stream',
-      })?.parserAppliedSeq).toBe(1)
+      }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(1)
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: null,
         serverInstanceId: 'server-attach-stream',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
     })
 
     it('accepts live output after a terminal.stream.changed control message without trusting the old stream', async () => {
@@ -6082,7 +6082,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-before-change',
         serverInstanceId: 'server-active-stream-change',
-      })?.parserAppliedSeq).toBe(1)
+      }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(1)
 
       act(() => {
         messageHandler!({
@@ -6114,11 +6114,11 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-before-change',
         serverInstanceId: 'server-active-stream-change',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-after-change',
         serverInstanceId: 'server-active-stream-change',
-      })?.parserAppliedSeq).toBe(2)
+      }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(2)
     })
 
     it('treats mismatched replay after a stream change as a completing lost range', async () => {
@@ -6205,7 +6205,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-after-change',
         serverInstanceId: 'server-stale-replay-stream-change',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
     })
 
     it('rejects a warm-delta attach when attach-ready reports a different stream id', async () => {
@@ -6247,7 +6247,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-before-rotation',
         serverInstanceId: 'server-stream-rotation',
-      })?.parserAppliedSeq).toBe(1)
+      }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(1)
 
       wsMocks.send.mockClear()
       act(() => {
@@ -6290,7 +6290,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-after-rotation',
         serverInstanceId: 'server-stream-rotation',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'terminal.attach',
         terminalId,
@@ -6361,7 +6361,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-geometry',
         serverInstanceId: 'server-geometry-authority',
-      })?.parserAppliedSeq).toBe(1)
+      }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(1)
 
       wsMocks.send.mockClear()
       act(() => {
@@ -6479,7 +6479,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-active',
         serverInstanceId: 'server-stream-mismatch',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
 
       wsMocks.send.mockClear()
       act(() => {
@@ -6722,7 +6722,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-hole',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
 
       wsMocks.send.mockClear()
       act(() => {
@@ -6793,7 +6793,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-malformed-numbers',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
 
       act(() => {
         messageHandler!({
@@ -6810,7 +6810,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-malformed-numbers',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
 
       wsMocks.send.mockClear()
       act(() => {
@@ -6857,7 +6857,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-surrogate-split',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
     })
 
     it('rejects terminal.output.batch when segment data disagrees with offsets', async () => {
@@ -6935,7 +6935,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-invalid-fail-closed',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
       expect(bridge.snapshot().perfEvents).toContainEqual(expect.objectContaining({
         event: 'terminal.catchup.surface_quarantined',
         terminalId,
@@ -6985,7 +6985,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-invalid-overlap-tail',
-      })?.parserAppliedSeq).toBe(10)
+      }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(10)
 
       term.write.mockClear()
       act(() => {
@@ -7020,7 +7020,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-invalid-overlap-tail',
-      })?.parserAppliedSeq).toBe(10)
+      }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(10)
 
       wsMocks.send.mockClear()
       act(() => {
@@ -7080,7 +7080,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-barrier-coalesced',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
 
       act(() => {
         rafCallbacks.shift()?.(16)
@@ -7090,7 +7090,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-barrier-coalesced',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
 
       act(() => {
         delayedCallbacks[0]?.callback()
@@ -7099,7 +7099,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-barrier-coalesced',
-      })?.parserAppliedSeq).toBe(3)
+      }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(3)
     })
 
     it('does not checkpoint across a stripped middle batch segment when adjacent renderable segments coalesce', async () => {
@@ -7150,7 +7150,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-stripped-middle-coalesced',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
 
       act(() => {
         rafCallbacks.shift()?.(16)
@@ -7160,7 +7160,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-stripped-middle-coalesced',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
 
       act(() => {
         delayedCallbacks[0]?.callback()
@@ -7169,7 +7169,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-stripped-middle-coalesced',
-      })?.parserAppliedSeq).toBe(1)
+      }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(1)
 
       wsMocks.send.mockClear()
       act(() => {
@@ -7261,7 +7261,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-opencode-heavy-replay',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
 
       act(() => {
         rafCallbacks.shift()?.(16)
@@ -7273,7 +7273,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-opencode-heavy-replay',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
       expect(queryByText('Recovering terminal output...')).not.toBeNull()
 
       act(() => {
@@ -7286,7 +7286,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-opencode-heavy-replay',
-      })?.parserAppliedSeq).toBe(chunks.length)
+      }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(chunks.length)
     })
 
     it('does not checkpoint a stripped terminal.output.batch BEL segment as parser-applied', async () => {
@@ -7321,10 +7321,15 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       expect(terminalWriteStrings(term)).toEqual(['A'])
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      // The strict APPLIED position never crosses the stripped BEL segment;
+      // the COVERAGE cursor does (a null-screen-effect completion signal) and
+      // is the resume position (responsive-terminal-restore WS2).
+      const strippedBelCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-stripped-bel',
-      })?.parserAppliedSeq).toBe(1)
+      }, { paneId: 'pane-v2-stream' })
+      expect(strippedBelCheckpoint?.parserAppliedSeq).toBe(1)
+      expect(strippedBelCheckpoint?.surfaceCoverageSeq).toBe(2)
 
       wsMocks.send.mockClear()
       act(() => {
@@ -7334,7 +7339,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'terminal.attach',
         terminalId,
-        sinceSeq: 1,
+        sinceSeq: 2,
       }))
     })
 
@@ -7391,10 +7396,15 @@ describe('TerminalView lifecycle updates', () => {
       await waitFor(() => {
         expect(queryByText('Recovering terminal output...')).toBeNull()
       })
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      // No false APPLIED record (nothing rendered), but the completion
+      // signal IS consumed coverage: the resume position is 1, not a
+      // full-baseline rebuild (responsive-terminal-restore WS2).
+      const belOnlyCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-replay-stripped-complete',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })
+      expect(belOnlyCheckpoint?.parserAppliedSeq).toBe(0)
+      expect(belOnlyCheckpoint?.surfaceCoverageSeq).toBe(1)
 
       wsMocks.send.mockClear()
       act(() => {
@@ -7404,7 +7414,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'terminal.attach',
         terminalId,
-        sinceSeq: 0,
+        sinceSeq: 1,
       }))
     })
 
@@ -7468,7 +7478,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-replay-stripped-tail',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
 
       act(() => {
         delayedCallbacks[0]?.callback()
@@ -7480,7 +7490,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-replay-stripped-tail',
-      })?.parserAppliedSeq).toBe(1)
+      }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(1)
 
       wsMocks.send.mockClear()
       act(() => {
@@ -7528,7 +7538,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-batch-mixed-stripped-bel',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
 
       wsMocks.send.mockClear()
       act(() => {
@@ -7577,10 +7587,14 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       expect(terminalWriteStrings(term)).toEqual(['B'])
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      // No false APPLIED record (the BEL blocks the strict cursor at zero);
+      // the coverage cursor spans the filtered BEL and the applied tail.
+      const legacyStrippedCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-legacy-stripped-bel',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })
+      expect(legacyStrippedCheckpoint?.parserAppliedSeq).toBe(0)
+      expect(legacyStrippedCheckpoint?.surfaceCoverageSeq).toBe(2)
 
       wsMocks.send.mockClear()
       act(() => {
@@ -7590,7 +7604,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'terminal.attach',
         terminalId,
-        sinceSeq: 0,
+        sinceSeq: 2,
       }))
     })
 
@@ -7642,10 +7656,12 @@ describe('TerminalView lifecycle updates', () => {
       await waitFor(() => {
         expect(queryByText('Recovering terminal output...')).toBeNull()
       })
-      expect(loadTerminalSurfaceCheckpoint(terminalId, {
+      const legacyBelOnlyCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-legacy-replay-stripped-complete',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })
+      expect(legacyBelOnlyCheckpoint?.parserAppliedSeq).toBe(0)
+      expect(legacyBelOnlyCheckpoint?.surfaceCoverageSeq).toBe(1)
 
       wsMocks.send.mockClear()
       act(() => {
@@ -7655,7 +7671,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
         type: 'terminal.attach',
         terminalId,
-        sinceSeq: 0,
+        sinceSeq: 1,
       }))
     })
 
@@ -7722,7 +7738,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-legacy-replay-stripped-tail',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
 
       act(() => {
         delayedCallbacks[0]?.callback()
@@ -7734,7 +7750,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-legacy-replay-stripped-tail',
-      })?.parserAppliedSeq).toBe(1)
+      }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(1)
 
       wsMocks.send.mockClear()
       act(() => {
@@ -7777,7 +7793,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId,
         serverInstanceId: 'server-output-legacy-mixed-stripped-bel',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
 
       wsMocks.send.mockClear()
       act(() => {
@@ -7840,7 +7856,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-active',
         serverInstanceId: 'server-missing-output-stream',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
 
       wsMocks.send.mockClear()
       act(() => {
@@ -7905,7 +7921,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-active',
         serverInstanceId: 'server-missing-gap-stream',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
 
       wsMocks.send.mockClear()
       act(() => {
@@ -8003,11 +8019,11 @@ describe('TerminalView lifecycle updates', () => {
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stored-stale-stream',
         serverInstanceId: 'server-missing-ready-stream',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: null,
         serverInstanceId: 'server-missing-ready-stream',
-      })).toBeNull()
+      }, { paneId: 'pane-v2-stream' })).toBeNull()
 
       wsMocks.send.mockClear()
       act(() => {
@@ -8041,11 +8057,11 @@ describe('TerminalView lifecycle updates', () => {
         xtermVersion: '6.0.0',
         bufferType: 'unknown',
         parserIdle: true,
-      })
+      }, { paneId: 'pane-v2-stream' })
       expect(loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: null,
         serverInstanceId,
-      })?.parserAppliedSeq).toBe(17)
+      }, { paneId: 'pane-v2-stream' })?.parserAppliedSeq).toBe(17)
 
       await renderTerminalHarness({
         status: 'running',
@@ -8207,7 +8223,7 @@ describe('TerminalView lifecycle updates', () => {
       const initialCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-1',
         serverInstanceId: 'server-a',
-      })
+      }, { paneId: 'pane-v2-stream' })
       expect(initialCheckpoint?.attachRequestId).toBe(firstAttach?.attachRequestId)
       expect(initialCheckpoint?.parserAppliedSeq).toBe(1)
 
@@ -8279,7 +8295,7 @@ describe('TerminalView lifecycle updates', () => {
       const checkpointAfterStaleCallback = loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-1',
         serverInstanceId: 'server-a',
-      })
+      }, { paneId: 'pane-v2-stream' })
       expect(checkpointAfterStaleCallback).not.toBeNull()
       expect(checkpointAfterStaleCallback?.attachRequestId).toBe(firstAttach?.attachRequestId)
       expect(checkpointAfterStaleCallback?.parserAppliedSeq).toBe(1)
@@ -8309,7 +8325,7 @@ describe('TerminalView lifecycle updates', () => {
       const checkpointAfterCurrentCallback = loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-1',
         serverInstanceId: 'server-a',
-      })
+      }, { paneId: 'pane-v2-stream' })
       expect(checkpointAfterCurrentCallback?.attachRequestId).toBe(firstAttach?.attachRequestId)
       expect(checkpointAfterCurrentCallback?.parserAppliedSeq).toBe(1)
     })
@@ -8344,7 +8360,7 @@ describe('TerminalView lifecycle updates', () => {
       const initialCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-delta',
         serverInstanceId: 'server-a',
-      })
+      }, { paneId: 'pane-v2-stream' })
       expect(initialCheckpoint?.attachRequestId).toBe(firstAttach?.attachRequestId)
       expect(initialCheckpoint?.parserAppliedSeq).toBe(1)
 
@@ -8462,7 +8478,7 @@ describe('TerminalView lifecycle updates', () => {
       const checkpointAfterCallbacks = loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-delta',
         serverInstanceId: 'server-a',
-      })
+      }, { paneId: 'pane-v2-stream' })
       expect(checkpointAfterCallbacks?.attachRequestId).toBe(firstAttach?.attachRequestId)
       expect(checkpointAfterCallbacks?.parserAppliedSeq).toBe(1)
 
@@ -8734,7 +8750,7 @@ describe('TerminalView lifecycle updates', () => {
       const trustedCheckpoint = loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-in-flight',
         serverInstanceId: 'server-a',
-      })
+      }, { paneId: 'pane-v2-stream' })
       expect(trustedCheckpoint?.parserAppliedSeq).toBe(1)
 
       const delayedCallbacks: Array<() => void> = []
@@ -9690,19 +9706,8 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
-    it('recreates a restored OpenCode pane when visible viewport hydration cannot replay startup output', async () => {
+    it('keeps a restored OpenCode pane alive when visible viewport hydration cannot replay startup output (no auto-kill)', async () => {
       const sessionRef = { provider: 'opencode', sessionId: 'ses_focus_replay_gap' } as const
-      const addedRestoreIds = new Set<string>()
-      restoreMocks.addTerminalRestoreRequestId.mockImplementation((id: string) => {
-        addedRestoreIds.add(id)
-      })
-      restoreMocks.consumeTerminalRestoreRequestId.mockImplementation((id: string) => {
-        if (addedRestoreIds.has(id)) {
-          addedRestoreIds.delete(id)
-          return true
-        }
-        return false
-      })
 
       const { store, tabId, paneId, terminalId, rerender } = await renderTerminalHarness({
         status: 'running',
@@ -9713,20 +9718,6 @@ describe('TerminalView lifecycle updates', () => {
         requestId: 'req-opencode-focus-gap',
         sessionRef,
       })
-      // b8ke ext r20 F2: the restored session has an owner record — the
-      // replacement kill must carry its observed (epoch, generation)
-      // pair so a reconnect-queued stale kill is typed-refused instead
-      // of killing a newer owner.
-      store.dispatch(applyRuntimeOwner({
-        type: 'session.runtimeOwner',
-        provider: 'opencode',
-        sessionId: 'ses_focus_replay_gap',
-        epoch: 12,
-        generation: 34,
-        ownerKind: 'terminal',
-        operationId: 'handoff-1',
-        transition: 'handoff-committed',
-      }))
 
       wsMocks.send.mockClear()
 
@@ -9735,6 +9726,10 @@ describe('TerminalView lifecycle updates', () => {
           <TerminalViewFromStore tabId={tabId} paneId={paneId} hidden={false} />
         </Provider>,
       )
+      // The hidden→visible rerender recreates the xterm surface — assert on
+      // the live instance.
+      const term = terminalInstances[terminalInstances.length - 1]
+      term.write.mockClear()
 
       let attach: any
       await waitFor(() => {
@@ -9765,65 +9760,38 @@ describe('TerminalView lifecycle updates', () => {
         } as any)
       })
 
-      await waitFor(() => {
-        // b8ke ext r20 F2: the FENCED production shape — the kill rides
-        // with the session's observed pair (the seeded record above).
-        expect(wsMocks.send).toHaveBeenCalledWith({
-          type: 'terminal.kill',
-          terminalId,
-          observedEpoch: 12,
-          observedGeneration: 34,
-        })
-      })
+      // Retention loss NEVER kills or replaces a healthy process
+      // (responsive-terminal-restore WS2): the old auto-kill path is removed
+      // entirely — honest notice, unchanged identity, live output continues.
+      expect(wsMocks.send.mock.calls.some(([msg]) => msg?.type === 'terminal.kill')).toBe(false)
+      expect(wsMocks.send.mock.calls.some(([msg]) => msg?.type === 'terminal.create')).toBe(false)
+      expect(terminalWriteStrings(term).some((entry) => entry.includes('Restarting OpenCode'))).toBe(false)
 
       act(() => {
         messageHandler!({
-          type: 'terminal.exit',
+          type: 'terminal.output',
           terminalId,
-          exitCode: 0,
+          seqStart: 42,
+          seqEnd: 45,
+          data: 'LIVE TAIL',
+          attachRequestId: attach.attachRequestId,
         })
       })
+      expectTerminalWriteContaining(term, 'LIVE TAIL')
 
-      let replacementRequestId: string | undefined
-      await waitFor(() => {
-        const layout = store.getState().panes.layouts[tabId]
-        expect(layout?.type).toBe('leaf')
-        if (layout?.type !== 'leaf' || layout.content.kind !== 'terminal') {
-          throw new Error('expected terminal pane')
-        }
-        expect(layout.content.terminalId).toBeUndefined()
-        expect(layout.content.status).toBe('creating')
-        expect(layout.content.sessionRef).toEqual(sessionRef)
-        replacementRequestId = layout.content.createRequestId
-        expect(replacementRequestId).not.toBe('req-opencode-focus-gap')
-      })
-
-      await waitFor(() => {
-        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
-          type: 'terminal.create',
-          requestId: replacementRequestId,
-          mode: 'opencode',
-          sessionRef,
-          restore: true,
-        }))
-      })
+      const layout = store.getState().panes.layouts[tabId]
+      expect(layout?.type === 'leaf' && layout.content.kind === 'terminal'
+        && layout.content.terminalId).toBe(terminalId)
+      expect(layout?.type === 'leaf' && layout.content.kind === 'terminal'
+        && layout.content.status).toBe('running')
+      expect(layout?.type === 'leaf' && layout.content.kind === 'terminal'
+        && layout.content.sessionRef).toEqual(sessionRef)
     })
 
-    it('recreates a hidden restored OpenCode pane when background viewport hydration cannot replay startup output', async () => {
+    it('keeps a hidden restored OpenCode pane alive when background hydration cannot replay startup output (no auto-kill)', async () => {
       const sessionRef = { provider: 'opencode', sessionId: 'ses_hidden_replay_gap' } as const
-      const addedRestoreIds = new Set<string>()
-      restoreMocks.addTerminalRestoreRequestId.mockImplementation((id: string) => {
-        addedRestoreIds.add(id)
-      })
-      restoreMocks.consumeTerminalRestoreRequestId.mockImplementation((id: string) => {
-        if (addedRestoreIds.has(id)) {
-          addedRestoreIds.delete(id)
-          return true
-        }
-        return false
-      })
 
-      const { store, tabId, paneId, terminalId, rerender } = await renderTerminalHarness({
+      const { store, tabId, terminalId, term } = await renderTerminalHarness({
         status: 'running',
         terminalId: 'term-opencode-hidden-gap',
         mode: 'opencode',
@@ -9832,20 +9800,9 @@ describe('TerminalView lifecycle updates', () => {
         requestId: 'req-opencode-hidden-gap',
         sessionRef,
       })
-      // b8ke ext r20 F2: same fenced production shape for the hidden
-      // background replacement — the kill carries the observed pair.
-      store.dispatch(applyRuntimeOwner({
-        type: 'session.runtimeOwner',
-        provider: 'opencode',
-        sessionId: 'ses_hidden_replay_gap',
-        epoch: 7,
-        generation: 21,
-        ownerKind: 'terminal',
-        operationId: 'handoff-2',
-        transition: 'handoff-committed',
-      }))
 
       wsMocks.send.mockClear()
+      term.write.mockClear()
       act(() => {
         getHydrationQueue().onActiveTabReady('tab-visible-neighbor', ['tab-visible-neighbor', tabId])
       })
@@ -9884,54 +9841,29 @@ describe('TerminalView lifecycle updates', () => {
         } as any)
       })
 
-      await waitFor(() => {
-        // b8ke ext r20 F2: the FENCED production shape (the seeded
-        // hidden-gap record: epoch 7, generation 21).
-        expect(wsMocks.send).toHaveBeenCalledWith({
-          type: 'terminal.kill',
-          terminalId,
-          observedEpoch: 7,
-          observedGeneration: 21,
-        })
-      })
+      // The hidden background hydrate gets the same honest treatment: no
+      // kill, no replacement spawn, identity intact, live output continues.
+      expect(wsMocks.send.mock.calls.some(([msg]) => msg?.type === 'terminal.kill')).toBe(false)
+      expect(wsMocks.send.mock.calls.some(([msg]) => msg?.type === 'terminal.create')).toBe(false)
+      expectTerminalWriteContaining(term, 'Output gap 1-41: reconnect window exceeded')
 
       act(() => {
         messageHandler!({
-          type: 'terminal.exit',
+          type: 'terminal.output',
           terminalId,
-          exitCode: 0,
+          seqStart: 42,
+          seqEnd: 45,
+          data: 'HIDDEN LIVE TAIL',
+          attachRequestId: attach.attachRequestId,
         })
       })
+      expectTerminalWriteContaining(term, 'HIDDEN LIVE TAIL')
 
-      rerender(
-        <Provider store={store}>
-          <TerminalViewFromStore tabId={tabId} paneId={paneId} hidden />
-        </Provider>,
-      )
-
-      let replacementRequestId: string | undefined
-      await waitFor(() => {
-        const layout = store.getState().panes.layouts[tabId]
-        expect(layout?.type).toBe('leaf')
-        if (layout?.type !== 'leaf' || layout.content.kind !== 'terminal') {
-          throw new Error('expected terminal pane')
-        }
-        expect(layout.content.terminalId).toBeUndefined()
-        expect(layout.content.status).toBe('creating')
-        expect(layout.content.sessionRef).toEqual(sessionRef)
-        replacementRequestId = layout.content.createRequestId
-        expect(replacementRequestId).not.toBe('req-opencode-hidden-gap')
-      })
-
-      await waitFor(() => {
-        expect(wsMocks.send).toHaveBeenCalledWith(expect.objectContaining({
-          type: 'terminal.create',
-          requestId: replacementRequestId,
-          mode: 'opencode',
-          sessionRef,
-          restore: true,
-        }))
-      })
+      const layout = store.getState().panes.layouts[tabId]
+      expect(layout?.type === 'leaf' && layout.content.kind === 'terminal'
+        && layout.content.terminalId).toBe(terminalId)
+      expect(layout?.type === 'leaf' && layout.content.kind === 'terminal'
+        && layout.content.status).toBe('running')
     })
 
     it('a pane hidden at mount hydrates in background with a geometry-neutral keepalive attach', async () => {
@@ -10554,7 +10486,7 @@ describe('TerminalView lifecycle updates', () => {
       const checkpointAfterReplay = loadTerminalSurfaceCheckpoint(terminalId, {
         streamId: 'stream-local-notice',
         serverInstanceId: 'server-local-notice',
-      })
+      }, { paneId: 'pane-v2-stream' })
       expect(checkpointAfterReplay?.attachRequestId).toBe(attach?.attachRequestId)
       expect(checkpointAfterReplay?.parserAppliedSeq).toBe(1)
 
@@ -10667,6 +10599,511 @@ describe('TerminalView lifecycle updates', () => {
         attachRequestId: expect.any(String),
       }))
     })
+
+      describe('interrupted terminal restore resumes instead of restarting (responsive-terminal-restore WS2)', () => {
+      const OSC52_FRAME = '\u001b]52;c;aGVsbG8=\u0007'
+
+      function attachMessagesFor(terminalId: string) {
+        return sentMessages().filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+      }
+
+      function terminalWrites(term: { write: { mock: { calls: Array<[unknown]> } } }): string {
+        return term.write.mock.calls.map(([data]) => String(data)).join('')
+      }
+
+      async function renderResumablePane(suffix: string) {
+        const terminalId = `term-resume-${suffix}`
+        const harness = await renderTerminalHarness({
+          status: 'running',
+          terminalId,
+          streamId: `stream-resume-${suffix}`,
+          ackInitialAttach: false,
+          clearSends: false,
+        })
+        return { ...harness, terminalId }
+      }
+
+      it('an interrupt after some applied callbacks resumes ONLY the remainder on the same surface (no clear, no surfaceReset re-claim)', async () => {
+        const { terminalId, term } = await renderResumablePane('partial')
+        term.clear.mockClear()
+        term.write.mockClear()
+        wsMocks.send.mockClear()
+
+        act(() => {
+          messageHandler!({
+            type: 'terminal.attach.ready',
+            terminalId,
+            headSeq: 10,
+            replayFromSeq: 1,
+            replayToSeq: 10,
+          })
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 2, data: 'HE' })
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 3, seqEnd: 4, data: 'LLO' })
+        })
+        expect(terminalWrites(term)).toBe('HELLO')
+
+        // Interrupt: the transport drops before frames 5-10 arrive.
+        act(() => { reconnectHandler?.() })
+
+        const resumeAttach = attachMessagesFor(terminalId).at(-1)
+        expect(resumeAttach).toMatchObject({ intent: 'transport_reconnect', sinceSeq: 4 })
+        expect(resumeAttach).not.toHaveProperty('surfaceReset')
+        expect(term.clear).not.toHaveBeenCalled()
+
+        // The remainder converges to the uninterrupted reference with no
+        // duplicate writes.
+        act(() => {
+          messageHandler!({
+            type: 'terminal.attach.ready',
+            terminalId,
+            headSeq: 10,
+            replayFromSeq: 5,
+            replayToSeq: 10,
+          })
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 5, seqEnd: 10, data: ' WORLD' })
+        })
+        expect(terminalWrites(term)).toBe('HELLO WORLD')
+      })
+
+      it('disconnect-and-resume across a MIXED page resumes from the coverage cursor with no duplicate writes', async () => {
+        const { terminalId, term } = await renderResumablePane('mixed')
+        term.clear.mockClear()
+        term.write.mockClear()
+        wsMocks.send.mockClear()
+
+        act(() => {
+          messageHandler!({
+            type: 'terminal.attach.ready',
+            terminalId,
+            headSeq: 8,
+            replayFromSeq: 1,
+            replayToSeq: 8,
+          })
+          // Filtered prefix: fully consumed by the OSC52 pre-parser, nothing
+          // renders, and the strict applied position stays pinned at zero.
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 4, data: OSC52_FRAME })
+          // Applied tail.
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 5, seqEnd: 8, data: 'hello' })
+        })
+        expect(terminalWrites(term)).toBe('hello')
+
+        act(() => { reconnectHandler?.() })
+
+        // The coverage cursor carries the resume position PAST the filtered
+        // range — never the applied position the filter pinned at zero, never
+        // a full-baseline rebuild.
+        const resumeAttach = attachMessagesFor(terminalId).at(-1)
+        expect(resumeAttach).toMatchObject({ intent: 'transport_reconnect', sinceSeq: 8 })
+        expect(resumeAttach).not.toHaveProperty('surfaceReset')
+        expect(term.clear).not.toHaveBeenCalled()
+
+        act(() => {
+          messageHandler!({
+            type: 'terminal.attach.ready',
+            terminalId,
+            headSeq: 12,
+            replayFromSeq: 9,
+            replayToSeq: 12,
+          })
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 9, seqEnd: 12, data: ' tail' })
+        })
+        // No duplicate writes: 'hello' renders exactly once, no re-filtered
+        // OSC52 side effects, convergence to the reference.
+        expect(terminalWrites(term)).toBe('hello tail')
+      })
+
+      it('disconnect-and-resume across a FILTERED-ONLY page resumes the claimed hydrate from coverage (partial-hydrate exemption)', async () => {
+        const { terminalId, term } = await renderResumablePane('filtered-only')
+        term.clear.mockClear()
+        term.write.mockClear()
+        wsMocks.send.mockClear()
+
+        act(() => {
+          messageHandler!({
+            type: 'terminal.attach.ready',
+            terminalId,
+            headSeq: 5,
+            replayFromSeq: 1,
+            replayToSeq: 5,
+          })
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 5, data: OSC52_FRAME })
+        })
+        // A page with ONLY null-screen-effect frames renders nothing — but it
+        // was consumed: the fresh-claimed surface is partially hydrated, not
+        // blank.
+        expect(terminalWrites(term)).toBe('')
+
+        act(() => { reconnectHandler?.() })
+
+        // The exemption: the marker-armed surface with coverage > 0 and a
+        // valid checkpoint resumes via transport_reconnect — no
+        // viewport_hydrate, no surfaceReset re-claim, no mode-preamble resend.
+        const resumeAttach = attachMessagesFor(terminalId).at(-1)
+        expect(resumeAttach).toMatchObject({ intent: 'transport_reconnect', sinceSeq: 5 })
+        expect(resumeAttach).not.toHaveProperty('surfaceReset')
+        expect(term.clear).not.toHaveBeenCalled()
+
+        act(() => {
+          messageHandler!({
+            type: 'terminal.attach.ready',
+            terminalId,
+            headSeq: 8,
+            replayFromSeq: 6,
+            replayToSeq: 8,
+          })
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 6, seqEnd: 8, data: 'live' })
+        })
+        expect(terminalWrites(term)).toBe('live')
+      })
+
+      it('an interrupt BEFORE any callback takes the full-hydrate path and delayed old callbacks never write stale content', async () => {
+        const { terminalId, term } = await renderResumablePane('pre-callback')
+
+        // Withhold the frame flush: frames are accepted and enqueued but no
+        // write callback has fired — nothing consumed.
+        const rafCallbacks: FrameRequestCallback[] = []
+        requestAnimationFrameSpy!.mockImplementation((cb) => {
+          rafCallbacks.push(cb)
+          return rafCallbacks.length
+        })
+        const pumpRaf = () => {
+          while (rafCallbacks.length > 0) {
+            rafCallbacks.shift()!(0)
+          }
+        }
+
+        act(() => {
+          messageHandler!({
+            type: 'terminal.attach.ready',
+            terminalId,
+            headSeq: 10,
+            replayFromSeq: 1,
+            replayToSeq: 10,
+          })
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 4, data: 'OLD' })
+        })
+        expect(rafCallbacks.length).toBeGreaterThan(0)
+
+        wsMocks.send.mockClear()
+        act(() => { reconnectHandler?.() })
+
+        // Nothing to resume from: the full-hydrate path (fresh override,
+        // surfaceReset re-claimed, sinceSeq 0).
+        const secondAttach = attachMessagesFor(terminalId).at(-1)
+        expect(secondAttach).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0 })
+        expect(secondAttach).toHaveProperty('surfaceReset', true)
+
+        // The delayed old-generation callbacks flush AFTER recovery: the
+        // superseded generation's queued writes are dropped — no stale
+        // content, no false progress.
+        act(() => { pumpRaf() })
+        expect(terminalWrites(term)).toBe('')
+
+        act(() => {
+          messageHandler!({
+            type: 'terminal.attach.ready',
+            terminalId,
+            headSeq: 10,
+            replayFromSeq: 1,
+            replayToSeq: 10,
+          })
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 2, data: 'NEW' })
+        })
+        act(() => { pumpRaf() })
+        expect(terminalWrites(term)).toBe('NEW')
+
+        // The checkpoint reflects only the new generation's applied frames —
+        // the dropped OLD range contributed no false progress.
+        const checkpoint = loadTerminalSurfaceCheckpoint(terminalId, {
+          streamId: 'stream-resume-pre-callback',
+          serverInstanceId: 'srv-v2-stream',
+        }, { paneId: 'pane-v2-stream' })
+        expect(checkpoint?.parserAppliedSeq).toBe(2)
+        expect(checkpoint?.surfaceCoverageSeq).toBe(2)
+      })
+
+      it('sibling panes rendering the same terminal cannot borrow each other\u2019s checkpoint progress', async () => {
+        const terminalId = 'term-sibling-shared'
+        const streamId = 'stream-sibling-shared'
+
+        // Pane A: fully hydrates through seq 10. Capture its handler AND its
+        // mount attach BEFORE pane B's render re-registers (the shared mock
+        // reassigns `messageHandler` on every registration).
+        await renderTerminalHarness({
+          status: 'running',
+          terminalId,
+          streamId,
+          ackInitialAttach: false,
+          clearSends: false,
+        })
+        const deliverA = messageHandler!
+        const attachA = [...wsMocks.send.mock.calls]
+          .map(([msg]) => msg)
+          .find((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+        expect(attachA?.attachRequestId).toBeTruthy()
+        wsMocks.send.mockClear()
+
+        // Pane B: a second pane rendering the SAME terminal (its own xterm
+        // surface), currently only through seq 2.
+        const tabB = 'tab-sibling-b'
+        const paneBId = 'pane-sibling-b'
+        const paneContentB: TerminalPaneContent = {
+          kind: 'terminal',
+          createRequestId: 'req-sibling-b',
+          status: 'running',
+          mode: 'shell',
+          shell: 'system',
+          terminalId,
+          streamId,
+        }
+        const rootB: PaneNode = { type: 'leaf', id: paneBId, content: paneContentB }
+        const storeB = configureStore({
+          reducer: {
+            tabs: tabsReducer,
+            panes: panesReducer,
+            settings: settingsReducer,
+            connection: connectionReducer,
+            turnCompletion: turnCompletionReducer,
+          },
+          preloadedState: {
+            tabs: {
+              tabs: [{
+                id: tabB,
+                mode: 'shell',
+                status: 'running',
+                title: 'Shell',
+                titleSetByUser: false,
+                createRequestId: 'req-sibling-b',
+                terminalId,
+              }],
+              activeTabId: tabB,
+            },
+            panes: {
+              layouts: { [tabB]: rootB },
+              activePane: { [tabB]: paneBId },
+              paneTitles: {},
+            },
+            settings: createSettingsState(),
+            connection: { status: 'connected', error: null, serverInstanceId: 'srv-v2-stream' },
+          },
+        })
+        render(
+          <Provider store={storeB}>
+            <TerminalView tabId={tabB} paneId={paneBId} paneContent={paneContentB} />
+          </Provider>,
+        )
+        await waitFor(() => {
+          expect(terminalInstances.length).toBeGreaterThanOrEqual(2)
+        })
+        const deliverB = messageHandler!
+        expect(deliverB).not.toBe(deliverA)
+        const termB = terminalInstances[terminalInstances.length - 1]
+
+        const attachForPane = (paneIdPrefix: string) => [...wsMocks.send.mock.calls]
+          .map(([msg]) => msg)
+          .filter((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)
+          .find((msg) => typeof msg?.attachRequestId === 'string' && msg.attachRequestId.startsWith(`${paneIdPrefix}:`))
+
+        // Drive pane A's hydration through seq 10.
+        act(() => {
+          deliverA(withCurrentAttachRequestId({
+            type: 'terminal.attach.ready',
+            terminalId,
+            headSeq: 10,
+            replayFromSeq: 1,
+            replayToSeq: 10,
+            attachRequestId: attachA!.attachRequestId,
+          }))
+          deliverA(withCurrentAttachRequestId({
+            type: 'terminal.output',
+            terminalId,
+            seqStart: 1,
+            seqEnd: 10,
+            data: 'A'.repeat(10),
+            attachRequestId: attachA!.attachRequestId,
+          }))
+        })
+
+        // Drive pane B's hydration through seq 2 only.
+        await waitFor(() => {
+          expect(attachForPane(paneBId)).toBeTruthy()
+        })
+        const attachB = attachForPane(paneBId)
+        act(() => {
+          deliverB(withCurrentAttachRequestId({
+            type: 'terminal.attach.ready',
+            terminalId,
+            headSeq: 2,
+            replayFromSeq: 1,
+            replayToSeq: 2,
+            attachRequestId: attachB!.attachRequestId,
+          }))
+          deliverB(withCurrentAttachRequestId({
+            type: 'terminal.output',
+            terminalId,
+            seqStart: 1,
+            seqEnd: 2,
+            data: 'B2',
+            attachRequestId: attachB!.attachRequestId,
+          }))
+        })
+        expect(terminalWriteStrings(termB).join('')).toContain('B2')
+
+        // Pane B reconnects: it must resume from ITS OWN surface's progress
+        // (seq 2), never from pane A's further-ahead checkpoint (seq 10) —
+        // resuming past its own rendered content would leave a data hole.
+        wsMocks.send.mockClear()
+        act(() => { reconnectHandler?.() })
+
+        const resumeB = attachForPane(paneBId)
+        expect(resumeB).toMatchObject({ intent: 'transport_reconnect', sinceSeq: 2 })
+
+        // Both panes keep their own scoped progress.
+        const checkpointA = loadTerminalSurfaceCheckpoint(terminalId, {
+          streamId,
+          serverInstanceId: 'srv-v2-stream',
+        }, { paneId: 'pane-v2-stream' })
+        expect(checkpointA?.parserAppliedSeq).toBe(10)
+        const checkpointB = loadTerminalSurfaceCheckpoint(terminalId, {
+          streamId,
+          serverInstanceId: 'srv-v2-stream',
+        }, { paneId: paneBId })
+        expect(checkpointB?.parserAppliedSeq).toBe(2)
+      })
+
+    it('recovery bounding: repeated progressless attaches stop at the bound, show the accessible retry state, preserve content, and explicit retry resumes', async () => {
+      const { terminalId, term } = await renderResumablePane('recovery')
+
+      const attachCount = () => attachMessagesFor(terminalId).length
+      // The mount attach is the pane's INITIAL hydration (never counted);
+      // the recovery bound counts progressless RE-attaches after it.
+      expect(attachCount()).toBe(1)
+
+      act(() => { reconnectHandler?.() })
+      expect(attachCount()).toBe(2)
+      act(() => { reconnectHandler?.() })
+      expect(attachCount()).toBe(3)
+      act(() => { reconnectHandler?.() })
+      expect(attachCount()).toBe(4)
+
+      term.clear.mockClear()
+      // The 4th progressless recovery attempt exceeds the bound: automatic
+      // cycling STOPS and the visible, accessible retry state shows.
+      act(() => { reconnectHandler?.() })
+      expect(attachCount()).toBe(4)
+
+      const retryStrip = screen.getByTestId('restore-recovery-retry')
+      expect(retryStrip).toHaveAttribute('role', 'alert')
+      const retryButton = screen.getByRole('button', { name: 'Retry terminal restore' })
+      expect(retryButton).toBeTruthy()
+      // The visible content is preserved: no wipe, no kill, no replacement.
+      expect(term.clear).not.toHaveBeenCalled()
+      expect(sentMessages().some((msg) => msg?.type === 'terminal.kill')).toBe(false)
+      expect(sentMessages().some((msg) => msg?.type === 'terminal.create')).toBe(false)
+
+      // Explicit retry re-arms: the attach goes out again.
+      act(() => {
+        fireEvent.click(retryButton)
+      })
+      expect(attachCount()).toBe(5)
+      expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+    })
+
+    it('recovery bounding: genuine coverage progress resets the progressless counter', async () => {
+      const { terminalId } = await renderResumablePane('recovery-progress')
+
+      const attachCount = () => attachMessagesFor(terminalId).length
+      expect(attachCount()).toBe(1)
+      act(() => { reconnectHandler?.() })
+      expect(attachCount()).toBe(2)
+
+      // Genuine progress: frames actually consume on the surface.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 4,
+          replayFromSeq: 1,
+          replayToSeq: 4,
+        })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 4, data: 'PROGRESS' })
+      })
+
+      // The progress reset the streak: three more reconnects are allowed
+      // (a fresh streak of recovery attempts 1-3), and the strip never shows.
+      act(() => { reconnectHandler?.() })
+      expect(attachCount()).toBe(3)
+      act(() => { reconnectHandler?.() })
+      expect(attachCount()).toBe(4)
+      act(() => { reconnectHandler?.() })
+      expect(attachCount()).toBe(5)
+      expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+
+      // The next progressless one exceeds the fresh streak's bound.
+      act(() => { reconnectHandler?.() })
+      expect(attachCount()).toBe(5)
+      expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+    })
+
+      it('quarantine freeze: an in-flight-write reconnect defers the decision and the drained repair rebuilds honestly when the surface moved', async () => {
+        const bridge = createPerfAuditBridge()
+        installPerfAuditBridge(bridge)
+        const { terminalId, term } = await renderResumablePane('quarantine')
+
+        const withheldWriteCallbacks: Array<() => void> = []
+        term.write.mockImplementation((_data: string, onWritten?: () => void) => {
+          if (onWritten) withheldWriteCallbacks.push(onWritten)
+        })
+
+        act(() => {
+          messageHandler!({
+            type: 'terminal.attach.ready',
+            terminalId,
+            headSeq: 10,
+            replayFromSeq: 1,
+            replayToSeq: 10,
+          })
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 4, data: 'PRE' })
+        })
+        expect(withheldWriteCallbacks.length).toBeGreaterThan(0)
+
+        wsMocks.send.mockClear()
+        term.clear.mockClear()
+        // Reconnect lands while the first hydrate's write is still in flight:
+        // the surface decision is FROZEN (quarantined hydrate, no wipe yet).
+        act(() => { reconnectHandler?.() })
+        const quarantinedAttach = attachMessagesFor(terminalId).at(-1)
+        expect(quarantinedAttach).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0 })
+        expect(term.clear).not.toHaveBeenCalled()
+
+        // The stale in-flight write completes during the frozen window — its
+        // bytes reached the surface, so the drained repair must rebuild from
+        // a full hydrate rather than resume a checkpoint that under-describes
+        // the surface.
+      act(() => {
+        withheldWriteCallbacks.splice(0).forEach((cb) => cb())
+      })
+
+      // The drained repair fires on the next poll tick (~16ms): it must
+      // REBUILD from a full hydrate (the stale completion's bytes are on
+      // the surface beyond the checkpoint) and record the honest decision.
+      const repairEvent = await waitFor(() => {
+        const event = bridge.snapshot().perfEvents.find(
+          (e) => e.event === 'terminal.catchup.surface_quarantine_repair',
+        )
+        expect(event).toBeTruthy()
+        return event
+      })
+      expect(repairEvent).toMatchObject({
+        terminalId,
+        resumable: false,
+        completedWritesDuringQuarantine: 1,
+      })
+      const repairAttach = attachMessagesFor(terminalId).at(-1)
+      expect(repairAttach).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0 })
+      })
+    })
+
   })
 
   describe('paced terminal replay consumption (pacedTerminalReplayV1)', () => {
@@ -10811,9 +11248,24 @@ describe('TerminalView lifecycle updates', () => {
     it('old server (no echo): attach payloads are byte-identical to today and no credit is ever sent', async () => {
       const { terminalId, term } = await setupPacedPane({ suffix: 'legacy-shell', negotiated: false })
 
+      // M1 (task-4 review): pin the COMPLETE legacy attach payload — every
+      // field, no toMatchObject partial. Old-server wire behavior must stay
+      // byte-identical, so any added/removed/reshaped field fails here.
       const mountAttach = attachMessagesFor(terminalId).at(-1)
-      expect(mountAttach).toMatchObject({ maxReplayBytes: PACED_PAGE_BYTES })
-      expect(mountAttach).not.toHaveProperty('replayPageBytes')
+      expect(mountAttach).toEqual({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        cols: 80,
+        rows: 24,
+        sinceSeq: 0,
+        attachRequestId: expect.stringMatching(/^pane-paced-legacy-shell:\d+:[A-Za-z0-9_-]{6}$/),
+        priority: 'foreground',
+        maxReplayBytes: PACED_PAGE_BYTES,
+        surfaceReset: true,
+        createRequestId: 'req-paced-legacy-shell',
+        tabId: 'tab-paced-legacy-shell',
+      })
 
       act(() => {
         messageHandler!({
@@ -10932,6 +11384,36 @@ describe('TerminalView lifecycle updates', () => {
         attachRequestId: latestAttachRequestIdForTerminal(terminalId),
         consumedSeq: 5,
       })
+    })
+
+    it('M2: a non-empty frame that failed to enqueue (disposed surface) never advances the frontier or credits', async () => {
+      const { terminalId } = await setupPacedPane({ suffix: 'enqueue-failure' })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 6,
+          replayFromSeq: 1,
+          replayToSeq: 6,
+        })
+      })
+      expect(creditMessages()).toEqual([])
+
+      // Dispose the surface (write queue and xterm gone) while the component's
+      // message callback still runs — the exact enqueue-failure shape M2 must
+      // distinguish from a fully pre-filtered frame. Capture the raw handler
+      // first: teardown unregisters it from the ws mock.
+      const deliver = messageHandler!
+      cleanup()
+
+      act(() => {
+        deliver({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 6, data: 'NEVER RENDERED' })
+      })
+
+      // The bytes never reached any surface: crediting them would let the
+      // server advance its retention cursor past unconsumed output.
+      expect(creditMessages()).toEqual([])
     })
 
     it('mixed page: filtered + applied frames coalesce into one credit at the page frontier with no duplicate output', async () => {
@@ -11058,6 +11540,53 @@ describe('TerminalView lifecycle updates', () => {
       expect(gapEvent).toMatchObject({ terminalId, fromSeq: 1, toSeq: 50 })
       expect(gapEvent?.headSeq).toBeNull()
       expect(gapEvent?.oldestRetainedSeq).toBeNull()
+    })
+
+    it('auto-kill removal: an old-server opencode retention gap never kills, replaces, or changes identity — honest notice and live output instead', async () => {
+      // Old servers never emit `replay_window_exceeded` (the paced core is the
+      // only emitter, and it requires negotiation), so this shape is only
+      // reachable by simulation — but the removal contract must hold on BOTH
+      // shapes: no terminal.kill, no replacement spawn, identity unchanged.
+      const { store, tabId, terminalId, term } = await setupPacedPane({
+        suffix: 'legacy-oc-gap',
+        negotiated: false,
+        mode: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'ses-paced-legacy-oc-gap' },
+      })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 100,
+          replayFromSeq: 1,
+          replayToSeq: 100,
+        })
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 1,
+          toSeq: 90,
+          reason: 'replay_window_exceeded',
+        })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 91, seqEnd: 95, data: 'LIVE TAIL' })
+      })
+
+      const sent = sentMessages()
+      expect(sent.some((msg) => msg?.type === 'terminal.kill')).toBe(false)
+      expect(sent.some((msg) => msg?.type === 'terminal.create')).toBe(false)
+      expect(terminalWriteStrings(term).some((entry) => entry.includes('Restarting OpenCode'))).toBe(false)
+
+      // Terminal identity is untouched: same terminalId, still running.
+      const layout = store.getState().panes.layouts[tabId]
+      expect(layout?.type === 'leaf' && layout.content.kind === 'terminal'
+        && layout.content.terminalId).toBe(terminalId)
+      expect(layout?.type === 'leaf' && layout.content.kind === 'terminal' && layout.content.status).toBe('running')
+
+      // The old-server honest outcome: a local gap notice, and live output
+      // keeps flowing on the unchanged surface.
+      expectTerminalWriteContaining(term, 'Output gap 1-90: reconnect window exceeded')
+      expectTerminalWriteContaining(term, 'LIVE TAIL')
     })
 
     it('an exit mid-replay withholds the credit for already-admitted writes; late arid frames neither crash, resurrect, nor credit', async () => {

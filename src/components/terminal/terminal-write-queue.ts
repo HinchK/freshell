@@ -29,6 +29,15 @@ type TerminalWriteQueueArgs = {
    * Used by TerminalView to consume generation-scoped one-shot markers.
    */
   onItemApplied?: (item: { mode: TerminalWriteQueueMode; generation: string | undefined }) => void
+  /**
+   * Surface-mutation ledger (responsive-terminal-restore WS2): fired for
+   * EVERY completed write item — INCLUDING stale generations (the item's
+   * bytes were already submitted to the surface when it went in flight, so a
+   * stale completion is still a mutation even though onItemApplied rightly
+   * skips it). Never fired for tasks. Used by the quarantine repair to prove
+   * the surface still matches its last checkpoint.
+   */
+  onWriteCompleted?: (item: { mode: TerminalWriteQueueMode; generation: string | undefined }) => void
   budgetMs?: number
   now?: () => number
   requestFrame?: (cb: FrameRequestCallback) => number
@@ -140,6 +149,7 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
           for (const callback of item.callbacks) callback()
           args.onItemApplied?.({ mode: item.mode, generation: item.generation })
         }
+        args.onWriteCompleted?.({ mode: item.mode, generation: item.generation })
       } finally {
         scope.complete()
         decrementInFlightWrites(item.generation)

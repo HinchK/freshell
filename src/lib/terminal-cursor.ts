@@ -22,6 +22,22 @@ export type TerminalSurfaceCheckpointIdentity = {
   serverBootId?: string
 }
 
+/**
+ * Surface scoping (responsive-terminal-restore WS2): checkpoints are keyed by
+ * the surface that rendered them — a pane/surface instance — so sibling panes
+ * rendering the same terminal cannot borrow or overwrite each other's
+ * rendered progress. The pane id is the stable per-surface discriminator (the
+ * attachRequestId already embeds `${paneId}:`). An absent scope addresses
+ * the legacy terminal-keyed store and never sees scoped entries.
+ */
+export type TerminalSurfaceScope = { paneId?: string }
+
+const SURFACE_KEY_SEPARATOR = '::'
+
+function surfaceStoreKey(scope: TerminalSurfaceScope | undefined, terminalId: string): string {
+  return scope?.paneId ? `${scope.paneId}${SURFACE_KEY_SEPARATOR}${terminalId}` : terminalId
+}
+
 type CursorMap = Record<string, CheckpointEntry>
 
 const MAX_ENTRIES = 500
@@ -88,6 +104,9 @@ function sanitizeCheckpoint(
     surfaceEpoch: normalizeSeq(candidate.surfaceEpoch),
     attachRequestId: candidate.attachRequestId,
     parserAppliedSeq: normalizeSeq(candidate.parserAppliedSeq),
+    ...(typeof candidate.surfaceCoverageSeq === 'number'
+      ? { surfaceCoverageSeq: normalizeSeq(candidate.surfaceCoverageSeq) }
+      : {}),
     cols: normalizeSeq(candidate.cols),
     rows: normalizeSeq(candidate.rows),
     geometryEpoch: normalizeSeq(candidate.geometryEpoch),
@@ -98,8 +117,15 @@ function sanitizeCheckpoint(
     parserIdle: candidate.parserIdle === true,
   })
 
-  if (checkpoint.parserAppliedSeq <= 0) return null
+  // A checkpoint needs SOME resumable position: rendered content (applied)
+  // or accounted coverage past a null-screen-effect filtered prefix.
+  if (checkpoint.parserAppliedSeq <= 0 && (checkpoint.surfaceCoverageSeq ?? 0) <= 0) return null
   return checkpoint
+}
+
+function terminalIdFromStoreKey(key: string): string {
+  const separatorIndex = key.lastIndexOf(SURFACE_KEY_SEPARATOR)
+  return separatorIndex === -1 ? key : key.slice(separatorIndex + SURFACE_KEY_SEPARATOR.length)
 }
 
 function sanitizeMap(raw: unknown): CursorMap {
@@ -107,16 +133,18 @@ function sanitizeMap(raw: unknown): CursorMap {
   const input = raw as Record<string, unknown>
   const out: CursorMap = {}
 
-  for (const [terminalId, value] of Object.entries(input)) {
-    if (!terminalId) continue
+  for (const [storeKey, value] of Object.entries(input)) {
+    if (!storeKey) continue
     if (!value || typeof value !== 'object') continue
 
     const candidate = value as Record<string, unknown>
-    const checkpoint = sanitizeCheckpoint(terminalId, candidate.checkpoint)
+    // Scoped keys embed the terminal id (`${paneId}::${terminalId}`); the
+    // checkpoint must still self-identify with that terminal.
+    const checkpoint = sanitizeCheckpoint(terminalIdFromStoreKey(storeKey), candidate.checkpoint)
     const updatedAt = normalizeTimestamp(candidate.updatedAt)
     if (!checkpoint || updatedAt <= 0) continue
 
-    out[terminalId] = { checkpoint, updatedAt }
+    out[storeKey] = { checkpoint, updatedAt }
   }
 
   return out
@@ -236,24 +264,47 @@ function sameCheckpointSurface(
     && a.bufferType === b.bufferType
 }
 
+function coveragePositionOf(checkpoint: TerminalSurfaceCheckpoint): number {
+  const coverage = checkpoint.surfaceCoverageSeq
+  // Zero coverage = no contiguous coverage beyond the applied position (a
+  // rendered tail with a lost prefix): fall back to applied, exactly the
+  // pre-cursor ranking behavior.
+  if (typeof coverage !== 'number' || !Number.isFinite(coverage) || coverage <= 0) {
+    return checkpoint.parserAppliedSeq
+  }
+  return Math.floor(coverage)
+}
+
 function chooseCheckpoint(
   existing: TerminalSurfaceCheckpoint | undefined,
   next: TerminalSurfaceCheckpoint,
 ): TerminalSurfaceCheckpoint {
   if (!existing) return next
   if (!sameCheckpointSurface(existing, next)) return next
+  // Overwrite prevention: keep the most advanced reconstruction position —
+  // coverage first (it subsumes the rendered baseline), applied as the
+  // legacy tiebreak. A regressed save can never clobber real progress.
+  const existingCoverage = coveragePositionOf(existing)
+  const nextCoverage = coveragePositionOf(next)
+  if (existingCoverage > nextCoverage) return existing
+  if (existingCoverage < nextCoverage) return next
   if (existing.parserAppliedSeq > next.parserAppliedSeq) return existing
   return next
 }
 
-function saveCheckpointEntry(checkpoint: TerminalSurfaceCheckpoint): void {
-  if (!checkpoint.terminalId || checkpoint.parserAppliedSeq <= 0) return
+function saveCheckpointEntry(
+  checkpoint: TerminalSurfaceCheckpoint,
+  scope: TerminalSurfaceScope | undefined,
+): void {
+  if (!checkpoint.terminalId) return
+  if (checkpoint.parserAppliedSeq <= 0 && (checkpoint.surfaceCoverageSeq ?? 0) <= 0) return
 
   const map = ensureLoaded()
   const now = Date.now()
-  const existing = map[checkpoint.terminalId]
+  const storeKey = surfaceStoreKey(scope, checkpoint.terminalId)
+  const existing = map[storeKey]
   const nextCheckpoint = chooseCheckpoint(existing?.checkpoint, checkpoint)
-  map[checkpoint.terminalId] = { checkpoint: nextCheckpoint, updatedAt: now }
+  map[storeKey] = { checkpoint: nextCheckpoint, updatedAt: now }
 
   const shouldPrune = Object.keys(map).length > MAX_ENTRIES
     || now - lastPruneAt >= PRUNE_INTERVAL_MS
@@ -271,9 +322,10 @@ function saveCheckpointEntry(checkpoint: TerminalSurfaceCheckpoint): void {
 export function loadTerminalSurfaceCheckpoint(
   terminalId: string,
   identity: TerminalSurfaceCheckpointIdentity,
+  scope?: TerminalSurfaceScope,
 ): TerminalSurfaceCheckpoint | null {
   if (!terminalId) return null
-  const entry = ensureLoaded()[terminalId]
+  const entry = ensureLoaded()[surfaceStoreKey(scope, terminalId)]
   if (!entry) return null
 
   const checkpoint = entry.checkpoint
@@ -285,8 +337,11 @@ export function loadTerminalSurfaceCheckpoint(
   return { ...checkpoint }
 }
 
-export function saveTerminalSurfaceCheckpoint(input: TerminalSurfaceCheckpoint): void {
-  saveCheckpointEntry(createTerminalSurfaceCheckpoint(input))
+export function saveTerminalSurfaceCheckpoint(
+  input: TerminalSurfaceCheckpoint,
+  scope?: TerminalSurfaceScope,
+): void {
+  saveCheckpointEntry(createTerminalSurfaceCheckpoint(input), scope)
 }
 
 export function loadTerminalCursor(terminalId: string): number {
@@ -302,8 +357,15 @@ export function saveTerminalCursor(terminalId: string, seq: number): void {
 export function clearTerminalCursor(terminalId: string): void {
   if (!terminalId) return
   const map = ensureLoaded()
-  if (!map[terminalId]) return
-  delete map[terminalId]
+  // Surface-scoped entries live under `${paneId}::${terminalId}` keys — a
+  // terminal-wide clear must remove every pane's entry for the terminal.
+  const matchingKeys = Object.keys(map).filter((key) => (
+    map[key]?.checkpoint.terminalId === terminalId
+  ))
+  if (matchingKeys.length === 0) return
+  for (const key of matchingKeys) {
+    delete map[key]
+  }
   if (persistTimer) {
     clearTimeout(persistTimer)
     persistTimer = null

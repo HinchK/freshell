@@ -40,6 +40,13 @@ function loadCheckpointSeq(terminalId: string): number {
   })?.parserAppliedSeq ?? 0
 }
 
+function loadCheckpointSeqScoped(paneId: string, terminalId: string): number {
+  return loadTerminalSurfaceCheckpoint(terminalId, {
+    streamId: 'stream-1',
+    serverInstanceId: 'server-a',
+  }, { paneId })?.parserAppliedSeq ?? 0
+}
+
 describe('terminal-cursor', () => {
   beforeEach(() => {
     vi.useRealTimers()
@@ -227,6 +234,117 @@ describe('terminal-cursor', () => {
     expect(setItemSpy).toHaveBeenCalledTimes(1)
 
     setItemSpy.mockRestore()
+  })
+
+  describe('surface-scoped checkpoint store (sibling pane isolation)', () => {
+    it('a scoped save is invisible to a different pane and to unscoped loads', () => {
+      saveTerminalSurfaceCheckpoint(
+        createCheckpoint({ parserAppliedSeq: 30, surfaceCoverageSeq: 30 }),
+        { paneId: 'pane-a' },
+      )
+
+      // The owning pane loads its own progress.
+      expect(loadTerminalSurfaceCheckpoint('term-1', {
+        streamId: 'stream-1',
+        serverInstanceId: 'server-a',
+      }, { paneId: 'pane-a' })?.parserAppliedSeq).toBe(30)
+
+      // A sibling pane rendering the same terminal cannot borrow it…
+      expect(loadTerminalSurfaceCheckpoint('term-1', {
+        streamId: 'stream-1',
+        serverInstanceId: 'server-a',
+      }, { paneId: 'pane-b' })).toBeNull()
+
+      // …and neither can an unscoped (legacy) caller.
+      expect(loadTerminalSurfaceCheckpoint('term-1', {
+        streamId: 'stream-1',
+        serverInstanceId: 'server-a',
+      })).toBeNull()
+    })
+
+    it('sibling panes cannot overwrite each other\u2019s progress', () => {
+      saveTerminalSurfaceCheckpoint(
+        createCheckpoint({ parserAppliedSeq: 30, surfaceCoverageSeq: 30 }),
+        { paneId: 'pane-a' },
+      )
+      saveTerminalSurfaceCheckpoint(
+        createCheckpoint({ parserAppliedSeq: 4, surfaceCoverageSeq: 4 }),
+        { paneId: 'pane-b' },
+      )
+
+      expect(loadCheckpointSeqScoped('pane-a', 'term-1')).toBe(30)
+      expect(loadCheckpointSeqScoped('pane-b', 'term-1')).toBe(4)
+      expect(getCursorMapSize()).toBe(2)
+    })
+
+    it('prevents a lower-coverage save from overwriting a higher-coverage checkpoint in the same scope', () => {
+      saveTerminalSurfaceCheckpoint(
+        createCheckpoint({ parserAppliedSeq: 8, surfaceCoverageSeq: 12 }),
+        { paneId: 'pane-a' },
+      )
+      // A regressed save (e.g. a stale write racing a rebuild) must not clobber.
+      saveTerminalSurfaceCheckpoint(
+        createCheckpoint({ parserAppliedSeq: 5, surfaceCoverageSeq: 5 }),
+        { paneId: 'pane-a' },
+      )
+
+      const loaded = loadTerminalSurfaceCheckpoint('term-1', {
+        streamId: 'stream-1',
+        serverInstanceId: 'server-a',
+      }, { paneId: 'pane-a' })
+      expect(loaded?.parserAppliedSeq).toBe(8)
+      expect(loaded?.surfaceCoverageSeq).toBe(12)
+    })
+
+    it('merges a coverage-only advance with an unchanged applied position', () => {
+      saveTerminalSurfaceCheckpoint(
+        createCheckpoint({ parserAppliedSeq: 8, surfaceCoverageSeq: 8 }),
+        { paneId: 'pane-a' },
+      )
+      // Filtered frames advanced coverage without moving the applied cursor.
+      saveTerminalSurfaceCheckpoint(
+        createCheckpoint({ parserAppliedSeq: 8, surfaceCoverageSeq: 14 }),
+        { paneId: 'pane-a' },
+      )
+
+      const loaded = loadTerminalSurfaceCheckpoint('term-1', {
+        streamId: 'stream-1',
+        serverInstanceId: 'server-a',
+      }, { paneId: 'pane-a' })
+      expect(loaded?.parserAppliedSeq).toBe(8)
+      expect(loaded?.surfaceCoverageSeq).toBe(14)
+    })
+
+    it('accepts a checkpoint with zero applied but positive coverage (mixed page)', () => {
+      saveTerminalSurfaceCheckpoint(
+        createCheckpoint({ parserAppliedSeq: 0, surfaceCoverageSeq: 9 }),
+        { paneId: 'pane-a' },
+      )
+
+      const loaded = loadTerminalSurfaceCheckpoint('term-1', {
+        streamId: 'stream-1',
+        serverInstanceId: 'server-a',
+      }, { paneId: 'pane-a' })
+      expect(loaded?.parserAppliedSeq).toBe(0)
+      expect(loaded?.surfaceCoverageSeq).toBe(9)
+    })
+
+    it('clearing a terminal removes every pane\u2019s scoped entry for it', () => {
+      saveTerminalSurfaceCheckpoint(
+        createCheckpoint({ parserAppliedSeq: 30, surfaceCoverageSeq: 30 }),
+        { paneId: 'pane-a' },
+      )
+      saveTerminalSurfaceCheckpoint(
+        createCheckpoint({ parserAppliedSeq: 4, surfaceCoverageSeq: 4 }),
+        { paneId: 'pane-b' },
+      )
+
+      clearTerminalCursor('term-1')
+
+      expect(loadCheckpointSeqScoped('pane-a', 'term-1')).toBe(0)
+      expect(loadCheckpointSeqScoped('pane-b', 'term-1')).toBe(0)
+      expect(getCursorMapSize()).toBe(0)
+    })
   })
 
   it('flushes immediately when clearing a cursor with pending debounced writes', () => {

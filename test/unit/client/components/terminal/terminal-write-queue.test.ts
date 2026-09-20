@@ -441,6 +441,40 @@ describe('onItemApplied marker hook', () => {
   })
 })
 
+describe('onWriteCompleted surface-mutation ledger hook', () => {
+  it('fires for EVERY completed write — including stale generations; never for tasks', () => {
+    const completed: string[] = []
+    const rafCallbacks: FrameRequestCallback[] = []
+    let pendingWritten: (() => void) | undefined
+    const queue = createTerminalWriteQueue({
+      terminalInstanceId: 'surface-onwritecompleted',
+      write: (_chunk, onWritten) => {
+        pendingWritten = onWritten
+      },
+      onWriteCompleted: (item) => completed.push(`${item.mode}:${item.generation}`),
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+    })
+
+    queue.setActiveGeneration('gen-1')
+    queue.enqueue('A', undefined, { mode: 'replay', generation: 'gen-1', coalesce: false })
+    rafCallbacks.shift()?.(0) // in flight
+    queue.setActiveGeneration('gen-2') // the in-flight write goes stale
+    queue.enqueueTask(() => {}, { mode: 'replay', generation: 'gen-2' })
+    rafCallbacks.shift()?.(0) // task runs while the stale write is still in flight
+    expect(completed).toEqual([])
+
+    // The stale write completes: its bytes already reached the surface when it
+    // was submitted — the mutation ledger must count it even though
+    // onItemApplied (generation-scoped) does not.
+    pendingWritten?.()
+    expect(completed).toEqual(['replay:gen-1'])
+  })
+})
+
 describe('onDrain (paced-replay credit flush tick)', () => {
   it('fires exactly once after a withheld write burst is released in order', () => {
     const rafCallbacks: FrameRequestCallback[] = []
