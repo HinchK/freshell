@@ -43,14 +43,17 @@ export type ApplyFreshAgentCompletionPayload = {
 
 /**
  * Server-authoritative fresh-agent turn completion. The provider adapters emit a
- * discrete turn-complete edge ONLY on a positive completion, so the client no longer
- * derives green/sound from the busy level. We resolve the owning tab/pane from the
- * `provider:sessionId` session key and fold the event into the GREEN/SOUND pipeline
- * via the `at`-monotonic dedupe regime (no completionSeq). The discrete edge is never
- * replayed from a snapshot, so a reconnect cannot re-green, and a stale/older `at` is
- * dropped. Across a real server restart the client clears the per-terminal `at`
- * baselines (resetCompletionDedupeBaselines), so a resumed durable session whose fresh
- * process stamps a lower wall-clock `at` is not swallowed.
+ * discrete turn-complete edge for ANY turn end except a user-initiated interrupt —
+ * successes, errors, max-turns, crashes, deadman fires, and mid-turn stream
+ * exceptions all ring the same unified attention signal — so the client never
+ * derives green/sound from the busy level or the turn's outcome. We resolve the
+ * owning tab/pane from the `provider:sessionId` session key and fold the event into
+ * the GREEN/SOUND pipeline via the `at`-monotonic dedupe regime (no completionSeq).
+ * The discrete edge is never replayed from a snapshot, so a reconnect cannot
+ * re-green, and a stale/older `at` is dropped. Across a real server restart the
+ * client clears the per-terminal `at` baselines (resetCompletionDedupeBaselines),
+ * so a resumed durable session whose fresh process stamps a lower wall-clock `at`
+ * is not swallowed.
  */
 export function applyFreshAgentCompletion(payload: ApplyFreshAgentCompletionPayload) {
   return (dispatch: AppDispatch, getState: () => RootState): void => {

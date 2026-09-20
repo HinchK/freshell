@@ -289,7 +289,7 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
     }
   })
 
-  it('a deny/errored completion emits sdk.result + idle and NEVER an sdk.turn.complete (D1-F2)', async () => {
+  it('a deny/errored completion emits sdk.result + idle AND the unified attention edge (needs-attention)', async () => {
     const eventsLog = path.join(tmp, 'events.jsonl')
     const fx = launch({
       rules: [
@@ -322,38 +322,61 @@ describe('fake-claude-sdk-sidecar respond/interrupt arms (AGENT-05/06 fixture)',
       // continuation (the following sdk.status idle renders synchronously).
       await fx.waitLine((o) => o.type === 'sdk.result' && o.result === 'error', 'errored sdk.result')
 
+      // Unified needs-attention contract: a deny is an ERROR TURN END, so the
+      // fake (mirroring the real sidecar's gate) rings the SAME attention
+      // edge a success would — exactly one, minted after the errored result
+      // and before the idle close, with a finite numeric monotonic `at`.
+      const denyEdge = await fx.waitLine(
+        (o) => o.type === 'sdk.turn.complete' && o.sessionId === sessionId,
+        'the deny turn.complete attention edge',
+      )
+      expect(typeof denyEdge.at).toBe('number')
+      expect(Number.isFinite(denyEdge.at)).toBe(true)
       const out = fx.stdoutLines()
       expect(
         out.filter((o) => o.type === 'sdk.turn.complete' && o.sessionId === sessionId),
-        'a denied turn must NEVER emit a positive completion edge (AGENTS.md invariant)',
-      ).toEqual([])
+        'exactly one attention edge for the denied turn',
+      ).toHaveLength(1)
+      const resultIdx = out.findIndex(
+        (o) => o.type === 'sdk.result' && o.result === 'error' && o.sessionId === sessionId,
+      )
+      const denyEdgeIdx = out.findIndex((o) => o.type === 'sdk.turn.complete' && o.sessionId === sessionId)
+      expect(resultIdx, 'the denied turn produced an errored sdk.result').toBeGreaterThanOrEqual(0)
+      expect(denyEdgeIdx, 'the edge follows the errored result in stream order').toBeGreaterThan(resultIdx)
+      const idleIdx = out.findIndex(
+        (o, i) => i > denyEdgeIdx && o.type === 'sdk.status' && o.sessionId === sessionId && o.status === 'idle',
+      )
+      expect(idleIdx, 'the idle close follows the edge in stream order').toBeGreaterThan(denyEdgeIdx)
       expect(
         out.some((o) => o.type === 'sdk.assistant' && o.sessionId === sessionId
           && o.content?.[0]?.text?.includes('denied')),
         'the denial assistant frame arrived',
       ).toBe(true)
-      expect(
-        out.some((o) => o.type === 'sdk.status' && o.sessionId === sessionId && o.status === 'idle'),
-        'the turn still closes to idle',
-      ).toBe(true)
 
       // The outbound wire audit records exactly what went over stdout.
       const wires = readJsonl(eventsLog).filter((r) => r.kind === 'wire')
       expect(
-        wires.some((r) => r.frame?.type === 'sdk.turn.complete'),
-        'the wire audit too shows NO turn.complete for the deny',
-      ).toBe(false)
-      expect(
-        wires.some((r) => r.frame?.type === 'sdk.result' && r.frame?.result === 'error'),
-        'the wire audit records the errored sdk.result',
-      ).toBe(true)
+        wires.filter((r) => r.frame?.type === 'sdk.turn.complete' && r.frame?.sessionId === sessionId),
+        'the wire audit too shows the deny turn.complete edge on stdout',
+      ).toHaveLength(1)
 
       // A plain turn still completes the positive way (fidelity pin):
-      // sdk.result{success} AND sdk.turn.complete.
+      // sdk.result{success} AND its own second attention edge, with a
+      // strictly-greater `at` (the shared monotonic clock). NB: match the
+      // SECOND edge by its `at` — a count-based predicate would resolve to
+      // the FIRST edge the moment two exist.
       fx.send({ type: 'send', sessionId, text: 'plain follow-up' })
-      await fx.waitLine((o) => o.type === 'sdk.turn.complete', 'positive completion')
+      const successEdge = await fx.waitLine(
+        (o) => o.type === 'sdk.turn.complete' && o.sessionId === sessionId && Number(o.at) > denyEdge.at,
+        'the follow-up success turn rings its own edge',
+      )
+      expect(successEdge.at, 'the shared monotonic clock keeps same-ms edges strictly increasing').toBeGreaterThan(denyEdge.at)
       const out2 = fx.stdoutLines()
       expect(out2.some((o) => o.type === 'sdk.result' && o.result === 'success')).toBe(true)
+      expect(
+        out2.filter((o) => o.type === 'sdk.turn.complete' && o.sessionId === sessionId),
+        'two turns, two edges — one per turn end',
+      ).toHaveLength(2)
     } finally {
       await fx.stop()
     }

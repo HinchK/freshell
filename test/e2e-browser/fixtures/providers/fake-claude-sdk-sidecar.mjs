@@ -85,10 +85,11 @@
 //
 // Wire audit (D1-F2): every OUTBOUND frame is ALSO recorded into the
 // FRESHELL_FAKE_EVENTS ledger as a `{t,pid,provider,kind:'wire',frame}` row,
-// so specs assert on what actually crossed stdout (e.g. the ABSENCE of
-// sdk.turn.complete on a denied turn) instead of trusting the program
-// emission ledger alone. Program rows and wire rows coexist there; filter on
-// `kind === 'wire'` for wire truth (event-kind consumers see no shape change).
+// so specs assert on what actually crossed stdout (e.g. the unified
+// sdk.turn.complete edge ringing for a denied/errored turn) instead of
+// trusting the program emission ledger alone. Program rows and wire rows
+// coexist there; filter on `kind === 'wire'` for wire truth (event-kind
+// consumers see no shape change).
 //
 // Transcript realism (AGENT-05 reload-while-pending): the cards render
 // EXCLUSIVELY from the REST snapshot, which 404s without a durable transcript
