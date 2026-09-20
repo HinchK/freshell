@@ -5,6 +5,22 @@ Date: 2026-09-19
 Incident: live self-hosted server on garageserver (`192.168.3.150:3001`), Electron client on DANDESKTOP
 Related: `docs/plans/2026-03-30-paginated-terminal-replay.md`, `docs/plans/2026-07-24-rust-attach-viewport.md` (TERM-07 open items)
 
+## User Request
+
+### Requested result
+- Implement the committed plan `docs/plans/2026-09-19-responsive-terminal-restore.md` (reliable, responsive pane restore) starting with its own Sequencing: the shared restore contract plus the bounded recovery increment (workstreams 1 paced path, 2, and 3 together), fully tested and prepared for PR approval.
+
+### Explicit constraints
+- Follow the plan's Sequencing section: the shared restore contract and bounded recovery increment come first; the screen-first snapshot path, on-demand history, and conversation refresh/pagination are later increments gated on their design validations and are not in this run.
+- Use red/green/refactor TDD; extend existing behavior tests rather than tests that assert plan text.
+- No PR creation and no live deployment; never restart the live self-hosted server without the user's explicit "APPROVED".
+- Broad repo-supported test runs go through the shared coordinator gate; the worktree base must be green via `scripts/base-gate.sh`.
+- Do not experiment on live user terminals to manufacture loss; use disposable test instances and fixtures.
+- Older clients must not receive newly introduced retention gaps; capability negotiation gates all new restore semantics, and no healthy process is killed or replaced because replay is missing.
+
+### Accepted tradeoffs and residuals
+- The bounded recovery increment may not meet the one-second fresh-screen latency target when no valid baseline exists; screen-first snapshots, on-demand history loading, and conversation refresh/pagination correctness remain follow-on increments per the plan's Sequencing.
+
 ## Summary
 
 When a client attaches to a terminal, the server sends its entire retained output newer than the requested position and ignores the requested replay budget. In the incident, initial and repeated full hydrations amounted to roughly 21 MB across seven terminals. The server's sustained-backlog disconnect threshold is lower than its output-spill threshold, creating a reconnect loop. The client already records parser-applied progress, but an incomplete fresh-surface hydrate and other safety checks can force the next attempt back to zero.
