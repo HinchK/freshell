@@ -37,10 +37,30 @@ fn counting_crashing_claude_spec(
     claude_spec(&script_path)
 }
 
-/// A claude-shaped CLI spec that crashes ONLY its first invocation (marker
-/// file absent), then survives (`exec sleep 30`) — the replacement generation
-/// stays live for the reconcile pin.
-fn crash_once_claude_spec(marker: &std::path::Path) -> freshell_platform::CliCommandSpec {
+/// A claude-shaped CLI spec that crashes ONLY its first invocation (the
+/// crash marker is absent), then survives (`exec sleep 30`) — the
+/// replacement generation stays live for the reconcile pin. Returns the
+/// spec plus the RELEASE marker path the caller writes to arm the
+/// first generation's deliberate crash.
+///
+/// FLAKE FIX (auto-resume base-gate RCA, 2026-09-19): the first
+/// generation does NOT crash until the test releases it — it polls the
+/// release marker, which the caller writes only AFTER the create's
+/// `terminal.created` reply is in. Pre-fix the shim died within
+/// milliseconds of the spawn, racing the create's post-spawn tail; when
+/// the death won that race, the b8ke ext r9 dead-PTY guard
+/// (`commit_session_ref_ownership`: "a dead runtime NEVER records
+/// Live") refused the create's winner commit and the create answered
+/// the typed lost-ownership error instead — the crash-once tests'
+/// `terminal.created` waits then consumed the error frame and burned
+/// their whole 30s frame budget (the origin/main base-gate flake,
+/// roughly 1-in-7 file runs under parallel load). Releasing on the
+/// settled reply makes the deliberate crash structurally POST-settle —
+/// no timing assumption anywhere (the codex sibling's fixed 1.2s sleep
+/// is the cruder precedent: it still bets on a wall-clock margin).
+fn crash_once_claude_spec(
+    marker: &std::path::Path,
+) -> (freshell_platform::CliCommandSpec, std::path::PathBuf) {
     // The SCRIPT path is per-test too (derived from the marker name — the
     // `crash_once_codex_spec` lesson): two tests in one binary share
     // std::process::id(), and a shared script would pin BOTH servers'
@@ -54,12 +74,21 @@ fn crash_once_claude_spec(marker: &std::path::Path) -> freshell_platform::CliCom
         "freshell-auto-resume-e2e-crash-once-shim-{marker_tag}-{}.sh",
         std::process::id()
     ));
+    let release = std::env::temp_dir().join(format!(
+        "freshell-auto-resume-e2e-crash-once-release-{marker_tag}-{}.txt",
+        std::process::id()
+    ));
     let script = format!(
-        "#!/bin/sh\nif [ -e \"{marker}\" ]; then exec sleep 30; fi\n: > \"{marker}\"\nexit 1\n",
-        marker = marker.display()
+        "#!/bin/sh\n\
+         if [ -e \"{marker}\" ]; then exec sleep 30; fi\n\
+         while [ ! -e \"{release}\" ]; do sleep 0.05; done\n\
+         : > \"{marker}\"\n\
+         exit 1\n",
+        marker = marker.display(),
+        release = release.display(),
     );
     write_executable(&script_path, &script);
-    claude_spec(&script_path)
+    (claude_spec(&script_path), release)
 }
 
 fn write_executable(path: &std::path::Path, script: &str) {
@@ -356,15 +385,18 @@ async fn reconcile_after_replacement_attaches_to_the_new_terminal() {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&marker);
-    let (url, registry) = common::spawn_server_with_specs_and_auto_resume_hub(
-        vec![crash_once_claude_spec(&marker)],
-        vec![50, 100],
-    )
-    .await;
+    let (crash_spec, release_marker) = crash_once_claude_spec(&marker);
+    let _ = std::fs::remove_file(&release_marker);
+    let (url, registry) =
+        common::spawn_server_with_specs_and_auto_resume_hub(vec![crash_spec], vec![50, 100]).await;
     let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
 
     let create_request_id = "req-e2e-crash-once";
     let (old_tid, session_id) = create_claude_terminal(&mut ws, create_request_id).await;
+    // Arm the shim's deliberate crash: the create is settled (its
+    // `terminal.created` reply is in), so the death can no longer race the
+    // create's post-spawn tail (see `crash_once_claude_spec`).
+    std::fs::write(&release_marker, b"released\n").expect("write the crash release marker");
 
     // DEFLAKE: FRAME_BUDGET (30s) replaces the old 10s frame budget as a
     // per-stage budget (this wait gets its own fresh deadline — see the
@@ -551,12 +583,18 @@ async fn successful_auto_resume_respawn_does_not_drop_its_ticket_unarmed() {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&marker);
-    let (url, registry) =
-        spawn_server_with_hub_and_ownership(vec![crash_once_claude_spec(&marker)], vec![50]).await;
+    let (crash_spec, release_marker) = crash_once_claude_spec(&marker);
+    let _ = std::fs::remove_file(&release_marker);
+    let (url, registry) = spawn_server_with_hub_and_ownership(vec![crash_spec], vec![50]).await;
     let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
     let (events, start_index) = grace_event_capture();
     let create_request_id = "req-e2e-ticket";
     let (old_tid, session_id) = create_claude_terminal(&mut ws, create_request_id).await;
+    // Arm the shim's deliberate crash: the create is settled (its
+    // `terminal.created` reply is in), so the death can no longer race the
+    // create's post-spawn tail — the r9 dead-PTY commit guard that turned
+    // the raced death into a typed create error (see `crash_once_claude_spec`).
+    std::fs::write(&release_marker, b"released\n").expect("write the crash release marker");
 
     // The crash-once generation crashes; the hub resumes it once — wait for
     // the replacement frame (the settle point AFTER the respawn's
