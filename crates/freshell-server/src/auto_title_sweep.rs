@@ -2244,4 +2244,194 @@ mod tests {
             "activity feeds the naming authority for a record-holding kilroy-typed row"
         );
     }
+
+    // -- cwd-canonicalize-lag (docs/plans/2026-09-20-cwd-canonicalize-lag.md,
+    // Task 3): sweep-level integration pins through the FULL pass path --
+    // SweepSession list -> find_all_by_session matching -> the per-pass
+    // terminal-meta refresh fan-out. The unified agent-names work moved
+    // scoped coding-agent sessions' TITLES to the naming authority (the
+    // legacy title ladder skips named providers), so the observable fan-out
+    // of cwd matching in the pass is the `terminal.meta.updated` upsert
+    // batch: every matched terminal's record is rebuilt and committed
+    // change-gated, and only matching terminals are ever in that set ----
+
+    /// Seeds the create-time terminal-meta record the pass's refresh path
+    /// requires (`refresh_terminal_meta` skips terminals the create path
+    /// never seeded).
+    fn seed_terminal_meta_for_test(state: &AutoTitleSweepState, terminal_id: &str) {
+        let record = freshell_ws::terminal_meta::record_for_create(
+            terminal_id,
+            "shell",
+            None,
+            None,
+            now_ms(),
+        );
+        state.terminal_meta.commit_if_changed(record, now_ms());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_cwd_discriminates_between_two_live_claude_terminals() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd_a = dir.path().join("a");
+        let cwd_b = dir.path().join("b");
+        std::fs::create_dir_all(&cwd_a).unwrap();
+        std::fs::create_dir_all(&cwd_b).unwrap();
+        let (state, mut rx) = sweep_state(dir.path(), None);
+
+        spawn_headless_terminal_for_test(&state.registry, "t-a");
+        spawn_headless_terminal_for_test(&state.registry, "t-b");
+        state.identity.upsert(
+            "t-a",
+            Some("claude"),
+            Some("s1"),
+            Some(cwd_a.to_str().unwrap()),
+            1,
+        );
+        state.identity.upsert(
+            "t-b",
+            Some("claude"),
+            Some("s1"),
+            Some(cwd_b.to_str().unwrap()),
+            2,
+        );
+        seed_terminal_meta_for_test(&state, "t-a");
+        seed_terminal_meta_for_test(&state, "t-b");
+
+        // The session's cwd is cwd_a: only t-a matches, so the meta-refresh
+        // fan-out must upsert t-a only — never t-b.
+        run_auto_title_pass(
+            &state,
+            &[session("claude", "s1", cwd_a.to_str().unwrap(), Some("hi"))],
+        )
+        .await;
+        let mut saw_a = false;
+        let mut saw_b = false;
+        while let Ok(frame) = rx.try_recv() {
+            if frame.contains("t-a") {
+                saw_a = true;
+            }
+            if frame.contains("t-b") {
+                saw_b = true;
+            }
+        }
+        assert!(
+            saw_a,
+            "the cwd-matched terminal must receive the meta upsert"
+        );
+        assert!(!saw_b, "the cwd-mismatched terminal must never receive it");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_matches_a_claude_terminal_through_real_symlinked_cwds() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let session_link = dir.path().join("session-link");
+        let terminal_link = dir.path().join("terminal-link");
+        std::os::unix::fs::symlink(&real, &session_link).unwrap();
+        std::os::unix::fs::symlink(&real, &terminal_link).unwrap();
+        let (state, mut rx) = sweep_state(dir.path(), None);
+
+        let tid = "t-sym";
+        spawn_headless_terminal_for_test(&state.registry, tid);
+        state.identity.upsert(
+            tid,
+            Some("claude"),
+            Some("s1"),
+            Some(terminal_link.to_str().unwrap()),
+            1,
+        );
+        seed_terminal_meta_for_test(&state, tid);
+
+        // Different raw strings, same canonical directory: the pass must
+        // match through REAL canonicalization (not the lexical fallback
+        // every cwd-less sweep test exercises) and upsert the matched
+        // terminal's meta.
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "claude",
+                "s1",
+                session_link.to_str().unwrap(),
+                Some("hi"),
+            )],
+        )
+        .await;
+        let mut saw_upsert = false;
+        while let Ok(frame) = rx.try_recv() {
+            if frame.contains(tid) {
+                saw_upsert = true;
+            }
+        }
+        assert!(
+            saw_upsert,
+            "the symlink-resolved match must reach the terminal meta fan-out"
+        );
+
+        // Second pass, same input: the memoized resolution keeps the match
+        // stable and the change-gated commit suppresses a second upsert.
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "claude",
+                "s1",
+                session_link.to_str().unwrap(),
+                Some("hi"),
+            )],
+        )
+        .await;
+        while let Ok(frame) = rx.try_recv() {
+            assert!(
+                !frame.contains(tid),
+                "a memo-stable identical pass must not re-upsert: {frame}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn sweep_stays_cwd_blind_for_codex_sessions_with_real_cwds() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd_session = dir.path().join("a");
+        let cwd_terminal = dir.path().join("b");
+        std::fs::create_dir_all(&cwd_session).unwrap();
+        std::fs::create_dir_all(&cwd_terminal).unwrap();
+        let (state, mut rx) = sweep_state(dir.path(), None);
+
+        let tid = "t-codex";
+        spawn_headless_terminal_for_test(&state.registry, tid);
+        state.identity.upsert(
+            tid,
+            Some("codex"),
+            Some("s1"),
+            Some(cwd_terminal.to_str().unwrap()),
+            1,
+        );
+        seed_terminal_meta_for_test(&state, tid);
+
+        // Different real cwds, same provider+session: codex matching must
+        // stay cwd-blind (the lazy fix must never accidentally scope it) —
+        // the terminal still reaches the meta fan-out despite the mismatch.
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "codex",
+                "s1",
+                cwd_session.to_str().unwrap(),
+                Some("hi"),
+            )],
+        )
+        .await;
+        let mut saw_upsert = false;
+        while let Ok(frame) = rx.try_recv() {
+            if frame.contains(tid) {
+                saw_upsert = true;
+            }
+        }
+        assert!(
+            saw_upsert,
+            "cwd-blind codex matching must still fan out to the terminal"
+        );
+    }
 }
