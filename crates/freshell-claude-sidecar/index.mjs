@@ -37,7 +37,7 @@
 //                                  when a turn ends with NO result frame (stream exception or natural EOF
 //                                  with a send still pending) — the abort/sdk.exit requested-teardown path
 //                                  stays silent
-//     { type:'sdk.turn.waiting',        sessionId, at }                   // 0->>=1 pending edge (claude only)
+//     { type:'sdk.turn.waiting',        sessionId, at }                   // 0->>=1 pending edge (written by this sidecar; codex controls emits its own waiting edge outside the sidecar lane)
 //     { type:'sdk.status',              sessionId, status }               // compacting / idle (stream end)
 //     { type:'sdk.error',               sessionId, message }
 //     { type:'sdk.exit',                sessionId }

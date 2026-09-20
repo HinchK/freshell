@@ -81,7 +81,8 @@ export type ApplyFreshAgentWaitingPayload = {
  * Server-authoritative fresh-agent "waiting for approval/question" edge. Mirrors
  * applyFreshAgentCompletion but records under a distinct `#waiting` terminalId so the
  * approval attention can never poison (or be poisoned by) the turn-complete dedupe
- * bucket via the monotonic `at` guard. Only Claude/kilroy ever emit this today.
+ * bucket via the monotonic `at` guard. Claude/kilroy and codex controls emit
+ * this edge on their own 0→≥1 pending approval/question transitions.
  *
  * Like the completion edge, the server buffers and replays this only to the FIRST
  * subscriber of a session (so a create-then-attach gap still greens once); a
