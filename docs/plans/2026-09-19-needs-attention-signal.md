@@ -31,7 +31,7 @@ Freshell agent attention becomes one binary "needs attention" signal: any turn e
 
 **Goal:** Any turn end the user didn't witness rings the bell and paints the tab/sidebar once, identically for every outcome, with user-initiated interrupts (and watched endings' sound) the only exceptions.
 
-**Architecture:** All changes are server-side emission widening; the client pipeline is already outcome-agnostic (it reads only `{provider, sessionId, at}` from `freshAgent.turn.complete`/`turn.waiting` frames) and needs zero behavioral code changes. Each provider's emission guard changes from "positive completion only" to "any turn end except user-initiated interrupt": freshopencode drops the `succeeded`/`turn_errored` terms from its settle gate, freshcodex's `on_turn_completed` emits for `completed`/`failed`/absent statuses (skipping only `interrupted`/`inProgress`), the freshclaude sidecar emits for any result subtype unless that session has a user-interrupt pending (a per-session interrupt mark, the opencode `turn_aborted` precedent), and the crash/death wedged paths (codex exit-watcher with a turn in flight, codex quiet deadman fire, freshclaude unrequested sidecar death with a turn in flight, opencode failed settles) mint the same `freshAgent.turn.complete` frame with a per-session monotonic `at`. Test contracts that pinned "never a false completion" invert deliberately; docs and comments follow.
+**Architecture:** The server-side emission widening is the core: the client pipeline is already outcome-agnostic in its FOLD (it reads only `{provider, sessionId, at}` from `freshAgent.turn.complete`/`turn.waiting` frames, fresh-agent-ws.ts:388-414), but the current client VIOLATES three explicit request constraints and gets three small behavior changes (Task 6): (1) attention flags are persisted to localStorage and rehydrated on reload (`persistMiddleware.ts:726-733`, `turnCompletionSlice.ts:40-72`), highlighting pre-load turn endings — persistence is removed so a reload witnesses nothing; (2) a watched turn ending marks the PANE too (`useTurnCompletionNotifications.ts:45-71` dispatches tab+pane attention before suppressing only the sound) — watched endings now mark the tab flag only (no pane-header mark; the sidebar row is the same attention flag's own surface); (3) the bell coalesces a whole effect-batch into one `play()` — it now rings once per event. Each provider's emission guard changes from "positive completion only" to "any turn end except user-initiated interrupt": freshopencode drops the `succeeded`/`turn_errored` terms from its settle gate, freshcodex's `on_turn_completed` emits for `completed`/`failed`/absent statuses AND for `interrupted` WITHOUT a recorded user-interrupt marker (the freshagent interrupt lane records a per-session marker at the interrupt verb, mirroring opencode's `turn_aborted` — only user-caused interrupts are silent), the freshclaude sidecar emits for any result subtype unless that session's gate holds a pending accepted user-interrupt mark (ordering-scoped: the SDK serializes turns within a query, so the interrupted turn's result is the first result after the settle — the mark is consumed by exactly that result and needs NO reset-at-send), and the crash/death wedged paths (codex exit-watcher with a turn in flight, codex quiet deadman fire, freshclaude unrequested sidecar death with a turn in flight, freshclaude mid-turn stream exception, opencode failed settles) mint the same `freshAgent.turn.complete` frame with a per-session monotonic `at`. Test contracts that pinned "never a false completion" invert deliberately; docs and comments follow.
 
 **Tech Stack:** Rust (freshell-codex, freshell-freshagent, freshell-ws crates, tokio), Node ESM (crates/freshell-claude-sidecar), TypeScript/React client (comments/contract tests only), Vitest (client + new sidecar gate unit test), Playwright e2e-browser.
 
@@ -40,6 +40,8 @@ Freshell agent attention becomes one binary "needs attention" signal: any turn e
 - Red-Green-Refactor for every behavior change; never delete/weaken a test to pass — tests that pinned the old success-only contract are updated to pin the new unified contract (with the plan's per-test direction), never skipped.
 - Relative TS imports need `.js` extensions where NodeNext/ESM applies (client code uses `@/` aliases; the sidecar package uses plain ESM).
 - Rust: `cargo fmt` clean; pre-push gate runs typecheck + clippy + targeted cargo tests; PRs touching Rust must pass the required `rust-gate` check.
+- Cargo test commands with MULTIPLE test filters must put the filters after `--` (`cargo test -p CRATE -- FILTER_A FILTER_B` — the libtest harness ORs them; cargo itself accepts only one positional filter before `--`).
+- This machine's test backends are CONFIGURED cloud (`FRESHELL_VITEST_BACKEND=cloud`, `FRESHELL_E2E_BACKEND=cloud`): vitest lanes run via `npm run test:vitest -- ...` (the repo-owned path honoring the backend), and e2e verification runs the affected specs on the CONFIGURED backend (the cloud lane) — never a raw local-config Playwright invocation as the sole evidence. Affected/new e2e specs must actually run on the configured backend and must not sit in `CLOUD_SKIP_SPECS` (`test/e2e-browser/playwright.cloud.config.ts`).
 - The e2e fakes (`test/e2e-browser/fixtures/providers/fake-claude-sdk-sidecar.mjs`) must mirror the real sidecar's new semantics exactly — they are the e2e contract.
 - All new `freshAgent.turn.complete` frames must carry a finite numeric strictly-monotonic per-session `at` (client drops malformed `at` silently).
 - Terminal-mode CLI panes and the codex remote-proxy lane (`remote_proxy.rs`, feeds the terminal activity hub) are NOT touched.
@@ -117,7 +119,7 @@ fn settle_turn_outcome(
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `cargo test -p freshell-freshagent errored_turn_emits failed_settle_emits -- --nocapture`
+Run: `cargo test -p freshell-freshagent -- errored_turn_emits failed_settle_emits --nocapture`
 
 Expected: PASS
 
@@ -140,25 +142,26 @@ git add crates/freshell-freshagent/src/opencode_ws.rs
 git commit -m "feat(freshopencode): ring the unified attention edge on any turn end except user interrupt"
 ```
 
-### Task 2: freshcodex — widen the turn/completed status guard
+### Task 2: freshcodex — widen the turn/completed status guard with a user-interrupt marker
 
 **Files:**
 - Modify: `crates/freshell-codex/src/events.rs:151-185` (`on_turn_completed`) and its module doc `:6-15`
+- Modify: the interrupt lane — trace from `crates/freshell-freshagent/src/codex/controls.rs` (interrupt verb) to the freshell-codex client call that issues the interrupt to the app server; add the marker where that lane can share state with `on_turn_completed` (the subscription/session state struct)
 - Test: `crates/freshell-codex/tests/completion_gating.rs`, `crates/freshell-codex/src/events.rs` in-file tests (:269-436), `crates/freshell-freshagent/src/codex.rs:13602-13652` (compact failed/interrupted test)
 
 **Interfaces:**
 - Consumes: `turn_status(&event.params)` (protocol.rs:355-368), `next_monotonic_turn_complete_at`, `TURN_STATUSES` = `completed|interrupted|failed|inProgress` (protocol.rs:28).
-- Produces: new guard semantics consumed by all freshagent codex lanes: emit for `Some("completed") | Some("failed") | None`; suppress for `Some("interrupted") | Some("inProgress")`.
+- Produces: new guard semantics consumed by all freshagent codex lanes: emit for `Some("completed") | Some("failed") | None`, and for `Some("interrupted")` WITHOUT a recorded user-interrupt marker; suppress for `Some("inProgress")` and `Some("interrupted")` WITH a pending user-interrupt marker (the marker is set by the interrupt control lane and consumed by the matching interrupted completion). The marker mirrors opencode's `turn_aborted` precedent: only a USER-initiated interrupt is silent — an automation/rollback-forced `interrupted` is a turn end the user didn't witness and rings.
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
 Rewrite the status matrix in `crates/freshell-codex/tests/completion_gating.rs`:
-- `each_status_gates_the_completion_edge_in_both_wire_shapes` (:38-82) → `each_status_routes_the_unified_attention_edge_in_both_wire_shapes`: for `completed` and `failed` (both wire shapes) assert snapshot + exactly one TurnComplete; for `interrupted` and `inProgress` assert snapshot only.
+- `each_status_gates_the_completion_edge_in_both_wire_shapes` (:38-82) → `each_status_routes_the_unified_attention_edge_in_both_wire_shapes`: for `completed` and `failed` (both wire shapes) assert snapshot + exactly one TurnComplete; for `inProgress` assert snapshot only; for `interrupted` WITH the user-interrupt marker armed assert snapshot only; for `interrupted` WITHOUT a marker assert snapshot + TurnComplete (non-user interrupts ring).
 - `absent_status_and_foreign_thread_never_chime` (:84-104) → `absent_status_emits_the_edge_and_foreign_thread_never_does`: absent status now snapshot + TurnComplete; foreign thread unchanged (nothing).
-- `only_completed_advances_the_monotonic_clock` (:106-137) → `every_edge_emitting_status_advances_the_monotonic_clock`: `failed` advances the clock like `completed`; `interrupted` does not; same-ms `completed`→`failed` sequence gets strictly increasing `at`.
+- `only_completed_advances_the_monotonic_clock` (:106-137) → `every_edge_emitting_status_advances_the_monotonic_clock`: `failed` advances the clock like `completed`; marker-armed `interrupted` does not; same-ms `completed`→`failed` sequence gets strictly increasing `at`.
 
 Update the in-file `events.rs` tests to the same direction:
-- `interrupted_status_emits_snapshot_but_never_chimes` (:318-340) — unchanged contract (interrupt silent), keep.
+- `interrupted_status_emits_snapshot_but_never_chimes` (:318-340) → `interrupted_status_with_a_user_interrupt_marker_emits_snapshot_only` (arm the marker first) — keep, plus a new sibling `interrupted_status_without_a_marker_emits_the_unified_edge`.
 - `failed_status_never_chimes` (:342-355) → `failed_status_emits_the_unified_edge`.
 - `in_progress_status_never_chimes` (:357-370) — unchanged contract, keep.
 - `absent_status_never_chimes_but_still_snapshots` (:372-379) → `absent_status_emits_the_unified_edge_and_still_snapshots`.
@@ -167,28 +170,53 @@ Update the in-file `events.rs` tests to the same direction:
 
 Run: `cargo test -p freshell-codex --test completion_gating`
 
-Expected: FAIL — `failed`/absent cases produce no TurnComplete under the current guard.
+Expected: FAIL — `failed`/absent cases produce no TurnComplete under the current guard, and the no-marker interrupted case cannot even be expressed (no marker API yet).
 
 - [ ] **Step 3: Add the minimal production implementation**
+
+1. Marker: add a per-session `user_interrupt_pending: Arc<StdMutex<bool>>` (or turn-id-keyed set if the session supports concurrent turns — verify; the app-server protocol has one active turn, a bool suffices) to the freshell-codex subscription/session state that `on_turn_completed` already reads. Set it in the interrupt control lane (where the user's interrupt verb is dispatched to the app server); `on_turn_completed`'s interrupted branch consumes it (load + clear) and suppresses only when it was set.
+2. Guard replacement at :173:
 
 ```rust
 // events.rs — replace the guard at :173
 // Unified "needs attention": every turn/completed that ENDED the turn rings
-// except an interrupt — user- or automation-initiated alike, `interrupted`
-// is silent either way — and the non-terminal `inProgress` marker.
-// `completed`, `failed`, and an absent status (the turn ended, outcome
-// unknown) all ring identically.
-match turn_status(&event.params).as_deref() {
-    Some("interrupted") | Some("inProgress") => return out,
+// except a USER-initiated interrupt (the interrupt lane arms the
+// user_interrupt_pending marker; consume it here) and the non-terminal
+// `inProgress` marker. `completed`, `failed`, an absent status (the turn
+// ended, outcome unknown), and a NON-user `interrupted` (automation- or
+// rollback-forced) all ring identically — the user didn't witness any of
+// them.
+let status = turn_status(&event.params);
+match status.as_deref() {
+    Some("inProgress") => return out,
+    Some("interrupted") => {
+        if user_interrupt_pending.swap(false, Ordering::SeqCst) {
+            return out;
+        }
+    }
     _ => {}
 }
 ```
 
-Update the module doc at events.rs:6-15 to state the unified rule (interrupts and inProgress stay silent; completed/failed/absent ring).
+(Adapt the marker access to the actual state-handle shape `on_turn_completed` holds; if the guard site cannot reach the session state, thread the Arc the same way the subscription's `last_turn_complete_at` is threaded — both are per-session liveness-scoped.)
+
+Update the module doc at events.rs:6-15 to state the unified rule (user-armed interrupts and inProgress stay silent; completed/failed/absent and non-user interrupted ring).
 
 - [ ] **Step 4: Run the focused tests**
 
 Run: `cargo test -p freshell-codex --test completion_gating && cargo test -p freshell-codex events::`
+
+Expected: PASS
+
+- [ ] **Step 5: Refactor while green**
+
+None — guard replacement; doc comments updated in place.
+
+- [ ] **Step 6: Run impacted-test verification**
+
+Impacted set: every codex test touching the guard's output — `interrupt_rpc.rs` (`interrupt_turn_rpc_then_interrupted_completion_snapshots_without_chime` — drives the REAL interrupt lane, so the marker arms and it stays green), `app_server_drive.rs` `full_drive_interrupted_turn_does_not_chime` (same — verify its interrupt goes through the marker-arming lane; if it fabricates the completion directly, arm the marker in the test), and in freshagent `codex.rs`: `handle_compact_failed_or_interrupted_turn_produces_no_completion_chime` (:13602-13652) — SPLIT into `handle_compact_failed_turn_emits_the_unified_edge` (failed compact now rings; update assertions) and `handle_compact_interrupted_turn_with_a_user_interrupt_stays_silent` (drive the real interrupt lane so the marker arms; the interrupted half stays silent); `completed_turn_yields_snapshot_then_chime_frames` (:9897-9926, stays green); the superseded/stale-completion legs (:12842, :12994, :13143, :13265, stay green); `handle_send_always_broadcasts_accepted_before...` (stays green); `turn_complete_event_frames_carry_the_inner_type` (stays green).
+
+Run: `cargo test -p freshell-freshagent codex -- --nocapture`
 
 Expected: PASS
 
@@ -219,7 +247,7 @@ git commit -m "feat(freshcodex): ring the unified attention edge for failed and 
 
 **Interfaces:**
 - Consumes: `CodexAdapterEvent::TurnComplete { session_id, at }` and `adapter_event_to_frame` (codex.rs:9123-9159), `next_monotonic_turn_complete_at`, `QuietDeadman` fields (`deadline`, `stuck_since`), `quiet_handles` (:6419-6427), `now_ms()`.
-- Produces: `CodexSession.synthesized_attention_at: Arc<StdMutex<Option<i64>>>` — the per-session monotonic clock for edges minted OUTSIDE the consumer (crash/deadman). Note: the consumer's own `CodexSubscription.last_turn_complete_at` is a separate in-memory clock; wall-clock advancement keeps the two ordered in practice (a cross-clock NTP-backwards collision would at worst swallow one edge; accepted, same regime as controls.rs's waiting clock).
+- Produces: `CodexSession.synthesized_attention_at: Arc<StdMutex<Option<i64>>>` — the per-session monotonic clock for edges minted OUTSIDE the consumer (crash/deadman). PREFER sharing the consumer subscription's own `last_turn_complete_at` Arc (thread it into the exit-watcher and the deadman at spawn, the same way `quiet_deadman` is threaded) so ordinary and synthesized edges use ONE clock and can never collide; fall back to a second `synthesized_attention_at` clock ONLY if the consumer's handle genuinely cannot reach those sites — then wall-clock advancement keeps the two ordered in practice (a cross-clock NTP-backwards collision would at worst swallow one edge; accepted residual, same regime as controls.rs's waiting clock).
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
@@ -230,7 +258,7 @@ git commit -m "feat(freshcodex): ring the unified attention edge for failed and 
 
 - [ ] **Step 2: Run and verify the intended failure**
 
-Run: `cargo test -p freshell-freshagent onexit_self_heel deadman -- --nocapture` (adjust selectors to match: `onexit_self_heal quiet_deadman`)
+Run: `cargo test -p freshell-freshagent -- onexit_self_heal quiet_deadman --nocapture`
 
 Expected: FAIL — no turn.complete is emitted today on crash or deadman fire.
 
@@ -264,7 +292,7 @@ if turn_was_in_flight {
 
 - [ ] **Step 4: Run the focused tests**
 
-Run: `cargo test -p freshell-freshagent onexit_self_heal quiet_deadman -- --nocapture`
+Run: `cargo test -p freshell-freshagent -- onexit_self_heal quiet_deadman --nocapture`
 
 Expected: PASS
 
@@ -291,13 +319,13 @@ git commit -m "feat(freshcodex): ring the unified attention edge on crash-while-
 
 **Files:**
 - Create: `crates/freshell-claude-sidecar/turn-complete-gate.mjs` (pure gate module)
-- Modify: `crates/freshell-claude-sidecar/index.mjs` — result case (:279-300), `handleInterrupt` (:483-506), the per-send reset points, sidecar protocol doc (:34-35), ADR comment (:49-52)
+- Modify: `crates/freshell-claude-sidecar/index.mjs` — result case (:279-300), `handleInterrupt` (:483-506), `consumeStream` catch arm (:311-331), sidecar protocol doc (:34-35), ADR comment (:49-52)
 - Test: `test/unit/sidecar/claude-turn-complete-gate.test.ts` (new; imports the pure module by relative path)
-- Modify: `test/e2e-browser/fixtures/providers/fake-claude-sdk-sidecar.mjs` (:251-258 guard + interrupt handling) — parity with the real sidecar
+- Modify: `test/e2e-browser/fixtures/providers/fake-claude-sdk-sidecar.mjs` (:251-258 guard + interrupt handling + crash lane) — parity with the real sidecar
 
 **Interfaces:**
-- Consumes: per-session sidecar state `st` (add `st.turnCompleteGate`), `nextMonotonic` (:170-172), SDK result message (`subtype: 'success' | 'error_during_execution' | 'error_max_turns' | 'error_max_budget_usd' | 'error_max_structured_output_retries'`), `sdk.interrupt_settled{ok}` frames (settle lands BEFORE the interrupted turn's result per the SDK contract, sdk.d.ts:3765).
-- Produces: `createTurnCompleteGate()` — pure state machine with `noteInterruptRequest()`, `noteInterruptSettled(ok: boolean)`, `resultEmitsAttention(): boolean` (consumes a pending mark; ALWAYS returns true when no mark), `reset()`. Emission rule: EVERY result emits `sdk.turn.complete` (any subtype — success, error_*, success-with-is_error) EXCEPT a result consumed by a pending accepted user-interrupt mark.
+- Consumes: per-session sidecar state `st` (add `st.turnCompleteGate`), `nextMonotonic` (:170-172), SDK result message (`subtype: 'success' | 'error_during_execution' | 'error_max_turns' | 'error_max_budget_usd' | 'error_max_structured_output_retries'`), `sdk.interrupt_settled{ok}` frames (settle lands BEFORE the interrupted turn's result per the SDK contract, sdk.d.ts:3765), `st.turnOpen` (:350, the mid-flight turn latch, cleared at a result).
+- Produces: `createTurnCompleteGate()` — pure state machine with `noteInterruptRequest()`, `noteInterruptSettled(ok: boolean)`, `resultEmitsAttention(): boolean` (consumes a pending mark; ALWAYS returns true when no mark). NO `reset()` and NO reset-at-send: the SDK serializes turns within one query (a queued send is input pushed onto the same stream; results arrive in turn order), so the interrupted turn's result is deterministically the FIRST result after the accepted settle — the mark is consumed by exactly that result. A reset-at-send would race (a queued send clears the mark before the interrupted turn's late result arrives → the user's own interrupt rings); lifecycle bounds staleness instead (the mark dies with the session state in `consumeStream`'s `sessions.delete`). Emission rule: EVERY result emits `sdk.turn.complete` (any subtype — success, error_*, success-with-is_error) EXCEPT a result consumed by a pending accepted user-interrupt mark.
 
 - [ ] **Step 1: Write the failing behavioral test**
 
@@ -330,11 +358,16 @@ describe('freshell-claude-sidecar turn-complete gate', () => {
     expect(gate.resultEmitsAttention()).toBe(true)
   })
 
-  it('a stale mark never leaks into a later send (reset)', () => {
+  it('a mark survives a queued send and still consumes only the interrupted turn\'s result (no reset-at-send)', () => {
+    // Ordering contract: the SDK serializes turns within one query, so the
+    // interrupted turn's result is the FIRST result after the settle even if
+    // the next prompt was queued before it arrived.
     const gate = createTurnCompleteGate()
     gate.noteInterruptRequest()
-    gate.reset()
-    expect(gate.resultEmitsAttention()).toBe(true)
+    gate.noteInterruptSettled(true)
+    // (queued send happens here — the gate deliberately does NOT reset)
+    expect(gate.resultEmitsAttention()).toBe(false) // interrupted turn's late result
+    expect(gate.resultEmitsAttention()).toBe(true)  // the queued turn's own result
   })
 })
 ```
@@ -361,7 +394,16 @@ Expected: FAIL — module does not exist yet.
  * receipt lands BEFORE the interrupted turn's own terminal result, so an
  * accepted interrupt arms a mark that consumes (and suppresses) exactly
  * that result. A rejected interrupt (ok:false — the turn kept running)
- * clears the mark; a new send clears any stale mark.
+ * clears the mark.
+ *
+ * There is DELIBERATELY no reset-on-send: the SDK serializes turns within
+ * one query (a queued send is input pushed onto the same stream, and
+ * results arrive in turn order), so the interrupted turn's result is
+ * deterministically the FIRST result after the accepted settle. A
+ * reset-at-send would race a queued send against the interrupted turn's
+ * late result and let the user's own interrupt ring. Staleness is bounded
+ * by the session lifecycle instead — the mark dies with the session state
+ * when consumeStream's finally deletes it.
  */
 export function createTurnCompleteGate() {
   let userInterruptPending = false
@@ -373,13 +415,12 @@ export function createTurnCompleteGate() {
       userInterruptPending = false
       return !interrupted
     },
-    reset() { userInterruptPending = false },
   }
 }
 ```
 
 `index.mjs` wiring (per session state `st`):
-1. Create the gate where the session state is initialized (alongside `lastTurnCompleteAt`), and call `st.turnCompleteGate.reset()` at the top of every send/create handling (the same place `lastTurnCompleteAt` is initialized/reset for a new turn scope).
+1. Create the gate where the session state is initialized (alongside `lastTurnCompleteAt`). Do NOT reset it on send/create — see the module doc's ordering argument.
 2. In `handleInterrupt` (:483-506): call `st.turnCompleteGate.noteInterruptRequest()` immediately before `st.query.interrupt()`; in the `.then` arm call `noteInterruptSettled(true)`, in the `.catch` arm `noteInterruptSettled(false)`.
 3. In the result case (:279-300): replace the `if (msg.subtype === 'success')` block with:
 
@@ -395,9 +436,25 @@ export function createTurnCompleteGate() {
       }
 ```
 
-4. Update the protocol doc at :34-35 and the ADR comment at :49-52 to the new contract (including that an accepted user interrupt's result is consumed silently and the stale "interrupts yield no result at all" claim is corrected).
+4. In `consumeStream`'s catch arm (:315-316) — a mid-turn stream EXCEPTION ends the turn without any result frame and without process death (the sidecar stays alive), so it must ring on its own: after emitting `sdk.error`, if `st?.turnOpen` is still true (no result cleared it) consult the same gate and emit the edge:
 
-5. `test/e2e-browser/fixtures/providers/fake-claude-sdk-sidecar.mjs`: replace the `if (subtype === 'success')` guard (:251-258) with the same gate logic — import `createTurnCompleteGate` from the real sidecar package. The fake's interrupt arm (:408-440) exists but only models the no-in-flight-query shape (settle `ok:false`, no result after) — for the interrupt-silence e2e to be non-vacuous, EXTEND it: an interrupt while a turn is in flight settles `ok:true` and is followed by the interrupted turn's own non-success `sdk.result` (mirroring the real SDK contract, sdk.d.ts:3765), which the fake's gate must then suppress. The deny-lane e2e (fresh-agent-control-rust.spec.ts:674-734 asserts `sdk.turn.complete` absence up to idle after deny) will be updated in Task 6 to expect the edge.
+```js
+  } catch (err) {
+    emit({ type: 'sdk.error', sessionId, message: `SDK error: ${err?.message || 'Unknown error'}` })
+    // A stream exception mid-turn IS a turn end the user didn't witness —
+    // ring the unified edge (the abort/sdk.exit path is a REQUESTED
+    // teardown and deliberately stays silent).
+    if (st?.turnOpen && st.turnCompleteGate.resultEmitsAttention()) {
+      const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
+      st.lastTurnCompleteAt = at
+      emit({ type: 'sdk.turn.complete', sessionId, at })
+    }
+  }
+```
+
+5. Update the protocol doc at :34-35 and the ADR comment at :49-52 to the new contract (an accepted user interrupt's result is consumed silently; the stale "interrupts yield no result at all" claim is corrected; a mid-turn stream exception emits the attention edge).
+
+6. `test/e2e-browser/fixtures/providers/fake-claude-sdk-sidecar.mjs`: replace the `if (subtype === 'success')` guard (:251-258) with the same gate logic — import `createTurnCompleteGate` from the real sidecar package. The fake's interrupt arm (:408-440) exists but only models the no-in-flight-query shape (settle `ok:false`, no result after) — for the interrupt-silence e2e to be non-vacuous, EXTEND it: an interrupt while a turn is in flight settles `ok:true` and is followed by the interrupted turn's own non-success `sdk.result` (mirroring the real SDK contract, sdk.d.ts:3765), which the fake's gate must then suppress. Mirror the catch-arm edge too: the fake's crash lane (its `crash` event) must emit the same `sdk.turn.complete` when a turn was open, gate consulted, so the mid-turn stream-crash e2e (Task 7) is drivable. The deny-lane e2e (fresh-agent-control-rust.spec.ts:674-734 asserts `sdk.turn.complete` absence up to idle after deny) will be updated in Task 7 to expect the edge.
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -445,15 +502,20 @@ Expected: FAIL — the with-turn test finds no turn.complete frame today.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-In the unrequested-death arm (where `emit_fresh_agent_error(... SIDECAR_EXITED ...)` fires, claude.rs:8129-8179): if the consumer's turn latch (`in_turn`) was armed at EOF, mint and broadcast the edge BEFORE the session is evicted (capture the broadcast id first, mirroring the existing arm's ordering):
+**Placement (critical):** by the time control reaches the unrequested-death arm (:8129-8179), the EOF handling has ALREADY cleared `in_turn` (:8098-8113) and evicted the session from the map (:8119-8128) — so reading `in_turn` or the session there is always false/gone. Capture the pre-state at the TOP of the EOF handling, before any clearing/eviction:
+
+1. At EOF-detected entry (before :8098): capture `let turn_was_in_flight = in_turn.load(Ordering::SeqCst);` and clone the clock handle + ids the death arm needs (`session.last_synthesized_complete_at` Arc clone, broadcast id, sidecar session id, session_type) into locals that survive the eviction.
+2. In the unrequested-death arm (where `emit_fresh_agent_error(... SIDECAR_EXITED ...)` fires), mint using the CAPTURED values — not the (now-cleared) latch or the (now-evicted) session:
 
 ```rust
 // Unified "needs attention": an unrequested sidecar death ends any in-flight
 // turn — the user must come look. Requested deaths (kill/shutdown/teardown)
-// stay silent: the user caused them or the pane is already gone.
-if in_turn.load(Ordering::SeqCst) {
+// stay silent: the user caused them or the pane is already gone. The armed
+// state was captured at EOF entry — the code below the eviction site has
+// already cleared in_turn and dropped the session, so it cannot be read here.
+if turn_was_in_flight {
     let at = {
-        let mut guard = session.last_synthesized_complete_at.lock().expect("synthesized clock");
+        let mut guard = last_synthesized_complete_at.lock().expect("synthesized clock");
         let at = freshell_codex::next_monotonic_turn_complete_at(*guard, now_ms());
         *guard = Some(at);
         at
@@ -468,11 +530,11 @@ if in_turn.load(Ordering::SeqCst) {
 }
 ```
 
-(Adapt to the arm's actual variable names; the `session_type` covers both freshclaude and kilroy. Requested deaths never reach this arm — the map entry is removed first, unchanged.)
+(Adapt to the arm's actual variable names; the `session_type` covers both freshclaude and kilroy. Requested deaths never reach this arm — the map entry is removed first, unchanged. The clock Arc lives on after eviction because it was cloned out at capture time; if the session struct is not reachable at EOF entry either, store the clock Arc in the same map/slot the consumer already holds for the session's liveness.)
 
 - [ ] **Step 4: Run the focused tests**
 
-Run: `cargo test -p freshell-freshagent sidecar_death in_turn_clears -- --nocapture`
+Run: `cargo test -p freshell-freshagent -- sidecar_death in_turn_clears --nocapture`
 
 Expected: PASS
 
@@ -495,7 +557,62 @@ git add crates/freshell-freshagent/src/claude.rs
 git commit -m "feat(freshclaude): ring the unified attention edge when the sidecar dies with a turn in flight"
 ```
 
-### Task 6: client contract updates, e2e spec updates, and the unified-signal e2e
+### Task 6: client behavior corrections — no persisted attention, watched = tab-only mark, bell rings once per event
+
+**Files:**
+- Modify: `src/store/turnCompletionSlice.ts:40-72` (rehydrate path), `src/store/persistMiddleware.ts:726-733` (persisted keys), `src/hooks/useTurnCompletionNotifications.ts:45-71` (mark + sound effect)
+- Test: `test/unit/client/store/turnCompletionPersistence.test.ts`, `test/unit/client/hooks/useTurnCompletionNotifications.test.tsx`
+
+**Interfaces:**
+- Consumes: the existing `recordTurnComplete`/attention action shapes and selectors (unchanged); the fold from Task 5's edges.
+- Produces: (1) `attentionByTab`/`attentionByPane` are no longer persisted to localStorage nor rehydrated on load — a page reload witnesses NOTHING (pre-load turn ends produce no highlight, honoring "reload... highlights no tabs for turn ends that happened before the page loaded"); (2) a watched turn ending (window focused AND the event's tab is the active tab) dispatches ONLY the tab attention mark — the pane-header mark (`attentionByPane`) is suppressed along with the sound (recorded interpretation: the tab attention flag's own surfaces — tab strip and its sidebar row — may show; the pane-header green is the mark beyond "the tab" and is suppressed); (3) the bell rings once PER EVENT — the effect-batch sound coalescing is removed.
+
+- [ ] **Step 1: Write the failing behavioral tests (RED)**
+
+1. `test/unit/client/store/turnCompletionPersistence.test.ts` — the rehydration protection (:42-56) inverts: after a store rehydrate from a persisted payload that contains attention entries, `attentionByTab`/`attentionByPane` must be EMPTY. Keep green every assertion about the OTHER persisted turnCompletion state (only the attention maps drop out of the contract).
+2. `test/unit/client/hooks/useTurnCompletionNotifications.test.tsx`:
+   - the mark matrix (:151-192): the watched case (focused window + active tab) now asserts tab attention SET, pane attention NOT set, no sound; every background case keeps tab+pane marks + one sound per event.
+   - the burst case (:236-259): a two-event effect batch now expects TWO `play()` calls (one per event), replacing the single-coalesced-call expectation.
+3. Check `test/e2e/fresh-agent-turn-complete-notification.test.tsx` for bell-count expectations and update them to per-event ringing if it pins the old coalescing.
+
+- [ ] **Step 2: Run and verify the intended failure**
+
+Run: `npm run test:vitest -- run test/unit/client/store/turnCompletionPersistence.test.ts test/unit/client/hooks/useTurnCompletionNotifications.test.tsx --config config/vitest/vitest.config.ts`
+
+Expected: FAIL — attention rehydrates today, watched endings mark panes, and the burst coalesces to one play.
+
+- [ ] **Step 3: Add the minimal production implementation**
+
+1. `persistMiddleware.ts:726-733`: drop the attention keys from the persisted turnCompletion payload.
+2. `turnCompletionSlice.ts:40-72`: the rehydrate path ignores/strips attention entries (no restoration of `attentionByTab`/`attentionByPane`).
+3. `useTurnCompletionNotifications.ts:45-71`: per processed event — if watched (window focused AND active tab id matches the event's tab id): dispatch the tab attention mark only (no pane mark, no sound); otherwise: dispatch tab + pane marks and call `play()` once for THIS event. The batch-level `anyCompletion` boolean and single trailing `play()` go away.
+
+- [ ] **Step 4: Run the focused tests**
+
+Run: `npm run test:vitest -- run test/unit/client/store/turnCompletionPersistence.test.ts test/unit/client/hooks/useTurnCompletionNotifications.test.tsx --config config/vitest/vitest.config.ts`
+
+Expected: PASS
+
+- [ ] **Step 5: Refactor while green**
+
+If the watched-check repeats, extract a tiny local predicate in the hook file; no new module.
+
+- [ ] **Step 6: Run impacted-test verification**
+
+Impacted set: anything asserting persisted/rehydrated attention or bell counts — `rg -n "attentionByTab|attentionByPane" src/ test/` (review each hit), plus `test/e2e/fresh-agent-turn-complete-notification.test.tsx`.
+
+Run: `npm run test:vitest -- run test/unit/client/store/ test/e2e/fresh-agent-turn-complete-notification.test.tsx --config config/vitest/vitest.config.ts`
+
+Expected: PASS
+
+- [ ] **Step 7: Commit the task**
+
+```bash
+git add src/store/turnCompletionSlice.ts src/store/persistMiddleware.ts src/hooks/useTurnCompletionNotifications.ts test/unit/client/store/turnCompletionPersistence.test.ts test/unit/client/hooks/useTurnCompletionNotifications.test.tsx
+git commit -m "feat(client): unified attention signal client corrections — no persisted attention, watched endings mark the tab only, bell per event"
+```
+
+### Task 7: wire-contract comments, e2e spec updates, and the unified-signal e2e on the configured backend
 
 **Files:**
 - Modify: `src/store/turnCompletionThunks.ts:44-54` (doc comment), `test/unit/client/lib/fresh-agent-ws.test.ts:484-538` (premise comment + companion fold test)
@@ -504,39 +621,38 @@ git commit -m "feat(freshclaude): ring the unified attention edge when the sidec
 - Create: `test/e2e-browser/specs/fresh-agent-error-turn-attention.spec.ts` (new e2e)
 
 **Interfaces:**
-- Consumes: Tasks 1-5's server edges (same frame shape as today's success edges); the client pipeline unchanged (outcome-agnostic: fresh-agent-ws.ts:388-414, turnCompletionThunks.ts:55-104).
-- Produces: e2e proof that an errored turn end in a background tab rings once, highlights tab+sidebar, and dismisses on visit.
+- Consumes: Tasks 1-6's server edges and client corrections (same frame shape as today's success edges; the fold stays outcome-agnostic).
+- Produces: e2e proof that an errored turn end in a background tab rings once, highlights tab+sidebar, and dismisses on visit — running on the CONFIGURED e2e backend.
 
 - [ ] **Step 1: Update the inverted contracts (RED)**
 
-1. `restore-matrix.spec.ts:1283-1289`: the `sentDuringCrash.some(type === 'freshAgent.turn.complete')` assertion reads the OUTBOUND browser→server ledger (vacuous w.r.t. server edges). Rewrite the lane to assert the crash RINGS via the server-frame path the harness exposes (mirror how `truly-idle-alerting.spec.ts` counts `turnCompletion.seq`): after the mid-turn crash of a freshcodex pane in a background tab, `turnCompletion.seq` increments by exactly 1 (the crash edge) — with the pane in the ACTIVE tab and the window focused it must NOT increment the bell count but the attention flag must still set (use the harness's focus/active-tab controls as the existing specs do).
+1. `restore-matrix.spec.ts:1283-1289`: the `sentDuringCrash.some(type === 'freshAgent.turn.complete')` assertion reads the OUTBOUND browser→server ledger (vacuous w.r.t. server edges). Rewrite the lane to assert the crash RINGS via the server-frame path the harness exposes (mirror how `truly-idle-alerting.spec.ts` counts `turnCompletion.seq`): after the mid-turn crash of a freshcodex pane in a background tab, `turnCompletion.seq` increments by exactly 1 (the crash edge) — with the pane in the ACTIVE tab and the window focused it must NOT ring the bell but the tab attention flag must still set (use the harness's focus/active-tab controls as the existing specs do).
 2. `fresh-agent-control-rust.spec.ts`:
    - deny lane (:674-734): the sidecar-wire absence assertions stay literally green, but the browser-facing contract flips — after deny, the tab must now get attention (assert `turnCompletion.seq === 1` and the emerald tab class), and the lane's `:96-101` comment rewrites to "deny is an unwitnessed error turn end — it rings the unified edge".
    - deadman lane (:1926-2015): after the stuck card appears, assert the unified attention edge also fired (`turnCompletion.seq` bump for the pane's tab) and the "never a fabricated idle/turn-complete" comments are replaced with the new contract (the deadman rings deliberately).
 3. `fresh-agent-ws.test.ts:484-538`: update the premise comment ("the deadman never fabricates a freshAgent.turn.complete" → "the STATUS frame itself dispatches no attention; the deadman's companion turn.complete edge is a separate frame") and add the companion assertion: a `freshAgent.status{stuck}` frame followed by a `freshAgent.turn.complete` frame for the same session folds status + attention independently (status fold dispatches no turnCompletion action; the edge dispatches recordTurnComplete — both asserted).
-4. `turnCompletionThunks.ts:44-54`: reword the doc comment from "ONLY on a positive completion" to the unified contract ("any turn end except a user-initiated interrupt; crashes and deadman fires included").
+4. `turnCompletionThunks.ts:44-54`: reword the doc comment from "ONLY on a positive completion" to the unified contract ("any turn end except a user-initiated interrupt; crashes, deadman fires, and mid-turn stream exceptions included").
 
 - [ ] **Step 2: Run and verify the intended failure**
 
 Run: `npm run test:vitest -- run test/unit/client/lib/fresh-agent-ws.test.ts --config config/vitest/vitest.config.ts`
 
-Expected: FAIL for the new companion assertions (before the Task 4 fake parity is exercised — run against the branch state; if the server-side lanes aren't exercised by this unit file, the new assertions are pure fold tests that PASS; treat Step 1's unit-file edits as contract updates verified green here, with the true RED evidence in the e2e steps below).
+Expected: the companion fold assertions PASS as pure fold tests (the true RED evidence for the e2e lanes is exercised in Step 4); treat this run as the contract-update verification and record it.
 
 - [ ] **Step 3: Add the new e2e spec**
 
-`test/e2e-browser/specs/fresh-agent-error-turn-attention.spec.ts` — model it on `truly-idle-alerting.spec.ts`'s harness (fake claude sidecar, two tabs, `turnCompletion.seq` counting, tab class assertions):
+`test/e2e-browser/specs/fresh-agent-error-turn-attention.spec.ts` — model it on `truly-idle-alerting.spec.ts`'s harness (fake claude sidecar, two tabs, `turnCompletion.seq` counting, tab class assertions), but build it CLOUD-LEGAL: drive everything through the fake's deterministic `__emit_*__` lanes — NO idle-grace-period or shade-transition timing dependencies (the exact patterns that put `truly-idle-alerting.spec.ts` itself in `CLOUD_SKIP_SPECS`; the new spec must NOT end up skipped):
 1. Create tab A with a freshclaude agent and tab B with a shell; keep tab B active (background the agent tab), window focused.
 2. Drive a turn that errors (the fake's deny/error lane: `__emit_result__` with `subtype: 'error_max_turns'`, or the approval-deny flow).
-3. Assert: bell rings once (`turnCompletion.seq === 1`), tab A gets the emerald attention class, the pane session's sidebar row highlights; the pane icon shows green (idle state), no amber card.
+3. Assert: bell rings once (`turnCompletion.seq === 1`), tab A gets the emerald attention class, the pane session's sidebar row highlights, and the pane-header mark is set (unwatched endings mark everything).
 4. Visit tab A → attention clears (click mode); send a new message → new turn; interrupt it via the pane's interrupt control while watching → assert NO new `turnCompletion` event (interrupt silence end-to-end). Drive the IN-FLIGHT interrupt shape via the fake sidecar's extended interrupt arm (Task 4): turn in flight → interrupt → settle `ok:true` → the interrupted turn's non-success `sdk.result` follows — the gate must suppress the edge, proving the silence is the GATE's doing, not a missing result frame (the fake's pre-existing no-in-flight arm would make this step vacuous).
-5. Drive a second errored turn while the window is unfocused (harness blur) → the bell path is not directly observable; assert `seq` increments and the attention flag sets (the suppression is unit-pinned; e2e asserts the fold).
+5. Drive a second errored turn while the window is unfocused (harness blur) → the bell path is not directly observable; assert `seq` increments and the attention flag sets (the suppression is unit-pinned in Task 6; e2e asserts the fold).
+6. Drive the mid-turn stream-crash lane: freshclaude turn in flight in a background tab → fake's crash event → assert the unified edge rings (`turnCompletion.seq` increments once) and the pane resolves to idle (the Task 4 catch-arm edge, e2e-witnessed).
 
-- [ ] **Step 4: Run the focused tests**
+- [ ] **Step 4: Run the affected e2e specs on the CONFIGURED backend**
 
-Run the affected e2e specs on the configured backend (default local):
-`npx playwright test test/e2e-browser/specs/fresh-agent-error-turn-attention.spec.ts test/e2e-browser/specs/fresh-agent-control-rust.spec.ts test/e2e-browser/specs/restore-matrix.spec.ts --config test/e2e-browser/playwright.config.ts`
-
-Expected: PASS
+1. First verify the backend scope: `rg -n "fresh-agent-error-turn-attention|fresh-agent-control-rust|restore-matrix" test/e2e-browser/playwright.cloud.config.ts` — none of the three may appear in `CLOUD_SKIP_SPECS` (`fresh-agent-control-rust.spec.ts` and `restore-matrix.spec.ts` are NOT skipped today; the new spec must not be added there either). A spec sitting in the skip list or a filter that matched no tests is NOT coverage.
+2. Inner-loop iteration may use local runs (`npm run test:e2e:local --` scoped to the three specs, or the local Playwright config), but the EVIDENCE run is the configured backend (`FRESHELL_E2E_BACKEND=cloud`): `npm run test:e2e` (full cloud lane — it runs the affected specs as part of the suite; if the cloud lane supports spec passthrough filtering, scope it to the three specs). Expected: PASS with the three specs actually executed on the cloud lane (confirm they ran, not filtered).
 
 - [ ] **Step 5: Refactor while green**
 
@@ -544,8 +660,8 @@ Extract any repeated "drive errored turn" fixture helpers into the fake's suppor
 
 - [ ] **Step 6: Run impacted-test verification**
 
-Run the full fresh-agent e2e directory plus the client unit files touching the fold:
-`npm run test:vitest -- run test/unit/client/lib/fresh-agent-turn-complete.test.ts test/unit/client/lib/fresh-agent-ws.test.ts test/e2e/fresh-agent-turn-complete-notification.test.tsx --config config/vitest/vitest.config.ts`
+Run the client unit files touching the fold on the repo-owned vitest path (configured backend):
+`npm run test:vitest -- run test/unit/client/lib/fresh-agent-turn-complete.test.ts test/unit/client/lib/fresh-agent-ws.test.ts --config config/vitest/vitest.config.ts`
 
 Expected: PASS
 
@@ -553,10 +669,10 @@ Expected: PASS
 
 ```bash
 git add src/store/turnCompletionThunks.ts test/unit/client/lib/fresh-agent-ws.test.ts test/e2e-browser/specs/
-git commit -m "test(fresh-agent): pin the unified attention signal end-to-end (errored turns ring; crash and deadman lanes invert)"
+git commit -m "test(fresh-agent): pin the unified attention signal end-to-end (errored turns ring; crash, deny, and deadman lanes invert; configured-backend evidence)"
 ```
 
-### Task 7: documentation contract update
+### Task 8: documentation contract update
 
 **Files:**
 - Modify: `AGENTS.md` ("Agent Status Indicators" paragraph), `docs/development/` only if a doc names the success-only rule (grep first; the rename-scope contract does not).
@@ -565,7 +681,7 @@ git commit -m "test(fresh-agent): pin the unified attention signal end-to-end (e
 
 - [ ] **Step 1: Rewrite the AGENTS.md contract paragraph**
 
-Rewrite the "Agent Status Indicators" sentences that read "a discrete `freshAgent.turn.complete` edge emitted only on a positive completion — freshclaude/kilroy on the SDK `result` with `subtype === 'success'`, freshopencode on the success-only `emitStatus(idle)` path, and freshcodex on `turn/completed` only when `params.turn.status === 'completed'`" to the unified rule: every turn end the user didn't witness rings one identical edge — success, error, max-turns, crashed (sidecar death with a turn in flight), wedged/stuck (codex deadman), and approval/question (turn.waiting) — with only user-initiated interrupts silent; freshclaude/kilroy emit for any `result` subtype unless an accepted user interrupt consumed it, freshcodex for `completed`/`failed`/absent statuses, freshopencode for every settle except `turn_aborted`. Also correct the stale claim "only Claude/kilroy raise approvals/questions" (codex controls does too) and the "no chime — a crash is not a positive completion" phrasing for the codex crash self-heal (now: crash-while-busy rings; the exit still clears blue).
+Rewrite the "Agent Status Indicators" sentences that read "a discrete `freshAgent.turn.complete` edge emitted only on a positive completion — freshclaude/kilroy on the SDK `result` with `subtype === 'success'`, freshopencode on the success-only `emitStatus(idle)` path, and freshcodex on `turn/completed` only when `params.turn.status === 'completed'`" to the unified rule: every turn end the user didn't witness rings one identical edge — success, error, max-turns, crashed (sidecar death with a turn in flight), mid-turn stream exception, wedged/stuck (codex deadman), and approval/question (turn.waiting) — with only USER-initiated interrupts silent; freshclaude/kilroy emit for any `result` subtype unless an accepted user interrupt's gate consumed it, freshcodex for `completed`/`failed`/absent statuses and non-user `interrupted` (the interrupt lane arms a per-session marker; only marker-armed interrupts are silent), freshopencode for every settle except `turn_aborted`. Also update the client-side sentences: attention flags are no longer persisted across reloads (a reload witnesses nothing), watched endings mark the tab flag only (no pane-header mark, no sound), and the bell rings once per event. Also correct the stale claim "only Claude/kilroy raise approvals/questions" (codex controls does too) and the "no chime — a crash is not a positive completion" phrasing for the codex crash self-heal (now: crash-while-busy rings; the exit still clears blue).
 
 - [ ] **Step 2: Verify**
 
@@ -585,13 +701,16 @@ git commit -m "docs(agents): rewrite the turn-complete attention contract to the
 ## Verification summary
 
 - Unit/Rust per-task gates: as listed in each task's Step 4/6.
+- E2e evidence runs on the CONFIGURED backend (`FRESHELL_E2E_BACKEND=cloud`): the three affected specs must actually execute (not be skipped/filtered) and pass on the cloud lane.
 - End-of-execution full-suite gate: `npm test` (coordinated) from the worktree, green excluding ledger-recorded pre-existing failures.
-- The user-visible outcome proof: `fresh-agent-error-turn-attention.spec.ts` (errored background turn → one bell + emerald tab + sidebar highlight; interrupt while watching → silence; crash + deadman lanes in the updated specs).
+- The user-visible outcome proof: `fresh-agent-error-turn-attention.spec.ts` (errored background turn → one bell + emerald tab + sidebar highlight; interrupt while watching → silence; crash, deny, and deadman lanes in the updated specs).
 
 ## Known accepted consequences (record for reviewers)
 
 1. `FreshAgentView` treats every `freshAgent.turn.complete` as snapshot/transcript-invalidating, so error/crash/stuck endings now also trigger one snapshot refetch per visible pane (bounded; failed fetches flow into existing error/lost handling). Deliberately accepted — no client change.
 2. A wedged codex turn that later genuinely completes fires two edges (stuck fire, then completion) — two honest events, two rings, monotonic `at` keeps them distinct. Accepted.
-3. Two per-session `at` clocks exist where synthesized edges are minted (consumer clock vs synthesized clock in codex/claude); wall-clock advancement orders them in practice — same accepted regime as the existing controls-lane waiting clock.
-4. Absent-status codex completions (outcome unknown) now ring — an ended turn is an ended turn.
+3. Where synthesized edges are minted, the implementation PREFERS sharing the consumer subscription's own `at` clock (one clock per session — no cross-clock collision possible); if a site genuinely cannot reach it, a second per-session clock exists and wall-clock advancement orders the two in practice — same accepted regime as the existing controls-lane waiting clock (a cross-clock same-millisecond or NTP-backwards collision would at worst swallow one edge; rare and self-healing on the next event).
+4. Absent-status codex completions (outcome unknown) and non-user `interrupted` completions (automation/rollback-forced) now ring — an ended turn is an ended turn, and the user didn't witness it.
 5. Compacts follow the same widened rule as turns (their `result`/turn-completed ends ring on non-interrupt outcomes), for all three providers.
+6. With per-event bells, two events landing in the same effect tick each call `play()`; the audio element restart makes a same-tick burst sound like one slightly longer chime — each event still rings (the call is per-event), the audible overlap is a platform artifact. Accepted.
+7. Watched endings set the tab attention flag, which also shows on the session's sidebar row (the flag's own surface); the pane-header green mark is the surface suppressed for watched endings. Recorded interpretation of "visual mark on the tab only".
