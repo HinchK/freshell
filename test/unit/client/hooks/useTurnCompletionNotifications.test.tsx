@@ -12,6 +12,7 @@ import turnCompletionReducer, {
   clearPaneAttention,
 } from '@/store/turnCompletionSlice'
 import { paneSelectionMiddleware } from '@/lib/pane-focus-ownership'
+import { handleUiCommand } from '@/lib/ui-commands'
 import { useTurnCompletionNotifications } from '@/hooks/useTurnCompletionNotifications'
 import type { Tab, AttentionDismiss } from '@/store/types'
 
@@ -19,6 +20,10 @@ const playSound = vi.hoisted(() => vi.fn())
 
 vi.mock('@/hooks/useNotificationSound', () => ({
   useNotificationSound: () => ({ play: playSound }),
+}))
+
+vi.mock('@/lib/ui-screenshot', () => ({
+  captureUiScreenshot: vi.fn(),
 }))
 
 function TestComponent() {
@@ -328,6 +333,57 @@ describe('useTurnCompletionNotifications', () => {
         store.dispatch(setActiveTab('tab-1'))
       })
       expect(store.getState().turnCompletion.watchedCompletionByTab['tab-1']).toBeUndefined()
+    })
+
+    it('watched mark survives a same-target re-click of the already-active tab', async () => {
+      const store = createStore('tab-1', 'click')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      act(() => {
+        store.dispatch(recordTurnComplete({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-1', at: 100 }))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.watchedCompletionByTab['tab-1']).toBe(true)
+      })
+
+      // Re-clicking the tab that is already active is not an away-and-back
+      // round trip — the mark clears only after the user navigates away
+      // and back.
+      act(() => {
+        store.dispatch(setActiveTab('tab-1'))
+      })
+      expect(store.getState().turnCompletion.watchedCompletionByTab['tab-1']).toBe(true)
+    })
+
+    it('watched mark survives an agent tab.select ui.command targeting the marked (already-active) tab', async () => {
+      const store = createStore('tab-1', 'click')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      act(() => {
+        store.dispatch(recordTurnComplete({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-1', at: 100 }))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.watchedCompletionByTab['tab-1']).toBe(true)
+      })
+
+      // The server-broadcast agent select-tab re-asserts the current tab —
+      // the user never navigated away, so the mark survives.
+      act(() => {
+        handleUiCommand({ type: 'ui.command', command: 'tab.select', payload: { id: 'tab-1' } }, store.dispatch)
+      })
+      expect(store.getState().turnCompletion.watchedCompletionByTab['tab-1']).toBe(true)
     })
 
     it('attention persists in type mode after switching tabs', async () => {

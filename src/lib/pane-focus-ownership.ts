@@ -292,11 +292,14 @@ const PANE_SELECTION_ACTIONS = new Set([
   'panes/closePane',
 ])
 
-/** Watched fresh-agent completions mark the tab strip only, and clear on any
- *  later (re)activation of the tab — re-activation implies the navigate-away
- *  leg already happened ("the mark clears next time the user navigates away
- *  and back"). The reducer is a reference-preserving no-op when the tab has
- *  no watched mark. */
+/** Watched fresh-agent completions mark the tab strip only, and clear when
+ *  the user navigates away and back ("the mark clears next time the user
+ *  navigates away and back"): a tabs/setActiveTab clears the target's mark
+ *  only when the PREVIOUS active tab differs from the target — same-target
+ *  re-asserts (re-clicking the active tab, an agent select-tab ui.command, a
+ *  machine-switch restore of the current id) never left, so the mark
+ *  survives them. The reducer is a reference-preserving no-op when the tab
+ *  has no watched mark. */
 type StoreLike = {
   getState: () => {
     tabs?: { activeTabId?: string | null }
@@ -322,8 +325,10 @@ export const paneSelectionMiddleware =
       || a?.type === 'tabs/setActiveTab'
     ) {
       paneSelectionSerial += 1
+      const isTabActivation = a.type === 'tabs/setActiveTab'
+      const prevActiveTabId = isTabActivation ? store.getState().tabs?.activeTabId : undefined
       const result = next(action)
-      if (a.type === 'tabs/setActiveTab') {
+      if (isTabActivation && prevActiveTabId !== a.payload) {
         clearWatchedCompletionFor(store, a.payload)
       }
       return result

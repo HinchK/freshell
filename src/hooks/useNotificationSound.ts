@@ -8,9 +8,10 @@ const NOTIFICATION_SOUND_SRC = '/your-code-is-ready.mp3'
  * play() never fires `ended`) and invoke `onDone` when the tone COMPLETES.
  * The OscillatorNode is an AudioScheduledSourceNode and fires `ended` at its
  * stop time — that completion signal drives ring-queue progression, never a
- * fixed timeout. Returns false when no audio machinery exists at all (nothing
- * can ever complete), so the caller advances the queue immediately instead of
- * stalling every later honest ring behind a dead one.
+ * fixed timeout. Returns false when no completion signal can ever fire right
+ * now — no audio machinery exists at all, or the context is (or remains)
+ * autoplay-suspended, its clock frozen — so the caller advances the queue
+ * immediately instead of stalling every later honest ring behind a dead one.
  */
 function playFallbackTone(ctxRef: { current: AudioContext | null }, onDone: () => void): boolean {
   try {
@@ -22,6 +23,21 @@ function playFallbackTone(ctxRef: { current: AudioContext | null }, onDone: () =
     }
 
     const ctx = ctxRef.current
+    // An autoplay-suspended context (created before user activation) never
+    // advances its clock, so a tone's `ended` would NEVER fire and the dead
+    // ring would wedge the whole queue. Best-effort resume; if the context
+    // is (or remains) suspended, treat this ring as dead — return false so
+    // the caller advances the queue exactly like the no-machinery path (a
+    // later user-gesture resume lets the NEXT ring's tone play normally).
+    if (ctx.state === 'suspended') {
+      try {
+        void ctx.resume().catch(() => {})
+      } catch {
+        // best-effort only — a context that cannot resume stays suspended
+      }
+      if (ctx.state === 'suspended') return false
+    }
+
     const oscillator = ctx.createOscillator()
     const gain = ctx.createGain()
 
@@ -75,6 +91,9 @@ export function useNotificationSound() {
     const armFallback = () => {
       if (fallbackArmed) return
       fallbackArmed = true
+      // A spurious `error` after a successful `ended` must not play an
+      // audible stray tone for the already-finished ring.
+      if (finished) return
       if (!playFallbackTone(audioContextRef, finish)) finish()
     }
 

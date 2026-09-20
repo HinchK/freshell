@@ -249,4 +249,115 @@ describe('useNotificationSound', () => {
     expect(AudioSpy).toHaveBeenCalledTimes(2)
     expect(audioInstances[1].play).toHaveBeenCalledTimes(1)
   })
+
+  it('advances the queue when the fallback AudioContext is autoplay-suspended: a dead ring never wedges later honest rings', async () => {
+    const toneEndedCallbacks: Array<() => void> = []
+    const suspendedContexts: Array<{ resume: ReturnType<typeof vi.fn> }> = []
+    class FakeOscillator {
+      type = 'sine'
+      frequency = { value: 0 }
+      connect = vi.fn()
+      start = vi.fn()
+      stop = vi.fn()
+      addEventListener = (type: string, cb: () => void) => {
+        if (type === 'ended') toneEndedCallbacks.push(cb)
+      }
+    }
+    class FakeSuspendedAudioContext {
+      // Autoplay policy: a context created without user activation starts
+      // suspended, and resume() outside a user gesture stays suspended
+      // (Firefox/Safari never auto-resume) — a suspended context's clock
+      // never advances, so a tone's `ended` can NEVER fire.
+      state = 'suspended'
+      currentTime = 0
+      destination = {}
+      close = vi.fn().mockResolvedValue(undefined)
+      resume = vi.fn(() => Promise.resolve())
+      createOscillator = () => new FakeOscillator()
+      createGain = () => ({ gain: {}, connect: vi.fn() })
+      constructor() {
+        suspendedContexts.push(this)
+      }
+    }
+    vi.stubGlobal('AudioContext', FakeSuspendedAudioContext)
+
+    // The chime file cannot play AND the fallback context is suspended —
+    // no completion signal can ever fire for this ring.
+    playImpl = () => Promise.reject(new Error('chime file failed to load'))
+
+    const store = createStore(true)
+    const { result } = renderHook(() => useNotificationSound(), {
+      wrapper: createWrapper(store),
+    })
+
+    act(() => {
+      result.current.play()
+    })
+    act(() => {
+      result.current.play()
+    })
+
+    // Let the rejected play() settle so the fallback is armed on ring 1.
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    // Ring 1's fallback could never complete, but it must not wedge the
+    // queue: ring 2 starts despite no completion signal ever firing.
+    expect(AudioSpy).toHaveBeenCalledTimes(2)
+    expect(audioInstances[1].play).toHaveBeenCalledTimes(1)
+    // No tone was scheduled on the frozen context (its `ended` would never
+    // fire), and a best-effort resume() was attempted first.
+    expect(toneEndedCallbacks).toHaveLength(0)
+    expect(suspendedContexts[0].resume).toHaveBeenCalled()
+  })
+
+  it('does not play a stray fallback tone when a spurious media error follows a successful ended', async () => {
+    const toneEndedCallbacks: Array<() => void> = []
+    class FakeOscillator {
+      type = 'sine'
+      frequency = { value: 0 }
+      connect = vi.fn()
+      start = vi.fn()
+      stop = vi.fn()
+      addEventListener = (type: string, cb: () => void) => {
+        if (type === 'ended') toneEndedCallbacks.push(cb)
+      }
+    }
+    class FakeAudioContext {
+      currentTime = 0
+      destination = {}
+      close = vi.fn().mockResolvedValue(undefined)
+      createOscillator = () => new FakeOscillator()
+      createGain = () => ({ gain: {}, connect: vi.fn() })
+    }
+    vi.stubGlobal('AudioContext', FakeAudioContext)
+
+    playImpl = () => Promise.resolve() // the chime plays fine
+
+    const store = createStore(true)
+    const { result } = renderHook(() => useNotificationSound(), {
+      wrapper: createWrapper(store),
+    })
+
+    act(() => {
+      result.current.play()
+    })
+    act(() => {
+      result.current.play()
+    })
+
+    // Ring 1 completes normally → ring 2 starts.
+    act(() => {
+      audioInstances[0].emit('ended')
+    })
+    expect(AudioSpy).toHaveBeenCalledTimes(2)
+
+    // A spurious `error` after the successful `ended` must not arm an
+    // audible fallback tone for the already-finished ring.
+    act(() => {
+      audioInstances[0].emit('error')
+    })
+    expect(toneEndedCallbacks).toHaveLength(0)
+  })
 })
