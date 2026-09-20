@@ -126,7 +126,9 @@ struct CodexConsumerRuntime {
     thread_id: String,
     active_turn: Arc<StdMutex<Option<String>>>,
     /// The session's USER-interrupt marker: the interrupt control lane arms it,
-    /// the consumer's subscription consumes it at the `interrupted` completion
+    /// the consumer's subscription consumes it at the `interrupted` completion,
+    /// and the consumer's `turn/started` fold CLEARS it (the opencode
+    /// dispatch-clear discipline bounding the marker to the current turn)
     /// (one shared `Arc` with [`CodexSession::user_interrupt_pending`]).
     user_interrupt_pending: Arc<AtomicBool>,
     quiet_deadman: Arc<StdMutex<QuietDeadman>>,
@@ -313,11 +315,13 @@ struct CodexSession {
     /// The per-session USER-interrupt marker (opencode's `turn_aborted`
     /// precedent): `handle_interrupt` arms it BEFORE issuing `turn/interrupt`
     /// (and disarms it again when the RPC fails — the interrupt never landed),
-    /// and the consumer's subscription consumes it at the `interrupted`
-    /// completion. ONE `Arc` shared by this session record (the interrupt lane)
-    /// and the consumer's [`CodexSubscription`] (the guard), so a user
-    /// interrupt is silent while an automation/rollback-forced `interrupted`
-    /// still rings the unified attention edge.
+    /// the consumer's subscription consumes it at the `interrupted`
+    /// completion, and the consumer's `turn/started` fold CLEARS it (the
+    /// full opencode dispatch-clear discipline — a stale armed marker never
+    /// crosses a turn boundary). ONE `Arc` shared by this session record (the
+    /// interrupt lane) and the consumer's [`CodexSubscription`] (the guard),
+    /// so a user interrupt is silent while an automation/rollback-forced
+    /// `interrupted` still rings the unified attention edge.
     user_interrupt_pending: Arc<AtomicBool>,
     /// Delta-r1 F2: the compact-window busy truth. `thread/compact/start`'s answer
     /// carries no turn id, and the REAL 0.147.0 sequence returns the RPC BEFORE
@@ -3123,7 +3127,11 @@ impl FreshCodexState {
     /// `user_interrupt_pending` marker BEFORE the RPC (opencode's `turn_aborted`
     /// precedent) and disarms it again when the RPC fails (the interrupt never
     /// landed — a later NON-user `interrupted` must still ring the unified edge).
-    /// A completion the marker did not cover (automation/rollback-forced) rings.
+    /// A completion the marker did not cover (automation/rollback-forced) rings. The
+    /// marker is bounded to the CURRENT turn: the consumer clears it at the next
+    /// `turn/started` on the thread (the full opencode dispatch-clear discipline),
+    /// so an armed marker whose `interrupted` completion never arrived cannot
+    /// cross a turn boundary and silence a later turn's non-user `interrupted`.
     /// Mirrors `ws-handler.ts:3503-3516` (fire-and-forget; `INTERNAL_ERROR` on failure).
     pub async fn handle_interrupt(&self, msg: FreshAgentInterrupt) {
         let session_id = msg.session_id.clone();
@@ -6348,7 +6356,9 @@ impl FreshCodexState {
     /// `turn/completed` yields an idle `freshAgent.session.snapshot` (always) then the
     /// unified `freshAgent.turn.complete` attention edge for every turn END except a
     /// USER-armed interrupt (the marker [`handle_interrupt`](Self::handle_interrupt) arms)
-    /// and the non-terminal `inProgress`.
+    /// and the non-terminal `inProgress`. The `turn/started` fold also CLEARS the
+    /// marker, bounding it to the current turn (the opencode dispatch-clear
+    /// discipline — a stale armed marker never crosses a turn boundary).
     fn spawn_consumer(
         &self,
         notifs: tokio::sync::mpsc::UnboundedReceiver<CodexNotification>,
@@ -8963,6 +8973,13 @@ fn disarm_codex_quiet(
 /// state. The quiet-deadman disarm in that arm is keyed to the ACTIVE turn's
 /// retirement, so a stale completion that retires no active turn leaves the
 /// still-in-flight turn's window armed.
+///
+/// Task-002 review M1/M2 (user-interrupt marker discipline): the `turn/started`
+/// arm CLEARS the per-session user-interrupt marker — a stale armed marker must
+/// not cross the turn boundary (the full opencode `turn_aborted` dispatch-clear
+/// discipline); and the SUPERSEDED leg of the `turn/completed` arm runs the
+/// guard for bookkeeping only (`on_superseded_turn_completed`), never consuming
+/// a marker that can only be armed for a NEWER turn's user interrupt.
 fn reduce_notification(
     subscription: &mut CodexSubscription,
     notification: CodexNotification,
@@ -9099,8 +9116,17 @@ fn reduce_notification(
                 // Preserve the subscription's per-session completion bookkeeping
                 // (including its monotonic clock) even when its normal idle/chime
                 // output is stale. The outward replacement keeps the client busy
-                // until the active turn's OWN completion arrives.
-                let completion_events = subscription.on_turn_completed(&event, now_ms());
+                // until the active turn's OWN completion arrives. A superseded
+                // completion's output is DISCARDED, so it runs the guard for
+                // BOOKKEEPING only — and must NOT consume the user-interrupt
+                // marker: a stale `interrupted` here can only be racing a marker
+                // armed for a NEWER turn's user interrupt, and consuming it
+                // would make that interrupt's own completion ring.
+                let completion_events = if superseded_by_active_turn {
+                    subscription.on_superseded_turn_completed(&event, now_ms())
+                } else {
+                    subscription.on_turn_completed(&event, now_ms())
+                };
                 if superseded_by_active_turn {
                     return vec![CodexAdapterEvent::StatusSnapshot {
                         session_id: subscription.session_id().to_string(),
@@ -9116,6 +9142,13 @@ fn reduce_notification(
             if let Some(turn_id) = &event.turn_id {
                 subscription.set_active_turn(turn_id.clone());
                 if event.thread_id == subscription.session_id() {
+                    // The full opencode `turn_aborted` discipline: a NEW turn
+                    // on this thread retires any stale armed user-interrupt
+                    // marker. An interrupt whose completion never arrived as
+                    // `interrupted` (e.g. the app-server completed the turn
+                    // as `completed`) must never cross the turn boundary and
+                    // silence a later NON-user `interrupted` (a missed bell).
+                    subscription.clear_user_interrupt();
                     // `handle_send` records the provider-returned turn id before its
                     // matching `turn/started` notification necessarily reaches this
                     // consumer. Treat that direct record as authoritative over a
@@ -13820,6 +13853,152 @@ pub(crate) mod tests {
             saw_idle,
             "the idle snapshot still flows for a user-interrupted compact turn"
         );
+    }
+
+    /// Task-002 review M1: the user-interrupt marker is bounded to the CURRENT
+    /// turn — the consumer clears it at every `turn/started` on the subscribed
+    /// thread (the full opencode `turn_aborted` discipline: opencode clears its
+    /// marker at every turn dispatch). An armed marker whose `interrupted`
+    /// completion never arrived (e.g. the app-server completed the interrupted
+    /// turn as `completed`) must never cross the turn boundary and silence a
+    /// later NON-user `interrupted` (a missed bell).
+    #[tokio::test]
+    async fn a_stale_armed_user_interrupt_marker_does_not_survive_a_new_turns_start() {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cxm1").await;
+
+        // The STALE marker: the user interrupted turn 1 (the lane armed the
+        // marker), but its completion never arrived as `interrupted` — the
+        // app-server completed the turn as `completed`, so the guard (which
+        // consumes only on `interrupted`) left the marker armed.
+        {
+            let sessions = st.sessions.lock().await;
+            sessions
+                .get("thread-cxm1")
+                .expect("session inserted")
+                .user_interrupt_pending
+                .store(true, Ordering::SeqCst);
+        }
+
+        // A NEW turn starts on the thread: the consumer's turn/started fold
+        // must clear the stale marker (it emits no wire frames; the FIFO
+        // notification channel guarantees this fold precedes the completion
+        // below).
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": "thread-cxm1", "turn": { "id": "turn-2" } }),
+        );
+
+        // A much-later NON-user `interrupted` (automation/rollback-forced) is
+        // a turn end the user didn't witness — the unified edge must RING.
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cxm1", "turn": { "id": "turn-2", "status": "interrupted" } }),
+        );
+
+        let mut completes = 0usize;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, wire.recv()).await else {
+                break;
+            };
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["sessionId"] != "thread-cxm1" {
+                continue;
+            }
+            if frame["event"]["type"] == "freshAgent.turn.complete" {
+                completes += 1;
+            }
+        }
+        assert_eq!(
+            completes, 1,
+            "a stale armed marker must not survive the new turn's start: the non-user interrupted rings"
+        );
+    }
+
+    /// Task-002 review M2: a stale `interrupted` completion for an
+    /// already-SUPERSEDED turn must not consume the user-interrupt marker —
+    /// the marker can only be armed for a NEWER turn's interrupt, and
+    /// consuming it would make that interrupt's own completion ring (a
+    /// false-positive bell for a USER-initiated interrupt). The superseded
+    /// branch calls the guard for BOOKKEEPING only and discards its output,
+    /// so it must leave the marker armed.
+    #[tokio::test]
+    async fn a_superseded_interrupted_completion_never_consumes_the_marker_armed_for_a_newer_turn()
+    {
+        let (st, _rx_boot) = state_with_bus();
+        let (peer, mut wire) = insert_idle_compact_session(&st, "thread-cxspr").await;
+
+        // The newer turn is running and tracked: its turn/started fold
+        // installed the active turn (it emits no wire frames of its own), so
+        // a wire-visible `thread/status/changed{active}` follows it in the
+        // FIFO channel — awaiting the fold's running snapshot PROVES the
+        // turn/started fold (and its marker clear) already ran, giving the
+        // arm below the same wire causality the production interrupt lane
+        // has (the user can only interrupt after observing busy).
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": "thread-cxspr", "turn": { "id": "turn-2" } }),
+        );
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-cxspr", "status": { "type": "active" } }),
+        );
+        let frame = await_next_status_snapshot(&mut wire, "thread-cxspr").await;
+        assert_eq!(
+            frame["event"]["status"],
+            json!("running"),
+            "the newer turn keeps the session busy: {frame}"
+        );
+
+        // The user interrupts the NEWER turn: the interrupt lane arms the
+        // marker before its turn/interrupt RPC (modeled by the direct arm —
+        // the interleaving under test has that RPC's completion not yet
+        // drained when the lagging consumer folds the stale one).
+        let marker = {
+            let sessions = st.sessions.lock().await;
+            sessions
+                .get("thread-cxspr")
+                .expect("session inserted")
+                .user_interrupt_pending
+                .clone()
+        };
+        marker.store(true, Ordering::SeqCst);
+
+        // The lagging consumer now drains turn 1's STALE interrupted
+        // completion (superseded by the newer active turn): the superseded
+        // branch keeps its bookkeeping but must NOT consume the marker.
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cxspr", "turn": { "id": "turn-1", "status": "interrupted" } }),
+        );
+        // The superseded branch replaces the stale output with a RUNNING
+        // snapshot — the deterministic "the consumer folded the stale
+        // completion" edge.
+        let frame = await_next_status_snapshot(&mut wire, "thread-cxspr").await;
+        assert_eq!(
+            frame["event"]["status"],
+            json!("running"),
+            "the superseded completion's replacement keeps the client busy: {frame}"
+        );
+        assert!(
+            marker.load(Ordering::SeqCst),
+            "a superseded stale interrupted completion must leave the marker armed for the newer turn's interrupt"
+        );
+
+        // The NEWER turn's own user-interrupt completion then consumes the
+        // surviving marker and stays SILENT: the idle snapshot flows, the
+        // unified edge does not.
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-cxspr", "turn": { "id": "turn-2", "status": "interrupted" } }),
+        );
+        await_next_idle_snapshot(&mut wire, "thread-cxspr").await;
+        assert_wire_quiet(&mut wire).await;
     }
 
     #[tokio::test]

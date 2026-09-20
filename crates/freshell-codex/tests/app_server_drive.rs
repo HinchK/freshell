@@ -122,7 +122,7 @@ async fn full_drive_completed_turn_emits_the_positive_edge_with_verbatim_effort(
 }
 
 #[tokio::test]
-async fn full_drive_interrupted_turn_does_not_chime() {
+async fn full_drive_user_armed_interrupted_turn_does_not_chime() {
     let (transport, peer) = new_channel_transport();
     let (client, mut notifs) = CodexAppServerClient::connect(transport);
     let client = Arc::new(client);
