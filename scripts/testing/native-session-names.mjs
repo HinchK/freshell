@@ -1885,33 +1885,55 @@ print(row, messages[0][0])
     } catch {
       // already closed
     }
-    // The pane content starts on the pre-durable pending handle; the DB row
-    // exists from create-time, so the verified bind lands within the window.
-    // Wait for the durable session ref (the native writeback targets it). A
-    // timeout here must carry the three decisive artifacts: the created
-    // frame's own projection (did the materialization lane bind BEFORE
-    // publishing?), the pane's LIVE content, and the naming store document
-    // (the bind's committed evidence).
-    let agentTarget
+    // A freshopencode create answers `created` with the PLACEHOLDER id BY
+    // DESIGN ("the binding row is written at materialization (first send),
+    // well after this create returns" — opencode_ws.rs): the shared serve
+    // creates the durable ses_* session only when the FIRST message is
+    // sent, and `bind_naming_handle_at_materialization` transfers the
+    // pending handle onto it there. Materialize through the REAL wire:
+    // send the first message (the model turn itself may fail — there is
+    // no provider in the sandbox — but the serve's session creation and
+    // the verified bind PRECEDE the turn). A timeout here must carry the
+    // three decisive artifacts: the created frame's own projection, the
+    // pane's LIVE content, and the naming store document (the bind's
+    // committed evidence).
+    const { ws: sendWs, frames: sendFrames } = await server.wsHello()
+    sendWs.send(JSON.stringify({
+      type: 'freshAgent.send',
+      requestId: `materialize-${randomUUID()}`,
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      sessionId: agentCreatedFrame.sessionId,
+      cwd: projectDir,
+      text: 'Materialize the session for the naming writeback contract',
+    }))
+    // The send's own outcome (accepted or errored on the provider call) is
+    // not asserted — only the materialization it triggers is. Bound the
+    // wait so a wedged lane cannot hang the contract.
+    await server.waitForFrameAny(sendFrames, ['freshAgent.send.accepted', 'freshAgent.error', 'error'], 90_000).catch(() => null)
     try {
-      agentTarget = await withTimeout(pollUntil(
-        'agent pane naming ref becomes durable',
-        async () => {
-          const ref = await server.paneNamingRef(agentTabId, agentPaneId)
-          if (!ref || ref.kind !== 'session') return null
-          return ref
-        },
-        90_000,
-        500,
-      ), 100_000, 'agent pane naming ref becomes durable')
-    } catch (error) {
-      const paneNow = await server.paneContent(agentTabId, agentPaneId).catch(() => null)
-      let storeDocument = '(unreadable)'
-      try {
-        storeDocument = fs.readFileSync(path.join(server.home, '.freshell', 'session-names.json'), 'utf8')
-      } catch { /* absent */ }
-      throw new Error(`${error.message}; created frame: ${JSON.stringify({ sessionId: agentCreatedFrame.sessionId, nameRef: agentCreatedFrame.nameRef, sessionName: agentCreatedFrame.sessionName })}; pane content now: ${JSON.stringify(paneNow)}; store document: ${storeDocument.slice(0, 8_000)}`)
+      sendWs.close()
+    } catch {
+      // already closed
     }
+    // The bind's DURABLE target: the pane CONTENT's nameRef only advances
+    // when a real CLIENT syncs its layout (the raw-WS pane has no
+    // layout-syncing client — observed end-to-end: the first send
+    // materialized the session, the store redirected the pending handle
+    // onto the durable ses_* id with a VERIFIED database location, while
+    // the pane content kept the placeholder). Derive the target from the
+    // naming state itself: read the PENDING ref — the store's redirect
+    // resolution answers the DURABLE record it bound to.
+    const agentTarget = await withTimeout(pollUntil(
+      'the pane handle binds onto its durable session record',
+      async () => {
+        const update = await server.readOne({ kind: 'pending', id: agentContent.namingHandle })
+        if (!update || update.record.ref.kind !== 'session') return null
+        return update.record.ref
+      },
+      90_000,
+      500,
+    ), 100_000, 'the pane handle binds onto its durable session record')
     const agentSessionId = agentTarget.sessionId
     result.agentSession = { tabId: agentTabId, paneId: agentPaneId, sessionId: agentSessionId }
     const serverName = 'Server-written opencode name'
