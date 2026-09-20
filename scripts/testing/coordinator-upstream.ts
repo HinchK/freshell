@@ -42,13 +42,6 @@ export function resolveVitestCommand(repoRoot: string): { command: string; args:
   }
 }
 
-export function resolveNpmCommand(
-  args: string[],
-  envVars: NodeJS.ProcessEnv = process.env,
-): { command: string; args: string[] } {
-  return resolveManagerCommand({ manager: 'npm', args, env: envVars })
-}
-
 export function resolveCargoCommand(): { command: string; args: string[] } {
   return {
     command: process.platform === 'win32' ? 'cargo.exe' : 'cargo',
