@@ -3496,9 +3496,9 @@ impl FreshOpencodeState {
     /// the model pair (the serve crate stores no session metadata, so resolution lives
     /// here: the session's model split via `split_opencode_model`, else `GET /config`'s
     /// `model`, else a LOUD error), POST, await idle, and settle with the SAME
-    /// idle-snapshot + gated `freshAgent.turn.complete` chime as a send turn. A serve
-    /// error still returns the pane to idle and surfaces the error loudly — never a
-    /// false completion.
+    /// idle-snapshot + unified `freshAgent.turn.complete` edge as a send turn. A
+    /// serve error still returns the pane to idle, rings the same unified edge
+    /// (the turn still ended), and surfaces the error loudly.
     ///
     /// TURN-SCOPED LIFECYCLE (delta-review round 1, D1-F1): the composer stays
     /// interactive while a session is busy (queued sends) and the `/compact` slash
@@ -3877,10 +3877,11 @@ impl FreshOpencodeState {
                 }
             };
 
-            // adapter.ts:386-393 — the same settle tail as a send turn (idle snapshot
-            // unconditionally + the gated chime); a serve error additionally surfaces
-            // loudly (the SAME nested envelope `emit_fresh_agent_error` builds) and
-            // never produces a false turn-complete.
+            // adapter.ts:386-393 — the same settle tail as a send turn (idle
+            // snapshot unconditionally + the unified attention edge: any turn
+            // end except a user interrupt); a serve error additionally
+            // surfaces loudly (the SAME nested envelope `emit_fresh_agent_error`
+            // builds).
             //
             // b8ke focused round-2 review R2-5: the accepted-daemon-operation
             // witness settles with the SAME discipline the send drive uses —
@@ -6093,8 +6094,10 @@ fn error_event(session_id: &str, message: &str) -> Value {
     json!({ "type": "freshAgent.error", "sessionId": session_id, "message": message })
 }
 
-/// `sdk.turn.complete → freshAgent.turn.complete` (sdk-events.ts:71-72; the status-guarded
-/// positive-completion chime, adapter.ts:377-381).
+/// `sdk.turn.complete → freshAgent.turn.complete` (sdk-events.ts:71-72; the
+/// unified turn-end attention edge — emitted for ANY turn end except a
+/// user-initiated interrupt, deliberately diverging from the legacy
+/// status-guarded positive-completion chime of adapter.ts:377-381).
 fn turn_complete_event(session_id: &str, at: i64) -> Value {
     json!({ "type": "freshAgent.turn.complete", "sessionId": session_id, "at": at })
 }
@@ -6102,9 +6105,12 @@ fn turn_complete_event(session_id: &str, at: i64) -> Value {
 /// The shared settle tail of a turn-scoped opencode pipeline (a send turn, a compact):
 /// broadcast the idle snapshot UNCONDITIONALLY (`emitStatus(state, 'idle')`,
 /// adapter.ts:371/384 — it flows whether the turn succeeded or errored), then the
-/// positive-completion `freshAgent.turn.complete` chime gated on a clean finish
-/// (`succeeded && !turn_aborted && !turn_errored`, adapter.ts:377), stamped by the
-/// session's monotonic turn-complete clock.
+/// UNIFIED `freshAgent.turn.complete` attention edge gated only on
+/// "the user did not interrupt" (`!turn_aborted`). A clean finish, a
+/// `session.error` turn (`turn_errored`), and a failed settle (`succeeded=false`:
+/// prompt-POST failure, `IdleTimeout`, `SidecarLost`) all ended a turn the user
+/// may not have been watching — one identical edge, no outcome on the wire —
+/// stamped by the session's monotonic turn-complete clock.
 fn settle_turn_outcome(
     fresh_agent: &FreshAgentState,
     real_id: &str,
@@ -6114,17 +6120,26 @@ fn settle_turn_outcome(
     last_turn_complete_at: &StdMutex<Option<i64>>,
 ) {
     fresh_agent.broadcast(&event_frame(real_id, snapshot_event(real_id, "idle")));
-    if succeeded && !turn_aborted.load(Ordering::SeqCst) && !turn_errored.load(Ordering::SeqCst) {
-        let at = {
-            let mut guard = last_turn_complete_at
-                .lock()
-                .expect("last_turn_complete_at mutex");
-            let at = next_monotonic_turn_complete_at(*guard, now_ms());
-            *guard = Some(at);
-            at
-        };
-        fresh_agent.broadcast(&event_frame(real_id, turn_complete_event(real_id, at)));
+    // Unified "needs attention": ANY turn end rings except a user-initiated
+    // interrupt (turn_aborted). A clean finish, a session.error turn
+    // (turn_errored), and a failed settle (succeeded=false: prompt-POST
+    // failure, IdleTimeout, SidecarLost) all ended a turn the user may not
+    // have been watching — one identical edge, no outcome on the wire.
+    if turn_aborted.load(Ordering::SeqCst) {
+        return;
     }
+    let at = {
+        let mut guard = last_turn_complete_at
+            .lock()
+            .expect("last_turn_complete_at mutex");
+        let at = next_monotonic_turn_complete_at(*guard, now_ms());
+        *guard = Some(at);
+        at
+    };
+    if !succeeded || turn_errored.load(Ordering::SeqCst) {
+        tracing::debug!(provider = PROVIDER, session_id = %real_id, "turn.settled_non_clean_unified_edge");
+    }
+    fresh_agent.broadcast(&event_frame(real_id, turn_complete_event(real_id, at)));
 }
 
 /// `freshAgent.session.materialized` (legacy reference: server/ws-handler.ts's
@@ -6485,6 +6500,56 @@ mod tests {
                 b"{}".to_vec()
             };
             Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) })
+        }
+    }
+
+    /// The failed-settle fake: like [`StatusPollFakeHttp`] (create mints a fresh
+    /// `ses_N`, everything else a benign 200 `{}`), but the send path's
+    /// `POST /session/:id/prompt_async` answers 500 — the deterministic
+    /// prompt-POST failure (`ServeError::Http`) that settles a turn with
+    /// `succeeded=false`, with no `session.error` SSE ever arriving.
+    struct PromptFailFakeHttp {
+        next_session: AtomicUsize,
+    }
+    impl PromptFailFakeHttp {
+        fn new() -> Self {
+            Self {
+                next_session: AtomicUsize::new(0),
+            }
+        }
+    }
+    impl ServeHttp for PromptFailFakeHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let is_prompt = req.url.contains("/prompt_async")
+                && matches!(req.method, freshell_opencode::serve::HttpMethod::Post);
+            // Precise create-match (the same predicate discipline as
+            // [`StatusPollFakeHttp`]): a loose `/session` contains() would also
+            // swallow the prompt POST this fake exists to fail.
+            let is_create = !is_prompt
+                && matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            let (status, body) = if is_prompt {
+                (500, b"prompt exploded".to_vec())
+            } else if is_create {
+                let n = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+                (
+                    200,
+                    serde_json::to_vec(&json!({ "id": format!("ses_{n}"), "directory": null }))
+                        .unwrap(),
+                )
+            } else {
+                (200, b"{}".to_vec())
+            };
+            Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) })
         }
     }
 
@@ -12575,7 +12640,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn errored_turn_emits_no_turn_complete_but_forwards_the_error() {
+    async fn errored_turn_emits_the_error_and_the_unified_attention_edge() {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
         let deps = ServeDeps {
@@ -12618,7 +12683,7 @@ mod tests {
         });
 
         let mut saw_error = false;
-        let mut saw_complete = false;
+        let mut complete_at: Vec<i64> = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -12637,7 +12702,13 @@ mod tests {
                     assert_eq!(frame["event"]["message"], "boom");
                     saw_error = true;
                 }
-                Some("freshAgent.turn.complete") => saw_complete = true,
+                Some("freshAgent.turn.complete") => {
+                    // Unified signal: an errored turn end the user didn't witness
+                    // rings the SAME edge as a clean one — the pane resolves, the
+                    // at is monotonic.
+                    complete_at.push(frame["event"]["at"].as_i64().expect("numeric at"));
+                    break; // the turn's terminal frame; stop draining.
+                }
                 _ => {}
             }
         }
@@ -12646,9 +12717,93 @@ mod tests {
             saw_error,
             "the session.error SSE event must be forwarded as freshAgent.error"
         );
+        assert_eq!(
+            complete_at.len(),
+            1,
+            "an errored turn must emit the unified attention edge"
+        );
         assert!(
-            !saw_complete,
-            "an errored turn must never emit turn.complete"
+            complete_at[0] > 0,
+            "at must be a positive monotonic timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_settle_emits_the_unified_attention_edge() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(PromptFailFakeHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-fail"), None).await;
+        let placeholder = "freshopencode-req-fail";
+        st.handle_send(send_msg(placeholder, "hello")).await;
+
+        // The prompt POST answers 500, so `run_turn` fails BEFORE any idle await
+        // and the settle tail runs with succeeded=false — the failed-settle leg
+        // of the unified signal (prompt-POST failure; IdleTimeout and
+        // SidecarLost settle through this same tail).
+        let mut saw_idle = false;
+        let mut complete_at: Vec<i64> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] != "freshAgent.event" {
+                continue;
+            }
+            match frame["event"]["type"].as_str() {
+                Some("freshAgent.session.snapshot") => {
+                    if let Some("idle") = frame["event"]["status"].as_str() {
+                        saw_idle = true;
+                    }
+                }
+                Some("freshAgent.turn.complete") => {
+                    // Unified signal: a turn that died mid-drive still ENDED —
+                    // the user may not have watched it, so it rings the SAME
+                    // edge as a clean finish, with a monotonic at.
+                    complete_at.push(frame["event"]["at"].as_i64().expect("numeric at"));
+                    break; // the turn's terminal frame; stop draining.
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            saw_idle,
+            "a failed settle must still broadcast the idle snapshot"
+        );
+        assert_eq!(
+            complete_at.len(),
+            1,
+            "a failed settle must emit the unified attention edge"
+        );
+        assert!(
+            complete_at[0] > 0,
+            "at must be a positive monotonic timestamp"
         );
     }
 
@@ -15118,7 +15273,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_serve_error_broadcasts_idle_and_a_loud_error_without_a_chime() {
+    async fn compact_serve_error_broadcasts_idle_a_loud_error_and_the_unified_chime() {
         let (st, http, mut rx) =
             compact_state(r#"{"model":null}"#, SummarizeOutcome::Answered500).await;
         insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
@@ -15126,7 +15281,8 @@ mod tests {
         st.handle_compact(compact_msg("ses_1")).await;
 
         // The failure settles on the detached drive (D1-F1): the terminal frame
-        // is the loud error (idle precedes it inside the settle tail).
+        // is the loud error (idle — and now the unified chime — precede it
+        // inside the settle tail).
         let frames = frames_until(&mut rx, |f| is_event(f, "freshAgent.error", None)).await;
         assert_eq!(http.summarize_requests().len(), 1, "the POST did land");
         assert!(
@@ -15156,12 +15312,15 @@ mod tests {
                 .contains("summarize exploded"),
             "the serve error text crosses the wire: {error_frame}"
         );
-        assert!(
-            !frames
-                .iter()
-                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
-            "a serve error never fabricates a completion: {frames:?}"
-        );
+        // Unified signal: a compact that died on a serve error still ENDED a
+        // turn the user may not have watched — the SAME edge rings (before the
+        // loud error, inside the settle tail), with a monotonic at.
+        let chime = frames
+            .iter()
+            .find(|f| is_event(f, "freshAgent.turn.complete", None))
+            .expect("a failed settle must emit the unified attention edge");
+        let at = chime["event"]["at"].as_i64().expect("numeric at");
+        assert!(at > 0, "at must be a positive monotonic timestamp: {chime}");
     }
 
     // ── D1-F1: compact is turn-scoped — busy refusal + kill/interrupt ──────
