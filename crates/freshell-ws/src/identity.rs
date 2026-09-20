@@ -535,7 +535,16 @@ impl TerminalIdentityRegistry {
     ) -> Vec<TerminalIdentity> {
         // isCwdScopedSessionMode (terminal-registry.ts:410-412): claude only.
         let scoped = provider == "claude";
-        let session_cwd = cwd.filter(|c| !c.is_empty()).map(normalize_scoped_cwd);
+        // LAZY resolution: only claude-scoped lookups ever normalize the
+        // session cwd. The eager form resolved EVERY session's cwd for every
+        // provider on every ~5s sweep pass; on WSL2 9P-mounted,
+        // cloud-sync-backed cwds each resolution stalled the async runtime
+        // 0.4-2s (the FRESHELL host-stats `lagging` toggle root cause).
+        // Non-scoped lookups never read the value, so they now pay nothing.
+        let session_cwd = match (scoped, cwd) {
+            (true, Some(c)) if !c.is_empty() => Some(self.normalize_scoped_cwd_cached(c)),
+            _ => None,
+        };
         self.list()
             .into_iter()
             .filter(|t| {
@@ -552,7 +561,7 @@ impl TerminalIdentityRegistry {
                     Some(want) => t
                         .cwd
                         .as_deref()
-                        .map(normalize_scoped_cwd)
+                        .map(|c| self.normalize_scoped_cwd_cached(c))
                         .is_some_and(|have| have == *want), // no terminal cwd -> excluded
                 }
             })
@@ -726,6 +735,12 @@ impl freshell_terminal::registry::SessionIdentityLookup for TerminalIdentityRegi
 /// `normalizeScopedSessionCwd` (terminal-registry.ts:414-431): realpath
 /// (native preferred, lexical fallback on error) -> backslashes to `/` ->
 /// strip trailing slashes -> lowercase on win32.
+///
+/// Deliberate divergence from the Node original: callers route through
+/// [`TerminalIdentityRegistry::normalize_scoped_cwd_cached`], which resolves
+/// each distinct raw cwd ONCE per registry lifetime instead of on every
+/// lookup. The Node code's per-call realpath is the same 9P-stall landmine
+/// this memo exists to fix; matching semantics are unchanged.
 fn normalize_scoped_cwd(cwd: &str) -> String {
     let resolved = std::fs::canonicalize(cwd)
         .map(|p| p.to_string_lossy().into_owned())
@@ -1475,6 +1490,76 @@ mod tests {
             .map(|t| t.terminal_id)
             .collect();
         assert_eq!(codex, vec!["t5".to_string()]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn find_all_by_session_canonicalizes_through_real_symlinks_for_claude() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        let session_link = dir.path().join("session-link");
+        let terminal_link = dir.path().join("terminal-link");
+        std::os::unix::fs::symlink(&real, &session_link).expect("symlink s");
+        std::os::unix::fs::symlink(&real, &terminal_link).expect("symlink t");
+
+        let reg = TerminalIdentityRegistry::new();
+        reg.upsert(
+            "t1",
+            Some("claude"),
+            Some("s1"),
+            Some(terminal_link.to_str().expect("utf8")),
+            1,
+        );
+
+        let matched =
+            reg.find_all_by_session("claude", "s1", Some(session_link.to_str().expect("utf8")));
+        let ids: Vec<String> = matched.into_iter().map(|t| t.terminal_id).collect();
+        assert_eq!(ids, vec!["t1".to_string()]);
+        // Both sides resolved exactly once, THROUGH the memo: with the eager
+        // per-call canonicalize this is 0 (the pre-fix red).
+        assert_eq!(reg.cwd_memo_len_for_tests(), 2);
+    }
+
+    #[test]
+    fn find_all_by_session_leaves_the_memo_untouched_for_non_scoped_providers() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let real = dir.path().join("real");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        let real_str = real.to_str().expect("utf8");
+
+        let reg = TerminalIdentityRegistry::new();
+        reg.upsert("t1", Some("codex"), Some("s1"), Some(real_str), 1);
+
+        let matched = reg.find_all_by_session("codex", "s1", Some(real_str));
+        assert_eq!(
+            matched
+                .into_iter()
+                .map(|t| t.terminal_id)
+                .collect::<Vec<_>>(),
+            vec!["t1".to_string()]
+        );
+        // The pre-fix code eagerly canonicalized EVERY session's cwd for every
+        // provider; the lazy fix must never resolve cwd on disk for non-claude
+        // lookups (the /mnt/d stall class this change exists to kill).
+        assert_eq!(reg.cwd_memo_len_for_tests(), 0);
+    }
+
+    #[test]
+    fn find_all_by_session_treats_an_empty_session_cwd_as_absent_for_scoping() {
+        // Pin the previously-unpinned empty-string clause: "" must skip the
+        // cwd check exactly like `None`, with no on-disk resolution either.
+        let reg = TerminalIdentityRegistry::new();
+        reg.upsert("t1", Some("claude"), Some("s1"), Some("/a"), 1);
+        reg.upsert("t2", Some("claude"), Some("s1"), None, 2);
+        let mut ids: Vec<String> = reg
+            .find_all_by_session("claude", "s1", Some(""))
+            .into_iter()
+            .map(|t| t.terminal_id)
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["t1".to_string(), "t2".to_string()]);
+        assert_eq!(reg.cwd_memo_len_for_tests(), 0);
     }
 
     #[test]
