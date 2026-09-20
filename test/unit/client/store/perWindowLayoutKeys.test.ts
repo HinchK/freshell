@@ -133,6 +133,14 @@ describe('per-window layout keys', () => {
     seedWindow(WINDOW_B_ID)
     sessionStorage.setItem(TAB_REGISTRY_CLIENT_INSTANCE_ID_STORAGE_KEY, 'client-registry-b')
 
+    // This test's seed must reach the layout-key module's OWN init: the
+    // config's sequence.shuffle is on precisely to catch order dependence,
+    // and the "a fresh context mints" test leaves a realm whose singleton
+    // holds a freshly MINTED id (into cleared sessionStorage) — a cached
+    // import here would keep that mint over this test's seed and remint
+    // the derived key. Reset for a fresh realm, like the neighboring
+    // mint/isolation tests do.
+    vi.resetModules()
     const { getWindowLayoutKey } = await import('@/store/window-layout-keys')
     const { setTabRegistryClientInstanceId } = await import('@/store/client-instance-id')
 
