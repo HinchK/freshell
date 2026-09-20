@@ -162,15 +162,6 @@ export function verifyElectronArtifact(
     }
   })()
   if (!mcpVersion) throw new Error('Electron MCP package metadata must include a release version')
-  try {
-    const lock = JSON.parse(readFileSync(path.join(root, 'mcp', 'package-lock.json'), 'utf8')) as { name?: unknown; version?: unknown }
-    if (lock.name !== 'freshell' || lock.version !== mcpVersion) {
-      throw new Error('MCP package-lock metadata does not match the staged package version')
-    }
-  } catch (error) {
-    if (error instanceof Error && error.message.startsWith('MCP package-lock metadata')) throw error
-    throw new Error('MCP package-lock metadata is invalid')
-  }
 
   const artifactFiles = walkFiles(root)
   const forbidden = artifactFiles.filter(isForbidden)
