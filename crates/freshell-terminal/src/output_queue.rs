@@ -17,9 +17,18 @@
 
 use freshell_protocol::ServerMessage;
 
-/// Default cap (legacy: `client-output-queue.ts:33`
-/// `DEFAULT_TERMINAL_CLIENT_QUEUE_MAX_BYTES = 32 * 1024 * 1024`).
-pub const DEFAULT_TERMINAL_CLIENT_QUEUE_MAX_BYTES: usize = 32 * 1024 * 1024;
+/// Default cap (responsive-terminal-restore Workstream 3: the SPILL bound —
+/// eviction + generation-scoped gap — that normal output pressure reaches
+/// strictly before any pressure-related disconnect; the disconnect threshold
+/// lives in `freshell-ws::backpressure::Term09Config` and must stay strictly
+/// above this). Legacy `client-output-queue.ts:33` shipped 32 MiB, which sat
+/// ABOVE legacy's 16 MiB catastrophic-disconnect threshold — the inversion
+/// that disconnected the production incident's ~21-25 MB backlog instead of
+/// spilling it. 16 MiB keeps a multi-second grace buffer for a slow-but-
+/// draining client while the byte-fair scheduler keeps other panes
+/// responsive; the incident backlog spills gracefully here instead of
+/// disconnecting.
+pub const DEFAULT_TERMINAL_CLIENT_QUEUE_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// The identity fields a queued output frame needs so a gap event can be
 /// built if it's later evicted. Mirrors the fields `ReplayFrame` carries in

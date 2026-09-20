@@ -1807,6 +1807,20 @@ async fn main() -> ExitCode {
                     as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
             })
         });
+    // TERM-09 backpressure config, fail-fast validated
+    // (responsive-terminal-restore Workstream 3): refuse to boot on a
+    // configuration whose disconnect threshold sits at or below the spill
+    // bound — the production incident's inverted shape. Structured event for
+    // the JSONL log (names the offending env vars), plain stderr line for
+    // the console, matching the AUTH_TOKEN refusal pattern.
+    let term09 = match resolve_term09_config() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!(error = %error, "server.config.term09_invalid");
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let ws_state = WsState {
         auto_resume_tx,
         auto_resume_cancels: Default::default(),
@@ -1865,7 +1879,7 @@ async fn main() -> ExitCode {
         hello_timeout_ms: resolve_hello_timeout_ms(),
         allowed_origins: Arc::new(resolve_allowed_origins()),
         ws_max_payload_bytes: resolve_ws_max_payload_bytes(),
-        term09: freshell_ws::backpressure::Term09Config::from_env(),
+        term09,
         create_protect,
         // THE kata-enn3 pin: the WS door holds the SAME gate Arc as the
         // REST door (never a second budget minted here).
@@ -3133,6 +3147,23 @@ fn resolve_ws_max_payload_bytes() -> usize {
         .unwrap_or(16 * 1024 * 1024)
 }
 
+/// TERM-09 terminal-stream backpressure config from env, fail-fast validated
+/// (responsive-terminal-restore Workstream 3): normal output pressure must
+/// reach bounded admission/spill (eviction + generation-scoped gap)
+/// STRICTLY before any pressure-related disconnect, so a configuration whose
+/// disconnect threshold sits at or below the spill bound refuses to boot —
+/// the caller logs a structured error naming the offending env vars and
+/// exits before binding any port. Validation lives HERE (the boot/env path),
+/// not inside `WsState`: test harnesses inject `Term09Config` values
+/// directly, including deliberately inverted shapes that make the monitor's
+/// last-resort window observable end to end.
+fn resolve_term09_config(
+) -> Result<freshell_ws::backpressure::Term09Config, freshell_ws::backpressure::Term09ConfigError> {
+    let config = freshell_ws::backpressure::Term09Config::from_env();
+    config.validate()?;
+    Ok(config)
+}
+
 /// SAFE-03: resolve the WS Origin allow-list from process env, mirroring
 /// `server/auth.ts#parseAllowedOrigins` (`ALLOWED_ORIGINS`) plus
 /// `server/network-manager.ts`'s user-facing `EXTRA_ALLOWED_ORIGINS` knob
@@ -4200,6 +4231,50 @@ mod tests {
                 None => std::env::remove_var(self.name),
             }
         }
+    }
+
+    /// TERM-09 boot wiring (responsive-terminal-restore Workstream 3): the
+    /// boot resolution must fail fast on a configuration that would restore
+    /// the spill≥disconnect inversion, naming the offending env vars — and
+    /// accept every correctly-ordered shape. Env-dependent cases in ONE test
+    /// fn (whole-process env mutation; no other test in this crate reads the
+    /// TERMINAL_* vars).
+    #[test]
+    fn term09_boot_resolution_fails_fast_on_inverted_env() {
+        let _queue = EnvVarGuard::unset("TERMINAL_CLIENT_QUEUE_MAX_BYTES");
+        let _catastrophic = EnvVarGuard::unset("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES");
+        let _stall = EnvVarGuard::unset("TERMINAL_WS_CATASTROPHIC_STALL_MS");
+
+        // Defaults must boot and satisfy the strict ordering.
+        let defaults = resolve_term09_config().expect("defaults must resolve");
+        assert!(defaults.catastrophic_buffered_bytes > defaults.queue_max_bytes);
+
+        // An inverted override (disconnect below spill — the production
+        // incident's shape) refuses to boot, naming both env vars.
+        let _inverted = EnvVarGuard::set("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES", "1048576");
+        let err = resolve_term09_config().expect_err("inverted env must refuse boot");
+        let message = err.to_string();
+        assert!(
+            message.contains("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES")
+                && message.contains("TERMINAL_CLIENT_QUEUE_MAX_BYTES"),
+            "the boot error must name the offending env vars: {message}"
+        );
+        drop(_inverted);
+
+        // An equalized pair (disconnect == spill) also refuses.
+        let _equalized_queue = EnvVarGuard::set("TERMINAL_CLIENT_QUEUE_MAX_BYTES", "268435456");
+        let _equalized_cat =
+            EnvVarGuard::set("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES", "268435456");
+        resolve_term09_config().expect_err("equalized env must refuse boot");
+        drop(_equalized_queue);
+        drop(_equalized_cat);
+
+        // A correctly-ordered override boots.
+        let _ordered_queue = EnvVarGuard::set("TERMINAL_CLIENT_QUEUE_MAX_BYTES", "2097152");
+        let _ordered_cat = EnvVarGuard::set("TERMINAL_WS_CATASTROPHIC_BUFFERED_BYTES", "8388608");
+        let tuned = resolve_term09_config().expect("ordered env must boot");
+        assert_eq!(tuned.queue_max_bytes, 2 * 1024 * 1024);
+        assert_eq!(tuned.catastrophic_buffered_bytes, 8 * 1024 * 1024);
     }
 
     fn env_test_temp_dir(tag: &str) -> std::path::PathBuf {

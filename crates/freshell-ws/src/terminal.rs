@@ -441,6 +441,11 @@ async fn run_loop(
     let mut catastrophic_ticker = tokio::time::interval(std::time::Duration::from_millis(
         (state.term09.catastrophic_stall_ms / 4).max(10),
     ));
+    // Drain-progress liveness (responsive-terminal-restore W3): the last
+    // snapshot of the writer's completed-send counter, so each monitor tick
+    // feeds the DELTA — successful sends since the previous tick — into the
+    // window decision. Slow consumption alone is not a dead socket.
+    let mut last_completed_sends: u64 = 0;
 
     // Task 9 (host-pressure pane): THIS connection's last `hoststats.refresh`
     // stamp — the per-connection 1s floor (legacy parity:
@@ -578,14 +583,21 @@ async fn run_loop(
             }
             // TERM-09 catastrophic backpressure: this connection's queued
             // output has stayed above the threshold continuously for the
-            // full stall duration -- close now (mirrors `broker.ts`'s
-            // `catastrophicBlocked` closing with 4008 "Catastrophic backpressure").
+            // full stall duration WITH ZERO successful socket sends — close
+            // now (mirrors `broker.ts`'s `catastrophicBlocked` closing with
+            // 4008 "Catastrophic backpressure"). A slow-but-progressing
+            // client resets the window every tick it completes a send.
             _ = catastrophic_ticker.tick() => {
-                if catastrophic.tick(ws_tx.pending_output_bytes()) {
+                let completed_sends = ws_tx.completed_sends();
+                let sends_since_last_tick = completed_sends.saturating_sub(last_completed_sends);
+                last_completed_sends = completed_sends;
+                if catastrophic.tick(ws_tx.pending_output_bytes(), sends_since_last_tick) {
                     tracing::warn!(
                         connection_id = conn_id,
                         pending_bytes = ws_tx.pending_output_bytes(),
                         threshold = state.term09.catastrophic_buffered_bytes,
+                        sends = completed_sends,
+                        window_ms = state.term09.catastrophic_stall_ms,
                         "ws.terminal_stream.catastrophic_close"
                     );
                     use axum::extract::ws::CloseFrame;

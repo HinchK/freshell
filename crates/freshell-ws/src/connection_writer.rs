@@ -92,6 +92,25 @@ struct Control {
 /// replay.
 const CONTROL_STREAK_LIMIT: usize = 8;
 
+/// Minimum spacing between `ws.terminal_stream.queue_overflow_spill` events
+/// per connection (responsive-terminal-restore Workstream 3 observability).
+/// Under sustained eviction a lane's gap head is leased on nearly every
+/// arbitration round — hundreds of gap deliveries per second under
+/// incident-scale pressure — so per-delivery events would flood the log;
+/// deliveries inside the window are folded into the next event's
+/// `suppressed` count. Identifiers and measurements only.
+const SPILL_EVENT_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// One rate-limited spill (queue-overflow eviction) observability event.
+struct SpillEvent {
+    terminal_id: String,
+    stream_id: String,
+    from_seq: i64,
+    to_seq: i64,
+    suppressed: u64,
+    pending_bytes: usize,
+}
+
 struct Queues {
     output: DeliveryQueue<Message>,
     interest: InterestState,
@@ -106,6 +125,50 @@ struct Queues {
     /// are strictly increasing in true admission order.
     next_seq: u64,
     closed: bool,
+    /// Successful socket sends completed on this connection (drain-progress
+    /// liveness, responsive-terminal-restore Workstream 3): incremented by
+    /// `finish_frame` for every frame whose send resolved Ok — output and
+    /// control alike, since the pump serializes all sends. Eviction and
+    /// superseded attachments reduce queued bytes WITHOUT touching this.
+    completed_sends: u64,
+    /// Rate-limited spill-event bookkeeping (see
+    /// [`SPILL_EVENT_MIN_INTERVAL`]): when the last
+    /// `ws.terminal_stream.queue_overflow_spill` event was emitted, and how
+    /// many gap deliveries have been folded into the next one since.
+    spill_last_logged: Option<std::time::Instant>,
+    spill_suppressed: u64,
+}
+
+impl Queues {
+    /// Rate-limited spill-event bookkeeping: returns `Some` when an event
+    /// should be emitted NOW (this gap's interval plus the count of gap
+    /// deliveries suppressed since the previous event), `None` when this
+    /// delivery is folded into a future event. Called under the admission
+    /// lock at gap-lease time — only gaps that actually lease are counted.
+    fn note_spill(&mut self, terminal_id: &str, range: &Range) -> Option<SpillEvent> {
+        let now = std::time::Instant::now();
+        let due = self
+            .spill_last_logged
+            .is_none_or(|last| now.duration_since(last) >= SPILL_EVENT_MIN_INTERVAL);
+        if !due {
+            self.spill_suppressed = self.spill_suppressed.saturating_add(1);
+            return None;
+        }
+        let suppressed = self.spill_suppressed;
+        self.spill_suppressed = 0;
+        self.spill_last_logged = Some(now);
+        Some(SpillEvent {
+            terminal_id: terminal_id.to_string(),
+            stream_id: range.stream_id.clone(),
+            from_seq: range.from_seq,
+            to_seq: range.to_seq,
+            suppressed,
+            pending_bytes: self
+                .output
+                .pending_bytes()
+                .saturating_add(self.in_flight_output_bytes),
+        })
+    }
 }
 
 /// Emission-time resolver for one terminal's current restore-contract
@@ -171,6 +234,9 @@ impl WriterSender {
                 controls_since_last_output: 0,
                 next_seq: 0,
                 closed: false,
+                completed_sends: 0,
+                spill_last_logged: None,
+                spill_suppressed: 0,
             }),
             output_limit: output_limit.max(1),
             control_limit: control_limit.max(1),
@@ -492,6 +558,19 @@ impl WriterSender {
             .pending_bytes()
             .saturating_add(queues.in_flight_output_bytes)
     }
+
+    /// Total successful socket sends completed on this connection (drain-
+    /// progress liveness, responsive-terminal-restore Workstream 3). The
+    /// catastrophic-backpressure monitor feeds its per-tick delta into its
+    /// window decision: sends are the ONLY progress signal (eviction and
+    /// supersede reduce queued bytes without being sends).
+    pub(super) fn completed_sends(&self) -> u64 {
+        self.shared
+            .queues
+            .lock()
+            .expect("writer queue lock")
+            .completed_sends
+    }
 }
 
 impl Sink<Message> for WriterSender {
@@ -564,6 +643,7 @@ impl WriterPump {
             let Some(delivery) = queues.output.pop() else {
                 return Ok(None);
             };
+            let mut spill = None;
             let (frame, bytes) = match delivery {
                 Delivery::Frame { payload, bytes } => (payload, bytes),
                 Delivery::Gap { terminal_id, range } => {
@@ -592,6 +672,9 @@ impl WriterPump {
                         }
                         None => None,
                     };
+                    // Spill observability (responsive-terminal-restore W3):
+                    // rate-limited per connection — see SPILL_EVENT_MIN_INTERVAL.
+                    spill = queues.note_spill(&terminal_id, &range);
                     let message =
                         ServerMessage::TerminalOutputGap(freshell_protocol::TerminalOutputGap {
                             terminal_id,
@@ -615,12 +698,26 @@ impl WriterPump {
             queues.in_flight_output_bytes = bytes;
             queues.output.set_reserved_bytes(bytes);
             queues.controls_since_last_output = 0;
-            return Ok(Some(NextFrame {
+            let next = NextFrame {
                 frame,
                 control_bytes: 0,
                 output_bytes: bytes,
                 flushed: None,
-            }));
+            };
+            // Never hold the admission lock across a log write.
+            drop(queues);
+            if let Some(spill) = spill {
+                tracing::warn!(
+                    terminal_id = %spill.terminal_id,
+                    stream_id = %spill.stream_id,
+                    from_seq = spill.from_seq,
+                    to_seq = spill.to_seq,
+                    suppressed = spill.suppressed,
+                    pending_bytes = spill.pending_bytes,
+                    "ws.terminal_stream.queue_overflow_spill"
+                );
+            }
+            return Ok(Some(next));
         }
         if let Some(control) = queues.controls.pop_front() {
             queues.controls_since_last_output += 1;
@@ -640,6 +737,10 @@ impl WriterPump {
         queues.in_flight_output_bytes = queues.in_flight_output_bytes.saturating_sub(output_bytes);
         let reserved = queues.in_flight_output_bytes;
         queues.output.set_reserved_bytes(reserved);
+        // Drain-progress liveness: one successful socket send just completed
+        // (output or control — the pump serializes all sends, so either
+        // proves the socket accepted bytes).
+        queues.completed_sends = queues.completed_sends.saturating_add(1);
     }
 
     /// Generic over the real transport so tests can stop a flush at a precise

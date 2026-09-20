@@ -467,6 +467,94 @@ async fn overflow_stops_a_pending_flush_without_waiting_for_send_timeout() {
     assert_eq!(text_frames(&capture).len(), 1);
 }
 
+/// An oversized indivisible OUTPUT frame — larger than the ENTIRE queue cap —
+/// spills immediately (output frames are themselves evictable, so the cap
+/// evicts the oversize frame the moment it is admitted) instead of
+/// accumulating unbounded bytes or closing the connection: the push
+/// succeeds, the loss is the honest queue-overflow gap covering exactly that
+/// frame, and pending bytes stay bounded at zero. (The CONTROL lane's
+/// one-oversize-frame grace is separate — see
+/// `overflow_stops_a_pending_flush_without_waiting_for_send_timeout`.)
+#[tokio::test]
+async fn oversized_indivisible_output_frame_spills_instead_of_accumulating() {
+    let (sender, pump) = overflow_writer();
+    let probe = serde_json::to_string(&output(1)).unwrap().len();
+    let mut huge = output(1);
+    if let ServerMessage::TerminalOutput(frame) = &mut huge {
+        // Serialized length comfortably exceeds the whole cap.
+        frame.data = "X".repeat(probe * 2);
+    }
+    assert!(
+        sender.push_server(huge),
+        "admission must survive an oversize frame (it spills, never wedges)"
+    );
+    assert_eq!(
+        sender.pending_output_bytes(),
+        0,
+        "the oversize frame must not accumulate: the queue stays bounded"
+    );
+    let next = pump.take_next().unwrap().unwrap();
+    let gap: serde_json::Value = serde_json::from_str(&leased_text(&next.frame)).unwrap();
+    assert_eq!(gap["type"], "terminal.output.gap");
+    assert_eq!(gap["reason"], "queue_overflow");
+    assert_eq!(
+        gap["fromSeq"], 1,
+        "the gap covers exactly the oversize frame"
+    );
+    assert_eq!(gap["toSeq"], 1);
+    pump.finish_frame(next.output_bytes, next.control_bytes);
+    assert!(
+        pump.take_next().unwrap().is_none(),
+        "nothing else was retained behind the oversize frame"
+    );
+}
+
+/// Drain-progress liveness (responsive-terminal-restore Workstream 3): the
+/// completed-send counter moves ONLY on successful socket sends. Supersede
+/// and eviction shrink queued bytes without touching it, and a leased frame
+/// counts only once its flush finishes.
+#[tokio::test]
+async fn completed_sends_counts_only_successful_socket_sends() {
+    let (mut sender, pump) = WriterSender::new(1 << 20, 1 << 20, Duration::from_secs(10));
+    assert_eq!(sender.completed_sends(), 0);
+    // Two queued output frames and one control.
+    assert!(sender.push_server(output(1)));
+    assert!(sender.push_server(output(2)));
+    sender.send(notice("control")).await.unwrap();
+    // A superseding attach DISCARDS another terminal's queued output — a
+    // byte reduction that is not a send and must not count as progress.
+    assert!(sender.push_server(named_output("victim", 1)));
+    assert!(sender.push_server(
+        serde_json::from_value(serde_json::json!({
+            "type":"terminal.attach.ready", "terminalId":"victim", "attachRequestId":"a2",
+            "streamId":"stream", "headSeq":1, "replayFromSeq":1, "replayToSeq":1
+        }))
+        .unwrap()
+    ));
+    assert_eq!(
+        sender.completed_sends(),
+        0,
+        "admission, eviction and supersede are not sends"
+    );
+    // Drive the pump: every take_next + finish_frame pair is one successful
+    // send; the discarded victim frame never leases.
+    let mut sends = 0u64;
+    while let Some(next) = pump.take_next().unwrap() {
+        pump.finish_frame(next.output_bytes, next.control_bytes);
+        sends += 1;
+        assert_eq!(
+            sender.completed_sends(),
+            sends,
+            "exactly one count per completed send"
+        );
+    }
+    assert_eq!(
+        sends, 4,
+        "control + superseding attach.ready + two output frames were sent"
+    );
+    assert_eq!(sender.completed_sends(), 4);
+}
+
 fn named_output(terminal_id: &str, seq: i64) -> ServerMessage {
     let mut message = output(seq);
     if let ServerMessage::TerminalOutput(frame) = &mut message {

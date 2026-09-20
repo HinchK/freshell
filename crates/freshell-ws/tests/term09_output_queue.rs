@@ -22,6 +22,19 @@ use freshell_ws::WsState;
 
 const AUTH_TOKEN: &str = "s3cr3t-token-abcdef";
 
+/// PTY floods in this file are heavy (tens of MB of PTY traffic plus
+/// per-frame JSON serialization). Serialize the flood tests within this
+/// binary: concurrent floods starve each other's production and drain
+/// rates, and a reader starved past a stall window legitimately trips the
+/// very liveness decisions under test — the failures would be contention,
+/// not behavior. An async mutex: the guard is held across `.await`s for
+/// the whole test.
+static FLOOD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn flood_test_serial() -> tokio::sync::MutexGuard<'static, ()> {
+    FLOOD_TEST_LOCK.lock().await
+}
+
 fn test_settings_value() -> serde_json::Value {
     serde_json::json!({
         "ai": {},
@@ -349,6 +362,7 @@ async fn drain_until_marker_or_deadline(
 /// -- legacy's "slow-client gap/recovery or documented close".
 #[tokio::test]
 async fn slow_client_does_not_block_fast_client_and_is_bounded() {
+    let _flood_guard = flood_test_serial().await;
     let term09 = Term09Config {
         queue_max_bytes: 8 * 1024,
         catastrophic_buffered_bytes: 32 * 1024,
@@ -422,6 +436,381 @@ async fn slow_client_does_not_block_fast_client_and_is_bounded() {
     );
 }
 
+/// What a throttled drain observed: accumulated output text, total output
+/// payload bytes, every `terminal.output.gap` frame (full JSON, in delivery
+/// order), every delivered output frame's `[seqStart..seqEnd]` range (in
+/// delivery order), and whether the connection ended.
+struct ThrottledDrain {
+    text: String,
+    output_bytes: usize,
+    gaps: Vec<serde_json::Value>,
+    frame_seqs: Vec<(i64, i64)>,
+    closed: bool,
+}
+
+/// Read terminal output at a bounded BYTE rate — a slow-but-PROGRESSING
+/// consumer (the incident's shape: a real browser on a slow path that keeps
+/// draining, never a dead socket). After every `chunk_bytes` of output
+/// payload received, pause `chunk_pause`, so the sustained drain rate is
+/// ~`chunk_bytes / chunk_pause`. Stops at `marker`, connection end, or the
+/// deadline (whichever first).
+async fn drain_throttled_until_marker(
+    ws: &mut TestWs,
+    marker: &str,
+    chunk_bytes: usize,
+    chunk_pause: Duration,
+    deadline: tokio::time::Instant,
+) -> ThrottledDrain {
+    let mut report = ThrottledDrain {
+        text: String::new(),
+        output_bytes: 0,
+        gaps: Vec::new(),
+        frame_seqs: Vec::new(),
+        closed: false,
+    };
+    let mut received_since_pause = 0usize;
+    // Rolling tail for marker detection: a marker can only arrive in fresh
+    // data (possibly straddling a frame boundary), so scanning the whole
+    // accumulated text per message would be quadratic — at incident-scale
+    // flood sizes that alone throttles the drain and masquerades as server
+    // slowness. The tail spans several marker lengths; a few hundred bytes
+    // bounds the scan at O(1) per message.
+    let mut tail = String::new();
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining.max(Duration::from_millis(1)), ws.next()).await {
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                match value.get("type").and_then(|v| v.as_str()) {
+                    Some("terminal.output") | Some("terminal.output.batch") => {
+                        let data_len = value
+                            .get("data")
+                            .and_then(|v| v.as_str())
+                            .map(str::len)
+                            .unwrap_or(0);
+                        if let Some(data) = value.get("data").and_then(|v| v.as_str()) {
+                            report.text.push_str(data);
+                            tail.push_str(data);
+                        }
+                        let seq_start = value.get("seqStart").and_then(|v| v.as_i64());
+                        let seq_end = value.get("seqEnd").and_then(|v| v.as_i64());
+                        if let (Some(start), Some(end)) = (seq_start, seq_end) {
+                            report.frame_seqs.push((start, end));
+                        }
+                        report.output_bytes += data_len;
+                        received_since_pause += data_len;
+                        if received_since_pause >= chunk_bytes {
+                            received_since_pause = 0;
+                            tokio::time::sleep(chunk_pause).await;
+                        }
+                    }
+                    Some("terminal.output.gap") => report.gaps.push(value),
+                    _ => {}
+                }
+                if tail.len() > 4 * marker.len() {
+                    let keep = tail.len() - 2 * marker.len();
+                    tail.drain(..keep);
+                }
+                if tail.contains(marker) {
+                    break;
+                }
+            }
+            Ok(Some(Ok(WsMessage::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => {
+                report.closed = true;
+                break;
+            }
+            Ok(Some(Ok(_))) => {}
+            Err(_) => break, // timed out
+        }
+    }
+    report
+}
+
+/// Responsive-terminal-restore Workstream 3, the incident shape: a burst far
+/// larger than the SPILL bound, drained by a slow-but-progressing client.
+/// The production incident (~21-25 MB backlog) disconnected the client under
+/// the old defaults (disconnect 16 MiB fired strictly before spill 32 MiB
+/// could evict); under the new defaults the same pressure must SPILL oldest
+/// output with an exact generation-scoped gap and KEEP THE CONNECTION OPEN,
+/// while the client keeps making successful sends and receives well over the
+/// old disconnect threshold (>16 MiB) across a >10 s pressure window.
+#[tokio::test]
+async fn incident_backlog_spills_instead_of_disconnecting() {
+    let _flood_guard = flood_test_serial().await;
+    // The real default configuration — this test pins the shipped defaults,
+    // not an injected variant.
+    let term09 = Term09Config::default();
+    let url = spawn_server(term09).await;
+
+    let mut creator = connect_and_complete_handshake(&url).await;
+    let terminal_id = create_shell_terminal(&mut creator, "create-incident").await;
+
+    // The victim: a normal client that reads continuously but slowly
+    // (~1 MiB/s), like a browser on a congested path. It is never stuck —
+    // its socket keeps accepting writes the whole time.
+    let mut victim = connect_and_complete_handshake(&url).await;
+    attach(&mut victim, &terminal_id, "attach-incident").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let marker = "FLOOD-DONE-MARKER";
+    // ~90 bytes/line * 400_000 lines =~ 40 MB — comfortably past the spill
+    // bound (16 MiB) so eviction genuinely fires, while the ~1 MiB/s drain
+    // keeps the client sending successfully across a >10 s pressure window.
+    let flood = flood_command(400_000, marker);
+    let started = tokio::time::Instant::now();
+    creator
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "terminal.input",
+                "terminalId": terminal_id,
+                "data": flood,
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send flood input");
+
+    let deadline = started + Duration::from_secs(60);
+    let report = drain_throttled_until_marker(
+        &mut victim,
+        marker,
+        256 * 1024,
+        Duration::from_millis(250),
+        deadline,
+    )
+    .await;
+    let elapsed = started.elapsed();
+
+    assert!(
+        !report.closed,
+        "a slow-but-progressing client must survive incident-scale pressure: \
+         the spill bound (eviction + gap) relieves it strictly before any \
+         pressure-related disconnect"
+    );
+    assert!(
+        report.text.contains(marker),
+        "the flood tail must be delivered after the spill; got {} bytes without \
+         the marker",
+        report.output_bytes
+    );
+    assert!(
+        elapsed >= Duration::from_secs(10),
+        "the pressure window must span the full old stall window (10s); observed {elapsed:?}"
+    );
+    assert!(
+        report.output_bytes > 16 * 1024 * 1024,
+        "the client must receive more than the OLD disconnect threshold \
+         (>16 MiB) while under pressure; got {} bytes",
+        report.output_bytes
+    );
+    assert!(
+        !report.gaps.is_empty(),
+        "a burst larger than the spill bound must produce an eviction gap"
+    );
+    for gap in &report.gaps {
+        assert_eq!(
+            gap["reason"], "queue_overflow",
+            "the observed loss is the queue-overflow (spill) gap: {gap}"
+        );
+        assert_eq!(
+            gap["terminalId"], terminal_id,
+            "gap addresses this terminal"
+        );
+        let from = gap["fromSeq"].as_i64().expect("fromSeq");
+        let to = gap["toSeq"].as_i64().expect("toSeq");
+        assert!(from >= 1 && from <= to, "exact coalesced interval: {gap}");
+        for (start, end) in &report.frame_seqs {
+            assert!(
+                *end < from || *start > to,
+                "evicted bytes are never delivered: frame [{start}..{end}] must \
+                 not intersect gap [{from}..{to}]"
+            );
+        }
+    }
+    let mut seqs = report.frame_seqs.iter();
+    if let Some(mut last) = seqs.next() {
+        for next in seqs {
+            assert!(
+                next.0 > last.1,
+                "delivered frames stay in strict sequence order across gaps: \
+                 {last:?} then {next:?}"
+            );
+            last = next;
+        }
+    }
+}
+
+/// Drain-progress liveness, end to end: a client that keeps making successful
+/// socket sends must NEVER be closed by the catastrophic monitor, even while
+/// its pending bytes sit continuously OVER the disconnect threshold.
+///
+/// The monitor's byte dimension is only observable when the queue may hold
+/// more than the threshold, which the boot validation forbids for real
+/// configurations (spill must sit strictly below disconnect). This test
+/// therefore deliberately injects the OLD inverted shape (queue bound above
+/// the disconnect threshold) straight into `WsState` — the one shape in which
+/// over-threshold pending bytes can persist — and proves the monitor keys on
+/// SEND PROGRESS, not on the byte count: the old sustained-bytes-only
+/// decision closed exactly this client.
+#[tokio::test]
+async fn slow_but_progressing_client_survives_over_threshold_backlog() {
+    let _flood_guard = flood_test_serial().await;
+    // Inverted ON PURPOSE (see doc comment): 8 MiB queue > 1 MiB threshold.
+    // The 2 s stall window keeps the test fast; the harness's 30 s ping
+    // interval keeps the per-send write timeout at 60 s, far beyond the
+    // window, so only the monitor's decision can close this connection.
+    let term09 = Term09Config {
+        queue_max_bytes: 8 * 1024 * 1024,
+        catastrophic_buffered_bytes: 1024 * 1024,
+        catastrophic_stall_ms: 2_000,
+    };
+    let url = spawn_server(term09).await;
+
+    let mut creator = connect_and_complete_handshake(&url).await;
+    let terminal_id = create_shell_terminal(&mut creator, "create-progress").await;
+
+    let mut victim = connect_and_complete_handshake(&url).await;
+    attach(&mut victim, &terminal_id, "attach-progress").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let marker = "FLOOD-DONE-MARKER";
+    // ~27 MB at ~2 MiB/s drain: the queue stays pinned at its 8 MiB bound —
+    // over the 1 MiB threshold continuously for many multiples of the 2 s
+    // stall window — while every frame the writer leases completes a
+    // successful send.
+    let flood = flood_command(300_000, marker);
+    creator
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "terminal.input",
+                "terminalId": terminal_id,
+                "data": flood,
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send flood input");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let report = drain_throttled_until_marker(
+        &mut victim,
+        marker,
+        256 * 1024,
+        Duration::from_millis(125),
+        deadline,
+    )
+    .await;
+
+    assert!(
+        !report.closed,
+        "a client with continuous successful sends must stay connected even \
+         with pending bytes over the threshold for the whole stall window"
+    );
+    assert!(
+        report.text.contains(marker),
+        "the progressing client must see the flood complete; got {} bytes",
+        report.output_bytes
+    );
+    assert!(
+        !report.gaps.is_empty(),
+        "the 8 MiB queue must evict (gap) against a ~27 MB flood at this \
+         drain rate; the overflow is repaired by the exact gap, not by hanging up"
+    );
+}
+
+/// Eviction and supersede are NOT send progress: a connection whose queue
+/// bytes shrink only via eviction and a superseding attach — with zero
+/// completed socket sends across the stall window — must still be closed by
+/// the catastrophic monitor. Byte reductions alone must never masquerade as
+/// liveness.
+#[tokio::test]
+async fn eviction_and_supersede_without_sends_still_close() {
+    let _flood_guard = flood_test_serial().await;
+    // Same deliberately-inverted injection as the progressing-client test:
+    // the queue may hold bytes over the threshold, making the monitor's
+    // window observable. The 30 s harness ping interval keeps the per-send
+    // write timeout at 60 s — far beyond this test's bounds — so a closure
+    // observed here is the monitor's, not the send timeout's.
+    let term09 = Term09Config {
+        queue_max_bytes: 8 * 1024 * 1024,
+        catastrophic_buffered_bytes: 1024 * 1024,
+        catastrophic_stall_ms: 2_000,
+    };
+    let url = spawn_server(term09).await;
+
+    let mut creator = connect_and_complete_handshake(&url).await;
+    let terminal_id = create_shell_terminal(&mut creator, "create-stuck").await;
+
+    // The stuck client: tiny SO_RCVBUF and it NEVER reads. Its queue fills,
+    // then EVICTS continuously (bytes shrinking without any send), and its
+    // in-flight frame wedges once the kernel buffers fill (zero sends).
+    let mut stuck = connect_with_tiny_recv_buffer(&url, 4096).await;
+    complete_handshake(&mut stuck).await;
+    attach(&mut stuck, &terminal_id, "attach-stuck").await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let marker = "FLOOD-DONE-MARKER";
+    // ~60 MB keeps production alive for several seconds past the mid-stall
+    // supersede below (the queue must refill after the discard).
+    let flood = flood_command(600_000, marker);
+    let started = tokio::time::Instant::now();
+    creator
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "terminal.input",
+                "terminalId": terminal_id,
+                "data": flood,
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("send flood input");
+
+    // Do NOT read from the stuck socket at all while the stall window runs —
+    // reading would drain the kernel buffers and count as send progress.
+    // First the queue fills and the in-flight frame wedges (eviction keeps
+    // shrinking queue bytes with zero completed sends).
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
+
+    // Mid-stall, re-attach the stuck client: the superseding attach DISCARDS
+    // its entire queued output (a byte reduction that is NOT a send). The
+    // monitor may honestly reset on the below-threshold fall, but the still-
+    // producing flood refills the queue and the window must close the
+    // connection — eviction/supersede alone must never keep it alive.
+    attach(&mut stuck, &terminal_id, "attach-stuck-supersede").await;
+
+    // Keep not reading through the refill + a full stall window (+margin):
+    // zero successful sends the whole time.
+    tokio::time::sleep(Duration::from_millis(4_000)).await;
+
+    // NOW resume reading: the connection should already be terminated (the
+    // catastrophic monitor fired while we were silent). The closure deadline
+    // (20 s from flood start) sits far below the 60 s write timeout and the
+    // 60 s keepalive termination, so observing a close here proves the
+    // monitor's decision — not the send timeout's.
+    let deadline = started + Duration::from_secs(20);
+    let mut closed = false;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, stuck.next()).await {
+            Ok(Some(Ok(WsMessage::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => {
+                closed = true;
+                break;
+            }
+            Ok(Some(Ok(_))) => {}
+            Err(_) => break, // timed out
+        }
+    }
+    assert!(
+        closed,
+        "a connection with zero completed sends for the whole stall window — \
+         whose queue bytes shrank only via eviction and a superseding attach — \
+         must still be closed by the catastrophic monitor"
+    );
+}
+
 /// Read frames until the first `terminal.output.gap` arrives, returning its
 /// JSON. Callers resume a previously-stuck client: the delivery queue serves
 /// the terminal's pending gap ahead of its remaining frames, so the gap
@@ -453,6 +842,7 @@ async fn first_gap_frame(ws: &mut TestWs, deadline: tokio::time::Instant) -> ser
 /// byte-identical to the pre-contract wire.
 #[tokio::test]
 async fn queue_overflow_gap_bounds_follow_negotiation() {
+    let _flood_guard = flood_test_serial().await;
     // Tiny queue so overflow fires almost immediately; catastrophic
     // backpressure threshold far above it so the connection stays OPEN and
     // the observed loss is the queue-overflow gap (not a 4008 close).
