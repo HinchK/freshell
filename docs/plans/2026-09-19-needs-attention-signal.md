@@ -397,7 +397,7 @@ export function createTurnCompleteGate() {
 
 4. Update the protocol doc at :34-35 and the ADR comment at :49-52 to the new contract (including that an accepted user interrupt's result is consumed silently and the stale "interrupts yield no result at all" claim is corrected).
 
-5. `test/e2e-browser/fixtures/providers/fake-claude-sdk-sidecar.mjs`: replace the `if (subtype === 'success')` guard (:251-258) with the same gate logic — import `createTurnCompleteGate` from the real sidecar package (the fixture already models the interrupt path; verify its interrupt handler exists and wire `noteInterruptRequest`/`noteInterruptSettled` there; if the fake lacks an interrupt handler, add the minimal hook mirroring the real one). The deny-lane e2e (fresh-agent-control-rust.spec.ts:674-734 asserts `sdk.turn.complete` absence up to idle after deny) will be updated in Task 6 to expect the edge.
+5. `test/e2e-browser/fixtures/providers/fake-claude-sdk-sidecar.mjs`: replace the `if (subtype === 'success')` guard (:251-258) with the same gate logic — import `createTurnCompleteGate` from the real sidecar package. The fake's interrupt arm (:408-440) exists but only models the no-in-flight-query shape (settle `ok:false`, no result after) — for the interrupt-silence e2e to be non-vacuous, EXTEND it: an interrupt while a turn is in flight settles `ok:true` and is followed by the interrupted turn's own non-success `sdk.result` (mirroring the real SDK contract, sdk.d.ts:3765), which the fake's gate must then suppress. The deny-lane e2e (fresh-agent-control-rust.spec.ts:674-734 asserts `sdk.turn.complete` absence up to idle after deny) will be updated in Task 6 to expect the edge.
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -528,7 +528,7 @@ Expected: FAIL for the new companion assertions (before the Task 4 fake parity i
 1. Create tab A with a freshclaude agent and tab B with a shell; keep tab B active (background the agent tab), window focused.
 2. Drive a turn that errors (the fake's deny/error lane: `__emit_result__` with `subtype: 'error_max_turns'`, or the approval-deny flow).
 3. Assert: bell rings once (`turnCompletion.seq === 1`), tab A gets the emerald attention class, the pane session's sidebar row highlights; the pane icon shows green (idle state), no amber card.
-4. Visit tab A → attention clears (click mode); send a new message → new turn; interrupt it via the pane's interrupt control while watching → assert NO new `turnCompletion` event (interrupt silence end-to-end).
+4. Visit tab A → attention clears (click mode); send a new message → new turn; interrupt it via the pane's interrupt control while watching → assert NO new `turnCompletion` event (interrupt silence end-to-end). Drive the IN-FLIGHT interrupt shape via the fake sidecar's extended interrupt arm (Task 4): turn in flight → interrupt → settle `ok:true` → the interrupted turn's non-success `sdk.result` follows — the gate must suppress the edge, proving the silence is the GATE's doing, not a missing result frame (the fake's pre-existing no-in-flight arm would make this step vacuous).
 5. Drive a second errored turn while the window is unfocused (harness blur) → the bell path is not directly observable; assert `seq` increments and the attention flag sets (the suppression is unit-pinned; e2e asserts the fold).
 
 - [ ] **Step 4: Run the focused tests**
