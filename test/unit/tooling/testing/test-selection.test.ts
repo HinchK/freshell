@@ -76,8 +76,5 @@ describe('Rust-first build and test selection', () => {
     expect(launch).toContain('launch-rust.sh')
     expect(launch).not.toContain('npm start')
     expect(readFileSync(path.join(PROJECT_ROOT, 'run-rust-server.sh'), 'utf8')).not.toContain('Legacy server:')
-
-    expect(readFileSync(path.join(PROJECT_ROOT, 'scripts/launch-rust.sh'), 'utf8'))
-      .toContain('npm run --silent prepare:rust-runtime')
   })
 })

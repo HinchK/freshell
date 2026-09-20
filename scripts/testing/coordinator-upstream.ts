@@ -3,11 +3,30 @@ import { createRequire } from 'node:module'
 import { constants as osConstants } from 'node:os'
 import path from 'node:path'
 
+import {
+  buildRunScriptArgs,
+  detectProjectManager,
+  resolveManagerCommand,
+  type PackageManagerKind,
+} from '../lib/package-manager.js'
+
 import type { UpstreamPhase } from './coordinator-command-matrix.js'
 
 const ACTIVE_ENV_KEY = 'FRESHELL_TEST_COORDINATOR_ACTIVE'
 const FAKE_UPSTREAM_ENV_KEY = 'FRESHELL_TEST_COORDINATOR_FAKE_UPSTREAM'
 const REPO_ROOT_ENV_KEY = 'FRESHELL_TEST_COORDINATOR_REPO_ROOT'
+
+const managerByRepoRoot = new Map<string, PackageManagerKind>()
+
+function detectPhaseManager(repoRoot: string): PackageManagerKind {
+  const cached = managerByRepoRoot.get(repoRoot)
+  if (cached !== undefined) {
+    return cached
+  }
+  const manager = detectProjectManager(repoRoot).manager
+  managerByRepoRoot.set(repoRoot, manager)
+  return manager
+}
 
 export function assertNoCoordinatorRecursion(envVars: NodeJS.ProcessEnv = process.env): void {
   if (envVars[ACTIVE_ENV_KEY] === '1') {
@@ -27,18 +46,7 @@ export function resolveNpmCommand(
   args: string[],
   envVars: NodeJS.ProcessEnv = process.env,
 ): { command: string; args: string[] } {
-  const npmExecPath = envVars.npm_execpath
-  if (npmExecPath && npmExecPath.endsWith('.js')) {
-    return {
-      command: process.execPath,
-      args: [npmExecPath, ...args],
-    }
-  }
-
-  return {
-    command: process.platform === 'win32' ? 'npm.cmd' : 'npm',
-    args,
-  }
+  return resolveManagerCommand({ manager: 'npm', args, env: envVars })
 }
 
 export function resolveCargoCommand(): { command: string; args: string[] } {
@@ -64,13 +72,23 @@ export async function runUpstreamPhase(
   return runRealPhase(phase, childEnv)
 }
 
-function resolveSpawnSpec(phase: UpstreamPhase, envVars: NodeJS.ProcessEnv): { command: string; args: string[]; selector: string } {
+interface SpawnSpec {
+  command: string
+  args: string[]
+  selector: string
+  viaShell?: boolean
+}
+
+function resolveSpawnSpec(phase: UpstreamPhase, envVars: NodeJS.ProcessEnv): SpawnSpec {
   if (phase.runner === 'npm') {
-    const forwardedArgs = phase.args.length > 0 ? ['--', ...phase.args] : []
-    const npm = resolveNpmCommand(['run', phase.script, ...forwardedArgs], envVars)
+    const repoRoot = envVars[REPO_ROOT_ENV_KEY] ?? process.cwd()
+    const manager = detectPhaseManager(repoRoot)
+    const scriptArgs = buildRunScriptArgs(manager, phase.script, phase.args)
+    const resolved = resolveManagerCommand({ manager, args: scriptArgs, env: envVars })
     return {
-      command: npm.command,
-      args: npm.args,
+      command: resolved.command,
+      args: resolved.args,
+      ...(resolved.viaShell === true ? { viaShell: true } : {}),
       selector: `npm:${phase.script}${phase.args.length > 0 ? ` ${phase.args.join(' ')}` : ''}`,
     }
   }
@@ -111,19 +129,26 @@ async function runFakePhase(phase: UpstreamPhase, envVars: NodeJS.ProcessEnv): P
       }),
     ],
     envVars,
+    false,
   )
 }
 
 async function runRealPhase(phase: UpstreamPhase, envVars: NodeJS.ProcessEnv): Promise<number> {
   const spawnSpec = resolveSpawnSpec(phase, envVars)
-  return spawnAndWait(spawnSpec.command, spawnSpec.args, envVars)
+  return spawnAndWait(spawnSpec.command, spawnSpec.args, envVars, spawnSpec.viaShell === true)
 }
 
-function spawnAndWait(command: string, args: string[], envVars: NodeJS.ProcessEnv): Promise<number> {
+function spawnAndWait(
+  command: string,
+  args: string[],
+  envVars: NodeJS.ProcessEnv,
+  viaShell: boolean,
+): Promise<number> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       stdio: 'inherit',
       env: envVars,
+      ...(viaShell ? { shell: true } : {}),
     })
 
     child.once('error', (error) => reject(error))

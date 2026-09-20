@@ -17,14 +17,8 @@ afterEach(() => {
   spawn.mockReset()
 })
 
-describe('runtime test npm subprocesses', () => {
-  it.each([
-    ['source-runtime prerequisite builder', () => runSourceRuntimeTests([])],
-    ['standard source-runtime phase', () => runStandardTests(['test/integration/tooling/source-runtime-rust.test.ts'])],
-  ])('launches %s using the npm JavaScript entrypoint on native Windows', async (_name, run) => {
-    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
-    const npmCli = 'C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js'
-    vi.stubEnv('npm_execpath', npmCli)
+describe('runtime test script subprocesses', () => {
+  function mockSpawnResolvingChildren(): void {
     spawn.mockImplementation((command: string) => {
       const child = Object.assign(new EventEmitter(), { exitCode: null, killed: false })
       queueMicrotask(() => {
@@ -33,16 +27,47 @@ describe('runtime test npm subprocesses', () => {
       })
       return child
     })
+  }
 
-    expect(await run()).toBe(0)
-    const launches = spawn.mock.calls.map(([command, args, options]) => ({
+  function launchedSpecs(): Array<{ command: unknown; args: unknown; windowsHide: unknown }> {
+    return spawn.mock.calls.map(([command, args, options]) => ({
       command,
       args,
       windowsHide: options?.windowsHide,
     }))
-    expect(launches).toContainEqual({
+  }
+
+  it('launches the source-runtime prerequisite builder using the npm JavaScript entrypoint on native Windows', async () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
+    const npmCli = 'C:\\Program Files\\nodejs\\node_modules\\npm\\bin\\npm-cli.js'
+    vi.stubEnv('npm_execpath', npmCli)
+    mockSpawnResolvingChildren()
+
+    expect(await runSourceRuntimeTests([])).toBe(0)
+    expect(launchedSpecs()).toContainEqual({
       command: process.execPath,
       args: expect.arrayContaining([npmCli, 'run']),
+      windowsHide: true,
+    })
+  })
+
+  it('launches the standard source-runtime phase through the detected pnpm entrypoint on native Windows', async () => {
+    vi.spyOn(process, 'platform', 'get').mockReturnValue('win32')
+    // POSIX-style path so path.basename recognizes the pnpm entrypoint on every
+    // test platform; Windows basename accepts forward slashes too.
+    const pnpmCjs = '/opt/freshell-test-bin/pnpm.cjs'
+    vi.stubEnv('npm_execpath', pnpmCjs)
+    mockSpawnResolvingChildren()
+
+    expect(await runStandardTests(['test/integration/tooling/source-runtime-rust.test.ts'])).toBe(0)
+    expect(launchedSpecs()).toContainEqual({
+      command: process.execPath,
+      args: [
+        pnpmCjs,
+        'run',
+        'test:source-runtime',
+        'test/integration/tooling/source-runtime-rust.test.ts',
+      ],
       windowsHide: true,
     })
   })
