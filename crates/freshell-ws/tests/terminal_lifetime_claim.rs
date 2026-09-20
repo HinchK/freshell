@@ -103,6 +103,24 @@ async fn connect_claim_negotiated(url: &str) -> (common::TestWs, Value) {
     (ws, ready)
 }
 
+/// Connect negotiating `terminalInterestV1` ONLY — the claim-robustness
+/// shape: the connection may send `terminal.interest` snapshots, but its
+/// `claimedTerminalIds` field must be ignored server-side because it never
+/// negotiated `terminalLifetimeClaimV1`.
+async fn connect_interest_only(url: &str) -> (common::TestWs, Value) {
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    send(
+        &mut ws,
+        json!({"type":"hello","token":common::AUTH_TOKEN,
+            "protocolVersion":freshell_protocol::WS_PROTOCOL_VERSION,
+            "capabilities":{"terminalInterestV1":true}}),
+    )
+    .await;
+    let ready = receive(&mut ws, "ready").await;
+    receive(&mut ws, "terminal.inventory").await;
+    (ws, ready)
+}
+
 /// Send `terminal.create` (shell) and return the created terminalId.
 async fn create_shell_terminal(ws: &mut common::TestWs, request_id: &str) -> String {
     send(
@@ -265,5 +283,55 @@ async fn claim_connection_drop_keeps_terminal_wanted_until_hard_cap() {
         killed,
         vec![tid],
         "the 24h hard cap must stay the cleanup backstop for an abandoned claim"
+    );
+}
+
+/// Claim robustness (mixed-version matrix cell 5): an interest snapshot
+/// carrying `claimedTerminalIds` from a connection that did NOT negotiate
+/// `terminalLifetimeClaimV1` is ignored — no claim is recorded, and the
+/// terminal stays RELEASED and REAPABLE: the idle sweep reaps it at the
+/// configured threshold exactly as if no claim had ever been sent. The
+/// wire-level claim_state pin lives in `terminal_interest_wire.rs`
+/// (`claims_from_an_unnegotiated_connection_are_ignored`); THIS test adds
+/// the sweep outcome — the protection the old client never gets.
+#[tokio::test]
+async fn unnegotiated_claim_is_ignored_and_the_terminal_stays_threshold_reapable() {
+    let _gate = GateGuard::enable();
+    let (url, registry) = common::spawn_server_with_specs(vec![]).await;
+    let (mut ws, ready) = connect_interest_only(&url).await;
+    assert!(
+        ready["capabilities"]["terminalLifetimeClaimV1"].is_null(),
+        "the interest-only connection must not get the claim echo: {ready}"
+    );
+
+    let tid = create_shell_terminal(&mut ws, "req-claim-robust").await;
+    registry.set_auto_kill_idle_minutes(1);
+
+    // The old-shape snapshot: accepted (interest is negotiated) but its
+    // claim field must be ignored server-side.
+    send(
+        &mut ws,
+        json!({"type":"terminal.interest","revision":1,
+            "focusedTerminalId":null,"visibleTerminalIds":[],
+            "claimedTerminalIds":[&tid]}),
+    )
+    .await;
+    fence_with_ping(&mut ws).await;
+    assert_eq!(
+        registry
+            .claim_state(&tid)
+            .map(|s| (s.claimers, s.released_by_client)),
+        Some((0, true)),
+        "a non-negotiated connection's claim field must be ignored"
+    );
+
+    // The ignored claim provides NO protection: the sweep reaps the hidden
+    // terminal at the configured threshold — it stays released/reapable.
+    freshell_platform::clock::advance_ms(2 * MINUTE_MS).unwrap();
+    let killed = registry.enforce_idle_kills();
+    assert_eq!(
+        killed,
+        vec![tid.clone()],
+        "an ignored claim must leave the terminal reapable at the configured threshold"
     );
 }

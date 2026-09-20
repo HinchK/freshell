@@ -108,15 +108,50 @@ describe('WsClient pane-reconcile capability', () => {
     expect(client.getServerCapabilities()).toEqual({})
 
     await connectAndReady(client, {
-      capabilities: { paneReconcileV1: true, pacedTerminalReplayV1: true },
+      capabilities: {
+        paneReconcileV1: true,
+        pacedTerminalReplayV1: true,
+        terminalLifetimeClaimV1: true,
+      },
     })
     expect(client.getServerCapabilities().paneReconcileV1).toBe(true)
     expect(client.getServerCapabilities().pacedTerminalReplayV1).toBe(true)
+    expect(client.getServerCapabilities().terminalLifetimeClaimV1).toBe(true)
 
     MockWebSocket.instances[0]._close(1006, 'drop')
     expect(client.getServerCapabilities().paneReconcileV1).toBeUndefined()
     expect(client.getServerCapabilities().pacedTerminalReplayV1).toBeUndefined()
+    expect(client.getServerCapabilities().terminalLifetimeClaimV1).toBeUndefined()
     expect(client.getServerCapabilities()).toEqual({})
+  })
+
+  it('mixed-version downgrade lifecycle: a reconnect onto an old server clears the negotiated restore capabilities', async () => {
+    // Matrix cell 7 (negotiation reset on disconnect, extended): a
+    // NEGOTIATED connection drops and the reconnect's ready carries NO
+    // capabilities (the old server) — the paced-replay and lifetime-claim
+    // acks must be gone so the client's next attach/interest use the
+    // legacy shapes (the TerminalView-level consequence is pinned in the
+    // lifecycle downgrade test; this is the transport-level guarantee it
+    // depends on).
+    const client = getWsClient()
+    const negotiated = await connectAndReady(client, {
+      capabilities: {
+        paneReconcileV1: true,
+        pacedTerminalReplayV1: true,
+        terminalInterestV1: true,
+        terminalLifetimeClaimV1: true,
+      },
+    })
+    expect(negotiated).toBeTruthy()
+    expect(client.getServerCapabilities().pacedTerminalReplayV1).toBe(true)
+    expect(client.getServerCapabilities().terminalLifetimeClaimV1).toBe(true)
+
+    negotiated._close(1006, 'drop')
+    const downgraded = await connectAndReady(client, { /* old server: no capabilities */ })
+    expect(downgraded).toBeTruthy()
+    expect(client.getServerCapabilities()).toEqual({})
+    expect(client.getServerCapabilities().pacedTerminalReplayV1).toBeUndefined()
+    expect(client.getServerCapabilities().terminalLifetimeClaimV1).toBeUndefined()
   })
 
   it('suppresses the in-flight create replay when the capability is acked', async () => {

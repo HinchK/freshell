@@ -599,6 +599,70 @@ async fn legacy_attach_inline_replay(
     (ready, outputs)
 }
 
+/// One attach's full spontaneous burst, collecting EVERY frame type: the
+/// ready (matched by `attachRequestId`), all `terminal.output` frames, and
+/// any `terminal.output.gap` frames separately. The gap bucket is the
+/// mixed-version matrix pin: a NON-NEGOTIATED attach must never produce a
+/// `replay_window_exceeded` gap — today's silent retained-tail behavior is
+/// the old-client contract.
+async fn attach_burst_collecting_gaps(
+    ws: &mut WsClient,
+    terminal_id: &str,
+    arid: &str,
+) -> (
+    serde_json::Value,
+    Vec<serde_json::Value>,
+    Vec<serde_json::Value>,
+) {
+    attach(ws, terminal_id, arid).await;
+    let mut ready = None;
+    let mut outputs = Vec::new();
+    let mut gaps = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        match next_json_or_timeout(ws, Duration::from_millis(400)).await {
+            None => {
+                if ready.is_some() {
+                    break; // the unprompted burst is complete
+                }
+                continue;
+            }
+            Some(value) => match value.get("type").and_then(|v| v.as_str()) {
+                Some("terminal.attach.ready")
+                    if value.get("attachRequestId").and_then(|v| v.as_str()) == Some(arid) =>
+                {
+                    ready = Some(value);
+                }
+                Some("terminal.output") => outputs.push(value),
+                Some("terminal.output.gap") => gaps.push(value),
+                _ => {}
+            },
+        }
+    }
+    let ready = ready.expect("attach.ready never arrived");
+    (ready, outputs, gaps)
+}
+
+/// The covered seq set of a frame list: every seq in [seqStart, seqEnd].
+fn covered_seqs(frames: &[serde_json::Value]) -> std::collections::BTreeSet<i64> {
+    frames
+        .iter()
+        .flat_map(|f| {
+            let start = f["seqStart"].as_i64().unwrap_or(0);
+            let end = f["seqEnd"].as_i64().unwrap_or(0);
+            start..=end
+        })
+        .collect()
+}
+
+/// The concatenated output data of a frame list, in receive (seq) order.
+fn concatenated_data(frames: &[serde_json::Value]) -> String {
+    frames
+        .iter()
+        .map(|f| f["data"].as_str().unwrap_or(""))
+        .collect()
+}
+
 /// Negotiated attach with real scrollback: ready carries the retention
 /// bounds, the first page is a BOUNDED prefix, and NO further replay frames
 /// arrive while the client withholds credit. A raw-socket credit then
@@ -1374,4 +1438,318 @@ async fn restore_observability_events_are_emitted_content_free() {
             );
         }
     }
+}
+
+// ── Mixed-version compatibility matrix (responsive-terminal-restore,
+// task-008): old client → new server on the real socket ──────────────────
+
+/// Old client → new server, ATTACH on large scrollback (matrix cell 1): a
+/// non-negotiated attach sees the FULL inline replay in one unprompted
+/// burst — far beyond one paced page budget, so pacing provably never
+/// engaged — with NO new ready fields, NO gap frames, contiguous coverage,
+/// and a raw credit send that is inert (observed as
+/// `ws.restore.credit status=non_negotiated`, producing nothing).
+#[tokio::test]
+async fn non_negotiated_attach_on_large_scrollback_stays_legacy_inline_and_credits_are_inert() {
+    let events = global_capture();
+    let ring = 512 * 1024;
+    let url = spawn_server(ring).await;
+    let mut driver = connect(&url).await;
+    hello(&mut driver, false).await;
+    let terminal_id = create_shell_terminal(&mut driver, "create-legacy-large").await;
+    // ~64KB of scrollback: many 4KB pages had pacing (wrongly) engaged.
+    flood_until_complete(&url, &mut driver, &terminal_id, 700).await;
+
+    let mut plain = connect(&url).await;
+    hello(&mut plain, false).await;
+    let (ready, outputs, gaps) =
+        attach_burst_collecting_gaps(&mut plain, &terminal_id, "attach-legacy-large").await;
+
+    // NO new ready fields for the non-negotiated connection.
+    assert!(
+        ready.get("oldestRetainedSeq").is_none(),
+        "an old client's attach.ready must not gain contract fields: {ready}"
+    );
+    assert!(
+        ready.get("replayResetReason").is_none(),
+        "an old client's attach.ready must not carry a reset reason: {ready}"
+    );
+    let head = ready["headSeq"].as_i64().expect("headSeq");
+
+    // The whole window arrived unprompted: contiguous coverage to the head,
+    // and the burst is far beyond one page budget (no pages, no credit gate).
+    let burst_bytes: usize = outputs.iter().map(|f| f.to_string().len()).sum();
+    assert!(
+        burst_bytes as i64 > PAGE_BUDGET,
+        "the unprompted burst ({burst_bytes}B) must exceed one page budget \
+         ({PAGE_BUDGET}B) — a paced first page would have been bounded"
+    );
+    let seqs = covered_seqs(&outputs);
+    assert_eq!(
+        seqs.iter().min(),
+        Some(&1),
+        "the inline replay starts at the window baseline"
+    );
+    assert_eq!(
+        seqs.iter().max(),
+        Some(&head),
+        "the inline replay reaches the head ({head})"
+    );
+    let mut contiguous: Vec<i64> = seqs.iter().copied().collect();
+    contiguous.dedup();
+    assert_eq!(
+        contiguous.len() as i64,
+        head,
+        "the inline replay is contiguous with no holes"
+    );
+    assert!(
+        gaps.is_empty(),
+        "an old client's attach burst must contain no gap frames: {gaps:?}"
+    );
+
+    // The raw credit send: inert. Observed as the non_negotiated verdict...
+    credit(&mut plain, &terminal_id, "attach-legacy-large", head).await;
+    let _inert = wait_for_restore_event(
+        &events,
+        &terminal_id,
+        "ws.restore.credit",
+        "status",
+        "non_negotiated",
+    )
+    .await
+    .expect("a non-negotiated connection's credit must be classified non_negotiated");
+
+    // ...and it produces nothing.
+    let after = next_json_or_timeout(&mut plain, Duration::from_millis(1200)).await;
+    assert!(
+        after
+            .as_ref()
+            .map(|v| v.get("type").and_then(|t| t.as_str()) != Some("terminal.output"))
+            .unwrap_or(true),
+        "an inert credit must produce no output, got {after:?}"
+    );
+
+    // Live output keeps flowing after the inert credit (the connection is
+    // not wedged by the refused pacing machinery).
+    let marker = "FLOOD-DONE-MARKER";
+    send_input(&mut driver, &terminal_id, &flood_command(30, marker)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let (acc, _) = drain_until_marker(&mut plain, marker, deadline).await;
+    assert!(
+        acc.contains(marker),
+        "live output flows normally after an inert credit"
+    );
+}
+
+/// Old client + retention loss → NO new gap (matrix cell 2): a
+/// non-negotiated attach whose `sinceSeq` predates the retained history
+/// receives the retained tail SILENTLY — today's behavior, never the
+/// negotiated `replay_window_exceeded` gap — on a real server with an
+/// evicted ring.
+#[tokio::test]
+async fn non_negotiated_attach_after_retention_loss_gets_the_retained_tail_silently() {
+    let ring = 12 * 1024;
+    let url = spawn_server(ring).await;
+    let mut driver = connect(&url).await;
+    hello(&mut driver, false).await;
+    let terminal_id = create_shell_terminal(&mut driver, "create-legacy-evict").await;
+    flood_until_complete(&url, &mut driver, &terminal_id, 100).await;
+
+    // Evict the ring front: a non-negotiated evictor drives a bigger flood
+    // to completion (its own inline replay + live tail observe the marker).
+    let mut evictor = connect(&url).await;
+    hello(&mut evictor, false).await;
+    attach(&mut evictor, &terminal_id, "attach-evictor-legacy").await;
+    let marker2 = "FLOOD-DONE-MARKER";
+    send_input(&mut driver, &terminal_id, &flood_command(400, marker2)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let (acc, _) = drain_until_marker(&mut evictor, marker2, deadline).await;
+    assert!(acc.contains(marker2), "the evicting flood completes");
+    drop(evictor);
+
+    // The old client attaches with sinceSeq 0 — predating the retained ring.
+    let mut plain = connect(&url).await;
+    hello(&mut plain, false).await;
+    let (ready, outputs, gaps) =
+        attach_burst_collecting_gaps(&mut plain, &terminal_id, "attach-legacy-evict").await;
+
+    // THE matrix pin: no `replay_window_exceeded` may reach an old client —
+    // the retention loss is reported the way today's server does: silently.
+    assert!(
+        gaps.is_empty(),
+        "an old client must never receive the newly introduced retention gap: {gaps:?}"
+    );
+    assert!(
+        ready.get("oldestRetainedSeq").is_none(),
+        "an old client's attach.ready must not gain contract fields: {ready}"
+    );
+    let head = ready["headSeq"].as_i64().expect("headSeq");
+    let replay_from = ready["replayFromSeq"].as_i64().expect("replayFromSeq");
+    assert!(
+        replay_from > 1,
+        "the fixture must have evicted the ring front: {ready}"
+    );
+
+    // The retained tail arrives silently: exactly [replay_from, head],
+    // starting at the ring front, contiguous, no phantom pre-eviction bytes.
+    let seqs = covered_seqs(&outputs);
+    assert!(!seqs.is_empty(), "there is a retained tail to deliver");
+    assert_eq!(
+        seqs.iter().min(),
+        Some(&replay_from),
+        "the silent tail starts at the ring front: {ready}"
+    );
+    assert_eq!(
+        seqs.iter().max(),
+        Some(&head),
+        "the silent tail reaches the head"
+    );
+    let mut contiguous: Vec<i64> = seqs.iter().copied().collect();
+    contiguous.dedup();
+    assert_eq!(
+        contiguous.len() as i64,
+        head - replay_from + 1,
+        "the silent tail is contiguous with no holes"
+    );
+
+    // Live output continues after the silent retained tail (no stall).
+    let marker3 = "FLOOD-DONE-MARKER";
+    send_input(&mut driver, &terminal_id, &flood_command(30, marker3)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let (acc, _) = drain_until_marker(&mut plain, marker3, deadline).await;
+    assert!(
+        acc.contains(marker3),
+        "live output flows normally after the silent retained tail"
+    );
+}
+
+/// Mixed connections on ONE terminal (matrix cell 4): a negotiated client and
+/// a non-negotiated client attached to the SAME terminal simultaneously —
+/// the negotiated one gets paced pages (credit-gated), the non-negotiated
+/// one gets the legacy inline replay; no cross-talk in either direction, and
+/// both converge to the SAME frame content (identical seq coverage and
+/// identical concatenated data — equality modulo pacing/batching shape).
+#[tokio::test]
+async fn mixed_negotiated_and_legacy_attachments_converge_without_cross_talk() {
+    let events = global_capture();
+    let ring = 512 * 1024;
+    let url = spawn_server(ring).await;
+    let mut driver = connect(&url).await;
+    hello(&mut driver, false).await;
+    let terminal_id = create_shell_terminal(&mut driver, "create-mixed").await;
+    flood_until_complete(&url, &mut driver, &terminal_id, 400).await;
+
+    // The negotiated client attaches first: one bounded page, mid-replay.
+    let mut paced = connect(&url).await;
+    hello(&mut paced, true).await;
+    let (paced_ready, page1) =
+        paced_attach_first_page(&mut paced, &terminal_id, "attach-mix-paced").await;
+    let head = paced_ready["headSeq"].as_i64().expect("headSeq");
+    let last1 = page1
+        .iter()
+        .map(|f| f["seqEnd"].as_i64().unwrap_or(0))
+        .max()
+        .expect("the first page covers something");
+    assert!(
+        last1 < head,
+        "the negotiated session is mid-replay (head {head})"
+    );
+
+    // The legacy twin attaches to the SAME terminal while the paced session
+    // is mid-replay: the FULL window arrives inline, immediately.
+    let mut legacy = connect(&url).await;
+    hello(&mut legacy, false).await;
+    let (legacy_ready, legacy_outputs, legacy_gaps) =
+        attach_burst_collecting_gaps(&mut legacy, &terminal_id, "attach-mix-legacy").await;
+    assert!(
+        legacy_gaps.is_empty(),
+        "the legacy twin must see no gap frames: {legacy_gaps:?}"
+    );
+    assert!(
+        legacy_ready.get("oldestRetainedSeq").is_none(),
+        "the legacy twin's ready must stay pre-contract: {legacy_ready}"
+    );
+    let legacy_seqs = covered_seqs(&legacy_outputs);
+    assert_eq!(
+        legacy_seqs.iter().max(),
+        Some(&head),
+        "the legacy twin gets the whole window inline"
+    );
+
+    // No cross-talk, direction 1: the other connection's attach must NOT
+    // cancel the negotiated session — its credit still produces its page...
+    credit(&mut paced, &terminal_id, "attach-mix-paced", last1).await;
+    let next = next_json(&mut paced).await;
+    assert_eq!(
+        next["type"], "terminal.output",
+        "the negotiated session survives the legacy attach: {next}"
+    );
+    assert_eq!(next["attachRequestId"], "attach-mix-paced");
+
+    // No cross-talk, direction 2: while the negotiated session withholds,
+    // the legacy attach must not leak pages to it (the next unprompted
+    // frame on the negotiated side is only the one its own credit bought).
+    let mut paced_frames = page1.clone();
+    let next_end = next["seqEnd"].as_i64().unwrap_or(last1);
+    paced_frames.push(next);
+    let mut credited = next_end;
+    // Credit every consumed frame's end — a page may span several frames
+    // (or one atomic over-budget frame per page), and the NEXT page is
+    // produced only on a credit inside the delivered window.
+    credit(&mut paced, &terminal_id, "attach-mix-paced", credited).await;
+    let mut saw_head = credited >= head;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        let Some(value) = next_json_or_timeout(&mut paced, Duration::from_secs(5)).await else {
+            assert!(
+                saw_head,
+                "the paced replay stalled before its target (head {head}, credited {credited})"
+            );
+            break;
+        };
+        if value.get("type").and_then(|v| v.as_str()) != Some("terminal.output") {
+            continue;
+        }
+        assert_eq!(
+            value["attachRequestId"], "attach-mix-paced",
+            "only the negotiated session's own pages arrive: {value}"
+        );
+        let end = value["seqEnd"].as_i64().unwrap_or(0);
+        saw_head |= end >= head;
+        paced_frames.push(value);
+        if end > credited {
+            credited = end;
+            credit(&mut paced, &terminal_id, "attach-mix-paced", end).await;
+        }
+    }
+    let complete =
+        wait_for_restore_event_of_terminal(&events, &terminal_id, "ws.restore.paced_complete")
+            .await
+            .expect("the negotiated session reaches paced_complete");
+    assert_eq!(
+        complete.fields.get("attach_request_id").map(String::as_str),
+        Some("attach-mix-paced")
+    );
+
+    // Convergence: identical seq coverage and identical concatenated data —
+    // the paced side (pages, credit-gated) and the legacy side (one inline
+    // burst) delivered the same terminal content, modulo pacing shape.
+    let paced_seqs = covered_seqs(&paced_frames);
+    assert_eq!(paced_seqs, legacy_seqs, "both sides cover the same seqs");
+    assert_eq!(
+        paced_seqs.iter().min(),
+        Some(&1),
+        "both sides cover from the window baseline"
+    );
+    assert_eq!(
+        paced_seqs.iter().max(),
+        Some(&head),
+        "both sides reach the head"
+    );
+    let paced_data = concatenated_data(&paced_frames);
+    let legacy_data = concatenated_data(&legacy_outputs);
+    assert_eq!(
+        paced_data, legacy_data,
+        "both sides delivered byte-identical content"
+    );
 }

@@ -121,9 +121,11 @@ async fn spawn_server() -> String {
 type WsClient =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// Send a `hello` and read the `ready` frame back as JSON (the first message
-/// of the connect handshake).
-async fn hello_ready(ws: &mut WsClient, capabilities: serde_json::Value) -> serde_json::Value {
+/// Send a `hello` and read the `ready` frame back as its RAW serialized text
+/// (no JSON re-parse): the byte-identity pins below compare literal wire
+/// bytes — serde `Value` equality would silently accept reordered keys,
+/// reformatted numbers, or spacing changes that old clients may still pin.
+async fn hello_ready_text(ws: &mut WsClient, capabilities: serde_json::Value) -> String {
     ws.send(WsMessage::Text(
         serde_json::json!({
             "type": "hello",
@@ -144,6 +146,13 @@ async fn hello_ready(ws: &mut WsClient, capabilities: serde_json::Value) -> serd
     let WsMessage::Text(text) = msg else {
         panic!("expected the ready text frame, got {msg:?}");
     };
+    text
+}
+
+/// Send a `hello` and read the `ready` frame back as JSON (the first message
+/// of the connect handshake).
+async fn hello_ready(ws: &mut WsClient, capabilities: serde_json::Value) -> serde_json::Value {
+    let text = hello_ready_text(ws, capabilities).await;
     serde_json::from_str(&text).expect("ready is JSON")
 }
 
@@ -374,5 +383,114 @@ async fn plain_attach_ready_omits_oldest_retained_seq() {
     assert!(
         ready.get("oldestRetainedSeq").is_none(),
         "a non-negotiated ready frame must not gain any new key: {ready}"
+    );
+}
+
+// ── Mixed-version compatibility matrix (responsive-terminal-restore,
+// task-008) ─────────────────────────────────────────────────────────────
+
+/// Old client → new server, READY-FRAME BYTE IDENTITY (carried task-1 review
+/// Nit 1): a capability-free hello must produce a `ready` whose RAW wire
+/// text is byte-identical to the pre-branch shape — pinned as literal
+/// serialized text, not serde `Value` equality (Value equality would silently
+/// accept reordered keys, `1`-vs-`1.0`, or spacing changes). Only the
+/// timestamp and buildId values are dynamic; every static byte around them,
+/// the key order, and the absence of every newer key are pinned exactly.
+#[tokio::test]
+async fn capability_free_ready_frame_raw_text_is_byte_identical_to_the_pre_branch_shape() {
+    let url = spawn_server().await;
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("ws connect");
+
+    let text = hello_ready_text(&mut ws, serde_json::json!({})).await;
+
+    // The tag leads, then the fields in the frozen struct order: timestamp,
+    // bootId, serverInstanceId, buildId — and NOTHING else (capabilities and
+    // runtimeOwners are omitted for this fixture: no capability keys, no
+    // ownership coordinator injected).
+    assert!(
+        text.starts_with(r#"{"type":"ready","timestamp":""#),
+        "the ready frame's literal prefix must stay byte-identical: {text}"
+    );
+    assert!(
+        text.contains(r#""bootId":"boot-test","serverInstanceId":"srv-test","buildId":""#),
+        "the static fields must serialize in the frozen order and shape: {text}"
+    );
+    assert!(
+        text.ends_with(r#""}"#),
+        "buildId is the last field — no key may follow it: {text}"
+    );
+    for forbidden in [
+        "capabilities",
+        "pacedTerminalReplayV1",
+        "terminalLifetimeClaimV1",
+        "runtimeOwners",
+        "oldestRetainedSeq",
+    ] {
+        assert!(
+            !text.contains(forbidden),
+            "an old client's ready frame must not contain the new key {forbidden}: {text}"
+        );
+    }
+}
+
+/// Old client → new server, sibling-negotiation BYTE IDENTITY: a hello that
+/// negotiates pre-branch capabilities but none of the new ones must get a
+/// `ready.capabilities` object whose RAW serialized text is the literal
+/// pre-branch bytes — exact key order, no spacing, no new keys interleaved
+/// (the Value-equality twin above cannot catch a reorder or a reformat).
+#[tokio::test]
+async fn sibling_negotiation_ready_capabilities_raw_text_is_byte_identical() {
+    let url = spawn_server().await;
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("ws connect");
+
+    let text = hello_ready_text(
+        &mut ws,
+        serde_json::json!({ "paneReconcileV1": true, "terminalInterestV1": true }),
+    )
+    .await;
+
+    assert!(
+        text.contains(r#""capabilities":{"paneReconcileV1":true,"terminalInterestV1":true}"#),
+        "the echoed capabilities object must be the literal pre-branch bytes \
+         (key order, separators, no new keys): {text}"
+    );
+    for forbidden in ["pacedTerminalReplayV1", "terminalLifetimeClaimV1"] {
+        assert!(
+            !text.contains(forbidden),
+            "a non-opting client's ready must not mention {forbidden}: {text}"
+        );
+    }
+}
+
+/// Combined negotiation (carried task-1 review Nit 2): a hello carrying
+/// `pacedTerminalReplayV1` AND a sibling capability produces a ready that
+/// carries BOTH keys — the paced echo never drops or swallows a sibling, and
+/// the raw text pins the combined literal shape.
+#[tokio::test]
+async fn combined_negotiation_ready_carries_both_the_paced_and_sibling_keys() {
+    let url = spawn_server().await;
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("ws connect");
+
+    let text = hello_ready_text(
+        &mut ws,
+        serde_json::json!({ "pacedTerminalReplayV1": true, "paneReconcileV1": true }),
+    )
+    .await;
+    let ready: serde_json::Value = serde_json::from_str(&text).expect("ready is JSON");
+
+    assert_eq!(
+        ready["capabilities"],
+        serde_json::json!({ "paneReconcileV1": true, "pacedTerminalReplayV1": true }),
+        "a combined negotiation must echo BOTH keys: {ready}"
+    );
+    assert!(
+        text.contains(r#""capabilities":{"paneReconcileV1":true,"pacedTerminalReplayV1":true}"#),
+        "the combined echo must keep the frozen literal byte order: {text}"
     );
 }

@@ -11241,6 +11241,8 @@ describe('TerminalView lifecycle updates', () => {
       mode?: TerminalPaneContent['mode']
       sessionRef?: TerminalPaneContent['sessionRef']
       negotiated?: boolean
+      hidden?: boolean
+      skipInitialAttachWait?: boolean
     }) {
       const suffix = opts?.suffix ?? `t${Math.floor(Math.random() * 1e9)}`
       const tabId = `tab-paced-${suffix}`
@@ -11290,11 +11292,18 @@ describe('TerminalView lifecycle updates', () => {
         },
       })
 
-      render(
+      const readPaneContent = () => {
+        const layout = store.getState().panes.layouts[tabId]
+        return layout && layout.type === 'leaf' && layout.content.kind === 'terminal'
+          ? layout.content
+          : paneContent
+      }
+      const renderAt = (isHidden: boolean) => (
         <Provider store={store}>
-          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} />
-        </Provider>,
+          <TerminalView tabId={tabId} paneId={paneId} paneContent={readPaneContent()} hidden={isHidden} />
+        </Provider>
       )
+      const view = render(renderAt(opts?.hidden === true))
 
       await waitFor(() => {
         expect(messageHandler).not.toBeNull()
@@ -11302,12 +11311,21 @@ describe('TerminalView lifecycle updates', () => {
       await waitFor(() => {
         expect(terminalInstances.length).toBeGreaterThan(0)
       })
-      await waitFor(() => {
-        expect(sentMessages().some((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)).toBe(true)
-      })
+      if (opts?.skipInitialAttachWait !== true) {
+        await waitFor(() => {
+          expect(sentMessages().some((msg) => msg?.type === 'terminal.attach' && msg?.terminalId === terminalId)).toBe(true)
+        })
+      }
 
       const term = terminalInstances[terminalInstances.length - 1]
-      return { store, tabId, paneId, terminalId, term }
+      return {
+        store,
+        tabId,
+        paneId,
+        terminalId,
+        term,
+        rerenderAt: (isHidden: boolean) => act(() => { view.rerender(renderAt(isHidden)) }),
+      }
     }
 
     function creditMessages() {
@@ -11409,7 +11427,7 @@ describe('TerminalView lifecycle updates', () => {
       expect(creditMessages()).toEqual([])
     })
 
-    it('old server opencode hydrates keep the budgetless legacy shape', async () => {
+    it('old server opencode hydrates keep the budgetless legacy shape (full-shape pin)', async () => {
       const { terminalId } = await setupPacedPane({
         suffix: 'legacy-oc',
         negotiated: false,
@@ -11418,6 +11436,20 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       const mountAttach = attachMessagesFor(terminalId).at(-1)
+      expect(mountAttach).toEqual({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        cols: 80,
+        rows: 24,
+        sinceSeq: 0,
+        attachRequestId: expect.stringMatching(/^pane-paced-legacy-oc:\d+:[A-Za-z0-9_-]{6}$/),
+        priority: 'foreground',
+        surfaceReset: true,
+        expectedSessionRef: { provider: 'opencode', sessionId: 'ses-paced-legacy-oc' },
+        createRequestId: 'req-paced-legacy-oc',
+        tabId: 'tab-paced-legacy-oc',
+      })
       expect(mountAttach).not.toHaveProperty('maxReplayBytes')
       expect(mountAttach).not.toHaveProperty('replayPageBytes')
     })
@@ -11764,6 +11796,330 @@ describe('TerminalView lifecycle updates', () => {
       const layout = store.getState().panes.layouts[tabId]
       expect(layout?.type === 'leaf' && layout.content.kind === 'terminal' && layout.content.status).toBe('exited')
       expect(layout?.type === 'leaf' && layout.content.kind === 'terminal' && layout.content.terminalId).toBeUndefined()
+    })
+
+    // ── Old-server downgrade matrix (responsive-terminal-restore task-008,
+    // matrix cell 6): for EVERY attach intent the client sends, the payloads
+    // are byte-identical to the pre-branch shapes when the ready echo lacks
+    // the capabilities — full-shape toEqual pins, zero credit sends,
+    // maxReplayBytes exactly where today sends it (and absent for opencode).
+    // The mount hydrate's full-shape pin is the M1 test above; the sweep
+    // below covers the remaining intents. ────────────────────────────────
+
+    it('old server transport_reconnect resumes with the pre-branch payload shape (full-shape pin)', async () => {
+      const { terminalId } = await setupPacedPane({ suffix: 'legacy-reconnect', negotiated: false })
+
+      // Establish a checkpoint: the mount hydrate consumed frames 1-4.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 10,
+          replayFromSeq: 1,
+          replayToSeq: 10,
+        })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 2, data: 'HE' })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 3, seqEnd: 4, data: 'LLO' })
+      })
+
+      wsMocks.send.mockClear()
+      act(() => { reconnectHandler?.() })
+
+      const resumeAttach = attachMessagesFor(terminalId).at(-1)
+      expect(resumeAttach).toEqual({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'transport_reconnect',
+        cols: 80,
+        rows: 24,
+        sinceSeq: 4,
+        attachRequestId: expect.stringMatching(/^pane-paced-legacy-reconnect:\d+:[A-Za-z0-9_-]{6}$/),
+        priority: 'foreground',
+        createRequestId: 'req-paced-legacy-reconnect',
+        tabId: 'tab-paced-legacy-reconnect',
+      })
+      expect(resumeAttach).not.toHaveProperty('maxReplayBytes')
+      expect(resumeAttach).not.toHaveProperty('replayPageBytes')
+      expect(resumeAttach).not.toHaveProperty('surfaceReset')
+
+      // The remainder arrives and is consumed with ZERO continuation credits.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 10,
+          replayFromSeq: 5,
+          replayToSeq: 10,
+        })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 5, seqEnd: 10, data: ' WORLD' })
+      })
+      expect(creditMessages()).toEqual([])
+    })
+
+    it('old server hidden-pane fallback attach keeps the pre-branch keepalive_delta shape (full-shape pin)', async () => {
+      const { terminalId, rerenderAt } = await setupPacedPane({ suffix: 'legacy-hidden', negotiated: false })
+
+      // The visible pane hydrates to completion (the active tab's hydration
+      // starts the background pump) and a checkpoint lands at 8.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 8,
+          replayFromSeq: 1,
+          replayToSeq: 8,
+        })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 4, data: 'abcd' })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 5, seqEnd: 8, data: 'efgh' })
+      })
+
+      // The pane goes hidden, then the transport reconnects: the hidden
+      // branch re-arms via the background hydration queue (the old-server
+      // fallback — no lifetime claim exists), and the pump grant attaches
+      // the keepalive_delta catch-up.
+      rerenderAt(true)
+      wsMocks.send.mockClear()
+      act(() => { reconnectHandler?.() })
+
+      const hiddenAttach = await waitFor(() => {
+        const found = attachMessagesFor(terminalId).at(-1)
+        expect(found).toBeTruthy()
+        return found
+      })
+      expect(hiddenAttach).toEqual({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'keepalive_delta',
+        cols: 80,
+        rows: 24,
+        sinceSeq: 8,
+        attachRequestId: expect.stringMatching(/^pane-paced-legacy-hidden:\d+:[A-Za-z0-9_-]{6}$/),
+        priority: 'background',
+        createRequestId: 'req-paced-legacy-hidden',
+        tabId: 'tab-paced-legacy-hidden',
+      })
+      expect(hiddenAttach).not.toHaveProperty('maxReplayBytes')
+      expect(hiddenAttach).not.toHaveProperty('replayPageBytes')
+      expect(hiddenAttach).not.toHaveProperty('surfaceReset')
+      expect(creditMessages()).toEqual([])
+    })
+
+    it('old server reveal promotion attaches with the pre-branch hydrate shape (full-shape pin)', async () => {
+      const { terminalId, rerenderAt } = await setupPacedPane({
+        suffix: 'legacy-reveal',
+        negotiated: false,
+        hidden: true,
+        skipInitialAttachWait: true,
+      })
+
+      // A freshly-mounted hidden pane attaches NOTHING (it waits for reveal).
+      expect(attachMessagesFor(terminalId)).toHaveLength(0)
+
+      // Reveal: the deferred hydrate fires with today's exact legacy shape.
+      rerenderAt(false)
+      const revealAttach = await waitFor(() => {
+        const found = attachMessagesFor(terminalId).at(-1)
+        expect(found).toBeTruthy()
+        return found
+      })
+      expect(revealAttach).toEqual({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        cols: 80,
+        rows: 24,
+        sinceSeq: 0,
+        attachRequestId: expect.stringMatching(/^pane-paced-legacy-reveal:\d+:[A-Za-z0-9_-]{6}$/),
+        priority: 'foreground',
+        maxReplayBytes: PACED_PAGE_BYTES,
+        surfaceReset: true,
+        createRequestId: 'req-paced-legacy-reveal',
+        tabId: 'tab-paced-legacy-reveal',
+      })
+      expect(revealAttach).not.toHaveProperty('replayPageBytes')
+      expect(creditMessages()).toEqual([])
+    })
+
+    it('old server load-more-history attach keeps the pre-branch shape (full-shape pin)', async () => {
+      const { terminalId } = await setupPacedPane({ suffix: 'legacy-loadmore', negotiated: false })
+
+      // The legacy byte-budget truncation: the recoverable-truncation banner
+      // (the only "load more" trigger — an old-server shape the client has
+      // kept since the Node-server era).
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 100,
+          replayFromSeq: 1,
+          replayToSeq: 100,
+        })
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 1,
+          toSeq: 90,
+          reason: 'replay_budget_exceeded',
+        })
+      })
+      expect(screen.getByRole('button', { name: 'Load earlier terminal history' })).toBeTruthy()
+
+      wsMocks.send.mockClear()
+      fireEvent.click(screen.getByRole('button', { name: 'Load earlier terminal history' }))
+
+      const loadMoreAttach = attachMessagesFor(terminalId).at(-1)
+      expect(loadMoreAttach).toEqual({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        cols: 80,
+        rows: 24,
+        sinceSeq: 0,
+        attachRequestId: expect.stringMatching(/^pane-paced-legacy-loadmore:\d+:[A-Za-z0-9_-]{6}$/),
+        priority: 'foreground',
+        // Today's load-more hydrate carries NO replay budget (pre-branch the
+        // handler passes no maxReplayBytes). The fresh-surface claim persists
+        // when the truncation gap completes the attach (the gap completion
+        // path keeps the marker), so the surfaceReset re-claim is today's
+        // shape too.
+        surfaceReset: true,
+        createRequestId: 'req-paced-legacy-loadmore',
+        tabId: 'tab-paced-legacy-loadmore',
+      })
+      expect(loadMoreAttach).not.toHaveProperty('maxReplayBytes')
+      expect(loadMoreAttach).not.toHaveProperty('replayPageBytes')
+      expect(creditMessages()).toEqual([])
+    })
+
+    it('downgrade lifecycle: after an old-server reconnect the next attach uses the legacy shape even though the previous connection was negotiated', async () => {
+      // Matrix cell 7 (extend the negotiation-reset pin): the first
+      // connection negotiated paced replay (replayPageBytes attaches); the
+      // reconnect lands on an old server (the ws-client resets capabilities
+      // on disconnect and the new ready carries none — pinned in
+      // ws-client.reconcile.test.ts) — the NEXT attach must use the legacy
+      // shape, and the pane must never emit a continuation credit again.
+      const { terminalId } = await setupPacedPane({ suffix: 'downgrade' })
+      const mountAttach = attachMessagesFor(terminalId).at(-1)
+      expect(mountAttach).toMatchObject({ replayPageBytes: PACED_PAGE_BYTES })
+
+      // A checkpoint lands at 6 on the negotiated connection.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 6,
+          replayFromSeq: 1,
+          replayToSeq: 6,
+        })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 3, data: 'abc' })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 4, seqEnd: 6, data: 'def' })
+      })
+
+      // The downgrade: the reconnect's ready carries no capabilities.
+      wsMocks.capabilities = {}
+      wsMocks.send.mockClear()
+      act(() => { reconnectHandler?.() })
+
+      const resumeAttach = attachMessagesFor(terminalId).at(-1)
+      expect(resumeAttach).toEqual({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'transport_reconnect',
+        cols: 80,
+        rows: 24,
+        sinceSeq: 6,
+        attachRequestId: expect.stringMatching(/^pane-paced-downgrade:\d+:[A-Za-z0-9_-]{6}$/),
+        priority: 'foreground',
+        createRequestId: 'req-paced-downgrade',
+        tabId: 'tab-paced-downgrade',
+      })
+      expect(resumeAttach).not.toHaveProperty('replayPageBytes')
+      expect(resumeAttach).not.toHaveProperty('maxReplayBytes')
+
+      // The previously-negotiated pane consumes the remainder with ZERO
+      // continuation credits — the paced consumption state died with the
+      // old connection.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 10,
+          replayFromSeq: 7,
+          replayToSeq: 10,
+        })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 7, seqEnd: 10, data: ' tail' })
+      })
+      expect(creditMessages()).toEqual([])
+    })
+
+    it('old-server retention shapes (silent tail, byte-budget gap, backlog gap) never kill, replace, or change identity', async () => {
+      // Matrix cell 8: an old-server-shaped stream NEVER sends
+      // `replay_window_exceeded` (the paced core is its only emitter and it
+      // requires negotiation) — the shapes an old server CAN produce are the
+      // byte-budget truncation gap, the slow-link backlog gap, and the
+      // SILENT retained tail. None of them may trigger any kill/replacement
+      // path (dead post-task-5). The simulated `replay_window_exceeded`
+      // shape on a non-negotiated connection is pinned above; this test
+      // covers the real old-server shapes.
+      const { store, tabId, terminalId, term } = await setupPacedPane({
+        suffix: 'legacy-shapes',
+        negotiated: false,
+        mode: 'opencode',
+        sessionRef: { provider: 'opencode', sessionId: 'ses-paced-legacy-shapes' },
+      })
+
+      // Shape 1 — the byte-budget truncation gap (recoverable): the honest
+      // Load-more banner, not a kill or replacement.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 100,
+          replayFromSeq: 1,
+          replayToSeq: 100,
+        })
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 1,
+          toSeq: 90,
+          reason: 'replay_budget_exceeded',
+        })
+      })
+      expect(screen.getByRole('button', { name: 'Load earlier terminal history' })).toBeTruthy()
+
+      // Shape 2 — the queue-overflow gap (slow link backlog): a local
+      // notice only.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 91,
+          toSeq: 95,
+          reason: 'queue_overflow',
+        })
+      })
+      expectTerminalWriteContaining(term, 'Output gap 91-95: slow link backlog')
+
+      // Shape 3 — the silent retained tail: old servers deliver the
+      // retained history with NO gap frame at all (the seq jump is silent).
+      act(() => {
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 96, seqEnd: 100, data: 'RETAINED TAIL' })
+      })
+      expectTerminalWriteContaining(term, 'RETAINED TAIL')
+
+      // The absence pin: no kill, no replacement spawn, no restart notice,
+      // identity untouched, zero credits.
+      const sent = sentMessages()
+      expect(sent.some((msg) => msg?.type === 'terminal.kill')).toBe(false)
+      expect(sent.some((msg) => msg?.type === 'terminal.create')).toBe(false)
+      expect(terminalWriteStrings(term).some((entry) => entry.includes('Restarting OpenCode'))).toBe(false)
+
+      const layout = store.getState().panes.layouts[tabId]
+      expect(layout?.type === 'leaf' && layout.content.kind === 'terminal'
+        && layout.content.terminalId).toBe(terminalId)
+      expect(layout?.type === 'leaf' && layout.content.kind === 'terminal' && layout.content.status).toBe('running')
+      expect(creditMessages()).toEqual([])
     })
   })
 
