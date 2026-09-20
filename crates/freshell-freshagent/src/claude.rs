@@ -7525,6 +7525,35 @@ rl.on('line', (line) => {
         }
     }
 
+    /// DEFLAKE (parallel-starvation family): the send's activity feed
+    /// lands on the SPAWNED sidecar-notification pump, not on the send's
+    /// own await path — under tokio worker starvation the pump can trail
+    /// the `respond_log_frames` return by seconds (observed: 3
+    /// consecutive full-crate failures of the racing-send test at host
+    /// load ~30, each passing solo). The protection under test is "the
+    /// feed is never silently dropped", not "it lands within
+    /// nanoseconds": poll for the wanted count with a generous deadline,
+    /// then assert on the collected snapshot.
+    async fn await_activities(
+        sink: &crate::naming::test_support::RecordingSink,
+        wanted: usize,
+    ) -> Vec<crate::naming::NameActivity> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            {
+                let activities = sink.activities.lock().unwrap();
+                if activities.len() >= wanted {
+                    return activities.clone();
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the send's activity feed never landed: {activities:?}"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     /// Unified agent names (Task 4): the shared accepted-input callback — an
     /// accepted freshclaude send feeds the naming authority ONE activity
     /// carrying the prompt text (the first-message fallback upgrade plus
@@ -7548,7 +7577,7 @@ rl.on('line', (line) => {
             .await;
         let _ = env.respond_log_frames(1).await;
 
-        let activities = sink.activities.lock().unwrap();
+        let activities = await_activities(&sink, 1).await;
         assert_eq!(activities.len(), 1, "{activities:?}");
         assert_eq!(
             activities[0].target,
@@ -7653,6 +7682,38 @@ rl.on('line', (line) => {
         // id can answer, and the feed falls back to the pending ref for
         // the addressed id itself (the store's redirect resolution
         // decides); the next send addresses the adopted id anyway.
+        //
+        // DEFLAKE (parallel-starvation family): the fake's ASYNC init
+        // adoption re-writes `cli_session_id` whenever it lands, so
+        // hand-clearing it immediately after `created` races the adoption
+        // — a scheduling delay lets the adoption land between the
+        // hand-clear and the send, and the feed then targets the fake's
+        // adopted id instead of the pending fallback (observed in a
+        // full-crate run). Wait for the adoption to COMPLETE first (the
+        // fake emits init ONCE), then hand-model the mid-adoption window:
+        // stash consumed + durable id not yet recorded.
+        {
+            let adoption_deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                {
+                    let adopted_yet = state
+                        .sessions
+                        .lock()
+                        .await
+                        .get(&session_id)
+                        .and_then(|s| s.cli_session_id.clone());
+                    if adopted_yet.is_some() {
+                        break;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < adoption_deadline,
+                        "the fake sidecar's init adoption never landed"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }
         state.naming_handles.lock().await.remove(&session_id);
         state
             .sessions
@@ -7667,7 +7728,7 @@ rl.on('line', (line) => {
             .await;
         let _ = env.respond_log_frames(1).await;
 
-        let activities = sink.activities.lock().unwrap();
+        let activities = await_activities(&sink, 1).await;
         assert_eq!(
             activities.len(),
             1,
@@ -7712,8 +7773,37 @@ rl.on('line', (line) => {
         // models the state the same way): the stash is consumed (the init
         // bind's cleanup) and the session row carries the adopted durable
         // id — the client is still addressing the placeholder.
+        //
+        // DEFLAKE (parallel-starvation family): the fake's ASYNC init
+        // adoption overwrites `cli_session_id` (with the fake's own id)
+        // whenever it runs, so hand-setting the adopted id immediately
+        // after `created` races it — a scheduling delay lets the adoption
+        // land between the hand-set and the send, and the activity then
+        // targets the fake's id (observed once in a full-crate run). Wait
+        // for the adoption to COMPLETE first, then hand-set the modeled
+        // adopted id — the scenario is the POST-adoption state either way.
         let adopted_cli_id = "11111111-2222-4333-8444-555555555555".to_string();
         {
+            let adoption_deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                {
+                    let adopted_yet = state
+                        .sessions
+                        .lock()
+                        .await
+                        .get(&session_id)
+                        .and_then(|s| s.cli_session_id.clone());
+                    if adopted_yet.is_some() {
+                        break;
+                    }
+                    assert!(
+                        tokio::time::Instant::now() < adoption_deadline,
+                        "the fake sidecar's init adoption never landed"
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
             let mut sessions = state.sessions.lock().await;
             sessions
                 .get_mut(&session_id)
@@ -7727,7 +7817,7 @@ rl.on('line', (line) => {
             .await;
         let _ = env.respond_log_frames(1).await;
 
-        let activities = sink.activities.lock().unwrap();
+        let activities = await_activities(&sink, 1).await;
         assert_eq!(
             activities.len(),
             1,

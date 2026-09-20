@@ -466,7 +466,18 @@ async fn ui_layout_sync_updates_the_shared_layout_store() {
 
     let store = state.layout.clone();
     let snap = store.get_normalized_snapshot(None);
-    assert_eq!(snap["tabs"], json!([{ "id": "tab_r", "title": "Remote" }]));
+    // Unified agent names: a tab row carries `nameSource` — which name
+    // authored the tab title. The ingested `agent-chat` pane on pane_1 is a
+    // session-named pane, so the tab's title projects that session's name
+    // source.
+    assert_eq!(
+        snap["tabs"],
+        json!([{
+            "id": "tab_r",
+            "title": "Remote",
+            "nameSource": { "kind": "session", "paneId": "pane_1" }
+        }])
+    );
     assert_eq!(snap["activeTabId"], json!("tab_r"));
     let tree = &snap["layouts"]["tab_r"];
     assert_eq!(tree["type"], json!("split"));
@@ -627,9 +638,11 @@ async fn ui_layout_sync_is_served_back_through_rest_on_the_same_process() {
     let body: serde_json::Value =
         serde_json::from_str(&resp.text().await.expect("body text")).expect("json body");
     let data = &body["data"];
+    // Unified agent names: this tab has no session-named pane, so its title
+    // projects the `legacy` name source (the raw WS-fed title).
     assert_eq!(
         data["tabs"],
-        json!([{ "id": "tab_ws", "title": "WS-fed tab" }])
+        json!([{ "id": "tab_ws", "title": "WS-fed tab", "nameSource": { "kind": "legacy" } }])
     );
     assert_eq!(data["activeTabId"], json!("tab_ws"));
     let tree = &data["layouts"]["tab_ws"];
