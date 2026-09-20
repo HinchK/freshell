@@ -63,9 +63,11 @@ pub fn bind_reusable(addr: SocketAddr, reuse_port: bool) -> std::io::Result<StdT
     Ok(std_listener)
 }
 
-/// One live listener: its shutdown signal + the accept-loop task handle. The
-/// accept loop drops its listener before exiting, so awaiting the handle is a
-/// true "old socket closed" barrier.
+/// One live listener: its shutdown signal and accept-loop task handle. The
+/// accept loop drops its listener before exiting, so awaiting the handle is
+/// a true "old socket closed" barrier. The bound address lives on the
+/// controller's `current_addr` mirror (one slot: exactly one listener
+/// exists at a time).
 struct LiveListener {
     shutdown: Arc<Notify>,
     accept_loop: JoinHandle<()>,
@@ -76,6 +78,13 @@ pub struct RebindController {
     reuse_port: bool,
     app: OnceLock<Router>,
     current: Mutex<Option<LiveListener>>,
+    /// The CURRENT listener's bound address, mirrored for cheap sync reads
+    /// (NET-02's rollback proof reads product truth instead of probing the
+    /// kernel namespace, where a sibling's just-assigned wildcard listener
+    /// makes a plain detector bind lie). Written under the same lock scope
+    /// as the `current` swap, so it is never newer or staler than the
+    /// listener itself.
+    current_addr: std::sync::Mutex<Option<SocketAddr>>,
 }
 
 impl RebindController {
@@ -85,6 +94,7 @@ impl RebindController {
             reuse_port,
             app: OnceLock::new(),
             current: Mutex::new(None),
+            current_addr: std::sync::Mutex::new(None),
         })
     }
 
@@ -112,6 +122,10 @@ impl RebindController {
         let addr = SocketAddr::new(host, self.port);
         let std_listener = bind_reusable(addr, self.reuse_port)?; // PROOF: must succeed
         let listener = tokio::net::TcpListener::from_std(std_listener)?;
+        // The listener's OWN address (its port when the caller bound
+        // kernel-assigned port 0): the product-truth record the rollback
+        // detector reads.
+        let bound_addr = listener.local_addr()?;
         let shutdown = Arc::new(Notify::new());
         let shut = Arc::clone(&shutdown);
         let accept_loop = tokio::spawn(async move {
@@ -157,6 +171,7 @@ impl RebindController {
             // this JoinHandle is a true "old listener closed" barrier.
         });
         let mut cur = self.current.lock().await;
+        *self.current_addr.lock().expect("current_addr lock") = Some(bound_addr);
         if let Some(old) = cur.replace(LiveListener {
             shutdown,
             accept_loop,
@@ -167,8 +182,22 @@ impl RebindController {
         Ok(())
     }
 
+    /// The CURRENT listener's bound address, or `None` when nothing is
+    /// serving. In-memory product truth (never a kernel probe): because
+    /// [`Self::serve_on`] only records an address AFTER the new bind and
+    /// only AFTER the previous accept loop's close barrier, this address
+    /// both proves the recorded listener is live and — the NET-02 rollback
+    /// use — proves any PREVIOUS listener on another address is gone.
+    // Consumed by the rollback test's product-truth detector (the `has_app`
+    // precedent: test-consumed surface until a bin caller reads it).
+    #[allow(dead_code)]
+    pub fn current_bind_addr(&self) -> Option<SocketAddr> {
+        *self.current_addr.lock().expect("current_addr lock")
+    }
+
     pub async fn shutdown_all(&self) {
         if let Some(cur) = self.current.lock().await.take() {
+            *self.current_addr.lock().expect("current_addr lock") = None;
             cur.shutdown.notify_one();
             let _ = cur.accept_loop.await;
         }
