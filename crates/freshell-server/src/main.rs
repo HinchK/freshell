@@ -622,10 +622,14 @@ async fn main() -> ExitCode {
         // a resume, an unarchive, or a lease), the OpenCode serve PATCH
         // (gated by the effective-database context), and the Claude
         // `session-names.mjs` helper (Rust owns its timeout and kill/wait).
-        // An adapter that cannot be wired (no shared serve yet, a missing
-        // helper) degrades to `None` — that provider's native work pauses as
-        // unsupported without affecting the others. Task 4 adds generation to
-        // this same owned loop and selector.
+        // The OpenCode adapter is ALWAYS wired: it holds the lazy shared
+        // serve-manager cell (`None` until the first freshopencode pane's
+        // lane runs it) and resolves the CURRENT manager per operation, so
+        // an armed series pauses only until the serve exists — a boot-time
+        // snapshot of that cell would freeze the `None` forever. A genuinely
+        // unwireable adapter (a missing Claude helper) degrades to `None` —
+        // that provider's native work pauses without affecting the others.
+        // Task 4 adds generation to this same owned loop and selector.
         {
             let names = names.clone();
             let codex_state = fresh_codex_state.clone();
@@ -647,10 +651,9 @@ async fn main() -> ExitCode {
                         >
                 },
             ));
-            let opencode_adapter = agent_state
-                .opencode_manager()
-                .await
-                .map(session_name_native::OpencodeNativeNameAdapter::new);
+            let opencode_adapter = Some(session_name_native::OpencodeNativeNameAdapter::new(
+                agent_state.opencode_shared_handle(),
+            ));
             let dispatch = Arc::new(session_name_native::NativeNameDispatch::new(
                 Some(session_name_native::ClaudeNativeNameAdapter::from_env()),
                 Some(codex_adapter),

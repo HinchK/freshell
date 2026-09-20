@@ -1408,18 +1408,27 @@ impl NativeNameBackend for CodexNativeNameAdapter {
     }
 }
 
+/// The shared serve-manager cell owned by the fresh-agent state: `None`
+/// until the first freshopencode pane's lane runs `ensure_manager`, then
+/// `Some` for the rest of the process lifetime. The naming adapter holds
+/// this handle and resolves the CURRENT manager per operation — the worker
+/// outlives the cell's lazy creation, so a boot-time snapshot would freeze
+/// the `None` and pause every opencode native series forever.
+pub type SharedOpencodeManager =
+    std::sync::Arc<tokio::sync::Mutex<Option<freshell_opencode::OpencodeServeManager>>>;
+
 /// The OpenCode adapter: the supported PATCH `update_session_title` route
 /// through the shared fresh-agent serve manager, gated by the
 /// effective-database context check BEFORE dispatch. A `:memory:` route or a
 /// database mismatch fails diagnostically (Unsupported) — never a silent
 /// write into the wrong store, never the directory as a store selector.
 pub struct OpencodeNativeNameAdapter {
-    manager: freshell_opencode::OpencodeServeManager,
+    shared: SharedOpencodeManager,
 }
 
 impl OpencodeNativeNameAdapter {
-    pub fn new(manager: freshell_opencode::OpencodeServeManager) -> Self {
-        Self { manager }
+    pub fn new(shared: SharedOpencodeManager) -> Self {
+        Self { shared }
     }
 
     fn session_id_of_target(name_ref: &SessionNameRef, location: &NativeLocation) -> String {
@@ -1490,8 +1499,13 @@ fn classify_opencode_error(error: freshell_opencode::ServeError, what: &str) -> 
 
 impl NativeNameBackend for OpencodeNativeNameAdapter {
     fn read(&self, target: NativeNameTarget) -> NativeFuture<NativeNameReadback> {
-        let manager = self.manager.clone();
+        let shared = Arc::clone(&self.shared);
         Box::pin(async move {
+            let Some(manager) = shared.lock().await.clone() else {
+                return NativeCallResult::Undelivered(
+                    "the shared opencode serve is not running".to_string(),
+                );
+            };
             let session_id = Self::session_id_of_target(&target.name_ref, &target.location);
             if session_id.is_empty() {
                 return NativeCallResult::Unsupported(
@@ -1522,8 +1536,13 @@ impl NativeNameBackend for OpencodeNativeNameAdapter {
     }
 
     fn write(&self, attempt: NativeNameAttempt) -> NativeFuture<()> {
-        let manager = self.manager.clone();
+        let shared = Arc::clone(&self.shared);
         Box::pin(async move {
+            let Some(manager) = shared.lock().await.clone() else {
+                return NativeCallResult::Undelivered(
+                    "the shared opencode serve is not running".to_string(),
+                );
+            };
             let session_id =
                 Self::session_id_of_target(&attempt.target.name_ref, &attempt.target.location);
             if session_id.is_empty() {
@@ -1551,11 +1570,17 @@ impl NativeNameBackend for OpencodeNativeNameAdapter {
 
     fn route_available(&self, target: NativeNameTarget) -> NativeProbeFuture {
         // A serve is startable on demand (`ensure_started`), so a wired
-        // adapter with a resolvable session id can always attempt; a
-        // mismatched database context is a DIAGNOSED provider failure the
-        // dispatch itself reports, not an absent capability.
+        // adapter with a resolvable session id can always attempt once the
+        // SHARED manager exists; a mismatched database context is a
+        // DIAGNOSED provider failure the dispatch itself reports, not an
+        // absent capability. The shared serve must EXIST though — before
+        // the first freshopencode pane's lane runs `ensure_manager` the
+        // capability is absent (the adapter never spawns a serve just to
+        // check a name), and the CURRENT cell is resolved per probe so the
+        // lazy creation un-pauses armed series within one re-probe window.
         let resolvable = !Self::session_id_of_target(&target.name_ref, &target.location).is_empty();
-        Box::pin(async move { resolvable })
+        let shared = Arc::clone(&self.shared);
+        Box::pin(async move { resolvable && shared.lock().await.is_some() })
     }
 }
 

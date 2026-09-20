@@ -1632,6 +1632,192 @@ async fn started_opencode_manager(
     (manager, http)
 }
 
+/// Wrap one started manager in a SHARED cell holding `Some(manager)` — the
+/// post-materialization state of the fresh-agent handle.
+fn shared_opencode(manager: OpencodeServeManager) -> super::SharedOpencodeManager {
+    Arc::new(tokio::sync::Mutex::new(Some(manager)))
+}
+
+/// Answers the session GET with no title until the first PATCH has been
+/// seen, then with the desired title — the pre-write read diverges (the
+/// write must dispatch) and the confirming readback synchronizes.
+struct TitledHttp {
+    requests: Mutex<Vec<HttpMethod>>,
+}
+
+impl ServeHttp for TitledHttp {
+    fn request<'a>(
+        &'a self,
+        req: ServeHttpRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>> + Send + 'a,
+        >,
+    > {
+        let is_health_probe = req.url.contains("/global/health");
+        if !is_health_probe {
+            self.requests.lock().unwrap().push(req.method);
+        }
+        let patched = self.requests.lock().unwrap().contains(&HttpMethod::Patch);
+        let body = if is_health_probe {
+            b"{}".to_vec()
+        } else if patched {
+            br#"{"title":"Shared-Serve Opencode Name"}"#.to_vec()
+        } else {
+            b"{}".to_vec()
+        };
+        Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) })
+    }
+}
+
+/// A started shared manager over the titled fake (the serve is pinned to the
+/// database the location carries so the effective-database gate passes).
+async fn started_shared_titled_manager(
+    env: Vec<(String, String)>,
+) -> (OpencodeServeManager, Arc<TitledHttp>) {
+    let http = Arc::new(TitledHttp {
+        requests: Mutex::new(Vec::new()),
+    });
+    let deps = ServeDeps {
+        spawner: Arc::new(FakeSpawner),
+        http: http.clone(),
+        ports: Arc::new(FixedPort),
+        events: Arc::new(NeverConnects),
+    };
+    let config = ServeConfig {
+        env,
+        health_timeout: Duration::from_millis(500),
+        ..Default::default()
+    };
+    let manager = OpencodeServeManager::new(deps, config);
+    manager.ensure_started().await.expect("fake serve starts");
+    (manager, http)
+}
+
+/// Unified agent names (Task 8 acceptance): the shared opencode serve
+/// manager is created LAZILY by the first freshopencode pane's lane
+/// (`ensure_manager`), long after the native worker's dispatch was wired at
+/// boot. The adapter must resolve the CURRENT shared manager per operation —
+/// a boot-time snapshot of the lazy cell would freeze its `None` and pause
+/// every opencode native series forever (the native smoke's live-observed
+/// gap: renames arm, the pane materializes, and the series never consumes a
+/// single cycle while claude and codex settle through the same worker).
+#[tokio::test]
+async fn an_opencode_native_series_resumes_when_the_shared_serve_arrives_after_boot() {
+    struct NeverGemini;
+    impl crate::ai_title::GeminiTransport for NeverGemini {
+        fn generate_content(
+            &self,
+            _prompt: String,
+            _max_output_tokens: u32,
+        ) -> crate::ai_title::BoxFuture<Result<String, String>> {
+            Box::pin(std::future::pending())
+        }
+    }
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = session(
+        freshell_protocol::session_names::NamedProvider::Opencode,
+        "ses_boot-late",
+    );
+    // The auto-title sweep's hydration shape: the indexed record exists
+    // first (a bare session rename with no record 404s), the manual rename
+    // arms the series, and the pane lane's acquisition attaches the
+    // verified route.
+    store
+        .hydrate_indexed(
+            crate::session_name_generation::IndexedNameInput {
+                provider: freshell_protocol::session_names::NamedProvider::Opencode,
+                session_id: "ses_boot-late".to_string(),
+                cwd: Some("/work/proj".to_string()),
+                first_user_message: Some("Materialize the shared serve".to_string()),
+                provider_title: None,
+            },
+            false,
+        )
+        .await
+        .expect("hydrate");
+    rename_user(&store, target.clone(), "Shared-Serve Opencode Name")
+        .await
+        .expect("the manual rename arms the series");
+    record_acquisition(
+        &store,
+        target.clone(),
+        verified_acquisition(opencode_location(
+            "/pinned/shared.db",
+            "ses_boot-late",
+            "/work/proj",
+        )),
+    )
+    .await
+    .expect("acquire");
+
+    // The boot-time wiring: the shared cell is EMPTY — no pane has run yet.
+    let shared: super::SharedOpencodeManager = Arc::new(tokio::sync::Mutex::new(None));
+    let dispatch = Arc::new(super::NativeNameDispatch::new(
+        None,
+        None,
+        Some(super::OpencodeNativeNameAdapter::new(shared.clone())),
+    ));
+    let generator = Arc::new(crate::session_name_generation::SessionNameGenerator::new(
+        crate::settings_store::SettingsStore::load(Some(dir.path()), vec![]),
+        crate::ai_title::AiKeyCell::init(None, None),
+        Arc::new(NeverGemini) as Arc<dyn crate::ai_title::GeminiTransport>,
+    ));
+    let worker = super::SessionNameWorker::start(Arc::clone(&store), dispatch, generator);
+
+    // While the shared serve is absent the series pauses: pending, with
+    // NOTHING consumed (the capability probe burns no cycle).
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    let paused = native_sync_of(&store, target.clone())
+        .await
+        .expect("the series projects");
+    assert_eq!(
+        paused.status,
+        NativeSyncStatus::Pending,
+        "the absent shared serve pauses the series"
+    );
+    let doc = document_json(dir.path());
+    let native_write = doc["nativeWrite"].as_object().expect("nativeWrite section");
+    assert_eq!(native_write.len(), 1, "exactly one armed series");
+    let entry = native_write.values().next().expect("the series entry");
+    assert_eq!(
+        entry["cyclesConsumed"].as_u64(),
+        Some(0),
+        "the pause consumes nothing"
+    );
+
+    // The pane lane materializes the shared serve (the cell flips to Some).
+    let (manager, http) = started_shared_titled_manager(vec![(
+        "OPENCODE_DB".to_string(),
+        "/pinned/shared.db".to_string(),
+    )])
+    .await;
+    *shared.lock().await = Some(manager);
+
+    // Within one capability re-probe window the series resumes and runs to
+    // synced — WITHOUT re-wiring the worker.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let sync = native_sync_of(&store, target.clone())
+            .await
+            .expect("the series projects");
+        if sync.status == NativeSyncStatus::Synced {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the series never resumed after the shared serve arrived: {sync:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    worker.abort();
+    assert!(
+        http.requests.lock().unwrap().contains(&HttpMethod::Patch),
+        "the writeback PATCH dispatched through the shared serve"
+    );
+}
+
 fn opencode_attempt(database: &str, session_id: &str) -> super::NativeNameAttempt {
     super::NativeNameAttempt {
         target: NativeNameTarget {
@@ -1662,7 +1848,7 @@ async fn opencode_http_failures_after_dispatch_are_ambiguous() {
         500,
     )
     .await;
-    let adapter = super::OpencodeNativeNameAdapter::new(manager);
+    let adapter = super::OpencodeNativeNameAdapter::new(shared_opencode(manager));
     match adapter
         .write(opencode_attempt("/pinned/other.db", "ses_5xx"))
         .await
@@ -1684,7 +1870,7 @@ async fn opencode_http_failures_after_dispatch_are_ambiguous() {
         400,
     )
     .await;
-    let adapter = super::OpencodeNativeNameAdapter::new(manager);
+    let adapter = super::OpencodeNativeNameAdapter::new(shared_opencode(manager));
     match adapter
         .write(opencode_attempt("/pinned/other.db", "ses_4xx"))
         .await
@@ -1706,7 +1892,7 @@ async fn the_opencode_read_gates_on_the_effective_database_context() {
         200,
     )
     .await;
-    let adapter = super::OpencodeNativeNameAdapter::new(manager);
+    let adapter = super::OpencodeNativeNameAdapter::new(shared_opencode(manager));
     let target = NativeNameTarget {
         name_ref: session(
             freshell_protocol::session_names::NamedProvider::Opencode,

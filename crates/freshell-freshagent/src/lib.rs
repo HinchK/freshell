@@ -190,6 +190,14 @@ pub(crate) fn resolve_probe_timeout_ms(state_override: Option<u64>, env_raw: Opt
         .unwrap_or(10_000u64)
 }
 
+/// The shared opencode serve-manager cell: `None` until the first
+/// freshopencode pane's lane runs `ensure_manager`, then the live manager
+/// for the rest of the process lifetime. The native naming adapter holds
+/// this handle and resolves the current manager per operation (a boot-time
+/// snapshot would freeze the `None` and pause every opencode native series
+/// forever — the worker outlives the cell's lazy creation).
+pub type SharedOpencodeManagerHandle = Arc<tokio::sync::Mutex<Option<OpencodeServeManager>>>;
+
 /// Shared, cheaply-cloneable fresh-agent REST state (mergeable into the server app).
 #[derive(Clone)]
 pub struct FreshAgentState {
@@ -201,7 +209,7 @@ pub struct FreshAgentState {
     /// paneId → pane record (placeholder id, cwd, model/effort, durable id).
     panes: Arc<Mutex<HashMap<String, PaneEntry>>>,
     /// The single lazily-started `opencode serve` client for this server process.
-    opencode: Arc<tokio::sync::Mutex<Option<OpencodeServeManager>>>,
+    opencode: SharedOpencodeManagerHandle,
     /// Monotonic `sessions.changed` revision.
     sessions_revision: Arc<AtomicI64>,
     /// Slice 1 (`docs/plans/2026-07-18-agent-api-mcp-parity-spec.md`): the SAME
@@ -863,12 +871,15 @@ impl FreshAgentState {
         *self.opencode.lock().await = Some(manager);
     }
 
-    /// Unified agent names (Task 3): the shared opencode serve manager when
-    /// one is already running (`None` before the first ensure — the native
-    /// title adapter pauses rather than spawning a serve just to check a
-    /// name). Read-only peek; `ensure_manager` remains the only spawner.
-    pub async fn opencode_manager(&self) -> Option<OpencodeServeManager> {
-        self.opencode.lock().await.clone()
+    /// Unified agent names (Task 3): the shared serve-manager cell the
+    /// native naming adapter holds. `None` before the first `ensure_manager`
+    /// (the first freshopencode pane's lane) — the adapter resolves the
+    /// CURRENT manager per operation so the lazy creation un-pauses armed
+    /// native series; it never spawns a serve just to check a name.
+    /// Read-only by contract from the adapter: `ensure_manager` remains the
+    /// only spawner.
+    pub fn opencode_shared_handle(&self) -> SharedOpencodeManagerHandle {
+        Arc::clone(&self.opencode)
     }
 
     /// Task 4 test seam: bound the REST resume probe's `get_session` budget
