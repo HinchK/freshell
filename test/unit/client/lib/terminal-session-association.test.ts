@@ -1,7 +1,12 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 
 const apiMocks = vi.hoisted(() => ({ post: vi.fn() }))
-vi.mock('@/lib/api', () => ({ api: { post: apiMocks.post } }))
+// The rebind bootstrap read rides the real retry wrapper; the mock keeps it
+// a passthrough (the fixtures never 429).
+vi.mock('@/lib/api', () => ({
+  with429Retry: async (attempt: () => Promise<unknown>) => attempt(),
+  api: { post: apiMocks.post },
+}))
 
 import { reconcileTerminalSessionAssociation } from '@/lib/terminal-session-association'
 import { reconcileTerminalSessionRefByTerminalId } from '@/store/panesSlice'

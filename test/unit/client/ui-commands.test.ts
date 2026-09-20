@@ -19,6 +19,10 @@ vi.mock('@/lib/api', () => ({
       super(message)
     }
   },
+  // The naming read rides the real retry wrapper; the mock keeps it a
+  // passthrough so the bootstrap path behaves exactly as production minus
+  // the (never-hit in these fixtures) 429 backoff.
+  with429Retry: async (attempt: () => Promise<unknown>) => attempt(),
   api: {
     get: vi.fn(),
     patch: vi.fn(),

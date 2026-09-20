@@ -68,6 +68,9 @@ vi.mock('@/lib/api', () => ({
       super(message)
     }
   },
+  // The naming bootstrap read rides the real retry wrapper; the mock keeps
+  // it a passthrough (the fixtures never 429).
+  with429Retry: async (attempt: () => Promise<unknown>) => attempt(),
   api: {
     get: (path: string) => mocks.apiGet(path),
     patch: vi.fn(),

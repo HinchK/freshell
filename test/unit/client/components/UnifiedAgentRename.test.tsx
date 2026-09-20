@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/react'
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
+import { ApiError } from '@/lib/api'
 import PaneContainer from '@/components/panes/PaneContainer'
 import TabBar from '@/components/TabBar'
 import sessionNamesReducer, { receiveSessionNames, sessionNamesIngestMiddleware } from '@/store/sessionNamesSlice'
@@ -54,6 +55,20 @@ vi.mock('@/lib/ws-client', () => ({
 }))
 
 vi.mock('@/lib/api', () => ({
+  ApiError: class ApiError extends Error {
+    readonly status: number
+    readonly details?: unknown
+    constructor(status: number, message: string, details?: unknown) {
+      super(message)
+      this.name = 'ApiError'
+      this.status = status
+      this.details = details
+    }
+  },
+  // The conflict lane refreshes the rename capture through the naming
+  // read, which rides the real retry wrapper; the mock keeps it a
+  // passthrough (the fixtures never 429).
+  with429Retry: async (attempt: () => Promise<unknown>) => attempt(),
   api: {
     get: (path: string, options?: unknown) => mockApiGet(path, options),
     patch: (path: string, body: unknown, options?: unknown) => mockApiPatch(path, body, options),
@@ -203,16 +218,19 @@ function renderScoped(store: ReturnType<typeof scopedPaneStore>['store'], layout
 }
 
 /** The server's 409 body: the other writer's accepted update rides along. */
-function revisionConflictError(winner: SessionNameUpdate): Error & { status: number; data: unknown } {
-  const error = new Error('another rename won') as Error & { status: number; data: unknown }
-  error.status = 409
-  error.data = {
+function revisionConflictError(winner: SessionNameUpdate): Error {
+  // The REAL wire shape since the conflict-lane repair: the scoped routes
+  // answer the accepted CURRENT record in the 409 body, and the client's
+  // `toRenameError` reads it from the ApiError's `details` (the parsed
+  // response body) — the legacy raw-Error-with-`data` twin is exactly the
+  // masking bug that repair fixed, so this fixture must be an ApiError
+  // carrying `details` like production.
+  return new ApiError(409, 'another rename won', {
     error: 'NAME_REVISION_CONFLICT',
     message: 'another rename won',
     sessionName: winner,
     nameRef: claudeSessionRef,
-  }
-  return error
+  })
 }
 
 describe('unified agent rename — one shared session name', () => {
