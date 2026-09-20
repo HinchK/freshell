@@ -4,6 +4,7 @@ import {
   consumeTurnCompleteEvents,
   markTabAttention,
   markPaneAttention,
+  markTabWatchedCompletion,
   type TurnCompleteEvent,
 } from '@/store/turnCompletionSlice'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
@@ -46,18 +47,43 @@ export function useTurnCompletionNotifications() {
     if (pendingEvents.length === 0) return
 
     const windowFocused = isWindowFocused()
+    // A turn ending the user was watching: the window is focused AND the
+    // event's tab is the active tab.
+    const isWatched = (event: TurnCompleteEvent) => windowFocused && activeTabId === event.tabId
+    const markAttention = (event: TurnCompleteEvent) => {
+      dispatch(markTabAttention({ tabId: event.tabId }))
+      dispatch(markPaneAttention({ paneId: event.paneId }))
+    }
     let highestHandledSeq = lastHandledSeqRef.current
-    let shouldPlay = false
+    let terminalShouldPlay = false
 
     for (const event of pendingEvents) {
       if (event.seq <= lastHandledSeqRef.current) continue
       highestHandledSeq = Math.max(highestHandledSeq, event.seq)
-      dispatch(markTabAttention({ tabId: event.tabId }))
-      dispatch(markPaneAttention({ paneId: event.paneId }))
-      if (windowFocused && activeTabId === event.tabId) {
+
+      if (event.source === 'terminal') {
+        // TERMINAL partition — today's behavior, unchanged: always mark tab+pane
+        // attention (watched endings included), suppress only the sound when
+        // watched, and coalesce the whole batch into ONE play().
+        markAttention(event)
+        if (isWatched(event)) {
+          continue
+        }
+        terminalShouldPlay = true
         continue
       }
-      shouldPlay = true
+
+      // FRESH-AGENT partition — the unified attention rules.
+      if (isWatched(event)) {
+        // Watched ending: tab-strip-only mark, no sound, no attention flags
+        // (attentionByTab also drives the sidebar row highlight, which must
+        // stay dark for a watched ending).
+        dispatch(markTabWatchedCompletion({ tabId: event.tabId }))
+        continue
+      }
+      // Unwitnessed ending: full attention marks and one audible ring per event.
+      markAttention(event)
+      play()
     }
 
     if (highestHandledSeq > lastHandledSeqRef.current) {
@@ -65,7 +91,7 @@ export function useTurnCompletionNotifications() {
       dispatch(consumeTurnCompleteEvents({ throughSeq: highestHandledSeq }))
     }
 
-    if (shouldPlay) {
+    if (terminalShouldPlay) {
       play()
     }
   }, [activeTabId, dispatch, pendingEvents, play])

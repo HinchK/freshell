@@ -22,6 +22,8 @@
 // remount parity, identical for user-driven splits; the descriptor restore
 // covers only elements that re-render on remount.
 
+import { clearTabWatchedCompletion } from '@/store/turnCompletionSlice'
+
 export interface PaneFocusRecord {
   owned: boolean
   /** Best-effort stable selector (within the pane root) for the focused
@@ -290,34 +292,54 @@ const PANE_SELECTION_ACTIONS = new Set([
   'panes/closePane',
 ])
 
+/** Watched fresh-agent completions mark the tab strip only, and clear on any
+ *  later (re)activation of the tab — re-activation implies the navigate-away
+ *  leg already happened ("the mark clears next time the user navigates away
+ *  and back"). The reducer is a reference-preserving no-op when the tab has
+ *  no watched mark. */
+type StoreLike = {
+  getState: () => {
+    tabs?: { activeTabId?: string | null }
+    panes?: { activePane?: Record<string, string> }
+  }
+  /** Mirrors Redux's Dispatch<UnknownAction> so the real store satisfies it. */
+  dispatch?: (action: { type: string }) => unknown
+}
+
+function clearWatchedCompletionFor(store: StoreLike, tabId: unknown): void {
+  if (typeof tabId !== 'string' || !tabId) return
+  store.dispatch?.(clearTabWatchedCompletion({ tabId }))
+}
+
 export const paneSelectionMiddleware =
-  (store: {
-    getState: () => {
-      tabs?: { activeTabId?: string | null }
-      panes?: { activePane?: Record<string, string> }
-    }
-  }) =>
+  (store: StoreLike) =>
   (next: (action: unknown) => unknown) =>
   (action: unknown): unknown => {
-    const a = action as { type?: string; payload?: { tabId?: string } } | null
+    const a = action as { type?: string; payload?: unknown } | null
     if (
       a?.type === 'panes/setActivePane'
       || a?.type === 'panes/nudgePaneFocus'
       || a?.type === 'tabs/setActiveTab'
     ) {
       paneSelectionSerial += 1
-      return next(action)
+      const result = next(action)
+      if (a.type === 'tabs/setActiveTab') {
+        clearWatchedCompletionFor(store, a.payload)
+      }
+      return result
     }
     if (a?.type && TAB_SELECTION_ACTIONS.has(a.type)) {
       const before = store.getState().tabs?.activeTabId
       const result = next(action)
-      if (store.getState().tabs?.activeTabId !== before) {
+      const after = store.getState().tabs?.activeTabId
+      if (after !== before) {
         paneSelectionSerial += 1
+        clearWatchedCompletionFor(store, after)
       }
       return result
     }
     if (a?.type && PANE_SELECTION_ACTIONS.has(a.type)) {
-      const tabId = a?.payload?.tabId
+      const tabId = (a?.payload as { tabId?: string } | undefined)?.tabId
       if (!tabId) return next(action)
       const before = store.getState().panes?.activePane?.[tabId]
       const result = next(action)

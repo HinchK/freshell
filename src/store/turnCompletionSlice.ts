@@ -1,5 +1,4 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit'
-import { TURN_COMPLETION_STORAGE_KEY } from './storage-keys'
 
 type TurnCompletePayload = {
   tabId: string
@@ -8,7 +7,13 @@ type TurnCompletePayload = {
   at: number
 }
 
-export type TurnCompleteEvent = TurnCompletePayload & { seq: number }
+/** Who recorded a pending event — partitions the notification hook. */
+export type TurnCompletionEventSource = 'freshAgent' | 'terminal'
+
+export type TurnCompleteEvent = TurnCompletePayload & {
+  seq: number
+  source: TurnCompletionEventSource
+}
 
 export type TerminalIdlePayload = {
   tabId: string
@@ -26,50 +31,29 @@ export interface TurnCompletionState {
   pendingEvents: TurnCompleteEvent[]
   attentionByTab: Record<string, boolean>
   attentionByPane: Record<string, boolean>
+  /**
+   * Watched fresh-agent turn endings (window focused + tab active): a
+   * tab-strip-ONLY mark. Deliberately separate from attentionByTab (which
+   * also drives the sidebar row highlight and would light sibling sessions
+   * of a split tab). Never persisted and cleared on any later re-activation
+   * of the tab.
+   */
+  watchedCompletionByTab: Record<string, boolean>
 }
 
-function readBooleanRecord(value: unknown): Record<string, boolean> {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
-  const out: Record<string, boolean> = {}
-  for (const [key, entry] of Object.entries(value)) {
-    if (entry === true) out[key] = true
-  }
-  return out
-}
-
-export function loadPersistedTurnCompletionState(): Pick<
-  TurnCompletionState,
-  'attentionByTab' | 'attentionByPane'
-> {
-  const empty = {
-    attentionByTab: {},
-    attentionByPane: {},
-  }
-  if (typeof localStorage === 'undefined') return empty
-
-  try {
-    const raw = localStorage.getItem(TURN_COMPLETION_STORAGE_KEY)
-    if (!raw) return empty
-    const parsed = JSON.parse(raw) as Record<string, unknown>
-    if (!parsed || typeof parsed !== 'object' || parsed.version !== 1) return empty
-    return {
-      attentionByTab: readBooleanRecord(parsed.attentionByTab),
-      attentionByPane: readBooleanRecord(parsed.attentionByPane),
-    }
-  } catch {
-    return empty
-  }
-}
-
-const persistedTurnCompletion = loadPersistedTurnCompletionState()
+// Attention is NEVER rehydrated: a page reload witnesses nothing ("never
+// replay history" — no highlights or bells for turn ends that happened before
+// the page loaded). Nothing else from the persisted payload is restored
+// either, so the slice simply does not read localStorage.
 
 const initialState: TurnCompletionState = {
   seq: 0,
   lastAtByTerminalId: {},
   lastIdleAtByTerminalId: {},
   pendingEvents: [],
-  attentionByTab: persistedTurnCompletion.attentionByTab,
-  attentionByPane: persistedTurnCompletion.attentionByPane,
+  attentionByTab: {},
+  attentionByPane: {},
+  watchedCompletionByTab: {},
 }
 
 const turnCompletionSlice = createSlice({
@@ -91,6 +75,7 @@ const turnCompletionSlice = createSlice({
       state.pendingEvents.push({
         ...action.payload,
         seq: state.seq,
+        source: 'freshAgent',
       })
     },
     // Truly-idle edge (terminal.idle) for terminal CLI panes: the ONLY event that
@@ -110,6 +95,7 @@ const turnCompletionSlice = createSlice({
         terminalId,
         at,
         seq: state.seq,
+        source: 'terminal',
       })
     },
     // Cleared on a real server restart (not a plain reconnect). The new process has no
@@ -141,6 +127,15 @@ const turnCompletionSlice = createSlice({
       if (!state.attentionByPane[action.payload.paneId]) return
       delete state.attentionByPane[action.payload.paneId]
     },
+    markTabWatchedCompletion(state, action: PayloadAction<{ tabId: string }>) {
+      const marks = state.watchedCompletionByTab ??= {}
+      if (marks[action.payload.tabId]) return
+      marks[action.payload.tabId] = true
+    },
+    clearTabWatchedCompletion(state, action: PayloadAction<{ tabId: string }>) {
+      if (!state.watchedCompletionByTab?.[action.payload.tabId]) return
+      delete state.watchedCompletionByTab[action.payload.tabId]
+    },
   },
 })
 
@@ -153,6 +148,8 @@ export const {
   clearTabAttention,
   markPaneAttention,
   clearPaneAttention,
+  markTabWatchedCompletion,
+  clearTabWatchedCompletion,
 } = turnCompletionSlice.actions
 
 export default turnCompletionSlice.reducer

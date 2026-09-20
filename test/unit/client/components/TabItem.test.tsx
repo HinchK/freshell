@@ -1,8 +1,23 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
+import { render as renderBase, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
+import { configureStore } from '@reduxjs/toolkit'
+import { Provider } from 'react-redux'
 import TabItem from '@/components/TabItem'
+import turnCompletionReducer from '@/store/turnCompletionSlice'
 import type { Tab } from '@/store/types'
 import type { PaneContent } from '@/store/paneTypes'
+import type { ReactElement } from 'react'
+
+// TabItem reads the tab-strip attention union (attentionByTab ∪
+// watchedCompletionByTab) from the store, so every render needs a Provider.
+// Aliasing keeps the per-test call sites unchanged.
+const tabItemStore = configureStore({
+  reducer: { turnCompletion: turnCompletionReducer },
+})
+
+function render(ui: ReactElement) {
+  return renderBase(<Provider store={tabItemStore}>{ui}</Provider>)
+}
 
 // Mock lucide-react icons
 vi.mock('lucide-react', () => ({
@@ -117,6 +132,39 @@ describe('TabItem', () => {
     expect(el?.className).not.toContain('bg-emerald-100')
     expect(el?.className).not.toContain('bg-foreground/15')
     expect(el?.className).toContain('bg-muted')
+  })
+
+  describe('tab-strip attention union (attentionByTab ∪ watchedCompletionByTab)', () => {
+    function renderWithTurnCompletion(state: Record<string, unknown>) {
+      const store = configureStore({
+        reducer: { turnCompletion: turnCompletionReducer },
+        preloadedState: { turnCompletion: state },
+      })
+      return renderBase(
+        <Provider store={store}>
+          <TabItem {...defaultProps} needsAttention={false} />
+        </Provider>,
+      )
+    }
+
+    it('renders emerald styling for a watched fresh-agent completion even without the attention prop', () => {
+      renderWithTurnCompletion({ watchedCompletionByTab: { 'tab-1': true } })
+      const el = getTabElement()
+      expect(el?.className).toContain('bg-emerald-100')
+      expect(el?.className).toContain('text-emerald-900')
+    })
+
+    it('renders emerald styling from the store attention map even when the prop is false', () => {
+      renderWithTurnCompletion({ attentionByTab: { 'tab-1': true } })
+      const el = getTabElement()
+      expect(el?.className).toContain('bg-emerald-100')
+    })
+
+    it('renders no emerald styling when neither mark is set', () => {
+      renderWithTurnCompletion({ attentionByTab: {}, watchedCompletionByTab: {} })
+      const el = getTabElement()
+      expect(el?.className).not.toContain('bg-emerald-100')
+    })
   })
 
   it('shows a blue single dot when a pane is busy even if the aggregate tab.status is not running', () => {
@@ -350,7 +398,7 @@ describe('TabItem', () => {
     expect(title.className).toContain('min-w-0')
     expect(title.className).toContain('truncate')
 
-    rerender(<TabItem {...defaultProps} isActive={true} />)
+    rerender(<Provider store={tabItemStore}><TabItem {...defaultProps} isActive={true} /></Provider>)
     title = screen.getByText('Test Tab')
     expect(title.className).toContain('flex-1')
     expect(title.className).toContain('min-w-0')

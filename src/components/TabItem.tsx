@@ -2,6 +2,8 @@ import { X, Circle } from 'lucide-react'
 import { useRef, useEffect } from 'react'
 import { cn } from '@/lib/utils'
 import { getTerminalStatusDotClassName, getTerminalStatusIconClassName } from '@/lib/terminal-status-indicator'
+import { useAppSelector } from '@/store/hooks'
+import { selectTabStripAttention } from '@/store/turnCompletionAttention'
 import PaneIcon from '@/components/icons/PaneIcon'
 import RepoIcon, { type RepoIconInfo } from '@/components/icons/RepoIcon'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
@@ -85,6 +87,12 @@ export default function TabItem({
     }
   }, [isRenaming])
 
+  // The tab strip renders the UNION of unwitnessed attention (the
+  // needsAttention prop, fed from attentionByTab) and watched fresh-agent
+  // completions (watchedCompletionByTab — a tab-strip-ONLY mark).
+  const stripAttention = useAppSelector((s) => selectTabStripAttention(s, tab.id))
+  const effectiveNeedsAttention = needsAttention || stripAttention
+
   const renderIcons = () => {
     if (!iconsOnTabs || !paneEntries || paneEntries.length === 0) {
       return <StatusDot status={tab.status} busy={busy} />
@@ -162,16 +170,16 @@ export default function TabItem({
         isActive
           ? cn(
               "z-30 border-b border-b-background bg-background text-foreground after:pointer-events-none after:absolute after:inset-x-0 after:-bottom-px after:h-[2px] after:bg-background after:content-['']",
-              needsAttention && tabAttentionStyle !== 'none' && (
+              effectiveNeedsAttention && tabAttentionStyle !== 'none' && (
                 tabAttentionStyle === 'darken'
                   ? 'border-t-[3px] border-t-muted-foreground bg-foreground/[0.08] shadow-[inset_0_4px_8px_hsl(var(--foreground)/0.1)]'
                   : 'border-t-[3px] border-t-success bg-success/15 dark:bg-success/25 shadow-[inset_0_4px_8px_hsl(var(--success)/0.2)]'
               ),
-              needsAttention && tabAttentionStyle === 'pulse' && 'animate-pulse'
+              effectiveNeedsAttention && tabAttentionStyle === 'pulse' && 'animate-pulse'
             )
           : cn(
               'shadow-[inset_0_-1px_0_hsl(var(--muted-foreground)/0.45)]',
-              needsAttention && tabAttentionStyle !== 'none'
+              effectiveNeedsAttention && tabAttentionStyle !== 'none'
                 ? tabAttentionStyle === 'darken'
                   ? 'bg-foreground/15 text-foreground hover:bg-foreground/20 dark:bg-foreground/20 dark:text-foreground dark:hover:bg-foreground/25'
                   : cn(

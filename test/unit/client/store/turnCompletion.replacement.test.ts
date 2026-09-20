@@ -140,6 +140,7 @@ describe('turn completion across terminal.replaced fold', () => {
       terminalId: NEW_ID,
       at: 100,
       seq: 1,
+      source: 'terminal',
     }])
     expect(store.getState().turnCompletion.lastIdleAtByTerminalId?.[NEW_ID]).toBe(100)
   })

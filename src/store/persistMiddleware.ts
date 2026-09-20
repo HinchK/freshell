@@ -724,11 +724,12 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
       }
 
       if (turnCompletionDirty) {
-        const rawTurnCompletion = JSON.stringify({
-          version: 1,
-          attentionByTab: state.turnCompletion?.attentionByTab ?? {},
-          attentionByPane: state.turnCompletion?.attentionByPane ?? {},
-        })
+        // Attention maps are NEVER persisted: a reload witnesses nothing
+        // ("never replay history" — no highlights for turn ends that happened
+        // before the page loaded). The lane survives as a schema-version
+        // marker whose writes also scrub attention entries written by older
+        // builds out of the persisted key.
+        const rawTurnCompletion = JSON.stringify({ version: 1 })
         localStorage.setItem(TURN_COMPLETION_STORAGE_KEY, rawTurnCompletion)
         broadcastPersistedRaw(TURN_COMPLETION_STORAGE_KEY, rawTurnCompletion)
       }
