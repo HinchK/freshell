@@ -20,18 +20,28 @@
 //! The sidecar emits the SAME `sdk.*` shapes `SdkBridge` broadcasts. The stdout consumer
 //! normalizes each `sdk.* → freshAgent.*` (a port of `server/fresh-agent/sdk-events.ts`)
 //! and wraps it in a `freshAgent.event` envelope: `sdk.session.init` → `freshAgent.session.init`
-//! (durable Claude UUID via `cliSessionId`), `sdk.stream`/`sdk.assistant`/`sdk.result`, and —
-//! ONLY when the SDK `result` carries `subtype==='success'` — the discrete
-//! `freshAgent.turn.complete` chime. That status-guarded edge is the T2
-//! `provider.emits-completion-signal` invariant. The `.jsonl` transcript the claude CLI
-//! persists under the isolated `<CLAUDE_HOME>/projects/…` corroborates it.
+//! (durable Claude UUID via `cliSessionId`), `sdk.stream`/`sdk.assistant`/`sdk.result`, and
+//! the discrete `freshAgent.turn.complete` attention edge. Task 4 made the edge UNIFIED:
+//! the sidecar rings it on EVERY turn end except a user-initiated interrupt (its
+//! result-gate + consumeStream finally mint); the consumer never mints one from a live
+//! stream. That edge is the T2 `provider.emits-completion-signal` invariant. The `.jsonl`
+//! transcript the claude CLI persists under the isolated `<CLAUDE_HOME>/projects/…`
+//! corroborates it.
 //!
-//! ## New failure mode (ADR Decision 2.1) — sidecar death is completion-safe
+//! ## Sidecar death (ADR Decision 2.1, revised by Task 5) — an in-flight death rings
 //!
-//! A `freshAgent.turn.complete` is broadcast ONLY on an explicit `sdk.turn.complete` from
-//! the sidecar. If the sidecar process dies mid-turn its stdout simply ends and the
-//! consumer stops — so a death can NEVER produce a false completion. Verified by
-//! [`tests::sidecar_death_never_yields_false_completion`].
+//! The sidecar's own edge covers every turn end its stream can report. The ONE end it
+//! cannot report is an UNREQUESTED process death mid-turn (SIGKILL — stdout just ends,
+//! the sidecar's finally never runs): the consumer's EOF tail then synthesizes the SAME
+//! `freshAgent.turn.complete` edge for the armed state captured at EOF entry, stamped by
+//! the session's Rust-side monotonic clock
+//! ([`ClaudeSession::last_synthesized_complete_at`] — the sidecar's own clock died with
+//! the process; wall-clock advancement orders the two timelines, the accepted regime).
+//! Requested deaths (kill/shutdown/teardown/rollback fork) never reach the death arm (the
+//! map entry is removed first) and stay silent, and an IDLE death mints nothing — the
+//! no-FALSE-completion property holds. Verified by
+//! [`tests::sidecar_death_with_turn_in_flight_rings_the_unified_edge`] and its idle twin
+//! [`tests::sidecar_death_while_idle_emits_no_completion`].
 //!
 //! ## Safety
 //!
@@ -54,6 +64,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::sync::Mutex as TokioMutex;
 
+use freshell_codex::next_monotonic_turn_complete_at;
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentApprovalRespond, FreshAgentAttach, FreshAgentCompact,
     FreshAgentConfigure, FreshAgentCreate, FreshAgentCreateFailed, FreshAgentCreated,
@@ -616,6 +627,18 @@ struct ClaudeSession {
     /// there), and sidecar EOF zeroes it with the tracker set. Carried across
     /// the rollback's kill+respawn exactly like `in_turn`.
     result_idle_pair_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// Task 5 (unified needs-attention signal): the session's Rust-side
+    /// completion clock — an UNREQUESTED sidecar death with a turn in flight
+    /// synthesizes the `freshAgent.turn.complete` edge the dead sidecar could
+    /// not emit, stamped strictly-monotonically per session via
+    /// [`next_monotonic_turn_complete_at`]. The sidecar's own clock died with
+    /// its process (and resets across a rollback fork, same as the sidecar's
+    /// own per-session state); wall-clock advancement orders the Rust-minted
+    /// `at`s against the sidecar-minted ones — the accepted regime, same as
+    /// Task 3. Minted ONLY by the consumer's unrequested-death arm: requested
+    /// deaths (kill/shutdown/teardown/rollback fork) never reach it, and an
+    /// idle death (no armed turn) mints nothing.
+    last_synthesized_complete_at: Arc<std::sync::Mutex<Option<i64>>>,
     /// kata 1wxv Task 4 (r2 serialization discipline): ONE per-session async turn
     /// lock. `handle_rollback` holds it across the WHOLE handler (busy-check →
     /// reads → record pre-write → pending-cancel → kill+spawn+adoption → reply);
@@ -2268,6 +2291,8 @@ impl FreshClaudeState {
         let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
         let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Task 5: the fresh session's death-mint clock (see the field doc).
+        let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
         let turn_lock = Arc::new(TokioMutex::new(()));
         // Fresh session: nothing announced yet; the consumer's status fold owns it.
         let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
@@ -2283,6 +2308,7 @@ impl FreshClaudeState {
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
             Arc::clone(&result_idle_pair_pending),
+            Arc::clone(&last_synthesized_complete_at),
             None,
             provenance,
         );
@@ -2338,6 +2364,7 @@ impl FreshClaudeState {
                 in_turn,
                 turn_tracker,
                 result_idle_pair_pending,
+                last_synthesized_complete_at,
                 turn_lock,
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status,
@@ -4979,7 +5006,15 @@ impl FreshClaudeState {
             ));
             return;
         }
-        let (durable_id, in_turn, turn_tracker, result_idle_pair_pending, turn_lock, session_type) = {
+        let (
+            durable_id,
+            in_turn,
+            turn_tracker,
+            result_idle_pair_pending,
+            turn_lock,
+            session_type,
+            last_synthesized_complete_at,
+        ) = {
             let guard = self.sessions.lock().await;
             match guard.get(&map_key) {
                 Some(s) => (
@@ -4989,6 +5024,11 @@ impl FreshClaudeState {
                     s.result_idle_pair_pending.clone(),
                     s.turn_lock.clone(),
                     session_type_str(op.session_type),
+                    // Task 5: the fork continues the SAME per-session
+                    // death-mint clock (carried like `in_turn` — the fork is
+                    // the same logical session lifetime, so a death-mint
+                    // after the fork can never regress past one before it).
+                    s.last_synthesized_complete_at.clone(),
                 ),
                 None => {
                     reply_sink(rollback_error_frame(
@@ -5959,6 +5999,10 @@ impl FreshClaudeState {
         // The respawn is fresh: nothing announced yet; the consumer's status
         // fold owns the tracked status from here.
         let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
+        // Task 5: the fork CARRIES the pre-rollback session's death-mint
+        // clock (extracted with the other carried handles above) — the fork
+        // continues the same logical session lifetime, so its Rust-minted
+        // `at`s stay ordered against anything the session minted before.
         let consumer = self.spawn_consumer(
             reader,
             map_key.clone(),
@@ -5971,6 +6015,7 @@ impl FreshClaudeState {
             in_turn.clone(),
             turn_tracker.clone(),
             result_idle_pair_pending.clone(),
+            Arc::clone(&last_synthesized_complete_at),
             Some(RollbackAdoption {
                 supersedes: durable_id.clone(),
                 preseeded_init,
@@ -6004,6 +6049,7 @@ impl FreshClaudeState {
                 in_turn: in_turn.clone(),
                 turn_tracker: turn_tracker.clone(),
                 result_idle_pair_pending: result_idle_pair_pending.clone(),
+                last_synthesized_complete_at,
                 turn_lock: turn_lock.clone(),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status,
@@ -6777,6 +6823,8 @@ impl FreshClaudeState {
         let in_turn = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
         let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Task 5: the resumed session's death-mint clock (see the field doc).
+        let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
         let turn_lock = Arc::new(TokioMutex::new(()));
         // Freshly resumed session: the tracked status starts "idle" (truthful — no
         // turn can be in flight before the client sends).
@@ -6793,6 +6841,7 @@ impl FreshClaudeState {
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
             Arc::clone(&result_idle_pair_pending),
+            Arc::clone(&last_synthesized_complete_at),
             None,
             // Conn-less lane (D8): attach-resume is not a create; the ledger
             // merge keeps the row's existing stamps.
@@ -6818,6 +6867,7 @@ impl FreshClaudeState {
                 in_turn,
                 turn_tracker,
                 result_idle_pair_pending,
+                last_synthesized_complete_at,
                 turn_lock,
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status,
@@ -7730,6 +7780,12 @@ impl FreshClaudeState {
         // after folding ANY `sdk.result`, and the NEXT `sdk.status:idle`
         // consumes it to skip the fold (pair punctuation, never an edge).
         result_idle_pair_pending: Arc<std::sync::atomic::AtomicBool>,
+        // Task 5 (unified needs-attention signal): the session's Rust-side
+        // completion clock — see [`ClaudeSession::last_synthesized_complete_at`].
+        // Held by the consumer (like the latch above) so the unrequested-death
+        // arm below can mint AFTER the eviction has already torn the session
+        // record out of the map.
+        last_synthesized_complete_at: Arc<std::sync::Mutex<Option<i64>>>,
         // kata 1wxv Task 4: Some ONLY on the rollback fork/fresh respawn — the
         // handler PREREAD the sdk.session.init line, so the consumer runs the
         // adoption for it FIRST (supersedes-aware), then resolves the parked
@@ -8095,6 +8151,13 @@ impl FreshClaudeState {
                     let _ = broadcast_tx.send(frame);
                 }
             }
+            // Task 5 (unified needs-attention signal): capture the armed state
+            // BEFORE this block clears it. By the time the unrequested-death arm
+            // below runs, `in_turn` is already false and the session record is
+            // already evicted — the death mint must read THIS captured value
+            // (the clock + id handles it needs are consumer-owned locals that
+            // already survive the eviction).
+            let turn_was_in_flight = in_turn.load(std::sync::atomic::Ordering::SeqCst);
             // kata 1wxv Task 4 busy-truth clear edge (c): sidecar EOF/death clears
             // the busy truth BEFORE the eviction verdict below (an unrequested
             // death can never hold a rollback BUSY_TURN hostage). The dead
@@ -8166,8 +8229,10 @@ impl FreshClaudeState {
                 // `freshAgentSlice.sessionError`). This branch is UNREQUESTED-death
                 // only: `handle_kill`/`shutdown`/attach-teardown all remove the map
                 // entry (and abort this consumer) first, so `evicted` is false there
-                // and stays silent -- and no completion chime is ever fabricated
-                // (ADR Decision 2.1 holds).
+                // and stays silent. ADR Decision 2.1's no-FALSE-completion property
+                // now holds through the GATE below: an in-flight death rings the
+                // unified attention edge (a turn end the user did not witness),
+                // an IDLE death still fabricates no chime.
                 let stamp = broadcast_id.lock().expect("broadcast id lock").clone();
                 tracing::warn!(session_id = %stamp, "freshagent.claude.sidecar_death_detected");
                 state.emit_fresh_agent_error(
@@ -8176,6 +8241,48 @@ impl FreshClaudeState {
                     "SIDECAR_EXITED",
                     "Claude agent process exited unexpectedly - the in-flight turn was lost. Reopen the pane or create a new agent to continue.",
                 );
+                // Task 5 (unified needs-attention signal): an UNREQUESTED death
+                // ends any in-flight turn — the user must come look. The sidecar
+                // (Task 4) rings its own edge on every turn end its stream can
+                // report; the ONE end it cannot report is a process death
+                // mid-turn (its finally never runs), so synthesize the SAME
+                // `freshAgent.turn.complete` edge here. The armed state was
+                // captured at EOF entry above — the clearing + eviction in
+                // between have already torn down the latch and the session
+                // record, so the mint reads the CAPTURED value and the
+                // consumer-held clock Arc. The sidecar's own monotonic clock
+                // died with its process; wall-clock advancement orders the
+                // Rust-minted `at`s against the sidecar-minted ones — the
+                // accepted regime, same as Task 3. Requested deaths never
+                // reach this arm; an idle death (no armed turn) stays silent.
+                if turn_was_in_flight {
+                    let at = {
+                        let mut guard = last_synthesized_complete_at
+                            .lock()
+                            .expect("synthesized clock lock");
+                        let at = next_monotonic_turn_complete_at(
+                            *guard,
+                            crate::rollback_record::now_ms(),
+                        );
+                        *guard = Some(at);
+                        at
+                    };
+                    // DIAG-01: the attention edge only — session id + source,
+                    // never the turn's text/response content.
+                    tracing::info!(provider = PROVIDER, session_id = %stamp,
+                        source = "freshclaude/consumer-exit", "freshagent.turn.complete");
+                    let frame = ServerMessage::FreshAgentEvent(FreshAgentEvent {
+                        event: json!({
+                            "type": "freshAgent.turn.complete",
+                            "sessionId": sidecar_session_id,
+                            "at": at,
+                        }),
+                        provider: PROVIDER.to_string(),
+                        session_id: stamp.clone(),
+                        session_type: session_type.clone(),
+                    });
+                    state.broadcast(&frame);
+                }
             }
         })
     }
@@ -9458,6 +9565,7 @@ pub(crate) mod tests {
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_tracker: Arc::new(std::sync::Mutex::new(TurnTracker::default())),
                 result_idle_pair_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                last_synthesized_complete_at: Arc::new(std::sync::Mutex::new(None)),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
@@ -10296,11 +10404,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn sidecar_death_never_yields_false_completion() {
-        // The ADR Decision 2.1 property: a mid-turn death (stdout ends after some events but
-        // BEFORE any sdk.turn.complete) can NEVER produce a freshAgent.turn.complete. We
-        // model the consumer's mapping over a death-truncated line stream and assert no
-        // completion frame is produced.
+    fn sidecar_death_while_idle_emits_no_completion() {
+        // The ADR Decision 2.1 no-FALSE-completion property, IDLE-death twin: a
+        // death-truncated stream WITHOUT an armed turn (stdout ends after some
+        // events but BEFORE any sdk.turn.complete) can NEVER produce a
+        // freshAgent.turn.complete. We model the consumer's mapping over the
+        // death-truncated line stream and assert no completion frame is produced.
         let death_stream = [
             json!({ "type": "sdk.session.init", "sessionId": "s", "cliSessionId": "0199abcd-1234-7abc-8def-0123456789ab" }),
             json!({ "type": "sdk.stream", "sessionId": "s", "event": { "type": "content_block_delta" } }),
@@ -10331,6 +10440,92 @@ pub(crate) mod tests {
             serde_json::from_str::<Value>(&ok).unwrap()["event"]["type"],
             "freshAgent.turn.complete"
         );
+    }
+
+    /// Task 5 (unified needs-attention signal): an UNREQUESTED sidecar death
+    /// with a turn in flight is a turn end the user did not witness — the
+    /// consumer's EOF tail synthesizes the SAME `freshAgent.turn.complete`
+    /// edge the sidecar would have emitted, alongside the
+    /// `freshAgent.error{SIDECAR_EXITED}` banner frame, both for the broadcast
+    /// id, with a finite numeric `at`; a second such death cycle stamps a
+    /// STRICTLY greater `at` (the per-session Rust clock is monotonic;
+    /// wall-clock advancement orders the two cycles — the accepted regime,
+    /// same as Task 3).
+    #[tokio::test]
+    async fn sidecar_death_with_turn_in_flight_rings_the_unified_edge() {
+        let _guard = CLAUDE_ENV_LOCK.lock().await;
+        let env = FakeClaudeSidecarEnv::install();
+        let (st, mut rx) = state_with_bus();
+
+        // One full death cycle: create → create-time idle → a plain send ARMS
+        // the turn → a mid-turn assistant frame models the truncated stream →
+        // the sidecar dies through its own exit hook (the consumer observes
+        // plain stdout EOF — indistinguishable from a SIGKILL mid-turn, the one
+        // death shape whose sidecar finally never runs). Returns the minted
+        // `at`. The `__exit__`/`__emit_assistant__` writes go through
+        // `inject_raw_send` (NOT handle_send) so no phantom second op arms —
+        // the armed state under test is exactly the one plain send.
+        async fn death_cycle(
+            st: &FreshClaudeState,
+            rx: &mut tokio::sync::broadcast::Receiver<String>,
+            request_id: &str,
+        ) -> i64 {
+            st.handle_create(dedup_create_msg(request_id), None).await;
+            let created = await_claude_created(rx, request_id).await;
+            let sid = created["sessionId"].as_str().unwrap().to_string();
+            await_status_frame(rx, &sid, "idle").await;
+            st.handle_send(send_msg(&sid, "a turn that dies mid-flight"))
+                .await;
+            await_in_turn(st, &sid, true).await;
+            inject_raw_send(st, &sid, "__emit_assistant__").await;
+            inject_raw_send(st, &sid, "__exit__").await;
+            // The death arm's two frames arrive in stream order (banner, then
+            // the synthesized edge) but the scan is order-agnostic. Poll with a
+            // deadline (the `await_status_frame` pattern): a blocking recv could
+            // never observe the deadline once the bus goes quiet.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+            let mut saw_exited_banner = false;
+            let mut at: Option<i64> = None;
+            while !(saw_exited_banner && at.is_some()) {
+                while let Ok(raw) = rx.try_recv() {
+                    let Ok(v) = serde_json::from_str::<Value>(&raw) else {
+                        continue;
+                    };
+                    if v["type"] != "freshAgent.event" || v["sessionId"] != sid {
+                        continue;
+                    }
+                    match v["event"]["type"].as_str() {
+                        Some("freshAgent.error") if v["event"]["code"] == "SIDECAR_EXITED" => {
+                            saw_exited_banner = true;
+                        }
+                        Some("freshAgent.turn.complete") => {
+                            at = v["event"]["at"].as_i64();
+                        }
+                        _ => {}
+                    }
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the death frames never fully arrived (banner={saw_exited_banner}, at={at:?})"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let at = at.expect("the turn.complete frame carries a finite numeric at");
+            assert!(at > 0, "at must be a finite numeric timestamp: {at}");
+            at
+        }
+
+        let first = death_cycle(&st, &mut rx, "req-death-edge-1").await;
+        // The clock is per-session (a fresh session's first stamp is bare
+        // `now`), so guarantee wall-clock advancement past the first mint
+        // before the second cycle — the accepted-regime ordering.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        let second = death_cycle(&st, &mut rx, "req-death-edge-2").await;
+        assert!(
+            second > first,
+            "the second death cycle's at ({second}) must strictly exceed the first ({first})"
+        );
+        drop(env);
     }
 
     #[test]
@@ -17521,6 +17716,7 @@ rl.on('line', (line) => {
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_tracker: Arc::new(std::sync::Mutex::new(TurnTracker::default())),
                 result_idle_pair_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                last_synthesized_complete_at: Arc::new(std::sync::Mutex::new(None)),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
@@ -17964,6 +18160,7 @@ rl.on('line', (line) => {
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
             Arc::new(std::sync::Mutex::new(TurnTracker::default())),
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::Mutex::new(None)),
             None,
             None, // provenance: test lane is conn-less (D8)
         );
@@ -18967,6 +19164,7 @@ rl.on('line', (line) => {
         let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
         let turn_lock = Arc::new(TokioMutex::new(()));
         let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
         let broadcast_id = Arc::new(std::sync::Mutex::new(map_key.to_string()));
@@ -18982,6 +19180,7 @@ rl.on('line', (line) => {
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
             Arc::clone(&result_idle_pair_pending),
+            Arc::clone(&last_synthesized_complete_at),
             None,
             None, // provenance: test lane is conn-less (D8)
         );
@@ -19002,6 +19201,7 @@ rl.on('line', (line) => {
                 in_turn,
                 turn_tracker,
                 result_idle_pair_pending,
+                last_synthesized_complete_at,
                 turn_lock,
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status,
@@ -19052,6 +19252,7 @@ rl.on('line', (line) => {
                 in_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 turn_tracker: Arc::new(std::sync::Mutex::new(TurnTracker::default())),
                 result_idle_pair_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                last_synthesized_complete_at: Arc::new(std::sync::Mutex::new(None)),
                 turn_lock: Arc::new(TokioMutex::new(())),
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status: Arc::new(std::sync::Mutex::new("idle".to_string())),
@@ -19111,6 +19312,7 @@ rl.on('line', (line) => {
         let turn_tracker = Arc::new(std::sync::Mutex::new(TurnTracker::default()));
         let pending = Arc::new(std::sync::Mutex::new(ClaudePending::default()));
         let result_idle_pair_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let last_synthesized_complete_at = Arc::new(std::sync::Mutex::new(None));
         let turn_lock = Arc::new(TokioMutex::new(()));
         let last_status = Arc::new(std::sync::Mutex::new("idle".to_string()));
         let broadcast_id = Arc::new(std::sync::Mutex::new(map_key.to_string()));
@@ -19126,6 +19328,7 @@ rl.on('line', (line) => {
             Arc::clone(&in_turn),
             Arc::clone(&turn_tracker),
             Arc::clone(&result_idle_pair_pending),
+            Arc::clone(&last_synthesized_complete_at),
             None,
             None, // provenance: test lane is conn-less (D8)
         );
@@ -19146,6 +19349,7 @@ rl.on('line', (line) => {
                 in_turn,
                 turn_tracker,
                 result_idle_pair_pending,
+                last_synthesized_complete_at,
                 turn_lock,
                 rollback_probe_slot: Arc::new(std::sync::Mutex::new(None)),
                 last_status,
@@ -19345,6 +19549,32 @@ rl.on('line', (line) => {
             );
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        // Task 5: the IN-FLIGHT death rings the unified edge — the busy clear
+        // and the synthesized `freshAgent.turn.complete` are the SAME EOF
+        // tail (the armed state was captured at EOF entry, before the clear).
+        // Await the edge for the broadcast id and pin its finite numeric `at`.
+        let mut synthesized_at: Option<i64> = None;
+        let edge_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while synthesized_at.is_none() {
+            while let Ok(raw) = rx.try_recv() {
+                let frame: Value = serde_json::from_str(&raw).unwrap();
+                if frame["type"] == "freshAgent.event"
+                    && frame["sessionId"] == sid
+                    && frame["event"]["type"] == "freshAgent.turn.complete"
+                {
+                    synthesized_at = frame["event"]["at"].as_i64();
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < edge_deadline,
+                "the in-flight sidecar death never rang freshAgent.turn.complete (edge c)"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            synthesized_at.unwrap_or(0) > 0,
+            "the synthesized edge carries a finite numeric at"
+        );
         drop(env);
     }
 
