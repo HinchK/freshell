@@ -173,12 +173,27 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
 
   const flush = () => {
     if (submittedWriteInFlight) return
-    const deadline = now() + budgetMs
+    // The drain budget bounds the time the drain CONSUMES, measured per item
+    // and summed — never ambient wall-clock time. An up-front deadline makes
+    // every OS-scheduling or GC stall that lands between items (or before the
+    // first) abort the drain with zero work done, starving the queue on
+    // loaded machines and losing sync-completing items entirely under the
+    // synchronous frame mocks every e2e harness uses. Per-item spans still
+    // bound genuinely expensive work: a drain stops after the item that
+    // pushes cumulative consumed time past the budget, so each tick makes
+    // real progress before yielding.
+    let consumedMs = 0
     flushing = true
     try {
-      while (queue.length > 0 && now() <= deadline && !submittedWriteInFlight) {
+      while (queue.length > 0 && !submittedWriteInFlight) {
+        const itemStartAt = now()
         const next = queue.shift()
         if (next) runItem(next)
+        const itemEndAt = now()
+        if (itemEndAt > itemStartAt) {
+          consumedMs += itemEndAt - itemStartAt
+        }
+        if (consumedMs > budgetMs) break
       }
     } finally {
       flushing = false

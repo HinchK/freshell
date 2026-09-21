@@ -330,6 +330,60 @@ describe('createTerminalWriteQueue', () => {
     expect(rafCallbacks).toHaveLength(0)
   })
 
+  it('keeps draining through ambient wall-clock stalls that land between items', () => {
+    // The load-race class observed in full-suite gates (shard runs and the
+    // Cloud Run vitest partition): an OS-scheduling or GC stall advances the
+    // wall clock in the gaps AROUND queue items while the drain itself
+    // consumes microseconds. A drain budget computed from ambient wall time
+    // sees the stall and defers items that cost ~nothing — under a
+    // synchronous frame mock (every e2e harness here) the remaining items
+    // never drain; on a loaded machine the queue throttles to one drained
+    // item per frame. The budget must bound the time the drain CONSUMES, not
+    // ambient time.
+    //
+    // Simulated interleaving via the `now` seam: the first write consumes
+    // ~1ms of real work; the drain's THIRD clock read observes 100ms of
+    // ambient time that passed between items without the queue doing any
+    // work. On an up-front-deadline drain this read lands on the loop's
+    // between-items check and aborts the drain after one item; per-item
+    // consumed-work accounting brackets only item work, so the stall is
+    // excluded and the drain continues.
+    const writes: string[] = []
+    const rafCallbacks: FrameRequestCallback[] = []
+    let nowMs = 0
+    let nowCalls = 0
+
+    const queue = createTerminalWriteQueue({
+      terminalInstanceId: 'surface-ambient-stall',
+      write: (chunk, onWritten) => {
+        writes.push(chunk)
+        nowMs += 1
+        onWritten?.()
+      },
+      requestFrame: (cb) => {
+        rafCallbacks.push(cb)
+        return rafCallbacks.length
+      },
+      cancelFrame: () => {},
+      now: () => {
+        nowCalls += 1
+        if (nowCalls === 3) {
+          // One ambient stall, observed on a read that brackets no drain work.
+          return nowMs + 100
+        }
+        return nowMs
+      },
+    })
+
+    queue.enqueue('A', undefined, { coalesce: false })
+    queue.enqueue('B', undefined, { coalesce: false })
+    queue.enqueue('C', undefined, { coalesce: false })
+
+    rafCallbacks.shift()?.(16)
+
+    expect(writes).toEqual(['A', 'B', 'C'])
+  })
+
   it('keeps submitted write scope active across async parser callbacks and serializes writes', () => {
     const writes: string[] = []
     const pendingCallbacks: Array<() => void> = []
