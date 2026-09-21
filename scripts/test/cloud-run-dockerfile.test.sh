@@ -75,7 +75,12 @@ if ! echo "$RUN_OUTPUT" | grep -q "6 passed"; then
   echo "$RUN_OUTPUT" | tail -30
   exit 1
 fi
-echo "PASS: auth smoke test passed (6 passed)"
+if ! echo "$RUN_OUTPUT" | grep -q 'e2e_playwright_task_complete'; then
+  echo "FAIL: retry-receipt export did not emit the task-complete event"
+  echo "$RUN_OUTPUT" | tail -30
+  exit 1
+fi
+echo "PASS: auth smoke test passed (6 passed, retry receipt exported)"
 
 # Check 7: Sharding works
 echo "Testing shard 1 of 2..."

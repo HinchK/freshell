@@ -177,6 +177,8 @@ describe('Rust-only distribution runtime contracts', () => {
 
     expect(dockerfile).toMatch(/FROM rust:[^\n]+ AS rust-builder/)
     expect(dockerfile).toContain('cargo build --release -p freshell-server --locked')
+    expect(dockerfile).toContain('pnpm install --frozen-lockfile --ignore-scripts')
+    expect(dockerfile).toContain('pnpm run build:client && pnpm run build:tools')
     expect(dockerfile).toContain('target/release/freshell-server')
     expect(dockerfile).toContain('dist/client')
     expect(dockerfile).toContain('dist/tools')
