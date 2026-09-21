@@ -28,8 +28,13 @@ jobs:
       - name: Detect Rust changes
         id: filter
         run: |
+          # Manager and dependency configuration changes must exercise the
+          # Rust suite too: it spawns Node fixtures (the codex fake
+          # app-server imports `ws`) whose behavior depends on the installed
+          # dependency tree. A rust-gate that skips because no .rs file
+          # changed is not proof of fixture compatibility.
           if git diff --name-only "origin/${{ github.base_ref }}...${{ github.sha }}" \
-            | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain|^\.cargo/|^test/fixtures/'; then
+            | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain|^\.cargo/|^test/fixtures/|(^|/)(pnpm-lock\.yaml|pnpm-workspace\.yaml|package(-lock)?\.json)$|^\.npmrc$|^packages/'; then
             echo "rust=true" >> "$GITHUB_OUTPUT"
           else
             echo "rust=false" >> "$GITHUB_OUTPUT"
@@ -47,14 +52,17 @@ jobs:
           toolchain: 1.96.0
       - uses: Swatinem/rust-cache@v2
       # The Rust suite spawns Node test fixtures (the codex fake app-server
-      # imports `ws`), so this job needs npm dependencies installed or those
-      # tests die at fixture boot ("fake app-server exited before listening").
+      # imports `ws`), so this job needs the workspace dependencies installed
+      # or those tests die at fixture boot ("fake app-server exited before
+      # listening").
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-      - name: Install npm dependencies (Rust test fixtures)
-        run: npm ci
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+      - name: Install dependencies (Rust test fixtures)
+        run: pnpm install --frozen-lockfile
       - name: Workspace tests
         run: cargo test --workspace --exclude freshell-tauri --locked
 

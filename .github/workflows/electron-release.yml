@@ -32,10 +32,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # pnpm must exist before setup-node resolves its pnpm cache. The action
+      # reads the exact version from the root packageManager pin.
+      - uses: pnpm/action-setup@v4
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
 
       - uses: actions/setup-python@v5
         with:
@@ -49,27 +54,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Install dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Run Electron unit tests
-        run: npm run test:electron
+        run: pnpm run test:electron
 
       - name: Build native Rust server
         run: cargo build --release -p freshell-server --locked
 
       - name: Build and verify Electron installer (Unix)
         if: matrix.os != 'windows-2022'
-        run: npm run electron:build
+        run: pnpm run electron:build
 
       - name: Build and verify Electron installer (Windows)
         if: matrix.os == 'windows-2022'
-        run: npm run electron:build:win
+        run: pnpm run electron:build:win
 
       - name: Verify unpacked native artifact
-        run: npm run verify:electron-artifact
+        run: pnpm run verify:electron-artifact
 
       - name: Checkout-free native runtime acceptance
-        run: npm run test:electron:runtime
+        run: pnpm run test:electron:runtime
         env:
           FRESHELL_ELECTRON_RUNTIME_DIR: ${{ matrix.runtime }}
 
@@ -93,6 +98,6 @@ jobs:
 
       - name: Upload installers to GitHub Release
         shell: bash
-        run: npx tsx scripts/upload-electron-release-assets.ts "$GITHUB_REF_NAME" release
+        run: pnpm exec tsx scripts/upload-electron-release-assets.ts "$GITHUB_REF_NAME" release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
