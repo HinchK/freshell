@@ -9251,9 +9251,15 @@ fn reduce_notification(
                     && normalized != CodexStatus::Starting
                     && !compact_in_flight.load(Ordering::SeqCst)
                 {
-                    // The observed turn end retires the active-turn tracker and
-                    // its in-flight-latch mirror together.
-                    retire_observed_turn_end(active_turn, turn_in_flight);
+                    // The observed thread end retires the active-turn tracker
+                    // ONLY. The in-flight crash latch stays ARMED through the
+                    // app-server's documented idle-BEFORE-completed gap: a
+                    // sidecar death inside that gap must still synthesize the
+                    // attention edge for the turn whose `turn/completed` never
+                    // arrives. The id-matched `turn/completed` retired arm
+                    // ([`clear_turn_in_flight`]) owns the latch's retirement;
+                    // the crash arm and the quiet deadman read the latch.
+                    *active_turn.lock().expect("active_turn mutex") = None;
                     // The terminal status also disarms (adapter.ts:1015): the entry
                     // feed re-armed the window while the turn was still tracked, and
                     // a stale deadline would block a later snapshot-observed arm.
@@ -16901,6 +16907,92 @@ pub(crate) mod tests {
                 .await
                 .contains_key("thread-crash-failed-pending"),
             "the session stays mapped after an unrequested exit"
+        );
+    }
+
+    /// The-usual SDD delta-r1 Finding 2: the app-server documents the terminal
+    /// `thread/status/changed` BEFORE the turn's own `turn/completed`. A sidecar
+    /// death inside that gap must still synthesize the unified attention edge —
+    /// the turn-in-flight crash latch stays ARMED through the idle status, and
+    /// the crash arm owns the classification for the `turn/completed` that never
+    /// arrives.
+    #[tokio::test]
+    async fn crash_in_the_idle_before_completed_gap_rings_the_synthesized_edge() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, mut rx) = state_with_bus();
+
+        // The fixture child this test kills at the gap — its OWN sleeper
+        // process, never a broad kill pattern.
+        let child = spawn_sleeper();
+        let pid = child.id().expect("sleeper pid");
+
+        // The active-turn seed mirrors onto the in-flight latch (the fixture's
+        // production invariant), so the turn is in flight from insertion.
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-idle-gap",
+            client,
+            Arc::new(StdMutex::new(Some("turn-1".to_string()))),
+            notifs,
+            child,
+            "codex-sidecar-test-idle-gap",
+        )
+        .await;
+
+        // The turn is STILL COMPLETING: the thread goes idle (the app-server's
+        // documented order puts this BEFORE `turn/completed`), and no
+        // `turn/completed` has arrived yet.
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-idle-gap", "status": { "type": "idle" } }),
+        );
+
+        // Deterministic sync: the consumer broadcasts the idle snapshot frame
+        // only AFTER the reduce's tracker/latch work for this notification ran.
+        let idle = collect_frames_until(&mut rx, std::time::Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.session.snapshot" && w["event"]["status"] == "idle"
+        })
+        .await;
+        assert!(
+            idle.matched,
+            "the terminal thread status broadcasts its idle snapshot: {:?}",
+            idle.frames
+        );
+
+        // The sidecar dies inside the idle→completed gap (an unrequested exit —
+        // never kill_tx). Safety: a targeted SIGKILL of this test's own fixture
+        // child (the `sleep` process spawned above) — never a broad kill pattern.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+
+        let exited = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |w| {
+            w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "exited"
+        })
+        .await;
+        assert!(
+            exited.matched,
+            "the watcher self-heals within the budget: {:?}",
+            exited.frames
+        );
+
+        // The crash ends a turn whose `turn/completed` never arrived — the
+        // synthesized unified edge must still ring, with a finite numeric `at`.
+        let edge = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |w| {
+            w["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert!(
+            edge.matched,
+            "a crash inside the idle-before-completed gap must still ring the synthesized attention edge: {:?}",
+            edge.frames
+        );
+        let edge_frame = edge.frames.last().expect("the matched edge frame");
+        assert_eq!(edge_frame["sessionId"], json!("thread-idle-gap"));
+        assert!(
+            edge_frame["event"]["at"].is_i64(),
+            "finite numeric `at` on the gap-crash edge: {edge_frame}"
         );
     }
 
