@@ -3421,7 +3421,12 @@ impl FreshOpencodeState {
     /// (`emitStatus(state,'idle')`, adapter.ts:530). A FAILED abort RPC instead rings
     /// the unified `freshAgent.turn.complete` edge for the just-detached LIVE turn —
     /// the local settle path is already gone at that point, so the detachment itself
-    /// is the only observable turn end left (see the Err arm).
+    /// is the only observable turn end left (see the Err arm) — UNLESS the session's
+    /// turn-complete clock advanced between the take and the Err arm (FR1-2): a task
+    /// already past the settle tail's `turn_aborted` check reads unfinished at
+    /// take-time, but its synchronous tail cannot be aborted, so its natural edge
+    /// lands DURING the join — the Err arm then mints nothing (the turn already
+    /// rang; a second edge would be a double bell).
     pub async fn handle_interrupt(&self, msg: FreshAgentInterrupt) {
         let session_arc = {
             let guard = self.sessions.lock().await;
@@ -3439,9 +3444,22 @@ impl FreshOpencodeState {
             daemon_turn_accepted,
             last_turn_complete_at,
             had_live_turn,
+            turn_complete_baseline,
         ) = {
             let mut session = session_arc.lock().await;
             session.turn_aborted.store(true, Ordering::SeqCst);
+            // FR1-2: sample the turn-complete clock's CURRENT value at take
+            // time — the Err arm's mint baseline. Read inside the same
+            // session lock, in the flag-set's synchronous prefix (no await
+            // between), so anything that rang BEFORE this interrupt is in
+            // the baseline, and anything that rings during the join (a
+            // settle tail already past its `turn_aborted` check — the
+            // synchronous tail cannot be aborted) lands in the clock BEFORE
+            // the join returns and is therefore NOT in the baseline.
+            let turn_complete_baseline = *session
+                .last_turn_complete_at
+                .lock()
+                .expect("last_turn_complete_at mutex");
             // A LIVE detached task is the finding-1 mint's scope: an
             // already-finished task's settle tail already rang its own natural
             // end, and a session with no task never had a turn in flight (the
@@ -3462,6 +3480,7 @@ impl FreshOpencodeState {
                 session.daemon_turn_accepted.clone(),
                 session.last_turn_complete_at.clone(),
                 had_live_turn,
+                turn_complete_baseline,
             )
         };
 
@@ -3498,7 +3517,19 @@ impl FreshOpencodeState {
                 // completion is not silently swallowed (adapter.ts:525-528's
                 // surviving purpose).
                 turn_aborted.store(false, Ordering::SeqCst);
-                if had_live_turn {
+                // FR1-2: the UNCHANGED-CLOCK gate. A task already past its
+                // settle tail's `turn_aborted` check reads unfinished at
+                // take-time, but its synchronous tail cannot be aborted —
+                // its natural edge lands DURING the join and advances the
+                // clock past the take-time baseline. An unchanged clock
+                // proves NOTHING rang between the take and here, so the
+                // detachment is the only observable turn end left and the
+                // mint is safe; an ADVANCED clock means the turn already
+                // rang, and a second edge would be a double bell.
+                let clock_now = *last_turn_complete_at
+                    .lock()
+                    .expect("last_turn_complete_at mutex");
+                if had_live_turn && clock_now == turn_complete_baseline {
                     tracing::debug!(
                         provider = PROVIDER,
                         session_id = %real_id,
@@ -12836,10 +12867,21 @@ mod tests {
         }
         let edge = edge
             .expect("a failed interrupt RPC must ring the unified attention edge for the detached live turn");
-        assert_ne!(
+        // The fixture deterministically materializes the FIRST session as
+        // `ses_1` (the fake's create POST is the only one before the mint),
+        // so assert the EXACT materialized id on BOTH the outer frame's
+        // envelope id and the event payload's session id — the old
+        // `assert_ne!` passed for null/empty/unrelated ids and never checked
+        // the nested payload at all (FR1-3).
+        assert_eq!(
             edge["sessionId"],
-            json!(placeholder),
-            "the edge is stamped with the materialized real session id: {edge}"
+            json!("ses_1"),
+            "the edge envelope is stamped with the materialized real session id: {edge}"
+        );
+        assert_eq!(
+            edge["event"]["sessionId"],
+            json!("ses_1"),
+            "the edge payload is stamped with the materialized real session id: {edge}"
         );
         assert!(
             edge["event"]["at"].is_i64(),
@@ -12992,6 +13034,145 @@ mod tests {
             second_edge.is_none(),
             "a failed interrupt after the turn already ended must not mint a second edge \
              (first edge at {first_at}): {second_edge:?}"
+        );
+    }
+
+    /// The-usual SDD focused-r1 FR1-2: a task already past the settle tail's
+    /// `turn_aborted` check still reads unfinished at take-time, so its
+    /// synchronous tail cannot be aborted and its natural edge lands DURING
+    /// the interrupt's join — minting in the Err arm then rings a DOUBLE
+    /// bell. The Err arm must be gated on an UNCHANGED turn-complete clock:
+    /// a baseline captured at take-time (inside the same session lock) and
+    /// compared post-join; if the clock advanced, the natural settle rang
+    /// and the Err arm stays silent.
+    ///
+    /// The mid-tail race window itself (an abort arriving between the tail's
+    /// flag check and its mint — microseconds) cannot be hit deterministically;
+    /// this test pins the GATE it closes, injecting the natural ring at the
+    /// exact point the gate covers: after the take block captured its
+    /// baseline (proven via the fake task's cancellation, which happens only
+    /// after the synchronous baseline read) and before the Err arm runs. The
+    /// injection runs the tail's own post-check mint (`mint_turn_complete_edge`
+    /// — `settle_turn_outcome`'s synchronous check-then-mint tail, the part an
+    /// abort can no longer un-ring).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interrupt_abort_failure_mints_no_second_edge_when_the_clock_advanced_during_the_join()
+    {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        // The per-session /abort POST answers 500 — the Err arm is
+        // deterministic.
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(AbortFailFakeHttp::new(2)),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-int-race"), None).await;
+        let placeholder = "freshopencode-req-int-race";
+
+        // The raced shape, built deterministically: a materialized session
+        // whose LIVE turn task parks on a probe channel (the settle-knob
+        // pattern the kill-close test uses — kind Compact + a settle channel
+        // the test holds, so `abort_and_settle` parks after the join and the
+        // Err arm runs only once the test releases it). Lock order: clone the
+        // session Arc out, drop the map guard, THEN lock the session.
+        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel::<()>();
+        let (settled_tx, settled_rx) = tokio::sync::oneshot::channel::<()>();
+        let clock = {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("session tracked").clone();
+            drop(sessions);
+            let mut session = session_arc.lock().await;
+            session.real_session_id = Some("ses_1".to_string());
+            session.turn_task = Some(TurnTask {
+                kind: TurnTaskKind::Compact,
+                handle: tokio::spawn(async move {
+                    let _ = probe_rx.await;
+                }),
+                compact_settled_rx: Some(settled_rx),
+            });
+            session.last_turn_complete_at.clone()
+        };
+
+        let interrupt = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_interrupt(FreshAgentInterrupt {
+                    provider: AgentProvider::Opencode,
+                    session_id: placeholder.to_string(),
+                    session_type: SessionType::Freshopencode,
+                    cwd: None,
+                })
+                .await
+            })
+        };
+
+        // Wait until the interrupt's take CANCELLED the fake task. The
+        // cancellation (handle.abort()) happens only after the take block's
+        // synchronous prefix — flag set, clock baseline read, live-turn
+        // sample — so probe closure is proof the baseline was captured.
+        // had_live_turn sampled true (the task was parked, not finished).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !probe_tx.is_closed() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the interrupt never aborted the fake turn task"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Let the interrupt reach the settle-wait park.
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        // The raced NATURAL edge: the settle tail (already past its
+        // `turn_aborted` check when the interrupt set the flag) rings
+        // DURING the interrupt's join window — the tail's own post-check
+        // mint, which an abort can no longer un-ring. This advances the
+        // session clock PAST the captured baseline.
+        mint_turn_complete_edge(&st.fresh_agent, "ses_1", &clock);
+
+        // Release the settle; the abort RPC fails and the Err arm runs with
+        // the clock advanced past its baseline.
+        let _ = settled_tx.send(());
+        interrupt.await.expect("interrupt task");
+
+        // Exactly ONE edge total — the raced natural one. The Err arm must
+        // NOT mint a second edge for the turn that already rang.
+        let mut edges = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+            {
+                edges += 1;
+            }
+        }
+        assert_eq!(
+            edges, 1,
+            "the raced natural settle rang once; the failed-interrupt Err arm must not mint a \
+             second edge for the turn that already rang"
         );
     }
 
