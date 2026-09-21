@@ -3416,10 +3416,12 @@ impl FreshOpencodeState {
     /// Handle a `freshAgent.interrupt` for opencode: mark the turn aborted (BEFORE
     /// aborting, so a racing in-flight completion sees the flag — adapter.ts:521), abort
     /// the in-flight turn task, and issue a best-effort `serveManager.abort()` against
-    /// the real session (`adapter.ts interrupt()` / `abortForState`). Always broadcasts
-    /// the resulting idle status (`emitStatus(state,'idle')`, adapter.ts:530) — even for
-    /// a not-yet-materialized session (`abortForState` no-ops when there's no
-    /// `realSessionId`, but the reference still emits idle unconditionally).
+    /// the real session (`adapter.ts interrupt()` / `abortForState`). Broadcasts the
+    /// resulting idle status on a landed abort and for a not-yet-materialized session
+    /// (`emitStatus(state,'idle')`, adapter.ts:530). A FAILED abort RPC instead rings
+    /// the unified `freshAgent.turn.complete` edge for the just-detached LIVE turn —
+    /// the local settle path is already gone at that point, so the detachment itself
+    /// is the only observable turn end left (see the Err arm).
     pub async fn handle_interrupt(&self, msg: FreshAgentInterrupt) {
         let session_arc = {
             let guard = self.sessions.lock().await;
@@ -3430,9 +3432,24 @@ impl FreshOpencodeState {
             return;
         };
 
-        let (real_id, route, turn_aborted, daemon_turn_accepted) = {
+        let (
+            real_id,
+            route,
+            turn_aborted,
+            daemon_turn_accepted,
+            last_turn_complete_at,
+            had_live_turn,
+        ) = {
             let mut session = session_arc.lock().await;
             session.turn_aborted.store(true, Ordering::SeqCst);
+            // A LIVE detached task is the finding-1 mint's scope: an
+            // already-finished task's settle tail already rang its own natural
+            // end, and a session with no task never had a turn in flight (the
+            // same in-flight predicate as the compact refusal gate below).
+            let had_live_turn = session
+                .turn_task
+                .as_ref()
+                .is_some_and(|task| !task.is_finished());
             if let Some(task) = session.turn_task.take() {
                 // ep4-r6 F2: join + await the compact's pre-drive-redo settle
                 // — the interrupt's answer must never precede the restore.
@@ -3443,6 +3460,8 @@ impl FreshOpencodeState {
                 session.cwd.clone(),
                 session.turn_aborted.clone(),
                 session.daemon_turn_accepted.clone(),
+                session.last_turn_complete_at.clone(),
+                had_live_turn,
             )
         };
 
@@ -3466,10 +3485,27 @@ impl FreshOpencodeState {
                 self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
             }
             Err(_) => {
-                // adapter.ts:525-528 -- the abort never landed, so the turn may still
-                // complete normally; clear the flag so a genuine completion isn't
-                // silently swallowed.
+                // The abort never landed, and the LOCAL settle path is already
+                // gone (a live turn task was taken + aborted above — that
+                // settle tail was the ONLY `freshAgent.turn.complete` emitter;
+                // the SSE bridge forwards status/error updates only), while
+                // the remote daemon-side end is unobservable as an edge. The
+                // detachment itself is therefore the turn end we ring for:
+                // mint the unified edge on the session's monotonic clock. A
+                // LIVE detachment only — an already-finished task's settle
+                // rang its own natural end, and no task means no turn was in
+                // flight. Still clear `turn_aborted` so a LATER turn's genuine
+                // completion is not silently swallowed (adapter.ts:525-528's
+                // surviving purpose).
                 turn_aborted.store(false, Ordering::SeqCst);
+                if had_live_turn {
+                    tracing::debug!(
+                        provider = PROVIDER,
+                        session_id = %real_id,
+                        "opencode.interrupt_abort_failed_unified_edge"
+                    );
+                    mint_turn_complete_edge(&self.fresh_agent, &real_id, &last_turn_complete_at);
+                }
             }
         }
     }
@@ -6105,6 +6141,27 @@ fn turn_complete_event(session_id: &str, at: i64) -> Value {
     json!({ "type": "freshAgent.turn.complete", "sessionId": session_id, "at": at })
 }
 
+/// Stamp the session's strictly-monotonic turn-complete clock and broadcast the
+/// unified `freshAgent.turn.complete` edge — the shared mint of
+/// [`settle_turn_outcome`]'s tail and every Rust-synthesized edge (the
+/// interrupt Err arm), so a later edge can never collide with or regress below
+/// an earlier one on the same session.
+fn mint_turn_complete_edge(
+    fresh_agent: &FreshAgentState,
+    real_id: &str,
+    last_turn_complete_at: &StdMutex<Option<i64>>,
+) {
+    let at = {
+        let mut guard = last_turn_complete_at
+            .lock()
+            .expect("last_turn_complete_at mutex");
+        let at = next_monotonic_turn_complete_at(*guard, now_ms());
+        *guard = Some(at);
+        at
+    };
+    fresh_agent.broadcast(&event_frame(real_id, turn_complete_event(real_id, at)));
+}
+
 /// The shared settle tail of a turn-scoped opencode pipeline (a send turn, a compact):
 /// broadcast the idle snapshot UNCONDITIONALLY (`emitStatus(state, 'idle')`,
 /// adapter.ts:371/384 — it flows whether the turn succeeded or errored), then the
@@ -6131,18 +6188,10 @@ fn settle_turn_outcome(
     if turn_aborted.load(Ordering::SeqCst) {
         return;
     }
-    let at = {
-        let mut guard = last_turn_complete_at
-            .lock()
-            .expect("last_turn_complete_at mutex");
-        let at = next_monotonic_turn_complete_at(*guard, now_ms());
-        *guard = Some(at);
-        at
-    };
     if !succeeded || turn_errored.load(Ordering::SeqCst) {
         tracing::debug!(provider = PROVIDER, session_id = %real_id, "turn.settled_non_clean_unified_edge");
     }
-    fresh_agent.broadcast(&event_frame(real_id, turn_complete_event(real_id, at)));
+    mint_turn_complete_edge(fresh_agent, real_id, last_turn_complete_at);
 }
 
 /// `freshAgent.session.materialized` (legacy reference: server/ws-handler.ts's
@@ -6549,6 +6598,78 @@ mod tests {
                     serde_json::to_vec(&json!({ "id": format!("ses_{n}"), "directory": null }))
                         .unwrap(),
                 )
+            } else {
+                (200, b"{}".to_vec())
+            };
+            Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) })
+        }
+    }
+
+    /// The failed-interrupt fixture (the-usual SDD delta-r1, Finding 1): like
+    /// [`StatusPollFakeHttp`] (create mints a fresh `ses_N`; status polls go busy
+    /// → idle), but the per-session `POST /session/:id/abort` answers 500 — the
+    /// deterministic `ServeError::Http` that drives
+    /// [`FreshOpencodeState::handle_interrupt`]'s Err arm while the local turn
+    /// task has already been taken + aborted.
+    struct AbortFailFakeHttp {
+        next_session: AtomicUsize,
+        last_created: StdMutex<Option<String>>,
+        status_polls: AtomicUsize,
+        busy_polls: usize,
+    }
+    impl AbortFailFakeHttp {
+        fn new(busy_polls: usize) -> Self {
+            Self {
+                next_session: AtomicUsize::new(0),
+                last_created: StdMutex::new(None),
+                status_polls: AtomicUsize::new(0),
+                busy_polls,
+            }
+        }
+    }
+    impl ServeHttp for AbortFailFakeHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let is_abort = req.url.contains("/abort")
+                && matches!(req.method, freshell_opencode::serve::HttpMethod::Post);
+            let is_status = req.url.contains("/session/status");
+            // Precise create-match (the same predicate discipline as
+            // [`StatusPollFakeHttp`]): a loose `/session` contains() would also
+            // swallow the abort POST this fake exists to fail.
+            let is_create = !is_status
+                && !is_abort
+                && matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            let (status, body) = if is_abort {
+                (500, b"abort exploded".to_vec())
+            } else if is_create {
+                let n = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+                let id = format!("ses_{n}");
+                *self.last_created.lock().unwrap() = Some(id.clone());
+                (
+                    200,
+                    serde_json::to_vec(&json!({ "id": id, "directory": null })).unwrap(),
+                )
+            } else if is_status {
+                let poll_n = self.status_polls.fetch_add(1, Ordering::SeqCst);
+                let last = self.last_created.lock().unwrap().clone();
+                if poll_n < self.busy_polls {
+                    let id = last.unwrap_or_default();
+                    (
+                        200,
+                        serde_json::to_vec(&json!({ id: { "type": "busy" } })).unwrap(),
+                    )
+                } else {
+                    (200, b"{}".to_vec())
+                }
             } else {
                 (200, b"{}".to_vec())
             };
@@ -12639,6 +12760,238 @@ mod tests {
         assert!(
             !saw_complete,
             "an interrupted turn must never emit turn.complete"
+        );
+    }
+
+    /// The-usual SDD delta-r1 Finding 1: when the interrupt's `serveManager.abort()`
+    /// RPC FAILS, the just-taken-and-aborted local turn task can never settle again —
+    /// and its settle tail was the ONLY `freshAgent.turn.complete` emitter (the SSE
+    /// bridge forwards status/error updates only). The interrupt did NOT succeed, so
+    /// the detachment itself is the turn end the Err arm must ring for — same
+    /// per-session monotonic clock as any other edge.
+    #[tokio::test]
+    async fn interrupt_with_a_failed_abort_rpc_rings_the_unified_attention_edge() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        // A generous busy-poll count so the turn task is provably LIVE when the
+        // interrupt lands (the natural idle sits ~50 polls out), while the
+        // per-session /abort POST answers 500 — the handler deterministically
+        // takes the Err arm.
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(AbortFailFakeHttp::new(50)),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-int-fail"), None).await;
+        let placeholder = "freshopencode-req-int-fail";
+        st.handle_send(send_msg(placeholder, "hello")).await;
+
+        // Interrupt promptly, long before the (deliberately slow) natural idle
+        // would land: the handler takes + aborts the LIVE turn task, then the
+        // abort RPC fails (500).
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        st.handle_interrupt(FreshAgentInterrupt {
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        // The unified edge must fire for the detached turn — stamped with the
+        // materialized real session id and a finite numeric monotonic `at`.
+        let mut edge: Option<serde_json::Value> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] != "freshAgent.event" {
+                continue;
+            }
+            if frame["event"]["type"] == "freshAgent.turn.complete" {
+                edge = Some(frame);
+                break;
+            }
+        }
+        let edge = edge
+            .expect("a failed interrupt RPC must ring the unified attention edge for the detached live turn");
+        assert_ne!(
+            edge["sessionId"],
+            json!(placeholder),
+            "the edge is stamped with the materialized real session id: {edge}"
+        );
+        assert!(
+            edge["event"]["at"].is_i64(),
+            "finite numeric `at` on the interrupt-minted edge: {edge}"
+        );
+
+        // `turn_aborted` still clears for FUTURE turns: a subsequent send's own
+        // settle must ring again, with a strictly-later monotonic `at`.
+        st.handle_send(send_msg(placeholder, "second")).await;
+        let mut second_at: Option<i64> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] != "freshAgent.event" {
+                continue;
+            }
+            if frame["event"]["type"] == "freshAgent.turn.complete" {
+                second_at = frame["event"]["at"].as_i64();
+                break;
+            }
+        }
+        let second_at = second_at.expect(
+            "a later turn's genuine completion must not be swallowed by the stale interrupt flag",
+        );
+        let first_at = edge["event"]["at"].as_i64().expect("numeric at");
+        assert!(
+            second_at > first_at,
+            "the session's turn-complete clock stays strictly monotonic: first {first_at}, second {second_at}"
+        );
+    }
+
+    /// Finding 1's mint is bounded to a LIVE detached turn task: interrupting a
+    /// session whose turn already ENDED (the registered task is finished — its
+    /// settle already rang the natural end) must not mint a SECOND edge. The
+    /// failed abort detached nothing.
+    #[tokio::test]
+    async fn interrupt_with_a_failed_abort_rpc_after_the_turn_ended_rings_no_second_edge() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        // A short busy-poll count so the first turn settles on its own quickly;
+        // the /abort POST still answers 500 for the later interrupt.
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(AbortFailFakeHttp::new(2)),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-int-done"), None).await;
+        let placeholder = "freshopencode-req-int-done";
+        st.handle_send(send_msg(placeholder, "hello")).await;
+
+        // Wait for the turn's own settle edge — the natural end rang once.
+        let first_at = {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    panic!("the first turn never rang its natural settle edge");
+                }
+                let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                    continue;
+                };
+                let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                if frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.turn.complete"
+                {
+                    break frame["event"]["at"].as_i64().expect("numeric at");
+                }
+            }
+        };
+
+        // Deterministic finish barrier: the registered task handle (whose tail
+        // emitted the edge above) must read FINISHED before the interrupt runs,
+        // so the Err arm's live-task gate is exercised on its no-detachment
+        // side. Lock order: clone the session Arc out, drop the map guard, THEN
+        // lock the session.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let session_arc = st.sessions.lock().await.get(placeholder).cloned();
+            let finished = match session_arc {
+                Some(session_arc) => {
+                    let session = session_arc.lock().await;
+                    session
+                        .turn_task
+                        .as_ref()
+                        .is_none_or(|task| task.is_finished())
+                }
+                None => true,
+            };
+            if finished {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the turn task never reported finished"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Interrupt the ENDED session with the abort RPC failing: the Err arm
+        // must stay silent — no second bell for a turn that already rang.
+        st.handle_interrupt(FreshAgentInterrupt {
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        let mut second_edge: Option<serde_json::Value> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+            {
+                second_edge = Some(frame);
+                break;
+            }
+        }
+        assert!(
+            second_edge.is_none(),
+            "a failed interrupt after the turn already ended must not mint a second edge \
+             (first edge at {first_at}): {second_edge:?}"
         );
     }
 
