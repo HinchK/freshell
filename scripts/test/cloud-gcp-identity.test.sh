@@ -389,6 +389,7 @@ export GREEN_LOG="$TDIR/green-gcloud.log"
 cat > "$GTDIR/gcloud" <<'GREEN_FAKE'
 #!/usr/bin/env bash
 echo "GCLOUD_ARGS: $*" >> "${GREEN_LOG:?set GREEN_LOG}"
+[ -n "${CLOUDSDK_CORE_DISABLE_PROMPTS:-}" ] && echo "PROMPTS_DISABLED=1" >> "${GREEN_LOG:?set GREEN_LOG}"
 # Shell redirection creates its target eagerly, so `grep ... >> FILE` would
 # materialize an EMPTY accounts file even when no --account token exists —
 # breaking every "--account was omitted" assertion. Capture, write only when
@@ -685,6 +686,12 @@ check "W12c e2e standalone push: succeeds under rung-2 pin" \
   bash -c '[ "$1" = "0" ] && [ ! -e "$3" ]' _ "$W12C_RC" "$W12C_OUT" "$SELECTOR_MARKER"
 check "W12c e2e standalone push: every gcloud call pinned to the GCLOUD_IDENT value" \
   accounts_all_equal "$RUNG2_IDENT"
+check "W12c e2e standalone push: preflight token mint precedes all lane work" \
+  bash -c '
+    tok="$(grep -n "auth print-access-token" "$1" | head -1 | cut -d: -f1)"
+    work="$(grep -nE "GCLOUD_ARGS:.*(artifacts repositories describe|builds submit)" "$1" | head -1 | cut -d: -f1)"
+    [ -n "$tok" ] && [ -n "$work" ] && [ "$tok" -lt "$work" ]
+  ' _ "$GREEN_LOG"
 
 # W12d: standalone logs — rung-2 pin on BOTH calls, non-pin args passed through.
 reset_green
@@ -698,6 +705,12 @@ check "W12d e2e standalone logs: list+read share the pinned identity, pass-throu
   ' _ "$W12D_RC" "$GREEN_LOG" "$W12D_OUT" "$SELECTOR_MARKER"
 check "W12d e2e standalone logs: every gcloud call pinned to the GCLOUD_IDENT value" \
   accounts_all_equal "$RUNG2_IDENT"
+check "W12d e2e standalone logs: preflight token mint precedes the executions list" \
+  bash -c '
+    tok="$(grep -n "auth print-access-token" "$1" | head -1 | cut -d: -f1)"
+    work="$(grep -n "GCLOUD_ARGS:.*executions list" "$1" | head -1 | cut -d: -f1)"
+    [ -n "$tok" ] && [ -n "$work" ] && [ "$tok" -lt "$work" ]
+  ' _ "$GREEN_LOG"
 
 # W12e: standalone logs — flag pin wins on the logs lane (rung 1 there too).
 reset_green
@@ -731,6 +744,12 @@ check "W13b vitest standalone push: succeeds, every gcloud call pinned to GCLOUD
   bash -c '[ "$1" = "0" ] && [ ! -e "$3" ]' _ "$W13B_RC" "$W13B_OUT" "$SELECTOR_MARKER"
 check "W13b vitest standalone push: every gcloud call pinned to the GCLOUD_IDENT value" \
   accounts_all_equal "$RUNG2_IDENT"
+check "W13b vitest standalone push: preflight token mint precedes all lane work" \
+  bash -c '
+    tok="$(grep -n "auth print-access-token" "$1" | head -1 | cut -d: -f1)"
+    work="$(grep -nE "GCLOUD_ARGS:.*(artifacts repositories describe|builds submit)" "$1" | head -1 | cut -d: -f1)"
+    [ -n "$tok" ] && [ -n "$work" ] && [ "$tok" -lt "$work" ]
+  ' _ "$GREEN_LOG"
 
 # W13c: standalone logs under rung-2 pin, pass-through preserved.
 reset_green
@@ -743,6 +762,50 @@ check "W13c vitest standalone logs: pinned identity on both calls, pass-through 
   ' _ "$W13C_RC" "$GREEN_LOG" "$W13C_OUT" "$SELECTOR_MARKER"
 check "W13c vitest standalone logs: every gcloud call pinned to the GCLOUD_IDENT value" \
   accounts_all_equal "$RUNG2_IDENT"
+check "W13c vitest standalone logs: preflight token mint precedes the executions list" \
+  bash -c '
+    tok="$(grep -n "auth print-access-token" "$1" | head -1 | cut -d: -f1)"
+    work="$(grep -n "GCLOUD_ARGS:.*executions list" "$1" | head -1 | cut -d: -f1)"
+    [ -n "$tok" ] && [ -n "$work" ] && [ "$tok" -lt "$work" ]
+  ' _ "$GREEN_LOG"
+
+# --- W14: e2e run lane — preflight + prompts env reach the green fake -------
+reset_green
+W14_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" HOME="$EMPTY_HOME" \
+  GCLOUD_IDENT="$RUNG2_IDENT" \
+  "$WRAPPER_E2E" run --cloud --shards=1 2>/dev/null < /dev/null) && W14_RC=0 || W14_RC=$?
+check "W14 e2e run: preflight token mint precedes run jobs create; prompts disabled on non-TTY stdin" \
+  bash -c '
+    [ "$1" = "0" ] || exit 1
+    tok="$(grep -n "auth print-access-token" "$2" | head -1 | cut -d: -f1)"
+    create="$(grep -n "run jobs create" "$2" | head -1 | cut -d: -f1)"
+    [ -n "$tok" ] && [ -n "$create" ] && [ "$tok" -lt "$create" ] &&
+    grep -q "PROMPTS_DISABLED=1" "$2"
+  ' _ "$W14_RC" "$GREEN_LOG"
+check "W14 e2e run: every gcloud call still pinned (preflight included)" \
+  accounts_all_equal "$RUNG2_IDENT"
+
+# --- W16: the TTY-gated export reaches the selector's environment, before
+# the preflight — the selector is the only pre-preflight component that can
+# prompt (every other prompt check pins GCLOUD_IDENT and bypasses the probe).
+reset_green
+W16_HOME="$TDIR/home-w16"; mkdir -p "$W16_HOME"
+mk_robot_install "$W16_HOME" ".codex/skills/gcloud-robot"
+W16_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" HOME="$W16_HOME" \
+  "$WRAPPER_E2E" run --cloud --shards=1 2>/dev/null < /dev/null) && W16_RC=0 || W16_RC=$?
+check "W16 non-TTY run: the selector observes CLOUDSDK_CORE_DISABLE_PROMPTS=1 (export precedes the probe)" \
+  bash -c '
+    [ "$1" = "0" ] &&
+    [ -e "$2" ] &&
+    grep -q "^prompts=1$" "$2.env"
+  ' _ "$W16_RC" "$SELECTOR_MARKER"
+rm -f "$SELECTOR_MARKER" "$SELECTOR_MARKER.env"
+check "W16b TTY run: the selector observes prompts unset (humans keep interactive reauth)" \
+  bash -c '
+    script -qec "env -u GCLOUD_IDENT -u GCLOUD_ROBOT_HOME -u GCLOUD_ROBOT_REQUIRE -u GCLOUD_ROBOT_PROJECT -u GCLOUD_ROBOT_PROBE_PERMISSION -u FRESHELL_GCP_ACCOUNT -u CLOUDSDK_CORE_ACCOUNT -u CLOUDSDK_CORE_PROJECT -u CLOUDSDK_CORE_DISABLE_PROMPTS -u SELECTOR_ACCOUNT -u SELECTOR_FAIL -u GCLOUD_IDENT_RESOLVED -u FRESHELL_GCP_IDENTITY_SOURCE -u FRESHELL_ROBOT_HOME_DISCOVERED -u GCLOUD_ROBOT_ACCOUNT PATH=\"$1:\$PATH\" HOME=\"$2\" bash \"$3\" run --cloud --shards=1" /dev/null >/dev/null 2>&1 || true
+    [ -e "$4" ] &&
+    grep -q "^prompts=unset$" "$4.env"
+  ' _ "$GTDIR" "$W16_HOME" "$WRAPPER_E2E" "$SELECTOR_MARKER"
 
 # --- W10/W11: help documents every identity knob, no human default ---------
 E2E_HELP=$("$WRAPPER_E2E" help 2>&1)

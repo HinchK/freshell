@@ -61,6 +61,16 @@ IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NA
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# kata e83z: non-TTY stdin is the agent case (bash -c, tool harnesses, CI).
+# The identity preflight below is the guaranteed fail-fast leg; this export is
+# defense-in-depth — verified in gcloud's CanPrompt() source to be honored as
+# the --quiet equivalent even where auto-detection does not apply. Humans at
+# a real terminal keep interactive reauth (the export is deliberately withheld
+# on TTY stdin).
+if [ ! -t 0 ]; then
+  export CLOUDSDK_CORE_DISABLE_PROMPTS=1
+fi
+
 # Shared gcloud identity ladder (gcloud-robot). Sourcing only defines
 # functions — no side effects, no output — so help and local lanes stay
 # gcloud-free and silent.
@@ -142,6 +152,18 @@ gcloud_artifacts_flags() {
 account_flag() {
   if [ -n "${GCP_ACCOUNT:-}" ]; then
     printf -- '--account=%s' "${GCP_ACCOUNT}"
+  fi
+}
+
+# kata e83z: cheap live-credential check at lane start — fails in seconds,
+# before any build/submit work, when the resolved identity cannot mint a token.
+# The error names the resolved identity and its source so the failure path is
+# as attributable as the success path.
+identity_preflight() {
+  if ! gcloud auth print-access-token $(account_flag) >/dev/null 2>&1; then
+    echo "[e2e-cloud] ERROR: identity preflight failed for ${GCP_ACCOUNT:-(ambient gcloud)} (source: ${FRESHELL_GCP_IDENTITY_SOURCE:-unresolved}) - gcloud auth print-access-token could not mint a token." >&2
+    echo "[e2e-cloud] Fix the credential/identity (docs/development/gcloud-robot.md) and re-run the lane." >&2
+    exit 1
   fi
 }
 
@@ -243,6 +265,7 @@ cmd_build() {
   # never at script top — help and local-only paths must keep working with
   # zero GCP tooling. Probe = the lane's gating permission.
   freshell_resolve_cloud_identity "cloudbuild.builds.create"
+  identity_preflight
 
   # Content-addressed tag (see image_tag_for_head): the only tag `run` pins.
   local tag remote_base build_commit
@@ -306,6 +329,7 @@ cmd_push() {
   # A standalone `push` reaches gcloud without passing through cmd_build;
   # resolve idempotently (free when cmd_build already did).
   freshell_resolve_cloud_identity "cloudbuild.builds.create"
+  identity_preflight
 
   # Ensure the Artifact Registry repo exists
   if ! gcloud artifacts repositories describe $(gcloud_artifacts_flags) "$GCP_REPO" &>/dev/null; then
@@ -479,6 +503,7 @@ cmd_run() {
   # so the local lane stays free of GCP tooling and of the ladder's
   # stderr note.
   freshell_resolve_cloud_identity "run.jobs.run"
+  identity_preflight
 
   # Recompute the remote ref with potentially overridden GCP settings —
   # COMMIT-ADDRESSED, never mutable :latest (see image_tag_for_head): the
@@ -818,6 +843,7 @@ cmd_logs() {
   # logs is a cloud-only lane (executions list + logs read); resolve after
   # parsing so an explicit pin short-circuits the ladder.
   freshell_resolve_cloud_identity "run.jobs.run"
+  identity_preflight
 
   local execution_id
   execution_id=$(gcloud run jobs executions list $(gcloud_flags) \

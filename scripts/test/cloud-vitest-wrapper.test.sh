@@ -362,8 +362,78 @@ wait "$INT_PID" 2>/dev/null || true
 check "SIGINT mid-run still deletes the run's own job" \
   grep -q 'run jobs delete' "$FAKE_GCLOUD_LOG"
 
+# Check 16 (kata e83z): TTY-gated prompt disabling + identity preflight.
+# FAKE8: prompts-env recording + failing-token mode. Every invocation runs
+# under `env -u CLOUDSDK_CORE_DISABLE_PROMPTS` so a host export can never
+# skew the TTY-side assertions.
+FAKE8_DIR=$(mktemp -d)
+FAKE8_LOG="$FAKE8_DIR/gcloud.log"
+export FAKE8_LOG
+cat > "$FAKE8_DIR/gcloud" << 'FAKE8'
+#!/usr/bin/env bash
+echo "FAKE_GCLOUD: $@" >> "${FAKE8_LOG:?set FAKE8_LOG}"
+[ -n "${CLOUDSDK_CORE_DISABLE_PROMPTS:-}" ] && echo "PROMPTS_DISABLED=1" >> "$FAKE8_LOG"
+case "$*" in
+  *"auth print-access-token"*)
+    if [ -n "${FAKE8_TOKEN_FAIL:-}" ]; then
+      echo "Reauthentication failed. cannot prompt during non-interactive execution" >&2
+      exit 1
+    fi
+    echo fake-token; exit 0 ;;
+  *"info"*) echo "/nonexistent-sdk-root"; exit 0 ;;
+  *"artifacts docker images describe"*) exit 0 ;;
+  *"artifacts repositories describe"*) exit 0 ;;
+  *"builds submit"*) exit 0 ;;
+  *"run jobs create"*) exit 0 ;;
+  *"run jobs execute"*) printf 'Execution [fake8-exec-1] has successfully completed.\n'; exit 0 ;;
+  *"executions list"*) echo "fake8-exec-1"; exit 0 ;;
+  *"executions describe"*) echo 1; exit 0 ;;
+  *"logs read"*) echo "  1 passed (1.0s)"; exit 0 ;;
+  *"run jobs delete"*) exit 0 ;;
+  *) exit 0 ;;
+esac
+FAKE8
+chmod +x "$FAKE8_DIR/gcloud"
+
+run8() { # suite-level helper: run the run lane under FAKE8; stdin: caller's
+  rm -f "$FAKE8_LOG"; touch "$FAKE8_LOG"
+  env -u CLOUDSDK_CORE_DISABLE_PROMPTS PATH="$FAKE8_DIR:$PATH" \
+    bash "$SCRIPT" run --cloud --config=default --shards=2 2>&1
+}
+
+V8_OUT=$(run8 < /dev/null) && V8_RC=0 || V8_RC=$?
+check "non-TTY stdin exports CLOUDSDK_CORE_DISABLE_PROMPTS=1 to gcloud children" \
+  bash -c 'grep -q "PROMPTS_DISABLED=1" "$1"' _ "$FAKE8_LOG"
+
+rm -f "$FAKE8_LOG"; touch "$FAKE8_LOG"
+check "TTY stdin leaves prompts enabled (humans keep interactive reauth)" \
+  bash -c '
+    script -qec "env -u CLOUDSDK_CORE_DISABLE_PROMPTS PATH=\"$1:\$PATH\" bash \"$2\" run --cloud --config=default --shards=2" /dev/null >/dev/null 2>&1 || true
+    ! grep -q "PROMPTS_DISABLED=1" "$3"
+  ' _ "$FAKE8_DIR" "$SCRIPT" "$FAKE8_LOG"
+
+rm -f "$FAKE8_LOG"; touch "$FAKE8_LOG"
+V8S_OUT=$(run8 < /dev/null) >/dev/null 2>&1 || true
+check "identity preflight mints a token before any build/submit work" \
+  bash -c '
+    tok_line="$(grep -n "auth print-access-token" "$1" | head -1 | cut -d: -f1)"
+    [ -n "$tok_line" ] || exit 1
+    if awk -v n="$tok_line" "NR<n" "$1" | grep -qE "FAKE_GCLOUD:.*(builds submit|run jobs create)"; then exit 1; fi
+    grep -q "FAKE_GCLOUD: auth print-access-token --account=suite-pinned-identity@example.invalid" "$1"
+  ' _ "$FAKE8_LOG"
+
+rm -f "$FAKE8_LOG"; touch "$FAKE8_LOG"
+V8F_OUT=$(env -u CLOUDSDK_CORE_DISABLE_PROMPTS PATH="$FAKE8_DIR:$PATH" FAKE8_TOKEN_FAIL=1 bash "$SCRIPT" run --cloud --config=default --shards=2 2>&1 < /dev/null) && V8F_RC=0 || V8F_RC=$?
+check "failed preflight exits fast: no builds submit, no job create, loud attributable error" \
+  bash -c '
+    [ "$1" != "0" ] &&
+    grep -q "identity preflight failed for suite-pinned-identity@example.invalid (source: GCLOUD_IDENT (explicit env bypass))" <<<"$2" &&
+    ! grep -qE "FAKE_GCLOUD:.*(builds submit|run jobs create)" "$3"
+  ' _ "$V8F_RC" "$V8F_OUT" "$FAKE8_LOG"
+
 # Cleanup
 rm -rf "$FAKE_GCLOUD_DIR"
+rm -rf "$FAKE8_DIR"
 
 echo ""
 if [ "$FAILURES" -eq 0 ]; then
