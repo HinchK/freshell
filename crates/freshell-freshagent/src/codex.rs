@@ -9439,10 +9439,39 @@ fn reduce_notification(
                 // with (never nested inside) the `active_turn` guard above
                 // and dropped before any `quiet_deadman` lock (same tier as
                 // `active_turn`).
-                let retired_slot_match = !retired && event.turn_id.is_some() && {
-                    let slot = retired_turn_id.lock().expect("retired_turn_id mutex");
-                    slot.as_deref() == event.turn_id.as_deref()
-                };
+                // FR3-1 (focused-r3 Minor): the `!superseded_by_active_turn`
+                // guard is REQUIRED on the ID-carrying leg too. The snapshot
+                // seed (`get_snapshot`'s U-1 mid-flight install) installs the
+                // newer turn into the tracker and arms the latch WITHOUT the
+                // emission gate, then voids the slot separately — a prior
+                // turn's matching completion folding inside that window is
+                // SUPERSEDED by the live tracker, and retiring the (still
+                // slot-held) prior turn's latch there would lower the latch
+                // the seed just installed for the NEWER turn, silencing a
+                // later crash/wedge of that turn. The guard makes the leg
+                // structurally superseded-safe: with a live tracker the slot
+                // match is inert (the gate-serialized install sites void the
+                // slot before any completion can fold; only the gate-free
+                // seed window can hold both, and there the guard holds).
+                // FR3-1 (focused-r3 Minor): the `!superseded_by_active_turn`
+                // guard is REQUIRED on the ID-carrying leg too. The snapshot
+                // seed (`get_snapshot`'s U-1 mid-flight install) installs the
+                // newer turn into the tracker and arms the latch WITHOUT the
+                // emission gate, then voids the slot separately — a prior
+                // turn's matching completion folding inside that window is
+                // SUPERSEDED by the live tracker, and retiring the (still
+                // slot-held) prior turn's latch there would lower the latch
+                // the seed just installed for the NEWER turn, silencing a
+                // later crash/wedge of that turn. The guard makes the leg
+                // structurally superseded-safe: with a live tracker the slot
+                // match is inert (the gate-serialized install sites void the
+                // slot before any completion can fold; only the gate-free
+                // seed window can hold both, and there the guard holds).
+                let retired_slot_match =
+                    !retired && !superseded_by_active_turn && event.turn_id.is_some() && {
+                        let slot = retired_turn_id.lock().expect("retired_turn_id mutex");
+                        slot.as_deref() == event.turn_id.as_deref()
+                    };
                 // FR2-1: the ID-less completion's slot inference — the accepted
                 // app-server shape permits `turn/completed` with NO turn id, and
                 // in the ordinary sequence (terminal idle status retires the
@@ -17437,6 +17466,109 @@ pub(crate) mod tests {
         assert!(
             edge.matched,
             "a crash during turn-2 rings turn-2's edge — the late turn-1 completion retired nothing: {:?}",
+            edge.frames
+        );
+    }
+
+    /// The-usual SDD focused-r3 FR3-1 (OPTIONAL post-PASS fix): the snapshot
+    /// seed (`get_snapshot`'s U-1 mid-flight install) installs the newer
+    /// turn into the tracker and arms the latch WITHOUT the emission gate,
+    /// then voids the retired-turn slot separately — a prior turn's
+    /// MATCHING completion folding inside that window is SUPERSEDED by the
+    /// live tracker, yet the slot still holds the prior turn. The ID-carrying
+    /// slot match must therefore be superseded-safe: it may never retire the
+    /// latch while a NEWER turn is live (that latch belongs to the newer
+    /// turn now) — the seed window deterministically constructed below.
+    #[tokio::test]
+    async fn a_superseded_slot_completion_during_the_snapshot_seed_window_keeps_the_newer_turns_latch(
+    ) {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, mut rx) = state_with_bus();
+
+        let child = spawn_sleeper();
+        let pid = child.id().expect("sleeper pid");
+
+        // The tracker seed Arc is kept for the deterministic seed-window
+        // construction below (the same Arc the fixture wires into the
+        // session — the production seed's own install path).
+        let active_turn: Arc<StdMutex<Option<String>>> =
+            Arc::new(StdMutex::new(Some("turn-1".to_string())));
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-seed-window",
+            client,
+            active_turn.clone(),
+            notifs,
+            child,
+            "codex-sidecar-test-seed-window",
+        )
+        .await;
+
+        // Turn-1's terminal status: the tracker retires into the slot
+        // (slot=turn-1) and the crash latch stays armed (the gap design).
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-seed-window", "status": { "type": "idle" } }),
+        );
+        let idle = collect_frames_until(&mut rx, std::time::Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.session.snapshot" && w["event"]["status"] == "idle"
+        })
+        .await;
+        assert!(
+            idle.matched,
+            "turn-1's terminal status broadcasts its idle snapshot: {:?}",
+            idle.frames
+        );
+
+        // The SNAPSHOT-SEED window, deterministically: get_snapshot's U-1
+        // mid-flight install puts turn-2 into the tracker (the latch it
+        // mirrors is already armed from the gap) BEFORE its separate slot
+        // void — so for one window the session holds BOTH a live turn-2
+        // tracker and the stale turn-1 slot. This is the exact interleaving
+        // the reviewer flagged: the install and the void are not atomic.
+        *active_turn.lock().expect("active_turn mutex") = Some("turn-2".to_string());
+
+        // Turn-1's matching completion folds INSIDE the window: it is
+        // superseded by the live turn-2 tracker and must retire NOTHING —
+        // the armed latch belongs to turn-2 now.
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-seed-window", "turnId": "turn-1", "status": "completed" }),
+        );
+        let running = collect_frames_until(&mut rx, std::time::Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.session.snapshot" && w["event"]["status"] == "running"
+        })
+        .await;
+        assert!(
+            running.matched,
+            "the superseded completion publishes the busy running snapshot: {:?}",
+            running.frames
+        );
+
+        // The crash latch is STILL ARMED for turn-2: a sidecar crash rings
+        // turn-2's synthesized edge — proof the superseded turn-1
+        // completion retired nothing. Safety: a targeted SIGKILL of this
+        // test's own fixture child — never a broad kill pattern.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        let exited = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |w| {
+            w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "exited"
+        })
+        .await;
+        assert!(
+            exited.matched,
+            "the watcher self-heals within the budget: {:?}",
+            exited.frames
+        );
+        let edge = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |w| {
+            w["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert!(
+            edge.matched,
+            "a crash during turn-2 rings turn-2's edge — the superseded turn-1 completion in the seed window retired nothing: {:?}",
             edge.frames
         );
     }
