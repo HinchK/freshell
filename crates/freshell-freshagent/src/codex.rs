@@ -9404,8 +9404,9 @@ fn reduce_notification(
             // while it was still running (the rollback gate then observed
             // false||false and admitted a mid-turn thread/revert that
             // force-interrupts the newer turn). A completion carrying NO id can
-            // never retire the active turn (fail-closed); the compact marker has
-            // its narrower FIFO-safe ownership exception below.
+            // never retire the active turn (fail-closed); the compact marker and
+            // the retired-turn latch each have their narrower FIFO-safe
+            // ownership exceptions below.
             if event.thread_id == subscription.session_id() {
                 // Scoped: the `active_turn` guard must be dropped BEFORE the
                 // quiet-deadman disarm below (the file-wide lock order is
@@ -9432,16 +9433,60 @@ fn reduce_notification(
                 // FR1-1: the RETIRED-TURN slot match — the completion does NOT
                 // match the live tracker (the terminal thread status already
                 // emptied it) but DOES match the slot that retirement recorded.
-                // The slot is read-only here (fail-closed on an ID-less
-                // completion, same as the live-tracker path);
-                // [`clear_turn_in_flight`] below owns the slot's clear. The
-                // slot guard is sequenced with (never nested inside) the
-                // `active_turn` guard above and dropped before any
-                // `quiet_deadman` lock (same tier as `active_turn`).
+                // The slot is read-only here (the ID-carrying leg stays
+                // fail-closed against a slot it cannot identify); [`clear_turn_in_flight`]
+                // below owns the slot's clear. The slot guard is sequenced
+                // with (never nested inside) the `active_turn` guard above
+                // and dropped before any `quiet_deadman` lock (same tier as
+                // `active_turn`).
                 let retired_slot_match = !retired && event.turn_id.is_some() && {
                     let slot = retired_turn_id.lock().expect("retired_turn_id mutex");
                     slot.as_deref() == event.turn_id.as_deref()
                 };
+                // FR2-1: the ID-less completion's slot inference — the accepted
+                // app-server shape permits `turn/completed` with NO turn id, and
+                // in the ordinary sequence (terminal idle status retires the
+                // tracker into the slot, latch deliberately ARMED) the provider's
+                // FIFO stream makes the ID-less completion that follows the
+                // retired turn's OWN completion: it must retire the latch
+                // (latch-only — publication still flows through the unchanged
+                // `on_turn_completed` path below). Without this inference the
+                // latch stays armed forever: the quiet deadman later flags the
+                // completed turn `stuck` + rings a SECOND edge, and a later
+                // sidecar crash rings for it too.
+                //
+                // Invariant chain this rests on (verified at every writer):
+                // (1) slot Some ⇒ active_turn None. The ONLY Some-writer is the
+                //     ThreadStatusChanged idle site, which takes the tracker
+                //     under the same emission-gate-serialized fold (or the
+                //     FIFO-ordered consumer pass) that every active-turn install
+                //     (handle_send's gate-held response leg, the TurnStarted
+                //     consumer arm, the snapshot seed) is sequenced against —
+                //     and every install site VOIDS the slot, so a live tracker
+                //     and a populated slot can never be observed together.
+                //     `!superseded_by_active_turn` (⇔ active_turn None for an
+                //     ID-less event) restates the invariant directly, so a
+                //     future writer that breaks (1) degrades this leg to a
+                //     no-op instead of retiring a LIVE turn's latch.
+                // (2) The two ID-less inferences are disjoint: the compact
+                //     owner's (`idless_superseded_compact_completion` below)
+                //     requires a live NEWER active turn (`superseded_by_active_turn`),
+                //     this one requires none. The `compact_in_flight` guard
+                //     additionally keeps this leg off inside an armed compact
+                //     window: the idle-site recording is suppressed inside
+                //     windows and the compact's own `turn/started` voids any
+                //     pre-window slot, so inside a window the compact
+                //     lifecycle owns the latch (its install re-mirrors it, its
+                //     own completion retires it) — the guard is the
+                //     conservative bound, never an inference enabler.
+                let idless_retired_slot_match = !retired
+                    && event.turn_id.is_none()
+                    && !superseded_by_active_turn
+                    && !compact_in_flight.load(Ordering::SeqCst)
+                    && {
+                        let slot = retired_turn_id.lock().expect("retired_turn_id mutex");
+                        slot.is_some()
+                    };
                 // Delta-r1 F2 + ep1-r3 F4 (completion-id OWNERSHIP): the compact
                 // window ends HERE — but ONLY on the `turn/completed` whose params
                 // turn id MATCHES the captured `compact_turn_id` (any status — a
@@ -9492,18 +9537,19 @@ fn reduce_notification(
                     // outlive the latch it bridges for).
                     clear_turn_in_flight(turn_in_flight, retired_turn_id);
                     disarm_codex_quiet(quiet_deadman, subscription.session_id(), "turn_complete");
-                } else if retired_slot_match {
-                    // RETIRED-SLOT match = LATCH-ONLY retirement (FR1-1): the
-                    // terminal thread status already published the idle
-                    // snapshot, and the pre-existing publication contract
-                    // treats this completion exactly as it always has
-                    // (`retired` stays false; the publication flows through
-                    // the normal `on_turn_completed` path below, ringing the
-                    // turn's ONE attention edge). The ONLY thing the slot
-                    // match adds is retiring the crash latch the idle
-                    // retirement deliberately left armed — without it the
-                    // deadman later flags a completed turn `stuck` and a
-                    // later sidecar crash rings for it too.
+                } else if retired_slot_match || idless_retired_slot_match {
+                    // RETIRED-SLOT match = LATCH-ONLY retirement (FR1-1 id-
+                    // carrying; FR2-1 ID-less): the terminal thread status
+                    // already published the idle snapshot, and the
+                    // pre-existing publication contract treats this
+                    // completion exactly as it always has (`retired` stays
+                    // false; the publication flows through the normal
+                    // `on_turn_completed` path below, ringing the turn's ONE
+                    // attention edge). The ONLY thing the slot match adds is
+                    // retiring the crash latch the idle retirement
+                    // deliberately left armed — without it the deadman later
+                    // flags a completed turn `stuck` and a later sidecar
+                    // crash rings for it too.
                     clear_turn_in_flight(turn_in_flight, retired_turn_id);
                     disarm_codex_quiet(quiet_deadman, subscription.session_id(), "turn_complete");
                 }
@@ -17392,6 +17438,120 @@ pub(crate) mod tests {
             edge.matched,
             "a crash during turn-2 rings turn-2's edge — the late turn-1 completion retired nothing: {:?}",
             edge.frames
+        );
+    }
+
+    /// The-usual SDD focused-r2 FR2-1: the app-server's ACCEPTED shape permits
+    /// an ID-LESS `turn/completed` (`turn_id: Option<String>`,
+    /// crates/freshell-codex protocol.rs). In the ordinary sequence the
+    /// terminal thread status retires the tracker into the retired-turn slot
+    /// and keeps the crash latch ARMED (the idle-before-completed gap
+    /// design); an ID-less completion then cannot MATCH the slot (the FR1-1
+    /// arm requires an id), so the latch stays armed FOREVER: the quiet
+    /// deadman later flags the pane `stuck` and rings a SECOND attention
+    /// edge for the already-completed turn, and any later sidecar crash
+    /// rings for it too. The provider's FIFO stream makes an ID-less
+    /// completion arriving with the slot holding a turn and no
+    /// live/superseding active turn the retired turn's OWN completion — it
+    /// must retire the latch latch-only (publication flows through the
+    /// unchanged `on_turn_completed` path, so the turn still rings its ONE
+    /// edge).
+    #[tokio::test]
+    async fn idless_completion_after_idle_retires_the_retired_turns_crash_latch() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, mut rx) = state_with_bus();
+        // A tiny quiet window (the deadman tests' own knob) so a lingering
+        // armed window would FIRE well inside this test's budget.
+        st.set_codex_quiet_window_ms_for_tests(150);
+
+        let child = spawn_sleeper();
+        let pid = child.id().expect("sleeper pid");
+
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-idless",
+            client,
+            Arc::new(StdMutex::new(Some("turn-1".to_string()))),
+            notifs,
+            child,
+            "codex-sidecar-test-idless",
+        )
+        .await;
+
+        // The app-server's documented order: the terminal thread status lands
+        // BEFORE the turn's own completion — the tracker retires into the
+        // retired-turn slot and the crash latch stays armed through the gap.
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-idless", "status": { "type": "idle" } }),
+        );
+        let idle = collect_frames_until(&mut rx, std::time::Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.session.snapshot" && w["event"]["status"] == "idle"
+        })
+        .await;
+        assert!(
+            idle.matched,
+            "the terminal thread status broadcasts its idle snapshot: {:?}",
+            idle.frames
+        );
+
+        // The turn's own completion carries NO id — the accepted ID-less
+        // shape. Publication is unchanged: it still rings the turn's ONE
+        // attention edge through the ordinary `on_turn_completed` path.
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-idless", "status": "completed" }),
+        );
+        let edge = collect_frames_until(&mut rx, std::time::Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert!(
+            edge.matched,
+            "the ID-less completion rings its one attention edge (publication unchanged): {:?}",
+            edge.frames
+        );
+
+        // (a) The ID-less completion RETIRED the latch: the armed-again quiet
+        // window (150 ms) must never fire — no `stuck` status and no SECOND
+        // attention edge for the already-completed turn.
+        let post = collect_frames_until(&mut rx, std::time::Duration::from_millis(500), |w| {
+            (w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "stuck")
+                || w["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert!(
+            !post.matched,
+            "the ID-less completion retired the latch: no stuck status, no second edge: {:?}",
+            post.frames
+        );
+
+        // (b) A subsequent sidecar crash (an unrequested exit) broadcasts the
+        // `exited` frame but must NOT synthesize an attention edge — the
+        // latch is provably down for the already-completed turn. Safety: a
+        // targeted SIGKILL of this test's own fixture child (the `sleep`
+        // process spawned above) — never a broad kill pattern.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        let exited = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |w| {
+            w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "exited"
+        })
+        .await;
+        assert!(
+            exited.matched,
+            "the watcher self-heals within the budget: {:?}",
+            exited.frames
+        );
+        let after = collect_frames_until(&mut rx, std::time::Duration::from_millis(400), |w| {
+            w["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert!(
+            !after.matched,
+            "a crash after the ID-less completion must not ring for the already-completed turn: {:?}",
+            after.frames
         );
     }
 
