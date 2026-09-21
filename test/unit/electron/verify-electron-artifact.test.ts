@@ -182,6 +182,20 @@ describe('verify-electron-artifact', () => {
     expect(() => verifyElectronArtifact(root, nativePlatform, { probe: refusingProbe() })).toThrow(/packageManager/)
   })
 
+  it('rejects a receipt with a missing package-manager identity and unsafe receipted paths', () => {
+    const missingManagerRoot = artifactRoot()
+    writeArtifact(missingManagerRoot, nativePlatform, { packageManager: undefined })
+
+    expect(() => verifyElectronArtifact(missingManagerRoot, nativePlatform, { probe: refusingProbe() })).toThrow(/packageManager/)
+
+    const escapingRoot = artifactRoot()
+    writeArtifact(escapingRoot, nativePlatform, {
+      fileHashes: { '..\\evil.txt': 'a'.repeat(64), '/etc/passwd': 'a'.repeat(64), 'ok/../../evil': 'a'.repeat(64) },
+    })
+
+    expect(() => verifyElectronArtifact(escapingRoot, nativePlatform, { probe: refusingProbe() })).toThrow(/invalid path/)
+  })
+
   it('rejects any link inside the artifact, wherever it points', () => {
     const outside = artifactRoot()
     writeFileSync(path.join(outside, 'outside.txt'), 'outside the artifact\n')

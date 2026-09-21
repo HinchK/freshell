@@ -253,7 +253,10 @@ function validateArtifactReceipt(
       failures.push('staging receipt fileHashes must not be empty')
     }
     for (const [relative, expected] of entries) {
-      if (typeof expected !== 'string' || relative.startsWith('/') || relative.split('/').includes('..')) {
+      // Stager receipts use posix keys only; any other spelling (absolute,
+      // backslash, or ..-traversal) is malformed input, rejected outright so
+      // it can never reach a path join on any platform.
+      if (typeof expected !== 'string' || relative.includes('\\') || relative.startsWith('/') || relative.split('/').includes('..')) {
         failures.push(`staging receipt lists an invalid path: ${relative}`)
         continue
       }
