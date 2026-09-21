@@ -164,3 +164,7 @@ Thumbs.db
 # Explicitly keep package manifests (harmless; guards against future globs)
 !package.json
 !package-lock.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!crates/freshell-claude-sidecar/package.json
+!packages/freshell-mcp-runtime/package.json

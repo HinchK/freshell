@@ -409,6 +409,10 @@ if [[ "$*" == *"auth print-access-token"* ]]; then echo stub-token; exit 0; fi
 if [[ "$*" == *"executions list"* ]]; then echo "green-exec-1"; exit 0; fi
 if [[ "$*" == *"logs read"* ]]; then echo "  1 passed (1.0s)"; exit 0; fi
 if [[ "$*" == *"logging read"* ]]; then
+  # Structured retry-receipt reconciliation for the green single-task
+  # execution this stub reports. Without this branch the e2e wrapper fails
+  # closed on receipt evidence before the identity-ladder behavior under
+  # test can complete.
   printf '[{"jsonPayload":{"event":"e2e_playwright_task_complete","execution":"green-exec-1","taskIndex":0,"taskCount":1,"recoveredRetryCount":0}}]\n'
   exit 0
 fi

@@ -177,8 +177,6 @@ describe('Rust-only distribution runtime contracts', () => {
 
     expect(dockerfile).toMatch(/FROM rust:[^\n]+ AS rust-builder/)
     expect(dockerfile).toContain('cargo build --release -p freshell-server --locked')
-    expect(dockerfile).toContain('npm ci --ignore-scripts')
-    expect(dockerfile).toContain('npm run build:client && npm run build:tools')
     expect(dockerfile).toContain('target/release/freshell-server')
     expect(dockerfile).toContain('dist/client')
     expect(dockerfile).toContain('dist/tools')

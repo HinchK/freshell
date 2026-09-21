@@ -50,14 +50,24 @@ ENV DEBIAN_FRONTEND=noninteractive \
     NONINTERACTIVE=1
 
 WORKDIR /app
-COPY package.json package-lock.json ./
+# Workspace member manifests must precede the frozen install: pnpm resolves
+# every importer listed in pnpm-workspace.yaml before touching the lock.
+# Each member manifest needs its destination directory spelled out — a
+# multi-file COPY into ./ flattens file sources by basename, which would
+# overwrite the root package.json with the member's manifest.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY crates/freshell-claude-sidecar/package.json crates/freshell-claude-sidecar/
+COPY packages/freshell-mcp-runtime/package.json packages/freshell-mcp-runtime/
 
-# Lifecycle scripts are disabled here; the final image needs only retained JS
-# tooling and static artifacts around the Rust backend.
-RUN npm ci --ignore-scripts
+# npm appears only as the pinned pnpm bootstrap (plan §7.2.2); dependency
+# installation is pnpm against the workspace lock. Lifecycle scripts are
+# disabled here; the final image needs only retained JS tooling and static
+# artifacts around the Rust backend.
+RUN npm install -g pnpm@10.34.5 \
+  && pnpm install --frozen-lockfile --ignore-scripts
 
 COPY . .
-RUN FRESHELL_BUILD_COMMIT="$FRESHELL_BUILD_COMMIT" npm run build:client && npm run build:tools
+RUN FRESHELL_BUILD_COMMIT="$FRESHELL_BUILD_COMMIT" pnpm run build:client && pnpm run build:tools
 
 # ---------------------------------------------------------------------------
 # Stage 3: test runtime. Vitest behaviorally compiles isolated Rust build-script
@@ -85,6 +95,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Must match the @playwright/test version in package.json.
 RUN npx --yes playwright@1.58.2 install --with-deps chromium
+
+# The runtime entrypoint drives Vitest and Playwright with `pnpm exec`
+# (plan §7.2.3), so the runtime stage needs the same pinned pnpm.
+RUN npm install -g pnpm@10.34.5
 
 WORKDIR /app
 COPY --from=rust-builder /build/target/release/freshell-server /app/target/release/freshell-server
