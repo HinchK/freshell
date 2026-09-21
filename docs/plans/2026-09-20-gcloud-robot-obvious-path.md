@@ -240,8 +240,10 @@ check "K7 explicit GCLOUD_ROBOT_HOME wins over well-known paths (source names GC
 
 # K7b: GCLOUD_ROBOT_ACCOUNT — the documented robot-first guarantee lever — is
 # forwarded to the selector and selected (the selector probes the env account
-# first; the bridge must not scrub or starve it).
-OUT=$(run_ladder "run.jobs.run" HOME="$WK2_HOME" GCLOUD_ROBOT_ACCOUNT="guaranteed-robot@example.invalid")
+# first; the bridge must not scrub or starve it). Uses the MARKER-install home
+# (WK5_HOME), whose selector honors SELECTOR_* and records the env contract —
+# the fixed-account mk_robot_install fakes ignore GCLOUD_ROBOT_ACCOUNT.
+OUT=$(run_ladder "run.jobs.run" HOME="$WK5_HOME" GCLOUD_ROBOT_ACCOUNT="guaranteed-robot@example.invalid")
 check "K7b GCLOUD_ROBOT_ACCOUNT is forwarded to the selector and wins the probe" \
   bash -c '
     [ "$1" = "guaranteed-robot@example.invalid" ] &&
@@ -691,11 +693,12 @@ check "run-lane startup banner reports the resolved identity and its source" \
   bash -c '
     grep -q "\[vitest-cloud\] Identity: suite-pinned-identity@example.invalid (source: GCLOUD_IDENT (explicit env bypass))" <<<"$1"
   ' _ "$V9_OUT"
-check "identity line leads the lane output (before the Running-on-Cloud-Run banner)" \
+check "identity line leads the lane output (before any build work and the banner)" \
   bash -c '
     ident="$(grep -n "\[vitest-cloud\] Identity:" <<<"$1" | head -1 | cut -d: -f1)"
-    banner="$(grep -n "Running on Cloud Run Jobs" <<<"$1" | head -1 | cut -d: -f1)"
-    [ -n "$ident" ] && [ -n "$banner" ] && [ "$ident" -lt "$banner" ]
+    [ -n "$ident" ] || exit 1
+    firstwork="$(grep -nE "Building Docker image|Running on Cloud Run Jobs" <<<"$1" | head -1 | cut -d: -f1)"
+    [ -n "$firstwork" ] && [ "$ident" -lt "$firstwork" ]
   ' _ "$V9_OUT"
 
 V10_DIRTY="$ROOT/.vitest-cloud-dirty-check-$$"
@@ -708,15 +711,18 @@ check "loud stdout WARNING when the -dirty image path is taken" \
     grep -q "WARNING: dirty worktree" <<<"$1" &&
     grep -q "not content-addressed" <<<"$1"
   ' _ "$V10_OUT"
-check "dirty WARNING leads the lane output (surfaced BEFORE any rebuild work)" \
+check "dirty WARNING precedes the rebuild work itself, not just the banner" \
   bash -c '
     warn="$(grep -n "WARNING: dirty worktree" <<<"$1" | head -1 | cut -d: -f1)"
+    [ -n "$warn" ] || exit 1
+    build="$(grep -n "Building Docker image" <<<"$1" | head -1 | cut -d: -f1)"
     banner="$(grep -n "Running on Cloud Run Jobs" <<<"$1" | head -1 | cut -d: -f1)"
-    [ -n "$warn" ] && [ -n "$banner" ] && [ "$warn" -lt "$banner" ]
+    [ -n "$build" ] && [ "$warn" -lt "$build" ] &&
+    [ -n "$banner" ] && [ "$warn" -lt "$banner" ]
   ' _ "$V10_OUT"
 ```
 
-(The dirty check creates a temporary untracked file so the WARNING is guaranteed regardless of the checkout's ambient state, and removes it immediately after the run. Suite-level invocation via `run8` keeps all fixtures in scope. The FAKE8 `builds submit` stub absorbs the dirty-rebuild branch. The ordering checks pin the placement requirement: the identity and dirty lines print BEFORE the build-decision block can spend ~13 minutes in `cmd_build` — a grep-only assertion would pass with the lines printed anywhere, including after the rebuild.)
+(The dirty check creates a temporary untracked file so the WARNING is guaranteed regardless of the checkout's ambient state, and removes it immediately after the run. Suite-level invocation via `run8` keeps all fixtures in scope. The FAKE8 `builds submit` stub absorbs the dirty-rebuild branch; the rebuild's own stdout line `Building Docker image via Cloud Build (tag: ...)` is the marker proving the WARNING precedes the BUILD WORK itself — an ordering-vs-banner-only assertion would still pass with both lines printed after a completed rebuild.)
 
 In `scripts/test/cloud-gcp-identity.test.sh`, after W14 (same invocation idiom):
 
@@ -731,11 +737,12 @@ check "W15 e2e banner: pinned identity + GCLOUD_IDENT source on stdout" \
   bash -c '
     grep -q "\[e2e-cloud\] Identity: rung2-bypass@example.invalid (source: GCLOUD_IDENT (explicit env bypass))" <<<"$2"
   ' _ "$W15_RC" "$W15_OUT"
-check "W15 e2e banner: identity line precedes the Running-on-Cloud-Run block" \
+check "W15 e2e banner: identity line precedes the first build work and the banner" \
   bash -c '
     ident="$(grep -n "\[e2e-cloud\] Identity:" <<<"$2" | head -1 | cut -d: -f1)"
-    banner="$(grep -n "Running on Cloud Run Jobs" <<<"$2" | head -1 | cut -d: -f1)"
-    [ -n "$ident" ] && [ -n "$banner" ] && [ "$ident" -lt "$banner" ]
+    [ -n "$ident" ] || exit 1
+    firstwork="$(grep -nE "Building Docker image|Running on Cloud Run Jobs" <<<"$2" | head -1 | cut -d: -f1)"
+    [ -n "$firstwork" ] && [ "$ident" -lt "$firstwork" ]
   ' _ "$W15_RC" "$W15_OUT"
 
 reset_green
@@ -756,13 +763,13 @@ touch "$W15C_DIRTY"
 W15C_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" HOME="$EMPTY_HOME" \
   "$WRAPPER_E2E" run --cloud --shards=1 2>"$W15C_ERR" < /dev/null) && W15C_RC=0 || W15C_RC=$?
 rm -f "$W15C_DIRTY"
-check "W15c e2e dirty tree: loud WARNING banner line on stdout, before the rebuild" \
+check "W15c e2e dirty tree: loud WARNING before the rebuild work itself" \
   bash -c '
     grep -q "\[e2e-cloud\] WARNING: dirty worktree" <<<"$2" &&
     grep -q "not content-addressed" <<<"$2" &&
     warn="$(grep -n "WARNING: dirty worktree" <<<"$2" | head -1 | cut -d: -f1)"
-    banner="$(grep -n "Running on Cloud Run Jobs" <<<"$2" | head -1 | cut -d: -f1)"
-    [ -n "$warn" ] && [ -n "$banner" ] && [ "$warn" -lt "$banner" ]
+    build="$(grep -n "Building Docker image" <<<"$2" | head -1 | cut -d: -f1)"
+    [ -n "$build" ] && [ "$warn" -lt "$build" ]
   ' _ "$W15C_RC" "$W15C_OUT"
 ```
 
@@ -862,7 +869,7 @@ Expected: FAIL — W10b/W10c strings absent; all other checks pass.
    - "Adoption states" section 1 ("wired but not yet provisioned ... lanes run exactly as before"): now stale for machines with a well-known-path install — update to say such machines resolve the robot via discovery (the selector runs; a second stderr note can appear when the probe fails).
    - Operator setup, after the `GCLOUD_ROBOT_HOME` export block: "On machines with a standard install the export is optional — the lanes probe the well-known locations in order when `GCLOUD_ROBOT_HOME` is unset; an explicit export still wins."
    - Broker section (OneCLI gateway broker), add: "The identity preflight mints via oauth2.googleapis.com, which the gateway deliberately does not broker: on brokered hosts, a lane whose resolved identity has a dead LOCAL credential now fails fast at the preflight instead of succeeding silently via brokered control-plane hosts. Keep the robot key activated (`scripts/bootstrap-robot.sh`) or pin `GCLOUD_IDENT` on such machines."
-   - Troubleshooting, add a two-shape entry: "An agent-launched lane (non-TTY stdin) fails within seconds at the identity preflight with `Reauthentication failed. cannot prompt during non-interactive execution` — the expected fail-fast shape (live-verified: the malformed-token subclass also fails fast and never prompts). A lane under a real TTY with a reauth-required human credential still blocks interactively on `Reauthentication required.` / `Please enter your password:` (the prompt class that produced the multi-hour incident; discovery moves this blockage EARLIER, inside the resolve, with the selector's output swallowed) — pin `GCLOUD_ROBOT_ACCOUNT` (the selector probes it first and never mints the human) or `GCLOUD_IDENT` on PTY-launched agent lanes. A `gcloud-robot: well-known install at ... produced no identity` note means a standard install exists but its probe failed — see the selector's stderr guidance."
+   - Troubleshooting, add a two-shape entry: "A dead resolved identity now fails a lane in seconds at the identity preflight with the observable signature `[vitest-cloud]/[e2e-cloud] ERROR: identity preflight failed for <identity> (source: <rung>) - gcloud auth print-access-token could not mint a token.` — the preflight swallows gcloud's own output, so the historical raw signature (`There was a problem refreshing your current auth tokens: Reauthentication failed. cannot prompt during non-interactive execution`) no longer appears on the preflight path; it is what the preflight replaced. A lane under a real TTY with a reauth-required HUMAN credential still blocks interactively on `Reauthentication required.` / `Please enter your password:` (the prompt class that produced the multi-hour incident; discovery moves this blockage EARLIER, inside the resolve, with the selector's output swallowed) — pin `GCLOUD_ROBOT_ACCOUNT` (the selector probes it first and never mints the human) or `GCLOUD_IDENT` on PTY-launched agent lanes. A `gcloud-robot: well-known install at ... produced no identity` note means a standard install exists but its probe failed — see the selector's stderr guidance."
 
 4. Both wrappers' `usage()` identity text: mirror the same ladder wording change as AGENTS.md plus one line documenting the non-TTY prompt disable + preflight. The text MUST contain the exact substring `well-known gcloud-robot install` (the string W10b greps — write it deliberately; do not let a paraphrase like "well-known gcloud-robot skill install" break the check) and the exact token `CLOUDSDK_CORE_DISABLE_PROMPTS` (W10c).
 
@@ -933,7 +940,7 @@ Assert: stdout contains `[vitest-cloud] Identity: gcloud-robot@misc-puttering-pr
 ## Notes
 
 - Live-incident evidence for this kata ran during this run's workspace stage: another agent's base-gate `gcloud builds submit` parked 3h05m on gcloud's interactive reauth prompt (Freshell PTY, ambient human credential in the reauth-required state, `GCLOUD_ROBOT_HOME` never set in the agent environment) — the exact failure mode Task 1 + Task 2 remove for non-TTY invocations, and Task 1 removes for standard-install machines. The load-bearing stage reproduced the prompt class live (timeout-bounded) and confirmed: non-TTY mint of a reauth-required credential fails in ~1s with the documented error string; TTY mint blocks on the interactive prompt.
-- Residual, stated honestly (live-verified, not hypothetical): an agent lane launched under a real PTY (a Freshell terminal pane) with a reauth-required human credential WILL block indefinitely on gcloud's interactive reauth prompt (`Reauthentication required.` / `Please enter your password:`) — prompts are disabled only on non-TTY stdin by design (humans keep interactive reauth). Post-change, discovery moves that blockage EARLIER (inside the resolve, before any banner output) and QUIETER (the selector's stderr and the preflight's output are both redirected): the selector probes `gcloud config get-value account` (the human) before the robot. The documented no-hang lever for PTY agent lanes is pinning `GCLOUD_ROBOT_ACCOUNT` (the selector probes the env-pinned account first and never mints the human) or `GCLOUD_IDENT` — the AGENTS.md bullet and the runbook troubleshooting entry added by Task 4 say so. The malformed-token ("plain invalid_grant") subclass never prompts at all — live-proven in both TTY and non-TTY legs.
+- Residual, stated honestly (live-verified, not hypothetical) — and its authorization: an agent lane launched under a real PTY (a Freshell terminal pane) with a reauth-required human credential WILL block indefinitely on gcloud's interactive reauth prompt (`Reauthentication required.` / `Please enter your password:`), and discovery moves that blockage EARLIER (inside the resolve, before any banner output) and QUIETER (the selector's stderr and the preflight's output are both redirected): the selector probes `gcloud config get-value account` (the human) before the robot. This residual is the User Request's own accepted tradeoff quoted verbatim — "humans in a terminal keep interactive reauth (prompts are disabled only for non-TTY stdin)" — applied to a Freshell agent pane, which is a TTY to the shell and indistinguishable from a human terminal to the specified `[ ! -t 0 ]` mechanism. The kata's incident premise calls agent PTYs "non-interactive shells", but the mechanism it specifies cannot detect that class; closing it would require relaxing the kata's explicit TTY-gate design (unconditional `CLOUDSDK_CORE_DISABLE_PROMPTS=1` — which gcloud honors even on TTYs, live-verified) or modifying the skill-owned selector/verbatim block (out of scope) — a user decision recorded here, NOT a plan defect to engineer around. The documented no-hang lever for PTY agent lanes is pinning `GCLOUD_ROBOT_ACCOUNT` (the selector probes the env-pinned account first and never mints the human) or `GCLOUD_IDENT` — the AGENTS.md bullet and the runbook troubleshooting entry added by Task 4 say so. The malformed-token ("plain invalid_grant") subclass never prompts at all — live-proven in both TTY and non-TTY legs. Suggested follow-up (out of scope, for the recap): a future change could have Freshell pane environments carry a marker env var the lanes honor for prompt suppression, closing the agent-PTY class without touching human terminals.
 - Human-first candidate order (documented, with its guarantee lever): if a LIVE human credential holds the lane's probe permission, the selector legitimately selects the human over the robot (candidate order: `GCLOUD_ROBOT_ACCOUNT` > config account > auth list — the skill's own policy; on the target project today the human lacks lane permissions per the operator's own bashrc note, and the live human credential is reauth-dead, so the robot wins in every observed configuration). `GCLOUD_ROBOT_REQUIRE=1` does not close this gap; `GCLOUD_ROBOT_ACCOUNT=<robot>` is the only lever that guarantees robot-first, and Task 4's AGENTS.md bullet documents it as such. Discovery makes the robot reachable and the banner reports what actually got picked; state the residual plainly in the PR description.
 - Broker interplay (garageserver): the OneCLI gateway brokers control-plane hosts only; `oauth2.googleapis.com` (the preflight's mint) is deliberately unbrokered. Today the robot key is live locally and discovery routes agent lanes to it, so no false-fail; a machine with NO usable local identity that previously sailed through brokered hosts now fails fast at the preflight instead (arguably correct — the identity really is broken). Task 4's runbook broker note documents this.
 - The kata's target population is exactly the non-bashrc shells (agent harnesses, server-spawned panes): every bashrc-sourcing shell already gets `GCLOUD_IDENT` pinned pre-guard and never reaches discovery. Say so in the PR description.
