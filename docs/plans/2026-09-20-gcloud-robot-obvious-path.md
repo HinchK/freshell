@@ -36,7 +36,7 @@ Fix KataTracker item e83z "Cloud lanes: make the gcloud-robot identity the obvio
 - The existing no-match ambient note (`gcp-identity.sh` line 45: `gcloud-robot: skill not found at ${GCLOUD_ROBOT_HOME:-<unset>} — using ambient gcloud (set GCLOUD_ROBOT_HOME to get robot identity)`, with an em-dash) must stay byte-identical: checks E/W5/W6b grep `skill not found .* using ambient gcloud` and require exactly one stderr line. All new banner/warning output goes to stdout.
 - Every non-`info` gcloud call in pinned wrapper runs must carry `--account` (`accounts_all_equal` invariant, cloud-gcp-identity.test.sh:277–285): the preflight goes through `$(account_flag)`.
 - Test hermeticity: the suites never touch the network and never execute the real `~/.codex/skills/gcloud-robot` selector. Two real installs exist on this machine (~/.codex/skills/gcloud-robot and ~/code/skill-gcloud-robot/gcloud-robot), and all three candidate paths are `$HOME`-relative — every ladder/wrapper invocation in `cloud-gcp-identity.test.sh` that can reach the probe must run with a controlled `HOME`. `env` assignment order is verified: a later `HOME=...` in the forwarded args overrides an earlier default (checked live).
-- The bridge's existing external contract is preserved exactly: rung-1 pin short-circuit FIRST (a pinned call with no `$1` must still succeed — `$1` is dereferenced only at the `GCLOUD_ROBOT_PROBE_PERMISSION` export), `GCP_ACCOUNT="${GCLOUD_IDENT:-}"` adoption, and `return 1` propagation under `GCLOUD_ROBOT_REQUIRE=1`.
+- The bridge's existing external contract is preserved exactly: rung-1 pin short-circuit first for any FRESH call (a pinned call with no `$1` must still succeed — `$1` is dereferenced only at the `GCLOUD_ROBOT_PROBE_PERMISSION` export), `GCP_ACCOUNT="${GCLOUD_IDENT:-}"` adoption, and `return 1` propagation under `GCLOUD_ROBOT_REQUIRE=1`. Repeat calls in the same process keep the first resolve's attribution (the ladder's own `GCLOUD_IDENT_RESOLVED` guard; a pin that appears after a first resolve is an adoption, not a pin — check K9 pins this).
 - Both wrappers run `set -euo pipefail`: the TTY test must use the `if [ ! -t 0 ]; then ...; fi` form (a bare `[ ! -t 0 ] && export` would exit the script when stdin IS a tty).
 - No behavior change for submitters without robot accounts: with no `GCLOUD_ROBOT_HOME` and no well-known install, every path is byte-identical to today.
 - Bash suites are invoked directly (`bash scripts/test/<name>.test.sh`) — no package.json/coordinator/CI wiring exists for them and none may be added.
@@ -113,8 +113,11 @@ SCRUB=(-u GCLOUD_IDENT -u GCLOUD_ROBOT_HOME -u GCLOUD_ROBOT_REQUIRE
        -u FRESHELL_GCP_ACCOUNT -u CLOUDSDK_CORE_ACCOUNT -u CLOUDSDK_CORE_PROJECT
        -u SELECTOR_ACCOUNT -u SELECTOR_FAIL
        -u GCLOUD_IDENT_RESOLVED -u FRESHELL_GCP_IDENTITY_SOURCE
-       -u FRESHELL_ROBOT_HOME_DISCOVERED)
+       -u FRESHELL_ROBOT_HOME_DISCOVERED
+       -u GCLOUD_ROBOT_ACCOUNT -u CLOUDSDK_CORE_DISABLE_PROMPTS)
 ```
+
+(`GCLOUD_ROBOT_ACCOUNT` joins the scrub list for host-leak hygiene AND because new checks deliberately set it as the robot-first guarantee lever; `CLOUDSDK_CORE_DISABLE_PROMPTS` must be scrubbed so the TTY-side assertions cannot be skewed by a host that already exports it — otherwise a host export makes correct TTY behavior look broken and lets the non-TTY red pass vacuously. Also extend the FAKE_SELECTOR body in the suite: record `account=${GCLOUD_ROBOT_ACCOUNT:-}` alongside the existing `project=`/`probe=` env-contract line, and echo `"${GCLOUD_ROBOT_ACCOUNT:-${SELECTOR_ACCOUNT:-}}"` as its result — existing checks pass GCLOUD_ROBOT_ACCOUNT unset, so their behavior is unchanged.)
 
 ```bash
 run_ladder() {
@@ -169,6 +172,14 @@ mk_robot_install "$WK2B_HOME" "code/skill-gcloud-robot/gcloud-robot" "code-robot
 OUT=$(run_ladder "run.jobs.run" HOME="$WK2B_HOME")
 check "K2b .claude wins when .codex absent" \
   bash -c '[ "$1" = "claude-robot@example.invalid" ]' _ "$(field "$OUT" ident)"
+
+# K2c: the ~/code checkout alone is a valid third candidate (guards against
+# the candidate list silently losing or misspelling its last entry).
+WK2C_HOME="$TDIR/home-k2c"; mkdir -p "$WK2C_HOME"
+mk_robot_install "$WK2C_HOME" "code/skill-gcloud-robot/gcloud-robot" "code-only-robot@example.invalid"
+OUT=$(run_ladder "run.jobs.run" HOME="$WK2C_HOME")
+check "K2c sole ~/code/skill-gcloud-robot install is discovered" \
+  bash -c '[ "$1" = "code-only-robot@example.invalid" ]' _ "$(field "$OUT" ident)"
 
 # K3: install present but selector NOT executable -> not a real install; the
 # existing one-line no-match note must stay byte-identical and alone on stderr.
@@ -227,6 +238,37 @@ check "K7 explicit GCLOUD_ROBOT_HOME wins over well-known paths (source names GC
     case "$2" in "gcloud-robot probe (GCLOUD_ROBOT_HOME: "*) exit 0;; esac; exit 1
   ' _ "$(field "$OUT" ident)" "$(field "$OUT" source)"
 
+# K7b: GCLOUD_ROBOT_ACCOUNT — the documented robot-first guarantee lever — is
+# forwarded to the selector and selected (the selector probes the env account
+# first; the bridge must not scrub or starve it).
+OUT=$(run_ladder "run.jobs.run" HOME="$WK2_HOME" GCLOUD_ROBOT_ACCOUNT="guaranteed-robot@example.invalid")
+check "K7b GCLOUD_ROBOT_ACCOUNT is forwarded to the selector and wins the probe" \
+  bash -c '
+    [ "$1" = "guaranteed-robot@example.invalid" ] &&
+    grep -q "^account=guaranteed-robot@example.invalid$" "$2.env"
+  ' _ "$(field "$OUT" ident)" "$SELECTOR_MARKER"
+
+# K9: a repeat resolve in the same process (e.g. cmd_run -> cmd_build) keeps
+# the FIRST resolve's attribution even when the pin slot is now occupied.
+OUT=$(env "${SCRUB[@]}" HOME="$EMPTY_HOME" GCLOUD_ROBOT_HOME="$FAKE_HOME" \
+      SELECTOR_ACCOUNT="probe-robot@example.invalid" \
+      bash -c '
+        set -u
+        . "$1"
+        GCP_PROJECT="misc-puttering-project"
+        GCP_ACCOUNT=""
+        freshell_resolve_cloud_identity "run.jobs.run"
+        first="${FRESHELL_GCP_IDENTITY_SOURCE:-}"
+        GCP_ACCOUNT="later-pin@example.invalid"
+        freshell_resolve_cloud_identity "cloudbuild.builds.create"
+        printf "first=%s\nsecond=%s\n" "$first" "${FRESHELL_GCP_IDENTITY_SOURCE:-}"
+      ' _ "$HELPER" 2>/dev/null || true)
+check "K9 repeat resolve after a later pin keeps the first resolve's attribution" \
+  bash -c '
+    case "$1" in "gcloud-robot probe (GCLOUD_ROBOT_HOME: "*) ;; *) exit 1;; esac
+    [ "$1" = "$2" ]
+  ' _ "$(field "$OUT" first)" "$(field "$OUT" second)"
+
 # K8: source attribution for the other rungs.
 OUT=$(run_ladder "run.jobs.run" GCLOUD_IDENT="env-ident@example.invalid")
 check "K8 GCLOUD_IDENT bypass attributes to the GCLOUD_IDENT source" \
@@ -271,7 +313,7 @@ done
 
 Run: `bash scripts/test/cloud-gcp-identity.test.sh`
 
-Expected: FAIL — the K checks fail for the missing behavior: K1/K2/K2b see an empty `ident` (no discovery exists), K5/K6 miss the new note, K8/K8b see an empty `source=` (bridge never sets it). Every pre-existing A–J/W check must still PASS after the harness retrofit (nothing reads `HOME` yet, so the retrofit alone is behavior-neutral). If any pre-existing check fails after the retrofit alone, fix the retrofit first — that is a harness bug, not the intended red.
+Expected: FAIL — the K checks fail for the missing behavior: K1/K2/K2b/K2c see an empty `ident` (no discovery exists), K7b sees the selector return the scrubbed empty account instead of the forwarded `GCLOUD_ROBOT_ACCOUNT`, K5/K6 miss the new note, K8/K8b see an empty `source=` (bridge never sets it), K9 sees empty attribution on both resolves. Every pre-existing A–J/W check must still PASS after the harness retrofit (nothing reads `HOME` yet, so the retrofit alone is behavior-neutral). If any pre-existing check fails after the retrofit alone, fix the retrofit first — that is a harness bug, not the intended red.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -309,15 +351,15 @@ freshell_resolve_cloud_identity() {
   # rung 1: an existing pin (the wrapper's --account= flag or
   # FRESHELL_GCP_ACCOUNT) wins outright — skip the ladder ENTIRELY: no
   # selector, no network, no stderr note, and GCLOUD_ROBOT_REQUIRE=1 must not
-  # fail a deliberately pinned call. (kata e83z: on a repeat call after the
-  # ladder already ran and ADOPTED an identity into the pin slot, keep the
-  # first resolve's attribution instead of mislabeling adoption as a pin —
-  # GCLOUD_IDENT_RESOLVED is the ladder's own per-process guard.)
-  if [ -n "${GCLOUD_IDENT_RESOLVED:-}" ]; then
+  # fail a deliberately pinned call. A pin that appears only AFTER a first
+  # resolve in the same process is an adopted identity, not a pin: the
+  # GCLOUD_IDENT_RESOLVED guard keeps the first resolve's attribution
+  # (kata e83z; pinned by check K9).
+  if [ -n "${GCP_ACCOUNT:-}" ] && [ -z "${GCLOUD_IDENT_RESOLVED:-}" ]; then
+    FRESHELL_GCP_IDENTITY_SOURCE="pin (--account flag or FRESHELL_GCP_ACCOUNT)"
     return 0
   fi
-  if [ -n "${GCP_ACCOUNT:-}" ]; then
-    FRESHELL_GCP_IDENTITY_SOURCE="pin (--account flag or FRESHELL_GCP_ACCOUNT)"
+  if [ -n "${GCLOUD_IDENT_RESOLVED:-}" ]; then
     return 0
   fi
   export GCLOUD_ROBOT_PROJECT="${GCLOUD_ROBOT_PROJECT:-${GCP_PROJECT:?GCP_PROJECT must be set before identity resolution}}"
@@ -398,7 +440,7 @@ git commit -m "feat(cloud): discover well-known gcloud-robot installs in the ide
 - Modify: `scripts/e2e-cloud.sh` (same, `[e2e-cloud]` prefix; resolve sites 245, 308, 481, 820)
 - Test: `scripts/test/cloud-vitest-wrapper.test.sh` (new FAKE8 + checks)
 - Test: `scripts/test/cloud-build.test.sh` (marker line in the existing fake; new checks)
-- Test: `scripts/test/cloud-gcp-identity.test.sh` (new W14: e2e run-lane preflight + prompts)
+- Test: `scripts/test/cloud-gcp-identity.test.sh` (new W14: e2e run-lane preflight + prompts; EXTEND the existing W12c/W12d standalone push/logs checks with preflight-order assertions so all four resolve sites per wrapper are covered)
 
 **Interfaces:**
 - Consumes: Task 1's bridge (`FRESHELL_GCP_IDENTITY_SOURCE`, discovery), `account_flag()`, the existing fakes' `auth print-access-token` stubs.
@@ -472,10 +514,10 @@ check "identity preflight mints a token before any build/submit work" \
 
 rm -f "$FAKE8_LOG"; touch "$FAKE8_LOG"
 V8F_OUT=$(PATH="$FAKE8_DIR:$PATH" FAKE8_TOKEN_FAIL=1 bash "$SCRIPT" run --cloud --config=default --shards=2 2>&1 < /dev/null) && V8F_RC=0 || V8F_RC=$?
-check "failed preflight exits fast: no builds submit, no job create, loud error on stderr" \
+check "failed preflight exits fast: no builds submit, no job create, loud attributable error" \
   bash -c '
     [ "$1" != "0" ] &&
-    grep -q "identity preflight failed" <<<"$2" &&
+    grep -q "identity preflight failed for suite-pinned-identity@example.invalid (source: GCLOUD_IDENT (explicit env bypass))" <<<"$2" &&
     ! grep -qE "FAKE_GCLOUD:.*(builds submit|run jobs create)" "$3"
   ' _ "$V8F_RC" "$V8F_OUT" "$FAKE8_LOG"
 ```
@@ -537,11 +579,33 @@ check "W14 e2e run: every gcloud call still pinned (preflight included)" \
   accounts_all_equal "$RUNG2_IDENT"
 ```
 
+Also EXTEND the existing W12c and W12d checks so the standalone `push` and `logs` lanes prove their own preflights (omitting either call site would otherwise stay green — `push` already mints later for docker login and `logs` has no direct token assertion). Append to each check's snippet (the W-series positional-args idiom), reading `$GREEN_LOG` after the existing invocation:
+
+```bash
+# W12c (e2e standalone push) — add:
+check "W12c e2e standalone push: preflight token mint precedes all lane work" \
+  bash -c '
+    tok="$(grep -n "auth print-access-token" "$1" | head -1 | cut -d: -f1)"
+    work="$(grep -nE "GCLOUD_ARGS:.*(artifacts repositories describe|builds submit)" "$1" | head -1 | cut -d: -f1)"
+    [ -n "$tok" ] && [ -n "$work" ] && [ "$tok" -lt "$work" ]
+  ' _ "$GREEN_LOG"
+
+# W12d (e2e standalone logs) — add:
+check "W12d e2e standalone logs: preflight token mint precedes the executions list" \
+  bash -c '
+    tok="$(grep -n "auth print-access-token" "$1" | head -1 | cut -d: -f1)"
+    work="$(grep -n "GCLOUD_ARGS:.*executions list" "$1" | head -1 | cut -d: -f1)"
+    [ -n "$tok" ] && [ -n "$work" ] && [ "$tok" -lt "$work" ]
+  ' _ "$GREEN_LOG"
+```
+
+(The vitest standalone lanes W13b/W13c get the same treatment — the run/push/logs preflight contract is per resolve site in BOTH wrappers. For W13b assert the mint precedes `artifacts repositories describe`; for W13c precedes `executions list`.)
+
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
 Run: `bash scripts/test/cloud-vitest-wrapper.test.sh && bash scripts/test/cloud-build.test.sh && bash scripts/test/cloud-gcp-identity.test.sh`
 
-Expected: FAIL — every new check fails (no `PROMPTS_DISABLED` marker is ever written; no `auth print-access-token` precedes `builds submit`/`run jobs create`; the failure-mode check sees the lane proceed past identity). All pre-existing checks still pass.
+Expected: FAIL — the substantive new checks fail (no `PROMPTS_DISABLED` marker is written on non-TTY runs; no `auth print-access-token` precedes `builds submit`/`run jobs create`; the failure-mode check sees the lane proceed past identity). The two TTY-side absence checks pass VACUOUSLY before implementation (nothing writes the marker at all yet) — they become meaningful only once the marker line exists; that is expected, not a red-expectation violation. All pre-existing checks still pass.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -566,9 +630,11 @@ fi
 ```bash
 # kata e83z: cheap live-credential check at lane start — fails in seconds,
 # before any build/submit work, when the resolved identity cannot mint a token.
+# The error names the resolved identity and its source so the failure path is
+# as attributable as the success path.
 identity_preflight() {
   if ! gcloud auth print-access-token $(account_flag) >/dev/null 2>&1; then
-    echo "[vitest-cloud] ERROR: identity preflight failed - gcloud auth print-access-token could not mint a token." >&2
+    echo "[vitest-cloud] ERROR: identity preflight failed for ${GCP_ACCOUNT:-(ambient gcloud)} (source: ${FRESHELL_GCP_IDENTITY_SOURCE:-unresolved}) - gcloud auth print-access-token could not mint a token." >&2
     echo "[vitest-cloud] Fix the credential/identity (docs/development/gcloud-robot.md) and re-run the lane." >&2
     exit 1
   fi
@@ -612,7 +678,7 @@ git commit -m "feat(cloud): fail-fast identity for agent cloud lanes - TTY-gated
 
 **Interfaces:**
 - Consumes: Task 1's `FRESHELL_GCP_IDENTITY_SOURCE` (a plain shell var in the wrapper process — the bridge is sourced, not subshelled), `image_tag_for_head()`'s existing `-dirty` sentinel, Task 2's FAKE8/W14 plumbing.
-- Produces: one stdout banner line `Identity: <account-or-(ambient gcloud)> (source: <FRESHELL_GCP_IDENTITY_SOURCE>)` in each wrapper's run-lane startup banner; one stdout `WARNING: dirty worktree` line whenever the computed image tag ends `-dirty`. The existing mid-run dirty lines (vitest 451 / e2e 503) stay unchanged; both new lines print before the existing `Running on Cloud Run Jobs...` banner block's Image line so identity+dirty state lead the banner.
+- Produces: one stdout lane-start line `Identity: <account-or-(ambient gcloud)> (source: <FRESHELL_GCP_IDENTITY_SOURCE>)` and, when the computed image tag ends `-dirty`, one stdout `WARNING: dirty worktree` line — BOTH printed in `cmd_run` immediately after `identity_preflight`, BEFORE the image-lookup/rebuild decision block (so they lead the lane output and precede any possibly ~13-minute build work; the existing 5-line `Running on Cloud Run Jobs...` block keeps its position after that block). The existing mid-run dirty lines (vitest 451 / e2e 503) stay unchanged. The preflight failure path (Task 2) independently names the identity and source in its error text, so the failure path is attributable too.
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
@@ -625,6 +691,12 @@ check "run-lane startup banner reports the resolved identity and its source" \
   bash -c '
     grep -q "\[vitest-cloud\] Identity: suite-pinned-identity@example.invalid (source: GCLOUD_IDENT (explicit env bypass))" <<<"$1"
   ' _ "$V9_OUT"
+check "identity line leads the lane output (before the Running-on-Cloud-Run banner)" \
+  bash -c '
+    ident="$(grep -n "\[vitest-cloud\] Identity:" <<<"$1" | head -1 | cut -d: -f1)"
+    banner="$(grep -n "Running on Cloud Run Jobs" <<<"$1" | head -1 | cut -d: -f1)"
+    [ -n "$ident" ] && [ -n "$banner" ] && [ "$ident" -lt "$banner" ]
+  ' _ "$V9_OUT"
 
 V10_DIRTY="$ROOT/.vitest-cloud-dirty-check-$$"
 touch "$V10_DIRTY"
@@ -636,9 +708,15 @@ check "loud stdout WARNING when the -dirty image path is taken" \
     grep -q "WARNING: dirty worktree" <<<"$1" &&
     grep -q "not content-addressed" <<<"$1"
   ' _ "$V10_OUT"
+check "dirty WARNING leads the lane output (surfaced BEFORE any rebuild work)" \
+  bash -c '
+    warn="$(grep -n "WARNING: dirty worktree" <<<"$1" | head -1 | cut -d: -f1)"
+    banner="$(grep -n "Running on Cloud Run Jobs" <<<"$1" | head -1 | cut -d: -f1)"
+    [ -n "$warn" ] && [ -n "$banner" ] && [ "$warn" -lt "$banner" ]
+  ' _ "$V10_OUT"
 ```
 
-(The dirty check creates a temporary untracked file so the WARNING is guaranteed regardless of the checkout's ambient state, and removes it immediately after the run. Suite-level invocation via `run8` keeps all fixtures in scope. The FAKE8 `builds submit` stub absorbs the dirty-rebuild branch.)
+(The dirty check creates a temporary untracked file so the WARNING is guaranteed regardless of the checkout's ambient state, and removes it immediately after the run. Suite-level invocation via `run8` keeps all fixtures in scope. The FAKE8 `builds submit` stub absorbs the dirty-rebuild branch. The ordering checks pin the placement requirement: the identity and dirty lines print BEFORE the build-decision block can spend ~13 minutes in `cmd_build` — a grep-only assertion would pass with the lines printed anywhere, including after the rebuild.)
 
 In `scripts/test/cloud-gcp-identity.test.sh`, after W14 (same invocation idiom):
 
@@ -652,6 +730,12 @@ W15_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" HOME="$EMPTY_HOME" \
 check "W15 e2e banner: pinned identity + GCLOUD_IDENT source on stdout" \
   bash -c '
     grep -q "\[e2e-cloud\] Identity: rung2-bypass@example.invalid (source: GCLOUD_IDENT (explicit env bypass))" <<<"$2"
+  ' _ "$W15_RC" "$W15_OUT"
+check "W15 e2e banner: identity line precedes the Running-on-Cloud-Run block" \
+  bash -c '
+    ident="$(grep -n "\[e2e-cloud\] Identity:" <<<"$2" | head -1 | cut -d: -f1)"
+    banner="$(grep -n "Running on Cloud Run Jobs" <<<"$2" | head -1 | cut -d: -f1)"
+    [ -n "$ident" ] && [ -n "$banner" ] && [ "$ident" -lt "$banner" ]
   ' _ "$W15_RC" "$W15_OUT"
 
 reset_green
@@ -672,10 +756,13 @@ touch "$W15C_DIRTY"
 W15C_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" HOME="$EMPTY_HOME" \
   "$WRAPPER_E2E" run --cloud --shards=1 2>"$W15C_ERR" < /dev/null) && W15C_RC=0 || W15C_RC=$?
 rm -f "$W15C_DIRTY"
-check "W15c e2e dirty tree: loud WARNING banner line on stdout" \
+check "W15c e2e dirty tree: loud WARNING banner line on stdout, before the rebuild" \
   bash -c '
     grep -q "\[e2e-cloud\] WARNING: dirty worktree" <<<"$2" &&
-    grep -q "not content-addressed" <<<"$2"
+    grep -q "not content-addressed" <<<"$2" &&
+    warn="$(grep -n "WARNING: dirty worktree" <<<"$2" | head -1 | cut -d: -f1)"
+    banner="$(grep -n "Running on Cloud Run Jobs" <<<"$2" | head -1 | cut -d: -f1)"
+    [ -n "$warn" ] && [ -n "$banner" ] && [ "$warn" -lt "$banner" ]
   ' _ "$W15C_RC" "$W15C_OUT"
 ```
 
@@ -687,7 +774,7 @@ Expected: FAIL — no `Identity:` banner line and no `WARNING: dirty worktree` l
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-In `cmd_run` of BOTH wrappers, immediately BEFORE the existing `Running on Cloud Run Jobs...` banner echo block (vitest ~466, e2e ~520 — locate the banner, not stale numbers):
+In `cmd_run` of BOTH wrappers, immediately AFTER the `identity_preflight` call and the tag recompute, and BEFORE the image-lookup/rebuild decision block (vitest: before the `gcloud artifacts docker images describe` at ~460; e2e: before the `describe`/dirty/missing chain at ~509 — locate the resolve+preflight and the decision block, not stale numbers). This placement is load-bearing: the build decision can run a ~13-minute `cmd_build` before the existing `Running on Cloud Run Jobs...` block, and the identity/dirty lines must lead the lane output, not trail the build:
 
 ```bash
 if [[ "$image_tag" == *-dirty ]]; then
@@ -696,7 +783,7 @@ fi
 echo "[vitest-cloud] Identity: ${GCP_ACCOUNT:-(ambient gcloud)} (source: ${FRESHELL_GCP_IDENTITY_SOURCE:-unresolved})"
 ```
 
-(e2e identical modulo `[e2e-cloud]`.) Both lines go to stdout; the existing mid-run dirty lines (451/503) are untouched.
+(e2e identical modulo `[e2e-cloud]`.) Both lines go to stdout; the existing mid-run dirty lines (451/503) and the existing banner block are untouched — the existing block keeps printing Image/Shards/Timeout/Configs/Args after the build decision exactly as today.
 
 - [ ] **Step 4: Run the focused test**
 
@@ -763,10 +850,10 @@ Expected: FAIL — W10b/W10c strings absent; all other checks pass.
 1. `AGENTS.md` — add one bullet to the Test Coordination list, after the base-gate bullet:
 
 ```markdown
-- Agent-launched broad gates should export `GCLOUD_ROBOT_REQUIRE=1` (the recommended default): fail closed when no robot identity resolves, instead of silently running as a possibly-stale human identity. Machines with a standard gcloud-robot install don't need `GCLOUD_ROBOT_HOME` exported — the lanes probe the well-known install locations (`~/.codex/skills/gcloud-robot`, `~/.claude/skills/gcloud-robot`, `~/code/skill-gcloud-robot/gcloud-robot`) when it's unset, and non-TTY (agent) invocations disable gcloud prompts and preflight the credential so a dead identity fails in seconds instead of hanging. For agent lanes that run under a real PTY (Freshell terminal panes), where prompts are deliberately NOT disabled, also export `GCLOUD_ROBOT_ACCOUNT=<robot>` — the selector probes that account first, so it never mints the (possibly stale) ambient human credential.
+- Agent-launched broad gates should export `GCLOUD_ROBOT_REQUIRE=1` (the recommended default): fail closed when no robot identity resolves, instead of silently running as a possibly-stale human identity. Machines with a standard gcloud-robot install don't need `GCLOUD_ROBOT_HOME` exported — the lanes probe the well-known install locations (`~/.codex/skills/gcloud-robot`, `~/.claude/skills/gcloud-robot`, `~/code/skill-gcloud-robot/gcloud-robot`) when it's unset, and non-TTY (agent) invocations disable gcloud prompts and preflight the credential so a dead identity fails in seconds instead of hanging. To guarantee the robot identity itself — rather than the selector's first passing candidate — export `GCLOUD_ROBOT_ACCOUNT=<robot>`: the selector probes that account first, so no other identity (including an ambient human with lane permissions) can win; for PTY-launched agent lanes (Freshell terminal panes, where prompts are deliberately NOT disabled) this also prevents the selector from ever minting the ambient human credential.
 ```
 
-(The last sentence documents this change's own PTY residual and its no-hang lever — required for honest documentation, live-verified mechanism: the selector probes the env-pinned account first.)
+(The last sentence documents both the robot-first guarantee lever and this change's own PTY residual — required for honest documentation; the mechanism is live-verified: the selector probes the env-pinned account first. Without it, the selector's documented candidate policy can legitimately pick a LIVE human that holds lane permissions over the robot — a state the lanes' runbook records as the selector's intended behavior, but not what "robot by default" means. `GCLOUD_ROBOT_REQUIRE=1` does NOT close that gap; only `GCLOUD_ROBOT_ACCOUNT` does.)
 
 2. `AGENTS.md` — update BOTH Identity paragraphs identically: replace `gcloud-robot probe (needs `GCLOUD_ROBOT_HOME`, the installed gcloud-robot skill directory)` with `gcloud-robot probe (via `GCLOUD_ROBOT_HOME`, or the first well-known gcloud-robot skill install: `~/.codex/skills/gcloud-robot`, `~/.claude/skills/gcloud-robot`, `~/code/skill-gcloud-robot/gcloud-robot`)`. The two paragraphs stay byte-identical to each other.
 
@@ -847,7 +934,7 @@ Assert: stdout contains `[vitest-cloud] Identity: gcloud-robot@misc-puttering-pr
 
 - Live-incident evidence for this kata ran during this run's workspace stage: another agent's base-gate `gcloud builds submit` parked 3h05m on gcloud's interactive reauth prompt (Freshell PTY, ambient human credential in the reauth-required state, `GCLOUD_ROBOT_HOME` never set in the agent environment) — the exact failure mode Task 1 + Task 2 remove for non-TTY invocations, and Task 1 removes for standard-install machines. The load-bearing stage reproduced the prompt class live (timeout-bounded) and confirmed: non-TTY mint of a reauth-required credential fails in ~1s with the documented error string; TTY mint blocks on the interactive prompt.
 - Residual, stated honestly (live-verified, not hypothetical): an agent lane launched under a real PTY (a Freshell terminal pane) with a reauth-required human credential WILL block indefinitely on gcloud's interactive reauth prompt (`Reauthentication required.` / `Please enter your password:`) — prompts are disabled only on non-TTY stdin by design (humans keep interactive reauth). Post-change, discovery moves that blockage EARLIER (inside the resolve, before any banner output) and QUIETER (the selector's stderr and the preflight's output are both redirected): the selector probes `gcloud config get-value account` (the human) before the robot. The documented no-hang lever for PTY agent lanes is pinning `GCLOUD_ROBOT_ACCOUNT` (the selector probes the env-pinned account first and never mints the human) or `GCLOUD_IDENT` — the AGENTS.md bullet and the runbook troubleshooting entry added by Task 4 say so. The malformed-token ("plain invalid_grant") subclass never prompts at all — live-proven in both TTY and non-TTY legs.
-- Human-first candidate order (out of scope, stated for reviewers): if a LIVE human credential holds the lane's probe permission, the selector legitimately selects the human over the robot (candidate order: `GCLOUD_ROBOT_ACCOUNT` > config account > auth list — the skill's own policy). Discovery makes the robot reachable and the banner reports what actually got picked; guaranteeing robot-first would require `GCLOUD_ROBOT_ACCOUNT`, which is the operator's lever, not this change's. State this plainly in the PR description.
+- Human-first candidate order (documented, with its guarantee lever): if a LIVE human credential holds the lane's probe permission, the selector legitimately selects the human over the robot (candidate order: `GCLOUD_ROBOT_ACCOUNT` > config account > auth list — the skill's own policy; on the target project today the human lacks lane permissions per the operator's own bashrc note, and the live human credential is reauth-dead, so the robot wins in every observed configuration). `GCLOUD_ROBOT_REQUIRE=1` does not close this gap; `GCLOUD_ROBOT_ACCOUNT=<robot>` is the only lever that guarantees robot-first, and Task 4's AGENTS.md bullet documents it as such. Discovery makes the robot reachable and the banner reports what actually got picked; state the residual plainly in the PR description.
 - Broker interplay (garageserver): the OneCLI gateway brokers control-plane hosts only; `oauth2.googleapis.com` (the preflight's mint) is deliberately unbrokered. Today the robot key is live locally and discovery routes agent lanes to it, so no false-fail; a machine with NO usable local identity that previously sailed through brokered hosts now fails fast at the preflight instead (arguably correct — the identity really is broken). Task 4's runbook broker note documents this.
 - The kata's target population is exactly the non-bashrc shells (agent harnesses, server-spawned panes): every bashrc-sourcing shell already gets `GCLOUD_IDENT` pinned pre-guard and never reaches discovery. Say so in the PR description.
 - The skill's canonical SKILL.md (`~/code/skill-gcloud-robot`) says `GCLOUD_ROBOT_HOME` is the only sanctioned resolution; this change knowingly diverges per the user's kata (the skill's own override rule sanctions it). The Freshell-side header rewrite records the divergence; the skill repo itself is out of scope — mention it in the PR description.
