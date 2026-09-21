@@ -6,6 +6,7 @@ import {
   REPO_ROOT,
   createNamedAgent,
   expectSharedName,
+  paneContentFromLayoutSnapshot,
   renameThroughCanonicalApi,
   renameThroughTabEdit,
   sendFirstMessage,
@@ -53,25 +54,43 @@ test.describe('cross-mode unified agent names', () => {
       expect(bRecord.name).not.toBe('Source session name')
 
       // Swap payloads: the source follows A's NEW pane id (the content swap
-      // moved the session), so the tab still shows A's name.
+      // moved the session), so the tab still shows A's name. The swap body's
+      // key is `target` (pane_ops.rs swap_pane also accepts `otherId` — an
+      // earlier draft sent `targetPaneId`, which the endpoint ignores: the
+      // swap was silently REFUSED with `data: null` forever, and the old
+      // `if (swap.ok)` guard kept the sub-assert green with nothing swapped
+      // (the review's M-4, proven live by the pinned shape below).
       const swap = await fetch(`${journey.server.info.baseUrl}/api/panes/${encodeURIComponent(a.paneId)}/swap`, {
         method: 'POST',
         headers: { 'x-auth-token': journey.server.info.token, 'content-type': 'application/json' },
-        body: JSON.stringify({ targetPaneId: b.paneId }),
+        body: JSON.stringify({ target: b.paneId }),
       })
-      if (swap.ok) {
-        await expect(
-          page.locator(`[data-context="tab"][data-tab-id="${a.tabId}"]`),
-        ).toContainText('Source session name', { timeout: 15_000 })
-      }
+      const swapText = await swap.text()
+      expect(swap.ok, swapText).toBe(true)
+      const swapBody = JSON.parse(swapText) as { data?: { tabId?: string } }
+      // The swap endpoint answers HTTP 200 for BOTH outcomes — a REFUSED
+      // store swap carries only `data.message`, the success arm carries
+      // `data.tabId` (pane_ops.rs swap_pane). Pin the success shape: an
+      // `if (swap.ok)` guard alone keeps this sub-assert green even when
+      // nothing swapped (a regression to always-refuse would stay green).
+      expect(swapBody.data?.tabId, `swap refused: ${JSON.stringify(swapBody)}`).toBe(a.tabId)
+      await expect(
+        page.locator(`[data-context="tab"][data-tab-id="${a.tabId}"]`),
+      ).toContainText('Source session name', { timeout: 15_000 })
 
-      // Close A's pane: the deterministic next scoped source (B) takes the
-      // tab; the tab rename now targets B's session. The client's source
-      // remap lands with the server-broadcast close fold — wait for it
-      // (the tab editor captures whatever source is current, and a rename
-      // fired at the stale closed source is a silent no-op).
-      const state = await harness.getState()
-      const closeTarget = findPaneIdOfSession(state, a.tabId, resolveSessionIdOf(state, a.nameRef)) ?? a.paneId
+      // Close A's pane — the pane that CURRENTLY holds A's session. After
+      // the pinned swap that is B's ORIGINAL pane id (the contents
+      // exchanged): poll until the client layout agrees, then close exactly
+      // that pane. NEVER fall back to A's own pane id — post-swap it holds
+      // B's session, and closing it would leave A as the source and
+      // silently retarget the rename (observed live once the swap began
+      // actually executing; the old `?? a.paneId` fallback dates from the
+      // always-refused-swap era, when A's pane id always still held A).
+      await expect.poll(async () => {
+        const state = await harness.getState()
+        return findPaneIdOfSession(state, a.tabId, resolveSessionIdOf(state, a.nameRef))
+      }, { timeout: 10_000, intervals: [250, 500, 1_000] }).toBe(b.paneId)
+      const closeTarget = b.paneId
       const closeRes = await postJsonRetry429(`${journey.server.info.baseUrl}/api/panes/${encodeURIComponent(closeTarget)}/close`, {}, journey.server.info.token)
       expect(closeRes.ok, await closeRes.text()).toBe(true)
       await expect.poll(async () => {
@@ -210,13 +229,16 @@ test.describe('cross-mode unified agent names', () => {
   test('shell browser editor document and excluded provider naming stay unchanged', async ({ browser }) => {
     // The excluded-providers + non-agent non-regression case: a shell pane's
     // OSC program title and its process-exit suffix, a browser pane's
-    // URL-derived title, and an editor pane's file-derived title keep their
-    // existing naming; the excluded kilroy runtime keeps its own naming
-    // behavior and is never admitted to the unified store or generator.
+    // URL-derived title, an editor pane's file-derived title, and an
+    // EXCLUDED coding-provider terminal pane (gemini, the existing
+    // fake-gemini.mjs fixture) keep their existing naming; the excluded
+    // kilroy runtime keeps its own naming behavior and is never admitted
+    // to the unified store or the generator.
     const journey = await bootJourney('freshclaude', {
       env: {
         FRESHELL_FAKE_PROVIDER: 'kilroy',
         KILROY_ENABLED: '1',
+        GEMINI_CMD: path.join(REPO_ROOT, 'test', 'e2e-browser', 'fixtures', 'providers', 'fake-gemini.mjs'),
       },
     })
     try {
@@ -232,17 +254,31 @@ test.describe('cross-mode unified agent names', () => {
         page.locator(`[data-context="tab"][data-tab-id="${shellTabId}"]`),
       ).toContainText('Shell OSC title', { timeout: 15_000 })
       // (2) The exit suffix: a shell exit appends " (exit N)" to the tab
-      // title — the legacy process-exit presentation. Follow-up finding
-      // (task-008 report): the suffix's `updateTab` fold does not land in
-      // the current client (the tab record stays status 'running' with the
-      // OSC-only title) — the first-ever e2e coverage of this legacy
-      // annotation; kept OUT of this spec's assertions until that
-      // presentation bug is fixed on its own track.
+      // title — the legacy process-exit presentation (the terminal.exited
+      // fold in TerminalView; terminal-title-policy.ts gates it to shells).
+      // REGISTERED FOLLOW-UP T8-F1 (pre-existing at the branch base
+      // 6ee5cf4b, outside this branch's scope — the branch left the
+      // exit-suffix code untouched): that `updateTab` fold does not land
+      // in the current client, so the "(exit N)" suffix never renders (the
+      // first-ever e2e pass over this legacy annotation found the defect).
+      // This case therefore asserts what IS true at the base contract and
+      // what the unified change must preserve: the shell observably exits
+      // (the server's terminal directory records status 'exited') and the
+      // nonagent tab keeps its OSC-derived title — no session-name
+      // adoption, no reset. The suffix rendering itself is T8-F1's own
+      // fix; this `toContainText` stays true when it lands ("Shell OSC
+      // title (exit 0)" still contains the OSC title).
       await page.keyboard.type('exit', { delay: 5 })
       await page.keyboard.press('Enter')
+      await expect.poll(async () => {
+        const terms = await (await fetch(`${journey.server.info.baseUrl}/api/terminals`, {
+          headers: { 'x-auth-token': journey.server.info.token },
+        })).json() as Array<{ mode?: string; status?: string }>
+        return terms.find((term) => term.mode === 'shell')?.status ?? ''
+      }, { timeout: 10_000, intervals: [250, 500, 1_000] }).toBe('exited')
       await expect(
-        page.locator('[data-pane-id] .xterm-helpers', { hasText: '' }).first(),
-      ).toBeAttached({ timeout: 5_000 }).catch(() => {})
+        page.locator(`[data-context="tab"][data-tab-id="${shellTabId}"]`),
+      ).toContainText('Shell OSC title', { timeout: 10_000 })
 
       // (3) A browser pane keeps its URL-derived title (the non-agent
       // derivation); an editor pane its file-derived title.
@@ -259,9 +295,57 @@ test.describe('cross-mode unified agent names', () => {
         body: JSON.stringify({ editor: path.join(journey.server.root, 'notes.md') }),
       })
       expect(editorPane.ok).toBe(true)
+
+      // (3b) An EXCLUDED coding-provider terminal pane (gemini via the
+      // existing fake-gemini.mjs fixture): its naming stays on the LEGACY
+      // non-agent derivations (never a unified session name — the tab's
+      // nameSource stays legacy and its rendered title stays one of the
+      // legacy derivations), and the unified create-sender lane never
+      // admits it: the server-side pane content carries NO naming handle
+      // and NO nameRef.
+      const geminiDir = path.join(journey.server.root, 'gemini-proj')
+      await fs.mkdir(geminiDir, { recursive: true })
+      const geminiPane = await fetch(`${journey.server.info.baseUrl}/api/tabs`, {
+        method: 'POST',
+        headers: { 'x-auth-token': journey.server.info.token, 'content-type': 'application/json' },
+        body: JSON.stringify({ mode: 'gemini', cwd: geminiDir }),
+      })
+      const geminiText = await geminiPane.text()
+      expect(geminiPane.ok, geminiText).toBe(true)
+      const geminiData = (JSON.parse(geminiText) as { data: { tabId: string; paneId: string } }).data
       // The REST-created tabs fold client-side via broadcast — settle the
       // count BEFORE the next UI create (its tab-add wait is count-based).
-      await harness.waitForTabCount(3, 15_000)
+      await harness.waitForTabCount(4, 15_000)
+      const geminiContent = await paneContentFromLayoutSnapshot(journey.server, geminiData.tabId, geminiData.paneId)
+      // The tab keeps a LEGACY title — never a unified session name. The
+      // pre-existing legacy derivations DISAGREE for excluded coding
+      // providers: the client's derivePaneTitle prefers the cwd basename
+      // ('gemini-proj'), while the server's seed_pane_title stores the
+      // provider label ('Gemini'), and once a machine-snapshot restore fold
+      // imports the stored paneTitles the single-pane override (tab-title.ts)
+      // flips the rendered tab to the stored label. Both are pre-branch
+      // behaviors (registered in the review-fix report as an observed
+      // pre-existing divergence; the sync's timing is nondeterministic), and
+      // NEITHER is a session name — the pane carries no naming identity at
+      // all (pinned below), so no session name exists to adopt. The
+      // deterministic naming-surface pin is the tab's nameSource: legacy.
+      await expect.poll(async () => {
+        const state = await harness.getState() as Record<string, any>
+        const tab = (state?.tabs?.tabs ?? []).find((t: any) => t.id === geminiData.tabId)
+        return tab?.nameSource?.kind ?? ''
+      }, { timeout: 10_000, intervals: [250, 500, 1_000] }).toBe('legacy')
+      await expect(
+        page.locator(`[data-context="tab"][data-tab-id="${geminiData.tabId}"]`),
+      ).toContainText(/gemini-proj|Gemini/, { timeout: 15_000 })
+      expect(geminiContent, 'the gemini pane content resolves in the layout snapshot').not.toBeNull()
+      expect(
+        geminiContent?.namingHandle,
+        'an excluded provider pane never carries a unified naming handle',
+      ).toBeUndefined()
+      expect(
+        geminiContent?.nameRef,
+        'an excluded provider pane never carries a unified nameRef',
+      ).toBeUndefined()
 
       // (4) The excluded kilroy runtime: kilroy panes keep their existing
       // naming behavior and never enter the unified store (no session-names

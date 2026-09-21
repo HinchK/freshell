@@ -701,11 +701,15 @@ async function createThroughUi(options: CreateNamedAgentOptions, fixture: ModeFi
  * snapshot — the REST/CLI/MCP create answers tab/pane ids, and the
  * server-side paneContent carries the authoritative `nameRef` (or the
  * pre-durable `namingHandle`). */
-async function nameRefFromLayoutSnapshot(
+/** The pane's full content object from the server's layout snapshot, or
+ * null when the pane is absent — the server-authoritative view of what the
+ * pane carries (the naming identity, the createRequestId — everything the
+ * real client's pane mount reads). */
+export async function paneContentFromLayoutSnapshot(
   server: UnifiedNamesServer,
   tabId: string,
   paneId: string,
-): Promise<SessionNameRef> {
+): Promise<Record<string, unknown> | null> {
   const response = await fetch(`${server.info.baseUrl}/api/layout/snapshot?tabId=${encodeURIComponent(tabId)}`, {
     headers: { 'x-auth-token': server.info.token },
   })
@@ -727,13 +731,23 @@ async function nameRefFromLayoutSnapshot(
   }
   for (const layout of Object.values(payload.data?.layouts ?? {})) {
     const content = findContent(layout)
-    if (content) {
-      if (content.nameRef && typeof content.nameRef === 'object') {
-        return content.nameRef as SessionNameRef
-      }
-      if (typeof content.namingHandle === 'string') {
-        return { kind: 'pending', id: content.namingHandle }
-      }
+    if (content) return content
+  }
+  return null
+}
+
+async function nameRefFromLayoutSnapshot(
+  server: UnifiedNamesServer,
+  tabId: string,
+  paneId: string,
+): Promise<SessionNameRef> {
+  const content = await paneContentFromLayoutSnapshot(server, tabId, paneId)
+  if (content) {
+    if (content.nameRef && typeof content.nameRef === 'object') {
+      return content.nameRef as SessionNameRef
+    }
+    if (typeof content.namingHandle === 'string') {
+      return { kind: 'pending', id: content.namingHandle }
     }
   }
   throw new Error(`the layout snapshot carries no naming identity for pane ${paneId}`)

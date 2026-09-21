@@ -162,9 +162,24 @@ export function findPaneIdOfSession(state: unknown, tabId: string, sessionId: st
 
 export function resolveSessionIdOf(state: unknown, ref: SessionNameRef): string | null {
   if (ref.kind === 'session') return ref.sessionId
-  const redirects = (state as { sessionNames?: { redirects?: Record<string, { to: SessionNameRef }> } })?.sessionNames?.redirects
-  const redirect = redirects?.[JSON.stringify(ref.kind === 'pending' ? ['pending', ref.id] : ['session', ref.provider, ref.sessionId])]
-  return redirect?.to?.kind === 'session' ? redirect.to.sessionId : null
+  // The client store's redirect shape is `{ toKey, revision }` where `toKey`
+  // is the canonical JSON-stringified `['session', provider, sessionId]` key
+  // (sessionNamesSlice.ts's `sessionNameRefKey(redirect.to)`). An earlier
+  // draft read a phantom `redirect.to.{kind,sessionId}` field that never
+  // exists in the store, so this ALWAYS returned null — masked for as long
+  // as the cross-mode close step fell back to the pane id it already had
+  // (the swap was silently refused, pre-M-4), and exposed the moment the
+  // pinned swap made the contents genuinely exchange.
+  const redirects = (state as { sessionNames?: { redirects?: Record<string, { toKey?: string }> } })?.sessionNames?.redirects
+  const entry = redirects?.[JSON.stringify(ref.kind === 'pending' ? ['pending', ref.id] : ['session', ref.provider, ref.sessionId])]
+  const toKey = entry?.toKey
+  if (typeof toKey !== 'string') return null
+  try {
+    const to = JSON.parse(toKey) as [string, string, string]
+    return to[0] === 'session' && typeof to[2] === 'string' ? to[2] : null
+  } catch {
+    return null
+  }
 }
 
 export function collectFreshAgentSessionIds(state: unknown): string[] {
