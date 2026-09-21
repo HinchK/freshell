@@ -294,6 +294,7 @@ async fn build_recorded_watch(
         crate::codex::QuietDeadman::new_shared(),
         Arc::new(AtomicBool::new(false)),
         Arc::new(std::sync::Mutex::new(None)),
+        Arc::new(std::sync::Mutex::new(None)),
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         None,
     );
@@ -351,6 +352,7 @@ async fn unrequested_exit_arm_removes_the_record() {
         Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
         crate::codex::QuietDeadman::new_shared(),
         Arc::new(AtomicBool::new(false)),
+        Arc::new(std::sync::Mutex::new(None)),
         Arc::new(std::sync::Mutex::new(None)),
         Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         None,
