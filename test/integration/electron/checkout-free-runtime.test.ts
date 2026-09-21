@@ -66,11 +66,11 @@ async function scanRuntimeLayout(root: string): Promise<{ links: string[]; lockF
         links.push(relative)
         continue
       }
+      if (entry.name === '.pnpm') {
+        pnpmState.push(relative)
+        continue
+      }
       if (stats.isDirectory()) {
-        if (entry.name === '.pnpm') {
-          pnpmState.push(relative)
-          continue
-        }
         await walk(absolute, relative)
         continue
       }
@@ -371,9 +371,10 @@ describe('checkout-free Electron runtime acceptance', () => {
 
       const probeScript = `
         const { createRequire } = await import('node:module')
+        const { pathToFileURL } = await import('node:url')
         const req = createRequire(${JSON.stringify(path.join(runtime, 'claude-sidecar', 'package.json'))})
         const entry = req.resolve('@anthropic-ai/claude-agent-sdk')
-        const sdk = await import('file://' + entry)
+        const sdk = await import(pathToFileURL(entry).href)
         if (typeof sdk.query !== 'function') {
           throw new Error('real Claude SDK did not expose query()')
         }
