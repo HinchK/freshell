@@ -64,6 +64,17 @@ Fix KataTracker item e83z "Cloud lanes: make the gcloud-robot identity the obvio
 
 In `scripts/test/cloud-gcp-identity.test.sh`:
 
+**Pre-step 0 — repair the pre-existing red in `cloud-exec-id-parse.test.sh` (harness drift, its own commit, BEFORE the red run):** the e2e wrapper's unconditional structured-receipts reconciliation (introduced by commits c09e1fa67/e1b23bc37, after this suite's fake was last touched) calls `gcloud logging read`, which the suite's fake gcloud never stubs — `e2e-cloud-structured-receipts.mjs` then throws on empty input and three e2e-side checks ("exits 0 on green run", "reports truthfully (succeeded=1)", "describe targets clean execution id") are red at the base commit on any machine (verified directly in this worktree, 2026-09-21), and the identity suite's W7 nested leg inherits the failure. Add the missing stub branch to that suite's fake gcloud (shape mirrors its existing branches; the payload matches what `e2e-cloud-structured-receipts.mjs` parses):
+
+```bash
+  if [[ "$*" == *"logging read"* ]]; then
+    printf '[{"jsonPayload":{"event":"e2e_playwright_task_complete","execution":"test-exec-123","taskIndex":0,"taskCount":1,"recoveredRetryCount":0}}]\n'
+    exit 0
+  fi
+```
+
+Verify: `bash scripts/test/cloud-exec-id-parse.test.sh` goes from 3 failed checks to all-PASS (the first cold cargo/playwright warm-up in a fresh worktree is slow — W7's nested `cloud-run-wrapper.test.sh` does a real release cargo build; expect one slow first run, fast after). Commit separately: `test: repair cloud-exec-id-parse fake gcloud logging read stub (pre-existing red, harness drift)`. This is a test-harness repair, not a behavior change and not test-weakening: it restores the suite's intended green shape against the wrapper's existing receipts contract.
+
 **Harness retrofit** (test scaffolding; it must keep every existing check green — verified in Step 2):
 
 1. After the `FAKE_HOME` selector setup (after line 53), add the controlled-home fixtures:
@@ -94,7 +105,16 @@ mk_marker_robot_install() {
 }
 ```
 
-2. In `run_ladder` (lines 80–95): add the default `HOME` into the `env` prefix BEFORE the forwarded `"$@"` (later `env` assignments win — verified), and add the `source=` transcript line inside the inner `bash -c`:
+2. In `run_ladder` (lines 80–95): add the default `HOME` into the `env` prefix BEFORE the forwarded `"$@"` (later `env` assignments win — verified), and add the `source=` transcript line inside the inner `bash -c`. Extend the `SCRUB` list with the three new bridge variables so a host environment can never skew a check (the suite's own SCRUB philosophy; load-bearing for the bridge's new early-return and attribution paths):
+
+```bash
+SCRUB=(-u GCLOUD_IDENT -u GCLOUD_ROBOT_HOME -u GCLOUD_ROBOT_REQUIRE
+       -u GCLOUD_ROBOT_PROJECT -u GCLOUD_ROBOT_PROBE_PERMISSION
+       -u FRESHELL_GCP_ACCOUNT -u CLOUDSDK_CORE_ACCOUNT -u CLOUDSDK_CORE_PROJECT
+       -u SELECTOR_ACCOUNT -u SELECTOR_FAIL
+       -u GCLOUD_IDENT_RESOLVED -u FRESHELL_GCP_IDENTITY_SOURCE
+       -u FRESHELL_ROBOT_HOME_DISCOVERED)
+```
 
 ```bash
 run_ladder() {
@@ -116,7 +136,7 @@ run_ladder() {
 }
 ```
 
-3. Add `HOME="$EMPTY_HOME"` to every W-series wrapper invocation (W1–W8, W12, W13 — the `env "${SCRUB[@]}" ... "$WRAPPER_E2E"/"$WRAPPER_VITEST" ...` lines) **except W9** (the `run --local` check at lines 440–443 runs real `npx vitest`, which needs the real npm cache under the real `HOME`; the local lane never calls the bridge, so the real `HOME` is safe there). W5, W6b, W8, and any invocation that leaves `GCLOUD_IDENT`/`GCLOUD_ROBOT_HOME`/pins unset NEED it; the pinned/probed ones get it for uniformity. (The checks pass `GCLOUD_ROBOT_HOME="$FAKE_HOME"` explicitly in most cases; those are unaffected by HOME but keep the addition for consistency.)
+3. Add `HOME="$EMPTY_HOME"` to every W-series wrapper invocation AND the W9 invocation (uniform). The earlier draft's W9 carve-out was falsified live: `npx vitest` resolves from repo-local `node_modules` and needs nothing from the real `HOME` (cloud-vitest-wrapper's real local legs are green under a hostile empty `HOME` — live-proven 2026-09-21), so W9 joins the uniform retrofit (it still requires the repo's `node_modules` to be installed — `npm ci` in the worktree, standard). Post-change, W5/W6b/W8/W9 and every invocation that leaves `GCLOUD_IDENT`/`GCLOUD_ROBOT_HOME`/pins unset NEED the controlled `HOME`; the pinned/probed ones get it for uniformity.
 
 **New checks** (append after check J, following the suite's real idiom — invocations at suite level, `check` greps via positional args):
 
@@ -222,16 +242,21 @@ check "K8b pin attributes to the pin source" \
 Also extend the W7 trap (after the existing W7 loop, lines 386–395) with a hostile-`HOME` variant:
 
 ```bash
-# --- W7b: the four pre-existing stubbed suites are probe-proof against
+# --- W7b: the pre-existing stubbed suites are probe-proof against
 # well-known-path discovery too (trap 11): each pins GCLOUD_IDENT internally,
 # and the bridge must never even discover when GCLOUD_IDENT is set — so a
 # hostile HOME full of marker-writing failing installs must stay untouched.
+# cloud-run-wrapper is deliberately NOT in this loop: its real cargo +
+# Playwright local legs need ~/.rustup and ~/.cache/ms-playwright, so it dies
+# at check 4 under a hostile HOME — BEFORE any bridge-relevant invocation —
+# making a marker-only assertion here vacuous. It stays covered by W7
+# (hostile GCLOUD_ROBOT_HOME under real HOME, green at base — verified
+# 2026-09-21) plus its top-of-file GCLOUD_IDENT pin.
 HOSTILE_HOME="$TDIR/home-w7b"; mkdir -p "$HOSTILE_HOME"
 mk_marker_robot_install "$HOSTILE_HOME" ".codex/skills/gcloud-robot"
 for nested in scripts/test/cloud-build.test.sh \
               scripts/test/cloud-exec-id-parse.test.sh \
-              scripts/test/cloud-vitest-wrapper.test.sh \
-              scripts/test/cloud-run-wrapper.test.sh; do
+              scripts/test/cloud-vitest-wrapper.test.sh; do
   rm -f "$SELECTOR_MARKER"
   env "${SCRUB[@]}" HOME="$HOSTILE_HOME" SELECTOR_FAIL=1 \
     bash "$nested" >"$TDIR/nested-w7b.log" 2>&1 && NESTED_RC=0 || NESTED_RC=$?
@@ -239,6 +264,8 @@ for nested in scripts/test/cloud-build.test.sh \
     bash -c '[ "$1" = "0" ] && [ ! -e "$2" ]' _ "$NESTED_RC" "$SELECTOR_MARKER"
 done
 ```
+
+(Live-proven 2026-09-21: all three of these suites are green under a hostile empty/marker `HOME` — cloud-build and cloud-vitest-wrapper directly, cloud-exec-id-parse after the Pre-step 0 repair. cloud-run-wrapper is red under hostile HOME at check 4 for toolchain reasons — see the loop comment.)
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
@@ -523,9 +550,12 @@ In BOTH wrappers (identical modulo prefix):
 1. Immediately after the defaults block (after the `IMAGE_*` defaults, near the `SCRIPT_DIR`/`ROOT` setup, before any subcommand dispatch):
 
 ```bash
-# kata e83z: agents (non-TTY stdin: bash -c, tool harnesses, CI) must get a
-# fail-fast gcloud error instead of a silent interactive reauth hang; humans
-# at a real terminal keep interactive reauth.
+# kata e83z: non-TTY stdin is the agent case (bash -c, tool harnesses, CI).
+# The identity preflight below is the guaranteed fail-fast leg; this export is
+# defense-in-depth — verified in gcloud's CanPrompt() source to be honored as
+# the --quiet equivalent even where auto-detection does not apply. Humans at
+# a real terminal keep interactive reauth (the export is deliberately withheld
+# on TTY stdin).
 if [ ! -t 0 ]; then
   export CLOUDSDK_CORE_DISABLE_PROMPTS=1
 fi
@@ -561,7 +591,7 @@ Expected: PASS.
 
 Run: `for s in scripts/test/cloud-*.test.sh scripts/test/e2e-harness-timeout-env.test.sh; do echo "== $s"; bash "$s" || exit 1; done`
 
-Expected: PASS. The preflight adds one pinned `--account=` token per lane to the fake logs; `accounts_all_equal` tolerates it by design (call count and token count both grow by one; ambient runs log the call with no token, so W5/W6b's absent-accounts-file proof still holds — verify those two checks explicitly in the output).
+Expected: PASS. The preflight adds one pinned `--account=` token per resolve site crossed (a green-fake run lane crosses two: `cmd_run`'s resolve and `cmd_build`'s on the rebuild path — each is a real ~1s token mint); call count and token count grow together, so `accounts_all_equal` tolerates it by design; ambient runs log the calls with no token, so W5/W6b's absent-accounts-file proof still holds — verify those two checks explicitly in the output.
 
 - [ ] **Step 7: Commit the task**
 
@@ -733,17 +763,21 @@ Expected: FAIL — W10b/W10c strings absent; all other checks pass.
 1. `AGENTS.md` — add one bullet to the Test Coordination list, after the base-gate bullet:
 
 ```markdown
-- Agent-launched broad gates should export `GCLOUD_ROBOT_REQUIRE=1` (the recommended default): fail closed when no robot identity resolves, instead of silently running as a possibly-stale human identity. Machines with a standard gcloud-robot install don't need `GCLOUD_ROBOT_HOME` exported — the lanes probe the well-known install locations (`~/.codex/skills/gcloud-robot`, `~/.claude/skills/gcloud-robot`, `~/code/skill-gcloud-robot/gcloud-robot`) when it's unset, and non-TTY (agent) invocations disable gcloud prompts and preflight the credential so a dead identity fails in seconds instead of hanging.
+- Agent-launched broad gates should export `GCLOUD_ROBOT_REQUIRE=1` (the recommended default): fail closed when no robot identity resolves, instead of silently running as a possibly-stale human identity. Machines with a standard gcloud-robot install don't need `GCLOUD_ROBOT_HOME` exported — the lanes probe the well-known install locations (`~/.codex/skills/gcloud-robot`, `~/.claude/skills/gcloud-robot`, `~/code/skill-gcloud-robot/gcloud-robot`) when it's unset, and non-TTY (agent) invocations disable gcloud prompts and preflight the credential so a dead identity fails in seconds instead of hanging. For agent lanes that run under a real PTY (Freshell terminal panes), where prompts are deliberately NOT disabled, also export `GCLOUD_ROBOT_ACCOUNT=<robot>` — the selector probes that account first, so it never mints the (possibly stale) ambient human credential.
 ```
+
+(The last sentence documents this change's own PTY residual and its no-hang lever — required for honest documentation, live-verified mechanism: the selector probes the env-pinned account first.)
 
 2. `AGENTS.md` — update BOTH Identity paragraphs identically: replace `gcloud-robot probe (needs `GCLOUD_ROBOT_HOME`, the installed gcloud-robot skill directory)` with `gcloud-robot probe (via `GCLOUD_ROBOT_HOME`, or the first well-known gcloud-robot skill install: `~/.codex/skills/gcloud-robot`, `~/.claude/skills/gcloud-robot`, `~/code/skill-gcloud-robot/gcloud-robot`)`. The two paragraphs stay byte-identical to each other.
 
 3. `docs/development/gcloud-robot.md`:
    - Ladder section rung 4: same wording change as the Identity paragraphs.
+   - "Adoption states" section 1 ("wired but not yet provisioned ... lanes run exactly as before"): now stale for machines with a well-known-path install — update to say such machines resolve the robot via discovery (the selector runs; a second stderr note can appear when the probe fails).
    - Operator setup, after the `GCLOUD_ROBOT_HOME` export block: "On machines with a standard install the export is optional — the lanes probe the well-known locations in order when `GCLOUD_ROBOT_HOME` is unset; an explicit export still wins."
-   - Troubleshooting, add an entry: "An agent-launched lane (non-TTY stdin) now fails within seconds at the identity preflight with `Reauthentication failed. cannot prompt during non-interactive execution` instead of hanging ~90 min on a reauth prompt. Lanes started from an interactive terminal still allow a human to reauth (prompts are disabled only on non-TTY stdin). A `gcloud-robot: well-known install at ... produced no identity` note means a standard install exists but its probe failed — see the selector's stderr guidance."
+   - Broker section (OneCLI gateway broker), add: "The identity preflight mints via oauth2.googleapis.com, which the gateway deliberately does not broker: on brokered hosts, a lane whose resolved identity has a dead LOCAL credential now fails fast at the preflight instead of succeeding silently via brokered control-plane hosts. Keep the robot key activated (`scripts/bootstrap-robot.sh`) or pin `GCLOUD_IDENT` on such machines."
+   - Troubleshooting, add a two-shape entry: "An agent-launched lane (non-TTY stdin) fails within seconds at the identity preflight with `Reauthentication failed. cannot prompt during non-interactive execution` — the expected fail-fast shape (live-verified: the malformed-token subclass also fails fast and never prompts). A lane under a real TTY with a reauth-required human credential still blocks interactively on `Reauthentication required.` / `Please enter your password:` (the prompt class that produced the multi-hour incident; discovery moves this blockage EARLIER, inside the resolve, with the selector's output swallowed) — pin `GCLOUD_ROBOT_ACCOUNT` (the selector probes it first and never mints the human) or `GCLOUD_IDENT` on PTY-launched agent lanes. A `gcloud-robot: well-known install at ... produced no identity` note means a standard install exists but its probe failed — see the selector's stderr guidance."
 
-4. Both wrappers' `usage()` identity text: mirror the same ladder wording change as AGENTS.md plus one line documenting the non-TTY prompt disable + preflight (the strings W10b/W10c grep: `well-known gcloud-robot install` and `CLOUDSDK_CORE_DISABLE_PROMPTS`).
+4. Both wrappers' `usage()` identity text: mirror the same ladder wording change as AGENTS.md plus one line documenting the non-TTY prompt disable + preflight. The text MUST contain the exact substring `well-known gcloud-robot install` (the string W10b greps — write it deliberately; do not let a paraphrase like "well-known gcloud-robot skill install" break the check) and the exact token `CLOUDSDK_CORE_DISABLE_PROMPTS` (W10c).
 
 - [ ] **Step 4: Run the focused test**
 
@@ -772,12 +806,49 @@ git commit -m "docs(cloud): recommend GCLOUD_ROBOT_REQUIRE for agent gates; docu
 
 ## Verification (whole change)
 
-1. All bash cloud suites green: `for s in scripts/test/cloud-*.test.sh scripts/test/e2e-harness-timeout-env.test.sh; do bash "$s" || exit 1; done`
-2. Full-suite coordinated gate at final HEAD per the-usual executing-plans (`npm test` from the worktree, via the repo's coordinator; the cloud lanes inside it exercise the new preflight + discovery against the real robot — the fix's own smoke test).
-3. No TypeScript/Rust/React surface touched: the pre-push gate passes trivially (its changed-file filters match none of this change set).
+1. All bash cloud suites green: `for s in scripts/test/cloud-*.test.sh scripts/test/e2e-harness-timeout-env.test.sh; do bash "$s" || exit 1; done` (requires the Pre-step 0 repair and a warmed `target/` for the W7-nested cloud-run-wrapper leg; the first cold run is slow, subsequent runs fast).
+2. Tier 1 — resolve-level discovery smoke (REQUIRED; ~10s; free; read-only; no coordinator gate — it is not a lane run). From the worktree, this exercises the real well-known discovery, the real selector + IAM probe, the source attribution, and the preflight mint:
+
+```bash
+env -u GCLOUD_IDENT -u GCLOUD_ROBOT_HOME -u GCLOUD_ROBOT_ACCOUNT \
+    -u FRESHELL_GCP_ACCOUNT -u GCLOUD_IDENT_RESOLVED \
+    -u CLOUDSDK_CORE_ACCOUNT -u CLOUDSDK_CORE_PROJECT \
+    GCLOUD_ROBOT_REQUIRE=1 \
+  bash -c 'set -euo pipefail
+    . scripts/lib/gcp-identity.sh
+    GCP_PROJECT="misc-puttering-project"
+    GCP_ACCOUNT=""
+    freshell_resolve_cloud_identity "run.jobs.run"
+    echo "IDENT=${GCLOUD_IDENT:?}"
+    echo "SOURCE=${FRESHELL_GCP_IDENTITY_SOURCE:?}"
+    gcloud auth print-access-token --account="$GCLOUD_IDENT" >/dev/null
+    echo "PREFLIGHT=ok"'
+```
+
+Expected: `IDENT=gcloud-robot@misc-puttering-project.iam.gserviceaccount.com`, `SOURCE=gcloud-robot probe (well-known install: /home/dan/.codex/skills/gcloud-robot)`, `PREFLIGHT=ok` (live-validated equivalent observations 2026-09-21).
+
+3. Tier 2 — integrated narrowed cloud-lane smoke (execution-stage, once at final HEAD before the delta review; coordinator-permitted narrowed lane — explicit filter + 1 shard, not a broad gate). From the clean, committed worktree HEAD (clean tree keeps the image tag content-addressed and reusable by the full-suite gate):
+
+```bash
+env -u GCLOUD_IDENT -u GCLOUD_ROBOT_HOME -u GCLOUD_ROBOT_ACCOUNT \
+    -u FRESHELL_GCP_ACCOUNT -u GCLOUD_IDENT_RESOLVED \
+    -u CLOUDSDK_CORE_ACCOUNT -u CLOUDSDK_CORE_PROJECT \
+    GCLOUD_ROBOT_REQUIRE=1 \
+  scripts/vitest-cloud.sh run --cloud --config=default --shards=1 \
+    test/unit/lib/pane-utils.test.ts
+```
+
+Assert: stdout contains `[vitest-cloud] Identity: gcloud-robot@misc-puttering-project.iam.gserviceaccount.com (source: gcloud-robot probe (well-known install: /home/dan/.codex/skills/gcloud-robot))`; stderr contains no `gcloud-robot:` diagnostic; exit 0. (~$0.02, ~2-3 min job + possible first ~13 min image build at the branch commit, shared by any later cloud run of the same commit. `GCLOUD_ROBOT_REQUIRE=1` only alters the failure path — the success path proves the default resolution.)
+
+4. Full-suite coordinated gate at final HEAD per the-usual executing-plans (`npm test` from the worktree, via the repo's coordinator). Coverage honesty: in the agent-harness env (backend vars unset) it validates the local suites only; where `FRESHELL_VITEST_BACKEND=cloud` is inherited the cloud lane runs but at rung 2 (`GCLOUD_IDENT` pinned by the operator bashrc) — it exercises the preflight, never discovery. Discovery against the real install is proven by the Tier 1 and Tier 2 smokes above, not by the gate.
+5. No TypeScript/Rust/React surface touched: the pre-push gate passes trivially (its changed-file filters match none of this change set).
 
 ## Notes
 
-- Live-incident evidence for this kata ran during this run's workspace stage: another agent's base-gate `gcloud builds submit` parked ~3h on gcloud's interactive reauth prompt (Freshell PTY, ambient human credential, `GCLOUD_ROBOT_HOME` never set in the agent environment) — the exact failure mode Task 1 + Task 2 remove for non-TTY invocations, and Task 1 removes for standard-install machines.
-- Residual, stated honestly: an agent lane launched under a real PTY (a Freshell terminal pane) with a dead human credential can still be prompted by gcloud — prompts are disabled only on non-TTY stdin by design (humans keep interactive reauth), and the selector probes `gcloud config get-value account` (the human) before the robot. Discovery makes the robot reachable; the banner reports what actually got picked.
+- Live-incident evidence for this kata ran during this run's workspace stage: another agent's base-gate `gcloud builds submit` parked 3h05m on gcloud's interactive reauth prompt (Freshell PTY, ambient human credential in the reauth-required state, `GCLOUD_ROBOT_HOME` never set in the agent environment) — the exact failure mode Task 1 + Task 2 remove for non-TTY invocations, and Task 1 removes for standard-install machines. The load-bearing stage reproduced the prompt class live (timeout-bounded) and confirmed: non-TTY mint of a reauth-required credential fails in ~1s with the documented error string; TTY mint blocks on the interactive prompt.
+- Residual, stated honestly (live-verified, not hypothetical): an agent lane launched under a real PTY (a Freshell terminal pane) with a reauth-required human credential WILL block indefinitely on gcloud's interactive reauth prompt (`Reauthentication required.` / `Please enter your password:`) — prompts are disabled only on non-TTY stdin by design (humans keep interactive reauth). Post-change, discovery moves that blockage EARLIER (inside the resolve, before any banner output) and QUIETER (the selector's stderr and the preflight's output are both redirected): the selector probes `gcloud config get-value account` (the human) before the robot. The documented no-hang lever for PTY agent lanes is pinning `GCLOUD_ROBOT_ACCOUNT` (the selector probes the env-pinned account first and never mints the human) or `GCLOUD_IDENT` — the AGENTS.md bullet and the runbook troubleshooting entry added by Task 4 say so. The malformed-token ("plain invalid_grant") subclass never prompts at all — live-proven in both TTY and non-TTY legs.
+- Human-first candidate order (out of scope, stated for reviewers): if a LIVE human credential holds the lane's probe permission, the selector legitimately selects the human over the robot (candidate order: `GCLOUD_ROBOT_ACCOUNT` > config account > auth list — the skill's own policy). Discovery makes the robot reachable and the banner reports what actually got picked; guaranteeing robot-first would require `GCLOUD_ROBOT_ACCOUNT`, which is the operator's lever, not this change's. State this plainly in the PR description.
+- Broker interplay (garageserver): the OneCLI gateway brokers control-plane hosts only; `oauth2.googleapis.com` (the preflight's mint) is deliberately unbrokered. Today the robot key is live locally and discovery routes agent lanes to it, so no false-fail; a machine with NO usable local identity that previously sailed through brokered hosts now fails fast at the preflight instead (arguably correct — the identity really is broken). Task 4's runbook broker note documents this.
+- The kata's target population is exactly the non-bashrc shells (agent harnesses, server-spawned panes): every bashrc-sourcing shell already gets `GCLOUD_IDENT` pinned pre-guard and never reaches discovery. Say so in the PR description.
 - The skill's canonical SKILL.md (`~/code/skill-gcloud-robot`) says `GCLOUD_ROBOT_HOME` is the only sanctioned resolution; this change knowingly diverges per the user's kata (the skill's own override rule sanctions it). The Freshell-side header rewrite records the divergence; the skill repo itself is out of scope — mention it in the PR description.
+- Pre-existing red repaired by Task 1 Pre-step 0: `cloud-exec-id-parse.test.sh` (harness drift — fake gcloud missing the `logging read` stub the e2e wrapper's receipts reconciliation requires; verified red at the base commit in this worktree and green after the stub). Recorded here so reviewers don't mistake the repair for test-weakening.
