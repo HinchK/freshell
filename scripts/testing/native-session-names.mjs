@@ -16,14 +16,18 @@
 //      initialize, `thread/read` includeTurns:false, production
 //      `thread/name/set` and read; a fresh management process readback; a
 //      held loaded execution handle that metadata work never steals;
-//      wrong-root isolation; and a zero-turn prospective start/restart with
-//      a pending Freshell rename (no model turn anywhere).
+//      wrong-root isolation; a zero-turn prospective start/restart with
+//      a pending Freshell rename (no model turn anywhere); and the
+//      canonical record's source protection (an externally renamed thread
+//      never acquires manual permanence; the writeback's own echo never
+//      disturbs the manual record).
 //   3. OpenCode — the real `opencode serve` HTTP surface with isolated
 //      scratch storage: zero-message POST /session `{}`, production
 //      GET/PATCH/GET, the writer event stream's `info.id`, SQLite
 //      read-only readback, an owned serve restart, a second same-database
-//      management connection, and a deliberate database mismatch diagnosed
-//      without losing the Freshell name.
+//      management connection, a deliberate database mismatch diagnosed
+//      without losing the Freshell name, and the hydrated record's source
+//      protection (the serve-observed title ingests as an automatic rank).
 //
 // Exit codes: 0 only when ALL THREE provider contracts ran and passed;
 // 1 for a contract failure (including a missing/skipped provider result —
@@ -31,7 +35,9 @@
 // (input/runtime/image), reported before any provider work.
 //
 // Containment: every child process this runner spawns is recorded and
-// stopped by exactly that PID; no broad kill patterns; no npm install,
+// stopped by exactly that PID; the receipt's `processOwnership` field
+// records the owned PIDs per provider leg so the kill scope is auditable
+// from the run's own evidence. No broad kill patterns; no npm install,
 // package discovery, or dependency upgrade ever happens here; no corpus,
 // credentials, or operator home is read. All writes stay under the
 // explicit scratch and receipt directories the wrapper mounts.
@@ -106,6 +112,7 @@ class Receipt {
       startedAt: this.startedAt,
       finishedAt: new Date().toISOString(),
       overall: this.overall,
+      processOwnership: ownershipSnapshot(),
       operations: this.operations,
       providers: this.providers,
       ...extra,
@@ -131,9 +138,42 @@ function sha256Bytes(bytes) {
 /** Every child PID this runner spawned, for owned cleanup. */
 const ownedPids = new Set()
 
-function recordOwnedProcess(child) {
-  if (child.pid) ownedPids.add(child.pid)
+/** The same PIDs, attributed per owner leg — the receipt's
+ * `processOwnership` field. Ownership is ENFORCED by
+ * `stopOwnedProcesses` (exact-PID kills of exactly these children, never a
+ * broad pattern); the receipt records WHAT was owned per provider so the
+ * kill scope is auditable from the run's own evidence. */
+const ownedPidsByOwner = new Map()
+
+function recordOwnedProcess(child, owner = 'unlabeled') {
+  if (child.pid) {
+    ownedPids.add(child.pid)
+    const list = ownedPidsByOwner.get(owner) ?? []
+    list.push(child.pid)
+    ownedPidsByOwner.set(owner, list)
+  }
   return child
+}
+
+function ownershipSnapshot() {
+  return Object.fromEntries([...ownedPidsByOwner].map(([owner, pids]) => [owner, [...pids]]))
+}
+
+/** Automatic-rank name sources (the protocol's `NameSource`:
+ * crates/freshell-protocol/src/session_names.rs — rank order `manual >
+ * legacy_protected > freshell_ai > provider_ai > first_message >
+ * directory`). A native-side name observation must NEVER fold as human
+ * intent: `manual` is reachable only through an explicit user rename and
+ * `legacy_protected` only through the migration. Both source-protection
+ * gates below fail closed on anything outside this set. */
+const AUTOMATIC_SOURCE_RANKS = new Set(['freshell_ai', 'provider_ai', 'first_message', 'directory'])
+
+function assertAutomaticNameSource(provider, record, context) {
+  if (!AUTOMATIC_SOURCE_RANKS.has(record?.source)) {
+    throw new Error(
+      `${provider} source protection violated (${context}): the canonical record's source is ${JSON.stringify(record?.source)} — a native-side name must never acquire the permanence of a human rename (record: ${JSON.stringify(record)})`,
+    )
+  }
 }
 
 function stopOwnedProcesses() {
@@ -249,7 +289,7 @@ class CodexAppServer {
     this.child = recordOwnedProcess(spawn(this.binary, ['app-server'], {
       env: this.env,
       stdio: ['pipe', 'pipe', 'pipe'],
-    }))
+    }), 'codex')
     this.child.stdout.on('data', (chunk) => this.onData(chunk))
     // The real CLI's stderr is the only honest diagnostic for a boot
     // failure (its existence checks, auth/config bootstrap errors), and a
@@ -464,7 +504,7 @@ class RustServer {
       env: this.env,
       stdio: ['ignore', logStream, logStream],
       detached: false,
-    }))
+    }), 'server')
     await withTimeout(pollUntil(
       'server health',
       async () => {
@@ -805,7 +845,7 @@ async function runClaudeHelper(args, request, claudeConfigRoot) {
       CLAUDE_CONFIG_DIR: claudeConfigRoot,
     },
     stdio: ['pipe', 'pipe', 'pipe'],
-  }))
+  }), 'claude')
   // A wedged helper is diagnosable from its kernel wait channel: a silent
   // timeout with zero stdout AND zero stderr must still answer WHERE the
   // process sits (uninterruptible 9p I/O, a lock wait, a stopped state),
@@ -1151,7 +1191,7 @@ async function codexContract(args, server, receipt, observed) {
   const result = {
     persistence: 'fail',
     freshReadback: 'fail',
-    sourceProtection: 'pass',
+    sourceProtection: 'fail',
     leaseSafety: 'fail',
     liveRedraw: 'not_measured',
     outcome: 'fail',
@@ -1399,6 +1439,25 @@ async function codexContract(args, server, receipt, observed) {
       },
       45_000,
     )
+    // (6b) SOURCE PROTECTION — the receipt's `sourceProtection` field is
+    // set ONLY by this gate, never pre-seeded. The external
+    // `thread/name/set` operations above (steps 1 and 4) renamed the thread
+    // on the NATIVE side with no Freshell intent anywhere; the canonical
+    // record for the legacy thread (bound by the resume-create) must carry
+    // an AUTOMATIC source. A native-side rename can never acquire the
+    // permanence of a human rename (no native-manual inference; the
+    // deterministic Task 3 lanes pin the extraction — this gate proves the
+    // end-to-end fold on the real CLI).
+    const preRename = await withTimeout(pollUntil(
+      'codex naming record present before the canonical rename',
+      async () => await server.readOne(codexTarget),
+      60_000,
+      250,
+    ), 70_000, 'codex naming record present before the canonical rename')
+    result.preRenameObservation = { source: preRename.record.source, name: preRename.record.name }
+    assertAutomaticNameSource('codex', preRename.record, 'after the external thread/name/set operations')
+    result.sourceProtection = 'pass'
+    result.operations.push('server:sourceProtection:automaticPreserved')
     const serverName = 'Server-written codex name'
     const renameRoute = await server.renameCanonical(codexTarget, serverName, 'user')
     if (!renameRoute.ok) throw new Error(`server canonical rename failed: ${renameRoute.status} ${JSON.stringify(renameRoute.body)}`)
@@ -1428,6 +1487,18 @@ async function codexContract(args, server, receipt, observed) {
     }
     connectionF.stop()
     result.operations.push('server:nativeWriteback:synced')
+    // The writeback's own echo must not disturb the manual record: the
+    // live sidecar observes the native name change and the ingestion lane
+    // folds it as an own-write echo — the canonical record keeps the
+    // user-written name and its manual source (the claude contract's
+    // own-echo protection, proven on the codex lane; a misclassified echo
+    // that flipped or reset the record fails this leg).
+    await new Promise((resolve) => setTimeout(resolve, 2_000))
+    const afterWriteback = await server.readOne(codexTarget)
+    if (afterWriteback?.record?.name !== serverName || afterWriteback.record.source !== 'manual') {
+      throw new Error(`codex own-echo protection failed: the record after the writeback is ${JSON.stringify(afterWriteback?.record)}`)
+    }
+    result.operations.push('server:sourceProtection:ownEchoPreserved')
     try {
       ws.close()
     } catch {
@@ -1538,7 +1609,7 @@ class OpencodeServe {
     this.child = recordOwnedProcess(spawn(this.binary, ['serve', '--hostname', '127.0.0.1', '--port', String(this.port)], {
       env: opencodeChildEnv(this.extraEnv),
       stdio: ['ignore', logStream, logStream],
-    }))
+    }), 'opencode')
     await withTimeout(pollUntil(
       `opencode serve ${this.label} health`,
       async () => {
@@ -1654,6 +1725,7 @@ async function opencodeContract(args, server, receipt, observed) {
   const result = {
     persistence: 'fail',
     freshReadback: 'fail',
+    sourceProtection: 'fail',
     databaseMismatchDiagnosed: 'fail',
     liveRedraw: 'not_measured',
     outcome: 'fail',
@@ -1904,6 +1976,15 @@ print(row, messages[0][0])
       source: hydrated.record.source,
       nativeSync: hydrated.nativeSync,
     }
+    // SOURCE PROTECTION — the receipt's `sourceProtection` field is set
+    // ONLY by this gate, never pre-seeded. The serve-observed native title
+    // was ingested by the naming lane as an AUTOMATIC observation: a
+    // native-side name must never fold as human intent (no native-manual
+    // inference). Before this gate the field was absent from the opencode
+    // receipt entirely, so the recorded `source: provider_ai` carried no
+    // proof.
+    assertAutomaticNameSource('opencode', hydrated.record, 'the hydrated serve-observed record')
+    result.sourceProtection = 'pass'
     const indexedRename = await server.renameCanonical(target, 'Indexed-session canonical name', 'user')
     if (!indexedRename.ok) throw new Error(`indexed-session canonical rename failed: ${indexedRename.status} ${JSON.stringify(indexedRename.body)}`)
     result.operations.push('server:indexedSessionRename:accepted')
@@ -2132,6 +2213,12 @@ async function main() {
     outcome: receipt.providers[provider]?.outcome ?? 'missing',
   }))
   const allPassed = providersPresent.every((entry) => entry.outcome === 'pass')
+  // The persisted receipt's `overall` must state the run's own outcome: it
+  // previously stayed 'pending' on a fully passing run (stdout said pass,
+  // the wrapper classified pass, the FILE said pending — the receipt
+  // understated the run). The failure paths set 'fail'/'prerequisite-missing'
+  // before this point; this line is the only success write.
+  receipt.overall = allPassed ? 'pass' : receipt.overall
   const document = receipt.write({
     prerequisites: { problems: [] },
     inputs: observed,
