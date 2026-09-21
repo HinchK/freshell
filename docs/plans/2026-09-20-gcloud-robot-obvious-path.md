@@ -117,7 +117,7 @@ SCRUB=(-u GCLOUD_IDENT -u GCLOUD_ROBOT_HOME -u GCLOUD_ROBOT_REQUIRE
        -u GCLOUD_ROBOT_ACCOUNT -u CLOUDSDK_CORE_DISABLE_PROMPTS)
 ```
 
-(`GCLOUD_ROBOT_ACCOUNT` joins the scrub list for host-leak hygiene AND because new checks deliberately set it as the robot-first guarantee lever; `CLOUDSDK_CORE_DISABLE_PROMPTS` must be scrubbed so the TTY-side assertions cannot be skewed by a host that already exports it — otherwise a host export makes correct TTY behavior look broken and lets the non-TTY red pass vacuously. Also extend the FAKE_SELECTOR body in the suite: record `account=${GCLOUD_ROBOT_ACCOUNT:-}` alongside the existing `project=`/`probe=` env-contract line, and echo `"${GCLOUD_ROBOT_ACCOUNT:-${SELECTOR_ACCOUNT:-}}"` as its result — existing checks pass GCLOUD_ROBOT_ACCOUNT unset, so their behavior is unchanged.)
+(`GCLOUD_ROBOT_ACCOUNT` joins the scrub list for host-leak hygiene AND because new checks deliberately set it as the robot-first guarantee lever; `CLOUDSDK_CORE_DISABLE_PROMPTS` must be scrubbed so the TTY-side assertions cannot be skewed by a host that already exports it — otherwise a host export makes correct TTY behavior look broken and lets the non-TTY red pass vacuously. Also extend the FAKE_SELECTOR body in the suite: record `account=${GCLOUD_ROBOT_ACCOUNT:-}` and `prompts=${CLOUDSDK_CORE_DISABLE_PROMPTS:-unset}` alongside the existing `project=`/`probe=` env-contract line, and echo `"${GCLOUD_ROBOT_ACCOUNT:-${SELECTOR_ACCOUNT:-}}"` as its result — existing checks pass GCLOUD_ROBOT_ACCOUNT unset, so their behavior is unchanged; the `prompts=` record lets W16 prove the TTY-gate export reaches the selector's environment.)
 
 ```bash
 run_ladder() {
@@ -450,7 +450,7 @@ git commit -m "feat(cloud): discover well-known gcloud-robot installs in the ide
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
-In `scripts/test/cloud-vitest-wrapper.test.sh` — the suite pins `GCLOUD_IDENT="suite-pinned-identity@example.invalid"` (line 15) so the ladder is bypassed and every fake gcloud call is pinned. Add a new fake plus suite-level invocation helpers (following the suite's FAKE..FAKE7 rewrite pattern; all wrapper invocations at SUITE level, `check` greps via positional args):
+In `scripts/test/cloud-vitest-wrapper.test.sh` — the suite pins `GCLOUD_IDENT="suite-pinned-identity@example.invalid"` (line 15) so the ladder is bypassed and every fake gcloud call is pinned. These suites do NOT share the identity suite's SCRUB machinery, so every new wrapper invocation below MUST run under an `env -u CLOUDSDK_CORE_DISABLE_PROMPTS` prefix — a host that already exports the variable would otherwise make the non-TTY assertion pass before implementation and the TTY assertion fail spuriously. Add a new fake plus suite-level invocation helpers (following the suite's FAKE..FAKE7 rewrite pattern; all wrapper invocations at SUITE level, `check` greps via positional args):
 
 ```bash
 # FAKE8: prompts-env recording + failing-token mode (kata e83z)
@@ -485,7 +485,8 @@ chmod +x "$FAKE8_DIR/gcloud"
 
 run8() { # suite-level helper: run the run lane under FAKE8; stdin: caller's
   rm -f "$FAKE8_LOG"; touch "$FAKE8_LOG"
-  PATH="$FAKE8_DIR:$PATH" bash "$SCRIPT" run --cloud --config=default --shards=2 2>&1
+  env -u CLOUDSDK_CORE_DISABLE_PROMPTS PATH="$FAKE8_DIR:$PATH" \
+    bash "$SCRIPT" run --cloud --config=default --shards=2 2>&1
 }
 ```
 
@@ -500,7 +501,7 @@ rm -f "$FAKE8_LOG"; touch "$FAKE8_LOG"
 T8_DIR="$FAKE8_DIR" # pass through positional args for the script(1) run
 check "TTY stdin leaves prompts enabled (humans keep interactive reauth)" \
   bash -c '
-    script -qec "env PATH=\"$1:\$PATH\" bash \"$2\" run --cloud --config=default --shards=2" /dev/null >/dev/null 2>&1 || true
+    script -qec "env -u CLOUDSDK_CORE_DISABLE_PROMPTS PATH=\"$1:\$PATH\" bash \"$2\" run --cloud --config=default --shards=2" /dev/null >/dev/null 2>&1 || true
     ! grep -q "PROMPTS_DISABLED=1" "$3"
   ' _ "$FAKE8_DIR" "$SCRIPT" "$FAKE8_LOG"
 
@@ -515,7 +516,7 @@ check "identity preflight mints a token before any build/submit work" \
   ' _ "$FAKE8_LOG"
 
 rm -f "$FAKE8_LOG"; touch "$FAKE8_LOG"
-V8F_OUT=$(PATH="$FAKE8_DIR:$PATH" FAKE8_TOKEN_FAIL=1 bash "$SCRIPT" run --cloud --config=default --shards=2 2>&1 < /dev/null) && V8F_RC=0 || V8F_RC=$?
+V8F_OUT=$(env -u CLOUDSDK_CORE_DISABLE_PROMPTS PATH="$FAKE8_DIR:$PATH" FAKE8_TOKEN_FAIL=1 bash "$SCRIPT" run --cloud --config=default --shards=2 2>&1 < /dev/null) && V8F_RC=0 || V8F_RC=$?
 check "failed preflight exits fast: no builds submit, no job create, loud attributable error" \
   bash -c '
     [ "$1" != "0" ] &&
@@ -534,7 +535,7 @@ then add after the existing build-lane checks:
 
 ```bash
 rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
-bash scripts/vitest-cloud.sh build >/dev/null 2>&1 </dev/null || true
+env -u CLOUDSDK_CORE_DISABLE_PROMPTS PATH="$FAKE_DIR:$PATH" bash scripts/vitest-cloud.sh build >/dev/null 2>&1 </dev/null || true
 check "vitest build lane: prompts disabled (non-TTY) + preflight token mint precedes builds submit" \
   bash -c '
     grep -q "PROMPTS_DISABLED=1" "$1" || exit 1
@@ -544,7 +545,7 @@ check "vitest build lane: prompts disabled (non-TTY) + preflight token mint prec
   ' _ "$FAKE_GCLOUD_LOG"
 
 rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
-bash scripts/e2e-cloud.sh build >/dev/null 2>&1 </dev/null || true
+env -u CLOUDSDK_CORE_DISABLE_PROMPTS PATH="$FAKE_DIR:$PATH" bash scripts/e2e-cloud.sh build >/dev/null 2>&1 </dev/null || true
 check "e2e build lane: prompts disabled (non-TTY) + preflight token mint precedes builds submit" \
   bash -c '
     grep -q "PROMPTS_DISABLED=1" "$1" || exit 1
@@ -556,7 +557,7 @@ check "e2e build lane: prompts disabled (non-TTY) + preflight token mint precede
 rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
 check "e2e build lane under a real TTY leaves prompts enabled" \
   bash -c '
-    script -qec "env PATH=\"$1:\$PATH\" bash scripts/e2e-cloud.sh build" /dev/null >/dev/null 2>&1 || true
+    script -qec "env -u CLOUDSDK_CORE_DISABLE_PROMPTS PATH=\"$1:\$PATH\" bash scripts/e2e-cloud.sh build" /dev/null >/dev/null 2>&1 || true
     ! grep -q "PROMPTS_DISABLED=1" "$2"
   ' _ "$FAKE_DIR" "$FAKE_GCLOUD_LOG"
 ```
@@ -602,6 +603,34 @@ check "W12d e2e standalone logs: preflight token mint precedes the executions li
 ```
 
 (The vitest standalone lanes W13b/W13c get the same treatment — the run/push/logs preflight contract is per resolve site in BOTH wrappers. For W13b assert the mint precedes `artifacts repositories describe`; for W13c precedes `executions list`.)
+
+Also add W16 — the prompt-env test that reaches the SELECTOR (every other prompt check pins `GCLOUD_IDENT` and bypasses the probe, so an implementation exporting `CLOUDSDK_CORE_DISABLE_PROMPTS` only AFTER identity resolution would still pass those; the selector is the component that can hang before the preflight):
+
+```bash
+# --- W16: the TTY-gated export reaches the selector's environment, before the
+# preflight — the selector is the only pre-preflight component that can prompt.
+reset_green
+W16_HOME="$TDIR/home-w16"; mkdir -p "$W16_HOME"
+mk_marker_robot_install "$W16_HOME" ".codex/skills/gcloud-robot"
+W16_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" HOME="$W16_HOME" \
+  "$WRAPPER_E2E" run --cloud --shards=1 2>/dev/null < /dev/null) && W16_RC=0 || W16_RC=$?
+check "W16 non-TTY run: the selector observes CLOUDSDK_CORE_DISABLE_PROMPTS=1 (export precedes the probe)" \
+  bash -c '
+    [ "$1" = "0" ] &&
+    [ -e "$2" ] &&
+    grep -q "^prompts=1$" "$2.env"
+  ' _ "$W16_RC" "$SELECTOR_MARKER"
+rm -f "$SELECTOR_MARKER" "$SELECTOR_MARKER.env"
+W16B_LOG="$TDIR/w16b.log"
+check "W16b TTY run: the selector observes prompts unset (humans keep interactive reauth)" \
+  bash -c '
+    script -qec "env -u GCLOUD_IDENT -u GCLOUD_ROBOT_HOME -u GCLOUD_ROBOT_REQUIRE -u GCLOUD_ROBOT_PROJECT -u GCLOUD_ROBOT_PROBE_PERMISSION -u FRESHELL_GCP_ACCOUNT -u CLOUDSDK_CORE_ACCOUNT -u CLOUDSDK_CORE_PROJECT -u CLOUDSDK_CORE_DISABLE_PROMPTS -u SELECTOR_ACCOUNT -u SELECTOR_FAIL -u GCLOUD_IDENT_RESOLVED -u FRESHELL_GCP_IDENTITY_SOURCE -u FRESHELL_ROBOT_HOME_DISCOVERED -u GCLOUD_ROBOT_ACCOUNT PATH=\"$1:\$PATH\" HOME=\"$2\" bash \"$3\" run --cloud --shards=1" /dev/null >/dev/null 2>&1 || true
+    [ -e "$4" ] &&
+    grep -q "^prompts=unset$" "$4.env"
+  ' _ "$GTDIR" "$W16_HOME" "$WRAPPER_E2E" "$SELECTOR_MARKER"
+```
+
+(W16/W16b pin the TTY gate's placement: the export must exist in the wrapper's environment BEFORE the selector child runs — every other prompt check pins `GCLOUD_IDENT` and bypasses the probe entirely. `SELECTOR_MARKER` is exported suite-wide, so the selector under `script(1)` still writes to the same marker files.)
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
@@ -821,36 +850,22 @@ git commit -m "feat(cloud): report resolved identity/source and loud dirty-tree 
 
 **Files:**
 - Modify: `AGENTS.md` (Test Coordination bullet list, lines 32–39; both Identity paragraphs 181–187 and 205–211 — kept byte-identical to each other)
-- Modify: `docs/development/gcloud-robot.md` (ladder section lines 40–59; Operator setup lines 115–132; Troubleshooting lines 348–394)
+- Modify: `docs/development/gcloud-robot.md` (ladder section lines 40–59; Adoption states section; Operator setup lines 115–132; Broker section; Troubleshooting lines 348–394)
 - Modify: `scripts/vitest-cloud.sh` + `scripts/e2e-cloud.sh` (`usage()` identity text: vitest 174–179, e2e 188–193)
-- Test: `scripts/test/cloud-gcp-identity.test.sh` (W10b/W10c help-text assertions)
 
 **Interfaces:**
 - Consumes: Tasks 1–3 behavior (discovery, TTY gate, preflight, banner).
 - Produces: documentation only, plus wrapper help-text updates that their existing help-grep checks (W10/W11) must still pass.
 
-- [ ] **Step 1: Write the failing behavioral tests**
+- [ ] **Step 1: Record the no-red rationale (pure documentation task)**
 
-In `scripts/test/cloud-gcp-identity.test.sh`, next to the W10/W11 block (lines 551–561):
+No new test is written for this task. Per the repo's test discipline, a test must run the behavior it protects — checks that only match prose, prompts, docs, or help text do not qualify, and the behavioral guarantees of this change are already carried by the runtime checks from Tasks 1–3 (K1–K9 discovery/attribution, W14–W16 preflight + prompt-env, the TTY/preflight checks). This task therefore has no meaningful Red step; it is validated by the repository's existing checks staying green (W10/W11's knob-name help assertions must continue to pass after the help-text edit — they are pre-existing and remain untouched).
 
-```bash
-check "W10b both wrappers' help documents well-known install discovery" \
-  bash -c '
-    grep -q "well-known gcloud-robot install" <<<"$1" && grep -q "well-known gcloud-robot install" <<<"$2"
-  ' _ "$E2E_HELP" "$VITEST_HELP"
-check "W10c both wrappers' help documents non-TTY fail-fast prompt behavior" \
-  bash -c '
-    grep -q "CLOUDSDK_CORE_DISABLE_PROMPTS" <<<"$1" && grep -q "CLOUDSDK_CORE_DISABLE_PROMPTS" <<<"$2"
-  ' _ "$E2E_HELP" "$VITEST_HELP"
-```
-
-(The strings are absent from both help texts today, so both checks fail for the right reason. Help text is user-visible behavior of the scripts; the existing W10/W11 knob-name checks keep passing because all four knob names stay.)
-
-- [ ] **Step 2: Run the tests and verify the intended failure**
+- [ ] **Step 2: Verify the existing checks hold over the edit**
 
 Run: `bash scripts/test/cloud-gcp-identity.test.sh`
 
-Expected: FAIL — W10b/W10c strings absent; all other checks pass.
+Expected: PASS (pre-existing state; confirms W10/W11 and the whole suite are green before the docs edit, so any post-edit failure is attributable to this task).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -871,13 +886,13 @@ Expected: FAIL — W10b/W10c strings absent; all other checks pass.
    - Broker section (OneCLI gateway broker), add: "The identity preflight mints via oauth2.googleapis.com, which the gateway deliberately does not broker: on brokered hosts, a lane whose resolved identity has a dead LOCAL credential now fails fast at the preflight instead of succeeding silently via brokered control-plane hosts. Keep the robot key activated (`scripts/bootstrap-robot.sh`) or pin `GCLOUD_IDENT` on such machines."
    - Troubleshooting, add a two-shape entry: "A dead resolved identity now fails a lane in seconds at the identity preflight with the observable signature `[vitest-cloud]/[e2e-cloud] ERROR: identity preflight failed for <identity> (source: <rung>) - gcloud auth print-access-token could not mint a token.` — the preflight swallows gcloud's own output, so the historical raw signature (`There was a problem refreshing your current auth tokens: Reauthentication failed. cannot prompt during non-interactive execution`) no longer appears on the preflight path; it is what the preflight replaced. A lane under a real TTY with a reauth-required HUMAN credential still blocks interactively on `Reauthentication required.` / `Please enter your password:` (the prompt class that produced the multi-hour incident; discovery moves this blockage EARLIER, inside the resolve, with the selector's output swallowed) — pin `GCLOUD_ROBOT_ACCOUNT` (the selector probes it first and never mints the human) or `GCLOUD_IDENT` on PTY-launched agent lanes. A `gcloud-robot: well-known install at ... produced no identity` note means a standard install exists but its probe failed — see the selector's stderr guidance."
 
-4. Both wrappers' `usage()` identity text: mirror the same ladder wording change as AGENTS.md plus one line documenting the non-TTY prompt disable + preflight. The text MUST contain the exact substring `well-known gcloud-robot install` (the string W10b greps — write it deliberately; do not let a paraphrase like "well-known gcloud-robot skill install" break the check) and the exact token `CLOUDSDK_CORE_DISABLE_PROMPTS` (W10c).
+4. Both wrappers' `usage()` identity text: mirror the same ladder wording change as AGENTS.md plus one line documenting the non-TTY prompt disable + preflight.
 
-- [ ] **Step 4: Run the focused test**
+- [ ] **Step 4: Run the focused verification**
 
 Run: `bash scripts/test/cloud-gcp-identity.test.sh`
 
-Expected: PASS.
+Expected: PASS — identical to Step 2's baseline result (the docs/help edits must not perturb the suite; W10/W11 still pass because every knob name stays in the help text).
 
 - [ ] **Step 5: Refactor while green**
 
@@ -892,7 +907,7 @@ Expected: PASS. No TypeScript/Rust files changed — the pre-push gate's changed
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add AGENTS.md docs/development/gcloud-robot.md scripts/vitest-cloud.sh scripts/e2e-cloud.sh scripts/test/cloud-gcp-identity.test.sh
+git add AGENTS.md docs/development/gcloud-robot.md scripts/vitest-cloud.sh scripts/e2e-cloud.sh
 git commit -m "docs(cloud): recommend GCLOUD_ROBOT_REQUIRE for agent gates; document well-known-path discovery and fail-fast identity (kata e83z)"
 ```
 
