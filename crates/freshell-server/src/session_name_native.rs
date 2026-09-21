@@ -86,6 +86,18 @@ const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// discoverable, allowance intact.
 const CAPABILITY_REPROBE_DELAY: Duration = Duration::from_secs(2);
 
+/// The bounded window a FAILED on-demand route discovery backs the series
+/// off for: a permanently-missing transcript (deleted after indexing, an
+/// off-machine session id) otherwise re-walks the whole projects tree every
+/// [`WORKER_POLL_INTERVAL`] poll, per series, for the process lifetime — a
+/// bounded rate over an unbounded duration. The window is worker-local and
+/// keyed by the stable name-ref key (route acquisition is
+/// revision-independent): a fresh rename on the same series never re-arms
+/// the walk early, the series re-attempts once the window expires, and one
+/// that acquires its route by another path simply leaves the paused set
+/// (its stale entry is harmless and bounded by the paused-set size).
+const DISCOVERY_RETRY_WINDOW: Duration = Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // Backend contract
 // ---------------------------------------------------------------------------
@@ -408,6 +420,38 @@ pub(crate) async fn discover_claude_route(
         .is_ok()
 }
 
+/// One on-demand discovery pass for index-adopted claude series (the
+/// sweep's hydration attaches no location): resolves at most one NEW route
+/// per pass — a found acquisition unpauses the series for the NEXT
+/// snapshot. `backoff` is the worker-local map of failed-discovery windows
+/// keyed by the stable name-ref key (route acquisition is
+/// revision-independent). Returns the number of discovery attempts made
+/// this pass.
+async fn discover_paused_claude_routes(
+    names: &Arc<SessionNames>,
+    backoff: &mut HashMap<String, tokio::time::Instant>,
+) -> usize {
+    let mut attempted = 0;
+    for target in names.paused_claude_series_without_route() {
+        let key = crate::session_names::name_ref_key(&target);
+        // A window recorded by a previous failed attempt suppresses the
+        // rescan for this pass; the series re-attempts once it expires.
+        if backoff
+            .get(&key)
+            .is_some_and(|until| *until > tokio::time::Instant::now())
+        {
+            continue;
+        }
+        attempted += 1;
+        if discover_claude_route(names, &target).await {
+            backoff.remove(&key);
+            break;
+        }
+        backoff.insert(key, tokio::time::Instant::now() + DISCOVERY_RETRY_WINDOW);
+    }
+    attempted
+}
+
 async fn run(
     names: Arc<SessionNames>,
     native: Arc<dyn NativeNameBackend>,
@@ -423,6 +467,9 @@ async fn run(
     // pending and discoverable, and the capability is rediscovered within
     // one window of its arrival.
     let mut probe_backoff: HashMap<(String, NameRevision), tokio::time::Instant> = HashMap::new();
+    // The transient per-series route-discovery backoff (see
+    // [`discover_paused_claude_routes`]).
+    let mut discovery_backoff: HashMap<String, tokio::time::Instant> = HashMap::new();
     loop {
         // Capability is checked BEFORE selection: disabled naming or a
         // missing key pauses the generation class without consuming
@@ -434,14 +481,9 @@ async fn run(
             Vec::new()
         };
         // On-demand route discovery for index-adopted claude series (the
-        // sweep's hydration attaches no location): resolve at most one
-        // series per poll pass — the 500ms poll bounds the rate, and a
-        // found acquisition unpauses the series for the NEXT snapshot.
-        for target in names.paused_claude_series_without_route() {
-            if discover_claude_route(&names, &target).await {
-                break;
-            }
-        }
+        // sweep's hydration attaches no location): at most one NEW route
+        // per pass, with a per-series backoff on failed attempts.
+        discover_paused_claude_routes(&names, &mut discovery_backoff).await;
         let native_items = names.native_work_snapshot();
         let selection = select_work(
             &native_items,

@@ -420,6 +420,121 @@ async fn an_index_adopted_claude_series_discovers_its_route_on_demand() {
     result
 }
 
+/// Task-008 review M-3: a FAILED on-demand route discovery must back the
+/// series off for the discovery window instead of re-walking the projects
+/// tree on every 500ms worker poll, per series, for the process lifetime
+/// (a transcript deleted after indexing, an off-machine session id). The
+/// backoff is worker-local, keyed by the stable name-ref key (route
+/// acquisition is revision-independent): an expired window attempts again,
+/// and a successful discovery clears the entry and unpauses the series.
+#[tokio::test]
+async fn a_failed_route_discovery_backs_off_instead_of_rescanning_every_pass() {
+    let _guard = CLAUDE_DISCOVERY_ENV_LOCK.lock().await;
+    let home = tempfile::tempdir().expect("claude home tempdir");
+    let session_id = "6c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f";
+    let project_cwd = home.path().join("proj");
+    std::fs::create_dir_all(&project_cwd).expect("project dir");
+    // NOTE: no transcript on disk yet — every discovery attempt fails until
+    // the file appears late in the test.
+    let mangled = project_cwd
+        .to_string_lossy()
+        .replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+    let transcript_dir = home.path().join("projects").join(&mangled);
+    std::fs::create_dir_all(&transcript_dir).expect("mangled project dir");
+
+    let saved_home = std::env::var_os("CLAUDE_HOME");
+    let saved_config = std::env::var_os("CLAUDE_CONFIG_DIR");
+    std::env::set_var("CLAUDE_HOME", home.path());
+    std::env::remove_var("CLAUDE_CONFIG_DIR");
+
+    let result = async {
+        let dir = temp_data_dir();
+        let store = open_store(dir.path());
+        let target = session(
+            freshell_protocol::session_names::NamedProvider::Claude,
+            session_id,
+        );
+        store
+            .hydrate_indexed(
+                crate::session_name_generation::IndexedNameInput {
+                    provider: freshell_protocol::session_names::NamedProvider::Claude,
+                    session_id: session_id.to_string(),
+                    cwd: Some(project_cwd.to_string_lossy().to_string()),
+                    first_user_message: Some("Probe the sardine factory".to_string()),
+                    provider_title: None,
+                },
+                false,
+            )
+            .await
+            .expect("hydrate");
+        rename_user(&store, target.clone(), "Manual Title")
+            .await
+            .expect("manual rename");
+        assert!(
+            !store.paused_claude_series_without_route().is_empty(),
+            "the routeless armed series is paused"
+        );
+
+        let mut backoff = std::collections::HashMap::new();
+        // Pass 1: the missing transcript is attempted once and the failure
+        // records a discovery window.
+        let attempted = super::discover_paused_claude_routes(&store, &mut backoff).await;
+        assert_eq!(attempted, 1, "the first pass attempts the series");
+        assert_eq!(backoff.len(), 1, "the failed attempt records a window");
+        // Pass 2, immediately: the window must suppress the rescan (the
+        // per-poll filesystem walk is the defect this test pins).
+        let attempted = super::discover_paused_claude_routes(&store, &mut backoff).await;
+        assert_eq!(attempted, 0, "the backoff window suppresses the rescan");
+        // An expired window attempts again (simulated with a past
+        // deadline — no fake clocks around the real store).
+        let key = crate::session_names::name_ref_key(&target);
+        backoff.insert(
+            key.clone(),
+            tokio::time::Instant::now() - super::DISCOVERY_RETRY_WINDOW,
+        );
+        let attempted = super::discover_paused_claude_routes(&store, &mut backoff).await;
+        assert_eq!(attempted, 1, "an expired window attempts discovery again");
+        assert_eq!(backoff.len(), 1, "the retried failure re-arms the window");
+        // The transcript appears late: the next expired window discovers
+        // the route, clears the backoff entry, and unpauses the series.
+        std::fs::write(
+            transcript_dir.join(format!("{session_id}.jsonl")),
+            format!(
+                concat!(
+                    r#"{{"parentUuid":null,"isSidechain":false,"type":"user","uuid":"m1","sessionId":"{session_id}","#,
+                    r#""timestamp":"2026-09-18T07:00:00.000Z","cwd":"{cwd}","message":{{"role":"user","content":"Probe the sardine factory"}}}}"#,
+                    "\n",
+                ),
+                cwd = project_cwd.to_string_lossy(),
+                session_id = session_id,
+            ),
+        )
+        .expect("transcript");
+        backoff.insert(key, tokio::time::Instant::now() - super::DISCOVERY_RETRY_WINDOW);
+        let attempted = super::discover_paused_claude_routes(&store, &mut backoff).await;
+        assert_eq!(attempted, 1, "the expired window attempts the late transcript");
+        assert!(
+            backoff.is_empty(),
+            "the successful discovery clears the window entry"
+        );
+        assert!(
+            store.paused_claude_series_without_route().is_empty(),
+            "the discovered series is no longer paused"
+        );
+    }
+    .await;
+
+    match saved_home {
+        Some(value) => std::env::set_var("CLAUDE_HOME", value),
+        None => std::env::remove_var("CLAUDE_HOME"),
+    }
+    match saved_config {
+        Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+        None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+    }
+    result
+}
+
 // ---------------------------------------------------------------------------
 // The finite cycle machine
 // ---------------------------------------------------------------------------
