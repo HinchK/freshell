@@ -32,9 +32,11 @@ jobs:
           # Rust suite too: it spawns Node fixtures (the codex fake
           # app-server imports `ws`) whose behavior depends on the installed
           # dependency tree. A rust-gate that skips because no .rs file
-          # changed is not proof of fixture compatibility.
+          # changed is not proof of fixture compatibility. Scoped to the
+          # root and workspace members — the independent demo locks are
+          # not part of the workspace dependency tree.
           if git diff --name-only "origin/${{ github.base_ref }}...${{ github.sha }}" \
-            | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain|^\.cargo/|^test/fixtures/|(^|/)(pnpm-lock\.yaml|pnpm-workspace\.yaml|package(-lock)?\.json)$|^\.npmrc$|^packages/'; then
+            | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain|^\.cargo/|^test/fixtures/|^(pnpm-lock\.yaml|pnpm-workspace\.yaml|package(-lock)?\.json|\.npmrc)$|^(crates|packages)/.*package(-lock)?\.json$|^packages/'; then
             echo "rust=true" >> "$GITHUB_OUTPUT"
           else
             echo "rust=false" >> "$GITHUB_OUTPUT"
@@ -55,7 +57,9 @@ jobs:
       # imports `ws`), so this job needs the workspace dependencies installed
       # or those tests die at fixture boot ("fake app-server exited before
       # listening").
-      - uses: pnpm/action-setup@v4
+      # Pinned revision of the v4 major; reads the exact version from the root
+      # packageManager pin (no floating duplicate).
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
       - uses: actions/setup-node@v4
         with:
           node-version: 22

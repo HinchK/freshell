@@ -1,6 +1,6 @@
 name: Demos
 
-# Each demo is an independent pnpm project with its own lock (plan section 5):
+# Each demo is an independent pnpm project with its own lock (plan §4.5):
 # prove they still install and build from their own locks, without the parent
 # workspace, whenever their manifests/locks/config change.
 
@@ -31,7 +31,9 @@ jobs:
       # reads the exact version from the root packageManager pin; each demo
       # enforces the same pin against its own install via its workspace
       # policy (packageManagerStrictVersion).
-      - uses: pnpm/action-setup@v4
+      # Pinned revision of the v4 major; reads the exact version from the root
+      # packageManager pin (no floating duplicate).
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
 
       - uses: actions/setup-node@v4
         with:

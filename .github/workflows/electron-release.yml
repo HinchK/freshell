@@ -34,7 +34,9 @@ jobs:
 
       # pnpm must exist before setup-node resolves its pnpm cache. The action
       # reads the exact version from the root packageManager pin.
-      - uses: pnpm/action-setup@v4
+      # Pinned revision of the v4 major; reads the exact version from the root
+      # packageManager pin (no floating duplicate).
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
 
       - uses: actions/setup-node@v4
         with:
