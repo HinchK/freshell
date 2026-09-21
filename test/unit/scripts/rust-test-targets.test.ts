@@ -10,6 +10,7 @@ import {
   planToInvocation,
   type WorkspaceGraph,
 } from '../../../scripts/hooks/rust-test-targets.js'
+import { resolveOwningTsx } from '@test/helpers/tsx-stub-resolution'
 
 // Workspace fixture mirroring the real dependency directions:
 // server -> {ws, terminal, sessions, freshagent, protocol}
@@ -216,15 +217,15 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
   // then exercise the hook's full chain regardless of the worktree's
   // install state (the hook passes the real rust-test-targets.ts path as
   // the script argument, so the stub only supplies the runtime).
-  const owningRoot = (() => {
-    const commonDir = spawnSync(
-      'git',
-      ['rev-parse', '--path-format=absolute', '--git-common-dir'],
-      { cwd: import.meta.dirname, encoding: 'utf8' },
-    )
-    return (commonDir.stdout ?? '').trim().replace(/\/\.git$/, '')
-  })()
-  const realTsx = path.join(owningRoot, 'node_modules', '.bin', 'tsx')
+  // The stub MUST embed an ABSOLUTE tsx path: the cloud test image ships
+  // no .git metadata, so plain git common-dir resolution yields a relative
+  // path there — and a relative stub exec's ITSELF inside the fixture repo
+  // in an infinite /bin/sh exec loop that freezes the worker (spawnSync
+  // blocks the event loop, so no vitest timeout ever fires). resolveOwningTsx
+  // falls back to a package.json walk-up in gitless checkouts, so the stub
+  // path is absolute in every environment (see
+  // test/unit/scripts/tsx-stub-resolution.test.ts).
+  const realTsx = resolveOwningTsx(import.meta.dirname)
 
   let fixtureRoot: string
   let baseSha: string
@@ -235,8 +236,13 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
   let cargoConfigSha: string
 
   function git(args: string[], opts: { cwd: string; stdin?: string } = { cwd: '' }): string {
-    const res = spawnSync('git', args, { cwd: opts.cwd, encoding: 'utf8' })
-    if (res.status !== 0) throw new Error(`git ${args.join(' ')} failed: ${res.stderr}`)
+    const res = spawnSync('git', args, { cwd: opts.cwd, encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' })
+    if (res.status !== 0 || res.error) {
+      const detail = res.error
+        ? `${res.error.message}${res.error.code === 'ETIMEDOUT' ? ' (timed out after 10s)' : ''}`
+        : res.stderr
+      throw new Error(`git ${args.join(' ')} failed: ${detail}`)
+    }
     return (res.stdout ?? '').trim()
   }
 
@@ -336,8 +342,20 @@ describe('pre-push hook routing (hermetic fixture repo)', () => {
       env: { ...process.env, ...extraEnv, FRESHELL_PREPUSH_DEBUG: '1' },
       encoding: 'utf8',
       cwd: fixtureRoot,
+      // A hung hook (e.g. a stub exec-loop) blocks the event loop, so no
+      // vitest timeout can fire — this spawn timeout is the ONLY guard.
+      // Generous for real hook debug-mode runs; ETIMEDOUT surfaces below.
+      timeout: 120_000,
+      killSignal: 'SIGKILL',
     })
-    return { status: res.status ?? -1, stderr: res.stderr ?? '' }
+    let stderr = res.stderr ?? ''
+    if (res.error) {
+      const timedOut = res.error.code === 'ETIMEDOUT'
+      stderr += `\nrunHook spawn failed: ${res.error.message}${
+        timedOut ? ' — hook invocation timed out after 120s (hook or tsx stub hung?)' : ''
+      }`
+    }
+    return { status: res.status ?? -1, stderr }
   }
 
   it('skips all checks for a docs-only range', () => {
