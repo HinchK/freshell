@@ -1574,8 +1574,11 @@ async fn handle_client_text(
                         // The paced replay core (responsive-terminal-restore
                         // W1): sink the first page (the registry produced it
                         // under the attach lock), emit the session start, and
-                        // drain to quiet — a short replay can complete here
-                        // without ever needing a credit.
+                        // — when the first page already covers the target —
+                        // hand the session to the off-dispatch drain task (a
+                        // short or empty replay drains to completion without
+                        // ever needing a credit, still never on the
+                        // dispatcher).
                         crate::paced_replay::start_session(
                             &state.registry,
                             conn_id,
@@ -1584,6 +1587,8 @@ async fn handle_client_text(
                             *start,
                             requested_since_seq,
                             attach_max_replay_bytes,
+                            ws_tx.clone(),
+                            create_cancel_rx.clone(),
                         );
                         true
                     }
@@ -1682,7 +1687,15 @@ async fn handle_client_text(
                 );
                 true
             } else {
-                handle_replay_credit(&replay_credit, state, conn_id, conn_sink, paced_sessions)
+                handle_replay_credit(
+                    &replay_credit,
+                    state,
+                    conn_id,
+                    conn_sink,
+                    paced_sessions,
+                    ws_tx,
+                    create_cancel_rx,
+                )
             }
         }
         ClientMessage::TerminalKill(kill) => {
@@ -7181,6 +7194,8 @@ fn handle_replay_credit(
     conn_id: u64,
     conn_sink: &FrameSink,
     paced_sessions: &mut crate::paced_replay::PacedSessions,
+    writer: &connection_writer::WriterSender,
+    cancel: &tokio::sync::watch::Receiver<bool>,
 ) -> bool {
     use crate::paced_replay::DriveOutcome;
     // Identifiers/measurements only, per the restore observability contract.
@@ -7193,8 +7208,8 @@ fn handle_replay_credit(
         );
     };
     let Some(session) = paced_sessions.get_mut(&replay_credit.terminal_id) else {
-        // No active session accepts this credit (completed, detached, or a
-        // terminal never paced): a stale generation.
+        // No active session accepts this credit (completed, detached,
+        // draining, or a terminal never paced): a stale generation.
         observe(crate::paced_replay::CreditVerdict::StaleGeneration);
         return true;
     };
@@ -7206,7 +7221,26 @@ fn handle_replay_credit(
     let budget = state.registry.paced_page_max_bytes();
     match crate::paced_replay::drive_session(&state.registry, conn_id, conn_sink, session, budget) {
         DriveOutcome::Active => {}
-        DriveOutcome::Completed | DriveOutcome::Gone => {
+        DriveOutcome::DrainReady => {
+            // The credited replay covered its fixed target: the session
+            // leaves the credited phase and moves WHOLE into the spawned
+            // drain task — the connection dispatcher stays free (input,
+            // other panes, controls) while the un-credited drain pages,
+            // and credits that arrive during the drain are inert stale
+            // generations (the drain is un-credited).
+            if let Some(session) = paced_sessions.remove(&replay_credit.terminal_id) {
+                crate::paced_replay::spawn_paced_drain(
+                    state.registry.clone(),
+                    conn_id,
+                    writer.clone(),
+                    Arc::clone(conn_sink),
+                    session,
+                    budget,
+                    cancel.clone(),
+                );
+            }
+        }
+        DriveOutcome::Gone => {
             paced_sessions.remove(&replay_credit.terminal_id);
         }
     }

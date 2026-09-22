@@ -89,6 +89,49 @@ async fn join(task: tokio::task::JoinHandle<WriterExit>) -> WriterExit {
         .unwrap()
 }
 
+/// The paced drain's backlog gate (responsive-terminal-restore W1): while
+/// the connection's output backlog sits at/above the watermark the gate
+/// PENDS — the sink itself (`push_server`) admits without yielding, so
+/// this gate is what bounds a producing drain by the connection queue's
+/// REAL consumption. The gate releases only when the writer pump
+/// completes actual frame sends and the published backlog drops below
+/// the watermark.
+#[tokio::test]
+async fn backlog_gate_waits_for_real_queue_consumption() {
+    let (sender, pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
+    let capture = Arc::new(Capture::default());
+    capture.block_flush.store(true, Ordering::SeqCst);
+    // Fill past the watermark (output_limit/2 = 2048 bytes): a blocked
+    // in-flight frame plus enough queued pages.
+    for seq in 1..=24 {
+        assert!(sender.push_server(output(seq)));
+    }
+    let task = tokio::spawn(pump.run(TestSink(Arc::clone(&capture))));
+    started(&capture).await;
+    assert!(
+        sender.pending_output_bytes() >= sender.backlog_watermark(),
+        "the fixture holds the backlog at/above the watermark (pending {})",
+        sender.pending_output_bytes()
+    );
+    let gate = sender.wait_backlog_below_watermark();
+    tokio::pin!(gate);
+    // The gate is CLOSED: it must not resolve while the backlog stands.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut gate)
+            .await
+            .is_err(),
+        "the gate stays closed while the backlog is at/above the watermark"
+    );
+    // REAL consumption releases it: the in-flight frame's flush completes
+    // and `finish_frame` publishes the drained backlog.
+    unblock(&capture);
+    tokio::time::timeout(Duration::from_secs(2), &mut gate)
+        .await
+        .expect("the gate opens when the pump drains real frames");
+    sender.stop_without_close();
+    let _ = join(task).await;
+}
+
 #[tokio::test]
 async fn blocked_flush_does_not_block_producers_and_is_still_accounted() {
     let (mut sender, pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));

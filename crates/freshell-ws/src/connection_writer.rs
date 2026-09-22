@@ -202,6 +202,15 @@ struct Shared {
     control_limit: usize,
     ready: Notify,
     stop: watch::Sender<Option<Stop>>,
+    /// Drain-side backpressure signal (responsive-terminal-restore W1):
+    /// the connection's current output backlog (`pending + in-flight`),
+    /// updated by the writer pump on every completed frame send. The
+    /// paced drain task waits on it between pages so the un-credited
+    /// drain is bounded by the connection queue's REAL backpressure —
+    /// the sink itself (`push_server`) admits without yielding (it
+    /// evicts the oldest queued output past the byte limit), so without
+    /// this gate a drain could self-spill its own unconsumed pages.
+    backlog: watch::Sender<usize>,
     /// Restore-contract bounds for materialized `terminal.output.gap`
     /// frames: set ONLY on negotiated connections, ONCE, by the connection
     /// setup BEFORE the pump is spawned (the same pre-spawn setup rule as
@@ -241,6 +250,8 @@ impl WriterSender {
         write_timeout: Duration,
     ) -> (Self, WriterPump) {
         let (stop_tx, stop_rx) = watch::channel(None);
+        let (backlog_tx, backlog_rx) = watch::channel(0usize);
+        let _ = backlog_rx; // receivers subscribe per wait; the sender owns the channel
         let shared = Arc::new(Shared {
             queues: Mutex::new(Queues {
                 output: DeliveryQueue::new(output_limit, metadata_limit(output_limit)),
@@ -259,6 +270,7 @@ impl WriterSender {
             control_limit: control_limit.max(1),
             ready: Notify::new(),
             stop: stop_tx,
+            backlog: backlog_tx,
             gap_bounds: std::sync::OnceLock::new(),
         });
         (
@@ -589,6 +601,44 @@ impl WriterSender {
             .saturating_add(queues.in_flight_output_bytes)
     }
 
+    /// The drain-side backpressure watermark (responsive-terminal-restore
+    /// W1): half the connection's output-queue budget. A producer that
+    /// has pushed the backlog to (or past) this mark must wait for the
+    /// writer pump to drain real frames before pushing more — the gate
+    /// that keeps the un-credited paced drain bounded by the connection
+    /// queue's actual consumption instead of its eviction behavior.
+    pub(crate) fn backlog_watermark(&self) -> usize {
+        (self.shared.output_limit / 2).max(1)
+    }
+
+    /// Wait until the connection's output backlog drops below
+    /// [`Self::backlog_watermark`] (or the writer dies — then the caller's
+    /// cancel path is the escape). The `watch` channel is fed by the
+    /// writer pump on every completed frame send, and a `watch` receiver
+    /// retains unseen-change marks, so subscribe-then-check-then-await
+    /// can never miss a wakeup: this is REAL backpressure (the sink's
+    /// `push_server` admits without yielding; this gate is what makes a
+    /// producing drain wait for actual socket consumption).
+    pub(crate) async fn wait_backlog_below_watermark(&self) {
+        let watermark = self.backlog_watermark();
+        loop {
+            if self.pending_output_bytes() < watermark {
+                return;
+            }
+            let mut rx = self.shared.backlog.subscribe();
+            // Re-check after subscribing: a drain between the first check
+            // and the subscription is covered by the retained change mark.
+            if self.pending_output_bytes() < watermark {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                // The writer pump is gone; the caller's cancel path owns
+                // the exit.
+                return;
+            }
+        }
+    }
+
     /// Total successful socket sends completed on this connection (drain-
     /// progress liveness, responsive-terminal-restore Workstream 3). The
     /// catastrophic-backpressure monitor feeds its per-tick delta into its
@@ -759,6 +809,12 @@ impl WriterPump {
         // (output or control — the pump serializes all sends, so either
         // proves the socket accepted bytes).
         queues.completed_sends = queues.completed_sends.saturating_add(1);
+        let backlog = queues.output.pending_bytes().saturating_add(reserved);
+        drop(queues);
+        // Drain-side backpressure signal (responsive-terminal-restore W1):
+        // publish the new backlog so gated producers (the paced drain
+        // task) wake as the queue drains. Sent with no queue lock held.
+        let _ = self.shared.backlog.send(backlog);
     }
 
     /// Generic over the real transport so tests can stop a flush at a precise
@@ -875,6 +931,9 @@ impl Drop for WriterPump {
             );
             queues.interest = InterestState::default();
         }
+        // Wake any gated producers: the backlog is gone with the writer,
+        // and their own cancel paths own the exit.
+        let _ = self.shared.backlog.send(0);
     }
 }
 

@@ -2,50 +2,57 @@
 //! coordinator for negotiated (`pacedTerminalReplayV1`) terminal replay.
 //!
 //! The registry owns the page reads ([`freshell_terminal::TerminalRegistry`]
-//! `attach`'s paced start, `next_replay_page`, `next_paced_tail_page`) and
+//! `attach`'s paced start, `next_replay_page`, `complete_paced_tail`) and
 //! the per-subscriber deferral; THIS module owns the session state the wire
 //! protocol needs: the fixed catch-up target, the production cursor, the
-//! credited-consumed window that gates continuation credits, and the
-//! drive loop that turns a valid [`TerminalReplayCredit`] into the next
-//! page (or the negotiated retention gap + continuation, or the tail drain
-//! that completes the session).
+//! credited-consumed window that gates continuation credits, and the two
+//! execution sites that turn a valid [`TerminalReplayCredit`] into the
+//! next page — the CREDITED replay phase (inline, one page per credit,
+//! dispatcher-owned) and the UN-CREDITED drain (a spawned task that pages
+//! the accumulated live range toward a FIXED target captured once at
+//! drain start, so the connection dispatcher stays free to service input
+//! and other panes for the drain's whole duration).
 //!
 //! Credit rules (all under the connection's negotiated capability; ignored
 //! otherwise): a credit whose `attachRequestId` does not match the ACTIVE
-//! session is a stale generation (superseded or completed — ignored); a
-//! `consumedSeq` outside `(credited, page_end]` is out of window (ignored —
-//! no double-grant, no phantom grant past the last-sent page). The grant is
-//! STRICTLY page-end: an in-window value below the page end is a partial
-//! consumption report (observed as `partial_consumption`, grants nothing —
-//! the prior batch is not yet fully consumed); only `consumedSeq == page_end`
-//! produces exactly ONE further replay page, so at most ONE unacknowledged
-//! page per (connection, terminal) exists at any time and per-pane
+//! session is a stale generation (superseded, completed, or DRAINING —
+//! ignored); a `consumedSeq` outside `(credited, page_end]` is out of
+//! window (ignored — no double-grant, no phantom grant past the last-sent
+//! page). The grant is STRICTLY page-end: an in-window value below the
+//! page end is a partial consumption report (observed as
+//! `partial_consumption`, grants nothing — the prior batch is not yet
+//! fully consumed); only `consumedSeq == page_end` produces exactly ONE
+//! further replay page, so at most ONE unacknowledged page per
+//! (connection, terminal) exists at any time and per-pane
 //! unacknowledged replay stays bounded by one page budget. Gap rounds
-//! continue within the same credit until a frame-carrying page is produced
-//! — an accepted credit always makes byte progress, never a zero-progress
-//! demand for more credit.
+//! continue within the same credit until a frame-carrying page is
+//! produced — an accepted credit always makes byte progress, never a
+//! zero-progress demand for more credit.
 //!
-//! When the cursor reaches the target, the accumulated live range
-//! `(target, head-at-tail-start]` drains as ordinary delivery (pages,
-//! not credit-gated) toward a FIXED tail target — the head captured when
-//! the tail phase starts — so ongoing production can never move the
-//! completion condition indefinitely. The completion then drains the
-//! staged remainder through the SAME budget-bounded paging (one page per
-//! drive step, the deferral cleared only at the completing verdict — the
-//! drained clear, or the final page that covers everything staged, sunk
-//! and cleared under one registry lock hold), looping toward fixed
-//! targets re-captured per round so live output can neither jump the
-//! pages nor be lost; a retention advance past the drain cursor reports
+//! When the replay cursor reaches the fixed attach-time target, the
+//! accumulated live range drains as ordinary delivery (pages, not
+//! credit-gated) in the SPAWNED drain task toward a FIXED target — the
+//! head captured ONCE when the drain starts, NEVER re-captured: when the
+//! target is covered, the completing page read re-fans the frames
+//! produced after it through the normal live fan-out path and clears the
+//! deferral atomically in the same registry lock hold, so ongoing
+//! production can never turn the drain into a moving-head chase and
+//! never occupies the connection dispatcher. Between pages the drain
+//! task waits on the connection queue's REAL backpressure (the writer's
+//! backlog watermark) — the sink itself admits without yielding, so the
+//! gate is what bounds the drain against self-spilling its own
+//! unconsumed pages. A retention advance past the drain cursor reports
 //! the exact bounds-carrying gap and resumes from the ring front — never
 //! a silent forward jump.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use freshell_protocol::{
     ServerMessage, TerminalOutputGap, TerminalOutputGapReason, TerminalReplayCredit,
 };
 use freshell_terminal::{
-    FrameSink, PacedPage, PacedSessionDesc, PacedTailCompletion, PacedTailPage, TerminalRegistry,
+    FrameSink, PacedPage, PacedSessionDesc, PacedTailCompletion, TerminalRegistry,
 };
 
 /// One active paced replay session for a (connection, terminal). Owned by
@@ -171,16 +178,18 @@ pub(crate) fn validate_credit(
 /// interval plus the task-2 bounds fields, stamped with the session's
 /// generation.
 fn retention_gap(
-    session: &PacedSession,
+    terminal_id: &str,
+    stream_id: &str,
+    attach_request_id: &str,
     lost_from: i64,
     lost_to: i64,
     head_seq: i64,
     oldest_retained_seq: i64,
 ) -> ServerMessage {
     ServerMessage::TerminalOutputGap(TerminalOutputGap {
-        terminal_id: session.terminal_id.clone(),
-        stream_id: session.stream_id.clone(),
-        attach_request_id: Some(session.attach_request_id.clone()),
+        terminal_id: terminal_id.to_string(),
+        stream_id: stream_id.to_string(),
+        attach_request_id: Some(attach_request_id.to_string()),
         from_seq: lost_from,
         to_seq: lost_to,
         reason: TerminalOutputGapReason::ReplayWindowExceeded,
@@ -196,9 +205,11 @@ pub(crate) enum DriveOutcome {
     /// A replay page is outstanding (uncredited); the session waits for the
     /// next credit.
     Active,
-    /// The session completed: the tail drained and the registry cleared the
-    /// deferral (the `ws.restore.paced_complete` event is emitted here).
-    Completed,
+    /// The credited replay phase is DONE — the fixed attach-time target is
+    /// covered. The caller hands the session to the spawned drain task
+    /// ([`spawn_paced_drain`]); the un-credited drain never runs on the
+    /// connection dispatcher.
+    DrainReady,
     /// The terminal (or the connection's subscriber) disappeared — the
     /// session is cancelled; the registry has no deferral left to clear.
     Gone,
@@ -256,7 +267,9 @@ pub(crate) fn drive_session(
                     oldest_retained_seq,
                 } => {
                     sink(retention_gap(
-                        session,
+                        &session.terminal_id,
+                        &session.stream_id,
+                        &session.attach_request_id,
                         lost_from,
                         lost_to,
                         head_seq,
@@ -283,218 +296,179 @@ pub(crate) fn drive_session(
             }
         }
     }
-    // Tail phase: ordinary, budget-bounded delivery of the accumulated
-    // live range toward the FIXED tail target (the head at tail-start).
-    let tail_target = match registry.replay_bounds(&session.terminal_id) {
-        Some(bounds) => bounds.head_seq,
-        None => {
-            tracing::warn!(
-                terminal_id = %session.terminal_id,
-                attach_request_id = %session.attach_request_id,
-                "ws.restore.paced_gone"
-            );
-            return DriveOutcome::Gone;
-        }
-    };
-    while session.page_end < tail_target {
-        match registry.next_paced_tail_page(
-            &session.terminal_id,
-            conn_id,
-            session.page_end,
-            tail_target,
-            budget,
-        ) {
-            PacedTailPage::Frames {
-                messages,
-                end_seq,
-                serialized_bytes,
-            } => {
-                for message in messages {
-                    sink(message);
+    DriveOutcome::DrainReady
+}
+
+/// Spawn the session's UN-CREDITED drain (the accumulated live range after
+/// the credited replay covered its fixed target). The drain runs OFF the
+/// connection dispatcher — a sustained producer can hold it open through
+/// real backpressure for as long as the client takes to consume the
+/// backlog, and the dispatcher must keep servicing input, other panes,
+/// and control traffic meanwhile (the inline-drain structure this
+/// replaces monopolized the dispatcher for the drain's whole duration,
+/// starving same-connection input).
+///
+/// The drain target is the head captured ONCE at drain start — NEVER
+/// re-captured: when the target is covered, the registry's completing
+/// verdict re-fans the frames produced after it through the normal live
+/// fan-out path and clears the deferral atomically in the same lock hold
+/// (`PacedTailCompletion::Completed`), so a sustained producer can never
+/// turn the drain into a moving-head chase. Between pages the task waits
+/// on the connection queue's REAL backpressure (the writer's backlog
+/// watermark — the sink itself admits without yielding and evicts past
+/// the byte limit, so this gate is what bounds the drain and keeps it
+/// from self-spilling its own unconsumed pages). `cancel` fires on the
+/// connection's teardown (any exit reason), bounding the task's lifetime
+/// with the connection's own.
+///
+/// Page order, the deferral contract, and lock discipline are preserved:
+/// the session leaves `PacedSessions` when it enters the drain (credits
+/// during the drain are stale generations — observed, inert), only this
+/// task produces the drain's pages (single producer, ascending seq), the
+/// registry's per-terminal lock is never held across pages, and the
+/// generation guard inside `TerminalRegistry::complete_paced_tail`
+/// refuses the drain the moment a re-attach supersedes its attach
+/// generation (the off-dispatch drain can race the dispatcher's
+/// re-attach handling; the guard makes that race inert).
+pub(crate) fn spawn_paced_drain(
+    registry: TerminalRegistry,
+    conn_id: u64,
+    writer: crate::terminal::WsSink,
+    sink: FrameSink,
+    mut session: PacedSession,
+    budget: i64,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        let terminal_id = session.terminal_id.clone();
+        let stream_id = session.stream_id.clone();
+        let attach_request_id = session.attach_request_id.clone();
+        // The FIXED drain target: captured ONCE, never reassigned.
+        let drain_target = match registry.replay_bounds(&terminal_id) {
+            Some(bounds) => bounds.head_seq,
+            None => {
+                tracing::warn!(
+                    terminal_id = %terminal_id,
+                    attach_request_id = %attach_request_id,
+                    "ws.restore.paced_gone"
+                );
+                return;
+            }
+        };
+        loop {
+            // REAL backpressure first: while the connection queue holds a
+            // backlog at/above the watermark, wait for the writer pump to
+            // drain real frames (or the connection to die — the cancel
+            // path is the escape).
+            tokio::select! {
+                _ = writer.wait_backlog_below_watermark() => {}
+                _ = cancel.changed() => {
+                    tracing::debug!(
+                        terminal_id = %terminal_id,
+                        attach_request_id = %attach_request_id,
+                        "ws.restore.paced_drain_cancelled"
+                    );
+                    return;
                 }
-                tracing::debug!(
-                    terminal_id = %session.terminal_id,
+            }
+            match registry.complete_paced_tail(
+                &terminal_id,
+                conn_id,
+                &attach_request_id,
+                session.page_end,
+                drain_target,
+                budget,
+            ) {
+                PacedTailCompletion::Handoff {
                     end_seq,
                     serialized_bytes,
-                    "ws.restore.paced_tail_page"
-                );
-                session.page_end = end_seq;
-                session.pages += 1;
-            }
-            PacedTailPage::Expired {
-                lost_from,
-                lost_to,
-                resume_from,
-                head_seq,
-                oldest_retained_seq,
-            } => {
-                sink(retention_gap(
-                    session,
-                    lost_from,
-                    lost_to,
-                    head_seq,
-                    oldest_retained_seq,
-                ));
-                tracing::info!(
-                    terminal_id = %session.terminal_id,
+                } => {
+                    tracing::debug!(
+                        terminal_id = %terminal_id,
+                        end_seq,
+                        serialized_bytes,
+                        "ws.restore.paced_tail_page"
+                    );
+                    session.page_end = end_seq;
+                    session.pages += 1;
+                }
+                PacedTailCompletion::Expired {
                     lost_from,
                     lost_to,
                     resume_from,
-                    "ws.restore.paced_expired"
-                );
-                session.page_end = resume_from;
-            }
-            PacedTailPage::CaughtUp => {
-                // The ring drained at or below the cursor (a quiet or
-                // slower terminal): the registry's atomic clear already
-                // fired inside the page read.
-                tracing::info!(
-                    terminal_id = %session.terminal_id,
-                    attach_request_id = %session.attach_request_id,
-                    last_seq = session.page_end,
-                    pages = session.pages,
-                    "ws.restore.paced_complete"
-                );
-                return DriveOutcome::Completed;
-            }
-            PacedTailPage::AtBoundary => break, // fixed target covered -> complete
-            PacedTailPage::Gone => {
-                tracing::warn!(
-                    terminal_id = %session.terminal_id,
-                    attach_request_id = %session.attach_request_id,
-                    "ws.restore.paced_gone"
-                );
-                return DriveOutcome::Gone;
-            }
-        }
-    }
-    // The PAGED completion: the staged remainder drains through the SAME
-    // budget-bounded paging as the replay — one page per call, the
-    // deferral cleared only at completion (the drained clear, or the final
-    // page that covers everything staged, sunk and cleared in one lock
-    // hold). The completion loops toward a FIXED target (the head
-    // captured at completion start), re-capturing only when a target is
-    // covered — it never chases a moving head within a round, and sink
-    // backpressure (the writer queue's admission-controlled push) bounds
-    // the loop against the connection queue. A retention advance past
-    // the drain cursor reports the exact bounds-carrying gap and resumes
-    // from the ring front — never a silent forward jump.
-    let mut completion_target = match registry.replay_bounds(&session.terminal_id) {
-        Some(bounds) => bounds.head_seq,
-        None => {
-            tracing::warn!(
-                terminal_id = %session.terminal_id,
-                attach_request_id = %session.attach_request_id,
-                "ws.restore.paced_gone"
-            );
-            return DriveOutcome::Gone;
-        }
-    };
-    loop {
-        match registry.complete_paced_tail(
-            &session.terminal_id,
-            conn_id,
-            session.page_end,
-            completion_target,
-            budget,
-        ) {
-            PacedTailCompletion::CaughtUp => break,
-            PacedTailCompletion::Completed { end_seq, .. } => {
-                session.page_end = end_seq;
-                session.pages += 1;
-                break;
-            }
-            PacedTailCompletion::Handoff {
-                end_seq,
-                serialized_bytes,
-            } => {
-                tracing::debug!(
-                    terminal_id = %session.terminal_id,
-                    end_seq,
-                    serialized_bytes,
-                    "ws.restore.paced_tail_handoff"
-                );
-                session.page_end = end_seq;
-                session.pages += 1;
-                if end_seq >= completion_target {
-                    // Fixed target covered: re-capture for the next bounded
-                    // round (the terminal kept producing beyond it).
-                    completion_target = match registry.replay_bounds(&session.terminal_id) {
-                        Some(bounds) => bounds.head_seq,
-                        None => {
-                            tracing::warn!(
-                                terminal_id = %session.terminal_id,
-                                attach_request_id = %session.attach_request_id,
-                                "ws.restore.paced_gone"
-                            );
-                            return DriveOutcome::Gone;
-                        }
-                    };
-                }
-            }
-            PacedTailCompletion::AtTarget => {
-                completion_target = match registry.replay_bounds(&session.terminal_id) {
-                    Some(bounds) => bounds.head_seq,
-                    None => {
-                        tracing::warn!(
-                            terminal_id = %session.terminal_id,
-                            attach_request_id = %session.attach_request_id,
-                            "ws.restore.paced_gone"
-                        );
-                        return DriveOutcome::Gone;
-                    }
-                };
-            }
-            PacedTailCompletion::Expired {
-                lost_from,
-                lost_to,
-                resume_from,
-                head_seq,
-                oldest_retained_seq,
-            } => {
-                sink(retention_gap(
-                    session,
-                    lost_from,
-                    lost_to,
                     head_seq,
                     oldest_retained_seq,
-                ));
-                tracing::info!(
-                    terminal_id = %session.terminal_id,
-                    lost_from,
-                    lost_to,
-                    resume_from,
-                    "ws.restore.paced_expired"
-                );
-                session.page_end = resume_from;
-            }
-            PacedTailCompletion::Gone => {
-                tracing::warn!(
-                    terminal_id = %session.terminal_id,
-                    attach_request_id = %session.attach_request_id,
-                    "ws.restore.paced_gone"
-                );
-                return DriveOutcome::Gone;
+                } => {
+                    sink(retention_gap(
+                        &terminal_id,
+                        &stream_id,
+                        &attach_request_id,
+                        lost_from,
+                        lost_to,
+                        head_seq,
+                        oldest_retained_seq,
+                    ));
+                    tracing::info!(
+                        terminal_id = %terminal_id,
+                        lost_from,
+                        lost_to,
+                        resume_from,
+                        "ws.restore.paced_expired"
+                    );
+                    session.page_end = resume_from;
+                }
+                PacedTailCompletion::CaughtUp => {
+                    // The ring drained at or below the cursor (a quiet or
+                    // slower terminal): the registry's atomic clear
+                    // already fired inside the page read.
+                    tracing::info!(
+                        terminal_id = %terminal_id,
+                        attach_request_id = %attach_request_id,
+                        last_seq = session.page_end,
+                        pages = session.pages,
+                        "ws.restore.paced_complete"
+                    );
+                    return;
+                }
+                PacedTailCompletion::Completed { end_seq, .. } => {
+                    // THE FIXED-TARGET ATOMIC LIVE HANDOFF: the page
+                    // covered the drain target, the frames produced
+                    // after it were re-fanned through the live path, and
+                    // the deferral cleared — all under the completing
+                    // page read's lock hold.
+                    session.page_end = session.page_end.max(end_seq);
+                    session.pages += 1;
+                    tracing::info!(
+                        terminal_id = %terminal_id,
+                        attach_request_id = %attach_request_id,
+                        last_seq = session.page_end,
+                        pages = session.pages,
+                        "ws.restore.paced_complete"
+                    );
+                    return;
+                }
+                PacedTailCompletion::Gone => {
+                    tracing::warn!(
+                        terminal_id = %terminal_id,
+                        attach_request_id = %attach_request_id,
+                        "ws.restore.paced_gone"
+                    );
+                    return;
+                }
             }
         }
-    }
-    tracing::info!(
-        terminal_id = %session.terminal_id,
-        attach_request_id = %session.attach_request_id,
-        last_seq = session.page_end,
-        pages = session.pages,
-        "ws.restore.paced_complete"
-    );
-    DriveOutcome::Completed
+    });
 }
 
 /// Begin one negotiated session after a paced attach: sink the first page
 /// (produced under the attach lock; sunk now that it is released), emit
-/// `ws.restore.paced_start`, and — ONLY when the first page already reached
-/// the target — run the initial tail drain (an attach with a short or empty
-/// replay completes without ever needing a credit). A first page that is a
-/// bounded prefix leaves the session ACTIVE with exactly ONE outstanding
-/// page: the next page is produced on the first credit, never before.
+/// `ws.restore.paced_start`, and — when the first page already reached the
+/// target — hand the session straight to the spawned drain (an attach with
+/// a short or empty replay drains to completion without ever needing a
+/// credit, still OFF the dispatcher). A first page that is a bounded
+/// prefix leaves the session ACTIVE with exactly ONE outstanding page:
+/// the next page is produced on the first credit, never before.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn start_session(
     registry: &TerminalRegistry,
     conn_id: u64,
@@ -503,6 +477,8 @@ pub(crate) fn start_session(
     start: freshell_terminal::PacedAttachStart,
     requested_since_seq: i64,
     max_replay_bytes: Option<i64>,
+    writer: crate::terminal::WsSink,
+    cancel: tokio::sync::watch::Receiver<bool>,
 ) {
     let page_bytes = start.session.page_bytes;
     let mut session = PacedSession::from_desc(start.session);
@@ -522,11 +498,24 @@ pub(crate) fn start_session(
     if session.page_end >= session.target {
         let budget = registry.paced_page_max_bytes();
         match drive_session(registry, conn_id, sink, &mut session, budget) {
-            // The tail drain never returns Active — but if it somehow did,
-            // keeping the session installed is the safe arm (the next credit
-            // drives it) rather than dropping live-ordering state.
-            DriveOutcome::Active => sessions.insert(session),
-            DriveOutcome::Completed | DriveOutcome::Gone => {}
+            DriveOutcome::Active => {
+                // The replay phase still has window left (the drive cannot
+                // return Active from a covered target — the safe arm keeps
+                // the session credited-phase-active).
+                sessions.insert(session);
+            }
+            DriveOutcome::DrainReady => {
+                spawn_paced_drain(
+                    registry.clone(),
+                    conn_id,
+                    writer,
+                    Arc::clone(sink),
+                    session,
+                    registry.paced_page_max_bytes(),
+                    cancel,
+                );
+            }
+            DriveOutcome::Gone => {}
         }
     } else {
         // The first page is the one outstanding, uncredited page.
