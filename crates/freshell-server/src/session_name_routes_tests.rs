@@ -635,6 +635,88 @@ async fn scoped_reset_is_refused_on_every_surface() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// Delta-review round 3, finding 8: an unknown `nameIntent` string (a typo
+/// like `"User"`) must be rejected loudly by the convenience routes, exactly
+/// as the canonical PATCH route rejects it (serde enum) and the CLI/MCP
+/// reject it — never silently defaulted to `automatic`, which quietly strips
+/// an intended rename's permanence. The safe direction is preserved either
+/// way: rejection forces the caller to state the intent correctly.
+#[tokio::test]
+async fn an_unknown_name_intent_is_rejected_loudly_not_silently_defaulted() {
+    let home = temp_home();
+    let state = names_state(&home);
+    let names = state.names.clone();
+    admit_pending(&names, "handle-intent", NamedProvider::Claude, Some("/w")).await;
+    bind_verified(
+        &names,
+        "handle-intent",
+        NamedProvider::Claude,
+        "sess-intent-1",
+    )
+    .await;
+
+    // Control: the canonical PATCH route already rejects the typo loudly.
+    let (status, body) = {
+        let canonical = super::router(state.clone());
+        patch(
+            canonical,
+            "/api/session-names",
+            json!({
+                "target": { "kind": "session", "provider": "claude", "sessionId": "sess-intent-1" },
+                "name": "Typo Intent",
+                "nameIntent": "User",
+            }),
+        )
+        .await
+    };
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // The session convenience route must match: the typo is a 400, and the
+    // saved name is untouched (no silent automatic rename).
+    let (status, body) = {
+        let sessions = sessions_router(&home, &names);
+        patch(
+            sessions,
+            "/api/sessions/sess-intent-1?provider=claude",
+            json!({ "titleOverride": "Typo Intent", "nameIntent": "User" }),
+        )
+        .await
+    };
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a typoed nameIntent is rejected loudly, not silently defaulted: {body}"
+    );
+    let survivor = names
+        .get(vec![SessionNameRef::Session {
+            provider: NamedProvider::Claude,
+            session_id: "sess-intent-1".into(),
+        }])
+        .await
+        .unwrap()[0]
+        .clone();
+    assert_ne!(
+        survivor.record.name, "Typo Intent",
+        "no silent automatic rename happened"
+    );
+
+    // The valid intents and the omitted default still work through the same
+    // route (the loud gate must not over-apply).
+    for intent in [None, Some("user"), Some("automatic")] {
+        let (status, body) = {
+            let sessions = sessions_router(&home, &names);
+            patch(
+                sessions,
+                "/api/sessions/sess-intent-1?provider=claude",
+                json!({ "titleOverride": "Valid Intent", "nameIntent": intent }),
+            )
+            .await
+        };
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// A request that OMITS the title field still updates unrelated fields
 /// through the legacy session route (archive), and a scoped title rename
 /// never writes a competing settings override.

@@ -132,20 +132,37 @@ pub(crate) async fn rename_through_authority(
 }
 
 /// Parse the rename-intent fields a convenience route may carry alongside
-/// its legacy body: `nameIntent` (`user` | `automatic`, default automatic)
-/// and `ifRevision` (compare-and-set, JS-safe ceiling). Unknown values
-/// default rather than erroring — the intent default is a server contract,
-/// not a client assertion.
-pub(crate) fn parse_rename_intents(body: &Value) -> (NameIntent, Option<u64>) {
-    let intent = match body.get("nameIntent").and_then(Value::as_str) {
-        Some("user") => NameIntent::User,
-        _ => NameIntent::Automatic,
+/// its legacy body: `nameIntent` (`user` | `automatic`, default automatic
+/// when omitted) and `ifRevision` (compare-and-set, JS-safe ceiling).
+/// Delta-review round 3, finding 8: an UNKNOWN `nameIntent` string is a
+/// loud 400 (via [`Err`]), matching the canonical PATCH route's serde
+/// rejection and the CLI/MCP argument gates — never a silent default to
+/// `automatic`, which would quietly strip an intended rename's permanence
+/// behind a typo. The safe direction is preserved either way: rejection
+/// forces the caller to state the intent correctly.
+pub(crate) fn parse_rename_intents(body: &Value) -> Result<(NameIntent, Option<u64>), String> {
+    let intent = match body.get("nameIntent") {
+        None | Some(Value::Null) => NameIntent::Automatic,
+        Some(Value::String(text)) => match text.as_str() {
+            "user" => NameIntent::User,
+            "automatic" => NameIntent::Automatic,
+            other => {
+                return Err(format!(
+                    "nameIntent must be \"user\" or \"automatic\", got {other:?}"
+                ))
+            }
+        },
+        Some(other) => {
+            return Err(format!(
+                "nameIntent must be \"user\" or \"automatic\", got {other}"
+            ))
+        }
     };
     let if_revision = body
         .get("ifRevision")
         .and_then(Value::as_u64)
         .filter(|r| *r <= MAX_NAME_REVISION);
-    (intent, if_revision)
+    Ok((intent, if_revision))
 }
 
 /// `POST /api/session-names/read {refs}` → `{names: [SessionNameUpdate]}`.

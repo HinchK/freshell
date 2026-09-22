@@ -3209,11 +3209,39 @@ pub(crate) async fn rename_scoped_session(
                 .into_response();
         }
     }
-    let intent = match body.get("nameIntent").and_then(Value::as_str) {
-        Some("user") => freshell_protocol::session_names::NameIntent::User,
-        // Default omitted intent to `automatic` on every scoped rename —
-        // the plan's rule 3 (agent suggestions are provider_ai rank).
-        _ => freshell_protocol::session_names::NameIntent::Automatic,
+    // Delta-review round 3, finding 8: an unknown `nameIntent` string is a
+    // loud 400 — the same rejection the canonical PATCH route, CLI, and MCP
+    // apply — never a silent default to `automatic` behind a typo. Omitted
+    // intent still defaults to automatic (the plan's rule 3: agent
+    // suggestions are provider_ai rank and never acquire user permanence).
+    let intent = match body.get("nameIntent") {
+        None | Some(serde_json::Value::Null) => {
+            freshell_protocol::session_names::NameIntent::Automatic
+        }
+        Some(serde_json::Value::String(text)) => match text.as_str() {
+            "user" => freshell_protocol::session_names::NameIntent::User,
+            "automatic" => freshell_protocol::session_names::NameIntent::Automatic,
+            other => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": "Invalid request",
+                        "details": format!("nameIntent must be \"user\" or \"automatic\", got {other:?}"),
+                    })),
+                )
+                    .into_response();
+            }
+        },
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "Invalid request",
+                    "details": format!("nameIntent must be \"user\" or \"automatic\", got {other}"),
+                })),
+            )
+                .into_response();
+        }
     };
     let if_revision = body
         .get("ifRevision")

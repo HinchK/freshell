@@ -307,7 +307,19 @@ async fn scoped_session_rename(
         )
             .into_response();
     };
-    let (intent, if_revision) = crate::session_name_routes::parse_rename_intents(body);
+    let (intent, if_revision) = match crate::session_name_routes::parse_rename_intents(body) {
+        Ok(parsed) => parsed,
+        Err(details) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "Invalid request",
+                    "details": details,
+                })),
+            )
+                .into_response()
+        }
+    };
     let update = match crate::session_name_routes::rename_through_authority(
         sink.as_ref(),
         target,

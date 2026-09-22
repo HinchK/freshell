@@ -773,6 +773,67 @@ async fn rename_pane_routes_a_scoped_claude_pane_to_the_naming_authority() {
     );
 }
 
+/// Delta-review round 3, finding 8: an unknown `nameIntent` string (a typo
+/// like `"User"`) is a loud 400 on the pane/tab convenience routes too —
+/// the same rejection the canonical PATCH route, CLI, and MCP apply — never
+/// a silent default to `automatic` that quietly strips an intended rename's
+/// permanence.
+#[tokio::test]
+async fn pane_rename_with_an_unknown_name_intent_is_rejected_loudly() {
+    let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+    let state = state_with(tx.clone());
+    let sink = wire_recording_sink(&state);
+    seed_durable_record(&sink, "handle-typo", "sess-typo-1").await;
+    seed_layout(
+        &state,
+        lone_pane_layout(json!({
+            "kind": "terminal",
+            "mode": "claude",
+            "sessionRef": { "provider": "claude", "sessionId": "sess-typo-1" },
+        })),
+    );
+
+    let req = Request::builder()
+        .method("PATCH")
+        .uri("/api/panes/p1")
+        .header("content-type", "application/json")
+        .header("x-auth-token", "tok")
+        .body(Body::from(
+            json!({ "name": "Typo Intent", "nameIntent": "User" }).to_string(),
+        ))
+        .unwrap();
+    let resp = crate::router(state.clone()).oneshot(req).await.unwrap();
+    let status = resp.status();
+    let body = body_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a typoed nameIntent is rejected loudly, not silently defaulted: {body}"
+    );
+    let renames = sink.renames.lock().unwrap();
+    assert!(
+        renames.is_empty(),
+        "no silent automatic rename reached the authority: {renames:?}"
+    );
+    drop(renames);
+
+    // The valid values and the omitted default still work (the gate must
+    // not over-apply).
+    for intent in [None, Some("user"), Some("automatic")] {
+        let req = Request::builder()
+            .method("PATCH")
+            .uri("/api/panes/p1")
+            .header("content-type", "application/json")
+            .header("x-auth-token", "tok")
+            .body(Body::from(
+                json!({ "name": "Valid Intent", "nameIntent": intent }).to_string(),
+            ))
+            .unwrap();
+        let resp = crate::router(state.clone()).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "intent {intent:?} is valid");
+    }
+}
+
 /// Unified agent names (Task 2): A→B pane reuse routes each rename to the
 /// pane's CURRENT binding — the durable record the content names now —
 /// never carrying a label across sessions. No frames, no registry titles.
