@@ -572,10 +572,41 @@ async fn session_directory(
     // snapshot is captured — captured order is authoritative, and a seq
     // assigned pre-await would interleave with concurrent requests.
     let snapshot_seq = next_snapshot_seq();
+    // Delta-review round 4, finding 1: the page's KILROY-ONLY rows, answered
+    // by the ONE shared seam (`crate::kilroy_lane`) — metadata-typed kilroy
+    // AND no canonical record AND no live scoped terminal (the directory
+    // has no terminal registry, so the live component is skipped here; the
+    // record component owns the dual-mode decision, and a pending-only
+    // dual-mode row converges the moment its record binds). One metadata
+    // read per request, shared with the sessionType overlay below.
+    let metadata_entries = state.metadata.get_all().await;
+    let kilroy_only_lanes = {
+        let candidates: Vec<crate::kilroy_lane::KilroyLaneCandidate> = items
+            .iter()
+            .filter(|item| {
+                freshell_freshagent::naming::named_provider_for(Some(&item.provider), None)
+                    .is_some()
+            })
+            .map(|item| crate::kilroy_lane::KilroyLaneCandidate {
+                provider: item.provider.clone(),
+                session_id: item.session_id.clone(),
+                cwd: item.cwd.clone(),
+            })
+            .collect();
+        crate::kilroy_lane::kilroy_only_keys(
+            &metadata_entries,
+            state.identity.naming().as_ref(),
+            &state.identity,
+            None,
+            &candidates,
+        )
+        .await
+    };
     let items = apply_session_overrides(
         items,
         &state.settings.session_overrides(),
         state.legacy_name_migration_completed,
+        &kilroy_only_lanes,
     );
     // Task 20: read-join `sessionType` from the SESSION-06 metadata store --
     // ONE `get_all()` per request (a cached read; disk is touched at most
@@ -585,7 +616,7 @@ async fn session_directory(
     // `applyOverride` first, then the metadata `sessionType`) and BEFORE the
     // live-terminal join (the original's indexer output already carries
     // `sessionType` when `toItems` runs).
-    let items = apply_session_metadata(items, &state.metadata.get_all().await);
+    let items = apply_session_metadata(items, &metadata_entries);
     // Capture the revision before quarantining corrupt persisted rows. A
     // change to a conflicting source must still invalidate a client's cached
     // read model even though that source is not safe to render.
@@ -1131,10 +1162,19 @@ fn item_from_meta(
 /// retitle it. The never-migrated fields (`summaryOverride`, `archived`,
 /// `deleted`) still apply, and every out-of-scope provider keeps the
 /// legacy ladder verbatim.
+///
+/// Delta-review round 4, finding 1: `kilroy_only_lanes` (the shared seam's
+/// answer for this page) keeps the title lane OPEN for KILROY-ONLY rows —
+/// kilroy retains its existing UI, and the sweep still writes those rows'
+/// legacy-ladder titles, so closing the lane on the provider string alone
+/// would stop displaying them. A dual-mode row (canonical record through a
+/// supported mode) is never in the set, so its lane stays closed — the
+/// supported-mode record owns its ONE singular name.
 fn apply_session_overrides(
     items: Vec<DirItem>,
     overrides: &serde_json::Map<String, Value>,
     legacy_name_migration_completed: bool,
+    kilroy_only_lanes: &std::collections::HashSet<String>,
 ) -> Vec<DirItem> {
     let canonical_keys: std::collections::HashSet<String> =
         items.iter().map(DirItem::key).collect();
@@ -1157,10 +1197,12 @@ fn apply_session_overrides(
                     return None;
                 }
                 // The receipt gate: a scoped row's title consultation closes
-                // once the consolidation committed.
+                // once the consolidation committed — EXCEPT the
+                // kilroy-only rows, which keep the legacy lane.
                 let title_lane_open = !legacy_name_migration_completed
                     || freshell_freshagent::naming::named_provider_for(Some(&item.provider), None)
-                        .is_none();
+                        .is_none()
+                    || kilroy_only_lanes.contains(&canonical_key);
                 if title_lane_open {
                     if let Some(t) = ov.get("titleOverride").and_then(Value::as_str) {
                         // Node's applyOverride guard (`session-indexer.ts:210-214`):
@@ -3029,7 +3071,8 @@ mod tests {
         );
         overrides.insert("claude:gone".into(), json!({ "deleted": true }));
 
-        let overlaid = apply_session_overrides(items, &overrides, false);
+        let overlaid =
+            apply_session_overrides(items, &overrides, false, &std::collections::HashSet::new());
         assert_eq!(overlaid.len(), 1, "deleted item filtered out");
         let v = overlaid[0].to_value();
         assert_eq!(v["sessionId"], json!("keep"));
@@ -3086,7 +3129,8 @@ mod tests {
         // Receipt committed: the scoped row ignores the migrated title
         // fields (its canonical record owns the title)…
         let items = vec![mk("claude", "s1"), mk("amplifier", "a1")];
-        let out = apply_session_overrides(items, &overrides, true);
+        let out =
+            apply_session_overrides(items, &overrides, true, &std::collections::HashSet::new());
         let scoped = &out[0];
         assert_eq!(scoped.title.as_deref(), Some("parsed"));
         assert!(!scoped.title_overridden);
@@ -3103,7 +3147,8 @@ mod tests {
         // Pre-receipt behavior is unchanged: the scoped row still consults
         // the ladder.
         let items = vec![mk("claude", "s1"), mk("amplifier", "a1")];
-        let out = apply_session_overrides(items, &overrides, false);
+        let out =
+            apply_session_overrides(items, &overrides, false, &std::collections::HashSet::new());
         assert_eq!(out[0].title.as_deref(), Some("Resurrected Alias"));
         assert!(out[0].title_overridden);
     }
@@ -3149,7 +3194,12 @@ mod tests {
         );
 
         let overlaid = apply_session_metadata(
-            apply_session_overrides(vec![item.clone()], &overrides, false),
+            apply_session_overrides(
+                vec![item.clone()],
+                &overrides,
+                false,
+                &std::collections::HashSet::new(),
+            ),
             &metadata,
         );
         assert_eq!(overlaid[0].title.as_deref(), Some("Legacy rename"));
@@ -3164,7 +3214,12 @@ mod tests {
             json!({ "sessionType": "freshclaude-canonical" }),
         );
         let canonical = apply_session_metadata(
-            apply_session_overrides(vec![item], &overrides, false),
+            apply_session_overrides(
+                vec![item],
+                &overrides,
+                false,
+                &std::collections::HashSet::new(),
+            ),
             &metadata,
         );
         assert_eq!(canonical[0].title.as_deref(), Some("Canonical rename"));
@@ -3222,7 +3277,12 @@ mod tests {
         )]);
 
         let overlaid = apply_session_metadata(
-            apply_session_overrides(vec![original, copied], &overrides, false),
+            apply_session_overrides(
+                vec![original, copied],
+                &overrides,
+                false,
+                &std::collections::HashSet::new(),
+            ),
             &metadata,
         );
         let original = overlaid
@@ -3269,7 +3329,12 @@ mod tests {
             provider_title: None,
             title_override_source: None,
         };
-        let overlaid = apply_session_overrides(vec![item], &serde_json::Map::new(), false);
+        let overlaid = apply_session_overrides(
+            vec![item],
+            &serde_json::Map::new(),
+            false,
+            &std::collections::HashSet::new(),
+        );
         let v = overlaid[0].to_value();
         // Oracle-compat: archived is ALWAYS present, defaulted false.
         assert_eq!(v["archived"], json!(false));
@@ -3322,7 +3387,12 @@ mod tests {
     fn overlaid_title(item: DirItem, row: Value) -> Option<String> {
         let mut overrides = serde_json::Map::new();
         overrides.insert(item.key(), row);
-        let out = apply_session_overrides(vec![item], &overrides, false);
+        let out = apply_session_overrides(
+            vec![item],
+            &overrides,
+            false,
+            &std::collections::HashSet::new(),
+        );
         out[0].title.clone()
     }
 
@@ -3413,6 +3483,7 @@ mod tests {
             vec![guard_item("s1", Some("provider-generated"))],
             &overrides,
             false,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(out[0].title.as_deref(), Some("Provider Title"));
         assert_eq!(out[0].summary.as_deref(), Some("sum"));
@@ -3459,7 +3530,12 @@ mod tests {
             "claude:sess-1".to_string(),
             json!({ "titleOverride": "Accidental pane label", "titleSource": "user" }),
         );
-        let out = apply_session_overrides(vec![item], &overrides, false);
+        let out = apply_session_overrides(
+            vec![item],
+            &overrides,
+            false,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out.len(), 1);
         let v = out[0].to_value();
         assert_eq!(v["title"], json!("Accidental pane label"));
@@ -3480,7 +3556,12 @@ mod tests {
             item.key(),
             json!({ "titleOverride": "proj", "titleSource": "dir" }),
         );
-        let out = apply_session_overrides(vec![item], &overrides, false);
+        let out = apply_session_overrides(
+            vec![item],
+            &overrides,
+            false,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out.len(), 1);
         let v = out[0].to_value();
         assert_eq!(v["title"], json!("Provider Title"));
@@ -3502,7 +3583,12 @@ mod tests {
             "amplifier:s1".to_string(),
             json!({ "titleOverride": "Hand-edited rename", "titleSource": "bogus-value" }),
         );
-        let out = apply_session_overrides(vec![guard_item("s1", None)], &overrides, false);
+        let out = apply_session_overrides(
+            vec![guard_item("s1", None)],
+            &overrides,
+            false,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(out.len(), 1);
         let v = out[0].to_value();
         assert_eq!(v["title"], json!("Hand-edited rename"));
@@ -3886,6 +3972,191 @@ mod tests {
         // …while the out-of-scope provider keeps the legacy ladder verbatim.
         assert_eq!(a1["title"], json!("Amplifier Ladder Stays"));
         assert_eq!(a1["titleOverridden"], json!(true));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// Delta-review round 4, finding 1 (the directory's post-migration title
+    /// lane): a KILROY-ONLY row keeps displaying the legacy-ladder title
+    /// the sweep deliberately still writes for it. Once the consolidation
+    /// receipt commits, the provider string alone must not close the
+    /// settings title lane — the shared kilroy-lane seam (metadata-typed
+    /// kilroy, no canonical record, no live scoped terminal) keeps the row
+    /// in the legacy lane, and no `sessionName` projection exists for it
+    /// (the sweep's guarantee: a kilroy-only session never has a record).
+    #[tokio::test]
+    async fn kilroy_only_rows_keep_displaying_legacy_titles_after_the_migration_receipt() {
+        use tower::ServiceExt;
+
+        let home = unique_temp_dir();
+        std::fs::create_dir_all(home.join(".freshell")).unwrap();
+        let settings = crate::settings_store::SettingsStore::load(
+            Some(&home),
+            vec!["claude".into(), "amplifier".into()],
+        );
+        // The legacy override row the sweep's kilroy ladder still writes.
+        settings
+            .patch_session_override(
+                "claude:k1",
+                &[
+                    ("titleOverride", Some(json!("Kilroy Legacy Title"))),
+                    ("titleSource", Some(json!("user"))),
+                ],
+            )
+            .await;
+        // The SPA's own sessionType tag — the ONLY thing that says this
+        // provider-`claude` session is kilroy.
+        let metadata = crate::session_metadata::SessionMetadataStore::new(home.join(".freshell"));
+        metadata
+            .set("claude", "k1", "kilroy", Some("explicit"))
+            .await
+            .unwrap();
+        // The naming authority wired the way production wires it; the
+        // kilroy-only session holds NO record in it.
+        let names = crate::session_names::SessionNames::open(home.join(".freshell")).unwrap();
+        let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+        identity.set_session_naming(names.clone());
+        let app = router(SessionDirectoryState {
+            auth_token: Arc::new("tok".to_string()),
+            settings,
+            session_index: Some(Arc::new(test_session_index(vec![Arc::new(
+                StaticSessionSource {
+                    items: vec![static_indexed_session("claude", "k1", "/p/k1.jsonl", 100)],
+                },
+            )]))),
+            identity,
+            metadata,
+            server_instance: Arc::new("srv-test".to_string()),
+            legacy_name_migration_completed: true,
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible&includeNonInteractive=1")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        let item = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["sessionId"] == json!("k1"))
+            .expect("k1 present");
+        assert_eq!(
+            item["title"],
+            json!("Kilroy Legacy Title"),
+            "a kilroy-only row keeps displaying its legacy-ladder title: {item}"
+        );
+        assert_eq!(item["titleOverridden"], json!(true));
+        assert!(
+            item.get("sessionName").is_none(),
+            "no canonical record exists to project: {item}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The singular-name half of the same lane decision: a kilroy-typed row
+    /// whose session holds a canonical record through the claude mode
+    /// (dual-mode) keeps the lane CLOSED — the supported-mode record owns
+    /// the session's ONE name (here a low-rank fallback, so the parsed
+    /// title stands and the record rides additively), and the leftover
+    /// legacy override never resurfaces as a competing title.
+    #[tokio::test]
+    async fn a_record_holding_kilroy_typed_row_keeps_the_title_lane_closed() {
+        use tower::ServiceExt;
+
+        let home = unique_temp_dir();
+        std::fs::create_dir_all(home.join(".freshell")).unwrap();
+        let settings = crate::settings_store::SettingsStore::load(
+            Some(&home),
+            vec!["claude".into(), "amplifier".into()],
+        );
+        settings
+            .patch_session_override(
+                "claude:k1",
+                &[
+                    ("titleOverride", Some(json!("Kilroy Legacy Title"))),
+                    ("titleSource", Some(json!("user"))),
+                ],
+            )
+            .await;
+        let metadata = crate::session_metadata::SessionMetadataStore::new(home.join(".freshell"));
+        metadata
+            .set("claude", "k1", "kilroy", Some("explicit"))
+            .await
+            .unwrap();
+        // The canonical record through the claude mode (the index-adopted
+        // hydration path) — the dual-mode singular-name owner.
+        let names = crate::session_names::SessionNames::open(home.join(".freshell")).unwrap();
+        names
+            .hydrate_indexed(
+                crate::session_name_generation::IndexedNameInput {
+                    provider: freshell_protocol::session_names::NamedProvider::Claude,
+                    session_id: "k1".to_string(),
+                    cwd: Some("/p".to_string()),
+                    first_user_message: Some("Scoped first".to_string()),
+                    provider_title: None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+        identity.set_session_naming(names.clone());
+        let app = router(SessionDirectoryState {
+            auth_token: Arc::new("tok".to_string()),
+            settings,
+            session_index: Some(Arc::new(test_session_index(vec![Arc::new(
+                StaticSessionSource {
+                    items: vec![static_indexed_session("claude", "k1", "/p/k1.jsonl", 100)],
+                },
+            )]))),
+            identity,
+            metadata,
+            server_instance: Arc::new("srv-test".to_string()),
+            legacy_name_migration_completed: true,
+        });
+        let resp = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("GET")
+                    .uri("/api/session-directory?priority=visible&includeNonInteractive=1")
+                    .header("x-auth-token", "tok")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let page: Value = serde_json::from_slice(&bytes).unwrap();
+        let item = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["sessionId"] == json!("k1"))
+            .expect("k1 present");
+        assert_ne!(
+            item["title"],
+            json!("Kilroy Legacy Title"),
+            "the record-holding session's name is the authority's alone: {item}"
+        );
+        assert_eq!(item["title"], json!("claude k1"));
+        assert_eq!(
+            item["sessionName"],
+            json!("Scoped first"),
+            "the canonical record rides the page additively: {item}"
+        );
         std::fs::remove_dir_all(&home).ok();
     }
 
@@ -5370,7 +5641,12 @@ mod tests {
             "claude:s1".into(),
             json!({ "titleOverride": "My Renamed Special Project" }),
         );
-        let overlaid = apply_session_overrides(vec![item], &overrides, false);
+        let overlaid = apply_session_overrides(
+            vec![item],
+            &overrides,
+            false,
+            &std::collections::HashSet::new(),
+        );
 
         let q = DirQuery {
             query: Some("Renamed Special".into()),
