@@ -124,9 +124,26 @@ vi.mock('@xterm/xterm', () => {
     open = vi.fn()
     loadAddon = vi.fn()
     registerLinkProvider = vi.fn(() => ({ dispose: vi.fn() }))
+    /**
+     * Honest-async test mode (round-4 F2): when `deferWrites` is set, a
+     * write's completion callback is HELD until the test releases it —
+     * modeling xterm's real asynchronous write completion. The default
+     * (false) keeps the historical synchronous callback so the existing
+     * suite's timing assumptions hold.
+     */
+    deferWrites = false
+    pendingWriteCallbacks: Array<() => void> = []
     write = vi.fn((_data: string, onWritten?: () => void) => {
+      if (this.deferWrites && onWritten) {
+        this.pendingWriteCallbacks.push(onWritten)
+        return
+      }
       onWritten?.()
     })
+    releasePendingWrites = () => {
+      const pending = this.pendingWriteCallbacks.splice(0)
+      for (const cb of pending) cb()
+    }
     writeln = vi.fn()
     clear = vi.fn()
     reset = vi.fn()
@@ -10629,6 +10646,20 @@ describe('TerminalView lifecycle updates', () => {
       term.write.mockClear()
       term.clear.mockClear()
       wsMocks.send.mockClear()
+      // Honest-async frames (round-4): the flush timing is REAL from here
+      // on — the clear and the content apply at flush time, never
+      // synchronously inside the message handler.
+      const pendingFrames: FrameRequestCallback[] = []
+      requestAnimationFrameSpy!.mockImplementation((cb: FrameRequestCallback) => {
+        pendingFrames.push(cb)
+        return pendingFrames.length
+      })
+      const flushFrames = async () => {
+        const frames = pendingFrames.splice(0)
+        await act(async () => {
+          for (const cb of frames) cb(0)
+        })
+      }
 
       act(() => {
         messageHandler!({
@@ -10639,6 +10670,7 @@ describe('TerminalView lifecycle updates', () => {
           reason: 'queue_overflow',
         })
       })
+      await flushFrames()
 
       const repair = repairAttaches()
       expect(repair.length).toBe(1)
@@ -10655,7 +10687,8 @@ describe('TerminalView lifecycle updates', () => {
       expectTerminalWriteContaining(term, 'Output gap 2-5: slow link backlog')
 
       // The hydrate's content establishes the new baseline: the surface
-      // is replaced exactly when the content arrives — never before.
+      // is replaced exactly when the content arrives — never before. The
+      // clear and the replacement apply as ONE flush-time unit.
       act(() => {
         messageHandler!({
           type: 'terminal.attach.ready',
@@ -10674,6 +10707,13 @@ describe('TerminalView lifecycle updates', () => {
           attachRequestId: repair[0]!.attachRequestId,
         })
       })
+      // BEFORE the flush: neither the clear nor the content applied — the
+      // pre-gap surface is intact (the round-4 atomic clear-then-write).
+      expect(term.clear).not.toHaveBeenCalled()
+      expect(
+        terminalWriteStrings(term).some((entry) => entry.includes('REBUILT')),
+      ).toBe(false)
+      await flushFrames()
       expect(term.clear).toHaveBeenCalledTimes(1)
       expectTerminalWriteContaining(term, 'REBUILT')
       expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
@@ -10806,6 +10846,18 @@ describe('TerminalView lifecycle updates', () => {
       messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'PRE-GAP-VISIBLE' })
       term.clear.mockClear()
       wsMocks.send.mockClear()
+      // Honest-async frames (round-4): real flush timing from here on.
+      const pendingFrames: FrameRequestCallback[] = []
+      requestAnimationFrameSpy!.mockImplementation((cb: FrameRequestCallback) => {
+        pendingFrames.push(cb)
+        return pendingFrames.length
+      })
+      const flushFrames = async () => {
+        const frames = pendingFrames.splice(0)
+        await act(async () => {
+          for (const cb of frames) cb(0)
+        })
+      }
 
       act(() => {
         messageHandler!({
@@ -10816,6 +10868,7 @@ describe('TerminalView lifecycle updates', () => {
           reason: 'queue_overflow',
         })
       })
+      await flushFrames()
 
       const repair = repairAttaches()
       expect(repair.length).toBe(1)
@@ -10847,6 +10900,7 @@ describe('TerminalView lifecycle updates', () => {
           attachRequestId: repair[0]!.attachRequestId,
         })
       })
+      await flushFrames()
 
       // The filtered frame rendered NOTHING: the clear must NOT have been
       // consumed, and the pre-gap surface is still the last thing written.
@@ -10858,7 +10912,8 @@ describe('TerminalView lifecycle updates', () => {
       expectTerminalWriteContaining(term, 'PRE-GAP-VISIBLE')
 
       // The clear is STILL ARMED: the next frame that will actually write
-      // bytes consumes it — clear-then-write, exactly once, at that frame.
+      // bytes consumes it — clear-then-write, exactly once, at that frame
+      // (applied at flush time as ONE atomic unit with the content).
       const clearCallsBefore = term.clear.mock.calls.length
       expect(clearCallsBefore).toBe(0)
       act(() => {
@@ -10871,6 +10926,9 @@ describe('TerminalView lifecycle updates', () => {
           attachRequestId: repair[0]!.attachRequestId,
         })
       })
+      // BEFORE the flush: the clear+write is queued, nothing applied.
+      expect(term.clear).not.toHaveBeenCalled()
+      await flushFrames()
       expect(term.clear).toHaveBeenCalledTimes(1)
       expectTerminalWriteContaining(term, 'REBUILT-LATE')
       const writes = term.write.mock.calls.map(([data]: [string]) => String(data)).join('')
@@ -10899,6 +10957,18 @@ describe('TerminalView lifecycle updates', () => {
       messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'PRE-GAP-VISIBLE' })
       term.clear.mockClear()
       wsMocks.send.mockClear()
+      // Honest-async frames (round-4): real flush timing from here on.
+      const pendingFrames: FrameRequestCallback[] = []
+      requestAnimationFrameSpy!.mockImplementation((cb: FrameRequestCallback) => {
+        pendingFrames.push(cb)
+        return pendingFrames.length
+      })
+      const flushFrames = async () => {
+        const frames = pendingFrames.splice(0)
+        await act(async () => {
+          for (const cb of frames) cb(0)
+        })
+      }
 
       act(() => {
         messageHandler!({
@@ -10909,6 +10979,7 @@ describe('TerminalView lifecycle updates', () => {
           reason: 'queue_overflow',
         })
       })
+      await flushFrames()
 
       const repair = repairAttaches()
       expect(repair.length).toBe(1)
@@ -10940,6 +11011,7 @@ describe('TerminalView lifecycle updates', () => {
           attachRequestId: repair[0]!.attachRequestId,
         })
       })
+      await flushFrames()
 
       // The duplicate was rejected: nothing rendered, nothing consumed.
       expect(term.clear).not.toHaveBeenCalled()
@@ -10950,7 +11022,7 @@ describe('TerminalView lifecycle updates', () => {
       expectTerminalWriteContaining(term, 'PRE-GAP-VISIBLE')
 
       // The clear is still armed: the next accepted writing frame
-      // clears-then-writes.
+      // clears-then-writes (applied at flush time as ONE atomic unit).
       act(() => {
         messageHandler!({
           type: 'terminal.output',
@@ -10961,9 +11033,272 @@ describe('TerminalView lifecycle updates', () => {
           attachRequestId: repair[0]!.attachRequestId,
         })
       })
+      // BEFORE the flush: the clear+write is queued, nothing applied.
+      expect(term.clear).not.toHaveBeenCalled()
+      await flushFrames()
       expect(term.clear).toHaveBeenCalledTimes(1)
       expectTerminalWriteContaining(term, 'REBUILT-LATE')
       expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+    })
+
+    it('a supersede between the armed clear and the flush preserves the OLD surface — clear and replacement write drop together', async () => {
+      // Round-4 F2 race (a), REAL async scheduling: the deferred clear is
+      // armed and the first replacement content enqueued, then a
+      // superseding attach lands BEFORE the animation-frame flush runs.
+      // The clear and the queued replacement write must drop TOGETHER
+      // (one generation-guarded queue item): a synchronous clear ahead
+      // of the write queue wipes the surface and the supersede then
+      // discards the replacement — the pre-gap content is gone forever.
+      wsMocks.capabilities = { pacedTerminalReplayV1: true }
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-clear-atomic-supersede',
+        ackInitialAttach: false,
+      })
+
+      const repairAttaches = () => sentMessages().filter(
+        (msg) => msg?.type === 'terminal.attach' && msg.terminalId === terminalId,
+      )
+
+      // A usable pre-gap surface (flushed under the default synchronous
+      // frame scheduling), then the frames go DEFERRED: the rest of the
+      // test runs with real flush timing under the test's control.
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'PRE-GAP-VISIBLE' })
+      term.clear.mockClear()
+      wsMocks.send.mockClear()
+      const pendingFrames: FrameRequestCallback[] = []
+      requestAnimationFrameSpy!.mockImplementation((cb: FrameRequestCallback) => {
+        pendingFrames.push(cb)
+        return pendingFrames.length
+      })
+      const flushFrames = async () => {
+        const frames = pendingFrames.splice(0)
+        await act(async () => {
+          for (const cb of frames) cb(0)
+        })
+      }
+
+      // The gap arms the deferred clear (the no-checkpoint fallback) and
+      // the first replacement content ENQUEUES the clear+write — nothing
+      // has flushed yet.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 2,
+          toSeq: 5,
+          reason: 'queue_overflow',
+        })
+      })
+      const repair = repairAttaches()
+      expect(repair.length).toBe(1)
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 5,
+          data: 'REPLACEMENT-BASE',
+          attachRequestId: repair[0]!.attachRequestId,
+        })
+      })
+      // The clear+write is QUEUED, not applied: with honest async
+      // scheduling NOTHING has hit xterm yet.
+      expect(term.clear).not.toHaveBeenCalled()
+      expect(
+        terminalWriteStrings(term).some((entry) => entry.includes('REPLACEMENT-BASE')),
+      ).toBe(false)
+
+      // THE SUPERSEDE: a further gap starts a NEW repair generation
+      // before the flush runs — the queued generation is dropped
+      // wholesale.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 6,
+          toSeq: 8,
+          reason: 'queue_overflow',
+        })
+      })
+      expect(repairAttaches().length).toBe(2)
+
+      // Now the flush runs: the dropped generation's clear AND write are
+      // gone together — the OLD surface survives intact.
+      await flushFrames()
+      expect(term.clear).not.toHaveBeenCalled()
+      expect(
+        terminalWriteStrings(term).some((entry) => entry.includes('REPLACEMENT-BASE')),
+        'the superseded replacement never mutates the surface',
+      ).toBe(false)
+      expectTerminalWriteContaining(term, 'PRE-GAP-VISIBLE')
+    })
+
+    it('the queue-overflow gap notice survives the immediate repair attach under real async scheduling', async () => {
+      // Round-4 F4 (Minor): the delivery-loss gap's honest local notice
+      // must SURVIVE the repair attach that fires in the same message
+      // handler. The repair mints a NEW generation with
+      // dropQueuedStaleWrites — a notice enqueued under the OLD
+      // generation is discarded before the animation-frame flush can
+      // render it (the pre-fix behavior, visible only with REAL flush
+      // timing — a synchronous rAF conceals the race). The notice is
+      // re-emitted under the NEW generation and renders.
+      wsMocks.capabilities = { pacedTerminalReplayV1: true }
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-gap-notice-survives-repair',
+      })
+
+      // A contiguous applied prefix establishes a valid checkpoint, so
+      // the repair is a DELTA resume (the notice is the only queued
+      // write in flight across the generation change).
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'ok' })
+      term.clear.mockClear()
+      term.write.mockClear()
+      wsMocks.send.mockClear()
+      const pendingFrames: FrameRequestCallback[] = []
+      requestAnimationFrameSpy!.mockImplementation((cb: FrameRequestCallback) => {
+        pendingFrames.push(cb)
+        return pendingFrames.length
+      })
+      const flushFrames = async () => {
+        const frames = pendingFrames.splice(0)
+        await act(async () => {
+          for (const cb of frames) cb(0)
+        })
+      }
+
+      // The gap and its repair attach fire in ONE synchronous handler
+      // run; the flush happens only afterwards.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 2,
+          toSeq: 5,
+          reason: 'queue_overflow',
+        })
+      })
+      const repairAttaches = sentMessages().filter(
+        (msg) => msg?.type === 'terminal.attach' && msg.terminalId === terminalId,
+      )
+      expect(repairAttaches.length).toBe(1)
+
+      // Nothing has rendered yet (real async): the notice is queued.
+      expect(
+        terminalWriteStrings(term).some((entry) => entry.includes('Output gap 2-5')),
+      ).toBe(false)
+
+      // THE ASSERTION: the notice renders despite the repair attach's
+      // generation change — the honest notice survives the repair.
+      await flushFrames()
+      expectTerminalWriteContaining(term, 'Output gap 2-5: slow link backlog')
+    })
+
+    it('a stale in-flight write completes BEFORE the clear applies — no post-clear mutation', async () => {
+      // Round-4 F2 race (b), REAL async scheduling: a write is still in
+      // flight (its xterm completion callback has not run) when the
+      // deferred clear+replacement flush applies. The queue's serial
+      // flush must apply the in-flight bytes BEFORE the clear — a
+      // synchronous clear ahead of the queue wipes the surface first and
+      // the in-flight bytes then mutate the blank surface AFTER the
+      // clear. The in-flight item here is the repair's own honest gap
+      // notice (emitted under the NEW generation by the round-4 F4 fix),
+      // so this fixture also pins the notice's survival ACROSS the repair
+      // attach under real flush timing.
+      wsMocks.capabilities = { pacedTerminalReplayV1: true }
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-clear-atomic-inflight',
+        ackInitialAttach: false,
+      })
+
+      const repairAttaches = () => sentMessages().filter(
+        (msg) => msg?.type === 'terminal.attach' && msg.terminalId === terminalId,
+      )
+
+      // A usable pre-gap surface, flushed under the default synchronous
+      // scheduling; then BOTH the frames and the xterm write completions
+      // go deferred — real async from here on.
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'PRE-GAP-VISIBLE' })
+      term.clear.mockClear()
+      term.write.mockClear()
+      wsMocks.send.mockClear()
+      term.deferWrites = true
+      const pendingFrames: FrameRequestCallback[] = []
+      requestAnimationFrameSpy!.mockImplementation((cb: FrameRequestCallback) => {
+        pendingFrames.push(cb)
+        return pendingFrames.length
+      })
+      const flushFrames = async () => {
+        const frames = pendingFrames.splice(0)
+        await act(async () => {
+          for (const cb of frames) cb(0)
+        })
+      }
+
+      // The gap arms the deferred clear (the no-checkpoint fallback) and
+      // the repair's honest notice enqueues UNDER THE NEW generation —
+      // the pre-fix code enqueued it under the OLD generation (dropped
+      // at the mint) and cleared synchronously ahead of the queue.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 2,
+          toSeq: 3,
+          reason: 'queue_overflow',
+        })
+      })
+      const repair = repairAttaches()
+      expect(repair.length).toBe(1)
+
+      // Flush once: the notice goes IN FLIGHT (its completion callback
+      // is held by the deferred-write mock). Nothing else applies.
+      await flushFrames()
+      const noticeWriteOrder = term.write.mock.invocationCallOrder[
+        term.write.mock.calls.findIndex(([data]: [string]) => String(data).includes('Output gap 2-3'))
+      ]
+      expect(noticeWriteOrder).toBeGreaterThan(0)
+      expect(term.pendingWriteCallbacks.length).toBe(1)
+      expect(term.clear).not.toHaveBeenCalled()
+
+      // The repair's first replacement content ENQUEUES the clear+write
+      // behind the in-flight notice.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 6,
+          replayFromSeq: 4,
+          replayToSeq: 6,
+          attachRequestId: repair[0]!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 4,
+          seqEnd: 6,
+          data: 'REPLACEMENT-AFTER-CLEAR',
+          attachRequestId: repair[0]!.attachRequestId,
+        })
+      })
+      expect(term.clear).not.toHaveBeenCalled()
+
+      // The in-flight notice completes, THEN the queue applies the
+      // clear+write item: the notice bytes land BEFORE the clear — no
+      // post-clear mutation, and the honest notice survived the repair.
+      const clearCallsBefore = term.clear.mock.calls.length
+      term.releasePendingWrites()
+      await flushFrames()
+      expect(term.clear.mock.calls.length).toBe(clearCallsBefore + 1)
+      const clearOrder = term.clear.mock.invocationCallOrder[0]
+      expect(clearOrder).toBeTruthy()
+      expect(
+        noticeWriteOrder,
+        'the in-flight write completes before the clear applies — no post-clear mutation',
+      ).toBeLessThan(clearOrder!)
+      expectTerminalWriteContaining(term, 'REPLACEMENT-AFTER-CLEAR')
     })
 
     it('repeated negotiated queue_overflow gaps exhaust to the visible retry strip', async () => {

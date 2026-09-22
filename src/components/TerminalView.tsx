@@ -1282,16 +1282,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // (the server declared the prefix unreconstructible, so the pre-gap
   // screen is the best available surface and the existing honest-loss UX
   // proceeds; see the gap arm).
-  const consumeRepairContentReset = useCallback((terminalId: string, attachRequestId?: unknown): boolean => {
-    if (repairContentResetPendingRef.current !== attachRequestId) return false
+  // Round-4 F2: the consumption returns the clear as a THUNK instead of
+  // running it synchronously — the caller hands it to the write queue as
+  // `clearBeforeWrite`, so the clear applies INSIDE the same
+  // generation-guarded queue item as the replacement bytes (atomic
+  // clear-then-write at flush time: a dropped generation drops clear+write
+  // together, a stale generation is refused at apply time, and an
+  // in-flight earlier write completes before the clear runs). The two
+  // no-wipe retirement paths (death without content; the round-2
+  // declared-unreconstructible disarm) are unchanged.
+  const consumeRepairContentReset = useCallback((terminalId: string, attachRequestId?: unknown): (() => void) | null => {
+    if (repairContentResetPendingRef.current !== attachRequestId) return null
     repairContentResetPendingRef.current = null
-    try {
-      termRef.current?.clear()
-    } catch {
-      // disposed
+    return () => {
+      try {
+        termRef.current?.clear()
+      } catch {
+        // disposed
+      }
+      clearTerminalCursor(terminalId)
     }
-    clearTerminalCursor(terminalId)
-    return true
   }, [])
 
   // ── Paced terminal replay consumption (responsive-terminal-restore
@@ -2255,11 +2265,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     // above satisfies exhaustive-deps without new warnings.
   }, [mayFocusNow, suppressNetworkEffects, syncGeometryEpochForViewport, ws, tabId])
 
-  const enqueueTerminalWrite = useCallback((data: string, onWritten?: () => void, options?: TerminalWriteQueueOptions): boolean => {
+  const enqueueTerminalWrite = useCallback((
+    data: string,
+    onWritten?: () => void,
+    options?: TerminalWriteQueueOptions,
+    clearBeforeWrite?: () => void,
+  ): boolean => {
     if (!data) return false
     const queue = writeQueueRef.current
     if (queue) {
-      queue.enqueue(data, onWritten, options)
+      queue.enqueue(data, onWritten, clearBeforeWrite ? { ...options, clearBeforeWrite } : options)
       return true
     }
     const term = termRef.current
@@ -2274,6 +2289,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       suppressExternalSideEffects: mode === 'replay',
     })
     try {
+      // No write queue (the direct fallback): the clear runs
+      // synchronously immediately before the direct write — the same
+      // clear-then-write ordering, in one synchronous step.
+      clearBeforeWrite?.()
       term.write(data, () => {
         try {
           onWritten?.()
@@ -2406,17 +2425,24 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     }
 
     const submittedBytesEqualInput = cleaned === raw
-    // THE RENDER MOMENT (responsive-terminal-restore WS3, round-3 fix): a
-    // deferred repair clear consumes ONLY here — the sequence validator
-    // already accepted this frame (the caller runs the acceptance before
-    // submitting), and `cleaned` non-empty proves the frame's write path
-    // WILL write bytes to xterm. The clear runs immediately before the
-    // write is enqueued, so the surface is cleared-then-written; a
-    // rejected or fully filtered frame (cleaned === '') never reaches
+    // THE RENDER MOMENT (responsive-terminal-restore WS3, round-3 fix;
+    // round-4 atomicity): a deferred repair clear consumes ONLY here —
+    // the sequence validator already accepted this frame (the caller
+    // runs the acceptance before submitting), and `cleaned` non-empty
+    // proves the frame's write path WILL write bytes to xterm. The
+    // consumed clear is returned as a THUNK and handed to the write
+    // queue as `clearBeforeWrite` on the SAME generation-guarded item as
+    // the replacement write: the flush applies clear-then-write as ONE
+    // atomic unit — a dropped generation drops clear+write together
+    // (the old surface survives a disconnect/supersede mid-window), a
+    // stale-generation write can never apply after the clear (the
+    // generation is checked at apply time), and an in-flight earlier
+    // write completes BEFORE the clear runs (the queue is serial). A
+    // rejected or fully filtered frame (`cleaned === ''`) never reaches
     // this point and leaves the clear armed for the next writing frame.
     // Rejected/filtered frames of a LATER generation than the armed one
     // no-op the ref check inside, exactly like before.
-    let consumedDeferredClear = false
+    let consumedDeferredClear: (() => void) | null = null
     if (cleaned && tid) {
       consumedDeferredClear = consumeRepairContentReset(tid, writeOptions?.generation)
     }
@@ -2425,6 +2451,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           cleaned,
           submittedBytesEqualInput ? onParserApplied : undefined,
           writeOptions,
+          consumedDeferredClear ?? undefined,
         )
       : false
     if (consumedDeferredClear && !submittedWrite) {
@@ -5022,6 +5049,22 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           const pacedReplayNegotiated = isPacedReplayNegotiated()
           const isTruncatedReplay = msg.reason === 'replay_budget_exceeded'
             && seqStateRef.current.pendingReplay
+          // The delivery-loss repair decision (pure — computed from the
+          // pre-gap seq state; the state itself is applied further below).
+          // Hoisted ABOVE the notice branches so the queue_overflow /
+          // handoff_boundary_reached notice can be SUPPRESSED here and
+          // re-emitted UNDER THE REPAIR'S NEW generation below: the repair
+          // attach mints a new generation with dropQueuedStaleWrites, so a
+          // notice enqueued under the OLD generation is discarded before
+          // the animation-frame flush can render it (round-4 F4 — the
+          // honest notice must survive the repair).
+          const gapDecisionForNotice = onOutputGap(seqStateRef.current, {
+            fromSeq: msg.fromSeq,
+            toSeq: msg.toSeq,
+          })
+          const deliveryRepairPending = pacedReplayNegotiated
+            && (msg.reason === 'queue_overflow' || msg.reason === 'handoff_boundary_reached')
+            && gapDecisionForNotice.requiresSurfaceQuarantine
           // Retention gaps NEVER trigger an automatic OpenCode replacement
           // (responsive-terminal-restore WS2): the auto-kill path is removed
           // entirely — a retention gap is honest state, not a license to
@@ -5070,6 +5113,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             ) {
               repairContentResetPendingRef.current = null
             }
+          } else if (deliveryRepairPending) {
+            // Suppressed here — re-emitted UNDER THE REPAIR'S NEW
+            // generation below (round-4 F4): the repair attach's
+            // generation change drops queued stale writes, so this
+            // notice must ride the generation that actually owns the
+            // surface when it renders.
           } else {
             const reason = msg.reason === 'replay_window_exceeded'
               ? 'reconnect window exceeded'
@@ -5167,6 +5216,19 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
                 ...viewportHydrateReplayOptions(contentRef.current, pacedReplayNegotiated),
               })
             }
+            // THE HONEST NOTICE SURVIVES THE REPAIR (round-4 F4): the
+            // repair attach above minted the NEW generation (dropping the
+            // queued stale writes of the old one), so the delivery-loss
+            // notice is (re-)emitted HERE, under the NEW generation —
+            // the animation-frame flush renders it after the generation
+            // change instead of being discarded by it.
+            const noticeReason = msg.reason === 'handoff_boundary_reached'
+              ? 'restore boundary reached'
+              : 'slow link backlog'
+            writeLocalXtermNotice(
+              term,
+              `\r\n[Output gap ${msg.fromSeq}-${msg.toSeq}: ${noticeReason}]\r\n`,
+            )
           }
         }
 

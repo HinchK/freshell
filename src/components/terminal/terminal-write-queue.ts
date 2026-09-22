@@ -17,6 +17,16 @@ export type TerminalWriteQueueOptions = {
   mode?: TerminalWriteQueueMode
   generation?: string
   coalesce?: boolean
+  /**
+   * Atomic clear-then-write (round-4 F2): the flush invokes this callback
+   * immediately before the item's bytes go to the surface, INSIDE the same
+   * generation-guarded queue item — a dropped generation drops the clear
+   * and the write together (the surface is preserved), and a stale
+   * generation is refused at apply time so neither the clear nor the write
+   * ever runs late. An item carrying a clear never coalesces into a
+   * previous item (the clear is a hard boundary between byte ranges).
+   */
+  clearBeforeWrite?: () => void
 }
 
 type TerminalWriteQueueArgs = {
@@ -49,6 +59,7 @@ type WriteQueueItem = {
   mode: TerminalWriteQueueMode
   generation: string | undefined
   coalescible: boolean
+  clearBeforeWrite?: () => void
   data: string
   callbacks: Array<() => void>
 }
@@ -159,6 +170,12 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
     }
 
     try {
+      // Atomic clear-then-write: the clear runs INSIDE this item, at
+      // apply time — a dropped/stale generation never reaches this point,
+      // and the serial flush guarantees every earlier item's bytes (and
+      // completion) precede it, so nothing can mutate the surface after
+      // the clear except this item's own bytes.
+      item.clearBeforeWrite?.()
       args.write(item.data, onWritten)
     } catch (error) {
       if (!didWriteComplete) {
@@ -227,7 +244,11 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
       const callbacks = onWritten ? [onWritten] : []
       const previous = queue[queue.length - 1]
       if (
-        coalescible
+        // An item carrying a clear NEVER coalesces into a previous item:
+        // the clear must run between the previous bytes and this item's
+        // bytes, so it always starts a new queue item.
+        !options?.clearBeforeWrite
+        && coalescible
         && previous?.kind === 'write'
         && previous.coalescible
         && previous.mode === mode
@@ -237,7 +258,15 @@ export function createTerminalWriteQueue(args: TerminalWriteQueueArgs): Terminal
         previous.data += data
         previous.callbacks.push(...callbacks)
       } else {
-        queue.push({ kind: 'write', mode, generation, coalescible, data, callbacks })
+        queue.push({
+          kind: 'write',
+          mode,
+          generation,
+          coalescible,
+          clearBeforeWrite: options?.clearBeforeWrite,
+          data,
+          callbacks,
+        })
       }
       scheduleFlush()
     },
