@@ -111,11 +111,12 @@ fn stuck_detection_clears_on_meaningful_output() {
 
 #[test]
 fn stuck_detection_clears_on_user_input() {
-    // Input bumps BOTH clocks (registry.rs:1818-1820).
+    // Input bumps BOTH clocks (registry.rs:1818-1820) and returns
+    // `InputOutcome` (NOT a Result — do not unwrap).
     let reg = stuck_test_registry("opencode");
     reg.backdate_last_activity("T", /* window+1 ago */);
     reg.enforce_stuck_detection();
-    reg.input("T", b"x").unwrap_or_else(|e| panic!("{e:?}"));
+    let _ = reg.input("T", b"x"); // InputOutcome — assert the row-clock variant if desired
     let cleared = reg.enforce_stuck_detection();
     assert_eq!(cleared.len(), 1);
     assert!(!cleared[0].stuck);
@@ -123,7 +124,7 @@ fn stuck_detection_clears_on_user_input() {
 
 #[test]
 fn stuck_detection_ignores_shell_mode_and_exited_rows_and_under_window() {
-    // shell-mode row past the window → no transition.
+    // shell-mode row past the window with fresh activity → no transition.
     // agent-mode row under the window → no transition.
     // agent-mode row with status != Running → no transition (mirror how
     // the 5320 suite forces an Exited row; e.g. finish_pty_exit or the
@@ -131,10 +132,40 @@ fn stuck_detection_ignores_shell_mode_and_exited_rows_and_under_window() {
 }
 
 #[test]
+fn stuck_detection_ignores_prompt_idle_rows_where_both_clocks_are_stale() {
+    // The round-1 review pin: a pane sitting quietly at a prompt emits
+    // NOTHING — both clocks age together, so there is no repaint loop and
+    // the pane must NOT be flagged (flagging it would alter a non-wedged
+    // pane). Backdate BOTH clocks equally past the window; do NOT feed.
+    let reg = stuck_test_registry("opencode");
+    reg.backdate_last_activity("T", /* window+1 ago, both clocks */);
+    assert!(reg.enforce_stuck_detection().is_empty());
+}
+
+#[test]
+fn stuck_detection_clears_when_output_freezes_entirely() {
+    // A flagged pane whose repaint stream stops (activity goes stale) is no
+    // longer provably a repaint loop: clear the flag with a transition.
+    let reg = stuck_test_registry("opencode");
+    reg.backdate_last_activity("T", /* window+1 ago */);
+    // repaint feeds keep activity fresh → flagged
+    reg.feed("T", frame(1, "\r\x1b[2K⠋ repaint", "S"));
+    let t = reg.enforce_stuck_detection();
+    assert_eq!(t.len(), 1);
+    assert!(t[0].stuck);
+    // now backdate both clocks far past the freshness bound, feed nothing
+    reg.backdate_last_activity("T", /* window+1 ago again */);
+    let cleared = reg.enforce_stuck_detection();
+    assert_eq!(cleared.len(), 1);
+    assert!(!cleared[0].stuck);
+}
+
+#[test]
 fn stuck_detection_disabled_when_window_zero_or_negative() {
     let reg = stuck_test_registry("opencode");
     reg.set_stuck_window_ms(0);
     reg.backdate_last_activity("T", /* far past */);
+    reg.feed("T", frame(1, "\r\x1b[2K⠋", "S")); // activity fresh
     assert!(reg.enforce_stuck_detection().is_empty());
 }
 ```
@@ -185,9 +216,15 @@ fn opencode_tui_gradient_bar_spinner_cycle_is_noise_after_first_sweep() {
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
-Run: `cargo test -p freshell-terminal stuck_detection 2>&1 | tail -20` and `cargo test -p freshell-terminal opencode_tui 2>&1 | tail -20`
+Cargo compiles the whole crate test target before applying name filters, so run the two additions SEPARATELY in this order:
 
-Expected: FAIL — `stuck_detection_*` tests fail to compile (`enforce_stuck_detection`, `StuckTransition`, `set_stuck_window_ms` do not exist); the `opencode_tui` fixture test compiles and FAILS only if it mis-models the strip set (it should pass immediately against the existing scanner — it is a signal PIN, not new behavior; if it fails, the fixture is wrong, not the scanner).
+Run A (fixture pin only — add the `opencode_tui` test FIRST, alone): `cargo test -p freshell-terminal opencode_tui 2>&1 | tail -20`
+
+Expected: PASS — the fixture pins EXISTING scanner behavior (a characterization pin in the family of the codex-shimmer tests, idle_noise.rs:337-366); if it FAILS, the fixture mis-models the strip set and the fixture is wrong, not the scanner.
+
+Run B (then add the `stuck_detection_*` tests and run): `cargo test -p freshell-terminal stuck_detection 2>&1 | tail -20`
+
+Expected: FAIL to COMPILE — `enforce_stuck_detection`, `StuckTransition`, `set_stuck_window_ms` do not exist (the intended missing-behavior failure).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -243,12 +280,21 @@ pub struct StuckTransition {
     pub at: i64,
 }
 
-/// Flag/unflag agent-mode RUNNING terminals whose MEANINGFUL clock went
-/// stale past the stuck window. Emits transitions ONLY on state change
-/// (stuck:false→true and true→false); never kills, never emits a
-/// turn-complete, and unlike `enforce_idle_kills` does NOT exempt attached
-/// terminals — an attached wedged pane is the primary failure class this
-/// sweep exists for (see the 2026-09-18 opencode zombie RCA).
+/// Flag/unflag agent-mode RUNNING terminals whose MEANINGFUL clock went stale
+/// past the stuck window WHILE raw output keeps flowing (the two-clock
+/// differential the User Request's load-bearing constraint itself names:
+/// "last_meaningful_activity_at stale while last_activity_at stays fresh").
+/// The activity-freshness conjunct is what separates a WEDGED repaint loop
+/// (the eternal spinner keeps painting — raw output fresh) from a pane
+/// sitting quietly at a prompt or mid-idle (both clocks equally stale — NOT
+/// the requested detection class, and flagging it would alter non-wedged
+/// panes). Emits transitions ONLY on state change (stuck:false→true and
+/// true→false); never kills, never emits a turn-complete, and unlike
+/// `enforce_idle_kills` does NOT exempt attached terminals — an attached
+/// wedged pane is the primary failure class this sweep exists for (see the
+/// 2026-09-18 opencode zombie RCA). A wedged pane whose output later FREEZES
+/// entirely stops matching (no longer a repaint loop) and the flag clears —
+/// an accepted safe-direction residual.
 pub fn enforce_stuck_detection(&self) -> Vec<StuckTransition> {
     let window = self.stuck_window_ms();
     if window <= 0 { return Vec::new(); }
@@ -257,7 +303,8 @@ pub fn enforce_stuck_detection(&self) -> Vec<StuckTransition> {
     // Walk rows with the same locking pattern enforce_idle_kills uses;
     // for each row:
     //   should = s.status == Running && is_agent_mode(&s.mode)
-    //            && (now - s.last_meaningful_activity_at) > window;
+    //            && (now - s.last_meaningful_activity_at) > window
+    //            && (now - s.last_activity_at) < STUCK_ACTIVITY_FRESH_MS;
     //   match (s.stuck_since.is_some(), should) {
     //     (false, true) => { s.stuck_since = Some(now);
     //                       transitions.push(StuckTransition{ stuck: true, ..now }) }
@@ -269,7 +316,17 @@ pub fn enforce_stuck_detection(&self) -> Vec<StuckTransition> {
 }
 ```
 
-Note `is_agent_mode` is a private fn in the same file — call it directly. Do NOT touch `enforce_idle_kills` or `idle_noise.rs`. The predicate is MEANINGFUL-staleness ALONE — deliberately no `last_activity_at` freshness requirement (LB-2: the actual zombie's `lastActivityAt` was still FRESH on day 2 per the investigation's debug dump, while frozen-output wedges would keep it stale; staleness-alone fires under every observed reading) — and deliberately NO busy/turn-in-flight gate (the zombie class attaches to aborted sessions with no reliable turn state; a busy gate would produce false negatives on exactly the target class; idle-quiet false positives are the user-accepted tradeoff).
+with the freshness const next to the window consts:
+
+```rust
+/// How recent raw PTY output must be for a row to count as "still
+/// repainting". 5 minutes: far above the 30s sweep tick, generous to any
+/// degraded repaint cadence, and hours below the 2h meaningful-silence
+/// window — so the two conjuncts never fight on real wedges.
+pub const STUCK_ACTIVITY_FRESH_MS: i64 = 300_000;
+```
+
+Note `is_agent_mode` is a private fn in the same file — call it directly. Do NOT touch `enforce_idle_kills` or `idle_noise.rs`. The predicate is the TWO-CLOCK DIFFERENTIAL — meaningful-clock staleness AND activity-clock freshness together (the User Request's Explicit constraint names exactly this signal; the round-1 review caught the staleness-only variant flagging prompt-idle panes, which would alter non-wedged panes). Deliberately NO busy/turn-in-flight gate (the zombie class attaches to aborted sessions with no reliable turn state; a busy gate would produce false negatives on exactly the target class).
 
 - [ ] **Step 4: Run the focused test**
 
@@ -302,8 +359,9 @@ git commit -m "feat(terminal): registry stuck sweep flags agent panes past meani
 
 **Files:**
 - Modify: `crates/freshell-protocol/src/server_messages.rs` (enum ~line 126 area after `terminal.status`; consts ~line 183; struct near `TerminalIdle` ~line 527)
+- Modify: `crates/freshell-protocol/src/client_messages.rs` (`TerminalKill` struct — add `reason: Option<String>`)
 - Modify: `port/contract/ws-server-messages.schema.json` + `port/contract/ws-message-inventory.json` (via the generator — never by hand)
-- Modify: `shared/ws-protocol.ts` (Zod schema near `TerminalIdleSchema` line 351; ServerMessage union member near the `terminal.idle` member ~line 1650s)
+- Modify: `shared/ws-protocol.ts` (Zod schema near `TerminalIdleSchema` line 351 + `TerminalKillSchema` ~line 648 gains `reason: z.string().optional()`; ServerMessage union member near the `terminal.idle` member ~line 1650s)
 - Test: `test/unit/client/lib/terminal-stuck-ws.test.ts` (new) and the contract freeze suite
 
 **Interfaces:**
@@ -416,8 +474,8 @@ Expected: PASS.
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-protocol/src/server_messages.rs shared/ws-protocol.ts port/contract/ws-server-messages.schema.json port/contract/ws-message-inventory.json
-git commit -m "feat(protocol): additive terminal.stuck server message (wedge-backstop)"
+git add crates/freshell-protocol/src/server_messages.rs crates/freshell-protocol/src/client_messages.rs shared/ws-protocol.ts port/contract/ws-server-messages.schema.json port/contract/ws-message-inventory.json crates/freshell-protocol/tests/inventory.rs test/unit/port/ws-contract-freeze.test.ts test/unit/client/lib/terminal-stuck-ws.test.ts
+git commit -m "feat(protocol): additive terminal.stuck server message + terminal.kill reason (wedge-backstop)"
 ```
 
 ---
@@ -426,52 +484,94 @@ git commit -m "feat(protocol): additive terminal.stuck server message (wedge-bac
 
 **Files:**
 - Modify: `crates/freshell-ws/src/lib.rs` (after `spawn_idle_monitor`, ~line 533)
+- Modify: `crates/freshell-ws/src/terminal.rs` (kill handler ~7699-7985: the `stuck-recovery` reason branch)
 - Modify: `crates/freshell-server/src/main.rs` (~lines 1131-1145 idle-monitor wiring area)
-- Modify: `crates/freshell-terminal/src/registry.rs` (`attach` — enqueue stuck frame to new subscribers; ~lines 1509-1734)
+- Modify: `crates/freshell-terminal/src/registry.rs` (attach — enqueue the current stuck truth to new subscribers; ~lines 1509-1734)
 - Test: `crates/freshell-ws/tests/terminal_stuck_monitor.rs` (new integration test)
 
 **Interfaces:**
-- Consumes: Task 1's `enforce_stuck_detection`/`StuckTransition`/`stuck_window_ms` setter; Task 2's `ServerMessage::TerminalStuck`.
+- Consumes: Task 1's `enforce_stuck_detection`/`StuckTransition`/`stuck_window_ms` setter; Task 2's `ServerMessage::TerminalStuck` and the extended `TerminalKill` (`reason` field).
 - Produces:
-  - `freshell_ws::broadcast_stuck_transitions(registry: &TerminalRegistry, broadcast_tx: &tokio::sync::broadcast::Sender<String>)` (testable tick body)
-  - `freshell_ws::spawn_stuck_monitor(registry: TerminalRegistry, broadcast_tx: broadcast::Sender<String>, sweep_interval: Duration)`
-  - `freshell_ws::stuck_window_ms_from_env() -> i64` (parses `FRESHELL_TERMINAL_STUCK_WINDOW_MS`, else `DEFAULT_STUCK_WINDOW_MS`)
-  - Registry `attach` enqueues `ServerMessage::TerminalStuck{stuck: true}` to a subscriber attaching to a flagged row.
+  - `freshell_ws::broadcast_stuck_frame(transition: &StuckTransition, broadcast_tx: &tokio::sync::broadcast::Sender<String>)` (pure: serialize one `terminal.stuck` frame and send; the unit-testable seam — cross-crate tests cannot construct the wedge row state via the public registry API, so they drive THIS function with constructed transitions)
+  - `freshell_ws::spawn_stuck_monitor(registry: TerminalRegistry, broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>, sweep_interval: Duration)` (tick = `for t in registry.enforce_stuck_detection() { broadcast_stuck_frame(&t, &tx) }`; the composition is 3 lines whose components are each pinned — the sweep by Task 1's in-file suite, the frame by the ws tests, the end-to-end flag by the e2e)
+  - `freshell_ws::stuck_window_ms_from_env() -> i64` (parses `FRESHELL_TERMINAL_STUCK_WINDOW_MS`; any parseable integer is used AS-IS — 0 or negative DISABLES detection, mirroring `auto_kill_idle_minutes`' disable semantics; unparseable values fall back to `DEFAULT_STUCK_WINDOW_MS`)
+  - Registry `attach` enqueues the CURRENT stuck truth (both directions) to new subscribers of agent-mode Running rows — tested in the registry crate's in-file suite (Task 3 adds these tests there, where the `feed`/`backdate_last_activity` helpers can construct the wedge state).
+  - `terminal.kill{reason:'stuck-recovery'}` server branch in `crates/freshell-ws/src/terminal.rs` (~7699-7985): when the kill's `reason` is `"stuck-recovery"`, run the fenced stop + PTY kill + row removal + `terminal.killed` ack EXACTLY as today, but SKIP the durable `ledger.close_pane(PaneCloseWrite{...})` envelope write (~7882-7900, unconditional for every kill today) AND skip the session-identity retirement/tombstone consult — the pane's durable session must stay resumable so the follow-up `resetPaneForReconcileCreate` → `terminal.create{restore:true}` can resume it. This mirrors the idle reaper's server-initiated kill (no close envelope; `pane_reconcile.rs:768` proves reaped rows converge to respawn, not suppression). Any other `reason` (or absent) keeps today's full pane-close semantics byte-for-byte.
 
 - [ ] **Step 1: Write the failing integration test**
 
-`crates/freshell-ws/tests/terminal_stuck_monitor.rs` (mirror the harness style of `crates/freshell-ws/tests/pane_reconcile.rs` — headless rows via its `headless` helper at 284-295; broadcast channel subscription). NOTE (LB-13): the registry crate's `feed`/`insert_headless`/`backdate_last_activity` helpers are `#[cfg(test)]`-gated and NOT exported cross-crate — drive the sweep from ws tests with the PUBLIC API only: `register_headless` with a PAST `created_at` (registry.rs:2294 — `last_meaningful_activity_at` inits to `created_at`, so a row created "window+1 ago" is immediately flaggable) to FLAG, and `registry.input` (registry.rs:1802-1836 — bumps BOTH clocks even for headless rows) to CLEAR:
+`crates/freshell-ws/tests/terminal_stuck_monitor.rs` — cross-crate tests drive the PURE frame function with constructed transitions (the wedge row state is not constructible via the public registry API — `register_headless` seeds BOTH clocks from `created_at`, and `registry.input` refreshes BOTH — so registry-state tests stay in the registry crate's in-file suite; see below):
 
 ```rust
-// RED: broadcast_stuck_transitions does not exist yet.
+// RED: broadcast_stuck_frame does not exist yet.
 #[test]
-fn stuck_monitor_broadcasts_transitions_only_on_change() {
-    let registry = // register_headless agent-mode row "T" with created_at = now - (window+1)
-                    // (mirror pane_reconcile.rs:284-295), set_stuck_window_ms(1);
+fn stuck_frames_serialize_both_directions() {
     let (tx, mut rx) = tokio::sync::broadcast::channel(64);
-    broadcast_stuck_transitions(&registry, &tx);
+    broadcast_stuck_frame(&freshell_terminal::StuckTransition {
+        terminal_id: "T".into(), mode: "opencode".into(), stuck: true, at: 123,
+    }, &tx);
     let first = rx.try_recv().unwrap();
     assert!(first.contains("\"type\":\"terminal.stuck\""));
     assert!(first.contains("\"stuck\":true"));
     assert!(first.contains("\"terminalId\":\"T\""));
-    // Second tick with no state change: nothing new.
-    broadcast_stuck_transitions(&registry, &tx);
-    assert!(rx.try_recv().is_err());
-    // Meaningful output clears: stuck:false transition broadcast.
-    registry.input("T", b"x").unwrap(); // bumps BOTH clocks (registry.rs:1818-1820)
-    broadcast_stuck_transitions(&registry, &tx);
+    assert!(first.contains("\"at\":123"));
+    broadcast_stuck_frame(&freshell_terminal::StuckTransition {
+        terminal_id: "T".into(), mode: "opencode".into(), stuck: false, at: 456,
+    }, &tx);
     let clear = rx.try_recv().unwrap();
     assert!(clear.contains("\"stuck\":false"));
 }
+```
+
+Attach-emission tests go in the REGISTRY crate's in-file `#[cfg(test)]` module (registry.rs ~5700, where `insert_headless`/`feed`/`backdate_last_activity`/collector-sink precedents at 5365-5371 can construct the flagged state) — added by this task because the attach emission ships in this task:
+
+```rust
+#[test]
+fn attaching_to_an_agent_row_enqueues_the_current_stuck_truth_both_directions() {
+    // LB-12 insertion (registry.rs:1709-1721, inside attach_to_shared's
+    // single-lock handoff, AFTER replay, BEFORE the Exited block).
+    // Flagged row: backdate both clocks past the window, feed repaint frames
+    // (activity fresh), sweep → flagged; attach with a collector sink →
+    // assert TerminalStuck{ stuck: true } arrives after attach.ready/replay.
+    // Healthy row (fresh meaningful clock): attach → assert the sink received
+    // TerminalStuck{ stuck: false } — the reconnect reconciliation frame.
+}
 
 #[test]
-fn attaching_to_a_stuck_row_enqueues_the_stuck_frame_to_the_new_subscriber() {
-    // Flag the row (as above), then registry.attach with a captured FrameSink
-    // (registry.rs:71 Arc<dyn Fn(ServerMessage)>); assert the sink observed
-    // TerminalStuck{ stuck: true } AFTER attach.ready/replay and BEFORE the
-    // Exited block (LB-12 insertion point: registry.rs:1709-1721, inside
-    // attach_to_shared's single-lock handoff; mirror the collector-sink
-    // precedent at registry.rs:5369-5371).
+fn attach_reconciles_a_late_clear_for_a_reconnecting_client() {
+    // Flag the row, attach (sink A sees stuck:true), then registry.input(...)
+    // clears the flag (next sweep), then attach with a FRESH sink B:
+    // assert sink B received stuck:false — a client that missed the
+    // stuck:false broadcast reconciles on re-attach.
+}
+```
+
+Kill-reason tests (same file — they exercise the ws kill handler through the existing harness patterns; if the handler requires a full `WsState`, place them beside the existing kill-handler tests in `crates/freshell-ws/tests/pane_ledger_triggers.rs`'s harness style instead):
+
+```rust
+#[test]
+fn stuck_recovery_kill_leaves_the_session_resumable() {
+    // The round-1 review Major: terminal.kill is the DURABLE pane-close
+    // primitive (unconditional ledger.close_pane envelope at terminal.rs
+    // ~7882-7900 + identity retirement/tombstones consulted by recovery
+    // suppression — recovery_inventory.rs apply_kill_tombstone_dominance).
+    // The stuck-restart MUST NOT corrupt that durable state. Drive a kill
+    // with reason:'stuck-recovery': assert (1) the row is gone and the
+    // correlated terminal.killed{success:true} ack still fires, (2) NO
+    // close-envelope journal record exists for the terminal (pane_ledger
+    // surface — mirror the ledger-assertion patterns in
+    // crates/freshell-ws/tests/pane_ledger_triggers.rs), and (3) the
+    // session identity is still resolvable (session_ref_for still answers)
+    // so a restore:create respawn is not suppressed.
+}
+
+#[test]
+fn pane_close_kill_keeps_the_full_durable_close() {
+    // Regression pin: a kill WITHOUT the stuck-recovery reason (absent
+    // reason, or any other value) must keep today's byte-for-byte
+    // semantics: the close envelope IS written and identity retirement
+    // happens — assert the ledger journal gained the record (guards the
+    // branch against swallowing the legacy path).
 }
 ```
 
@@ -479,31 +579,29 @@ fn attaching_to_a_stuck_row_enqueues_the_stuck_frame_to_the_new_subscriber() {
 
 Run: `cargo test -p freshell-ws --test terminal_stuck_monitor 2>&1 | tail -10`
 
-Expected: FAIL — `broadcast_stuck_transitions` not found (compile error) is the intended missing-behavior failure.
+Expected: FAIL — `broadcast_stuck_frame` not found (compile error) is the intended missing-behavior failure.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
 `freshell-ws/src/lib.rs` (after `spawn_idle_monitor`, mirroring its doc style):
 
 ```rust
-/// Tick body of [`spawn_stuck_monitor`]: run the registry's stuck sweep and
-/// broadcast one `terminal.stuck` frame per transition. Factored out so
-/// tests can drive a single tick without a timer.
-pub fn broadcast_stuck_transitions(
-    registry: &freshell_terminal::TerminalRegistry,
+/// Serialize one `terminal.stuck` transition frame and broadcast it. Pure
+/// seam: cross-crate tests drive THIS with constructed transitions (the
+/// wedge row state is not constructible through the public registry API).
+pub fn broadcast_stuck_frame(
+    transition: &freshell_terminal::StuckTransition,
     broadcast_tx: &tokio::sync::broadcast::Sender<String>,
 ) {
-    for t in registry.enforce_stuck_detection() {
-        let msg = freshell_protocol::ServerMessage::TerminalStuck(
-            freshell_protocol::TerminalStuck {
-                terminal_id: t.terminal_id.clone(),
-                at: t.at,
-                stuck: t.stuck,
-            },
-        );
-        if let Ok(json) = serde_json::to_string(&msg) {
-            let _ = broadcast_tx.send(json);
-        }
+    let msg = freshell_protocol::ServerMessage::TerminalStuck(
+        freshell_protocol::TerminalStuck {
+            terminal_id: transition.terminal_id.clone(),
+            at: transition.at,
+            stuck: transition.stuck,
+        },
+    );
+    if let Ok(json) = serde_json::to_string(&msg) {
+        let _ = broadcast_tx.send(json);
     }
 }
 
@@ -514,11 +612,13 @@ pub fn broadcast_stuck_transitions(
 /// is killed here.
 pub fn spawn_stuck_monitor(
     registry: freshell_terminal::TerminalRegistry,
-    broadcast_tx: tokio::sync::broadcast::Sender<String>,
+    broadcast_tx: std::sync::Arc<tokio::sync::broadcast::Sender<String>>,
     sweep_interval: std::time::Duration,
 ) {
     spawn_periodic(sweep_interval, move || {
-        broadcast_stuck_transitions(&registry, &broadcast_tx);
+        for transition in registry.enforce_stuck_detection() {
+            broadcast_stuck_frame(&transition, &broadcast_tx);
+        }
     });
 }
 
@@ -534,23 +634,38 @@ pub fn stuck_window_ms_from_env() -> i64 { /* parse std::env, default DEFAULT_ST
 registry.set_stuck_window_ms(freshell_ws::stuck_window_ms_from_env());
 // reuse the same 30s/250ms sweep_interval expression used for the idle
 // monitor at 1140-1144:
-freshell_ws::spawn_stuck_monitor(registry.clone(), state.broadcast_tx.clone().subscribe? /* the WsState broadcast sender */, stuck_sweep_interval);
+freshell_ws::spawn_stuck_monitor(registry.clone(), Arc::clone(&broadcast_tx), stuck_sweep_interval);
 ```
-(Use the same broadcast sender handle `auto_resume`'s `broadcast_frame` sends on — `WsState.broadcast_tx`, main.rs:1875 area. Confirm the exact clone type from `broadcast_settled_frame`'s usage, auto_resume.rs:1375-1406.)
+(Use the same broadcast sender handle `auto_resume`'s `broadcast_frame` sends on — the `Arc<tokio::sync::broadcast::Sender<String>>` created at main.rs:916; confirm the exact clone shape from `broadcast_settled_frame`'s usage, auto_resume.rs:1375-1406.)
 
-`registry.rs` `attach` (~1509-1734), inside `attach_to_shared`'s single-lock handoff — insertion point per LB-12: AFTER the replay enqueue block and BEFORE the Exited block (registry.rs:1709-1721), preserving the ready < modes.sync < replay < live ordering invariant (1663-1666):
+`terminal.rs` kill handler (~7699-7985): gate the durable-close portion on the reason. Read `kill.reason` (added to the `TerminalKill` client message in Task 2):
 
 ```rust
-if s.stuck_since.is_some() {
+let stuck_recovery = kill.reason.as_deref() == Some("stuck-recovery");
+// ... existing fenced-stop + kill + ack machinery runs UNCHANGED ...
+// The durable close block (spawn_blocking ledger.close_pane(PaneCloseWrite{...}),
+// terminal.rs:~7882-7900) AND the session-identity retirement/tombstone
+// consult run ONLY when !stuck_recovery. For stuck_recovery, log
+// tracing::info!(terminal_id, "terminal_kill_stuck_recovery: process-only
+// kill; session left resumable") and skip both — the pane's session must
+// survive for the restore:create respawn the client dispatches next.
+// Everything else (terminal.killed ack, row removal, ownership claim
+// release) is identical.
+```
+
+`registry.rs` `attach` (~1509-1734), inside `attach_to_shared`'s single-lock handoff — insertion point per LB-12: AFTER the replay enqueue block and BEFORE the Exited block (registry.rs:1709-1721), preserving the ready < modes.sync < replay < live ordering invariant (1663-1666). The round-1 review requires the emission to carry the CURRENT truth in BOTH directions for agent-mode Running rows — `stuck: true` when flagged, `stuck: false` when healthy — so a reconnecting client that missed a `stuck:false` broadcast reconciles its stale card:
+
+```rust
+if is_agent_mode(&s.mode) && s.status == TerminalRunStatus::Running {
     let frame = ServerMessage::TerminalStuck(TerminalStuck {
         terminal_id: s.terminal_id.clone(),
-        at: s.stuck_since.unwrap_or_default(),
-        stuck: true,
+        at: s.stuck_since.unwrap_or_else(|| now_ms()),
+        stuck: s.stuck_since.is_some(),
     });
     // enqueue to the NEW subscriber's sink only (not the broadcast), so a
-    // reconnecting client learns the row is flagged. Repeated keepalive
-    // re-attach re-sends the frame; the client fold is idempotent (sets a
-    // keyed value), so this is harmless.
+    // reconnecting client learns the CURRENT stuck state in both
+    // directions. Repeated keepalive re-attach re-sends the frame; the
+    // client fold is idempotent (sets/clears a keyed value).
     (sink)(frame);
 }
 ```
@@ -558,13 +673,13 @@ if s.stuck_since.is_some() {
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `cargo test -p freshell-ws --test terminal_stuck_monitor 2>&1 | tail -5`
+Run: `cargo test -p freshell-ws --test terminal_stuck_monitor 2>&1 | tail -5` and `cargo test -p freshell-terminal stuck attach 2>&1 | tail -5` (the attach-emission tests live in the registry crate's in-file suite)
 
 Expected: PASS.
 
 - [ ] **Step 5: Refactor while green**
 
-If `broadcast_stuck_transitions` and `auto_resume::broadcast_frame` share a serialize-and-send helper worth extracting, extract a tiny `fn broadcast_server_message(tx, msg)` in `freshell-ws`; otherwise leave as-is (two-line duplication is acceptable across modules).
+If `broadcast_stuck_frame` and `auto_resume::broadcast_frame` share a serialize-and-send helper worth extracting, extract a tiny `fn broadcast_server_message(tx, msg)` in `freshell-ws`; otherwise leave as-is (two-line duplication is acceptable across modules).
 
 - [ ] **Step 6: Run impacted-test verification**
 
@@ -577,8 +692,8 @@ Expected: PASS.
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-ws/src/lib.rs crates/freshell-server/src/main.rs crates/freshell-terminal/src/registry.rs crates/freshell-ws/tests/terminal_stuck_monitor.rs
-git commit -m "feat(ws): spawn_stuck_monitor broadcasts terminal.stuck transitions; attach replays stuck flag"
+git add crates/freshell-ws/src/lib.rs crates/freshell-ws/src/terminal.rs crates/freshell-server/src/main.rs crates/freshell-terminal/src/registry.rs crates/freshell-ws/tests/terminal_stuck_monitor.rs
+git commit -m "feat(ws): spawn_stuck_monitor broadcasts terminal.stuck transitions; stuck-recovery kill stays resumable"
 ```
 
 ---
@@ -590,11 +705,12 @@ git commit -m "feat(ws): spawn_stuck_monitor broadcasts terminal.stuck transitio
 - Modify: `src/store/turnCompletionThunks.ts` (or sibling location of `applyServerIdle`, ~line 22-36) — `applyTerminalStuck` thunk
 - Modify: `src/App.tsx` (WS fold case near the `terminal.idle` case, 1678-1685)
 - Create: `src/components/TerminalStuckCard.tsx`
+- Modify: `src/lib/kill-ack.ts` (ONE additive opt: `reason?: string`, forwarded onto the `terminal.kill` frame)
 - Modify: `src/components/TerminalView.tsx` (render + handlers + the created-fold clear-on-adoption dispatch, near the exit-banner block 5831-6140)
 - Test: `test/unit/client/lib/terminal-stuck-ws.test.ts` (extend: fold tests), `test/unit/client/store/terminalLifecycleSlice` tests (extend or new), `test/unit/client/components/TerminalStuckCard.test.tsx` (new), `test/unit/client/components/TerminalView.stuckCard.test.tsx` (new, mirroring `TerminalView.exitBanner.test.tsx` harness)
 
 **Interfaces:**
-- Consumes: Task 2's `TerminalStuckSchema`/union member; existing `selectTabPaneByTerminalId` (`src/store/selectors/paneTerminalSelectors.ts:52`), `resetPaneForReconcileCreate` (`src/store/panesSlice.ts:2409-2475`), `sendTerminalKillAndAwait` (`src/lib/kill-ack.ts:116-173` — LB-6: REUSE this existing helper; do NOT add a new one; opts `createRequestId?/timeoutMs?/send?/observedEpoch?/observedGeneration?`, returns `KillAck = { ok: true } | { ok: false; error?; timedOut? }`; use the `send` opt in tests' ws-spy harnesses), `resolveTerminalKillFence` (`src/lib/terminal-kill.ts`), the `terminal.killed` correlated ack fold (`TerminalView.tsx:5032-5050`).
+- Consumes: Task 2's `TerminalStuckSchema`/union member + the extended `TerminalKillSchema` (`reason` field); existing `selectTabPaneByTerminalId` (`src/store/selectors/paneTerminalSelectors.ts:52`), `resetPaneForReconcileCreate` (`src/store/panesSlice.ts:2409-2475`), `sendTerminalKillAndAwait` (`src/lib/kill-ack.ts:116-173` — LB-6: REUSE this helper; opts `createRequestId?/timeoutMs?/send?/observedEpoch?/observedGeneration?`, returns `KillAck = { ok: true } | { ok: false; error?; timedOut? }`; Task 4 adds ONE additive opt `reason?: string` that the helper forwards onto the `terminal.kill` frame — use the `send` opt in tests' ws-spy harnesses), `resolveTerminalKillFence` (`src/lib/terminal-kill.ts`), the `terminal.killed` correlated ack fold (`TerminalView.tsx:5032-5050`).
 - Produces:
   - `terminalLifecycleSlice` state: `stuckAtByPaneId: Record<string, { at: number; terminalId: string }>` (LB-8: store the flagged terminalId WITH the entry — terminalId churn happens exactly on kill/respawn/replacement, which is when a prior flag is stale); reducers `recordTerminalStuck({paneId, terminalId, at})`, `clearTerminalStuck({paneId})`, and `clearTerminalStuckIfOtherTerminal({paneId, terminalId})` (delete the entry only when `stuck.terminalId !== payload.terminalId`); `recordTerminalExit`, `clearTerminalLifecycle`, and `foldTerminalReplacement` also delete/clear the pane's stuck entry (one-line belts; `foldTerminalReplacement` keys the clear on `newTerminalId`).
   - `applyTerminalStuck` thunk: parse with `TerminalStuckSchema`, resolve pane via `selectTabPaneByTerminalId`, dispatch record/clear. NEVER dispatches `turnCompletion/*`.
@@ -640,7 +756,8 @@ it('invokes the callbacks', () => { /* click both */ })
 
 ```tsx
 // A (server order: exit → killed): click "Restart agent" →
-//   A1. ws send called with terminal.kill carrying terminalId + fence pair
+//   A1. ws send called with terminal.kill carrying terminalId, reason
+//       'stuck-recovery', + fence pair
 //   A2. drive terminal.exit for the live tid → pane content status 'exited',
 //       exit record written (recordTerminalExit), stuck entry cleared
 //   A3. drive terminal.killed{success:true} → no failure surface
@@ -705,7 +822,12 @@ const restartStuckAgentPane = useCallback(async () => {
   if (!tid) return
   if (pendingDurableReplacementRef.current) return // advisory guard (LB-7 E)
   const fence = resolveTerminalKillFence(store, terminalContent)
-  const ack = await sendTerminalKillAndAwait(tid, { ...fence }) // kill-ack.ts:116 — REUSE, do not add a new helper
+  // reason:'stuck-recovery' is load-bearing (round-1 review Major): a bare
+  // terminal.kill is the DURABLE pane-close primitive (close envelope +
+  // identity retirement + recovery suppression). The stuck restart must
+  // kill the process WITHOUT retiring the session so the respawn can
+  // restore:true-resume it.
+  const ack = await sendTerminalKillAndAwait(tid, { ...fence, reason: 'stuck-recovery' })
   if (!ack.ok) {
     log.warn('terminal_stuck_restart_kill_failed', { terminalId: tid, ack })
     return // keep the card; the user can retry
@@ -713,8 +835,9 @@ const restartStuckAgentPane = useCallback(async () => {
   dispatch(clearTerminalLifecycle({ paneId }))
   dispatch(resetPaneForReconcileCreate({ tabId, paneId, intent: 'respawn', sessionRef: terminalContent.sessionRef }))
 }, [/* deps */])
-// startFreshFromStuckPane: same kill-await, then intent 'fresh' (mirrors
-// startFreshConversation, TerminalView.tsx:5917-5926).
+// startFreshFromStuckPane: same kill-await (reason:'stuck-recovery' — even a
+// fresh conversation must not corrupt the durable session's close state),
+// then intent 'fresh' (mirrors startFreshConversation, TerminalView.tsx:5917-5926).
 // The await-first order is load-bearing: the reconcile reset must not fire
 // before the correlated terminal.killed resolves (pinned by matrix A/B in the
 // test step).
@@ -745,7 +868,7 @@ Expected: PASS. Then `npm run typecheck:client 2>&1 | tail -3` — Expected: PAS
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/components/TerminalStuckCard.tsx src/components/TerminalView.tsx src/store/terminalLifecycleSlice.ts src/store/turnCompletionThunks.ts src/App.tsx test/unit/client
+git add src/components/TerminalStuckCard.tsx src/components/TerminalView.tsx src/store/terminalLifecycleSlice.ts src/store/turnCompletionThunks.ts src/App.tsx src/lib/kill-ack.ts test/unit/client
 git commit -m "feat(client): Agent-appears-stuck card for terminal-mode agent panes with kill+restart actions"
 ```
 
@@ -800,11 +923,13 @@ test.describe('terminal stuck backstop (rust only)', () => {
 })
 ```
 
-- [ ] **Step 2: Run the spec and verify the intended failure**
+- [ ] **Step 2: Run the spec and verify the intended outcome**
+
+The red-green obligation for this feature is discharged by the per-task focused tests in Tasks 1-4 (each ran RED first against the then-missing behavior). This e2e is the acceptance-level spec for the completed feature: written and first-run AFTER Tasks 3-4 land, its first run on a correct implementation is expected to PASS.
 
 Run (after confirming `FRESHELL_E2E_BACKEND` is set, else ask the user first — see Global Constraints): `npm run test:e2e -- terminal-stuck-rust.spec.ts 2>&1 | tail -15`
 
-Expected: FAIL before Tasks 3/4 behavior is fully wired — but since Tasks 3-4 already landed, the expected failure mode at RED time is either the spec's own fixture bugs (shim not spinning) or harness assertions (card absent). Verify it fails for the intended reason (missing user-visible behavior), not a boot/selector accident.
+Expected: PASS. Any failure is a defect — either the fixture recipe (shim not spawning, env not merged, clock verbs 404) or a product gap the focused tests missed. Diagnose which before changing anything; do NOT treat a fixture accident as a product RED.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -837,8 +962,19 @@ git commit -m "test(e2e): terminal stuck backstop coverage + docs mock"
 
 ---
 
-## Load-bearing validation results (Stage 2 — all claims resolved; see load-bearing-ledger.md + reports/load-bearing-validator-{A,B,C}.md)
+## Load-bearing validation results (Stage 2 — all claims resolved; see load-bearing-ledger.md + reports/load-bearing-validator-{A,B,C}.md; round-1 review corrections applied below)
 
 1. **LB-1 VERIFIED (measured stream) / ACCEPTABLE (sibling→zombie transfer)** — an independent re-port of the real `NoiseScanner` over the real 18,471-unit capture reproduced the earlier probe's numbers exactly: 17 meaningful (14 bar-composition firsts + 3 text repaints), 0 ring evictions, ring peak 17/32; production wiring gives one PTY read → one classifier frame with no awaits or sustained-stall paths (coalescing fail-open requires ≥1.25 units/read sustained — not producible by the wiring). The zombie's own bytes were never captured — transfer rests on same-binary + the safe fail-open direction (a missed detection, never a false accusation); Task 1's fixture test pins the shape with the real Rust scanner. Residual: a hypothetical ≥18-cell gradient bar would exceed the 32-ring and fail open (same safe direction).
-2. **LB-2 VERIFIED (decision stands)** — the actual zombie's `lastActivityAt` was FRESH on day 2 (investigation debug dump), refuting the frozen-output premise while CONFIRMING the design: meaningful-staleness ALONE fires under every observed reading (fresh-output zombie, frozen variant, degraded cadence). Deliberately NO busy/turn-in-flight gate: the zombie class attaches to aborted sessions with no reliable turn state — a busy gate would miss exactly the target class; idle-quiet false positives are the user-accepted tradeoff.
+2. **LB-2 — CORRECTED BY ROUND-1 REVIEW (predicate now the two-clock differential)** — the User Request's own constraint text names the signal: "last_meaningful_activity_at stale while last_activity_at stays fresh". The original staleness-only predicate would have flagged prompt-idle panes (both clocks equally stale) — broader than the accepted tradeoff and a violation of "must not alter non-wedged panes". The sweep now requires BOTH meaningful-staleness beyond the window AND raw-activity freshness (`STUCK_ACTIVITY_FRESH_MS` = 5 min): the zombie evidence (lastActivityAt fresh on day 2, continuous 1.4-core render loop, in-flight-write quarantine warnings) shows real wedges keep painting; a pane that stops emitting entirely is no longer a "pure repaint loop" and is not flagged (safe-direction residual, unit-pinned). Still deliberately NO busy/turn-in-flight gate — the zombie class attaches to aborted sessions with no reliable turn state.
 3. **LB-3..LB-13 VERIFIED** — two-pass collect-then-apply implementable (LB-3); `broadcast_tx` shape/wiring confirmed (LB-4); selector precedent confirmed (LB-5); `sendTerminalKillAndAwait` exists and is REUSED (LB-6); both kill/ack/respawn frame orderings converge, pinned by the Task 4 test matrix (LB-7); stale-stuck-card race is real — the plan adopts paneId keying with `{at, terminalId}` + clear-on-adoption via `clearTerminalStuckIfOtherTerminal` in the created fold (+ belts in recordTerminalExit/clearTerminalLifecycle/foldTerminalReplacement) (LB-8); the e2e fixture uses the OPENCODE_CMD + enabledProviders recipe (LB-9); the e2e uses the HARNESS-14 test-clock recipe with freeze-after-quiet discipline (LB-10); all wire-contract pins co-move in Task 2's commit, including inventory.rs:51/56/66 and ZOD_BACKED_SERVER_MESSAGES (LB-11); attach emission point after replay/before Exited preserves ordering (LB-12); ws tests drive the sweep via public `register_headless`(past created_at) + `registry.input` (LB-13).
+
+## Round-1 review corrections (all 8 findings dispositioned; see plan-review-log.md)
+
+1. Detection predicate gained the activity-freshness conjunct (Major → CLEARED — the constraint text itself specifies the differential; new unit tests pin prompt-idle non-flagging and freeze-clears-flag).
+2. Attach-time emission now carries the current truth in BOTH directions so a reconnecting client reconciles a missed `stuck:false` (Major → CLEARED; reconcile test added).
+3. `terminal.kill` is the durable pane-close primitive (unconditional `ledger.close_pane` envelope at terminal.rs:~7882, identity retirement, kill tombstones consulted by recovery suppression — verified first-hand); the stuck restart now sends `terminal.kill{reason:'stuck-recovery'}` whose server branch skips the durable close + retirement so the respawned pane's session stays resumable (Major → CLEARED; both-direction kill tests added: no envelope written, identity resolvable, default close path regression-pinned).
+4. Task 2's commit now stages every file it modifies/creates (inventory.rs, freeze test, the new client test) (Major → CLEARED).
+5. Task 1's RED step split: the classifier fixture pin (expected PASS as a characterization pin) runs before the registry tests' intended compile-fail RED (Major → CLEARED).
+6. Test sketches use the real `input` API — it returns `InputOutcome`, not `Result`; no unwrap (Major → CLEARED).
+7. The e2e is acceptance-level: written/first-run after Tasks 3-4, expected PASS on a correct implementation; red-green is discharged by the per-task focused RED tests (Major → CLEARED).
+8. The window env parser accepts any integer; 0/negative disables as documented (Minor → CLEARED).
