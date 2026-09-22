@@ -1137,6 +1137,22 @@ test.describe('paced-restore convergence (incident-shaped, rust)', () => {
         // clean-restore reset covers.
         await waitPaneConverged(harness, healthyTerminalId, healthyExpected, CONVERGENCE_BOUND_MS)
       }
+      // RESTORED preserved-content assertion (focused-e1r1 finding 3): the
+      // round-1 revision removed the strip-time flood-row floor as a
+      // timing race for the RETENTION-PINNED pane (whose rebuilds
+      // legitimately clear mid-interruption). Restored here under the
+      // correct semantics — on the RETAINED pane, whose every restore is
+      // a checkpoint delta resume: after five reconnect-restores the
+      // surface still holds its pre-gap flood rows (no destructive
+      // clear-and-rebuild ever wiped them) AND every restore completed
+      // (the per-flap convergence above). A sinceSeq-0 viewport wipe
+      // repair would blank these rows mid-rebuild; the preserved delta
+      // resume never does.
+      const healthyPreservedBuffer = await paneBuffer(harness, healthyTerminalId)
+      expect(
+        floodLineCount(healthyPreservedBuffer, healthyTag),
+        'the retained pane’s pre-gap surface is preserved across its completed restores',
+      ).toBeGreaterThan(0)
       // Five successful-but-progressless flaps later: the pane never
       // exhausted, and the NEXT flap still auto-attaches. (Diagnostics
       // attach BEFORE the assertion so a failure is self-explaining; the

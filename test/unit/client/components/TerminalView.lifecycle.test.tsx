@@ -10446,12 +10446,17 @@ describe('TerminalView lifecycle updates', () => {
       expect(writes).toContain('RESUMED')
     })
 
-    it('a negotiated queue_overflow gap initiates the bounded repair attach on the still-open connection', async () => {
+    it('a negotiated queue_overflow gap repairs from the surface checkpoint cursor without destroying the surface', async () => {
       // The negotiated lane (pacedTerminalReplayV1): the spill gap is
       // repairable delivery loss — the shared restore contract requires
       // "repair from retained output", initiated on the SAME connection
-      // (no transport flap). The old-server lane (no capability) keeps
-      // its local-notice-only behavior — pinned by the test above.
+      // (no transport flap). The ring retained the spilled range, so the
+      // repair RESUMES from the surface checkpoint cursor (the
+      // checkpoint-aware delta resume): a delta attach refills the
+      // visible surface without clearing it — never a sinceSeq:0
+      // viewport wipe that would destroy the pre-gap surface before a
+      // replacement baseline exists. The old-server lane (no capability)
+      // keeps its local-notice-only behavior — pinned by the test above.
       wsMocks.capabilities = { pacedTerminalReplayV1: true }
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',
@@ -10462,8 +10467,11 @@ describe('TerminalView lifecycle updates', () => {
         (msg) => msg?.type === 'terminal.attach' && msg.terminalId === terminalId,
       )
 
+      // A contiguous applied prefix establishes a valid surface
+      // checkpoint (streamId stamped by the ready).
       messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'ok' })
       term.write.mockClear()
+      term.clear.mockClear()
       wsMocks.send.mockClear()
       expect(repairAttaches()).toEqual([])
 
@@ -10485,15 +10493,169 @@ describe('TerminalView lifecycle updates', () => {
       expect(repair[0]).toMatchObject({
         type: 'terminal.attach',
         terminalId,
+        intent: 'transport_reconnect',
+        sinceSeq: 1,
+        attachRequestId: expect.any(String),
+      })
+      // The pre-gap surface is PRESERVED: the repair never clears the
+      // viewport before its content establishes the refilled surface.
+      expect(term.clear).not.toHaveBeenCalled()
+      // The honest local notice still renders alongside the repair.
+      expectTerminalWriteContaining(term, 'Output gap 2-5: slow link backlog')
+
+      // The repair completes: the new generation's ready + frames refill
+      // the hole and converge the screen on the SAME connection, with no
+      // retry strip.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 8,
+          replayFromSeq: 2,
+          replayToSeq: 8,
+          attachRequestId: repair[0]!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 8,
+          data: 'REPAIRED',
+          attachRequestId: repair[0]!.attachRequestId,
+        })
+      })
+      expectTerminalWriteContaining(term, 'REPAIRED')
+      expect(term.clear).not.toHaveBeenCalled()
+      expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+    })
+
+    it('a queue_overflow repair answered by expired retention takes the honest-loss path, never a destructive rebuild', async () => {
+      // The retained ring may have expired past the checkpoint cursor by
+      // the time the repair's delta attach lands. The server answers with
+      // the bounds-carrying retention gap: the EXISTING honest-loss UX
+      // applies (the accessible retention notice, live output continuing)
+      // — the pre-gap surface is never destroyed, and the retention gap
+      // never re-triggers the queue_overflow repair loop.
+      wsMocks.capabilities = { pacedTerminalReplayV1: true }
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-gap-repair-expired',
+      })
+
+      const repairAttaches = () => sentMessages().filter(
+        (msg) => msg?.type === 'terminal.attach' && msg.terminalId === terminalId,
+      )
+
+      for (let seq = 1; seq <= 8; seq += 1) {
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: seq, seqEnd: seq, data: `row${seq}` })
+      }
+      term.write.mockClear()
+      term.clear.mockClear()
+      wsMocks.send.mockClear()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 9,
+          toSeq: 12,
+          reason: 'queue_overflow',
+        })
+      })
+
+      const repair = repairAttaches()
+      expect(repair.length).toBe(1)
+      expect(repair[0]).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'transport_reconnect',
+        sinceSeq: 8,
+        attachRequestId: expect.any(String),
+      })
+
+      // The server's answer: retention expired past the cursor — the
+      // bounds-carrying retention gap, then live frames from the
+      // retained front.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 9,
+          toSeq: 20,
+          reason: 'replay_window_exceeded',
+          headSeq: 24,
+          oldestRetainedSeq: 21,
+          attachRequestId: repair[0]!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 21,
+          seqEnd: 24,
+          data: 'FROMFRONT',
+          attachRequestId: repair[0]!.attachRequestId,
+        })
+      })
+
+      // The honest-loss UX: the accessible retention notice shows, live
+      // output continues, and the surface is NEVER destroyed.
+      expect(screen.getByTestId('restore-retention-loss-notice')).toBeTruthy()
+      expectTerminalWriteContaining(term, 'FROMFRONT')
+      expect(term.clear).not.toHaveBeenCalled()
+      // The retention gap does NOT initiate another repair (its reason is
+      // replay_window_exceeded, not queue_overflow): no repair loop.
+      expect(repairAttaches().length).toBe(1)
+    })
+
+    it('a queue_overflow gap with no valid checkpoint falls back to a full hydrate that never clears before content', async () => {
+      // No valid checkpoint exists (no streamId was ever established):
+      // the repair may fall back to a full hydrate — but the viewport is
+      // NOT cleared before the new baseline is actually established by
+      // attach content. If the repair dies before content, the pre-gap
+      // surface stays visible; when the hydrate's content arrives, it
+      // replaces the surface at that moment.
+      wsMocks.capabilities = { pacedTerminalReplayV1: true }
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-gap-repair-no-checkpoint',
+        ackInitialAttach: false,
+      })
+
+      const repairAttaches = () => sentMessages().filter(
+        (msg) => msg?.type === 'terminal.attach' && msg.terminalId === terminalId,
+      )
+
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'ok' })
+      term.write.mockClear()
+      term.clear.mockClear()
+      wsMocks.send.mockClear()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 2,
+          toSeq: 5,
+          reason: 'queue_overflow',
+        })
+      })
+
+      const repair = repairAttaches()
+      expect(repair.length).toBe(1)
+      expect(repair[0]).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
         intent: 'viewport_hydrate',
         sinceSeq: 0,
         attachRequestId: expect.any(String),
       })
-      // The honest local notice still renders alongside the repair.
+      // The pre-gap surface is PRESERVED at attach time: the fallback
+      // hydrate must not clear the viewport before its content arrives.
+      expect(term.clear).not.toHaveBeenCalled()
       expectTerminalWriteContaining(term, 'Output gap 2-5: slow link backlog')
 
-      // The repair completes: the new generation's ready + frames converge
-      // the screen on the SAME connection.
+      // The hydrate's content establishes the new baseline: the surface
+      // is replaced exactly when the content arrives — never before.
       act(() => {
         messageHandler!({
           type: 'terminal.attach.ready',
@@ -10508,11 +10670,12 @@ describe('TerminalView lifecycle updates', () => {
           terminalId,
           seqStart: 1,
           seqEnd: 8,
-          data: 'REPAIRED',
+          data: 'REBUILT',
           attachRequestId: repair[0]!.attachRequestId,
         })
       })
-      expectTerminalWriteContaining(term, 'REPAIRED')
+      expect(term.clear).toHaveBeenCalledTimes(1)
+      expectTerminalWriteContaining(term, 'REBUILT')
       expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
     })
 

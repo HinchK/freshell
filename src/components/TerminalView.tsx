@@ -522,6 +522,12 @@ type AttachTerminalOptions = {
   replayPageBytes?: number
   priority?: TerminalAttachPriority
   sinceSeq?: number
+  /** Delivery-loss repair fallback (responsive-terminal-restore WS3):
+   *  attach as a full hydrate WITHOUT clearing the viewport first — the
+   *  surface is replaced only when the hydrate's content actually arrives
+   *  (the deferred content reset). If the repair dies before content, the
+   *  pre-gap surface stays visible. Never on the wire. */
+  deferViewportClearUntilContent?: boolean
   /**
    * Internal recovery-accounting hint (never on the wire): the reconcile
    * episode this attach belongs to (M-1). Every attach of ONE episode
@@ -1032,6 +1038,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const generationGapFreeRef = useRef(true)
   const generationSuppressCleanResetRef = useRef(false)
   const gapRepairPendingRef = useRef(false)
+  // Delivery-loss repair fallback (responsive-terminal-restore WS3): the
+  // attach generation of a full-hydrate repair that must NOT clear the
+  // viewport at attach time — the surface is replaced only when that
+  // generation's first content frame arrives (the deferred content reset:
+  // "the viewport must not be cleared before the new baseline is actually
+  // established by attach content"). Null when no deferred reset is
+  // pending; cleared once fired and re-armed per attach.
+  const repairContentResetPendingRef = useRef<string | null>(null)
   const surfaceEpochRef = useRef(0)
   const geometryEpochRef = useRef(1)
   const geometryAuthorityRef = useRef<TerminalGeometryAuthority>('single_client')
@@ -1230,6 +1244,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     }
     abandonedAttachRequestIdsRef.current.delete(pending.attachRequestId)
     quarantineRepairRef.current = null
+  }, [])
+
+  // Deferred content reset (responsive-terminal-restore WS3, delivery-loss
+  // repair fallback): when a hydrate attach deferred its viewport clear
+  // (`deferViewportClearUntilContent`), the pre-gap surface stays visible
+  // until that generation's first content frame ACTUALLY arrives — the
+  // new baseline is established by attach content, never before. If the
+  // repair dies without content, nothing is cleared and the pre-gap
+  // surface survives. Same direct-clear discipline as the attach-time
+  // clear (both run before the triggering frame is queued, and queued
+  // stale-generation writes were already dropped by the generation swap).
+  const consumeRepairContentReset = useCallback((terminalId: string, attachRequestId?: unknown) => {
+    if (repairContentResetPendingRef.current !== attachRequestId) return
+    repairContentResetPendingRef.current = null
+    try {
+      termRef.current?.clear()
+    } catch {
+      // disposed
+    }
+    clearTerminalCursor(terminalId)
   }, [])
 
   // ── Paced terminal replay consumption (responsive-terminal-restore
@@ -3567,6 +3601,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     generationGapFreeRef.current = true
     generationSuppressCleanResetRef.current = gapRepairPendingRef.current
     gapRepairPendingRef.current = false
+    // Per-generation deferred content reset (delivery-loss repair
+    // fallback): armed only for the hydrate that asked to defer its
+    // viewport clear until its content establishes the new baseline.
+    repairContentResetPendingRef.current = opts?.deferViewportClearUntilContent === true
+      ? attachRequestId
+      : null
 
     currentAttachRef.current = {
       requestId: attachRequestId,
@@ -4700,6 +4740,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           }
           if (!outputSource) return
 
+          // A deferred-clear repair hydrate replaces the surface exactly
+          // when its first content arrives (never before).
+          consumeRepairContentReset(tid, msg.attachRequestId)
           const previousSeqState = seqStateRef.current
           const batchDecision = onOutputBatchSegments(previousSeqState, batchSegments)
           if (!batchDecision.accept) {
@@ -4813,6 +4856,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             }
             return
           }
+          // A deferred-clear repair hydrate replaces the surface exactly
+          // when its first content arrives (never before).
+          consumeRepairContentReset(tid, msg.attachRequestId)
           const previousSeqState = seqStateRef.current
           const frameDecision = onOutputFrame(previousSeqState, {
             seqStart: msg.seqStart,
@@ -4978,13 +5024,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           // negotiated lane only): a queue_overflow gap on the STILL-OPEN
           // connection means this connection missed sequenced output — the
           // shared restore contract requires repair from retained output,
-          // never silent advancement and never a stranded screen. One
-          // bounded repair attach per gap (a full viewport-hydrate rebuild:
-          // the surface already rendered the frames after the hole, so a
-          // delta resume would duplicate them), through the recovery
+          // never silent advancement and never a stranded screen. The ring
+          // retained the spilled range, so the repair RESUMES from the
+          // surface checkpoint cursor (the checkpoint-aware delta resume):
+          // a delta attach refills the visible surface WITHOUT clearing
+          // it. One bounded repair attach per gap, through the recovery
           // accounting — repeated gaps exhaust to the visible retry strip.
-          // Old servers never emit this negotiated gap shape; their
-          // local-notice behavior (pinned above) is unchanged.
+          // If the server answers that retention has expired past the
+          // cursor (the bounds-carrying gap), the existing honest-loss UX
+          // applies below — never a destructive rebuild. Only when no
+          // valid checkpoint exists may the repair fall back to a full
+          // hydrate, and even then the viewport is not cleared before the
+          // new baseline is actually established by attach content (the
+          // deferred content reset). Old servers never emit this
+          // negotiated gap shape; their local-notice behavior (pinned
+          // above) is unchanged.
           if (
             pacedReplayNegotiated
             && msg.reason === 'queue_overflow'
@@ -5000,10 +5054,24 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             // The repair generation must not refund the streak on a clean
             // completion: repeated gaps still exhaust to the retry strip.
             gapRepairPendingRef.current = true
-            attachTerminal(tid, 'viewport_hydrate', {
-              clearViewportFirst: true,
-              ...viewportHydrateReplayOptions(contentRef.current, pacedReplayNegotiated),
-            })
+            // The gap's local-notice invalidation bumped the surface
+            // epoch; re-save the quarantined surface's pinned cursor under
+            // the new epoch so the delta repair's checkpoint decision
+            // validates and resumes from the coverage cursor.
+            persistSurfaceCheckpointForAttach(tid, currentAttachRef.current, parserAppliedSeqRef.current)
+            const checkpointDecision = getCheckpointDeltaReplayDecision(tid)
+            if (checkpointDecision.ok) {
+              attachTerminal(tid, 'transport_reconnect', {
+                clearViewportFirst: false,
+                sinceSeq: checkpointDecision.sinceSeq,
+              })
+            } else {
+              attachTerminal(tid, 'viewport_hydrate', {
+                clearViewportFirst: false,
+                deferViewportClearUntilContent: true,
+                ...viewportHydrateReplayOptions(contentRef.current, pacedReplayNegotiated),
+              })
+            }
           }
         }
 
