@@ -726,14 +726,26 @@ struct Inner {
     /// and retries at the capped interval.
     re_warm_attempts: AtomicUsize,
     /// The DISPATCH ERA (ep2-r2 fresheyes Major — cross-generation event
-    /// contamination): a monotonic counter retired (incremented) by every
-    /// running-entry TAKE under the `running` lock — the two `lose_daemon`
-    /// arms and `shutdown`. Each daemon's dispatch sink captures the era at
-    /// its connect (inside the cold-start critical section, so no take can
-    /// interleave) and drops every event once the era has moved past it:
-    /// no event originating from a daemon whose loss has been taken can
-    /// dispatch into the successor era.
+    /// contamination; HARDENED ep2-r3 — the check-to-dispatch TOCTOU): a
+    /// monotonic counter retired (incremented) by every running-entry TAKE
+    /// under the `running` lock — the two `lose_daemon` arms and `shutdown`.
+    /// Each daemon's dispatch sink captures the era at its connect (inside
+    /// the cold-start critical section, so no take can interleave) and
+    /// [`dispatch_event_on_era`] re-verifies it UNDER the `session_emitters`
+    /// mutex, atomically with sender-selection + send: no event originating
+    /// from a daemon whose loss has been taken can dispatch into the
+    /// successor era, even when the sink's fast-path check passed before a
+    /// preemption straddled the take.
     event_era: AtomicU64,
+    /// ep2-r3 test seam (`cfg(test)`-only): when armed, the dispatch sink
+    /// parks AFTER passing its era check and BEFORE dispatching — the exact
+    /// preempted-callback window the ep2-r3 fresheyes Major pins (a check
+    /// that is not atomic with dispatch can pass, be preempted, and then
+    /// deliver into a successor era's registration). Never compiled into
+    /// production builds. See
+    /// [`OpencodeServeManager::arm_dispatch_park_for_tests`].
+    #[cfg(test)]
+    test_dispatch_park: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// When the running daemon completed its (healthy) cold start — the
     /// fresh-incident clock for the re-warm backoff.
     last_cold_start_at: Mutex<Option<Instant>>,
@@ -757,6 +769,8 @@ impl OpencodeServeManager {
                 daemon_signals: broadcast::Sender::new(DAEMON_CHANNEL_CAPACITY),
                 re_warm_attempts: AtomicUsize::new(0),
                 event_era: AtomicU64::new(0),
+                #[cfg(test)]
+                test_dispatch_park: Mutex::new(None),
                 last_cold_start_at: Mutex::new(None),
             }),
         }
@@ -959,24 +973,32 @@ impl OpencodeServeManager {
     }
 
     /// The per-connection dispatch sink, ERA-GATED (ep2-r2 fresheyes Major —
-    /// cross-generation event contamination): the sink captures the CURRENT
+    /// cross-generation event contamination; HARDENED ep2-r3 — the
+    /// check-to-dispatch TOCTOU): the sink captures the CURRENT
     /// [`Inner::event_era`] at its daemon's connect (called from
     /// `ensure_started` inside the cold-start `running` critical section,
-    /// so no take can interleave with the capture) and drops every event
-    /// once the era has moved past it. Every daemon removal is a TAKE under
-    /// that same lock (`lose_daemon`'s two arms, `shutdown`), and each take
-    /// retires the era via [`Self::retire_event_era`] BEFORE the lock
-    /// releases — so by construction NO event originating from a daemon
-    /// whose loss has been taken can dispatch into the successor era: a
-    /// buffered/late `session.idle` from the lost generation can never
-    /// satisfy the successor's `await_idle` (the false
-    /// `freshAgent.turn.complete` the no-chime-on-loss contract forbids),
-    /// and no other late event can contaminate a successor-era bridge. The
-    /// gate lives at the SINK — the one point every dispatched event must
-    /// pass — because dropping the [`EventStreamHandle`] only ABORTS the
-    /// transport's reader task (`SseHandle`'s drop), and an
-    /// already-in-flight dispatch can still land after that; the era check
-    /// is the airtight fence.
+    /// so no take can interleave with the capture) and hands it to
+    /// [`dispatch_event_on_era`], which re-verifies the era UNDER the
+    /// `session_emitters` mutex, atomically with selection+send. The
+    /// load-compare here is only the CHEAP FAST PATH (the common
+    /// already-retired case drops without touching the emitter map) — it
+    /// is NOT the fence: an event that passes it can still be preempted
+    /// before dispatch, and only the under-lock re-verification stops a
+    /// stale event from reaching a successor-era registration after its
+    /// era was retired, its emitters swept, and the successor registered a
+    /// replacement sender. Every daemon removal is a TAKE under that same
+    /// `running` lock (`lose_daemon`'s two arms, `shutdown`), each take
+    /// retires the era via [`Self::retire_event_era`] BEFORE its sweep
+    /// claims the emitter mutex — so by construction NO event originating
+    /// from a daemon whose loss has been taken can dispatch into the
+    /// successor era: a buffered/late `session.idle` from the lost
+    /// generation can never satisfy the successor's `await_idle` (the
+    /// false `freshAgent.turn.complete` the no-chime-on-loss contract
+    /// forbids), and no other late event can contaminate a successor-era
+    /// bridge. The authoritative gate lives at DISPATCH — under the
+    /// emitter mutex — because dropping the [`EventStreamHandle`] only
+    /// ABORTS the transport's reader task (`SseHandle`'s drop), and a
+    /// check that is not atomic with dispatch can be preempted past both.
     fn make_dispatch_sink(&self) -> EventSink {
         let weak = Arc::downgrade(&self.inner);
         let era = self.inner.event_era.load(Ordering::Acquire);
@@ -989,8 +1011,39 @@ impl OpencodeServeManager {
                 // the gate, never reaching the successor era's emitters.
                 return;
             }
-            dispatch_event_on(&inner, event);
+            // ep2-r3 test seam (`cfg(test)`-only): hold the callback in the
+            // exact window the fresheyes finding names — the era check has
+            // PASSED and the dispatch has not yet run — so a test can
+            // retire the era and register a successor-era sender while this
+            // callback is parked. See
+            // [`Self::arm_dispatch_park_for_tests`].
+            #[cfg(test)]
+            if let Some(park) = inner
+                .test_dispatch_park
+                .lock()
+                .expect("test dispatch park mutex")
+                .clone()
+            {
+                park();
+            }
+            dispatch_event_on_era(&inner, event, Some(era));
         })
+    }
+
+    /// Arm or clear the `cfg(test)`-only dispatch park (ep2-r3): the armed
+    /// closure is invoked by every dispatch sink AFTER passing its era
+    /// check and BEFORE dispatching, so a test can hold an in-flight
+    /// callback while it retires the era (a daemon loss take) and
+    /// registers a successor-era sender — the preempted-callback
+    /// interleaving the era verification's dispatch-time atomicity must
+    /// survive. Production builds never see the seam.
+    #[cfg(test)]
+    pub(crate) fn arm_dispatch_park_for_tests(&self, park: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self
+            .inner
+            .test_dispatch_park
+            .lock()
+            .expect("test dispatch park mutex") = park;
     }
 
     /// Retire the current dispatch era — the take-side half of the era gate
@@ -1752,8 +1805,13 @@ impl OpencodeServeManager {
         self.inner.daemon_signals.subscribe()
     }
 
-    /// Feed one parsed SSE event into the per-session fan-out. This is the ingestion
-    /// point the [`EventSource`] sink calls (`dispatchEvent`, `serve-manager.ts:429-432`).
+    /// Feed one parsed SSE event into the per-session fan-out. This is the
+    /// generation-less ingestion seam (`dispatchEvent`,
+    /// `serve-manager.ts:429-432`) — test-facing in practice. It is
+    /// deliberately UNGATED (no era): the era fence guards the REAL
+    /// per-connection sinks (see [`Self::make_dispatch_sink`] and
+    /// [`dispatch_event_on_era`]); a production caller must ingest through
+    /// a sink, not this seam.
     pub fn dispatch_event(&self, event: ParsedServeEvent) {
         dispatch_event_on(&self.inner, event);
     }
@@ -1985,19 +2043,54 @@ impl OpencodeServeManager {
 }
 
 fn dispatch_event_on(inner: &Arc<Inner>, event: ParsedServeEvent) {
+    dispatch_event_on_era(inner, event, None);
+}
+
+/// The era-verified dispatch (ep2-r3 fresheyes Major — the check-to-dispatch
+/// TOCTOU): era verification is ATOMIC with dispatch. `Some(era)` (the sink
+/// path, carrying the era its daemon connected under) is re-verified UNDER
+/// the `session_emitters` mutex, and the mutex is held across the
+/// check → sender-selection → send — the review's required invariant,
+/// exactly: an event dispatches into a session's sender only if the event's
+/// daemon era matches the CURRENT era, verified under the lock the sweep
+/// itself must take. The take retires the era (an atomic increment) BEFORE
+/// its sweep claims the emitters mutex, so a callback that re-verifies under
+/// this lock either sees the retired era (the event is dropped BEFORE any
+/// entry is selected or created — a retired-era event can never mint an
+/// emitter entry) or holds the lock ahead of the sweep, in which case every
+/// entry it selects was registered in its OWN era (the sweep clears the map
+/// at every retirement). Either way no stale-era event can reach a
+/// successor-era registration, whatever the OS scheduler does between a
+/// sink's fast-path check and this dispatch.
+///
+/// `None` (the pub [`OpencodeServeManager::dispatch_event`] seam) is the
+/// generation-less legacy lane, deliberately ungated — its callers are tests
+/// and test helpers; if a production caller ever appears it must go through
+/// a sink (or carry an era here).
+fn dispatch_event_on_era(inner: &Arc<Inner>, event: ParsedServeEvent, era: Option<u64>) {
     let Some(session_id) = event.session_id.clone() else {
         return;
     };
-    let sender = {
-        let mut emitters = inner
-            .session_emitters
-            .lock()
-            .expect("session emitters mutex");
-        emitters
-            .entry(session_id)
-            .or_insert_with(|| broadcast::Sender::new(SESSION_CHANNEL_CAPACITY))
-            .clone()
-    };
+    let mut emitters = inner
+        .session_emitters
+        .lock()
+        .expect("session emitters mutex");
+    if let Some(era) = era {
+        if inner.event_era.load(Ordering::Acquire) != era {
+            // The era this event originated from was retired while the
+            // callback was in flight (after its sink passed the check,
+            // before this lock): drop it under the lock — never dispatched,
+            // never an entry.
+            return;
+        }
+    }
+    let sender = emitters
+        .entry(session_id)
+        .or_insert_with(|| broadcast::Sender::new(SESSION_CHANNEL_CAPACITY))
+        .clone();
+    // The send rides inside the same critical section: the selected sender
+    // is the era-verified one, and `broadcast::Sender::send` is a
+    // non-blocking enqueue (no re-entrancy into this mutex).
     let _ = sender.send(SessionSignal::Event(event));
 }
 
@@ -2432,6 +2525,22 @@ mod tests {
     struct NoopEventSource;
     impl EventSource for NoopEventSource {
         fn connect(&self, _url: String, _sink: EventSink) -> Box<dyn EventStreamHandle> {
+            Box::new(NoopHandle)
+        }
+    }
+
+    /// An [`EventSource`] that RECORDS every sink it is handed (one per cold
+    /// start, in connect order) — the REAL per-connection dispatch closures
+    /// the manager mints at each daemon's connect, so a test can call a
+    /// daemon generation's sink directly, carrying that generation's
+    /// identity (the `tests/serve_daemon_selfheal.rs`
+    /// `RecordingEventSource` shape, unit-side).
+    struct RecordingEventSource {
+        sinks: Mutex<Vec<EventSink>>,
+    }
+    impl EventSource for RecordingEventSource {
+        fn connect(&self, _url: String, sink: EventSink) -> Box<dyn EventStreamHandle> {
+            self.sinks.lock().expect("recorded sinks mutex").push(sink);
             Box::new(NoopHandle)
         }
     }
@@ -3543,6 +3652,180 @@ mod tests {
             Some("http://127.0.0.1:1"),
             "the crash warn names the dead daemon's base URL: {warn:?}"
         );
+    }
+
+    // ── ep2-r3 fresheyes Major: the check-to-dispatch TOCTOU ──────────────
+
+    /// The era check is not atomic with dispatch into `session_emitters`
+    /// (ep2-r3 fresheyes Major — the check-to-dispatch TOCTOU): a callback
+    /// can pass the check, be preempted before `dispatch_event_on` acquires
+    /// the emitter mutex, and resume only after its daemon's loss was
+    /// TAKEN (the era retired, the emitters swept) and the successor
+    /// registered a replacement sender — the stale event is then delivered
+    /// into the successor's registration; a stale `session.idle` would
+    /// falsely satisfy the successor's `await_idle` (the false
+    /// `freshAgent.turn.complete` precursor).
+    ///
+    /// The interleaving, forced deterministically through the
+    /// `cfg(test)` dispatch park: A's REAL sink passes the era check and
+    /// PARKS; while held, A is lost through the REAL watcher arm (take +
+    /// era retire + sweep) and the successor B re-warms (its own sink
+    /// connected); a B-era `await_idle` is subscribed and IN FLIGHT for
+    /// the durable session; only then is the parked callback released —
+    /// its era check ALREADY PASSED, so only a re-verification atomic
+    /// with dispatch can stop it. The stale A-era event must NOT satisfy
+    /// B's await. A GENUINE B-era idle through B's own sink still must
+    /// (the gate is an era fence, not a broken dispatch). Pre-fix, the
+    /// released callback dispatched straight into B's fresh registration
+    /// and the successor's await resolved Ok.
+    #[tokio::test]
+    async fn a_preempted_era_checked_event_never_reaches_the_successors_registration() {
+        let exited = Arc::new(AtomicBool::new(false));
+        let killed = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(RecordingEventSource {
+            sinks: Mutex::new(Vec::new()),
+        });
+        let deps = ServeDeps {
+            spawner: Arc::new(FlagExitSpawner {
+                exited: exited.clone(),
+                killed: killed.clone(),
+            }),
+            http: Arc::new(RecordingHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: events.clone(),
+        };
+        let config = ServeConfig {
+            daemon_watch_interval: Duration::from_millis(5),
+            re_warm_backoff_initial_ms: 5,
+            re_warm_backoff_max_ms: 50,
+            ..ServeConfig::default()
+        };
+        let mgr = OpencodeServeManager::new(deps, config);
+        mgr.ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        let mut signals = mgr.subscribe_daemon_signals();
+        let sink_a = events
+            .sinks
+            .lock()
+            .expect("recorded sinks mutex")
+            .first()
+            .expect("A's cold start connected its event stream")
+            .clone();
+
+        // The park: `entered` fires once the callback has passed A's era
+        // check; dropping `release_tx` resumes it. The release receiver
+        // rides a Mutex because the park closure must be `Sync` (an
+        // `EventSink` requirement) and only the parked callback ever
+        // touches it.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        mgr.arm_dispatch_park_for_tests(Some(Arc::new(move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.lock().expect("release latch mutex").recv();
+        })));
+
+        // The preempted A-era callback, on its own OS thread: the sink is
+        // synchronous, and the runtime must stay free to run the loss and
+        // the re-warm while the callback is held.
+        let done = Arc::new(AtomicBool::new(false));
+        let done_thread = done.clone();
+        let idle_event = || {
+            crate::events::parse_serve_event(&serde_json::json!({
+                "type": "session.idle",
+                "properties": { "sessionID": "ses_race" }
+            }))
+            .expect("parseable serve event")
+        };
+        let sink_thread = std::thread::spawn(move || {
+            sink_a(idle_event());
+            done_thread.store(true, Ordering::SeqCst);
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the sink parks after passing the era check, before dispatch");
+
+        // While the callback is held: A dies through the REAL watcher arm —
+        // the take retires the dispatch era and sweeps the emitters inside
+        // the same running-lock critical section.
+        exited.store(true, Ordering::SeqCst);
+        let lost = tokio::time::timeout(Duration::from_secs(2), signals.recv())
+            .await
+            .expect("loss signal within budget")
+            .expect("channel alive");
+        assert!(
+            matches!(
+                lost,
+                DaemonSignal::Lost {
+                    reason: "process_exit"
+                }
+            ),
+            "got {lost:?}"
+        );
+        // The successor B re-warms — a NEW generation with its own sink.
+        exited.store(false, Ordering::SeqCst);
+        let started = tokio::time::timeout(Duration::from_secs(2), signals.recv())
+            .await
+            .expect("re-warm within budget")
+            .expect("channel alive");
+        assert!(matches!(started, DaemonSignal::Started), "got {started:?}");
+        let sink_b = events
+            .sinks
+            .lock()
+            .expect("recorded sinks mutex")
+            .get(1)
+            .expect("B's cold start connected its event stream")
+            .clone();
+
+        // The B-era registration the stale event must not reach: an
+        // in-flight `await_idle` for the durable session.
+        let rx = mgr.subscribe("ses_race");
+        let idle_manager = mgr.clone();
+        let mut await_idle = tokio::spawn(async move {
+            idle_manager
+                .await_idle("ses_race", rx, Duration::from_secs(5), None)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Release the preempted callback: the era check already passed —
+        // only an ATOMIC re-verification at dispatch can stop it now.
+        drop(release_tx);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !done.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "the parked callback must complete after the release"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // THE assertion: the stale A-era event must NOT satisfy B's await —
+        // the successor stays pending through the grace window.
+        match tokio::time::timeout(Duration::from_millis(300), &mut await_idle).await {
+            Err(_still_pending) => {}
+            Ok(Ok(Ok(()))) => panic!(
+                "the preempted A-era event — era-checked BEFORE the take, \
+                 dispatched AFTER the successor registered — satisfied the \
+                 successor's await_idle: the false freshAgent.turn.complete \
+                 precursor (ep2-r3 check-to-dispatch TOCTOU)"
+            ),
+            other => panic!("await_idle settled unexpectedly: {other:?}"),
+        }
+
+        // Positive control: a GENUINE B-era idle through B's OWN sink still
+        // satisfies it — the gate is an era fence, not a broken dispatch.
+        mgr.arm_dispatch_park_for_tests(None);
+        sink_b(idle_event());
+        let outcome = tokio::time::timeout(Duration::from_secs(2), await_idle)
+            .await
+            .expect("the genuine B-era idle resolves within budget");
+        assert!(
+            matches!(outcome, Ok(Ok(()))),
+            "the successor's own idle edge must satisfy await_idle, got {outcome:?}"
+        );
+        sink_thread.join().expect("the sink thread ends cleanly");
     }
 
     /// Spawn-level: a config-supplied inline document is MERGED into the launch
