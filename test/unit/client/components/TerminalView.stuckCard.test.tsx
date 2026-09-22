@@ -681,6 +681,60 @@ describe('TerminalView stuck card (wedge-backstop LB-7 matrix)', () => {
     expect(screen.getByRole('alert')).toHaveTextContent(/appears stuck/i)
   })
 
+  // ── G: in-flight re-entrancy guard (Task 4 review, Minor-1) ──
+  it('restart (arm G, double-click): a second click while the kill-await is outstanding is a no-op — exactly one kill, exactly one reset', async () => {
+    const { store, paneContent } = makeStore({ stuck: { at: 123, terminalId: TID } })
+    await renderPane(store, paneContent)
+
+    // Both clicks land while the first kill's bounded ack-wait
+    // (KILL_ACK_TIMEOUT_MS) is still outstanding — no terminal.killed is
+    // delivered between them.
+    await clickRestart()
+    await clickRestart()
+    const kills = sentKills()
+    expect(kills).toHaveLength(1)
+    const requestId = kills[0].requestId
+    expect(kills[0]).toMatchObject({ type: 'terminal.kill', terminalId: TID, reason: 'stuck-recovery' })
+
+    // The one outstanding await resolves: exactly ONE reconcile reset
+    // (reconcileEpoch pins the count — a re-entered second click would
+    // have landed a second reset and driven it to 2).
+    await act(async () => {
+      emit({ type: 'terminal.exit', terminalId: TID, exitCode: 0 })
+      emit({ type: 'terminal.killed', requestId, terminalId: TID, success: true })
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    const content = paneState(store)
+    expect(content.pendingReconcile).toBe('respawn')
+    expect(content.reconcileEpoch).toBe(1)
+  })
+
+  it('restart (arm G, failed kill): the guard clears when the await settles — a retry fires a fresh kill', async () => {
+    const { store, paneContent } = makeStore({ stuck: { at: 123, terminalId: TID } })
+    await renderPane(store, paneContent)
+
+    await clickRestart()
+    let kills = sentKills()
+    expect(kills).toHaveLength(1)
+    const firstRequestId = kills[0].requestId
+
+    // The kill fails: no reset, the pane and the card stay (arm C's contract).
+    await act(async () => {
+      emit({ type: 'terminal.killed', requestId: firstRequestId, terminalId: TID, success: false, error: 'durable close failed' })
+    })
+    await flushAcks()
+    expect(screen.getByRole('alert')).toHaveTextContent(/appears stuck/i)
+
+    // The guard must not be a latch: the settled failure clears it, so the
+    // user's retry fires a genuinely new correlated kill.
+    await clickRestart()
+    kills = sentKills()
+    expect(kills).toHaveLength(2)
+    expect(kills[1]).toMatchObject({ type: 'terminal.kill', terminalId: TID, reason: 'stuck-recovery' })
+    expect(kills[1].requestId).not.toBe(firstRequestId)
+  })
+
   // ── Store-propagation sanity (parent contract): the gate reads the pane's
   // CURRENT status, so a status flip through the store removes the card even
   // while the stale prop would still show it.

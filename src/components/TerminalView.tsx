@@ -1004,6 +1004,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     terminalId: string
   } | null>(null)
   const pendingDurableReplacementRef = useRef<PendingDurableReplacement | null>(null)
+  // Wedge-backstop (Task 4 review, Minor-1): in-flight lock for the stuck
+  // card's shared kill-await path. The card's buttons stay enabled during the
+  // bounded KILL_ACK_TIMEOUT_MS wait; without the lock a second click
+  // re-enters, fires a second terminal.kill, and lands a second
+  // resetPaneForReconcileCreate (reconcileEpoch 2 — a superseded/orphan PTY
+  // until the idle reaper bounds it). Set at the shared entry before the
+  // send, cleared when the await settles (success AND failure — a failed
+  // kill must stay retryable; the lock is not a latch).
+  const pendingStuckRecoveryRef = useRef(false)
   const serverInstanceIdRef = useRef(serverInstanceId)
   const searchTerminalIdCleanupRef = useRef<string | null>(terminalContent?.terminalId ?? null)
   const deferredAttachStateRef = useRef<DeferredAttachState>({
@@ -5846,6 +5855,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // (2) the await-first order — the reconcile reset must not fire before
   //     the correlated terminal.killed resolves (pinned by the matrix's
   //     A/B/B' arms in TerminalView.stuckCard.test.tsx).
+  // (3) the in-flight re-entrancy lock (review Minor-1) — a second click
+  //     while the bounded kill-await is outstanding bails at the shared
+  //     entry (pinned by the matrix's G arms: one kill, one reset, and a
+  //     failed kill stays retryable).
   // (Hooks-legal placement: before the terminal-content conditional return.)
   const killStuckTerminalAndAwait = useCallback(async (): Promise<KillAck | null> => {
     const tid = terminalIdRef.current
@@ -5853,22 +5866,34 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     // Advisory guard (matrix arm E): the opencode replay-window replacement
     // flow already owns this pane's recovery — a second kill would race it.
     if (pendingDurableReplacementRef.current) return null
-    const content = contentRef.current
-    const fence = resolveTerminalKillFence(appStore, {
-      sessionRef: content?.sessionRef,
-    })
-    const ack = await sendTerminalKillAndAwait(tid, { ...fence, reason: 'stuck-recovery' })
-    if (!ack.ok) {
-      // Keep the card; the user can retry. The server close stays
-      // authoritative — nothing about the pane is changed on failure.
-      log.warn('terminal_stuck_recovery_kill_failed', { paneId, terminalId: tid, ...ack })
-      return null
+    // In-flight re-entrancy lock (matrix arm G, review Minor-1): a second
+    // click while this pane's kill-await is outstanding is a no-op. Both
+    // stuck-card actions share this entry, so the lock covers restart AND
+    // start-fresh (a cross-button click bails the same way).
+    if (pendingStuckRecoveryRef.current) return null
+    pendingStuckRecoveryRef.current = true
+    try {
+      const content = contentRef.current
+      const fence = resolveTerminalKillFence(appStore, {
+        sessionRef: content?.sessionRef,
+      })
+      const ack = await sendTerminalKillAndAwait(tid, { ...fence, reason: 'stuck-recovery' })
+      if (!ack.ok) {
+        // Keep the card; the user can retry. The server close stays
+        // authoritative — nothing about the pane is changed on failure.
+        log.warn('terminal_stuck_recovery_kill_failed', { paneId, terminalId: tid, ...ack })
+        return null
+      }
+      // Discard the old terminal's presentation state (the Relaunch
+      // discipline): a rejected respawn create must not resurrect a stale
+      // crash/stuck banner for what is actually a launch failure.
+      dispatch(clearTerminalLifecycle({ paneId }))
+      return ack
+    } finally {
+      // Both success and failure settle here, so the lock never outlives
+      // the await — a failed kill stays retryable.
+      pendingStuckRecoveryRef.current = false
     }
-    // Discard the old terminal's presentation state (the Relaunch
-    // discipline): a rejected respawn create must not resurrect a stale
-    // crash/stuck banner for what is actually a launch failure.
-    dispatch(clearTerminalLifecycle({ paneId }))
-    return ack
   }, [appStore, dispatch, paneId])
 
   const restartStuckAgentPane = useCallback(async () => {
