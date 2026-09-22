@@ -207,6 +207,24 @@ struct TurnTask {
     /// AWAIT it after joining the aborted handle, so a following send can
     /// never observe the still-destroyed interim state mid-restore.
     compact_settled_rx: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Emission-complete marker (send-during-compact queue): the drive
+    /// task flips this at the END of its settle tail — AFTER the last
+    /// broadcast (the trailing `idle` snapshot), immediately before the
+    /// tail's drain spawn. tokio's `JoinHandle::is_finished()` stays
+    /// false until the task's future RETURNS, and the tail's broadcasts
+    /// must ALL precede the next queued send's `running` (the round-2
+    /// review's ordering finding: a START-of-tail flip would let a
+    /// pushed drain drive mid-tail and broadcast `running` before this
+    /// drive's trailing `idle` — the pane would flash idle while a send
+    /// is active). The drain's in-flight gate is
+    /// `!t.is_finished() && !t.settling.load(SeqCst)`: a settling
+    /// registration has finished EMITTING (its drain is next, or
+    /// kill/interrupt own the queue), while a LIVE unsettled drive
+    /// still blocks — the no-stacking/no-misordering rule. Consulted
+    /// ONLY by the drain gate: the compact busy check, the rollback
+    /// BUSY_TURN check, and the attach labels keep reading
+    /// `is_finished()` alone.
+    settling: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Focused ep4-r5 (opencode_ws.rs:1155): the pre-drive redo destroy must be
@@ -1568,13 +1586,50 @@ impl FreshOpencodeState {
                 request_id = ?msg.request_id,
                 queued_depth = session.pending_sends.len(),
                 "fresh_agent_send_queued_behind_compact");
-            // Task 3 appends the push-armed detached drain here
-            // (`Self::drain_detached`) — the self-healing sliver closer.
-            // In THIS task the parked entry simply waits for the drain
-            // machinery the next task adds.
+            // Self-healing sliver closer: arm a drain for this push. A
+            // no-op when a live drive exists (the gate returns and that
+            // drive's tail drains later); acts immediately when the
+            // registration is settling/finished/absent with no upcoming
+            // tail (the post-drain window where nothing else would
+            // trigger). Spawned via the dyn-erased boundary — the
+            // spawned drain parks on the session mutex; detached, so
+            // the arm never blocks and no future type recurses.
+            Self::drain_detached(self, &real_id);
             return;
         }
 
+        self.send_locked(
+            &session_arc,
+            &mut session,
+            msg,
+            session_id,
+            send_fence,
+            false,
+        )
+        .await;
+    }
+
+    /// The post-gate send body (flag resets → … → run_turn spawn →
+    /// turn_task registration), extracted from `handle_send` so the
+    /// send-during-compact drain re-enters the EXACT send path for a
+    /// queued entry. CONTRACT: the caller HOLDS this session's mutex for
+    /// the whole call (the same discipline the inline body had — the
+    /// session→map lock pair stays the only permitted ordering).
+    /// `already_accepted` suppresses the `freshAgent.send.accepted`
+    /// broadcast when the queue arm already emitted it (never
+    /// double-fire). Task 5 adds the `op_guard` parameter (the armed
+    /// attach guard moved into the drive and released at the prompt's
+    /// dispatch boundary); this task's signature stays as written.
+    async fn send_locked(
+        &self,
+        session_arc: &Arc<TokioMutex<OpencodeSession>>,
+        session: &mut tokio::sync::MutexGuard<'_, OpencodeSession>,
+        msg: FreshAgentSend,
+        session_id: String,
+        send_fence: Option<freshell_ownership::ObservedFence>,
+        already_accepted: bool,
+    ) {
+        let request_id = msg.request_id.clone();
         // materializeOrSend:334-335 -- a fresh turn starts un-aborted and un-errored;
         // `handle_interrupt` flips `turn_aborted` while we are parked on idle, and
         // the serve-stream bridge flips `turn_errored` if the turn reports an error.
@@ -2011,13 +2066,18 @@ impl FreshOpencodeState {
         // mirroring the codex slice's ack timing. The turn itself runs in a detached
         // task below so `freshAgent.kill` can target it independently of this handler's
         // own (already-detached, per terminal.rs dispatch) task.
-        self.broadcast_send_accepted(&acked_session_id, &request_id, &route);
+        if !already_accepted {
+            self.broadcast_send_accepted(&acked_session_id, &request_id, &route);
+        }
 
         let fresh_agent = self.fresh_agent.clone();
         let turn_aborted = session.turn_aborted.clone();
         let turn_errored = session.turn_errored.clone();
         let last_turn_complete_at = session.last_turn_complete_at.clone();
         let daemon_turn_accepted = session.daemon_turn_accepted.clone();
+        let this = self.clone();
+        let settling = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let settling_task = Arc::clone(&settling);
 
         let turn_task = tokio::spawn(async move {
             // `run_turn` (freshell-opencode/serve.rs) prompts + awaits idle against the
@@ -2062,12 +2122,125 @@ impl FreshOpencodeState {
                 &turn_errored,
                 &last_turn_complete_at,
             );
+            // send-during-compact queue: FIFO one-at-a-time — after this
+            // send settles, drive the next queued entry (no-op when the
+            // queue is empty). Spawned via the dyn-erased boundary —
+            // never awaited.
+            settling_task.store(true, Ordering::SeqCst);
+            Self::drain_detached(&this, &real_id);
         });
         session.turn_task = Some(TurnTask {
             kind: TurnTaskKind::Send,
             handle: turn_task,
             compact_settled_rx: None,
+            settling,
         });
+    }
+
+    /// Send-during-compact drain: drives at most ONE queued send (FIFO)
+    /// when the session is quiescent; the driven send's own settle tail
+    /// re-triggers for the next entry (one at a time). Triggers (EVERY
+    /// one spawned via [`Self::drain_detached`] — never awaited):
+    /// (a) the compact drive's settle tail — success AND failure;
+    /// (b) the send drive's settle tail; (c) `handle_interrupt` after the
+    /// aborted compact settles (the aborted task's tail never runs);
+    /// (d) the queue arm's push (the self-healing sliver closer: a push
+    /// landing behind a settling/finished registration with no upcoming
+    /// tail gets drained immediately; a no-op when a live drive exists);
+    /// (e) EVERY `close_pending` decrement site in the kill enumeration
+    /// (Task 4) — the positive trigger that heals a compact settling
+    /// during a kill's awaited durable close, including the
+    /// DURABLE_CLOSE_FAILED clean-failure arm.
+    ///
+    /// GATES, in order: `killed` → return (kill dropped the queue under
+    /// its own lock). `close_pending > 0` → return WITHOUT retry — the
+    /// decrement sites re-trigger positively when the gate releases, so
+    /// no bound can strand an accepted message. A live drive
+    /// (`!is_finished() && !settling`) → return (that drive's settle
+    /// tail is the next trigger).
+    ///
+    /// Refused entries are discarded with a request-correlated
+    /// `send_error` (the client's owned-failure cleanup correlates by
+    /// requestId) and the drain continues with the next entry. Kill and
+    /// the handoff stop DROP the queue instead — the gates above are
+    /// the belt-and-braces re-check for a drain racing those paths'
+    /// lock sections.
+    async fn drain_pending_sends(&self, lookup_id: &str) {
+        let session_arc = {
+            let guard = self.sessions.lock().await;
+            guard.get(lookup_id).cloned()
+        };
+        let Some(session_arc) = session_arc else {
+            return;
+        };
+        let mut session = session_arc.lock().await;
+        loop {
+            if session.killed.load(Ordering::SeqCst) || session.close_pending > 0 {
+                return;
+            }
+            if session
+                .turn_task
+                .as_ref()
+                .is_some_and(|t| !t.is_finished() && !t.settling.load(Ordering::SeqCst))
+            {
+                return; // a live drive's settle tail is the next trigger
+            }
+            let Some(msg) = session.pending_sends.front().cloned() else {
+                return;
+            };
+            let real_id = session
+                .real_session_id
+                .clone()
+                .unwrap_or_else(|| msg.session_id.clone());
+            let send_fence = match crate::ownership_lane::wire_fence(
+                msg.observed_epoch,
+                msg.observed_generation,
+            ) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    session.pending_sends.pop_front();
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %lookup_id, request_id = ?msg.request_id,
+                        "fresh_agent_send_drain_refused: half-sent observed fence");
+                    self.send_error(&msg.request_id, err.code(), err.message());
+                    continue;
+                }
+            };
+            // (Task 5 inserts the guard-based fence re-validation here.)
+            session.pending_sends.pop_front();
+            self.send_locked(&session_arc, &mut session, msg, real_id, send_fence, true)
+                .await;
+            return; // one entry driven; its settle tail continues the FIFO
+        }
+    }
+
+    /// The dyn-erased drain boundary (round-2 review finding, probe
+    /// reports/recursion-probe.rs on rustc 1.96.0): a PLAIN fn returning
+    /// a boxed future. The old trait solver cannot prove `Send`
+    /// through any cycle of opaque async-fn futures (E0283/E0733) — no
+    /// generator may store another opaque drain/send future. This
+    /// boundary erases the drain's concrete future type at the spawn
+    /// edge, so every spawn site is immune by construction. The state
+    /// is taken BY VALUE (an owned clone moved into the boxed
+    /// future): a `&Self` borrow into a `'static` boxed future cannot
+    /// compile (tokio::spawn requires 'static — the round-3 review's
+    /// finding).
+    fn drain_boxed(
+        this: Self,
+        id: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(async move { this.drain_pending_sends(&id).await })
+    }
+
+    /// The ONE drain spawn helper every trigger site calls (compact
+    /// settle tail, send settle tail, handle_interrupt, the queue arm's
+    /// push, the kill-enumeration decrement sites). Detached: tails
+    /// never block on the session mutex, and the spawned task parks on
+    /// the mutex if it races a lock holder — always safe.
+    fn drain_detached(this: &Self, id: &str) {
+        let this = this.clone();
+        let id = id.to_string();
+        tokio::spawn(Self::drain_boxed(this, id));
     }
 
     // ── freshAgent.configure (WS) ────────────────────────────────────────────
@@ -3518,6 +3691,12 @@ impl FreshOpencodeState {
                 turn_aborted.store(false, Ordering::SeqCst);
             }
         }
+        // send-during-compact queue: an interrupted compact never runs its
+        // own settle tail (the TurnTask doc — an aborted drive drops
+        // mid-await and never reaches its tail), so THIS handler is the
+        // drain trigger — after the abort settled and the daemon-side
+        // abort resolved. Only kill drops the queue; interrupt does not.
+        Self::drain_detached(self, &real_id);
     }
 
     // ── freshAgent.compact (WS, AGENT-04) ────────────────────────────────────
@@ -3797,6 +3976,9 @@ impl FreshOpencodeState {
         let fresh_agent = self.fresh_agent.clone();
         let identity_sink = std::sync::Arc::clone(&self.identity_sink);
         let compact_id = real_id.clone();
+        let this = self.clone();
+        let settling = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let settling_task = Arc::clone(&settling);
         // Focused ep4-r5 (opencode_ws.rs:1155): an abort (kill/interrupt)
         // that drops this task WHILE the drive is parked inside
         // `ensure_started` (a cold start, or any point before the summarize
@@ -3977,11 +4159,19 @@ impl FreshOpencodeState {
                     }),
                 ));
             }
+            // send-during-compact queue: the compact settled (success OR
+            // failure) and its emissions are complete — drain one queued
+            // send; its own settle tail continues the FIFO. Spawned via
+            // the dyn-erased boundary — never awaited (the recursive
+            // future-type cycle + tail-blocking rules).
+            settling_task.store(true, Ordering::SeqCst);
+            Self::drain_detached(&this, &compact_id);
         });
         session.turn_task = Some(TurnTask {
             kind: TurnTaskKind::Compact,
             handle: compact_task,
             compact_settled_rx: Some(compact_settled_rx),
+            settling,
         });
     }
 
@@ -7805,6 +7995,7 @@ mod tests {
                 kind: TurnTaskKind::Compact,
                 handle: tokio::spawn(std::future::pending::<()>()),
                 compact_settled_rx: Some(settled_rx),
+                settling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             });
         }
 
@@ -12772,6 +12963,16 @@ mod tests {
         /// guard is armed in the handler before the resolution, and the
         /// mutation/POST has not run).
         config_gate: Option<Arc<tokio::sync::Notify>>,
+        /// send-during-compact queue (Task 3): when set, the FIRST
+        /// `prompt_async` POST parks on `notified()` — a deterministic
+        /// "a queued send is in flight" window for the FIFO one-at-a-time
+        /// proof. ONE-SHOT by construction: the arm `take()`s the gate in
+        /// its synchronous part, so only the first prompt after arming
+        /// parks; every later prompt answers immediately. Recording
+        /// happens at request arrival for EVERY request, so
+        /// `await_prompt_posted` sees the parked POST — the same
+        /// record-then-park split the summarize arm uses.
+        prompt_gate: StdMutex<Option<Arc<tokio::sync::Notify>>>,
     }
 
     impl CompactFakeHttp {
@@ -12793,11 +12994,20 @@ mod tests {
                 summarize_gate,
                 health_gate,
                 config_gate,
+                prompt_gate: StdMutex::new(None),
             }
         }
 
         fn recorded(&self) -> Vec<RecordedRequest> {
             self.requests.lock().expect("requests mutex").clone()
+        }
+
+        /// send-during-compact queue (Task 3): arm the one-shot prompt
+        /// park; the returned Notify releases the parked POST.
+        fn arm_prompt_gate(&self) -> Arc<tokio::sync::Notify> {
+            let gate = Arc::new(tokio::sync::Notify::new());
+            *self.prompt_gate.lock().expect("prompt gate mutex") = Some(gate.clone());
+            gate
         }
 
         fn summarize_requests(&self) -> Vec<RecordedRequest> {
@@ -12906,12 +13116,24 @@ mod tests {
                     Some("running"),
                     "the busy `running` snapshot must precede the summarize POST"
                 );
+                // send-during-compact queue (Task 3, fixture edit A): the gate
+                // consult is HOISTED above the outcome arms — previously only
+                // `OkAnswered` parked, so the 500/transport arms answered
+                // immediately and a queued send could never form under them
+                // (the compact settled before the send arrived). All three
+                // delivered-outcome arms now park identically AFTER the
+                // record + order pin; the `Undelivered` refusal arm above
+                // still answers pre-record, ungated.
+                let gate = self.summarize_gate.clone();
                 if self.summarize_outcome == SummarizeOutcome::MidflightTransport {
                     // The request WAS recorded above (delivery is ambiguous),
                     // then the connection broke before an answer — the exact
                     // reqwest send()-phase failure the real transport maps to
                     // `ServeHttpError::Ambiguous` → `ServeError::Transport`.
-                    return Box::pin(async {
+                    return Box::pin(async move {
+                        if let Some(gate) = gate {
+                            gate.notified().await;
+                        }
                         Err(ServeHttpError::Ambiguous(
                             "error sending request for url (http://127.0.0.1:42579/session/ses_1/summarize?directory=%2Ftmp)"
                                 .to_string(),
@@ -12919,7 +13141,10 @@ mod tests {
                     });
                 }
                 if self.summarize_outcome == SummarizeOutcome::Answered500 {
-                    return Box::pin(async {
+                    return Box::pin(async move {
+                        if let Some(gate) = gate {
+                            gate.notified().await;
+                        }
                         Ok(ServeHttpResponse::new(500, b"summarize exploded".to_vec()))
                     });
                 }
@@ -12927,7 +13152,6 @@ mod tests {
                     .lock()
                     .expect("busy budget mutex")
                     .insert(id, 2);
-                let gate = self.summarize_gate.clone();
                 return Box::pin(async move {
                     if let Some(gate) = gate {
                         gate.notified().await;
@@ -12947,7 +13171,13 @@ mod tests {
                     .lock()
                     .expect("busy budget mutex")
                     .insert(id, 2);
-                return Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) });
+                let prompt_gate = self.prompt_gate.lock().expect("prompt gate mutex").take();
+                return Box::pin(async move {
+                    if let Some(gate) = prompt_gate {
+                        gate.notified().await;
+                    }
+                    Ok(ServeHttpResponse::new(200, b"{}".to_vec()))
+                });
             }
             if method == "GET" && req.url.contains("/session/status") {
                 let mut budgets = self.busy_budget.lock().expect("busy budget mutex");
@@ -13030,6 +13260,57 @@ mod tests {
             .expect("healthy fake serve starts");
         fresh_agent.set_manager_for_test(manager).await;
         (FreshOpencodeState::new(fresh_agent), http, rx)
+    }
+
+    /// [`compact_state_gated`]'s bus-sender variant (send-during-compact
+    /// queue, Task 3): ALSO returns the broadcast bus's sender. The
+    /// FIFO/order tests subscribe a SECOND, untouched receiver from it
+    /// BEFORE any handler runs — a broadcast channel buffers each
+    /// receiver INDEPENDENTLY, so that receiver keeps the run's TOTAL
+    /// emission order even while the first receiver's
+    /// `frames_until`/`drain_frames` calls consume their own buffer
+    /// (consumed frames are gone; the round-3 review's finding).
+    async fn compact_state_gated_tx(
+        config_body: &str,
+        summarize_outcome: SummarizeOutcome,
+        summarize_gate: Option<Arc<tokio::sync::Notify>>,
+        config_gate: Option<Arc<tokio::sync::Notify>>,
+    ) -> (
+        FreshOpencodeState,
+        Arc<CompactFakeHttp>,
+        tokio::sync::broadcast::Receiver<String>,
+        Arc<tokio::sync::broadcast::Sender<String>>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        let bus_tx = Arc::new(tx.clone());
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx.clone()));
+        let http = Arc::new(CompactFakeHttp::new(
+            config_body.as_bytes().to_vec(),
+            summarize_outcome,
+            tx.subscribe(),
+            summarize_gate,
+            None,
+            config_gate,
+        ));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        (FreshOpencodeState::new(fresh_agent), http, rx, bus_tx)
     }
 
     /// Insert a directly-materialized session (no send drove it) with the given model.
@@ -15238,6 +15519,30 @@ mod tests {
         .expect("the summarize POST lands within the budget");
     }
 
+    /// Wait (bounded) until the fake has recorded a `prompt_async` POST
+    /// whose body contains `text` — the send-during-compact drain tests'
+    /// "the queued send actually POSTed" witness. Recording happens at
+    /// request ARRIVAL for every request (the same record-then-park
+    /// split the summarize arm uses), so a POST parked on the one-shot
+    /// prompt gate is still observable here. The POSTs happen inside
+    /// SPAWNED drive tasks — never assert them against a fixed sleep.
+    async fn await_prompt_posted(http: &Arc<CompactFakeHttp>, text: &str) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if http
+                    .recorded()
+                    .iter()
+                    .any(|r| r.url.contains("prompt_async") && r_body_contains(r, text))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the prompt POST containing {text:?} lands within the budget"));
+    }
+
     /// D1-F1(a): the composer stays interactive while a session is busy, so a
     /// `/compact` gesture CAN arrive while a turn is in flight. The compact
     /// must be REFUSED with a nested `freshAgent.error{INTERNAL_ERROR}` naming
@@ -15258,6 +15563,7 @@ mod tests {
             kind: TurnTaskKind::Send,
             handle: tokio::spawn(std::future::pending::<()>()),
             compact_settled_rx: None,
+            settling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
 
         st.handle_compact(compact_msg("ses_1")).await;
@@ -15596,6 +15902,339 @@ mod tests {
                 .unwrap_or(true),
             "the kill took + aborted the compact's registered task"
         );
+    }
+
+    // ── send-during-compact queue: the drain (Task 3) ─────────────────────
+
+    /// The drain's FIFO + one-at-a-time + emission-order contract, end to
+    /// end. Two sends queued behind a parked compact; the release drains
+    /// them strictly one per settle tail: the compact's trailing `idle`
+    /// precedes the first send's `running`, the first send's trailing
+    /// `idle` precedes the second's `running` — pinned over the WHOLE
+    /// run's frame stream from a second receiver (the first receiver's
+    /// earlier frames_until/drain_frames calls consume their own buffer).
+    #[tokio::test]
+    async fn a_queued_send_drains_after_the_compact_settles_in_fifo_order() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        // The _tx variant exposes the bus sender: a SECOND, untouched
+        // receiver carries the total frame order for assertion (6) even
+        // though this test's earlier frames_until/drain_frames calls
+        // consume the first receiver (the round-3 review's finding).
+        let (st, http, mut rx, bus_tx) = compact_state_gated_tx(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        let mut order_rx = bus_tx.subscribe();
+        insert_compact_session(&st, "ses_q2", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q2")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+
+        // Arm the one-shot prompt park BEFORE the drain can fire.
+        let prompt_gate = http.arm_prompt_gate();
+
+        // TWO queued sends — FIFO order is the assertion target.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q2", "first queued")),
+        )
+        .await
+        .expect("queues inline");
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q2", "second queued")),
+        )
+        .await
+        .expect("queues inline");
+
+        // Both accepted at queue time. frames_until stops at the FIRST
+        // predicate match — wait for EACH requestId with its own call.
+        let _ = frames_until(&mut rx, |f| {
+            f["type"] == "freshAgent.send.accepted" && f["requestId"] == "req-first queued"
+        })
+        .await;
+        let _ = frames_until(&mut rx, |f| {
+            f["type"] == "freshAgent.send.accepted" && f["requestId"] == "req-second queued"
+        })
+        .await;
+
+        // Release: the compact POST answers, the drive settles, the drain runs.
+        summarize_gate.notify_waiters();
+
+        // (1) The FIRST drained send parks on the one-shot prompt gate.
+        await_prompt_posted(&http, "first queued").await;
+
+        // (2) ONE-AT-A-TIME (the design constraint, now PROVEN): while the
+        // first queued send is in flight (parked), the second has NOT
+        // started — the drain drives exactly one entry per settle tail.
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async") && r_body_contains(&r, "second queued")),
+            "one-at-a-time: the second queued send has not POSTed while the first is in flight"
+        );
+
+        // (3) Release the first send's prompt; its settle tail drives the
+        // second (bounded async waits: the POSTs happen inside spawned
+        // tasks — never assert them against a fixed sleep).
+        prompt_gate.notify_waiters();
+        await_prompt_posted(&http, "second queued").await;
+
+        // (4) Order on the recorded log: compact BEFORE first, first BEFORE
+        // second (FIFO).
+        let recorded = http.recorded();
+        let summarize_ix = recorded
+            .iter()
+            .position(|r| r.url.contains("summarize"))
+            .expect("summarize POST recorded");
+        let first_ix = recorded
+            .iter()
+            .position(|r| r.url.contains("prompt_async") && r_body_contains(&r, "first queued"))
+            .expect("first queued send drained");
+        let second_ix = recorded
+            .iter()
+            .position(|r| r.url.contains("prompt_async") && r_body_contains(&r, "second queued"))
+            .expect("second queued send drained");
+        assert!(
+            summarize_ix < first_ix,
+            "drain waits for the compact settle"
+        );
+        assert!(first_ix < second_ix, "FIFO order");
+
+        // (5) The queue drains completely and the pane settles idle —
+        // wait for EACH drive's trailing idle with its own bounded call
+        // (frames_until stops at the FIRST match, and the first call
+        // would otherwise return on the compact's already-buffered idle
+        // while the second send's drive is still in flight): the
+        // compact's, the first send's, then the second send's. All
+        // three landed = the queue drained and the pane settled.
+        for _ in 0..3 {
+            let _ = frames_until(&mut rx, |f| {
+                is_event(f, "freshAgent.session.snapshot", Some("idle"))
+            })
+            .await;
+        }
+        let session_arc = st.sessions.lock().await.get("ses_q2").cloned().unwrap();
+        assert!(session_arc.lock().await.pending_sends.is_empty());
+
+        // (6) THE EMISSION-ORDER CONTRACT (the round-2 review's ordering
+        // finding): over the WHOLE run's frame stream, each drive's trailing
+        // idle precedes the next drive's running — the compact settles (idle)
+        // before send #1 starts (running), and send #1 settles before send #2
+        // starts. One drain_frames at the end gives the total emission
+        // order; positional assertions on the running/idle snapshot lists.
+        // Drain the SECOND receiver — the first receiver's earlier
+        // frames_until/drain_frames calls already consumed its frames, so
+        // the full emission order survives only in order_rx.
+        let all_frames = drain_frames(&mut order_rx);
+        let running_ix: Vec<usize> = all_frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| is_event(f, "freshAgent.session.snapshot", Some("running")))
+            .map(|(i, _)| i)
+            .collect();
+        let idle_ix: Vec<usize> = all_frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| is_event(f, "freshAgent.session.snapshot", Some("idle")))
+            .map(|(i, _)| i)
+            .collect();
+        // This rig emits exactly 3 runnings (compact, send 1, send 2) and 3
+        // idles — assert the counts, then the cross-drive ordering.
+        assert_eq!(running_ix.len(), 3, "compact + two sends each ran once");
+        assert_eq!(idle_ix.len(), 3, "each drive settled once");
+        assert!(
+            idle_ix[0] < running_ix[1],
+            "the compact's trailing idle precedes the first queued send's running"
+        );
+        assert!(
+            idle_ix[1] < running_ix[2],
+            "the first send's trailing idle precedes the second queued send's running"
+        );
+    }
+
+    /// MUST #4 (the client contract): a fresh send arriving while older
+    /// entries are still queued appends — never drives ahead of them.
+    /// The exact window: a live (unsettled) SEND drive with an
+    /// already-queued entry the drain has not popped yet.
+    #[tokio::test]
+    async fn a_send_arriving_behind_pending_queue_entries_appends_fifo() {
+        let (st, _http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            None,
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q2b", Some("prov/model")).await;
+        let session_arc = st.sessions.lock().await.get("ses_q2b").cloned().unwrap();
+        {
+            let mut session = session_arc.lock().await;
+            // Plant the live SEND drive + the pending older entry white-box
+            // (same-crate test style): the drain has not popped it.
+            session.turn_task = Some(TurnTask {
+                kind: TurnTaskKind::Send,
+                handle: tokio::spawn(std::future::pending::<()>()),
+                compact_settled_rx: None,
+                settling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            });
+            session
+                .pending_sends
+                .push_back(send_msg("ses_q2b", "older entry"));
+        }
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q2b", "newer entry")),
+        )
+        .await
+        .expect("appends behind pending entries");
+        let session = session_arc.lock().await;
+        let texts: Vec<String> = session
+            .pending_sends
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        assert_eq!(
+            texts,
+            vec!["older entry".to_string(), "newer entry".to_string()],
+            "a send behind pending queue entries appends in FIFO order"
+        );
+    }
+
+    /// The settling-flag gate semantics, planted deterministically.
+    #[tokio::test]
+    async fn a_settling_registration_does_not_block_the_drain_but_a_live_one_does() {
+        let (st, _http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            None,
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q2c", Some("prov/model")).await;
+        let session_arc = st.sessions.lock().await.get("ses_q2c").cloned().unwrap();
+        // (a) live (unsettling) registration → the drain returns without popping.
+        {
+            let mut session = session_arc.lock().await;
+            session.turn_task = Some(TurnTask {
+                kind: TurnTaskKind::Compact,
+                handle: tokio::spawn(std::future::pending::<()>()),
+                compact_settled_rx: None,
+                settling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            });
+            session.pending_sends.push_back(send_msg("ses_q2c", "held"));
+        }
+        st.drain_pending_sends("ses_q2c").await;
+        assert_eq!(
+            session_arc.lock().await.pending_sends.len(),
+            1,
+            "a live registration blocks the drain"
+        );
+        // (b) settling registration → the drain pops and drives (the drive
+        // itself POSTs to the fake — this rig has no coordinator wired, so
+        // the unfenced entry proceeds exactly like the direct path).
+        {
+            let mut session = session_arc.lock().await;
+            session.turn_task = Some(TurnTask {
+                kind: TurnTaskKind::Compact,
+                handle: tokio::spawn(std::future::pending::<()>()),
+                compact_settled_rx: None,
+                settling: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            });
+        }
+        st.drain_pending_sends("ses_q2c").await;
+        assert!(
+            session_arc.lock().await.pending_sends.is_empty(),
+            "a settling registration is past its emissions — the drain proceeds"
+        );
+    }
+
+    /// Same rig; park the compact, queue one send, then interrupt. The
+    /// aborted compact's own settle tail NEVER runs (TurnTask doc
+    /// :199-201), so the drain must fire from handle_interrupt after
+    /// abort_and_settle — the queued prompt POST is the proof.
+    #[tokio::test]
+    async fn an_interrupted_compact_still_drains_the_queued_send() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q3", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q3")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q3", "survives the interrupt")),
+        )
+        .await;
+        // The inline FreshAgentInterrupt literal the interrupt lifecycle
+        // test uses (same field shape, adapted to ses_q3).
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q3".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers");
+        await_prompt_posted(&http, "survives the interrupt").await;
+    }
+
+    /// Same rig with SummarizeOutcome::Answered500 + the gate (fixture
+    /// companion edit A makes the 500 arm park like OkAnswered — without
+    /// it, the compact settles before the send arrives and the queue is
+    /// never exercised). Queue a send while parked, release, the compact
+    /// FAILS — the settle tail still runs → the drain still fires.
+    #[tokio::test]
+    async fn a_queued_send_drains_after_a_failed_compact_too() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::Answered500,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q4", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q4")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q4", "drains past the failure")),
+        )
+        .await;
+        summarize_gate.notify_waiters();
+        // The failure is LOUD (pre-existing), and the queued send STILL drains.
+        let _ = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.error", None) && f["event"]["code"] == "OPENCODE_COMPACT_FAILED"
+        })
+        .await;
+        await_prompt_posted(&http, "drains past the failure").await;
     }
 
     // ── freshAgent.fork (AGENT-07, approval-respond Task 5) ────────────────
@@ -16911,6 +17550,7 @@ mod tests {
             kind: TurnTaskKind::Send,
             handle: tokio::spawn(async { std::future::pending::<()>().await }),
             compact_settled_rx: None,
+            settling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
         (st, rx, sink, http)
     }
