@@ -7112,6 +7112,13 @@ fn handle_attach(
     );
     // TERM-07 seam: the client's replay-budget request rides both paths.
     let max_replay_bytes = attach.max_replay_bytes;
+    // Round-2 finding F3: the negotiated forward-page upper bound rides
+    // the same paths as a PacedAttachOptions input — the registry clamps
+    // it to its own cap and records the effective budget on the session
+    // so every later page honors the same bound.
+    let paced_options = freshell_terminal::PacedAttachOptions {
+        replay_page_bytes: attach.replay_page_bytes,
+    };
     let outcome = if geometry_identity_ok {
         let cols = attach.cols.clamp(0, u16::MAX as i64) as u16;
         let rows = attach.rows.clamp(0, u16::MAX as i64) as u16;
@@ -7136,6 +7143,7 @@ fn handle_attach(
             attach.intent,
             cols,
             rows,
+            paced_options,
         )
     } else {
         state.registry.attach(
@@ -7149,6 +7157,7 @@ fn handle_attach(
             canonical_session_ref,
             attach.surface_reset,
             max_replay_bytes,
+            paced_options,
         )
     };
     if outcome.found {
@@ -7218,7 +7227,11 @@ fn handle_replay_credit(
     if verdict != crate::paced_replay::CreditVerdict::Accepted {
         return true;
     }
-    let budget = state.registry.paced_page_max_bytes();
+    // Round-2 finding F3: the SESSION's effective page budget (the
+    // attach's `replayPageBytes` request clamped to the registry cap,
+    // recorded on the session at attach) sizes the credited pages — the
+    // whole session honors the requested bound, not just the first page.
+    let budget = session.page_budget;
     match crate::paced_replay::drive_session(&state.registry, conn_id, conn_sink, session, budget) {
         DriveOutcome::Active => {}
         DriveOutcome::DrainReady => {

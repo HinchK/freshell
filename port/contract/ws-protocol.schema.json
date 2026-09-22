@@ -1021,6 +1021,11 @@
               ],
               "type": "string"
             },
+            "replayPageBytes": {
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991,
+              "type": "integer"
+            },
             "rows": {
               "maximum": 500,
               "minimum": 2,
@@ -8057,6 +8062,11 @@
             "background"
           ],
           "type": "string"
+        },
+        "replayPageBytes": {
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991,
+          "type": "integer"
         },
         "rows": {
           "maximum": 500,

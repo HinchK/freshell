@@ -523,6 +523,13 @@ export const TerminalAttachSchema = z.object({
   expectedSessionRef: SessionLocatorSchema.optional(),
   sinceSeq: z.number().int().nonnegative().optional(),
   maxReplayBytes: z.number().int().positive().optional(),
+  /** Paced terminal restore (responsive-terminal-restore Workstream 1):
+   *  the negotiated forward-page limit the client requests — an optional
+   *  UPPER BOUND on each paced replay page's serialized bytes, honored
+   *  only on pacedTerminalReplayV1 connections and clamped by the server
+   *  to its own page-budget cap (min(requested, server cap)). Additive
+   *  optional; absent or invalid values keep the server's default. */
+  replayPageBytes: z.number().int().positive().optional(),
   attachRequestId: z.string().min(1).optional(),
   /** Positive marker: the attaching xterm surface was freshly constructed
    * (page load / renderer recreation / user reset). Servers that know this

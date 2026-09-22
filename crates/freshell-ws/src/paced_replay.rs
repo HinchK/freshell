@@ -85,6 +85,11 @@ pub(crate) struct PacedSession {
     pub credited: i64,
     /// Production cursor: the last seq sent in a page.
     pub page_end: i64,
+    /// The session's page budget (round-2 finding F3): the clamped
+    /// effective bound (`min(requested replayPageBytes, registry cap)`)
+    /// recorded at attach — credits, the tail drain, and the exit drain
+    /// all page at this SAME bound; nothing re-reads the registry cap.
+    pub page_budget: i64,
     /// Pages produced so far (observability).
     pub pages: u64,
 }
@@ -102,6 +107,7 @@ impl PacedSession {
             effective_since: desc.effective_since,
             credited: desc.effective_since,
             page_end: desc.page_end,
+            page_budget: desc.page_budget,
             pages: u64::from(started),
         }
     }
@@ -641,12 +647,13 @@ pub(crate) fn start_session(
         requested_since = requested_since_seq,
         effective_since = session.effective_since,
         target = session.target,
+        page_budget = session.page_budget,
         page_bytes,
         max_replay_bytes = ?max_replay_bytes,
         "ws.restore.paced_start"
     );
     if session.page_end >= session.target {
-        let budget = registry.paced_page_max_bytes();
+        let budget = session.page_budget;
         match drive_session(registry, conn_id, sink, &mut session, budget) {
             DriveOutcome::Active => {
                 // The replay phase still has window left (the drive cannot
@@ -661,7 +668,7 @@ pub(crate) fn start_session(
                     writer,
                     Arc::clone(sink),
                     session,
-                    registry.paced_page_max_bytes(),
+                    budget,
                     cancel,
                 );
             }
@@ -686,6 +693,7 @@ mod tests {
             effective_since: 10,
             credited: 10,
             page_end: 50,
+            page_budget: 4096,
             pages: 1,
         }
     }
@@ -814,11 +822,16 @@ mod tests {
             target: 9,
             effective_since: 3,
             page_end: 7,
+            page_budget: 4096,
             page_bytes: 123,
         };
         let session = PacedSession::from_desc(desc);
         assert_eq!(session.credited, 3, "crediting starts at the baseline");
         assert_eq!(session.page_end, 7);
+        assert_eq!(
+            session.page_budget, 4096,
+            "the session carries the attach's effective page budget"
+        );
         assert_eq!(session.pages, 1);
 
         // An attach with nothing to replay starts with no pages.
@@ -832,6 +845,7 @@ mod tests {
                 target: 3,
                 effective_since: 3,
                 page_end: 3,
+                page_budget: 4096,
                 page_bytes: 0,
             }
         };

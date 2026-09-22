@@ -400,6 +400,23 @@ pub struct TerminalAttach {
     pub expected_session_ref: Option<SessionLocator>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_replay_bytes: Option<i64>,
+    /// Paced terminal restore (responsive-terminal-restore Workstream 1):
+    /// the negotiated forward-page limit — an optional UPPER BOUND on each
+    /// paced replay page's serialized bytes, honored only on
+    /// pacedTerminalReplayV1 connections and clamped to the server's own
+    /// page-budget cap (`min(requested, server cap)`). Round-2 finding F3:
+    /// the field used to be emitted by the client and silently stripped
+    /// here — it is now part of the honest wire contract. Additive
+    /// optional; a missing, malformed, or non-positive value falls back to
+    /// the server's default exactly like the pre-contract accept-and-strip
+    /// behavior (the lossy deserializer keeps a wrong-typed value from
+    /// failing the whole attach frame).
+    #[serde(
+        default,
+        deserialize_with = "lossy_positive_i64",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub replay_page_bytes: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<TerminalAttachPriority>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -426,6 +443,20 @@ pub struct TerminalAttach {
     pub observed_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<u64>,
+}
+
+/// [`TerminalAttach::replay_page_bytes`]'s lossy deserializer (round-2
+/// finding F3): only a clean positive integer counts as a requested bound;
+/// a missing, malformed (wrong-typed, fractional), or non-positive value
+/// deserializes to `None` — the server's default — instead of failing the
+/// whole attach frame. This preserves the pre-contract accept-and-strip
+/// tolerance for buggy senders exactly.
+fn lossy_positive_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    Ok(value.as_ref().and_then(|v| v.as_i64()).filter(|n| *n > 0))
 }
 
 /// `terminal.replay.credit` (responsive-terminal-restore Workstream 1): one

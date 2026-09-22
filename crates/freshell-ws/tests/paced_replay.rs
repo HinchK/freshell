@@ -896,6 +896,206 @@ async fn negotiated_attach_gets_first_page_only_and_credit_gates_the_rest() {
     assert_eq!(next["source"], "replay");
 }
 
+/// Send `terminal.attach` with a negotiated forward-page upper bound
+/// (`replayPageBytes`, round-2 finding F3).
+async fn attach_with_page_budget(
+    ws: &mut WsClient,
+    terminal_id: &str,
+    attach_request_id: &str,
+    replay_page_bytes: serde_json::Value,
+) {
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.attach",
+            "terminalId": terminal_id,
+            "intent": "viewport_hydrate",
+            "cols": 80,
+            "rows": 24,
+            "attachRequestId": attach_request_id,
+            "sinceSeq": 0,
+            "replayPageBytes": replay_page_bytes,
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send terminal.attach with replayPageBytes");
+}
+
+/// Round-2 finding F3: the negotiated `replayPageBytes` wire field is
+/// honored as the session's page upper bound END-TO-END — the field used
+/// to be emitted by the client and stripped by the server's
+/// accept-and-strip deserializer, so the server always paged at its own
+/// cap. The bound is proven at the wire three ways: the session's
+/// `ws.restore.paced_start` event carries the CLAMPED effective budget
+/// (the requested value when under the cap), every packable page stays
+/// within it while the session still converges, and malformed or absent
+/// values fall back to the server's default exactly like the old strip
+/// behavior instead of failing the attach frame. (The fixture's flood
+/// frames are ~8.5 KiB — larger than any sub-cap bound — so a page that
+/// cannot pack even one frame carries exactly ONE frame: the page
+/// builder's explicit atomic over-budget result, the plan's bounded
+/// behavior for a frame larger than the budget.)
+#[tokio::test]
+async fn negotiated_attach_honors_the_requested_replay_page_bytes() {
+    let events = global_capture();
+    let ring = 512 * 1024;
+    let url = spawn_server(ring).await;
+    let mut driver = connect(&url).await;
+    hello(&mut driver, false).await;
+    let terminal_id = create_shell_terminal(&mut driver, "create-paced-budget").await;
+    flood_until_complete(&url, &mut driver, &terminal_id, 700).await;
+
+    // The requested bound sits BELOW the server's 4096-byte cap.
+    let requested = 2048usize;
+    let mut paced = connect(&url).await;
+    hello(&mut paced, true).await;
+    attach_with_page_budget(
+        &mut paced,
+        &terminal_id,
+        "attach-budget",
+        serde_json::json!(requested),
+    )
+    .await;
+    let mut ready = None;
+    let mut page: Vec<serde_json::Value> = Vec::new();
+    let mut head = 0i64;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        match next_json_or_timeout(&mut paced, Duration::from_millis(400)).await {
+            None => {
+                if ready.is_some() {
+                    break;
+                }
+                continue;
+            }
+            Some(value) => match value.get("type").and_then(|v| v.as_str()) {
+                Some("terminal.attach.ready") => {
+                    head = value["headSeq"].as_i64().expect("headSeq");
+                    note_ready_stream(&value);
+                    ready = Some(value);
+                }
+                Some("terminal.output") => page.push(value),
+                _ => {}
+            },
+        }
+    }
+    ready.expect("attach.ready never arrived");
+    assert!(!page.is_empty(), "there is replay to page");
+
+    // THE WIRE PROOF: the session's effective page budget is the REQUESTED
+    // bound clamped to itself (under the cap) — the stripped-field bug
+    // would report the server cap (4096) instead.
+    let start_ev = wait_for_restore_event(
+        &events,
+        &terminal_id,
+        "ws.restore.paced_start",
+        "attach_request_id",
+        "attach-budget",
+    )
+    .await
+    .expect("the bounded attach emits its paced_start event");
+    assert_eq!(
+        start_ev.fields.get("page_budget").map(String::as_str),
+        Some("2048"),
+        "the requested replayPageBytes becomes the session's page budget: {:?}",
+        start_ev.fields
+    );
+
+    // Credit-drive the rest of the window at the SAME bound: every page
+    // either packs strictly within it or carries exactly ONE frame (the
+    // atomic over-budget result for a frame larger than the bound — the
+    // flood's ~8.5 KiB frames), and the session converges.
+    let mut pages = 0usize;
+    let mut last_seq = 0i64;
+    loop {
+        let page_bytes: usize = page.iter().map(|f| f.to_string().len()).sum();
+        if page.len() > 1 {
+            assert!(
+                page_bytes <= requested,
+                "a multi-frame page must pack within the {requested}-byte bound, got {page_bytes}"
+            );
+        }
+        pages += 1;
+        last_seq = page
+            .last()
+            .map(|f| f["seqEnd"].as_i64().unwrap_or(0))
+            .unwrap_or(last_seq);
+        if last_seq >= head {
+            break; // the fixed target is covered
+        }
+        credit(&mut paced, &terminal_id, "attach-budget", last_seq).await;
+        page.clear();
+        let mut saw_frame = false;
+        while tokio::time::Instant::now() < deadline {
+            match next_json_or_timeout(&mut paced, Duration::from_millis(400)).await {
+                None => break, // the page is complete
+                Some(value) => {
+                    if value.get("type").and_then(|v| v.as_str()) == Some("terminal.output") {
+                        saw_frame = true;
+                        page.push(value);
+                    }
+                }
+            }
+        }
+        assert!(
+            saw_frame || !page.is_empty(),
+            "the credit must produce the next page"
+        );
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the session must converge at the requested bound"
+        );
+    }
+    assert!(pages > 1, "the window must page repeatedly ({pages})");
+
+    // A MALFORMED bound (wrong-typed) keeps the server default and never
+    // fails the attach frame — the pre-contract accept-and-strip
+    // tolerance, preserved at the wire level.
+    let mut malformed = connect(&url).await;
+    hello(&mut malformed, true).await;
+    attach_with_page_budget(
+        &mut malformed,
+        &terminal_id,
+        "attach-bad-budget",
+        serde_json::json!("2048"),
+    )
+    .await;
+    let bad_ev = wait_for_restore_event(
+        &events,
+        &terminal_id,
+        "ws.restore.paced_start",
+        "attach_request_id",
+        "attach-bad-budget",
+    )
+    .await
+    .expect("a wrong-typed replayPageBytes still attaches");
+    assert_eq!(
+        bad_ev.fields.get("page_budget").map(String::as_str),
+        Some("4096"),
+        "a malformed bound falls back to the server cap"
+    );
+
+    // An ABSENT bound keeps the server default (the field is optional and
+    // additive).
+    let mut default_attach = connect(&url).await;
+    hello(&mut default_attach, true).await;
+    paced_attach_first_page(&mut default_attach, &terminal_id, "attach-default-budget").await;
+    let default_ev = wait_for_restore_event(
+        &events,
+        &terminal_id,
+        "ws.restore.paced_start",
+        "attach_request_id",
+        "attach-default-budget",
+    )
+    .await
+    .expect("the absent-bound attach emits its paced_start event");
+    assert_eq!(
+        default_ev.fields.get("page_budget").map(String::as_str),
+        Some("4096"),
+        "an absent bound keeps the server cap"
+    );
+}
+
 /// A PARTIAL-PAGE credit (a consumedSeq inside the outstanding page, below
 /// its end) grants NOTHING on the wire: the server observes it as
 /// `partial_consumption` and produces no page — only the page-end value

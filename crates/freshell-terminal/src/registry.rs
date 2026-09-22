@@ -158,6 +158,21 @@ pub struct ClaimState {
     pub released_by_client: bool,
 }
 
+/// Paced-attach inputs beyond the legacy wire fields
+/// (responsive-terminal-restore round-2, finding F3): the negotiated
+/// forward-page limit the client requested (`replayPageBytes` — an
+/// optional UPPER BOUND on each paced page's serialized bytes, clamped to
+/// the registry's own [`TerminalRegistry::paced_page_max_bytes`] cap).
+/// Inert for non-paced attaches.
+#[derive(Debug, Clone, Default)]
+pub struct PacedAttachOptions {
+    /// The attach's `replayPageBytes`: `Some(positive)` bounds every page
+    /// of the session at `min(requested, registry cap)`; `None` (or a
+    /// non-positive value, filtered at the protocol layer) keeps the
+    /// server default.
+    pub replay_page_bytes: Option<i64>,
+}
+
 /// The ws pacing coordinator's session description for one paced replay
 /// (responsive-terminal-restore Workstream 1): everything the coordinator
 /// needs to gate continuation credits and drive page reads. Produced by the
@@ -178,6 +193,12 @@ pub struct PacedSessionDesc {
     /// The production cursor: the last seq sent in a page (== the first
     /// page's last seq; `effective_since` when the first page is empty).
     pub page_end: i64,
+    /// The session's page budget (round-2 finding F3): the clamped
+    /// effective bound (`min(requested replayPageBytes, registry cap)`,
+    /// the registry cap when absent) that sized the FIRST page and bounds
+    /// every later page — the whole session honors the request, not just
+    /// the first page.
+    pub page_budget: i64,
     /// Serialized wire bytes of the first page (observability).
     pub page_bytes: u64,
 }
@@ -1454,6 +1475,22 @@ impl TerminalRegistry {
         self.paced_page_max_bytes.load(Ordering::Relaxed)
     }
 
+    /// The EFFECTIVE page budget for one paced attach (round-2 finding
+    /// F3): the negotiated `replayPageBytes` request honored as an
+    /// optional UPPER BOUND clamped to the registry's own cap —
+    /// `min(requested, cap)` when present and positive, the cap when
+    /// absent (missing/invalid requests already arrived as `None` via the
+    /// protocol layer's lossy deserializer; the `> 0` filter here also
+    /// guards direct embedders). One session keeps ONE budget: the caller
+    /// records this on [`PacedSessionDesc::page_budget`] so credits and
+    /// the tail drain page at the SAME bound that sized the first page.
+    pub fn effective_paced_page_budget(&self, paced: &PacedAttachOptions) -> i64 {
+        match paced.replay_page_bytes.filter(|requested| *requested > 0) {
+            Some(requested) => self.paced_page_max_bytes().min(requested),
+            None => self.paced_page_max_bytes(),
+        }
+    }
+
     /// Reconciliation §7.5: shrink/grow the liveness window a generation must
     /// survive to reset the respawn counter (tests use small values).
     pub fn set_respawn_liveness_window_ms(&self, ms: i64) {
@@ -1826,7 +1863,11 @@ impl TerminalRegistry {
     /// is emitted once, strictly between `attach.ready` and the replay.
     /// `max_replay_bytes` is the attach's TERM-07 budget request — recorded
     /// on the subscriber with no delivery-behavior change (see
-    /// [`Subscriber::max_replay_bytes`]).
+    /// [`Subscriber::max_replay_bytes`]). `paced` carries the negotiated
+    /// round-2 paced-attach inputs ([`PacedAttachOptions`]): the
+    /// `replayPageBytes` forward-page upper bound, honored as
+    /// `min(requested, registry cap)` on the paced path and recorded on
+    /// the session for every later page (round-2 finding F3).
     #[allow(clippy::too_many_arguments)]
     pub fn attach(
         &self,
@@ -1840,6 +1881,7 @@ impl TerminalRegistry {
         session_ref: Option<SessionLocator>,
         surface_reset: Option<bool>,
         max_replay_bytes: Option<i64>,
+        paced: PacedAttachOptions,
     ) -> AttachOutcome {
         // Take the terminal's shared Arc under the registry lock, then drop the
         // registry lock so we hold ONLY the per-terminal lock during the handoff.
@@ -1870,6 +1912,7 @@ impl TerminalRegistry {
             max_replay_bytes,
             shared,
             None,
+            paced,
         )
     }
 
@@ -1897,6 +1940,7 @@ impl TerminalRegistry {
         intent: TerminalAttachIntent,
         cols: u16,
         rows: u16,
+        paced: PacedAttachOptions,
     ) -> AttachOutcome {
         let inner = self.inner.lock().expect("registry lock");
         let Some(handle) = inner.terminals.get(terminal_id) else {
@@ -1920,6 +1964,7 @@ impl TerminalRegistry {
             max_replay_bytes,
             Arc::clone(&handle.shared),
             Some((intent, cols, rows, handle.pty.as_ref())),
+            paced,
         )
     }
 
@@ -1938,6 +1983,7 @@ impl TerminalRegistry {
         max_replay_bytes: Option<i64>,
         shared: Arc<Mutex<TerminalShared>>,
         geometry: Option<(TerminalAttachIntent, u16, u16, Option<&PtyTerminal>)>,
+        paced: PacedAttachOptions,
     ) -> AttachOutcome {
         let mut s = shared.lock().expect("terminal lock");
         let geometry = geometry.map(|(intent, cols, rows, pty)| {
@@ -1951,11 +1997,11 @@ impl TerminalRegistry {
         // inline replay + synthetic exit, in their legacy order; a paced
         // attach without an attachRequestId cannot be credited and falls
         // back to the legacy inline replay, byte-identical to today).
-        let paced = paced_terminal_replay_v1
+        let paced_path = paced_terminal_replay_v1
             && attach_request_id.is_some()
             && s.status == TerminalRunStatus::Running;
 
-        if paced {
+        if paced_path {
             return self.paced_attach_to_shared(
                 s,
                 terminal_id,
@@ -1968,6 +2014,7 @@ impl TerminalRegistry {
                 surface_reset,
                 max_replay_bytes,
                 geometry,
+                paced,
             );
         }
 
@@ -2143,6 +2190,7 @@ impl TerminalRegistry {
         surface_reset: Option<bool>,
         max_replay_bytes: Option<i64>,
         geometry: Option<AttachResizeStatus>,
+        paced: PacedAttachOptions,
     ) -> AttachOutcome {
         let effective_requested = since_seq.max(0);
         let head_seq = s.head_seq;
@@ -2236,9 +2284,14 @@ impl TerminalRegistry {
             }));
         }
 
-        // Select the first page (bounded by the registry's page budget),
-        // cloning ONLY the selected frames — never the whole ring.
-        let budget = self.paced_page_max_bytes();
+        // Select the first page (bounded by the session's EFFECTIVE page
+        // budget — round-2 finding F3: the negotiated `replayPageBytes`
+        // request clamped to the registry's cap), cloning ONLY the
+        // selected frames — never the whole ring. The SAME budget is
+        // recorded on the session so credits and the tail drain page at
+        // the requested bound too — the whole session honors the request,
+        // not just the first page.
+        let budget = self.effective_paced_page_budget(&paced);
         let first_page = if baseline < head_seq {
             paced_page_build(
                 &s,
@@ -2273,6 +2326,7 @@ impl TerminalRegistry {
                     target: head_seq,
                     effective_since: baseline,
                     page_end,
+                    page_budget: budget,
                     page_bytes,
                 },
                 first_page,
@@ -5626,6 +5680,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let legacy = outputs(&legacy_seen);
         assert!(
@@ -5660,6 +5715,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let bs = batches(&batch_seen);
         assert!(
@@ -5718,6 +5774,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let bs = batches(&seen);
         assert_eq!(bs.len(), 1);
@@ -5750,6 +5807,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         assert!(out.found);
 
@@ -5798,6 +5856,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let ready = attach_ready(&seen).expect("attach.ready sent");
         assert_eq!(ready.head_seq, 2);
@@ -5832,6 +5891,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let ready = attach_ready(&seen).expect("attach.ready sent");
         assert_eq!(
@@ -5864,6 +5924,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let ready = attach_ready(&seen).expect("attach.ready sent");
         assert_eq!(ready.head_seq, 0);
@@ -5970,6 +6031,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         assert!(out.found);
         let start = out.paced.expect("negotiated attach starts a paced session");
@@ -6025,6 +6087,157 @@ mod tests {
         }
     }
 
+    /// Round-2 finding F3: the negotiated `replayPageBytes` request is an
+    /// optional UPPER BOUND the server honors on the WHOLE session —
+    /// `min(requested, registry cap)` when present and positive, the
+    /// registry cap when absent or invalid — and the recorded session
+    /// budget is what credits and the tail drain page at later.
+    #[test]
+    fn paced_attach_honors_a_smaller_requested_page_budget() {
+        let reg = TerminalRegistry::new();
+        reg.set_paced_page_max_bytes(4096);
+        reg.insert_headless("T", "S");
+        for seq in 1..=12 {
+            reg.feed("T", frame(seq, &format!("line-{seq:03}\r\n"), "S"));
+        }
+        let (sink, _seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("paced-budget".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+            PacedAttachOptions {
+                replay_page_bytes: Some(600),
+            },
+        );
+        let start = out.paced.expect("paced session");
+        assert_eq!(
+            start.session.page_budget, 600,
+            "the requested bound clamps to itself when under the cap"
+        );
+        assert!(
+            page_serialized_bytes(&start.first_page) <= 600,
+            "the first page is sized to the request, not the cap"
+        );
+        assert!(
+            start.first_page.len() < 12,
+            "a 600-byte bound pages the window instead of packing it whole"
+        );
+        // The SAME bound pages the rest of the credited window: a
+        // registry-cap read would pack far more per page.
+        let mut cursor = start.session.page_end;
+        let mut pages = 1;
+        while cursor < start.session.target {
+            match reg.next_replay_page("T", 1, cursor, start.session.target, 600) {
+                PacedPage::Frames {
+                    messages, end_seq, ..
+                } => {
+                    assert!(
+                        page_serialized_bytes(&messages) <= 600,
+                        "every credited page honors the requested bound"
+                    );
+                    assert!(end_seq > cursor);
+                    cursor = end_seq;
+                    pages += 1;
+                }
+                other => panic!("unexpected replay read: {other:?}"),
+            }
+        }
+        assert!(pages > 2, "the smaller bound means more pages: {pages}");
+    }
+
+    #[test]
+    fn paced_attach_page_budget_clamps_at_the_server_cap() {
+        let reg = TerminalRegistry::new();
+        reg.set_paced_page_max_bytes(4096);
+        reg.insert_headless("T", "S");
+        for seq in 1..=4 {
+            reg.feed("T", frame(seq, &format!("line-{seq}\r\n"), "S"));
+        }
+        let (sink, _seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("paced-cap-clamp".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+            PacedAttachOptions {
+                replay_page_bytes: Some(16 * 1024 * 1024),
+            },
+        );
+        let start = out.paced.expect("paced session");
+        assert_eq!(
+            start.session.page_budget, 4096,
+            "an oversized request clamps to the server's own cap"
+        );
+    }
+
+    #[test]
+    fn paced_attach_page_budget_absent_or_invalid_keeps_the_server_default() {
+        let reg = TerminalRegistry::new();
+        reg.set_paced_page_max_bytes(4096);
+        reg.insert_headless("T", "S");
+        for seq in 1..=4 {
+            reg.feed("T", frame(seq, &format!("line-{seq}\r\n"), "S"));
+        }
+        let (sink, _seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("paced-default".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+            PacedAttachOptions::default(),
+        );
+        assert_eq!(
+            out.paced.expect("paced session").session.page_budget,
+            4096,
+            "an absent request keeps the server default"
+        );
+
+        // A non-positive request is invalid, not a bound: the registry
+        // double-checks positivity (the protocol layer's lossy
+        // deserializer already filters it on the wire, but the registry
+        // is also a direct embedder API).
+        let (sink, _seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("paced-invalid".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+            PacedAttachOptions {
+                replay_page_bytes: Some(0),
+            },
+        );
+        assert_eq!(
+            out.paced.expect("paced session").session.page_budget,
+            4096,
+            "an invalid request keeps the server default"
+        );
+    }
+
     /// A batch-capable negotiated subscriber gets `terminal.output.batch`
     /// pages that reassemble to the same bytes as the per-frame projection.
     #[test]
@@ -6047,6 +6260,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let start = out.paced.expect("paced session");
         assert!(
@@ -6134,6 +6348,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let start = out.paced.expect("paced session");
 
@@ -6222,6 +6437,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let start = out.paced.expect("paced session");
         let mut cursor = start.session.page_end;
@@ -6371,6 +6587,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let start = out.paced.expect("paced session");
 
@@ -6563,6 +6780,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let repair = out2.paced.expect("the repair paced session");
         let mut repair_delivered = page_seq_data(&repair.first_page);
@@ -6614,6 +6832,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let start = out.paced.expect("paced session");
 
@@ -6776,6 +6995,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let start = out.paced.expect("paced session");
 
@@ -6966,6 +7186,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let start = out.paced.expect("paced session");
 
@@ -7179,6 +7400,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let start = out.paced.expect("paced session");
 
@@ -7384,6 +7606,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let start = out.paced.expect("paced session");
 
@@ -7628,6 +7851,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let repair = out2.paced.expect("the repair paced session");
         let mut repair_delivered = page_seq_data(&repair.first_page);
@@ -7684,6 +7908,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let start = out.paced.expect("paced session");
 
@@ -7886,6 +8111,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let repair = out2.paced.expect("the repair paced session");
         assert_eq!(
@@ -7943,6 +8169,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let start = out.paced.expect("paced session");
         assert_eq!(start.session.page_end, 1, "per-frame pages: one frame");
@@ -7968,6 +8195,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let start2 = out2.paced.expect("paced session 2");
         assert_eq!(
@@ -8092,6 +8320,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let start = out.paced.expect("paced session");
         assert_eq!(
@@ -8163,6 +8392,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let start = out.paced.expect("paced session");
         assert_eq!(start.session.page_end, 1, "budget 0 => one frame per page");
@@ -8267,6 +8497,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let start = out.paced.expect("paced session");
         assert_eq!(start.session.page_end, 1);
@@ -8416,6 +8647,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         assert!(out.paced.is_some(), "the paced attach arms the deferral");
         reg.feed("T", frame(2, "two\r\n", "S"));
@@ -8442,6 +8674,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         assert!(
             out2.paced.is_none(),
@@ -8478,6 +8711,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let start = out3
             .paced
@@ -8540,6 +8774,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         assert!(out.found);
         let start = out
@@ -8622,6 +8857,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         assert!(
             out.paced.is_none(),
@@ -8669,6 +8905,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         assert!(
             out.paced.is_none(),
@@ -8707,6 +8944,7 @@ mod tests {
             None,
             None,
             Some(128 * 1024),
+            PacedAttachOptions::default(),
         );
         let recorded = {
             let inner = reg.inner.lock().unwrap();
@@ -8732,6 +8970,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let recorded2 = {
             let inner = reg.inner.lock().unwrap();
@@ -8765,6 +9004,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let plain_ready = attach_ready(&plain_seen).expect("attach.ready sent");
         assert_eq!(plain_ready.oldest_retained_seq, None);
@@ -8806,6 +9046,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let paced_ready = attach_ready(&paced_seen).expect("attach.ready sent");
         assert_eq!(paced_ready.oldest_retained_seq, Some(1));
@@ -8854,6 +9095,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         reg.feed("T", frame(1, "before\r\n", "S"));
         assert_eq!(outputs(&seen_a).len(), 1);
@@ -8881,6 +9123,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let replayed = outputs(&seen_b);
         assert_eq!(
@@ -8907,6 +9150,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         // Second attach: geometry authority flips to multi_client_unknown.
         let _ = reg.attach(
@@ -8920,6 +9164,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let ready_b = attach_ready(&seen_b).unwrap();
         assert_eq!(
@@ -8955,6 +9200,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         for i in 1..=5 {
             reg.feed("T", frame(i, &format!("line-{i}\r\n"), "S"));
@@ -8976,6 +9222,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let ready = attach_ready(&seen_r).unwrap();
         assert_eq!(ready.effective_since_seq, Some(3));
@@ -9006,6 +9253,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         // A live frame produced AFTER attach must arrive after the replayed one.
         reg.feed("T", frame(2, "new\r\n", "S"));
@@ -9028,7 +9276,19 @@ mod tests {
     fn attach_to_unknown_terminal_reports_not_found() {
         let reg = TerminalRegistry::new();
         let (sink, seen) = collector();
-        let out = reg.attach("nope", 1, sink, None, 0, false, false, None, None, None);
+        let out = reg.attach(
+            "nope",
+            1,
+            sink,
+            None,
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+            PacedAttachOptions::default(),
+        );
         assert!(!out.found);
         assert!(seen.lock().unwrap().is_empty());
     }
@@ -9069,6 +9329,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
 
         assert!(reg.kill("T"));
@@ -9097,8 +9358,32 @@ mod tests {
         reg.insert_headless("T-b", "S2");
         let (sink_a, seen_a) = collector();
         let (sink_b, seen_b) = collector();
-        let _ = reg.attach("T-a", 1, sink_a, None, 0, false, false, None, None, None);
-        let _ = reg.attach("T-b", 2, sink_b, None, 0, false, false, None, None, None);
+        let _ = reg.attach(
+            "T-a",
+            1,
+            sink_a,
+            None,
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+            PacedAttachOptions::default(),
+        );
+        let _ = reg.attach(
+            "T-b",
+            2,
+            sink_b,
+            None,
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+            PacedAttachOptions::default(),
+        );
         let rev_before = reg.revision();
 
         let killed = reg.kill_all();
@@ -9395,6 +9680,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         assert!(reg.directory()[0].has_clients);
         reg.detach("T", 9);
@@ -9523,6 +9809,7 @@ mod tests {
                     TerminalAttachIntent::ViewportHydrate,
                     131,
                     48,
+                    PacedAttachOptions::default(),
                 )
             })
         };
@@ -9546,6 +9833,7 @@ mod tests {
                     TerminalAttachIntent::TransportReconnect,
                     67,
                     30,
+                    PacedAttachOptions::default(),
                 )
             })
         };
@@ -9621,6 +9909,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
 
         // A secondary viewer must be able to attach without silently taking
@@ -9640,6 +9929,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
 
         // Later attach generations from that same second socket are still
@@ -9714,6 +10004,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         ); // conn 1 is attached
            // conn 2 reconnects with another socket attached and no prior attachment of its own.
         let out = reg.resize_for_attach("T", 2, TerminalAttachIntent::TransportReconnect, 95, 41);
@@ -9737,6 +10028,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
 
         // The first transport reconnect from B is replay-only while A views
@@ -9756,6 +10048,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
 
         let out = reg.resize_for_attach("T", 2, TerminalAttachIntent::TransportReconnect, 95, 41);
@@ -9806,6 +10099,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let _ = reg.attach(
             "T2",
@@ -9818,6 +10112,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
 
         reg.remove_connection(42);
@@ -9855,6 +10150,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         assert!(outcome.found);
 
@@ -9910,6 +10206,7 @@ mod tests {
             None,
             Some(true),
             None,
+            PacedAttachOptions::default(),
         );
         assert!(outcome.found);
 
@@ -9961,6 +10258,7 @@ mod tests {
             None,
             Some(true),
             None,
+            PacedAttachOptions::default(),
         );
         assert!(outcome.found);
 
@@ -10002,6 +10300,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         // … and explicitly false: no sync either way (fixture f14's gating).
         let (sink_b, seen_b) = collector();
@@ -10016,6 +10315,7 @@ mod tests {
             None,
             Some(false),
             None,
+            PacedAttachOptions::default(),
         );
 
         assert!(modes_syncs(&seen_a).is_empty(), "flag absent => no sync");
@@ -10042,6 +10342,7 @@ mod tests {
             None,
             Some(true),
             None,
+            PacedAttachOptions::default(),
         );
         assert!(modes_syncs(&seen).is_empty(), "empty synthesis => no sync");
     }
@@ -10055,7 +10356,19 @@ mod tests {
         // The client fails closed on a sync lacking attachRequestId
         // (`missing_attach_request_id`), so the server never builds one.
         let (sink, seen) = collector();
-        let _ = reg.attach("T", 1, sink, None, 0, false, false, None, Some(true), None);
+        let _ = reg.attach(
+            "T",
+            1,
+            sink,
+            None,
+            0,
+            false,
+            false,
+            None,
+            Some(true),
+            None,
+            PacedAttachOptions::default(),
+        );
         assert!(
             modes_syncs(&seen).is_empty(),
             "no attachRequestId => no sync"
@@ -10084,6 +10397,7 @@ mod tests {
             None,
             Some(true),
             None,
+            PacedAttachOptions::default(),
         );
         assert!(outcome.found);
 
@@ -10170,6 +10484,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         assert!(outcome.found);
         reg.set_auto_kill_idle_minutes(1);
@@ -10358,6 +10673,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         assert!(outcome.found);
         reg.set_auto_kill_idle_minutes(1);
@@ -10396,6 +10712,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         assert!(outcome.found);
         // A second, already-detached terminal whose countdown must NOT be
@@ -10437,7 +10754,8 @@ mod tests {
                 false,
                 None,
                 None,
-                None
+                None,
+                PacedAttachOptions::default()
             )
             .found
         );
@@ -10474,7 +10792,8 @@ mod tests {
                 false,
                 None,
                 None,
-                None
+                None,
+                PacedAttachOptions::default()
             )
             .found
         );
@@ -10604,7 +10923,8 @@ mod tests {
                 false,
                 None,
                 None,
-                None
+                None,
+                PacedAttachOptions::default()
             )
             .found
         );
@@ -10638,7 +10958,8 @@ mod tests {
                 false,
                 None,
                 None,
-                None
+                None,
+                PacedAttachOptions::default()
             )
             .found
         );
@@ -10710,7 +11031,8 @@ mod tests {
                 false,
                 None,
                 None,
-                None
+                None,
+                PacedAttachOptions::default()
             )
             .found
         );
@@ -10727,7 +11049,8 @@ mod tests {
                 false,
                 None,
                 None,
-                None
+                None,
+                PacedAttachOptions::default()
             )
             .found
         );
@@ -10831,6 +11154,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let replayed = outputs(&seen);
         // Whole-frame FIFO eviction keeps at least one frame; the FIRST frame
@@ -10860,6 +11184,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let replayed = outputs(&seen);
         assert_eq!(
@@ -10903,6 +11228,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let ascii_chars: usize = outputs(&seen_a)
             .iter()
@@ -10933,6 +11259,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let box_chars: usize = outputs(&seen_b)
             .iter()
@@ -11204,6 +11531,7 @@ mod tests {
             None,
             None,
             None,
+            PacedAttachOptions::default(),
         );
         let retained_chars: usize = outputs(&seen).iter().map(|f| f.data.chars().count()).sum();
         assert!(

@@ -398,6 +398,38 @@ fn rich_client_messages() {
         other => panic!("expected TerminalAttach, got {other:?}"),
     }
 
+    // terminal.attach (inbound) — the negotiated forward-page bound
+    // (round-2 finding F3): present-and-positive round-trips on the
+    // frozen contract; malformed and non-positive values fall back to
+    // None (the server default) instead of failing the whole attach
+    // frame. The invalid shapes are deliberately OUTSIDE the frozen
+    // contract (the Zod schema rejects them), so they are parsed
+    // directly — the tolerance is the server-side accept-and-strip
+    // parity, not a contract case.
+    let wire = r#"{"type":"terminal.attach","terminalId":"t1","intent":"viewport_hydrate","cols":80,"rows":24,"attachRequestId":"a1","replayPageBytes":2048}"#;
+    match client_roundtrip(wire, "terminal.attach") {
+        ClientMessage::TerminalAttach(a) => {
+            assert_eq!(a.replay_page_bytes, Some(2048));
+        }
+        other => panic!("expected TerminalAttach, got {other:?}"),
+    }
+    for invalid in ["\"2048\"", "0", "-5", "1.5"] {
+        let wire = format!(
+            r#"{{"type":"terminal.attach","terminalId":"t1","intent":"viewport_hydrate","cols":80,"rows":24,"attachRequestId":"a1","replayPageBytes":{invalid}}}"#
+        );
+        match serde_json::from_str::<ClientMessage>(&wire)
+            .expect("the invalid bound must not fail the attach frame")
+        {
+            ClientMessage::TerminalAttach(a) => {
+                assert_eq!(
+                    a.replay_page_bytes, None,
+                    "an invalid replayPageBytes ({invalid}) falls back to the server default"
+                );
+            }
+            other => panic!("expected TerminalAttach, got {other:?}"),
+        }
+    }
+
     // ping — unit variant.
     match client_roundtrip(r#"{"type":"ping"}"#, "ping") {
         ClientMessage::Ping => {}
