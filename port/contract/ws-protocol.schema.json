@@ -8748,12 +8748,15 @@
       "additionalProperties": false,
       "properties": {
         "at": {
-          "type": "number"
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
         },
         "stuck": {
           "type": "boolean"
         },
         "terminalId": {
+          "minLength": 1,
           "type": "string"
         },
         "type": {

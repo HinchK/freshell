@@ -359,11 +359,13 @@ export const TerminalIdleSchema = z.object({
  * `terminal.stuck` — the terminal-mode wedged-agent flag, emitted once per
  * stuck/unstuck transition (and to fresh subscribers while flagged).
  * Drives the pane's "Agent appears stuck" card; never a completion edge.
+ * Pinned wire contract shared with the Rust server port - do not change
+ * unilaterally: { terminalId, at (server epoch ms), stuck }.
  */
 export const TerminalStuckSchema = z.object({
   type: z.literal('terminal.stuck'),
-  terminalId: z.string(),
-  at: z.number(),
+  terminalId: z.string().min(1),
+  at: z.number().int().nonnegative(),
   stuck: z.boolean(),
 })
 

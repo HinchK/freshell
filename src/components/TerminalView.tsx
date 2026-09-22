@@ -47,6 +47,7 @@ import { recordTurnComplete } from '@/store/turnCompletionSlice'
 import {
   clearRecoveringNotices,
   clearTerminalLifecycle,
+  clearTerminalStuckIfOtherTerminal,
   foldTerminalReplacement,
   recordAutoResumeRecovering,
   recordAutoResumeSettled,
@@ -55,8 +56,10 @@ import {
   selectExitRecord,
   selectLastTerminalIdFrom,
   selectResumeCycles,
+  selectStuckEntry,
 } from '@/store/terminalLifecycleSlice'
 import { TerminalExitBanner } from '@/components/TerminalExitBanner'
+import { TerminalStuckCard } from '@/components/TerminalStuckCard'
 import { TerminalLaunchFailureCard } from '@/components/TerminalLaunchFailureCard'
 import { FencedOwnerRecoveryActions, SessionHandoffErrorBanner } from '@/components/SessionHandoffErrorBanner'
 import { buildResumeContent, freshSessionTypeForPaneFlavor } from '@/lib/session-type-utils'
@@ -67,6 +70,7 @@ import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
 import { resolveTerminalKillFence, sendTerminalKill } from '@/lib/terminal-kill'
+import { sendTerminalKillAndAwait, type KillAck } from '@/lib/kill-ack'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import {
   buildCodexIdentityMismatchRepairContent,
@@ -647,6 +651,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // Flap-circuit-breaker settle count (znhn item 2) — typed field, feeds the
   // "crashed N times — auto-resume paused" alert copy.
   const resumeCycles = useAppSelector((s) => selectResumeCycles(s, paneId)) ?? null
+  // Wedge-backstop: the server-authoritative wedged-agent flag for this pane
+  // (folded from `terminal.stuck` by applyTerminalStuck). Keyed by paneId —
+  // the exit handler clears paneContent.terminalId, so the entry must not be.
+  const stuckEntry = useAppSelector((s) => selectStuckEntry(s, paneId))
 
   // All hooks MUST be called before any conditional returns
   const ws = useMemo(() => getWsClient(), [])
@@ -4695,6 +4703,18 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             ...(msg.clearCodexDurability ? { codexDurability: undefined } : {}),
             ...(msg.restoreError ? { restoreError: msg.restoreError } : {}),
           })
+          // Wedge-backstop clear-on-adoption (LB-8): the pane just adopted a
+          // terminalId — a stuck entry left by the pane's PREVIOUS terminal is
+          // stale (the flagged row is gone server-side once killed, so no
+          // stuck:false can ever arrive for it; a detached row has no
+          // subscriber to see the exit either). Clear it unless it already
+          // refers to THIS terminal. A genuinely wedged replacement re-flags
+          // via the next sweep broadcast or the attach-time emission —
+          // self-healing, never flag-swallowing.
+          dispatch(clearTerminalStuckIfOtherTerminal({
+            paneId: paneIdRef.current,
+            terminalId: newId,
+          }))
           if (createdSessionRef) {
             const associationResult = reconcileTerminalSessionAssociation({
               dispatch,
@@ -5815,6 +5835,68 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     attachTerminal(tid, 'viewport_hydrate', { clearViewportFirst: true })
   }, [attachTerminal])
 
+  // ── Wedge-backstop (terminal-mode deadman): the stuck card's actions ──
+  // Both actions kill the wedged terminal through the CORRELATED close-ack
+  // helper and only then re-drive the pane. Two load-bearing details:
+  // (1) reason:'stuck-recovery' on the kill — a bare terminal.kill is the
+  //     DURABLE pane-close primitive (close envelope + identity retirement +
+  //     recovery suppression); the stuck restart must kill the process
+  //     WITHOUT retiring the session so the respawn's restore:create can
+  //     resume it (Task 3's server branch).
+  // (2) the await-first order — the reconcile reset must not fire before
+  //     the correlated terminal.killed resolves (pinned by the matrix's
+  //     A/B/B' arms in TerminalView.stuckCard.test.tsx).
+  // (Hooks-legal placement: before the terminal-content conditional return.)
+  const killStuckTerminalAndAwait = useCallback(async (): Promise<KillAck | null> => {
+    const tid = terminalIdRef.current
+    if (!tid) return null
+    // Advisory guard (matrix arm E): the opencode replay-window replacement
+    // flow already owns this pane's recovery — a second kill would race it.
+    if (pendingDurableReplacementRef.current) return null
+    const content = contentRef.current
+    const fence = resolveTerminalKillFence(appStore, {
+      sessionRef: content?.sessionRef,
+    })
+    const ack = await sendTerminalKillAndAwait(tid, { ...fence, reason: 'stuck-recovery' })
+    if (!ack.ok) {
+      // Keep the card; the user can retry. The server close stays
+      // authoritative — nothing about the pane is changed on failure.
+      log.warn('terminal_stuck_recovery_kill_failed', { paneId, terminalId: tid, ...ack })
+      return null
+    }
+    // Discard the old terminal's presentation state (the Relaunch
+    // discipline): a rejected respawn create must not resurrect a stale
+    // crash/stuck banner for what is actually a launch failure.
+    dispatch(clearTerminalLifecycle({ paneId }))
+    return ack
+  }, [appStore, dispatch, paneId])
+
+  const restartStuckAgentPane = useCallback(async () => {
+    const ack = await killStuckTerminalAndAwait()
+    if (!ack) return
+    dispatch(resetPaneForReconcileCreate({
+      tabId,
+      paneId,
+      intent: 'respawn',
+      sessionRef: contentRef.current?.sessionRef,
+    }))
+  }, [killStuckTerminalAndAwait, dispatch, tabId, paneId])
+
+  // Start fresh: the same bounded kill-await (still reason:'stuck-recovery'
+  // — even a fresh conversation must not corrupt the durable session's close
+  // state), then the genuinely-new-conversation reset — intent 'fresh'
+  // clears sessionRef/resumeSessionId/codexDurability (startFreshConversation
+  // semantics).
+  const startFreshFromStuckPane = useCallback(async () => {
+    const ack = await killStuckTerminalAndAwait()
+    if (!ack) return
+    dispatch(resetPaneForReconcileCreate({
+      tabId,
+      paneId,
+      intent: 'fresh',
+    }))
+  }, [killStuckTerminalAndAwait, dispatch, tabId, paneId])
+
   // NOW we can do the conditional return - after all hooks
   if (!isTerminal || !terminalContent) {
     return null
@@ -6098,6 +6180,24 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           </button>
         </div>
       )}
+      {/* Wedge-backstop: the "Agent appears stuck" card for a RUNNING
+       * agent-mode pane the server flagged (terminal.stuck). The gate is
+       * deliberate: shell panes never qualify (the server sweep is
+       * agent-mode-only), and a non-running pane has its own surfaces (the
+       * exit banner / launch-failure card) — a stuck flag on a dead pane is
+       * stale by definition and must not mask them. */}
+      {terminalContent
+        && terminalContent.mode !== 'shell'
+        && terminalContent.status === 'running'
+        && stuckEntry !== undefined ? (
+        <div className="pointer-events-auto absolute inset-x-0 top-0 z-20 m-2">
+          <TerminalStuckCard
+            mode={terminalContent.mode ?? 'agent'}
+            onRestart={restartStuckAgentPane}
+            onStartFresh={startFreshFromStuckPane}
+          />
+        </div>
+      ) : null}
       {showExitBanner && (
         <div className="absolute inset-x-0 bottom-0 z-20">
           <TerminalExitBanner

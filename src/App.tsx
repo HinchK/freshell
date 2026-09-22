@@ -112,7 +112,7 @@ import { setAmplifierActivitySnapshot, upsertAmplifierActivity, removeAmplifierA
 import { setOpencodeActivitySnapshot, upsertOpencodeActivity, removeOpencodeActivity, resetOpencodeActivity } from '@/store/opencodeActivitySlice'
 import { hostStatsReset, hostStatsSnapshotReceived, hostStatsSubscribedSet, resolveHostStatsRefresh, failHostStatsRefresh } from '@/store/hostStatsSlice'
 import { subscribeHostStats } from '@/lib/host-stats-ws'
-import { applyServerIdle } from '@/store/turnCompletionThunks'
+import { applyServerIdle, applyTerminalStuck } from '@/store/turnCompletionThunks'
 import { setRegistry, updateServerStatus } from '@/store/extensionsSlice'
 import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { createLogger } from '@/lib/client-logger'
@@ -1681,6 +1681,17 @@ export default function App() {
           const reason = msg.reason === 'queue-empty' ? 'queue-empty' : 'grace'
           if (terminalId) {
             dispatch(applyServerIdle({ terminalId, at, reason }) as any)
+          }
+        }
+        // Wedge-backstop: the server-authoritative wedged-agent flag for
+        // terminal-mode agent panes. Surface-only — applyTerminalStuck folds
+        // it into terminalLifecycleSlice and never touches the
+        // turn-completion pipeline (no fabricated completion edge).
+        if (msg.type === 'terminal.stuck') {
+          const terminalId = typeof msg.terminalId === 'string' ? msg.terminalId : ''
+          const at = typeof msg.at === 'number' ? msg.at : Date.now()
+          if (terminalId) {
+            dispatch(applyTerminalStuck({ type: 'terminal.stuck', terminalId, at, stuck: msg.stuck === true }) as any)
           }
         }
         if (msg.type === 'terminal.exit') {

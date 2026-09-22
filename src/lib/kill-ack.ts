@@ -126,6 +126,13 @@ export function sendTerminalKillAndAwait(
      *  legacy-unfenced. */
     observedEpoch?: number
     observedGeneration?: number
+    /** Wedge-backstop Task 4: WHY the client is killing this terminal,
+     *  forwarded verbatim onto the terminal.kill frame. `'stuck-recovery'`
+     *  (the stuck card's restart/start-fresh actions) makes the server run
+     *  the process-only kill and skip the durable pane-close envelope, so
+     *  the follow-up respawn can resume the session (Task 3's server
+     *  branch). Absent = today's full pane-close semantics, byte-for-byte. */
+    reason?: string
   },
 ): Promise<KillAck> {
   const requestId = nanoid()
@@ -138,6 +145,7 @@ export function sendTerminalKillAndAwait(
     ...(opts?.observedEpoch !== undefined && opts?.observedGeneration !== undefined
       ? { observedEpoch: opts.observedEpoch, observedGeneration: opts.observedGeneration }
       : {}),
+    ...(opts?.reason ? { reason: opts.reason } : {}),
   })
   const wait = awaitCloseFrame((msg) => {
     const m = msg as Record<string, unknown>
