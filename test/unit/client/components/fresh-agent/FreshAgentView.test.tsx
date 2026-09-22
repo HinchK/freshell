@@ -1929,6 +1929,138 @@ describe('FreshAgentView', () => {
     expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1)
   })
 
+  // 2026-09-20 incident (log-validated): the daemon died, the snapshot GET
+  // answered the typed 409 RESTORE_UNAVAILABLE for the pane's OWN stale
+  // Live{FreshAgent, gen 1} claim, and the pane dead-ended on a dismiss-only
+  // banner forever. The documented recovery is the generation-fenced attach +
+  // refetch — drive it once.
+  // LB-09: the mount attach already sends ONE freshAgent.attach on mount, so a
+  // bare length assertion is vacuous — read the baseline AFTER the mount
+  // settles and assert the POST-409 delta.
+  it('recovers a freshopencode pane from a snapshot 409 with one fenced attach and a refetch', async () => {
+    const store = createStore()
+    // Seed the runtime-owner record and make the 409 name a NEWER generation —
+    // the recovery attach MUST carry the 409's generation (fence bound to the
+    // refusal, not the possibly-stale record), or the wired server refuses it
+    // with FENCE_REQUIRED and the dead-end persists.
+    store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'opencode',
+      sessionId: 'ses_live',
+      epoch: 1,
+      generation: 1,
+      ownerKind: 'fresh-agent',
+      operationId: 'incident-live-claim',
+      transition: 'handoff-committed',
+    }))
+    // DEFER the first rejection until after the baseline is read — an
+    // immediately-rejected mock races the mount fetch (the recovery attach may
+    // land before the test snapshots the count).
+    let rejectFirstSnapshot!: (error: unknown) => void
+    apiMock.getFreshAgentThreadSnapshot
+      .mockImplementationOnce(() => new Promise<never>((_, reject) => {
+        rejectFirstSnapshot = reject
+      }))
+      .mockResolvedValue({
+        ...freshopencodeSnapshot('recovered transcript', 7),
+        threadId: 'ses_live',
+        sessionId: 'ses_live',
+      })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-live-409',
+        sessionId: 'ses_live',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_live' },
+        status: 'connected',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+    // The mount attach, settled (LB-09 baseline).
+    const attachCountBeforeRecovery = sentFreshAgentMessages('freshAgent.attach').length
+    expect(attachCountBeforeRecovery).toBe(1)
+    await act(async () => {
+      rejectFirstSnapshot(new ApiError(409, 'Session ses_live is still running on the server.', {
+        code: 'RESTORE_UNAVAILABLE',
+        ownerKind: 'fresh-agent',
+        ownerGeneration: 2,
+      }))
+    })
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(attachCountBeforeRecovery + 1)
+      const recoveryAttach = sentFreshAgentMessages('freshAgent.attach').at(-1)
+      expect(recoveryAttach?.observedEpoch).toBe(1) // the record's epoch
+      expect(recoveryAttach?.observedGeneration).toBe(2) // the 409's CURRENT generation, not the stale record's 1
+    })
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2) // exactly one recovery refetch
+    })
+    // The pane kept its identity (the 409 is NOT the 404 lost-thread reset):
+    expect(getFreshAgentPaneContent(store).sessionId).toBe('ses_live')
+    expect(getFreshAgentPaneContent(store).createRequestId).toBe('req-live-409')
+    // And no dead-end banner for the recovered pane:
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument())
+  })
+
+  it('does not loop recovery fetches on repeated 409s', async () => {
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+      // Every GET rejects with the same real ApiError (an Error instance) so
+      // handleSnapshotError preserves the 409's own message on the banner.
+      apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(409, 'Session ses_live is still running on the server.', {
+        code: 'RESTORE_UNAVAILABLE',
+        ownerKind: 'fresh-agent',
+        ownerGeneration: 2,
+      }))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          createRequestId: 'req-live-409-loop',
+          sessionId: 'ses_live',
+          sessionRef: { provider: 'opencode', sessionId: 'ses_live' },
+          status: 'connected',
+        },
+      }))
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      // Settle the mount fetch and the single recovery refetch (the second 409
+      // falls through to the honest banner — the recovery guard already
+      // consumed this pane identity). Advance the fake clock deterministically
+      // (the wall-clock debounce races under parallel suites — the sibling
+      // scheduler tests' note).
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      const baseline = sentFreshAgentMessages('freshAgent.attach').length
+      expect(screen.getByText(/still running on the server/i)).toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(baseline) // one recovery total, not per fetch (LB-03)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeLessThanOrEqual(3) // mount + recovery only — no loop
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      vi.useRealTimers()
+    }
+  })
+
   it('attaches materialized FreshOpenCode panes with durable route metadata on mount and reconnect', async () => {
     const store = createStore()
     let reconnectHandler: (() => void) | undefined
