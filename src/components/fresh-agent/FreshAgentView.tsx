@@ -2878,10 +2878,15 @@ export function FreshAgentView({
           // the coordinator's live generation; the record's epoch is
           // preserved). Without this, a stale owner record sends a
           // stale-generation attach the wired server refuses with
-          // FENCE_REQUIRED — preserving the dead-end.
+          // FENCE_REQUIRED — preserving the dead-end. The fold keys the
+          // CANONICAL session (Task 5 review M2): the recovery attach's
+          // fence read resolves the stored aliasOf chain, so a pane holding
+          // a superseded id must fold onto the same record the attach reads
+          // — the raw pane id would land on the inert alias mirror.
+          const canonicalSession = resolveCanonicalPaneSession(appStore.getState(), fresh)
           dispatch(applyRefusalFence({
-            provider: fresh.provider,
-            sessionId,
+            provider: canonicalSession?.provider ?? fresh.provider,
+            sessionId: canonicalSession?.sessionId ?? sessionId,
             ownerKind: 'fresh-agent',
             ownerGeneration: refusalOwnerGeneration,
           }))
