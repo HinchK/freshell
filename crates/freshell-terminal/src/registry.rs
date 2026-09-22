@@ -159,19 +159,33 @@ pub struct ClaimState {
 }
 
 /// Paced-attach inputs beyond the legacy wire fields
-/// (responsive-terminal-restore round-2, finding F3): the negotiated
-/// forward-page limit the client requested (`replayPageBytes` — an
-/// optional UPPER BOUND on each paced page's serialized bytes, clamped to
-/// the registry's own [`TerminalRegistry::paced_page_max_bytes`] cap).
-/// Inert for non-paced attaches.
-#[derive(Debug, Clone, Default)]
+/// (responsive-terminal-restore round-2): the negotiated forward-page
+/// limit the client requested (`replayPageBytes` — an optional UPPER BOUND
+/// on each paced page's serialized bytes, clamped to the registry's own
+/// [`TerminalRegistry::paced_page_max_bytes`] cap; finding F3) and the
+/// connection's staged-exit notification hook (finding F1 — installed with
+/// the paced subscriber, atomically with the attach, so a natural exit
+/// while the deferral is armed can move the connection's session into its
+/// exit-drain). Both are inert for non-paced attaches.
+#[derive(Clone, Default)]
 pub struct PacedAttachOptions {
     /// The attach's `replayPageBytes`: `Some(positive)` bounds every page
     /// of the session at `min(requested, registry cap)`; `None` (or a
     /// non-positive value, filtered at the protocol layer) keeps the
     /// server default.
     pub replay_page_bytes: Option<i64>,
+    /// The connection's exit-sequencing hook (finding F1): invoked by
+    /// `finish_pty_exit` — OUTSIDE the terminal lock — when a natural
+    /// exit STAGES this subscriber's exit behind its still-armed
+    /// deferral. Receives (terminal_id, exit_code); the ws layer routes
+    /// it to the owning connection's dispatch loop, which hands the
+    /// session to the exit-drain. Must never acquire the originating
+    /// terminal's lock (it fires from the PTY reader thread).
+    pub paced_exit_notify: Option<PacedExitNotify>,
 }
+
+/// The staged-exit notification hook for a paced subscriber (finding F1).
+pub type PacedExitNotify = Arc<dyn Fn(&str, i64) + Send + Sync>;
 
 /// The ws pacing coordinator's session description for one paced replay
 /// (responsive-terminal-restore Workstream 1): everything the coordinator
@@ -416,6 +430,21 @@ struct Subscriber {
     /// hold), consumed by the handoff's completing verdicts, swept with
     /// the subscriber by re-attach/socket close.
     paced_handoff_boundary: Option<i64>,
+    /// Round-2 finding F1: the STAGED natural-exit code — set by
+    /// `finish_pty_exit` when the terminal exits while this subscriber's
+    /// deferral is still armed. The staged exit is NOT sunk then: the
+    /// session's drain drives the deferred final output to completion,
+    /// and the completing verdict delivers the staged exit in the SAME
+    /// lock hold (ordered after the final pages through the same sink)
+    /// and retires the subscriber — the client observes final output
+    /// THEN exit (plan:190 sequenced exit delivery). Cleared with the
+    /// subscriber on delivery, detach, socket close, or supersede.
+    paced_exit_pending: Option<i64>,
+    /// Round-2 finding F1: the connection's staged-exit notification
+    /// hook (see [`PacedAttachOptions::paced_exit_notify`]) — invoked
+    /// once, OUTSIDE the terminal lock, at staging time so the ws layer
+    /// can move a still-CREDITED session into its exit-drain.
+    paced_exit_notify: Option<PacedExitNotify>,
     /// TERM-07 seam: the attach's `maxReplayBytes` request, threaded through
     /// BOTH attach paths and recorded here with NO delivery-behavior change
     /// this increment. The plan's binding rule preserves the field's legacy
@@ -2057,6 +2086,8 @@ impl TerminalRegistry {
                 paced_terminal_replay_v1,
                 paced_deferred: false,
                 paced_handoff_boundary: None,
+                paced_exit_pending: None,
+                paced_exit_notify: None,
                 max_replay_bytes,
             },
         );
@@ -2221,6 +2252,8 @@ impl TerminalRegistry {
                 paced_terminal_replay_v1: true,
                 paced_deferred: true,
                 paced_handoff_boundary: None,
+                paced_exit_pending: None,
+                paced_exit_notify: paced.paced_exit_notify.clone(),
                 max_replay_bytes,
             },
         );
@@ -2614,6 +2647,10 @@ impl TerminalRegistry {
                 .get_mut(&conn_id)
                 .expect("subscriber checked above")
                 .paced_deferred = false;
+            // Finding F1: a staged natural exit rides the completing hold —
+            // ordered after everything already sunk, then the subscriber
+            // retires.
+            deliver_staged_paced_exit(&mut s, conn_id);
             return PacedTailCompletion::CaughtUp;
         }
         let oldest = s.oldest_retained_seq();
@@ -2640,9 +2677,9 @@ impl TerminalRegistry {
         );
         let Some(build) = built else {
             // Defensive: the window is non-empty and retained (checked
-            // above), so an empty build means nothing the walk could select —
-            // treat the window as delivered rather than stalling the
-            // session. If anything remains staged beyond the fixed target,
+            // above), so an empty build means nothing the walk could
+            // select — treat the window as delivered rather than stalling
+            // the session. If anything remains staged beyond the fixed target,
             // the post-target handoff owns it (with the boundary captured
             // ONCE under this hold, exactly like the covering-page arm);
             // otherwise clear now.
@@ -2651,6 +2688,7 @@ impl TerminalRegistry {
                     .get_mut(&conn_id)
                     .expect("subscriber checked above")
                     .paced_deferred = false;
+                deliver_staged_paced_exit(&mut s, conn_id);
                 return PacedTailCompletion::Completed {
                     end_seq: from_seq,
                     serialized_bytes: 0,
@@ -2682,6 +2720,10 @@ impl TerminalRegistry {
                 .get_mut(&conn_id)
                 .expect("subscriber checked above")
                 .paced_deferred = false;
+            // Finding F1: the staged exit (if the terminal exited while
+            // the deferral was armed) rides this completing hold — after
+            // the final pages, exactly once.
+            deliver_staged_paced_exit(&mut s, conn_id);
             return PacedTailCompletion::Completed {
                 end_seq: build.end_seq,
                 serialized_bytes: build.serialized_bytes,
@@ -2827,6 +2869,8 @@ impl TerminalRegistry {
                 .expect("subscriber checked above");
             sub.paced_deferred = false;
             sub.paced_handoff_boundary = None;
+            // Finding F1: the staged exit rides this completing hold too.
+            deliver_staged_paced_exit(&mut s, conn_id);
             return PacedTailCompletion::CaughtUp;
         }
         let oldest = s.oldest_retained_seq();
@@ -2889,6 +2933,10 @@ impl TerminalRegistry {
                 .expect("subscriber checked above");
             sub.paced_deferred = false;
             sub.paced_handoff_boundary = None;
+            // Finding F1: the retention-overrun bounded-baseline exit still
+            // sequences a staged exit AFTER the exact gaps — the gap, then
+            // exit, never exit-first.
+            deliver_staged_paced_exit(&mut s, conn_id);
             return PacedTailCompletion::GapCompleted {
                 lost_from: from_seq + 1,
                 lost_to: oldest - 1,
@@ -3311,11 +3359,44 @@ impl TerminalRegistry {
             exit_code,
             terminal_id: terminal_id.to_string(),
         });
-        for sub in s.subscribers.values() {
-            (sub.sink)(exit.clone());
+        // Round-2 finding F1 — the exit fan-out is PARTITIONED. A
+        // subscriber whose paced session is still DEFERRED (its final
+        // output is staged in the ring, pages undelivered) must NOT
+        // receive terminal.exit now: exit-first strands the deferred
+        // range (the client's exit handler clears the attach and rejects
+        // late frames). Stage the exit on the subscriber instead — the
+        // session's drain drives the deferred range to completion and
+        // the completing verdict delivers the staged exit in the SAME
+        // lock hold, ordered after the final output through the same
+        // sink (plan:190 sequenced exit delivery). The connection's
+        // notify hook (collected here, fired OUTSIDE the lock below)
+        // lets the ws layer move a still-CREDITED session into that
+        // drain. Every OTHER subscriber keeps the frozen behavior:
+        // exit now, subscription retired.
+        let mut staged_notify: Vec<PacedExitNotify> = Vec::new();
+        let mut retire_now: Vec<u64> = Vec::new();
+        for (conn_id, sub) in s.subscribers.iter_mut() {
+            if sub.paced_deferred {
+                sub.paced_exit_pending = Some(exit_code);
+                if let Some(notify) = sub.paced_exit_notify.clone() {
+                    staged_notify.push(notify);
+                }
+            } else {
+                (sub.sink)(exit.clone());
+                retire_now.push(*conn_id);
+            }
         }
-        s.subscribers.clear();
+        for conn_id in retire_now {
+            s.subscribers.remove(&conn_id);
+        }
         drop(s);
+        // Fire the staged-exit notifications with NO lock held: the hook
+        // only enqueues on the owning connection's channel and must never
+        // re-enter this terminal's lock (it runs on the PTY reader
+        // thread).
+        for notify in staged_notify {
+            notify(terminal_id, exit_code);
+        }
         // Reconciliation §7.5: a generation that died inside the liveness
         // window counts toward the respawn cap; one that survived it resets
         // the counter (a healthy resume is not penalized). Natural exits only
@@ -4802,6 +4883,9 @@ fn complete_at_fixed_boundary(
         }));
         sub.paced_deferred = false;
         sub.paced_handoff_boundary = None;
+        // Finding F1: the staged exit rides the completing hold — ordered
+        // after the residual gap frame, then the subscriber retires.
+        deliver_staged_paced_exit(s, conn_id);
         return PacedTailCompletion::GapCompleted {
             lost_from: boundary + 1,
             lost_to: back.1,
@@ -4814,10 +4898,36 @@ fn complete_at_fixed_boundary(
     }
     sub.paced_deferred = false;
     sub.paced_handoff_boundary = None;
+    deliver_staged_paced_exit(s, conn_id);
     PacedTailCompletion::Completed {
         end_seq,
         serialized_bytes,
     }
+}
+
+/// Round-2 finding F1: deliver a subscriber's STAGED natural exit, if
+/// any, in the same lock hold that just cleared its deferral — the sink
+/// is the connection queue (per-terminal FIFO), so the exit leases
+/// strictly AFTER everything this hold sank (the final pages and any
+/// gap frames), and the subscriber retires exactly like
+/// `finish_pty_exit`'s immediate arm retired its non-paced peers. No-op
+/// when nothing is staged (the ordinary completion paths stay
+/// byte-identical).
+fn deliver_staged_paced_exit(s: &mut TerminalShared, conn_id: u64) -> Option<i64> {
+    let code = s.subscribers.get(&conn_id)?.paced_exit_pending?;
+    let sink = Arc::clone(&s.subscribers.get(&conn_id)?.sink);
+    sink(ServerMessage::TerminalExit(TerminalExit {
+        exit_code: code,
+        terminal_id: s.terminal_id.clone(),
+    }));
+    s.subscribers.remove(&conn_id);
+    tracing::info!(
+        terminal_id = %s.terminal_id,
+        conn_id,
+        exit_code = code,
+        "terminal.paced_exit_delivered"
+    );
+    Some(code)
 }
 
 /// One built page: its ascending wire messages, the last seq it covers (the
@@ -5588,6 +5698,23 @@ mod tests {
             self.insert_headless_at(terminal_id, stream_id, now_ms());
         }
 
+        /// Round-2 finding F1 test seam: this subscriber's staged exit
+        /// code, if a natural exit staged one behind an armed deferral
+        /// (None when the subscriber is gone or nothing is staged).
+        fn paced_exit_pending_of(&self, terminal_id: &str, conn_id: u64) -> Option<i64> {
+            let shared = {
+                let inner = self.inner.lock().expect("registry lock");
+                inner
+                    .terminals
+                    .get(terminal_id)
+                    .map(|handle| Arc::clone(&handle.shared))
+            }?;
+            let s = shared.lock().expect("terminal lock");
+            s.subscribers
+                .get(&conn_id)
+                .and_then(|sub| sub.paced_exit_pending)
+        }
+
         /// Same as [`insert_headless`](Self::insert_headless), but with an
         /// explicit `created_at` instead of the wall clock. Needed by tests that
         /// must pin two terminals to the SAME timestamp (e.g. exercising
@@ -6114,6 +6241,7 @@ mod tests {
             None,
             PacedAttachOptions {
                 replay_page_bytes: Some(600),
+                ..PacedAttachOptions::default()
             },
         );
         let start = out.paced.expect("paced session");
@@ -6174,6 +6302,7 @@ mod tests {
             None,
             PacedAttachOptions {
                 replay_page_bytes: Some(16 * 1024 * 1024),
+                ..PacedAttachOptions::default()
             },
         );
         let start = out.paced.expect("paced session");
@@ -6229,12 +6358,217 @@ mod tests {
             None,
             PacedAttachOptions {
                 replay_page_bytes: Some(0),
+                ..PacedAttachOptions::default()
             },
         );
         assert_eq!(
             out.paced.expect("paced session").session.page_budget,
             4096,
             "an invalid request keeps the server default"
+        );
+    }
+
+    /// Round-2 finding F1 (Major): a natural exit while a paced
+    /// subscriber's deferral is armed must NOT sink terminal.exit ahead
+    /// of the still-deferred final output — the exit is STAGED on the
+    /// subscriber, the connection is notified (so its credited-phase
+    /// session can move to the exit-drain), and the completing verdict
+    /// delivers the staged exit in the SAME lock hold, ordered after the
+    /// final pages (plan:190 sequenced exit delivery).
+    #[test]
+    fn natural_exit_stages_the_paced_exit_until_the_drain_delivers_the_final_output() {
+        let reg = TerminalRegistry::new();
+        reg.set_paced_page_max_bytes(0); // per-frame pages: deterministic cursor control
+        reg.insert_headless("T", "S");
+        for seq in 1..=3 {
+            reg.feed("T", frame(seq, "before-attach\r\n", "S"));
+        }
+        let (sink, seen) = collector();
+        let notifies: Arc<StdMutex<Vec<(String, i64)>>> = Arc::new(StdMutex::new(Vec::new()));
+        let notify_sink = Arc::clone(&notifies);
+        let out = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("paced-exit".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+            PacedAttachOptions {
+                paced_exit_notify: Some(Arc::new(move |terminal_id, exit_code| {
+                    notify_sink
+                        .lock()
+                        .unwrap()
+                        .push((terminal_id.to_string(), exit_code));
+                })),
+                ..PacedAttachOptions::default()
+            },
+        );
+        let start = out.paced.expect("paced session");
+        assert_eq!(start.session.page_end, 1, "budget 0 => one frame per page");
+
+        // The terminal produces its FINAL output past the attach target
+        // and then exits naturally — the exit hook fires AFTER the last
+        // ingest (pty.rs runs the hook after the reader's final flush).
+        for seq in 4..=6 {
+            reg.feed("T", frame(seq, "FINAL-OUTPUT\r\n", "S"));
+        }
+        assert!(reg.finish_pty_exit("T", 0), "the first exit finishes");
+
+        // THE STAGING: no terminal.exit yet — the deferred range (2..=6)
+        // is undelivered, and exit-first would strand it (the client's
+        // exit handler clears the attach and rejects late frames).
+        assert!(
+            !seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| matches!(m, ServerMessage::TerminalExit(_))),
+            "terminal.exit must NOT precede the deferred final output"
+        );
+        // The connection was notified so its session can move to the
+        // exit-drain.
+        assert_eq!(
+            notifies.lock().unwrap().as_slice(),
+            &[("T".to_string(), 0)],
+            "the staged exit notifies the owning connection"
+        );
+        // The subscriber survives the exit (the drain needs it); a
+        // LEGACY subscriber on another connection would have been retired
+        // immediately.
+        assert_eq!(
+            reg.paced_exit_pending_of("T", 1),
+            Some(0),
+            "the exit is staged on the paced subscriber"
+        );
+
+        // The exit-drain (the ws drain task calls complete_paced_tail with
+        // the head-at-exit target): every deferred page, then the staged
+        // exit LAST, and the subscriber retires with the exit.
+        let mut cursor = start.session.page_end;
+        loop {
+            match reg.complete_paced_tail("T", 1, "paced-exit", cursor, 6, 0) {
+                PacedTailCompletion::Handoff { end_seq, .. } => {
+                    assert!(end_seq > cursor, "the exit-drain pages forward");
+                    cursor = end_seq;
+                }
+                PacedTailCompletion::Completed { end_seq, .. } => {
+                    assert!(end_seq >= 6, "the deferred range is fully delivered");
+                    break;
+                }
+                other => panic!("unexpected verdict: {other:?}"),
+            }
+        }
+        let delivered: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|m| match m {
+                ServerMessage::TerminalOutput(o) => Some(o.data.clone()),
+                ServerMessage::TerminalExit(_) => Some("<exit>".to_string()),
+                _ => None,
+            })
+            .collect();
+        let exit_at = delivered
+            .iter()
+            .position(|d| d == "<exit>")
+            .expect("the staged exit is delivered at completion");
+        assert_eq!(
+            delivered.len(),
+            exit_at + 1,
+            "terminal.exit is the LAST frame the client observes: {delivered:?}"
+        );
+        assert!(
+            delivered
+                .iter()
+                .take(exit_at)
+                .any(|d| d.contains("FINAL-OUTPUT")),
+            "the deferred final output arrives before the exit: {delivered:?}"
+        );
+        assert_eq!(
+            reg.paced_exit_pending_of("T", 1),
+            None,
+            "the subscriber retired with the delivered exit"
+        );
+    }
+
+    /// Round-2 finding F1, the unchanged neighbors: a NON-paced subscriber
+    /// still receives terminal.exit immediately at the natural exit, and a
+    /// paced attach to an ALREADY-EXITED terminal keeps the frozen legacy
+    /// inline replay + synthesized exit (no session, no staging).
+    #[test]
+    fn natural_exit_delivers_immediately_to_non_paced_subscribers_and_exited_terminals_stay_legacy()
+    {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        for seq in 1..=2 {
+            reg.feed("T", frame(seq, "history\r\n", "S"));
+        }
+        // A LEGACY subscriber: exit delivery is immediate and final.
+        let (legacy_sink, legacy_seen) = collector();
+        let _ = reg.attach(
+            "T",
+            7,
+            legacy_sink,
+            Some("legacy".into()),
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+            PacedAttachOptions::default(),
+        );
+        assert!(reg.finish_pty_exit("T", 3));
+        assert!(
+            legacy_seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|m| matches!(m, ServerMessage::TerminalExit(e) if e.exit_code == 3)),
+            "the legacy subscriber gets terminal.exit immediately"
+        );
+        assert!(
+            reg.paced_exit_pending_of("T", 7).is_none(),
+            "the legacy subscriber retired with its exit"
+        );
+
+        // A NEGOTIATED attach to the already-Exited terminal: the legacy
+        // inline replay + synthesized exit, exactly the frozen shape — no
+        // paced session, no staging (the attach-after-exit case is
+        // unchanged by the exit-sequencing fix).
+        let (paced_sink, paced_seen) = collector();
+        let out = reg.attach(
+            "T",
+            8,
+            paced_sink,
+            Some("after-exit".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+            PacedAttachOptions::default(),
+        );
+        assert!(
+            out.paced.is_none(),
+            "an already-exited terminal never starts a paced session"
+        );
+        let seen = paced_seen.lock().unwrap();
+        let exit_at = seen
+            .iter()
+            .position(|m| matches!(m, ServerMessage::TerminalExit(_)))
+            .expect("the synthesized exit arrives with the legacy attach");
+        assert!(
+            seen.iter().take(exit_at).any(|m| matches!(
+                m,
+                ServerMessage::TerminalOutput(o) if o.seq_start == 1
+            )),
+            "the frozen inline replay precedes the synthesized exit"
         );
     }
 

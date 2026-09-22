@@ -402,6 +402,25 @@ async fn run_loop(
     // registry-side deferrals die with the subscribers remove_connection
     // sweeps), a detach cancels one, a re-attach replaces it.
     let mut paced_sessions = crate::paced_replay::PacedSessions::default();
+    // Round-2 finding F1: the connection's staged-exit routing. A natural
+    // exit while a paced session's deferral is armed STAGES the exit
+    // registry-side (final output first) and fires the per-subscriber
+    // notify hook; this channel carries the event back to THIS loop, whose
+    // select arm moves the connection's session into the exit-drain (the
+    // existing off-dispatch, reserve-then-admit machinery, target = the
+    // fixed head at exit). Unbounded mpsc: the sender lives on registry
+    // subscribers and fires at most once per subscriber; the drain
+    // stamps a hard bound on the staged window itself.
+    let (paced_exit_tx, mut paced_exit_rx) = mpsc::unbounded_channel::<(String, i64)>();
+    let paced_exit_notify: Option<freshell_terminal::PacedExitNotify> = paced_terminal_replay_v1
+        .then(|| {
+            let tx = paced_exit_tx.clone();
+            let notify: freshell_terminal::PacedExitNotify =
+                Arc::new(move |terminal_id: &str, exit_code: i64| {
+                    let _ = tx.send((terminal_id.to_string(), exit_code));
+                });
+            notify
+        });
     let conn_sink: FrameSink = {
         let sender = ws_tx.clone();
         Arc::new(move |msg| {
@@ -551,6 +570,7 @@ async fn run_loop(
                             &mut host_stats_last_refresh_at,
                             &mut conn_identity,
                             &mut paced_sessions,
+                            &paced_exit_notify,
                         )
                         .await
                         {
@@ -581,13 +601,46 @@ async fn run_loop(
                     _ => {}
                 }
             }
-            // TERM-09 catastrophic backpressure: this connection's queued
-            // output has stayed above the threshold continuously for the
-            // full stall duration WITH ZERO successful socket sends — close
-            // now (mirrors `broker.ts`'s `catastrophicBlocked` closing with
-            // 4008 "Catastrophic backpressure"). A slow-but-progressing
-            // client resets the window every tick it completes a send.
+            // Round-2 finding F1: a terminal with THIS connection's active
+            // paced session exited naturally while its deferral was armed —
+            // the registry STAGED the exit behind the still-deferred final
+            // output and fired the notify hook. Move the session into the
+            // EXIT-DRAIN: the existing off-dispatch, reserve-then-admit
+            // machinery pages the deferred range toward the fixed head at
+            // exit, and the completing verdict delivers the staged exit in
+            // the same lock hold, ordered after the final pages
+            // (plan:190 sequenced exit delivery). When the terminal's
+            // session is NOT in the credited table, a drain task already
+            // owns it (its completing verdict delivers the staged exit) or
+            // the session already completed before the exit (the exit was
+            // delivered at staging) — nothing to do here.
+            Some((terminal_id, exit_code)) = paced_exit_rx.recv() => {
+                if let Some(session) = paced_sessions.remove(&terminal_id) {
+                    tracing::info!(
+                        terminal_id = %terminal_id,
+                        attach_request_id = %session.attach_request_id,
+                        exit_code,
+                        "ws.restore.paced_exit_drain"
+                    );
+                    let page_budget = session.page_budget;
+                    crate::paced_replay::spawn_paced_drain(
+                        state.registry.clone(),
+                        conn_id,
+                        ws_tx.clone(),
+                        Arc::clone(&conn_sink),
+                        session,
+                        page_budget,
+                        create_cancel_rx.clone(),
+                    );
+                }
+            }
             _ = catastrophic_ticker.tick() => {
+                // TERM-09 catastrophic backpressure: this connection's queued
+                // output has stayed above the threshold continuously for the
+                // full stall duration WITH ZERO successful socket sends — close
+                // now (mirrors `broker.ts`'s `catastrophicBlocked` closing with
+                // 4008 "Catastrophic backpressure"). A slow-but-progressing
+                // client resets the window every tick it completes a send.
                 let completed_sends = ws_tx.completed_sends();
                 let sends_since_last_tick = completed_sends.saturating_sub(last_completed_sends);
                 last_completed_sends = completed_sends;
@@ -821,6 +874,11 @@ async fn handle_client_text(
     // Responsive-terminal-restore W1: this connection's paced replay
     // sessions (one per attached terminal; the pacing coordinator's state).
     paced_sessions: &mut crate::paced_replay::PacedSessions,
+    // Round-2 finding F1: the connection's staged-exit notification hook.
+    // A natural exit while a paced session's deferral is armed STAGES the
+    // exit registry-side and fires this hook; the run_loop's
+    // paced_exit_rx arm routes it into the exit-drain.
+    paced_exit_notify: &Option<freshell_terminal::PacedExitNotify>,
 ) -> bool {
     // Accept-and-strip: unknown/unparseable frames are ignored (matches the
     // runtime's tolerance; the handshake already gated auth).
@@ -1563,6 +1621,7 @@ async fn handle_client_text(
                     conn_sink,
                     terminal_output_batch_v1,
                     paced_terminal_replay_v1,
+                    paced_exit_notify.clone(),
                 ) {
                     AttachReply::Error(err) => send(ws_tx, &err).await,
                     AttachReply::Legacy => {
@@ -7093,6 +7152,7 @@ fn handle_attach(
     conn_sink: &FrameSink,
     terminal_output_batch_v1: bool,
     paced_terminal_replay_v1: bool,
+    paced_exit_notify: Option<freshell_terminal::PacedExitNotify>,
 ) -> AttachReply {
     // STATE-SYNC FIX 1 increment 2a: stamp the canonical identity onto
     // `attach.ready` from the shared identity registry (create-time
@@ -7115,9 +7175,15 @@ fn handle_attach(
     // Round-2 finding F3: the negotiated forward-page upper bound rides
     // the same paths as a PacedAttachOptions input — the registry clamps
     // it to its own cap and records the effective budget on the session
-    // so every later page honors the same bound.
+    // so every later page honors the same bound. Round-2 finding F1: the
+    // connection's staged-exit notification hook installs with the paced
+    // subscriber ATOMICALLY with the attach (a post-attach registration
+    // would race the very natural exit it exists to sequence), so a
+    // natural exit while the deferral is armed can move this connection's
+    // session into its exit-drain.
     let paced_options = freshell_terminal::PacedAttachOptions {
         replay_page_bytes: attach.replay_page_bytes,
+        paced_exit_notify,
     };
     let outcome = if geometry_identity_ok {
         let cols = attach.cols.clamp(0, u16::MAX as i64) as u16;
@@ -10597,6 +10663,7 @@ mod pane_reconcile_gate_tests {
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
             &mut Default::default(),
+            &None,
         )
         .await;
         assert!(
@@ -10623,6 +10690,7 @@ mod pane_reconcile_gate_tests {
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
             &mut Default::default(),
+            &None,
         )
         .await;
         assert!(pong_ok);
@@ -10669,6 +10737,7 @@ mod pane_reconcile_gate_tests {
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
             &mut Default::default(),
+            &None,
         )
         .await;
         assert!(ok);
@@ -10695,6 +10764,7 @@ mod pane_reconcile_gate_tests {
                 &mut host_stats_last_refresh_at,
                 &mut conn_identity,
                 &mut Default::default(),
+                &None,
             )
             .await;
             assert!(ok, "attempt {attempt}: a full queue must be answered");
@@ -11038,6 +11108,7 @@ mod host_stats_dispatch_tests {
                 &mut host_stats_last_refresh_at,
                 &mut conn_identity,
                 &mut Default::default(),
+                &None,
             )
             .await;
             assert!(ok);
@@ -11071,6 +11142,7 @@ mod host_stats_dispatch_tests {
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
             &mut Default::default(),
+            &None,
         )
         .await;
         assert!(ok);
@@ -11094,6 +11166,7 @@ mod host_stats_dispatch_tests {
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
             &mut Default::default(),
+            &None,
         )
         .await;
         assert!(pong_ok);
@@ -11138,6 +11211,7 @@ mod host_stats_dispatch_tests {
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
             &mut Default::default(),
+            &None,
         )
         .await;
         assert!(ok);
@@ -11167,6 +11241,7 @@ mod host_stats_dispatch_tests {
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
             &mut Default::default(),
+            &None,
         )
         .await;
         assert!(ok);
@@ -11214,6 +11289,7 @@ mod host_stats_dispatch_tests {
             &mut host_stats_last_refresh_at,
             &mut conn_identity,
             &mut Default::default(),
+            &None,
         )
         .await;
         assert!(ok);

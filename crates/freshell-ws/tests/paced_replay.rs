@@ -3320,3 +3320,91 @@ async fn mixed_negotiated_and_legacy_attachments_converge_without_cross_talk() {
         "both sides delivered byte-identical content"
     );
 }
+
+/// Round-2 finding F1 (Major): a terminal that produces final output and
+/// exits NATURALLY mid-restore must have its deferred output paged to the
+/// client BEFORE `terminal.exit` — the exit is the LAST frame for the
+/// terminal, and the final marker line produced past the attach target is
+/// delivered, not stranded in the ring. Before the fix, the exit hook sank
+/// terminal.exit immediately and cleared every subscriber, so output
+/// ingested after the attach target stayed only in the ring: page reads
+/// returned Gone and the client's exit handler rejected late frames.
+#[tokio::test]
+async fn natural_exit_mid_restore_sequences_final_output_before_terminal_exit() {
+    let ring = 512 * 1024;
+    let url = spawn_server(ring).await;
+    let mut driver = connect(&url).await;
+    hello(&mut driver, false).await;
+    let terminal_id = create_shell_terminal(&mut driver, "create-exit-mid-restore").await;
+    flood_until_complete(&url, &mut driver, &terminal_id, 700).await;
+
+    // Negotiate a paced attach and do NOT credit: the session sits in the
+    // credited phase, its deferral armed, with the replay window still
+    // open when the shell exits.
+    let mut paced = connect(&url).await;
+    hello(&mut paced, true).await;
+    let (ready, page1) = paced_attach_first_page(&mut paced, &terminal_id, "attach-exit").await;
+    let head = ready["headSeq"].as_i64().expect("headSeq");
+    let last_seq = page1
+        .iter()
+        .map(|f| f["seqEnd"].as_i64().unwrap_or(0))
+        .max()
+        .expect("first page frames");
+    assert!(
+        last_seq < head,
+        "the session is mid-restore when the shell exits (page end {last_seq}, head {head})"
+    );
+
+    // The shell produces one FINAL marker line and exits naturally. The
+    // octal escapes keep the echoed command from printing the marker early.
+    send_input(
+        &mut paced,
+        &terminal_id,
+        "printf '\\106\\111\\116\\101\\114\\055\\115\\101\\122\\113\\105\\122\\012'; exit\n",
+    )
+    .await;
+
+    // THE ORDERING: read until terminal.exit. No output frame may follow
+    // the exit, and the final marker must have arrived BEFORE it (the
+    // deferred range — the rest of the credited window, the command echo,
+    // and the marker — pages first; the exit rides the completing hold).
+    let mut saw_exit = false;
+    let mut acc = String::new();
+    let mut output_frames = 0usize;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        let Some(value) = next_json_or_timeout(&mut paced, Duration::from_secs(5)).await else {
+            break;
+        };
+        match value.get("type").and_then(|v| v.as_str()) {
+            Some("terminal.output") => {
+                assert!(!saw_exit, "no output may follow terminal.exit: {value}");
+                if let Some(data) = value.get("data").and_then(|v| v.as_str()) {
+                    acc.push_str(data);
+                }
+                output_frames += 1;
+            }
+            Some("terminal.exit") => {
+                saw_exit = true;
+            }
+            _ => {}
+        }
+        if saw_exit {
+            break;
+        }
+    }
+    assert!(
+        saw_exit,
+        "terminal.exit must arrive (the staged exit drains)"
+    );
+    assert!(
+        acc.contains("FINAL-MARKER"),
+        "the deferred final output is delivered before the exit (got {output_frames} frames)"
+    );
+    // The exit-drain actually paged the deferred range (not an empty
+    // hand-off): the pre-exit burst included the remaining window.
+    assert!(
+        output_frames > 1,
+        "the exit-drain paged the deferred range before the exit ({output_frames} frames)"
+    );
+}

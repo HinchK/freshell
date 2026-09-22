@@ -13596,6 +13596,58 @@ describe('TerminalView lifecycle updates', () => {
       expect(layout?.type === 'leaf' && layout.content.kind === 'terminal' && layout.content.terminalId).toBeUndefined()
     })
 
+    // Delta round-2 finding F1, the ORDERED complement of the safety case
+    // above: when the SERVER sequences the deferred final output before
+    // terminal.exit (the natural-exit fix pages the deferred range and only
+    // then delivers the exit), the client must render every final frame and
+    // only then fold the exit — no frame lost to the exit boundary.
+    it('an ordered exit mid-replay renders the final output before the exit folds', async () => {
+      const { store, tabId, terminalId, term } = await setupPacedPane({ suffix: 'ordered-exit' })
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 9,
+          replayFromSeq: 1,
+          replayToSeq: 9,
+        })
+        // The server-sequenced burst: the deferred final output pages
+        // arrive FIRST (stamped with the current attach generation), then
+        // terminal.exit LAST.
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 3, data: 'PRE' })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 4,
+          seqEnd: 6,
+          data: 'FINAL-OUTPUT',
+          attachRequestId: latestAttachRequestIdForTerminal(terminalId),
+          streamId: latestStreamIdByTerminal.get(terminalId) ?? `test-stream:${terminalId}`,
+        })
+        messageHandler!({ type: 'terminal.exit', terminalId, exitCode: 0 })
+      })
+
+      // Both ranges rendered, in wire order, on the live surface.
+      expectTerminalWriteContaining(term, 'PRE')
+      expectTerminalWriteContaining(term, 'FINAL-OUTPUT')
+      const writes = terminalWriteStrings(term)
+      const preAt = writes.findIndex((entry) => entry.includes('PRE'))
+      const finalAt = writes.findIndex((entry) => entry.includes('FINAL-OUTPUT'))
+      expect(preAt).toBeGreaterThanOrEqual(0)
+      expect(finalAt).toBeGreaterThan(preAt)
+
+      // The exit folded AFTER the final output: exited status, identity
+      // released. The client credited each page as it consumed it (the
+      // exit does not retract credit for already-consumed pages — the
+      // server treats the post-exit credits as inert stale generations),
+      // and nothing credits after the fold.
+      const layout = store.getState().panes.layouts[tabId]
+      expect(layout?.type === 'leaf' && layout.content.kind === 'terminal' && layout.content.status).toBe('exited')
+      expect(layout?.type === 'leaf' && layout.content.kind === 'terminal' && layout.content.terminalId).toBeUndefined()
+      expect(creditMessages().map((msg) => msg.consumedSeq)).toEqual([3, 6])
+    })
+
     // ── Old-server downgrade matrix (responsive-terminal-restore task-008,
     // matrix cell 6): for EVERY attach intent the client sends, the payloads
     // are byte-identical to the pre-branch shapes when the ready echo lacks
