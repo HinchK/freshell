@@ -2486,6 +2486,20 @@ impl FreshOpencodeState {
         let (turn_task, bridge, real, route, daemon_turn_accepted) = {
             let mut s = session_arc.lock().await;
             s.killed.store(true, Ordering::SeqCst);
+            // send-during-compact queue: the handoff stop drops the queued
+            // sends (WARN per entry — a message must never silently
+            // disappear) under the SAME lock section, atomic with `killed`.
+            // The queue must NOT follow the session to the handoff target:
+            // the target rebuilds a fresh session object via
+            // `resume_durable_session` — silently carrying user-typed
+            // prompts across the transition would fire them on a pane that
+            // never typed them. The distinct WARN message keeps kill and
+            // handoff separable in the logs (different user stories).
+            while let Some(queued) = s.pending_sends.pop_front() {
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %session_id, request_id = ?queued.request_id,
+                    "fresh_agent_send_dropped_on_handoff");
+            }
             (
                 s.turn_task.take(),
                 s.serve_bridge.take(),
@@ -3013,6 +3027,17 @@ impl FreshOpencodeState {
                     if let Some(session_arc) = &session_arc {
                         let mut s = session_arc.lock().await;
                         s.close_pending = s.close_pending.saturating_sub(1);
+                        // send-during-compact queue: the enumeration gate
+                        // released for THIS session — positively re-trigger
+                        // the drain. A compact that settled while the kill
+                        // held `close_pending > 0` parked its settle-tail
+                        // drain; this is the only time-unbounded heal (any
+                        // in-drain retry bound would strand an accepted
+                        // message when the close outlives it — the round-2
+                        // review's finding). `drain_detached` is
+                        // self-gating: killed (the kill dropped the queue)
+                        // or a live drive or an empty queue are all no-ops.
+                        Self::drain_detached(self, &msg.session_id);
                     }
                     self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
                         provider: PROVIDER.to_string(),
@@ -3058,6 +3083,19 @@ impl FreshOpencodeState {
                             if let Some(session_arc) = &session_arc {
                                 let mut s = session_arc.lock().await;
                                 s.close_pending = s.close_pending.saturating_sub(1);
+                                // send-during-compact queue: the enumeration
+                                // gate released for THIS session — positively
+                                // re-trigger the drain. A compact that settled
+                                // while the kill held `close_pending > 0`
+                                // parked its settle-tail drain; this is the
+                                // only time-unbounded heal (any in-drain
+                                // retry bound would strand an accepted
+                                // message when the close outlives it — the
+                                // round-2 review's finding). `drain_detached`
+                                // is self-gating: killed (the kill dropped
+                                // the queue) or a live drive or an empty
+                                // queue are all no-ops.
+                                Self::drain_detached(self, &msg.session_id);
                             }
                             self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
                                 provider: PROVIDER.to_string(),
@@ -3175,6 +3213,20 @@ impl FreshOpencodeState {
                                 if let Some(session_arc) = &session_arc {
                                     let mut s = session_arc.lock().await;
                                     s.close_pending = s.close_pending.saturating_sub(1);
+                                    // send-during-compact queue: the
+                                    // enumeration gate released for THIS
+                                    // session — positively re-trigger the
+                                    // drain. A compact that settled while the
+                                    // kill held `close_pending > 0` parked
+                                    // its settle-tail drain; this is the only
+                                    // time-unbounded heal (any in-drain retry
+                                    // bound would strand an accepted message
+                                    // when the close outlives it — the
+                                    // round-2 review's finding).
+                                    // `drain_detached` is self-gating: killed
+                                    // (the kill dropped the queue) or a live
+                                    // drive or an empty queue are all no-ops.
+                                    Self::drain_detached(self, &msg.session_id);
                                 }
                                 self.broadcast(&ServerMessage::FreshAgentKilled(
                                     FreshAgentKilled {
@@ -3202,6 +3254,18 @@ impl FreshOpencodeState {
                         if let Some(session_arc) = &session_arc {
                             let mut s = session_arc.lock().await;
                             s.close_pending = s.close_pending.saturating_sub(1);
+                            // send-during-compact queue: the enumeration gate
+                            // released for THIS session — positively
+                            // re-trigger the drain. A compact that settled
+                            // while the kill held `close_pending > 0` parked
+                            // its settle-tail drain; this is the only
+                            // time-unbounded heal (any in-drain retry bound
+                            // would strand an accepted message when the close
+                            // outlives it — the round-2 review's finding).
+                            // `drain_detached` is self-gating: killed (the
+                            // kill dropped the queue) or a live drive or an
+                            // empty queue are all no-ops.
+                            Self::drain_detached(self, &msg.session_id);
                         }
                         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
                             provider: PROVIDER.to_string(),
@@ -3226,6 +3290,18 @@ impl FreshOpencodeState {
                         if let Some(session_arc) = &session_arc {
                             let mut s = session_arc.lock().await;
                             s.close_pending = s.close_pending.saturating_sub(1);
+                            // send-during-compact queue: the enumeration gate
+                            // released for THIS session — positively
+                            // re-trigger the drain. A compact that settled
+                            // while the kill held `close_pending > 0` parked
+                            // its settle-tail drain; this is the only
+                            // time-unbounded heal (any in-drain retry bound
+                            // would strand an accepted message when the close
+                            // outlives it — the round-2 review's finding).
+                            // `drain_detached` is self-gating: killed (the
+                            // kill dropped the queue) or a live drive or an
+                            // empty queue are all no-ops.
+                            Self::drain_detached(self, &msg.session_id);
                         }
                         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
                             provider: PROVIDER.to_string(),
@@ -3249,6 +3325,18 @@ impl FreshOpencodeState {
                         if let Some(session_arc) = &session_arc {
                             let mut s = session_arc.lock().await;
                             s.close_pending = s.close_pending.saturating_sub(1);
+                            // send-during-compact queue: the enumeration gate
+                            // released for THIS session — positively
+                            // re-trigger the drain. A compact that settled
+                            // while the kill held `close_pending > 0` parked
+                            // its settle-tail drain; this is the only
+                            // time-unbounded heal (any in-drain retry bound
+                            // would strand an accepted message when the close
+                            // outlives it — the round-2 review's finding).
+                            // `drain_detached` is self-gating: killed (the
+                            // kill dropped the queue) or a live drive or an
+                            // empty queue are all no-ops.
+                            Self::drain_detached(self, &msg.session_id);
                         }
                         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
                             provider: PROVIDER.to_string(),
@@ -3403,6 +3491,18 @@ impl FreshOpencodeState {
                         if let Some(session_arc) = &session_arc {
                             let mut s = session_arc.lock().await;
                             s.close_pending = s.close_pending.saturating_sub(1);
+                            // send-during-compact queue: the enumeration gate
+                            // released for THIS session — positively
+                            // re-trigger the drain. A compact that settled
+                            // while the kill held `close_pending > 0` parked
+                            // its settle-tail drain; this is the only
+                            // time-unbounded heal (any in-drain retry bound
+                            // would strand an accepted message when the close
+                            // outlives it — the round-2 review's finding).
+                            // `drain_detached` is self-gating: killed (the
+                            // kill dropped the queue) or a live drive or an
+                            // empty queue are all no-ops.
+                            Self::drain_detached(self, &msg.session_id);
                         }
                         self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
                             provider: PROVIDER.to_string(),
@@ -3442,6 +3542,20 @@ impl FreshOpencodeState {
                     .into_iter()
                     .collect();
                 s.killed.store(true, Ordering::SeqCst);
+                // send-during-compact queue: a killed pane drops its queued
+                // sends (WARN per entry — a message must never silently
+                // disappear). Under the SAME phase-3 lock so the drop is
+                // atomic with `killed`: a queueing send parked on this lock
+                // serializes either before (its entry is dropped here) or
+                // after (it observes killed at the handle_send gate and
+                // refuses typed). The drain's killed gate (and the decrement
+                // sites' self-gating spawns) are the backstops for a drain
+                // mid-drive racing this lock.
+                while let Some(queued) = s.pending_sends.pop_front() {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %msg.session_id, request_id = ?queued.request_id,
+                        "fresh_agent_send_dropped_on_kill");
+                }
                 (
                     s.turn_task.take(),
                     s.serve_bridge.take(),
@@ -15684,6 +15798,230 @@ mod tests {
                 .iter()
                 .any(|f| is_event(f, "freshAgent.turn.complete", None)),
             "an aborted compact must NEVER fabricate a turn-complete: {frames:?}"
+        );
+    }
+
+    /// send-during-compact queue (Task 4): a `freshAgent.kill` (pane close/
+    /// retire) DROPS the queued sends under the phase-3 session lock —
+    /// atomic with `killed` — with one structured WARN per dropped entry
+    /// (a message must never silently disappear), and the dropped message
+    /// NEVER reaches the daemon (the drain's killed gate and the decrement
+    /// sites' self-gating spawns are the backstops for a drain mid-drive
+    /// racing the drop).
+    #[tokio::test]
+    async fn kill_with_a_queued_send_drops_it_with_a_warn_and_it_never_posts() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q5", Some("prov/model")).await;
+        let session_arc = st.sessions.lock().await.get("ses_q5").cloned().unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q5")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q5", "must die with the pane")),
+        )
+        .await;
+        assert!(
+            !session_arc.lock().await.pending_sends.is_empty(),
+            "fixture: the send queued behind the parked compact"
+        );
+
+        let (events, _guard) = info_capture::capture();
+
+        // The kill — the same inline FreshAgentKill literal the
+        // kill-mid-compact test above uses.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            st.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q5".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("kill completes");
+
+        // (1) The queued message is gone and never POSTs (causally safe: the
+        // queue was dropped under the phase-3 lock; the drain's killed gate
+        // and the decrement sites' self-gating spawns never drive).
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")
+                    && r_body_contains(r, "must die with the pane")),
+            "kill drops the queue — the message must never reach the daemon"
+        );
+        assert!(
+            session_arc.lock().await.pending_sends.is_empty(),
+            "the drop emptied the queue"
+        );
+        // (2) The drop is observable: one WARN naming the dropped request
+        // (message + the structured request_id field).
+        let captured = events.lock().unwrap();
+        assert!(
+            captured
+                .iter()
+                .any(|e| e.message.contains("fresh_agent_send_dropped_on_kill")
+                    && format!("{:?}", e.fields).contains("req-must die with the pane")),
+            "every dropped entry is WARNed with its request id: {captured:?}"
+        );
+    }
+
+    /// send-during-compact queue (Task 4, the stranding heal — the round-2
+    /// review's finding): the kill's DURABLE_CLOSE_FAILED arm decrements
+    /// `close_pending` with `killed` NEVER set ("the session is resumable
+    /// exactly as if the kill never ran"). A compact that settles inside
+    /// the kill's awaited-close window parks its settle-tail drain behind
+    /// `close_pending > 0` — the drain returns. The decrement site's
+    /// POSITIVE drain re-trigger must heal it: the queued send drains with
+    /// NO further input from the test, no matter how long the close took.
+    #[tokio::test]
+    async fn a_queued_send_survives_a_clean_failed_kill_and_drains_after_the_close_gate_releases() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        insert_compact_session(&st, "ses_q6", Some("prov/model")).await;
+        let session_arc = st.sessions.lock().await.get("ses_q6").cloned().unwrap();
+
+        // 1. Park the compact (the standard gated rig), queue one send.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q6")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q6", "the stranded heal")),
+        )
+        .await;
+        assert!(
+            !session_arc.lock().await.pending_sends.is_empty(),
+            "fixture: the send queued behind the parked compact"
+        );
+
+        // 2. The kill whose durable close parks, then fails CLEAN (the
+        // minimal fake-side knob scripts the park-then-failure: no existing
+        // knob composes a park window with the Clean failure class —
+        // `set_fail_writes` answers immediately with no park window, and
+        // the retire stall parks but answers `Ok`, the SUCCESS arm).
+        let close_fail = fake.arm_retire_fail_park("opencode", "ses_q6");
+        let st2 = st.clone();
+        let mut kill = tokio::spawn(async move {
+            st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q6".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+        });
+        // The kill is deterministically inside its AWAITED durable close
+        // (the enumeration gate armed): the knob's `entered` fired when
+        // the batch call parked its answer.
+        let mut entered = false;
+        for _ in 0..100 {
+            if close_fail.entered.try_recv().is_ok() {
+                entered = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(entered, "the kill parked inside its awaited durable close");
+        assert_eq!(
+            session_arc.lock().await.close_pending,
+            1,
+            "the kill's enumeration gate is armed while the close parks"
+        );
+
+        // 3. Release the summarize gate DURING the awaited-close window: the
+        // compact settles; its settle-tail drain spawns, observes
+        // `close_pending > 0`, and returns (the stranded leg).
+        summarize_gate.notify_waiters();
+        let _ = frames_until(&mut rx, |f| is_event(f, "freshAgent.turn.complete", None)).await;
+        // The settle tail emits its terminal frames and then spawns the
+        // drain in ONE synchronous stretch (no await between the
+        // turn.complete broadcast and the spawn), so on this current-thread
+        // runtime the drain IS spawned by the time frames_until returns —
+        // but the spawned task still needs a scheduler round to RUN and
+        // observe the armed gate: yield until it has returned.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !session_arc.lock().await.pending_sends.is_empty(),
+            "the settle-tail drain returned at the armed gate — the send is stranded"
+        );
+
+        // 4. The parked close answers CLEAN FAILURE: the kill completes with
+        // FreshAgentKilled{success:false, DURABLE_CLOSE_FAILED} (the
+        // pre-existing broadcast), `killed` stays false, and
+        // `close_pending` returns to 0 — the decrement site.
+        close_fail
+            .release
+            .send(())
+            .expect("release the parked close failure");
+        tokio::time::timeout(std::time::Duration::from_secs(15), &mut kill)
+            .await
+            .expect("the kill completes")
+            .expect("kill task completed");
+
+        // THE HEAL: the queued prompt POSTs with NO further input from the
+        // test — the decrement site's drain_detached fired.
+        await_prompt_posted(&http, "the stranded heal").await;
+
+        // The kill answered failure and the session is resumable exactly as
+        // if the kill never ran.
+        let frames = drain_frames(&mut rx);
+        let killed_frame = frames
+            .iter()
+            .find(|f| f["type"] == "freshAgent.killed")
+            .expect("the kill answers freshAgent.killed");
+        assert_eq!(
+            killed_frame["success"], false,
+            "a Clean-failed durable close reports success:false: {killed_frame}"
+        );
+        assert_eq!(
+            killed_frame["code"], "DURABLE_CLOSE_FAILED",
+            "the failure class is the clean close failure: {killed_frame}"
+        );
+        assert!(
+            !session_arc.lock().await.killed.load(Ordering::SeqCst),
+            "a Clean-failed close must never mark the session killed"
+        );
+        assert_eq!(
+            session_arc.lock().await.close_pending,
+            0,
+            "the enumeration gate released"
+        );
+        assert!(
+            session_arc.lock().await.pending_sends.is_empty(),
+            "the healed drain emptied the queue"
         );
     }
 
