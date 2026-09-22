@@ -1164,9 +1164,24 @@ impl OpencodeServeManager {
     /// compact path consumes only its `model` key (probed on 1.18.18: present,
     /// string-or-null) as the model-pair fallback when a session carries no splittable
     /// model of its own.
+    ///
+    /// A slow config read must never kill the shared daemon — the FR2 read rule
+    /// (b8ke): capture the base once (spawn-on-demand is preserved), then
+    /// transport over the captured base with `DiscardOnTimeout::No`.
     pub async fn get_config(&self, route: &Route) -> Result<Value, ServeError> {
+        let base = self.require_base().await?;
         let path = with_route("/config", route);
-        self.json_request(HttpMethod::Get, &path, None, None).await
+        self.json_request_over_base(
+            HttpMethod::Get,
+            &path,
+            None,
+            None,
+            base,
+            DiscardOnTimeout::No,
+            &[],
+            None,
+        )
+        .await
     }
 
     /// `POST /session/:id/summarize` — the compact RPC. VALIDATED opencode 1.18.18
@@ -1217,11 +1232,22 @@ impl OpencodeServeManager {
         if let Some(w) = accepted_witness {
             witnesses.push(w);
         }
-        self.json_request_maybe_witnessed(
+        // 2026-09-20 incident: the summarize POST used the discard-on-timeout
+        // lane, so a 600 s budget exceeded on a healthy-but-busy daemon KILLED
+        // the one shared daemon for every freshopencode session. Mirror the
+        // FR2 captured-base transport (`get_session_at`): a timed-out compact
+        // answers `RequestTimeout` and NEVER kills the shared daemon. The
+        // redo-destroy classification is unchanged — `RequestTimeout` stays
+        // outside `never_dispatched()` (a timed-out POST may have reached the
+        // daemon).
+        let base = self.require_base().await?;
+        self.json_request_over_base(
             HttpMethod::Post,
             &path,
             Some(json!({ "providerID": provider_id, "modelID": model_id })),
             None,
+            base,
+            DiscardOnTimeout::No,
             &witnesses,
             // The summarize handler runs the whole LLM turn before answering;
             // use its dedicated timeout rather than the generic request bound.
@@ -1617,7 +1643,7 @@ fn encode_path_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     // ── display_error_chain (transport diagnostics preservation) ─────────────
 
@@ -1774,17 +1800,21 @@ mod tests {
     // ── compact (POST /session/:id/summarize) + get_config (GET /config) ────────
 
     /// A `ServeHttp` fake that records every request (`METHOD url body?`) and scripts
-    /// responses: healthy probes, summarize per `summarize_status`, fork per
-    /// `fork_status`/`fork_body`, `/config` per `config_body`, everything else a
+    /// responses: healthy probes, summarize per `summarize_status` (or a NEVER-resolving
+    /// response when `summarize_pending` — the wedged shape from
+    /// `tests/serve_health_bounded.rs`), fork per `fork_status`/`fork_body`, `/config`
+    /// per `config_body` (or never-resolving when `config_pending`), everything else a
     /// benign 200 `{}`. Per-request timeouts land in the index-aligned
     /// [`RecordingHttp::timeouts`] vec (`requests[i]`'s timeout is `timeouts[i]`).
     struct RecordingHttp {
         requests: Mutex<Vec<(String, String, Option<String>)>>,
         timeouts: Mutex<Vec<Option<Duration>>>,
         summarize_status: u16,
+        summarize_pending: bool,
         fork_status: u16,
         fork_body: Vec<u8>,
         config_body: Vec<u8>,
+        config_pending: bool,
         revert_status: u16,
     }
 
@@ -1794,9 +1824,11 @@ mod tests {
                 requests: Mutex::new(Vec::new()),
                 timeouts: Mutex::new(Vec::new()),
                 summarize_status: 200,
+                summarize_pending: false,
                 fork_status: 200,
                 fork_body: br#"{"id":"ses_child","directory":"/tmp/x"}"#.to_vec(),
                 config_body: br#"{"model":null}"#.to_vec(),
+                config_pending: false,
                 revert_status: 200,
             }
         }
@@ -1839,6 +1871,14 @@ mod tests {
                 return Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) });
             }
             if req.url.contains("/summarize") {
+                if self.summarize_pending {
+                    // A genuine wedge: the response NEVER resolves — only the
+                    // caller's per-request bound can settle it.
+                    return Box::pin(async {
+                        std::future::pending::<()>().await;
+                        unreachable!()
+                    });
+                }
                 let status = self.summarize_status;
                 let body = if status == 200 {
                     // VALIDATED 1.18.18 contract: the summarize success body is a boolean.
@@ -1863,6 +1903,14 @@ mod tests {
                 return Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) });
             }
             if req.url.contains("/config") {
+                if self.config_pending {
+                    // A genuine wedge: the response NEVER resolves — only the
+                    // caller's per-request bound can settle it.
+                    return Box::pin(async {
+                        std::future::pending::<()>().await;
+                        unreachable!()
+                    });
+                }
                 let body = self.config_body.clone();
                 return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
             }
@@ -1898,6 +1946,35 @@ mod tests {
         }
     }
 
+    /// A never-exiting serve process whose `kill()` calls are COUNTED — the
+    /// discard-on-timeout assertion seam (the `tests/serve_health_bounded.rs`
+    /// `NeverExitsProcess` pattern).
+    struct KillCountingProcess {
+        killed: Arc<AtomicUsize>,
+    }
+    impl ServeProcess for KillCountingProcess {
+        fn exited(&self) -> Option<i32> {
+            None
+        }
+        fn take_fatal_startup_error(&self) -> Option<String> {
+            None
+        }
+        fn kill(&self) {
+            self.killed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct KillCountingSpawner {
+        killed: Arc<AtomicUsize>,
+    }
+    impl ProcessSpawner for KillCountingSpawner {
+        fn spawn(&self, _req: SpawnRequest) -> Result<Box<dyn ServeProcess>, String> {
+            Ok(Box::new(KillCountingProcess {
+                killed: self.killed.clone(),
+            }))
+        }
+    }
+
     struct NoopHandle;
     impl EventStreamHandle for NoopHandle {}
     struct NoopEventSource;
@@ -1917,6 +1994,26 @@ mod tests {
     ) -> OpencodeServeManager {
         let deps = ServeDeps {
             spawner: Arc::new(FakeSpawner),
+            http,
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let mgr = OpencodeServeManager::new(deps, config);
+        mgr.ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        mgr
+    }
+
+    /// [`started_recording_manager_with_config`] with a kill-counting spawner,
+    /// for the lanes that must NEVER kill the shared daemon.
+    async fn started_recording_manager_counting_kills(
+        http: Arc<RecordingHttp>,
+        config: ServeConfig,
+        killed: Arc<AtomicUsize>,
+    ) -> OpencodeServeManager {
+        let deps = ServeDeps {
+            spawner: Arc::new(KillCountingSpawner { killed }),
             http,
             ports: Arc::new(FakeAllocator),
             events: Arc::new(NoopEventSource),
@@ -2135,6 +2232,53 @@ mod tests {
         }
     }
 
+    // 2026-09-20 incident: a compact timeout (600 s budget) ran the
+    // DiscardOnTimeout::Yes arm and KILLED the one shared `opencode serve`
+    // daemon for every freshopencode session. The compact lane must degrade
+    // like the FR2 snapshot lane: the POST times out, the daemon survives.
+    #[tokio::test]
+    async fn compact_timeout_does_not_kill_the_shared_daemon() {
+        let killed = Arc::new(AtomicUsize::new(0));
+        let http = Arc::new(RecordingHttp {
+            summarize_pending: true,
+            ..RecordingHttp::new()
+        });
+        let config = ServeConfig {
+            compact_timeout: Duration::from_millis(50),
+            ..ServeConfig::default()
+        };
+        let mgr =
+            started_recording_manager_counting_kills(http.clone(), config, killed.clone()).await;
+
+        let err = mgr
+            .compact("ses_timeout", "prov-a", "mdl-x", &None, None, None)
+            .await
+            .expect_err("the summarize POST must time out");
+        assert!(
+            matches!(err, ServeError::RequestTimeout { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            killed.load(Ordering::SeqCst),
+            0,
+            "a compact timeout must NEVER kill the shared daemon"
+        );
+        assert!(
+            mgr.base_url().await.is_some(),
+            "the running entry must survive a compact timeout"
+        );
+        // The compact-timeout POST must still carry the dedicated budget.
+        let requests = http.recorded();
+        let summarize_index = requests
+            .iter()
+            .position(|(method, url, _)| method == "POST" && url.contains("/summarize"))
+            .expect("a summarize POST was recorded");
+        assert_eq!(
+            http.recorded_timeout(summarize_index),
+            Some(Duration::from_millis(50))
+        );
+    }
+
     #[tokio::test]
     async fn get_config_returns_the_raw_config_body() {
         let http = Arc::new(RecordingHttp {
@@ -2153,6 +2297,40 @@ mod tests {
             .find(|(method, url, _)| method == "GET" && url.contains("/config"))
             .expect("a /config GET was recorded");
         assert!(body.is_none(), "GET /config carries no body");
+    }
+
+    // The compact drive's pre-flight model-pair resolution reads /config; a slow
+    // config GET is the same defect class (a read must never kill the daemon).
+    #[tokio::test]
+    async fn get_config_timeout_does_not_kill_the_shared_daemon() {
+        let killed = Arc::new(AtomicUsize::new(0));
+        let http = Arc::new(RecordingHttp {
+            config_pending: true,
+            ..RecordingHttp::new()
+        });
+        let config = ServeConfig {
+            request_timeout: Duration::from_millis(50),
+            ..ServeConfig::default()
+        };
+        let mgr = started_recording_manager_counting_kills(http, config, killed.clone()).await;
+
+        let err = mgr
+            .get_config(&None)
+            .await
+            .expect_err("config GET must time out");
+        assert!(
+            matches!(err, ServeError::RequestTimeout { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            killed.load(Ordering::SeqCst),
+            0,
+            "a config read timeout must NEVER kill the shared daemon"
+        );
+        assert!(
+            mgr.base_url().await.is_some(),
+            "the running entry must survive a config read timeout"
+        );
     }
 
     // ── fork (POST /session/:id/fork) ────────────────────────────────────────
