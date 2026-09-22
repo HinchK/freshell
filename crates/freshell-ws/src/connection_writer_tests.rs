@@ -189,6 +189,70 @@ async fn an_oversize_drain_page_admits_into_a_fully_drained_queue() {
     let _ = join(task).await;
 }
 
+/// Round-2 finding F5: releasing a [`DrainAdmission`] must WAKE the tasks
+/// waiting on the backlog watch channel — a drain that consumed the
+/// available reservation and completed WITHOUT admitting (a `CaughtUp` or
+/// `Gone` verdict: a retention gap instead of a page, a cancelled session)
+/// frees admission capacity, and a concurrently gated drain must
+/// re-evaluate immediately rather than sleeping until an unrelated socket
+/// send or keepalive publishes the backlog. At the supported 64 KiB queue
+/// floor two 32 KiB drains are exactly this shape (watermark 32 KiB, the
+/// floor's clamped page budget 32 KiB): drain A holds the whole watermark;
+/// drain B is gated; A completes without admitting.
+///
+/// Bounded-assert discipline: the wake is observed VIA THE CHANNEL/state —
+/// the reservation resolves without a single completed socket send (the
+/// pump is never run), so the only possible waker is the release itself.
+#[tokio::test]
+async fn drain_admission_release_wakes_a_gated_drain_without_a_socket_send() {
+    let (sender, _pump) = WriterSender::new(64 * 1024, 4096, Duration::from_secs(10));
+    assert_eq!(
+        sender.backlog_watermark(),
+        32 * 1024,
+        "the reviewer's 64 KiB queue-floor shape"
+    );
+    // Drain A consumes the whole watermark's reservation.
+    let permit_a = sender
+        .reserve_drain_admission(32 * 1024)
+        .await
+        .expect("drain A reserves against an empty queue");
+    {
+        let queues = sender.shared.queues.lock().unwrap();
+        assert_eq!(queues.drain_reserved, 32 * 1024);
+    }
+    // Drain B gates: A's reservation leaves no room for a second page.
+    let permit_b = sender.reserve_drain_admission(32 * 1024);
+    tokio::pin!(permit_b);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut permit_b)
+            .await
+            .is_err(),
+        "drain B stays gated while drain A holds the reservation"
+    );
+    // Drain A completes WITHOUT admitting anything (the CaughtUp/Gone
+    // shape: no page was built, no frame was sent): its release alone must
+    // free and PUBLISH the capacity.
+    drop(permit_a);
+    let permit_b = tokio::time::timeout(Duration::from_secs(2), permit_b)
+        .await
+        .expect("the release alone wakes the gated drain — no socket send required")
+        .expect("the writer is alive");
+    {
+        let queues = sender.shared.queues.lock().unwrap();
+        assert_eq!(
+            queues.drain_reserved,
+            32 * 1024,
+            "drain B now holds the released capacity"
+        );
+    }
+    assert_eq!(
+        sender.completed_sends(),
+        0,
+        "no socket send ever happened: the wake came from the reservation release"
+    );
+    drop(permit_b);
+}
+
 /// Round-5 finding 1 (Major), the reviewer's exact scenario: MULTIPLE pane
 /// drains awakened together against a JUST-UNDER-WATERMARK backlog with
 /// FULL-SIZE pages. The drain admission gate must account for the page it

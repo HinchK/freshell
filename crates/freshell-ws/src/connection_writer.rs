@@ -268,8 +268,32 @@ impl Drop for DrainAdmission {
     fn drop(&mut self) {
         // Also runs after the pump's Drop reset the queue state: the
         // saturating subtraction keeps a stale guard's release inert.
+        let mut backlog_publish: Option<usize> = None;
         if let Ok(mut queues) = self.shared.queues.lock() {
             queues.drain_reserved = queues.drain_reserved.saturating_sub(self.bytes);
+            // Round-2 finding F5: the release FREES admission capacity —
+            // publish the backlog so tasks waiting on the gate
+            // (`reserve_drain_admission`) re-evaluate NOW instead of
+            // sleeping until an unrelated socket send or keepalive
+            // publishes it. A drain that completed without admitting (a
+            // CaughtUp/Gone verdict: no page, no send) otherwise strands
+            // concurrent drains behind capacity that already came back.
+            // `watch::send` wakes every waiter even for an equal value
+            // (the change mark is versioned, not value-compared), and the
+            // post-pump-Drop reset path publishes the same way the pump's
+            // own Drop does.
+            backlog_publish = Some(
+                queues
+                    .output
+                    .pending_bytes()
+                    .saturating_add(queues.in_flight_output_bytes),
+            );
+        }
+        if let Some(backlog) = backlog_publish {
+            // Best-effort like every other publish (a closed channel means
+            // no drain is waiting — nothing to wake). Never held under the
+            // queue lock.
+            let _ = self.shared.backlog.send(backlog);
         }
     }
 }
