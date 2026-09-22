@@ -29,6 +29,23 @@
 //! produced — an accepted credit always makes byte progress, never a
 //! zero-progress demand for more credit.
 //!
+//! E2R3 (the third sharpening of the natural-exit transition): the
+//! session's PHASE-TRANSITION decision — "extend the credited phase
+//! with a staged exit" vs "transfer to the uncredited tail drain" vs
+//! "arm at session start" — is ATOMIC with respect to exit staging.
+//! [`TerminalRegistry::paced_exit_transition`] reads the staged-exit
+//! state and the frozen head under ONE registry lock hold and returns
+//! the decision; every drive site applies it idempotently. The
+//! load-bearing site is [`settle_exit_transition`], the POST-DRIVE
+//! disposition that commits extend-vs-transfer: an exit staged during
+//! the drive — after the pre-arm's read, inside the pre-fix
+//! check-then-act window — is absorbed by the disposition's own atomic
+//! read, the credited phase extends, and terminal.exit rides the
+//! credit acknowledging the page that reaches the frozen head. An exit
+//! staged strictly after the disposition's transfer confirmation is
+//! the drain's documented uncredited tail content: the atomicity
+//! boundary is exactly the transfer decision.
+//!
 //! When the replay cursor reaches the fixed attach-time target, the
 //! accumulated live range drains as ordinary delivery (pages, not
 //! credit-gated) in the SPAWNED drain task toward a FIXED target — the
@@ -127,24 +144,6 @@ impl PacedSession {
         });
     }
 
-    /// E2R2 finding (the exit-arming race), invariant 2: after a
-    /// `DrainReady` drive, `true` when the session is armed for a staged
-    /// exit AND its last emitted page — the one that reached the frozen
-    /// [`Self::exit_head`] — is still UN-CREDITED. That page's
-    /// acknowledgment is the ONLY verdict terminal.exit may ride: the
-    /// session must STAY in the credited phase (removal happens on the
-    /// acknowledging credit, and the spawned drain's completing verdict
-    /// delivers the staged exit after it). `false` in every other
-    /// DrainReady state — un-armed (the ordinary completion: the
-    /// uncredited tail drain) or armed with `credited == page_end` (the
-    /// acknowledging credit is the one being processed, or the staged
-    /// exit added no output past the credited cursor — the empty drain's
-    /// CaughtUp hold delivers the exit now, after everything the client
-    /// already acknowledged).
-    pub(crate) fn uncredited_exit_page(&self) -> bool {
-        self.exit_head.is_some() && self.credited < self.page_end
-    }
-
     /// Adopt the registry's attach-time session description (the first page
     /// was produced under the attach lock and is sunk by the caller).
     pub(crate) fn from_desc(desc: PacedSessionDesc) -> Self {
@@ -164,51 +163,54 @@ impl PacedSession {
     }
 }
 
-/// E2R2 finding (the exit-arming race), invariant 1 — ARMING ALWAYS
-/// PRECEDES DRIVING, at every drive site (the credit path, the attach
-/// start, and the notify arm). The REGISTRY is the authority for a
-/// staged natural exit: the staging happens under the terminal lock
-/// BEFORE the connection's notify hook fires, so this query observes it
-/// regardless of the notify's dispatch order — arming here, BEFORE the
-/// drive that follows, is what closes the credit/notify race. Because
-/// the drive runs after the arm, an arm that extends the phase target
-/// beyond the credited cursor is ALWAYS followed by a drive that
-/// produces the next page: no state can exist where the target exceeds
-/// the credited cursor and no page was just emitted (the pre-fix
-/// drive-then-arm ordering kept such sessions with nothing outstanding,
-/// permanently wedging the final output and terminal.exit — nothing
-/// outstanding means no credit can ever come).
+/// E2R2 finding (the exit-arming race), invariant 1 — the PRE-ARM:
+/// arming always precedes driving, at every drive site (the credit
+/// path, the attach start, and the notify arm), so the drive pages
+/// toward the extended phase target immediately. The registry is the
+/// authority for a staged natural exit: the staging happens under the
+/// terminal lock BEFORE the connection's notify hook fires, so this
+/// query observes it regardless of the notify's dispatch order.
 ///
-/// Monotone and idempotent: a session already armed (by the notify or an
-/// earlier arm) never moves its `exit_head` backward and never
-/// double-delivers — the terminal's head is frozen by the exit, and
-/// [`PacedSession::arm_staged_exit`] takes the max. Returns `true` when
-/// THIS call armed (observability).
+/// E2R3: the arm reads the transition decision under ONE registry
+/// lock hold ([`TerminalRegistry::paced_exit_transition`] — the staged
+/// exit and the frozen head together); the pre-fix shape read them in
+/// two separate holds. The arm is a HINT, never a transition
+/// commitment: it only ever EXTENDS the session (monotone, idempotent),
+/// and the disposition ([`settle_exit_transition`]) re-decides
+/// atomically after the drive — so an exit this read missed because it
+/// staged inside the credit's window is absorbed by the disposition's
+/// own read. Because the arm precedes the drive, an arm that extends
+/// the phase target beyond the credited cursor is always followed by a
+/// drive that produces the next page: no state can exist where the
+/// target exceeds the credited cursor and no page was just emitted
+/// (the pre-fix drive-then-arm ordering kept such sessions with
+/// nothing outstanding, permanently wedging the final output and
+/// terminal.exit — nothing outstanding means no credit can ever
+/// come).
+///
+/// Returns `true` when THIS call armed (observability).
 pub(crate) fn arm_staged_exit_from_registry(
     registry: &TerminalRegistry,
     conn_id: u64,
     session: &mut PacedSession,
 ) -> bool {
     if session.exit_head.is_some() {
-        // Already armed — the notify or an earlier arm won the race; the
-        // frozen head never moves and a second arm is inert.
+        // Already armed — the notify, the start, or an earlier arm won
+        // the race; the frozen head never moves and a second arm is
+        // inert.
         return false;
     }
-    if registry
-        .staged_paced_exit(&session.terminal_id, conn_id)
-        .is_none()
-    {
-        return false;
-    }
-    let Some(bounds) = registry.replay_bounds(&session.terminal_id) else {
-        // staged_paced_exit was Some, so the terminal exists; defensive.
+    let Some(exit_head) = registry
+        .paced_exit_transition(&session.terminal_id, conn_id)
+        .exit_head
+    else {
         return false;
     };
-    session.arm_staged_exit(bounds.head_seq);
+    session.arm_staged_exit(exit_head);
     tracing::info!(
         terminal_id = %session.terminal_id,
         attach_request_id = %session.attach_request_id,
-        exit_head = bounds.head_seq,
+        exit_head,
         "ws.restore.paced_exit_armed"
     );
     true
@@ -438,6 +440,140 @@ pub(crate) fn drive_session(
         }
     }
     DriveOutcome::DrainReady
+}
+
+/// E2R3 — the disposition a drive site commits from the ATOMIC
+/// transition decision (see [`settle_exit_transition`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TransitionDisposition {
+    /// Keep the session in the credited phase: a page is outstanding, or
+    /// the extended phase still has window left to page on the client's
+    /// continuation credits.
+    Stay,
+    /// Hand the session to the uncredited tail drain
+    /// ([`spawn_paced_drain`]) — the atomic decision confirmed no
+    /// staged exit, or the armed exit head is fully acknowledged (the
+    /// drain's completing verdict delivers the staged exit after
+    /// everything the client already acknowledged).
+    Transfer,
+    /// The terminal (or the connection's subscriber) disappeared —
+    /// cancel the session; the registry has no deferral left to clear.
+    Gone,
+}
+
+/// E2R3 — THE ATOMIC TRANSITION DISPOSITION. The phase-transition
+/// decision — "extend the credited phase with a staged exit" vs
+/// "transfer to the uncredited tail drain" — is committed HERE, from
+/// ONE registry lock hold
+/// ([`TerminalRegistry::paced_exit_transition`]: the staged-exit state
+/// and the frozen head read together) AFTER the drive produced its
+/// pages.
+///
+/// THE LOCK-SCOPE MAP (decided under the lock vs applied after):
+/// - UNDER the decision's hold: the staged-exit state and the frozen
+///   head are read, and the decision value — extend, or the
+///   atomically-confirmed absence of a staged exit — leaves the lock
+///   WITH the read. No window exists in which a concurrently staged
+///   exit can change which transition is correct.
+/// - AFTER the hold (idempotent application, safe against concurrent
+///   staging: an armed head is FROZEN by the exit, and the unarmed
+///   transfer's boundary IS the decision): the session arms, the
+///   wedge-guard may emit the extended phase's next page, the session
+///   stays in the table, or it moves to the spawned drain. The
+///   terminal lock is never held across the application — pages are
+///   built under the drive's own per-page holds and sunk outside them,
+///   exactly as before.
+///
+/// WHY THE DECISION SITS AFTER THE DRIVE: the disposition must be
+/// settled from state that accounts for the drive's own pages, and
+/// the staging that matters is whatever happened-before THIS
+/// decision's hold — including an exit staged DURING the drive, after
+/// the pre-arm's read (the pre-fix check-then-act window: the arm read
+/// "no exit", the drive ran, the exit staged, and the disposition then
+/// decided from the stale read and transferred the session to the
+/// drain, which dumped the remaining suffix and delivered
+/// terminal.exit without the acknowledging credit). An exit staged
+/// before the hold is absorbed here: the phase extends and the exit
+/// rides the credit acknowledging the page reaching the frozen head.
+/// An exit staged strictly after the hold is post-decision — at the
+/// transfer site it is the drain's documented uncredited tail content.
+/// The atomicity boundary is exactly this decision.
+///
+/// The armed dispositions, in drive-site order:
+/// - `Gone` from the drive: the registry owns the teardown — cancel.
+/// - an uncredited page outstanding (`credited < page_end`): STAY —
+///   including the page that just reached the armed exit head; the
+///   removal rides the credit that acknowledges it (E2R2 invariant
+///   2), and the next credit's drive pages toward the extended target.
+/// - all-acknowledged cursor with the armed head AHEAD
+///   (`credited == page_end < exit_head`): THE WEDGE GUARD — the
+///   extension outgrew everything outstanding, so the drive MUST
+///   produce the extended phase's next page NOW (no state may exist
+///   where the target exceeds the credited cursor and no page is
+///   outstanding — nothing outstanding means no credit can ever come;
+///   the guard emits at most the ONE page every drive site emits per
+///   credit).
+/// - armed, all acknowledged, head covered
+///   (`credited == page_end >= exit_head`): TRANSFER — the spawned
+///   drain's CaughtUp hold delivers the staged exit after everything
+///   the client already acknowledged; the acknowledging credit is the
+///   one being processed, so the exit rides it.
+///
+/// The unarmed disposition is the drive's own outcome — the ordinary
+/// semantics, byte-identical to the pre-E2R3 dispatch (Active → stay,
+/// DrainReady → transfer, Gone → cancel) — and the atomically
+/// confirmed no-staged-exit is what makes the transfer safe: no
+/// happened-before staging was missed.
+pub(crate) fn settle_exit_transition(
+    registry: &TerminalRegistry,
+    conn_id: u64,
+    sink: &FrameSink,
+    session: &mut PacedSession,
+    drive_outcome: DriveOutcome,
+) -> TransitionDisposition {
+    let transition = registry.paced_exit_transition(&session.terminal_id, conn_id);
+    let Some(exit_head) = transition.exit_head else {
+        // (b) No exit staged — atomically confirmed under the
+        // decision's lock hold. Any staging after this hold is
+        // post-transfer tail content (the drain's documented
+        // uncredited semantics).
+        return match drive_outcome {
+            DriveOutcome::Active => TransitionDisposition::Stay,
+            DriveOutcome::DrainReady => TransitionDisposition::Transfer,
+            DriveOutcome::Gone => TransitionDisposition::Gone,
+        };
+    };
+    // (a) A staged exit is visible UNDER THIS HOLD: the credited phase
+    // extends through the frozen head — idempotent, monotone.
+    session.arm_staged_exit(exit_head);
+    if drive_outcome == DriveOutcome::Gone {
+        return TransitionDisposition::Gone;
+    }
+    if session.credited < session.page_end {
+        // An uncredited page is outstanding — including the page that
+        // just reached the armed exit head: the exit rides the credit
+        // that acknowledges it, never the drive that emitted it.
+        return TransitionDisposition::Stay;
+    }
+    if session.page_end < exit_head {
+        // THE WEDGE GUARD: the extension outgrew an all-acknowledged
+        // cursor — the drive must produce the extended phase's next
+        // page now.
+        return match drive_session(registry, conn_id, sink, session, session.page_budget) {
+            DriveOutcome::Active => TransitionDisposition::Stay,
+            DriveOutcome::DrainReady if session.credited < session.page_end => {
+                TransitionDisposition::Stay
+            }
+            DriveOutcome::DrainReady => TransitionDisposition::Transfer,
+            DriveOutcome::Gone => TransitionDisposition::Gone,
+        };
+    }
+    // Armed, everything emitted is acknowledged, and the frozen head
+    // is covered: the spawned drain's CaughtUp hold delivers the
+    // staged exit now, after everything the client already
+    // acknowledged — the acknowledging credit is the one being
+    // processed, so the exit rides it.
+    TransitionDisposition::Transfer
 }
 
 /// The drain's per-iteration admission reservation (E2R1 finding 2b):
@@ -751,12 +887,20 @@ pub(crate) fn spawn_paced_drain(
 
 /// Begin one negotiated session after a paced attach: sink the first page
 /// (produced under the attach lock; sunk now that it is released), emit
-/// `ws.restore.paced_start`, and — when the first page already reached the
-/// target — hand the session straight to the spawned drain (an attach with
-/// a short or empty replay drains to completion without ever needing a
-/// credit, still OFF the dispatcher). A first page that is a bounded
-/// prefix leaves the session ACTIVE with exactly ONE outstanding page:
-/// the next page is produced on the first credit, never before.
+/// `ws.restore.paced_start`, and settle the start's phase transition —
+/// ATOMICALLY with respect to exit staging (E2R3). The start's arm
+/// reads the transition decision under ONE registry lock hold, so an
+/// exit staged during the attach is seen in the SAME decision; when the
+/// arm extends an all-acknowledged cursor (the empty-first-page state),
+/// the start's drive settles the disposition through
+/// [`settle_exit_transition`]: the extended phase's first page is
+/// produced NOW (the wedge guard), and the session stays credited-phase
+/// active. When the first page already covered the target and nothing
+/// is staged, the session hands straight to the spawned drain (a short
+/// or empty replay drains to completion without ever needing a credit,
+/// still OFF the dispatcher). A first page that is a bounded prefix
+/// leaves the session ACTIVE with exactly ONE outstanding page: the
+/// next page is produced on the first credit, never before.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn start_session(
     registry: &TerminalRegistry,
@@ -785,57 +929,44 @@ pub(crate) fn start_session(
         max_replay_bytes = ?max_replay_bytes,
         "ws.restore.paced_start"
     );
-    if session.page_end >= session.target {
-        let budget = session.page_budget;
-        // E2R2 finding (the exit-arming race), invariant 1: ARM FIRST —
-        // a natural exit may have staged between the attach and this
-        // drive, and the registry is the authority (staging happens
-        // under the terminal lock, before the notify's dispatch). The
-        // arm extends the credited phase through the terminal's frozen
-        // final head BEFORE the drive, so the drive below produces the
-        // extended phase's next page: an arm that extends the target
-        // beyond the credited cursor is always followed by a page (no
-        // wedge state).
-        arm_staged_exit_from_registry(registry, conn_id, &mut session);
-        match drive_session(registry, conn_id, sink, &mut session, budget) {
-            DriveOutcome::Active => {
-                // The replay phase still has window left (the drive cannot
-                // return Active from a covered target — the safe arm keeps
-                // the session credited-phase-active).
-                sessions.insert(session);
-            }
-            DriveOutcome::DrainReady if session.uncredited_exit_page() => {
-                // E2R2 finding, invariant 2: the drive just EMITTED the page
-                // reaching the armed exit head and the client has not
-                // credited it — the session stays in the credited phase;
-                // removal and the exit ride the credit that acknowledges
-                // that page, never the drive that emitted it.
-                sessions.insert(session);
-            }
-            DriveOutcome::DrainReady => {
-                // The credited phase covered its target and everything
-                // emitted is acknowledged: the session leaves the credited
-                // phase. With a staged exit armed and `credited ==
-                // page_end` (the empty-first-page arm that extended
-                // nothing, or an exit that added no output), the spawned
-                // drain's CaughtUp hold delivers the staged exit now,
-                // after everything the client already acknowledged — zero
-                // uncredited pages.
-                spawn_paced_drain(
-                    registry.clone(),
-                    conn_id,
-                    writer,
-                    Arc::clone(sink),
-                    session,
-                    budget,
-                    cancel,
-                );
-            }
-            DriveOutcome::Gone => {}
-        }
-    } else {
-        // The first page is the one outstanding, uncredited page.
+    // E2R3: the start's ATOMIC arm/decide — ONE registry lock hold
+    // reads the staged-exit state; an exit staged during the attach is
+    // seen HERE, in the same decision (the notify arm and the first
+    // credit's disposition are later, also-atomic re-decisions).
+    // Arming precedes every branch below, so no branch can hand an
+    // armed session to the uncredited drain by accident of ordering.
+    arm_staged_exit_from_registry(registry, conn_id, &mut session);
+    if session.page_end < session.phase_target() && session.credited < session.page_end {
+        // A bounded first page is outstanding: the credited phase
+        // continues on the client's credits — no transition is
+        // committed at start (the next drive site's disposition is
+        // atomic).
         sessions.insert(session);
+        return;
+    }
+    // The target is covered (with any extension), or the arm extended
+    // an all-acknowledged cursor with the frozen head ahead (the
+    // wedge-guard state: the drive MUST produce the extended phase's
+    // next page now). Either way the disposition is settled from the
+    // ATOMIC decision after the drive.
+    let budget = session.page_budget;
+    let outcome = drive_session(registry, conn_id, sink, &mut session, budget);
+    match settle_exit_transition(registry, conn_id, sink, &mut session, outcome) {
+        TransitionDisposition::Stay => {
+            sessions.insert(session);
+        }
+        TransitionDisposition::Transfer => {
+            spawn_paced_drain(
+                registry.clone(),
+                conn_id,
+                writer,
+                Arc::clone(sink),
+                session,
+                budget,
+                cancel,
+            );
+        }
+        TransitionDisposition::Gone => {}
     }
 }
 

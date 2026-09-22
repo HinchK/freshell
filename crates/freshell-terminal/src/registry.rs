@@ -187,6 +187,27 @@ pub struct PacedAttachOptions {
 /// The staged-exit notification hook for a paced subscriber (finding F1).
 pub type PacedExitNotify = Arc<dyn Fn(&str, i64) + Send + Sync>;
 
+/// E2R3 (the atomic exit-transition decision): the phase-transition
+/// facts for one paced subscriber, read under ONE registry lock hold —
+/// the staged-exit state AND the terminal's head TOGETHER, so no window
+/// exists between the read and the caller's commitment of the
+/// disposition in which a concurrently staged exit can change which
+/// transition was correct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PacedExitTransition {
+    /// The terminal's FROZEN final head when a natural exit is STAGED
+    /// for this subscriber ([`TerminalRegistry::finish_pty_exit`]
+    /// staged it behind the still-armed deferral): the credited phase
+    /// extends through it, and terminal.exit rides the credit that
+    /// acknowledges the page reaching it. `None` atomically confirms
+    /// NO exit is staged as of this decision's lock hold — an exit
+    /// staging after the hold is post-decision content (at the
+    /// transfer site: the drain's documented uncredited tail
+    /// semantics). The head is frozen by the exit, so a `Some` value
+    /// is stable for the subscriber's remainder.
+    pub exit_head: Option<i64>,
+}
+
 /// E2R3 (the atomic exit-transition decision) test-support: the armed
 /// payload of the ONE-SHOT natural-exit staging hook — WHICH
 /// connection's subscriber stages WHICH exit code when the next hook
@@ -1623,6 +1644,42 @@ impl TerminalRegistry {
                 "terminal.paced_exit_staged_by_test_hook"
             );
         }
+    }
+
+    /// E2R3 (the atomic exit-transition decision): read one
+    /// subscriber's staged-exit state and the terminal's head under a
+    /// SINGLE terminal-lock hold and return the transition decision.
+    /// This is the ONE authority the ws layer's drive sites sequence
+    /// on — the credit path's pre-arm, the session start's arm, and
+    /// (load-bearing) the post-drive disposition that commits
+    /// extend-vs-transfer: because the staged-exit read and the
+    /// decision value leave the lock TOGETHER, no concurrently
+    /// staging PTY reader can invalidate the read before its caller
+    /// commits the disposition. The pre-fix arm read the staging and
+    /// the head in two separate holds and its disposition then decided
+    /// from that stale read after a drive — the check-then-act window
+    /// this closes structurally.
+    ///
+    /// A terminal/subscriber that is gone decides `exit_head: None`
+    /// (nothing staged); the caller's drive or drain discovers the
+    /// disappearance exactly as before.
+    pub fn paced_exit_transition(&self, terminal_id: &str, conn_id: u64) -> PacedExitTransition {
+        let Some(shared) = self.shared_for(terminal_id) else {
+            return PacedExitTransition { exit_head: None };
+        };
+        let mut s = shared.lock().expect("terminal lock");
+        let exit_head = s
+            .subscribers
+            .get(&conn_id)
+            .and_then(|sub| sub.paced_exit_pending)
+            .map(|_| s.head_seq);
+        // E2R3 test-support hook site: the one-shot staging fires
+        // AFTER this read, INSIDE the same lock hold — the
+        // deterministic model of the PTY reader staging its natural
+        // exit concurrently with THIS decision's use of its read. The
+        // transition-race tests' interleave. Inert in production.
+        self.fire_paced_exit_stage_hook(&mut s, terminal_id);
+        PacedExitTransition { exit_head }
     }
 
     /// The EFFECTIVE page budget for one paced attach (round-2 finding
@@ -6892,6 +6949,109 @@ mod tests {
             reg.paced_exit_pending_of("T", 1),
             Some(4),
             "the refused restage changed nothing"
+        );
+    }
+
+    /// E2R3 (the atomic exit-transition decision): the decision reads
+    /// the staged exit and the terminal's FROZEN head together under
+    /// ONE lock hold — `None` before any exit (atomically confirmed),
+    /// the frozen final head once staged, `None` for unknown terminals
+    /// and connections.
+    #[test]
+    fn paced_exit_transition_reads_the_staging_and_frozen_head_together() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        for seq in 1..=2 {
+            reg.feed("T", frame(seq, "history\r\n", "S"));
+        }
+        let (sink, _seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("transition".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+            PacedAttachOptions::default(),
+        );
+        let _ = out.paced.expect("paced session");
+
+        assert_eq!(
+            reg.paced_exit_transition("T", 1),
+            PacedExitTransition { exit_head: None },
+            "no exit staged: None, atomically confirmed under the decision's hold"
+        );
+        assert_eq!(
+            reg.paced_exit_transition("T", 2),
+            PacedExitTransition { exit_head: None },
+            "an unknown connection decides None"
+        );
+        assert_eq!(
+            reg.paced_exit_transition("T-gone", 1),
+            PacedExitTransition { exit_head: None },
+            "an unknown terminal decides None, not a panic"
+        );
+
+        // The exit stages with final output past the prior head; the
+        // decision carries the terminal's FROZEN final head (not the
+        // exit code) so the caller can extend the credited phase
+        // through it.
+        for seq in 3..=4 {
+            reg.feed("T", frame(seq, "FINAL\r\n", "S"));
+        }
+        assert!(reg.finish_pty_exit("T", 5));
+        assert_eq!(
+            reg.paced_exit_transition("T", 1),
+            PacedExitTransition { exit_head: Some(4) },
+            "the decision carries the terminal's frozen final head"
+        );
+    }
+
+    /// E2R3 test-support: the one-shot hook fires at the DECISION site
+    /// AFTER its read — the decision itself returns the pre-staging
+    /// state (the deterministic model of the PTY reader staging
+    /// concurrently with THIS decision's use of its read), and the
+    /// NEXT decision — with no further staging — reads the staged exit
+    /// under its own single hold. This is the interleave the ws
+    /// transition-race tests ride end-to-end.
+    #[test]
+    fn paced_exit_transition_hook_stages_after_the_decisions_read() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        for seq in 1..=2 {
+            reg.feed("T", frame(seq, "history\r\n", "S"));
+        }
+        let (sink, _seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("decision-hook".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+            PacedAttachOptions::default(),
+        );
+        let _ = out.paced.expect("paced session");
+
+        reg.set_paced_exit_stage_hook_for_tests(1, 6);
+        assert_eq!(
+            reg.paced_exit_transition("T", 1),
+            PacedExitTransition { exit_head: None },
+            "the firing decision observes the PRE-staging state — the hook stages after its read"
+        );
+        assert_eq!(
+            reg.paced_exit_transition("T", 1),
+            PacedExitTransition { exit_head: Some(2) },
+            "the hook's staging landed inside the firing decision's lock scope; \
+             the next decision reads the frozen head under its own hold"
         );
     }
 

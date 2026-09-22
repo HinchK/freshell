@@ -606,21 +606,22 @@ async fn run_loop(
                     _ => {}
                 }
             }
-            // E2R2 finding (the exit-arming race): the notify arm is the
-            // DISPATCH-side mirror of the credit path's arm-first
-            // invariant. A session still in its credited phase — which
-            // always has exactly ONE uncredited page outstanding — gets
-            // its phase extended through the terminal's frozen final head
-            // HERE when the notify wins the dispatch race; the credit
-            // path's arm-first query closes the same race when a credit
-            // runs first (the registry is the authority either way, and
-            // arming is monotone + idempotent, so whichever arm lands
-            // first wins and the other is inert). NOTHING is ever
-            // delivered here and the session never leaves the table
-            // here: the extended phase pages only on continuation
-            // credits, and terminal.exit rides the credit that
-            // acknowledges the page reaching the armed exit head (the
-            // drive sites own that disposition).
+            // E2R3 (the atomic exit-transition decision): the notify arm
+            // is the DISPATCH-side PRE-ARM — an extension hint, never a
+            // transition commitment. A session still in its credited
+            // phase — which always has exactly ONE uncredited page
+            // outstanding — gets its phase extended through the
+            // terminal's frozen final head HERE when the notify wins the
+            // dispatch race, so the next credit's drive pages toward it
+            // immediately; the arm reads the transition decision under
+            // ONE registry lock hold (monotone, idempotent — whichever
+            // arm lands first wins and the others are inert). NOTHING
+            // is ever delivered here and the session never leaves the
+            // table here: the disposition that commits extend-vs-transfer
+            // is the drive sites' `settle_exit_transition`, whose own
+            // atomic read absorbs any staging this arm missed — so a
+            // lost, delayed, or out-raced notify is a paging hint
+            // difference only, never a correctness difference.
             Some((terminal_id, exit_code)) = paced_exit_rx.recv() => {
                 let _ = exit_code; // the armed log names the frozen head; the drain logs the code
                 if let Some(session) = paced_sessions.get_mut(&terminal_id) {
@@ -7273,7 +7274,7 @@ fn handle_replay_credit(
     writer: &connection_writer::WriterSender,
     cancel: &tokio::sync::watch::Receiver<bool>,
 ) -> bool {
-    use crate::paced_replay::DriveOutcome;
+    use crate::paced_replay::TransitionDisposition;
     // Identifiers/measurements only, per the restore observability contract.
     let observe = |verdict: crate::paced_replay::CreditVerdict| {
         tracing::info!(
@@ -7299,45 +7300,37 @@ fn handle_replay_credit(
     // recorded on the session at attach) sizes the credited pages — the
     // whole session honors the requested bound, not just the first page.
     let budget = session.page_budget;
-    // E2R2 finding (the exit-arming race) — THE INVARIANT, part 1:
-    // arming ALWAYS precedes driving in the credit path. The registry is
-    // the authority for a staged natural exit (the staging happens under
-    // the terminal lock BEFORE the notify fires), so a staged exit is
-    // discovered HERE — before the drive — and the drive below pages
-    // toward the extended phase target. An arm that extends the target
-    // beyond the credited cursor is therefore ALWAYS followed by a drive
-    // that produces the next page: no state may exist where the target
-    // exceeds the credited cursor and no page was just emitted (the
-    // pre-fix drive-then-arm ordering kept such sessions with nothing
-    // outstanding — permanently wedging the final output and
-    // terminal.exit, because nothing outstanding means no credit can
-    // ever come).
+    // E2R2 finding (the exit-arming race) — invariant 1, THE PRE-ARM:
+    // arming precedes the drive so the drive pages toward the extended
+    // phase target immediately. The arm is monotone/idempotent and
+    // NEVER a transition commitment: the disposition below re-decides
+    // atomically after the drive, so an exit staged inside this
+    // credit's window — after this arm's read, during the drive — is
+    // absorbed by the disposition's own single-hold read (E2R3: the
+    // pre-fix check-then-act window is closed structurally, not
+    // re-ordered).
     crate::paced_replay::arm_staged_exit_from_registry(registry, conn_id, session);
-    match crate::paced_replay::drive_session(registry, conn_id, conn_sink, session, budget) {
-        DriveOutcome::Active => {}
-        // THE INVARIANT, part 2: terminal.exit rides the CREDIT verdict
-        // that acknowledges consumption of the page reaching the armed
-        // exit head — never the drive that emits it. A DrainReady drive
-        // that just emitted that page leaves it UN-CREDITED: removal
-        // waits for the NEXT credit — the acknowledging one (the client
-        // clears its attach state on exit, so an exit delivered here
-        // would also kill that page's parser-applied checkpoint and
-        // consumption credit on the client side). Every other
-        // DrainReady completes now: the session leaves the credited
-        // phase and the spawned drain's CaughtUp hold delivers any
-        // staged exit AFTER everything the client already acknowledged
-        // (an armed session with `credited == page_end` extended
-        // nothing past the acknowledged cursor, or the acknowledging
-        // credit is the one being processed).
-        DriveOutcome::DrainReady if session.uncredited_exit_page() => {}
-        DriveOutcome::DrainReady => {
-            // The credited phase covered its target (and any staged exit
-            // rides the drain's completing verdict, or there is none): the
-            // session leaves the credited phase and moves WHOLE into the
-            // spawned drain task — the connection dispatcher stays free
-            // (input, other panes, controls) while the un-credited drain
-            // pages, and credits that arrive during the drain are inert
-            // stale generations (the drain is un-credited).
+    let outcome = crate::paced_replay::drive_session(registry, conn_id, conn_sink, session, budget);
+    // E2R3 — THE ATOMIC TRANSITION DISPOSITION: extend-vs-transfer is
+    // committed from ONE registry lock hold AFTER the drive. An exit
+    // staged before the disposition's hold extends the credited phase
+    // (the exit rides the acknowledging credit of the page reaching the
+    // frozen head — E2R2 invariant 2 lives in the disposition now); the
+    // atomically-confirmed absence of a staged exit is what makes the
+    // transfer below safe; an exit staged strictly after the hold is
+    // the drain's documented uncredited tail content (the atomicity
+    // boundary is exactly the transfer decision).
+    match crate::paced_replay::settle_exit_transition(
+        registry, conn_id, conn_sink, session, outcome,
+    ) {
+        TransitionDisposition::Stay => {}
+        // The credited phase covered its target and everything it must
+        // acknowledge is acknowledged (or the armed exit head is fully
+        // covered): the session moves WHOLE into the spawned drain task
+        // — the connection dispatcher stays free (input, other panes,
+        // controls) while the un-credited drain pages, and credits that
+        // arrive during the drain are inert stale generations.
+        TransitionDisposition::Transfer => {
             if let Some(session) = paced_sessions.remove(&replay_credit.terminal_id) {
                 crate::paced_replay::spawn_paced_drain(
                     registry.clone(),
@@ -7350,7 +7343,7 @@ fn handle_replay_credit(
                 );
             }
         }
-        DriveOutcome::Gone => {
+        TransitionDisposition::Gone => {
             paced_sessions.remove(&replay_credit.terminal_id);
         }
     }
@@ -11444,11 +11437,17 @@ mod paced_exit_race_tests {
     /// The deterministic terminal under test: a shell script that produces
     /// output only in response to input lines, then a final marker, then
     /// exits. Nothing is emitted before the first input, so the ring's
-    /// head is deterministically 0 until the test writes.
+    /// head is deterministically 0 until the test writes. Each pad step
+    /// prints a UNIQUE marker (`PAD-STEP-<i>`): `step`'s marker wait is a
+    /// substring match over the whole retained ring, so a repeated
+    /// marker would let step i+1 return on step i's output before its
+    /// own ingestion — the attach would then race the remaining pads'
+    /// asynchronous ingestion (a real flake: the first page could cover
+    /// the whole raced window and fail the bounded-prefix assert).
     fn race_script(pads: usize, final_marker: &str) -> String {
         let mut script = String::new();
-        for _ in 0..pads {
-            script.push_str("read x; printf 'PAD-STEP\\n'; ");
+        for pad in 0..pads {
+            script.push_str(&format!("read x; printf 'PAD-STEP-{pad}\\n'; "));
         }
         script.push_str(&format!("read x; printf '{}\\n'; exit\n", final_marker));
         script
@@ -11465,11 +11464,13 @@ mod paced_exit_race_tests {
     /// coalesces with the step's output nondeterministically (sometimes
     /// one frame, sometimes two) — `stty -echo` plus the ECHO-OFF
     /// banner (the harness's [`RaceHarness::wait_ready`] gate) makes
-    /// every post-banner step produce EXACTLY its printf frame.
+    /// every post-banner step produce EXACTLY its printf frame. Pad
+    /// markers are unique per step for the same reason as the exiting
+    /// script's (see [`race_script`]).
     fn quiet_race_script(pads: usize, final_marker: &str) -> String {
         let mut script = String::from("stty -echo; printf 'ECHO-OFF\\n'; ");
-        for _ in 0..pads {
-            script.push_str("read x; printf 'PAD-STEP\\n'; ");
+        for pad in 0..pads {
+            script.push_str(&format!("read x; printf 'PAD-STEP-{pad}\\n'; "));
         }
         script.push_str(&format!("read x; printf '{}\\n'; ", final_marker));
         script.push_str("while :; do read x; done");
@@ -11848,10 +11849,11 @@ mod paced_exit_race_tests {
     async fn exit_page_read_uncredited_holds_the_exit_for_its_credit() {
         let mut harness = RaceHarness::new("preempt", 8, "FINAL-PREEMPT");
         // Seed the pre-exit window: every pad step lands in the ring
-        // deterministically before the paced attach.
+        // deterministically before the paced attach (each step waits for
+        // its OWN unique marker, so the attach cannot race a pad's
+        // asynchronous ingestion).
         for step in 0..8 {
-            harness.step("pad", "PAD-STEP").await;
-            let _ = step;
+            harness.step("pad", &format!("PAD-STEP-{step}")).await;
         }
         let head_at_attach = harness.head();
         assert!(head_at_attach > 0, "the pre-exit window is non-empty");
@@ -11983,7 +11985,7 @@ mod paced_exit_race_tests {
         // (echo off), so the attach target is frame 2 and the first
         // page (one frame per page) leaves frame 2 for the racing
         // credit's drive.
-        harness.step("pad", "PAD-STEP").await;
+        harness.step("pad", "PAD-STEP-0").await;
         let target = harness.head();
         assert_eq!(target, 2, "one pad step adds exactly one frame (echo off)");
         let start = harness.attach_paced(0);
@@ -12218,7 +12220,7 @@ mod paced_exit_race_tests {
             1,
             "the ECHO-OFF banner is the ring's frame 1"
         );
-        harness.step("pad", "PAD-STEP").await;
+        harness.step("pad", "PAD-STEP-0").await;
         assert_eq!(
             harness.head(),
             2,
