@@ -402,15 +402,17 @@ async fn run_loop(
     // registry-side deferrals die with the subscribers remove_connection
     // sweeps), a detach cancels one, a re-attach replaces it.
     let mut paced_sessions = crate::paced_replay::PacedSessions::default();
-    // Round-2 finding F1: the connection's staged-exit routing. A natural
-    // exit while a paced session's deferral is armed STAGES the exit
-    // registry-side (final output first) and fires the per-subscriber
-    // notify hook; this channel carries the event back to THIS loop, whose
-    // select arm moves the connection's session into the exit-drain (the
-    // existing off-dispatch, reserve-then-admit machinery, target = the
-    // fixed head at exit). Unbounded mpsc: the sender lives on registry
-    // subscribers and fires at most once per subscriber; the drain
-    // stamps a hard bound on the staged window itself.
+    // Round-2 finding F1 + E2R1 finding 1: the connection's staged-exit
+    // routing. A natural exit while a paced session's deferral is armed
+    // STAGES the exit registry-side (final output first) and fires the
+    // per-subscriber notify hook; this channel carries the event back to
+    // THIS loop, whose select arm extends the still-CREDITED session's
+    // phase through the terminal's final head — the deferred final
+    // output pages ONLY on continuation credits, and the session's
+    // completing verdict delivers the staged exit (no uncredited dump).
+    // Unbounded mpsc: the sender lives on registry subscribers and fires
+    // at most once per subscriber; the credited session bounds the
+    // staged window itself.
     let (paced_exit_tx, mut paced_exit_rx) = mpsc::unbounded_channel::<(String, i64)>();
     let paced_exit_notify: Option<freshell_terminal::PacedExitNotify> = paced_terminal_replay_v1
         .then(|| {
@@ -601,37 +603,65 @@ async fn run_loop(
                     _ => {}
                 }
             }
-            // Round-2 finding F1: a terminal with THIS connection's active
-            // paced session exited naturally while its deferral was armed —
-            // the registry STAGED the exit behind the still-deferred final
-            // output and fired the notify hook. Move the session into the
-            // EXIT-DRAIN: the existing off-dispatch, reserve-then-admit
-            // machinery pages the deferred range toward the fixed head at
-            // exit, and the completing verdict delivers the staged exit in
-            // the same lock hold, ordered after the final pages
-            // (plan:190 sequenced exit delivery). When the terminal's
-            // session is NOT in the credited table, a drain task already
-            // owns it (its completing verdict delivers the staged exit) or
-            // the session already completed before the exit (the exit was
-            // delivered at staging) — nothing to do here.
+            // E2R1 finding 1: a natural exit must SEQUENCE behind the
+            // session's normal CREDITED completion — the pacing contract
+            // pinned at the exit boundary. A session still in its
+            // credited phase STAYS ARMED: the credited phase extends
+            // ONCE through the terminal's final head (the head is frozen
+            // by the exit), the deferred final output pages ONLY on the
+            // client's continuation credits, and the session's
+            // completing verdict (the drain's CaughtUp hold) delivers
+            // the staged exit after the last page. A client that
+            // withholds credits receives no further pages and no exit
+            // until it credits; a dead connection ends the wait naturally
+            // (keepalive termination). No uncredited dump, under any
+            // name.
             Some((terminal_id, exit_code)) = paced_exit_rx.recv() => {
-                if let Some(session) = paced_sessions.remove(&terminal_id) {
-                    tracing::info!(
-                        terminal_id = %terminal_id,
-                        attach_request_id = %session.attach_request_id,
-                        exit_code,
-                        "ws.restore.paced_exit_drain"
-                    );
-                    let page_budget = session.page_budget;
-                    crate::paced_replay::spawn_paced_drain(
-                        state.registry.clone(),
-                        conn_id,
-                        ws_tx.clone(),
-                        Arc::clone(&conn_sink),
-                        session,
-                        page_budget,
-                        create_cancel_rx.clone(),
-                    );
+                let mut deliver_now = false;
+                if let Some(session) = paced_sessions.get_mut(&terminal_id) {
+                    if session.exit_head.is_none() {
+                        if let Some(bounds) = state.registry.replay_bounds(&terminal_id) {
+                            session.arm_staged_exit(bounds.head_seq);
+                            tracing::info!(
+                                terminal_id = %terminal_id,
+                                attach_request_id = %session.attach_request_id,
+                                exit_code,
+                                exit_head = bounds.head_seq,
+                                "ws.restore.paced_exit_armed"
+                            );
+                            // The extended phase is ALREADY complete and
+                            // the client owes no credit (nothing
+                            // outstanding): no credit can ever arrive, so
+                            // the exit delivers NOW through the empty
+                            // drain's CaughtUp hold (the reservation is
+                            // released unused — zero uncredited pages).
+                            deliver_now = session.credited == session.page_end
+                                && session.page_end >= session.phase_target();
+                        }
+                        // No bounds: the terminal is gone; the session
+                        // reports Gone on its next credit.
+                    }
+                    // exit_head already set: a credit raced ahead of this
+                    // notify and armed the extension — the armed session
+                    // pages on credits; nothing more to do here.
+                }
+                // A session NOT in the credited table is owned by its
+                // drain task (its completing verdict delivers the staged
+                // exit) or already completed (the exit was delivered at
+                // staging, the non-paced shape) — nothing to do.
+                if deliver_now {
+                    if let Some(session) = paced_sessions.remove(&terminal_id) {
+                        let page_budget = session.page_budget;
+                        crate::paced_replay::spawn_paced_drain(
+                            state.registry.clone(),
+                            conn_id,
+                            ws_tx.clone(),
+                            Arc::clone(&conn_sink),
+                            session,
+                            page_budget,
+                            create_cancel_rx.clone(),
+                        );
+                    }
                 }
             }
             _ = catastrophic_ticker.tick() => {
@@ -7298,25 +7328,56 @@ fn handle_replay_credit(
     // recorded on the session at attach) sizes the credited pages — the
     // whole session honors the requested bound, not just the first page.
     let budget = session.page_budget;
+    let mut exit_armed_stays_credited = false;
     match crate::paced_replay::drive_session(&state.registry, conn_id, conn_sink, session, budget) {
         DriveOutcome::Active => {}
         DriveOutcome::DrainReady => {
-            // The credited replay covered its fixed target: the session
-            // leaves the credited phase and moves WHOLE into the spawned
-            // drain task — the connection dispatcher stays free (input,
-            // other panes, controls) while the un-credited drain pages,
-            // and credits that arrive during the drain are inert stale
-            // generations (the drain is un-credited).
-            if let Some(session) = paced_sessions.remove(&replay_credit.terminal_id) {
-                crate::paced_replay::spawn_paced_drain(
-                    state.registry.clone(),
-                    conn_id,
-                    writer.clone(),
-                    Arc::clone(conn_sink),
-                    session,
-                    budget,
-                    cancel.clone(),
-                );
+            // E2R1 finding 1 (race close): a natural exit may have staged
+            // between this credit and the notify's dispatch — the REGISTRY
+            // is the authority (staging happens under the terminal lock,
+            // before the notify fires), so a still-credited session with a
+            // staged exit STAYS ARMED: the credited phase extends once
+            // through the terminal's final head and the deferred final
+            // output pages ONLY on credits. An Accepted credit has already
+            // consumed the outstanding page (credited == page_end), so the
+            // extended phase either leaves pages to produce (stay armed)
+            // or is complete (the empty drain below delivers the staged
+            // exit through its CaughtUp hold — zero uncredited pages).
+            if session.exit_head.is_none()
+                && state
+                    .registry
+                    .staged_paced_exit(&replay_credit.terminal_id, conn_id)
+                    .is_some()
+            {
+                if let Some(bounds) = state.registry.replay_bounds(&replay_credit.terminal_id) {
+                    session.arm_staged_exit(bounds.head_seq);
+                    if session.page_end < session.phase_target() {
+                        exit_armed_stays_credited = true;
+                    }
+                }
+                // No bounds: the terminal is gone — fall through to the
+                // drain, which reports Gone.
+            }
+            if !exit_armed_stays_credited {
+                // The credited phase covered its target (and any staged
+                // exit is delivered by the drain's completing verdict, or
+                // there is none): the session leaves the credited phase
+                // and moves WHOLE into the spawned drain task — the
+                // connection dispatcher stays free (input, other panes,
+                // controls) while the un-credited drain pages, and
+                // credits that arrive during the drain are inert stale
+                // generations (the drain is un-credited).
+                if let Some(session) = paced_sessions.remove(&replay_credit.terminal_id) {
+                    crate::paced_replay::spawn_paced_drain(
+                        state.registry.clone(),
+                        conn_id,
+                        writer.clone(),
+                        Arc::clone(conn_sink),
+                        session,
+                        budget,
+                        cancel.clone(),
+                    );
+                }
             }
         }
         DriveOutcome::Gone => {

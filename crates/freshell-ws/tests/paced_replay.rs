@@ -3708,14 +3708,18 @@ async fn mixed_negotiated_and_legacy_attachments_converge_without_cross_talk() {
     );
 }
 
-/// Round-2 finding F1 (Major): a terminal that produces final output and
-/// exits NATURALLY mid-restore must have its deferred output paged to the
-/// client BEFORE `terminal.exit` — the exit is the LAST frame for the
-/// terminal, and the final marker line produced past the attach target is
-/// delivered, not stranded in the ring. Before the fix, the exit hook sank
-/// terminal.exit immediately and cleared every subscriber, so output
-/// ingested after the attach target stayed only in the ring: page reads
-/// returned Gone and the client's exit handler rejected late frames.
+/// E2R1 finding 1 (a) + finding 4: a natural exit mid-restore sequences
+/// behind the session's normal CREDITED completion — and the ordering is
+/// asserted over the FULL frame stream. A CREDITING client drives the
+/// whole deferred range one page per credit in ascending order, and
+/// terminal.exit is the LAST frame: exactly one exit, every output frame
+/// (and the final marker produced past the attach target) precedes it,
+/// and NOTHING follows it — the test keeps reading for a deterministic
+/// quiet window after the exit and any frame that arrived would fail the
+/// asserts. (The old test broke on the FIRST exit, so its output arm
+/// could never observe a post-exit frame — the stated claim was
+/// unproven. The pre-fix behavior this replaces: the exit-drain removed
+/// the still-credited session and dumped its whole window uncredited.)
 #[tokio::test]
 async fn natural_exit_mid_restore_sequences_final_output_before_terminal_exit() {
     let ring = 512 * 1024;
@@ -3725,21 +3729,21 @@ async fn natural_exit_mid_restore_sequences_final_output_before_terminal_exit() 
     let terminal_id = create_shell_terminal(&mut driver, "create-exit-mid-restore").await;
     flood_until_complete(&url, &mut driver, &terminal_id, 700).await;
 
-    // Negotiate a paced attach and do NOT credit: the session sits in the
-    // credited phase, its deferral armed, with the replay window still
-    // open when the shell exits.
+    // Negotiate a paced attach and do NOT credit yet: the session sits
+    // in the credited phase, its deferral armed, with the replay window
+    // still open when the shell exits.
     let mut paced = connect(&url).await;
     hello(&mut paced, true).await;
     let (ready, page1) = paced_attach_first_page(&mut paced, &terminal_id, "attach-exit").await;
     let head = ready["headSeq"].as_i64().expect("headSeq");
-    let last_seq = page1
+    let mut credited = page1
         .iter()
         .map(|f| f["seqEnd"].as_i64().unwrap_or(0))
         .max()
         .expect("first page frames");
     assert!(
-        last_seq < head,
-        "the session is mid-restore when the shell exits (page end {last_seq}, head {head})"
+        credited < head,
+        "the session is mid-restore when the shell exits (page end {credited}, head {head})"
     );
 
     // The shell produces one FINAL marker line and exits naturally. The
@@ -3751,47 +3755,367 @@ async fn natural_exit_mid_restore_sequences_final_output_before_terminal_exit() 
     )
     .await;
 
-    // THE ORDERING: read until terminal.exit. No output frame may follow
-    // the exit, and the final marker must have arrived BEFORE it (the
-    // deferred range — the rest of the credited window, the command echo,
-    // and the marker — pages first; the exit rides the completing hold).
+    // The client already consumed the first page before the exit — its
+    // continuation credit is due NOW. From here the flow is pure
+    // credit-pacing: each credit grants the next page through the whole
+    // deferred range, and the exit sequences behind the credited
+    // completion.
+    credit(&mut paced, &terminal_id, "attach-exit", credited).await;
+
+    // Collect EVERY frame until a deterministic quiet window closes AFTER
+    // the exit (finding 4: the ordering is asserted over the FULL frame
+    // stream — the old test broke on the first exit, so its output arm
+    // could never observe a post-exit frame).
     let mut saw_exit = false;
+    let mut exits = 0usize;
     let mut acc = String::new();
+    let mut seqs: Vec<i64> = Vec::new();
     let mut output_frames = 0usize;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
-        let Some(value) = next_json_or_timeout(&mut paced, Duration::from_secs(5)).await else {
-            break;
+        let window = if saw_exit {
+            Duration::from_millis(750)
+        } else {
+            Duration::from_secs(5)
+        };
+        let Some(value) = next_json_or_timeout(&mut paced, window).await else {
+            if saw_exit {
+                break; // quiet AFTER the exit: the stream is provably complete
+            }
+            continue;
         };
         match value.get("type").and_then(|v| v.as_str()) {
             Some("terminal.output") => {
                 assert!(!saw_exit, "no output may follow terminal.exit: {value}");
+                seqs.push(value["seqStart"].as_i64().unwrap_or(0));
                 if let Some(data) = value.get("data").and_then(|v| v.as_str()) {
                     acc.push_str(data);
                 }
                 output_frames += 1;
+                let end = value["seqEnd"].as_i64().unwrap_or(0);
+                if end > credited {
+                    credited = end;
+                    credit(&mut paced, &terminal_id, "attach-exit", end).await;
+                }
             }
             Some("terminal.exit") => {
                 saw_exit = true;
+                exits += 1;
+                assert_eq!(
+                    exits, 1,
+                    "exactly one terminal.exit may ever arrive: {value}"
+                );
             }
             _ => {}
-        }
-        if saw_exit {
-            break;
         }
     }
     assert!(
         saw_exit,
-        "terminal.exit must arrive (the staged exit drains)"
+        "terminal.exit must arrive — the staged exit delivers at the session's \
+         CREDITED completion (pages flow only on credits)"
     );
     assert!(
         acc.contains("FINAL-MARKER"),
         "the deferred final output is delivered before the exit (got {output_frames} frames)"
     );
-    // The exit-drain actually paged the deferred range (not an empty
-    // hand-off): the pre-exit burst included the remaining window.
     assert!(
         output_frames > 1,
-        "the exit-drain paged the deferred range before the exit ({output_frames} frames)"
+        "the deferred range paged before the exit ({output_frames} frames)"
     );
+    let mut sorted = seqs.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        seqs, sorted,
+        "every delivered frame precedes the exit in ascending seq order"
+    );
+    // exit is the LAST frame: the loop only breaks on a quiet window
+    // AFTER the exit — any frame that arrived in it failed the asserts
+    // above, so reaching here proves nothing followed the exit.
+}
+
+/// E2R1 finding 1 (b): the pacing contract PINNED at the exit boundary.
+/// A client that WITHHOLDS credits after a natural exit mid-restore
+/// receives NO further pages and NO exit — asserted as absence over a
+/// deterministic window — and the flow RESUMES on the next credit (the
+/// deferred final output pages only on credits, and the exit sequences
+/// behind the session's credited completion). The pre-fix behavior this
+/// guards against: the exit-drain removed the still-credited session and
+/// dumped its whole window (plus the exit) uncredited, as fast as the
+/// socket accepted it.
+#[tokio::test]
+async fn natural_exit_mid_restore_withholding_client_gets_no_pages_and_no_exit_until_it_credits() {
+    let ring = 512 * 1024;
+    let url = spawn_server(ring).await;
+    let mut driver = connect(&url).await;
+    hello(&mut driver, false).await;
+    let terminal_id = create_shell_terminal(&mut driver, "create-exit-withhold").await;
+    flood_until_complete(&url, &mut driver, &terminal_id, 700).await;
+
+    // Negotiate a paced attach and do NOT credit: the session sits in
+    // the credited phase, its deferral armed, mid-restore.
+    let mut paced = connect(&url).await;
+    hello(&mut paced, true).await;
+    let (ready, page1) =
+        paced_attach_first_page(&mut paced, &terminal_id, "attach-exit-hold").await;
+    let head = ready["headSeq"].as_i64().expect("headSeq");
+    let mut credited = page1
+        .iter()
+        .map(|f| f["seqEnd"].as_i64().unwrap_or(0))
+        .max()
+        .expect("first page frames");
+    assert!(
+        credited < head,
+        "the session is mid-restore when the shell exits"
+    );
+
+    // The shell produces one FINAL marker line and exits naturally.
+    send_input(
+        &mut paced,
+        &terminal_id,
+        "printf '\\106\\111\\116\\101\\114\\055\\115\\101\\122\\113\\105\\122\\012'; exit\n",
+    )
+    .await;
+
+    // THE WITHHOLD: no credits. Over a deterministic window, NOTHING may
+    // arrive — no page, no gap, no exit. (Give the exit a moment to
+    // stage, then hold: the window covers both.)
+    let hold_deadline = tokio::time::Instant::now() + Duration::from_millis(2_000);
+    while tokio::time::Instant::now() < hold_deadline {
+        let Some(value) = next_json_or_timeout(&mut paced, Duration::from_millis(250)).await else {
+            continue;
+        };
+        match value.get("type").and_then(|v| v.as_str()) {
+            Some("terminal.output") => panic!(
+                "no page may flow while the client withholds credits \
+                 (the deferred final output pages ONLY on credits): {value}"
+            ),
+            Some("terminal.output.gap") => {
+                panic!("no gap may flow while the client withholds credits: {value}")
+            }
+            Some("terminal.exit") => panic!(
+                "no exit may arrive while pages remain undelivered — the exit \
+                 sequences behind the session's CREDITED completion: {value}"
+            ),
+            _ => {}
+        }
+    }
+
+    // RESUME ON CREDIT: the first credit pages the deferred range, and
+    // the flow converges — the marker, then the exit LAST (the same
+    // full-stream ordering as the crediting case).
+    credit(&mut paced, &terminal_id, "attach-exit-hold", credited).await;
+    let mut saw_exit = false;
+    let mut exits = 0usize;
+    let mut acc = String::new();
+    let mut seqs: Vec<i64> = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        let window = if saw_exit {
+            Duration::from_millis(750)
+        } else {
+            Duration::from_secs(5)
+        };
+        let Some(value) = next_json_or_timeout(&mut paced, window).await else {
+            if saw_exit {
+                break;
+            }
+            continue;
+        };
+        match value.get("type").and_then(|v| v.as_str()) {
+            Some("terminal.output") => {
+                assert!(!saw_exit, "no output may follow terminal.exit: {value}");
+                seqs.push(value["seqStart"].as_i64().unwrap_or(0));
+                if let Some(data) = value.get("data").and_then(|v| v.as_str()) {
+                    acc.push_str(data);
+                }
+                let end = value["seqEnd"].as_i64().unwrap_or(0);
+                if end > credited {
+                    credited = end;
+                    credit(&mut paced, &terminal_id, "attach-exit-hold", end).await;
+                }
+            }
+            Some("terminal.exit") => {
+                saw_exit = true;
+                exits += 1;
+                assert_eq!(exits, 1, "exactly one terminal.exit: {value}");
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_exit,
+        "the flow resumes on credit and the exit arrives last"
+    );
+    assert!(
+        acc.contains("FINAL-MARKER"),
+        "the deferred final output resumed on credit and was delivered"
+    );
+    let mut sorted = seqs.clone();
+    sorted.sort_unstable();
+    assert_eq!(seqs, sorted, "the resumed pages ascend");
+}
+
+/// E2R1 finding 1 (c): retention expiry while the exit-staged session
+/// WAITS on credits. The ring's front evicts the credited window's next
+/// needed frames while the client withholds; the client's next credit
+/// reports the EXACT bounds-carrying gap, the continuation pages only on
+/// credits through the retained window, and the exit is the LAST frame.
+#[tokio::test]
+async fn natural_exit_mid_restore_retention_expiry_reports_the_exact_gap_then_exit() {
+    // Small ring so a withheld session loses its middle to eviction.
+    let ring = 12 * 1024;
+    let url = spawn_server(ring).await;
+    let mut driver = connect(&url).await;
+    hello(&mut driver, false).await;
+    let terminal_id = create_shell_terminal(&mut driver, "create-exit-expiry").await;
+    flood_until_complete(&url, &mut driver, &terminal_id, 100).await;
+
+    // Negotiate a paced attach and do NOT credit: the session sits in
+    // the credited phase, mid-restore.
+    let mut paced = connect(&url).await;
+    hello(&mut paced, true).await;
+    let (ready, page1) = paced_attach_first_page(&mut paced, &terminal_id, "attach-exit-exp").await;
+    let head = ready["headSeq"].as_i64().expect("headSeq");
+    let credited = page1
+        .iter()
+        .map(|f| f["seqEnd"].as_i64().unwrap_or(0))
+        .max()
+        .expect("first page frames");
+    assert!(
+        credited < head,
+        "the session is mid-restore when the ring churns"
+    );
+
+    // Evict the middle of the replay window while the client withholds
+    // (the evictor attaches non-negotiated and observes its own flood's
+    // completion deterministically).
+    let mut evictor = connect(&url).await;
+    hello(&mut evictor, false).await;
+    attach(&mut evictor, &terminal_id, "attach-exit-evictor").await;
+    let marker2 = "FLOOD-DONE-MARKER";
+    send_input(&mut evictor, &terminal_id, &flood_command(400, marker2)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let (evictor_acc, _) = drain_until_marker(&mut evictor, marker2, deadline).await;
+    assert!(
+        evictor_acc.contains(marker2),
+        "the evicting flood completes"
+    );
+    drop(evictor);
+
+    // The shell now produces one FINAL marker line and exits naturally,
+    // staging the exit behind the still-armed session. The exit must
+    // NOT deliver anything while the client withholds.
+    send_input(
+        &mut paced,
+        &terminal_id,
+        "printf '\\106\\111\\116\\101\\114\\062\\055\\115\\101\\122\\113\\105\\122\\012'; exit\n",
+    )
+    .await;
+    let hold_deadline = tokio::time::Instant::now() + Duration::from_millis(1_500);
+    while tokio::time::Instant::now() < hold_deadline {
+        let Some(value) = next_json_or_timeout(&mut paced, Duration::from_millis(250)).await else {
+            continue;
+        };
+        match value.get("type").and_then(|v| v.as_str()) {
+            Some("terminal.output") | Some("terminal.output.gap") | Some("terminal.exit") => {
+                panic!(
+                    "nothing may flow while the client withholds credits — the exact \
+                 gap reports only on the next credit: {value}"
+                )
+            }
+            _ => {}
+        }
+    }
+
+    // THE CREDIT: the next needed frames were evicted, so the drive's
+    // FIRST product is the EXACT negotiated gap — never a silent
+    // forward jump — and the continuation then pages from the ring
+    // front on credits, to the marker and the exit LAST.
+    credit(&mut paced, &terminal_id, "attach-exit-exp", credited).await;
+    let gap = next_json_or_timeout(&mut paced, Duration::from_secs(5))
+        .await
+        .expect("the credit reports the retention gap");
+    assert_eq!(
+        gap.get("type").and_then(|v| v.as_str()),
+        Some("terminal.output.gap"),
+        "the credit's first product is the exact retention gap: {gap}"
+    );
+    assert_eq!(
+        gap["reason"], "replay_window_exceeded",
+        "the gap names retention loss: {gap}"
+    );
+    assert_eq!(
+        gap["fromSeq"].as_i64(),
+        Some(credited + 1),
+        "the lost interval starts at the credited cursor+1: {gap}"
+    );
+    let gap_oldest = gap["oldestRetainedSeq"]
+        .as_i64()
+        .expect("oldestRetainedSeq");
+    assert_eq!(
+        gap["toSeq"].as_i64(),
+        Some(gap_oldest - 1),
+        "the lost interval ends just before the new ring front: {gap}"
+    );
+    assert_eq!(gap["attachRequestId"], "attach-exit-exp");
+
+    // Continuation on credits: the pages start at the ring front, the
+    // final marker is delivered, and the exit is the LAST frame (the
+    // full-stream ordering).
+    let mut saw_exit = false;
+    let mut exits = 0usize;
+    let mut acc = String::new();
+    let mut seqs: Vec<i64> = Vec::new();
+    let mut continued = credited.max(gap_oldest - 1);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while tokio::time::Instant::now() < deadline {
+        let window = if saw_exit {
+            Duration::from_millis(750)
+        } else {
+            Duration::from_secs(5)
+        };
+        let Some(value) = next_json_or_timeout(&mut paced, window).await else {
+            if saw_exit {
+                break;
+            }
+            continue;
+        };
+        match value.get("type").and_then(|v| v.as_str()) {
+            Some("terminal.output") => {
+                assert!(!saw_exit, "no output may follow terminal.exit: {value}");
+                let start = value["seqStart"].as_i64().unwrap_or(0);
+                assert!(
+                    start >= gap_oldest,
+                    "the continuation starts at the new baseline (ring front \
+                     {gap_oldest}), got seq {start}"
+                );
+                seqs.push(start);
+                if let Some(data) = value.get("data").and_then(|v| v.as_str()) {
+                    acc.push_str(data);
+                }
+                let end = value["seqEnd"].as_i64().unwrap_or(0);
+                if end > continued {
+                    continued = end;
+                    credit(&mut paced, &terminal_id, "attach-exit-exp", end).await;
+                }
+            }
+            Some("terminal.exit") => {
+                saw_exit = true;
+                exits += 1;
+                assert_eq!(exits, 1, "exactly one terminal.exit: {value}");
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_exit,
+        "the exact gap is followed by the continuation and the exit arrives last"
+    );
+    assert!(
+        acc.contains("FINAL2-MARKER"),
+        "the retained window pages through the final marker on credits"
+    );
+    let mut sorted = seqs.clone();
+    sorted.sort_unstable();
+    assert_eq!(seqs, sorted, "the continuation pages ascend");
 }

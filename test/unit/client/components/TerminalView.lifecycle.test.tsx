@@ -13596,11 +13596,14 @@ describe('TerminalView lifecycle updates', () => {
       expect(layout?.type === 'leaf' && layout.content.kind === 'terminal' && layout.content.terminalId).toBeUndefined()
     })
 
-    // Delta round-2 finding F1, the ORDERED complement of the safety case
-    // above: when the SERVER sequences the deferred final output before
-    // terminal.exit (the natural-exit fix pages the deferred range and only
-    // then delivers the exit), the client must render every final frame and
-    // only then fold the exit — no frame lost to the exit boundary.
+    // Delta round-2 finding F1 + focused E2R1 finding 1, the ORDERED
+    // complement of the safety case above: when the SERVER sequences the
+    // deferred final output before terminal.exit (the natural-exit fix
+    // pages the deferred range ONLY on continuation credits and delivers
+    // the exit after the session's credited completion — the wire here
+    // models that ordered stream), the client must render every final
+    // frame and only then fold the exit — no frame lost to the exit
+    // boundary, exit last.
     it('an ordered exit mid-replay renders the final output before the exit folds', async () => {
       const { store, tabId, terminalId, term } = await setupPacedPane({ suffix: 'ordered-exit' })
 
@@ -13638,10 +13641,10 @@ describe('TerminalView lifecycle updates', () => {
       expect(finalAt).toBeGreaterThan(preAt)
 
       // The exit folded AFTER the final output: exited status, identity
-      // released. The client credited each page as it consumed it (the
-      // exit does not retract credit for already-consumed pages — the
-      // server treats the post-exit credits as inert stale generations),
-      // and nothing credits after the fold.
+      // released. Under the server's credited-exit contract the client's
+      // page-end credits DRIVE the deferred pages (the server sequences
+      // the exit behind them), so every consumed page is credited and
+      // nothing credits after the fold (no page follows the exit).
       const layout = store.getState().panes.layouts[tabId]
       expect(layout?.type === 'leaf' && layout.content.kind === 'terminal' && layout.content.status).toBe('exited')
       expect(layout?.type === 'leaf' && layout.content.kind === 'terminal' && layout.content.terminalId).toBeUndefined()

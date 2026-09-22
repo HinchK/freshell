@@ -90,11 +90,43 @@ pub(crate) struct PacedSession {
     /// recorded at attach — credits, the tail drain, and the exit drain
     /// all page at this SAME bound; nothing re-reads the registry cap.
     pub page_budget: i64,
+    /// E2R1 finding 1: when the terminal EXITS NATURALLY while this
+    /// session is still in its credited phase, the registry STAGES the
+    /// exit on the subscriber and the credited phase extends ONCE
+    /// through the terminal's final head — captured at the staging (the
+    /// head is frozen by the exit; there is no moving-head chase). The
+    /// deferred final output then pages ONLY on the client's
+    /// continuation credits, and the session's completing verdict (the
+    /// drain's CaughtUp hold) delivers the staged exit after the last
+    /// page. `None` while the terminal lives: the ordinary fixed-target
+    /// semantics (frames past the target are tail delivery).
+    pub exit_head: Option<i64>,
     /// Pages produced so far (observability).
     pub pages: u64,
 }
 
 impl PacedSession {
+    /// The credited phase's paging target: the fixed attach-time head,
+    /// extended once through the terminal's final head when a staged
+    /// exit armed the extension.
+    pub(crate) fn phase_target(&self) -> i64 {
+        match self.exit_head {
+            Some(exit_head) => self.target.max(exit_head),
+            None => self.target,
+        }
+    }
+
+    /// Arm the staged-exit extension (idempotent, monotone): the
+    /// terminal's final head becomes part of the credited phase's
+    /// paging target, so the deferred final output pages only on
+    /// credits.
+    pub(crate) fn arm_staged_exit(&mut self, exit_head: i64) {
+        self.exit_head = Some(match self.exit_head {
+            Some(armed) => armed.max(exit_head),
+            None => exit_head,
+        });
+    }
+
     /// Adopt the registry's attach-time session description (the first page
     /// was produced under the attach lock and is sunk by the caller).
     pub(crate) fn from_desc(desc: PacedSessionDesc) -> Self {
@@ -108,6 +140,7 @@ impl PacedSession {
             credited: desc.effective_since,
             page_end: desc.page_end,
             page_budget: desc.page_budget,
+            exit_head: None,
             pages: u64::from(started),
         }
     }
@@ -259,6 +292,14 @@ pub(crate) enum DriveOutcome {
 /// advance past the drain cursor reports the exact bounds-carrying gap
 /// and resumes from the ring front so live frames can neither jump the
 /// pages nor be lost.
+///
+/// E2R1 finding 1: the replay phase pages toward the session's PHASE
+/// TARGET — the fixed attach-time head, extended once through the
+/// terminal's final head when a natural exit staged behind the
+/// still-armed session (see [`PacedSession::exit_head`]). The deferred
+/// final output therefore pages ONLY on the client's continuation
+/// credits, and the exit sequences behind the session's credited
+/// completion.
 pub(crate) fn drive_session(
     registry: &TerminalRegistry,
     conn_id: u64,
@@ -266,14 +307,15 @@ pub(crate) fn drive_session(
     session: &mut PacedSession,
     budget: i64,
 ) -> DriveOutcome {
-    // Replay phase: page (target, ...] toward the fixed target.
-    if session.page_end < session.target {
+    // Replay phase: page (page_end, ...] toward the phase target.
+    let phase_target = session.phase_target();
+    if session.page_end < phase_target {
         loop {
             match registry.next_replay_page(
                 &session.terminal_id,
                 conn_id,
                 session.page_end,
-                session.target,
+                phase_target,
                 budget,
             ) {
                 PacedPage::Frames {
@@ -284,10 +326,10 @@ pub(crate) fn drive_session(
                     }
                     session.page_end = end_seq;
                     session.pages += 1;
-                    if session.page_end < session.target {
+                    if session.page_end < phase_target {
                         return DriveOutcome::Active;
                     }
-                    break; // cursor reached the target -> tail
+                    break; // cursor reached the phase target -> tail
                 }
                 PacedPage::Done => break,
                 PacedPage::Expired {
@@ -685,15 +727,48 @@ pub(crate) fn start_session(
                 sessions.insert(session);
             }
             DriveOutcome::DrainReady => {
-                spawn_paced_drain(
-                    registry.clone(),
-                    conn_id,
-                    writer,
-                    Arc::clone(sink),
-                    session,
-                    budget,
-                    cancel,
-                );
+                // E2R1 finding 1 (the attach-time race close): a natural
+                // exit may have staged between the attach and this drive —
+                // the REGISTRY is the authority (staging happens under the
+                // terminal lock, before the notify's dispatch), so a
+                // still-credited session with a staged exit STAYS ARMED:
+                // the credited phase extends once through the terminal's
+                // final head and the deferred final output pages ONLY on
+                // credits. Only a session with NO staged exit hands off to
+                // the uncredited tail drain.
+                let mut stays_armed = false;
+                if session.exit_head.is_none()
+                    && registry
+                        .staged_paced_exit(&session.terminal_id, conn_id)
+                        .is_some()
+                {
+                    if let Some(bounds) = registry.replay_bounds(&session.terminal_id) {
+                        session.arm_staged_exit(bounds.head_seq);
+                        // The extended phase is complete AND the client
+                        // owes no credit (an empty first page): the exit
+                        // delivers now through the empty drain's CaughtUp
+                        // hold — no credit can ever arrive. Otherwise the
+                        // session stays armed; the exit waits for the
+                        // credited completion.
+                        stays_armed = session.page_end < session.phase_target()
+                            || session.credited < session.page_end;
+                    }
+                    // No bounds: the terminal is gone — fall through to
+                    // the drain, which reports Gone.
+                }
+                if stays_armed {
+                    sessions.insert(session);
+                } else {
+                    spawn_paced_drain(
+                        registry.clone(),
+                        conn_id,
+                        writer,
+                        Arc::clone(sink),
+                        session,
+                        budget,
+                        cancel,
+                    );
+                }
             }
             DriveOutcome::Gone => {}
         }
@@ -717,8 +792,44 @@ mod tests {
             credited: 10,
             page_end: 50,
             page_budget: 4096,
+            exit_head: None,
             pages: 1,
         }
+    }
+
+    #[test]
+    fn staged_exit_extends_the_credited_phase_once_and_monotonically() {
+        // E2R1 finding 1: a natural exit behind a still-credited session
+        // extends the credited phase's paging target ONCE through the
+        // terminal's final head — the deferred final output pages only
+        // on credits. The extension is idempotent and monotone (a credit
+        // that raced ahead of the notify must not shrink or duplicate
+        // it), and while no exit is staged the phase target stays the
+        // ordinary fixed attach-time head.
+        let mut session = session_fixture();
+        assert_eq!(
+            session.phase_target(),
+            100,
+            "no staged exit: the phase target is the fixed attach-time head"
+        );
+        session.arm_staged_exit(140);
+        assert_eq!(
+            session.phase_target(),
+            140,
+            "the staged exit extends the phase target to the terminal's final head"
+        );
+        session.arm_staged_exit(120);
+        assert_eq!(
+            session.phase_target(),
+            140,
+            "a stale re-arm never shrinks the extension (monotone)"
+        );
+        session.arm_staged_exit(160);
+        assert_eq!(
+            session.phase_target(),
+            160,
+            "only the terminal's frozen head moves it — and it is frozen by death"
+        );
     }
 
     fn credit(arid: &str, consumed_seq: i64) -> TerminalReplayCredit {

@@ -1504,6 +1504,30 @@ impl TerminalRegistry {
         self.paced_page_max_bytes.load(Ordering::Relaxed)
     }
 
+    /// E2R1 finding 1: the staged natural-exit code for one paced
+    /// subscriber — `Some(code)` when the terminal exited naturally
+    /// while THIS subscriber's paced deferral was still armed
+    /// ([`Self::finish_pty_exit`] staged the exit instead of delivering
+    /// it). The STAGING is the authority for the ws layer's
+    /// exit-sequencing decisions: it happens under this terminal's lock
+    /// BEFORE the connection's notify hook fires, so a query anywhere
+    /// after that point observes it regardless of the notify's dispatch
+    /// order. `None` when the terminal is gone, the subscriber is gone,
+    /// or no exit is staged.
+    pub fn staged_paced_exit(&self, terminal_id: &str, conn_id: u64) -> Option<i64> {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|handle| Arc::clone(&handle.shared))?
+        };
+        let s = shared.lock().expect("terminal lock");
+        s.subscribers
+            .get(&conn_id)
+            .and_then(|sub| sub.paced_exit_pending)
+    }
+
     /// The EFFECTIVE page budget for one paced attach (round-2 finding
     /// F3): the negotiated `replayPageBytes` request honored as an
     /// optional UPPER BOUND clamped to the registry's own cap —
@@ -5701,18 +5725,10 @@ mod tests {
         /// Round-2 finding F1 test seam: this subscriber's staged exit
         /// code, if a natural exit staged one behind an armed deferral
         /// (None when the subscriber is gone or nothing is staged).
+        /// Delegates to the real accessor the ws layer sequences on
+        /// (E2R1 finding 1's [`TerminalRegistry::staged_paced_exit`]).
         fn paced_exit_pending_of(&self, terminal_id: &str, conn_id: u64) -> Option<i64> {
-            let shared = {
-                let inner = self.inner.lock().expect("registry lock");
-                inner
-                    .terminals
-                    .get(terminal_id)
-                    .map(|handle| Arc::clone(&handle.shared))
-            }?;
-            let s = shared.lock().expect("terminal lock");
-            s.subscribers
-                .get(&conn_id)
-                .and_then(|sub| sub.paced_exit_pending)
+            self.staged_paced_exit(terminal_id, conn_id)
         }
 
         /// Same as [`insert_headless`](Self::insert_headless), but with an
@@ -6569,6 +6585,60 @@ mod tests {
             reg.paced_exit_pending_of("T", 1),
             None,
             "the subscriber retired with the delivered exit"
+        );
+    }
+
+    /// E2R1 finding 1: [`TerminalRegistry::staged_paced_exit`] is the
+    /// AUTHORITY the ws layer's exit-sequencing decisions query (the
+    /// staging happens under the terminal lock, before the connection's
+    /// notify hook fires — so a query anywhere after that point observes
+    /// it regardless of the notify's dispatch order). Pin its
+    /// truthfulness: None before any exit, None for unknown terminals
+    /// and connections, Some(code) once a deferred subscriber's terminal
+    /// exits naturally.
+    #[test]
+    fn staged_paced_exit_reports_the_authority_the_ws_layer_sequences_on() {
+        let reg = TerminalRegistry::new();
+        reg.set_paced_page_max_bytes(0);
+        reg.insert_headless("T", "S");
+        for seq in 1..=3 {
+            reg.feed("T", frame(seq, "history\r\n", "S"));
+        }
+        let (sink, _seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("paced-authority".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+            PacedAttachOptions::default(),
+        );
+        let _ = out.paced.expect("paced session");
+        assert_eq!(
+            reg.staged_paced_exit("T", 1),
+            None,
+            "no exit is staged while the terminal lives"
+        );
+        assert_eq!(
+            reg.staged_paced_exit("T", 2),
+            None,
+            "an unknown connection has nothing staged"
+        );
+        assert_eq!(
+            reg.staged_paced_exit("T-gone", 1),
+            None,
+            "an unknown terminal is None, not a panic"
+        );
+        assert!(reg.finish_pty_exit("T", 7), "the first exit finishes");
+        assert_eq!(
+            reg.staged_paced_exit("T", 1),
+            Some(7),
+            "the staged exit code is the ws layer's sequencing authority"
         );
     }
 
