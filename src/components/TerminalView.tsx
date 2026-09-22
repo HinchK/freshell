@@ -4714,6 +4714,35 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             return
           }
 
+          if (tid && batchDecision.implicitGaps.length > 0) {
+            // Implicit gap (responsive-terminal-restore): the batch jumped
+            // forward across sequences no gap frame declared. The seq state
+            // already folded the hole (known lost range + quarantine, the
+            // applied cursor pinned below it); surface it honestly — the
+            // generation is gap-tainted, the quarantine is observable, and
+            // a local notice names the exact lost range. Never a silent
+            // applied-cursor advance.
+            generationGapFreeRef.current = false
+            for (const implicitGap of batchDecision.implicitGaps) {
+              recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
+                terminalId: tid,
+                attachRequestId: msg.attachRequestId,
+                activeAttachRequestId: currentAttachRef.current?.requestId,
+                streamId: msg.streamId,
+                fromSeq: implicitGap.fromSeq,
+                toSeq: implicitGap.toSeq,
+                parserAppliedSeq: parserAppliedSeqRef.current,
+                highestObservedSeq: batchDecision.state.highestObservedSeq,
+                reason: 'implicit_sequence_jump',
+              })
+              writeLocalXtermNotice(
+                term,
+                `\r\n[Output gap ${implicitGap.fromSeq}-${implicitGap.toSeq}: unexplained sequence jump]\r\n`,
+              )
+            }
+            resetParserAppliedSurface(parserAppliedSeqRef.current)
+          }
+
           if (tid && batchDecision.freshReset) {
             clearTerminalCursor(tid)
             resetParserAppliedSurface()
@@ -4800,6 +4829,33 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               })
             }
             return
+          }
+
+          if (tid && frameDecision.implicitGap) {
+            // Implicit gap (responsive-terminal-restore): the frame jumped
+            // forward across sequences no gap frame declared. The seq state
+            // already folded the hole (known lost range + quarantine, the
+            // applied cursor pinned below it); surface it honestly — the
+            // generation is gap-tainted, the quarantine is observable, and
+            // a local notice names the exact lost range. Never a silent
+            // applied-cursor advance.
+            generationGapFreeRef.current = false
+            recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
+              terminalId: tid,
+              attachRequestId: msg.attachRequestId,
+              activeAttachRequestId: currentAttachRef.current?.requestId,
+              streamId: msg.streamId,
+              fromSeq: frameDecision.implicitGap.fromSeq,
+              toSeq: frameDecision.implicitGap.toSeq,
+              parserAppliedSeq: parserAppliedSeqRef.current,
+              highestObservedSeq: frameDecision.state.highestObservedSeq,
+              reason: 'implicit_sequence_jump',
+            })
+            writeLocalXtermNotice(
+              term,
+              `\r\n[Output gap ${frameDecision.implicitGap.fromSeq}-${frameDecision.implicitGap.toSeq}: unexplained sequence jump]\r\n`,
+            )
+            resetParserAppliedSurface(parserAppliedSeqRef.current)
           }
 
           if (tid && frameDecision.freshReset) {

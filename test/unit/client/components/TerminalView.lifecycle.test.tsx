@@ -9358,6 +9358,14 @@ describe('TerminalView lifecycle updates', () => {
 
       const { terminalId } = await renderTerminalHarness({ status: 'running', terminalId: 'term-v2-max-cursor' })
 
+      // Contiguous frames up to the in-memory high-water mark: an
+      // unexplained forward sequence jump is an implicit gap under the
+      // restore contract (the applied cursor pins below the hole and the
+      // reconnect correctly falls back to a full hydrate), so the
+      // in-memory sequence must be reached honestly.
+      for (let seq = 1; seq <= 8; seq += 1) {
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: seq, seqEnd: seq, data: 'x' })
+      }
       messageHandler!({ type: 'terminal.output', terminalId, seqStart: 9, seqEnd: 10, data: 'ij' })
       wsMocks.send.mockClear()
 
@@ -10373,6 +10381,69 @@ describe('TerminalView lifecycle updates', () => {
         sinceSeq: 0,
         attachRequestId: expect.any(String),
       }))
+    })
+
+    it('treats an unexplained forward sequence jump as an implicit gap, never a silent cursor advance', async () => {
+      // Restore contract (responsive-terminal-restore): an incoming frame
+      // beyond the expected next sequence, with NO gap frame received,
+      // must not silently advance the applied cursor across the missing
+      // instructions. The hole is an implicit gap: the surface is
+      // quarantined (observable, applied cursor pinned below the hole) and
+      // an honest local notice names the exact lost range. The jumped
+      // frame's real data still renders.
+      const bridge = createPerfAuditBridge()
+      installPerfAuditBridge(bridge)
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-implicit-gap',
+      })
+
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'ok' })
+      term.write.mockClear()
+
+      act(() => {
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 6, seqEnd: 8, data: 'JUMPED' })
+      })
+
+      expectTerminalWriteContaining(term, 'Output gap 2-5: unexplained sequence jump')
+      expectTerminalWriteContaining(term, 'JUMPED')
+      expect(bridge.snapshot().perfEvents).toContainEqual(expect.objectContaining({
+        event: 'terminal.catchup.surface_quarantined',
+        terminalId,
+        fromSeq: 2,
+        toSeq: 5,
+        reason: 'implicit_sequence_jump',
+      }))
+    })
+
+    it('does not flag a session start at attach.ready’s effective from-seq as an implicit gap', async () => {
+      // A ready whose replay window starts beyond the cursor is a
+      // legitimate session start (a retention-adjusted resume): the first
+      // frame AT the window's from-seq is the server-declared baseline —
+      // no implicit-gap notice, no quarantine.
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-implicit-gap-exempt',
+      })
+
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'ok' })
+      term.write.mockClear()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 30,
+          replayFromSeq: 20,
+          replayToSeq: 30,
+          attachRequestId: latestAttachRequestIdForTerminal(terminalId),
+        })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 20, seqEnd: 22, data: 'RESUMED' })
+      })
+
+      const writes = term.write.mock.calls.map(([data]) => String(data)).join('')
+      expect(writes).not.toContain('unexplained sequence jump')
+      expect(writes).toContain('RESUMED')
     })
 
     it('a negotiated queue_overflow gap initiates the bounded repair attach on the still-open connection', async () => {
