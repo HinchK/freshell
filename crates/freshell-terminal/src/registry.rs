@@ -239,6 +239,9 @@ struct TerminalShared {
     /// ticking counters, status-bar redraws) does not refresh this.
     /// Read ONLY by `enforce_idle_kills`.
     last_meaningful_activity_at: i64,
+    /// Set (epoch ms) while `enforce_stuck_detection` flags this row stuck;
+    /// cleared by the first meaningful activity. Surface-only state.
+    stuck_since: Option<i64>,
     /// Current PTY geometry + epoch (`§5.3`): epoch starts 1, +1 only on a real change after the first client geometry record.
     cols: u16,
     rows: u16,
@@ -412,6 +415,27 @@ struct RegistryInner {
 /// a [`TerminalRegistry`] is constructed but `set_auto_kill_idle_minutes`
 /// hasn't been called yet (e.g. before the boot-time settings load completes).
 const DEFAULT_AUTO_KILL_IDLE_MINUTES: i64 = 15;
+
+/// Stuck-pane detection window: an agent-mode terminal whose PTY produced no
+/// MEANINGFUL output for this long is flagged `stuck` — surfaced to the pane
+/// as the "Agent appears stuck" card, NEVER auto-killed. Attached panes are
+/// the primary class (the idle reaper deliberately exempts them,
+/// registry.rs `enforce_idle_kills`) — this sweep has NO subscribers
+/// exemption. The terminal-mode analogue of the freshcodex quiet deadman
+/// (`FRESHELL_FRESHCODEX_QUIET_WINDOW_MS`, codex.rs) but keyed on the
+/// DEV-0009 meaningful clock because a wedged agent TUI (e.g. opencode
+/// resumed onto an aborted session rendering an eternal spinner) keeps
+/// repainting: only the noise classifier distinguishes it from progress.
+/// 2h default: far above normal long-turn/LLM-thinking silence, well below
+/// the observed 2-day zombie. Seeded from FRESHELL_TERMINAL_STUCK_WINDOW_MS
+/// by freshell-server main; 0/negative disables.
+pub const DEFAULT_STUCK_WINDOW_MS: i64 = 7_200_000;
+
+/// How recent raw PTY output must be for a row to count as "still
+/// repainting". 5 minutes: far above the 30s sweep tick, generous to any
+/// degraded repaint cadence, and hours below the 2h meaningful-silence
+/// window — so the two conjuncts never fight on real wedges.
+pub const STUCK_ACTIVITY_FRESH_MS: i64 = 300_000;
 
 /// TERM-15/TERM-16 activity tap: the registry-level lifecycle events the
 /// activity hub (`freshell-ws`) subscribes to. `Created`/`Exit` fire for
@@ -613,6 +637,13 @@ pub struct TerminalRegistry {
     /// change (`set_auto_kill_idle_minutes`) is visible on the NEXT sweep
     /// without restarting the monitor.
     auto_kill_idle_minutes: Arc<AtomicI64>,
+    /// Wedge-backstop: the `enforce_stuck_detection` meaningful-idle window
+    /// (ms; [`DEFAULT_STUCK_WINDOW_MS`] is the default). Atomic like
+    /// `auto_kill_idle_minutes` so the sweep reads the live value without
+    /// the registry lock, and a live change ([`Self::set_stuck_window_ms`])
+    /// is visible on the NEXT sweep without restarting the monitor.
+    /// `0`/negative disables the sweep.
+    stuck_window_ms: Arc<AtomicI64>,
     /// `this.scrollbackMaxChars` (`terminal-registry.ts:1276`, computed by
     /// `computeScrollbackMaxChars` from `settings.terminal.scrollback`).
     /// Captured into each new terminal's `max_replay_chars` at [`Self::create`]
@@ -742,6 +773,18 @@ pub struct AttachOutcome {
 #[must_use]
 pub struct InputOutcome {
     pub found: bool,
+}
+
+/// One [`TerminalRegistry::enforce_stuck_detection`] state change: the
+/// terminal, its mode, the new stuck flag, and the sweep instant.
+/// Transitions are emitted ONLY on a false→true or true→false edge — never
+/// per sweep tick.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StuckTransition {
+    pub terminal_id: String,
+    pub mode: String,
+    pub stuck: bool,
+    pub at: i64,
 }
 
 /// Outcome of the attach-time geometry application (TERM-07;
@@ -911,6 +954,7 @@ impl TerminalRegistry {
             conn_seq: Arc::new(AtomicU64::new(1)),
             active_connections: Arc::new(AtomicI64::new(0)),
             auto_kill_idle_minutes: Arc::new(AtomicI64::new(DEFAULT_AUTO_KILL_IDLE_MINUTES)),
+            stuck_window_ms: Arc::new(AtomicI64::new(DEFAULT_STUCK_WINDOW_MS)),
             scrollback_max_bytes: Arc::new(AtomicI64::new(DEFAULT_MAX_SCROLLBACK_CHARS)),
             activity_observer: Arc::new(std::sync::RwLock::new(None)),
             respawn_liveness_window_ms: Arc::new(AtomicI64::new(
@@ -1112,6 +1156,19 @@ impl TerminalRegistry {
         self.auto_kill_idle_minutes.load(Ordering::Relaxed)
     }
 
+    /// Wedge-backstop: set the stuck-detection meaningful-idle window (ms).
+    /// `<= 0` disables the sweep (mirrors `set_auto_kill_idle_minutes`'
+    /// disable semantics); visible on the NEXT `enforce_stuck_detection`
+    /// sweep, no restart required.
+    pub fn set_stuck_window_ms(&self, ms: i64) {
+        self.stuck_window_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// The currently-configured stuck-detection window, ms.
+    pub fn stuck_window_ms(&self) -> i64 {
+        self.stuck_window_ms.load(Ordering::Relaxed)
+    }
+
     /// `registry.setSettings(settings)`'s `scrollbackMaxChars` recompute
     /// (`terminal-registry.ts:1317-1321`): update the replay-log byte cap NEW
     /// terminals will be created with (TERM-13). Callers pass
@@ -1278,6 +1335,107 @@ impl TerminalRegistry {
         candidates
     }
 
+    /// Flag/unflag agent-mode RUNNING terminals whose MEANINGFUL clock went stale
+    /// past the stuck window WHILE raw output keeps flowing (the two-clock
+    /// differential the User Request's load-bearing constraint itself names:
+    /// "last_meaningful_activity_at stale while last_activity_at stays fresh").
+    /// The activity-freshness conjunct is what separates a WEDGED repaint loop
+    /// (the eternal spinner keeps painting — raw output fresh) from a pane
+    /// sitting quietly at a prompt or mid-idle (both clocks equally stale — NOT
+    /// the requested detection class, and flagging it would alter non-wedged
+    /// panes). Emits transitions ONLY on state change (stuck:false→true and
+    /// true→false); never kills, never emits a turn-complete, and unlike
+    /// `enforce_idle_kills` does NOT exempt attached terminals — an attached
+    /// wedged pane is the primary failure class this sweep exists for (see the
+    /// 2026-09-18 opencode zombie RCA). A wedged pane whose output later FREEZES
+    /// entirely stops matching (no longer a repaint loop) and the flag clears —
+    /// an accepted safe-direction residual. Deliberately NO busy/turn-in-flight
+    /// gate: the zombie class attaches to aborted sessions with no reliable turn
+    /// state, so a busy gate would produce false negatives on exactly the target
+    /// class.
+    ///
+    /// Callers drive the cadence externally exactly like `enforce_idle_kills`
+    /// (this crate is deliberately tokio-free, so the periodic timer lives in
+    /// `freshell-ws`).
+    pub fn enforce_stuck_detection(&self) -> Vec<StuckTransition> {
+        let window = self.stuck_window_ms();
+        if window <= 0 {
+            return Vec::new();
+        }
+        let now = now_ms();
+        // Two-pass collect-then-apply mirroring `enforce_idle_kills`' lock
+        // discipline (registry-inner lock + per-row lock during the walk).
+        // `stuck_since` is written under the same row lock IN-walk — nothing
+        // is deferred to a second pass because no kill happens; the row lock
+        // IS the atomicity boundary for the flag flip. Structured logging is
+        // deferred until after the locks drop (the DIAG-01 discipline).
+        let mut collected: Vec<(StuckTransition, i64)> = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .values()
+                .filter_map(|handle| {
+                    let mut s = handle.shared.lock().expect("terminal lock");
+                    let should = s.status == TerminalRunStatus::Running
+                        && Self::is_agent_mode(&s.mode)
+                        && now.saturating_sub(s.last_meaningful_activity_at) > window
+                        && now.saturating_sub(s.last_activity_at) < STUCK_ACTIVITY_FRESH_MS;
+                    match (s.stuck_since.is_some(), should) {
+                        (false, true) => {
+                            s.stuck_since = Some(now);
+                            Some((
+                                StuckTransition {
+                                    terminal_id: s.terminal_id.clone(),
+                                    mode: s.mode.clone(),
+                                    stuck: true,
+                                    at: now,
+                                },
+                                now.saturating_sub(s.last_meaningful_activity_at),
+                            ))
+                        }
+                        (true, false) => {
+                            s.stuck_since = None;
+                            Some((
+                                StuckTransition {
+                                    terminal_id: s.terminal_id.clone(),
+                                    mode: s.mode.clone(),
+                                    stuck: false,
+                                    at: now,
+                                },
+                                0,
+                            ))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect()
+        };
+        // Deterministic order for observability/tests (mirrors the idle
+        // reaper's `candidates.sort()`).
+        collected.sort_by(|a, b| a.0.terminal_id.cmp(&b.0.terminal_id));
+        for (t, meaningful_idle_ms) in &collected {
+            if t.stuck {
+                tracing::warn!(
+                    component = "terminal-registry",
+                    event = "terminal_stuck_flagged",
+                    terminal_id = %t.terminal_id,
+                    mode = %t.mode,
+                    meaningful_idle_ms,
+                    "agent pane flagged stuck; surfacing to pane"
+                );
+            } else {
+                tracing::info!(
+                    component = "terminal-registry",
+                    event = "terminal_stuck_cleared",
+                    terminal_id = %t.terminal_id,
+                    mode = %t.mode,
+                    "meaningful activity resumed; stuck flag cleared"
+                );
+            }
+        }
+        collected.into_iter().map(|(t, _)| t).collect()
+    }
+
     /// `registry.create()` (`terminal-registry.ts:1544-1740`): spawn the PTY and
     /// register it as a **running** terminal owned by no connection. The PTY's reader
     /// thread frames output straight into this terminal's replay log (and fans out to
@@ -1366,6 +1524,7 @@ impl TerminalRegistry {
             created_at: now,
             last_activity_at: now,
             last_meaningful_activity_at: now,
+            stuck_since: None,
             cols: spec.cols,
             rows: spec.rows,
             geometry_epoch: 1,
@@ -2314,6 +2473,7 @@ impl TerminalRegistry {
             created_at,
             last_activity_at: created_at,
             last_meaningful_activity_at: created_at,
+            stuck_since: None,
             cols: 120,
             rows: 30,
             geometry_epoch: 1,
@@ -5692,6 +5852,215 @@ mod tests {
 
         assert!(killed.is_empty());
         assert_eq!(reg.inventory().len(), 1);
+    }
+
+    // `enforce_stuck_detection` (wedge-backstop Task 1): the terminal-mode
+    // wedged-agent backstop. Same backdate-driven discipline as the idle-kill
+    // suite above, but the two-clock differential means a row only flags when
+    // the MEANINGFUL clock is stale past the window WHILE raw output keeps
+    // flowing (a pure repaint loop) — backdating alone can never flag.
+
+    #[test]
+    fn new_registry_defaults_stuck_window_ms_to_the_documented_default() {
+        // The 2h default must apply when a boot never calls
+        // `set_stuck_window_ms` — mirrors
+        // `new_registry_defaults_auto_kill_idle_minutes_to_legacy_default`.
+        let reg = TerminalRegistry::new();
+        assert_eq!(reg.stuck_window_ms(), DEFAULT_STUCK_WINDOW_MS);
+        assert_eq!(DEFAULT_STUCK_WINDOW_MS, 7_200_000);
+    }
+
+    const STUCK_TEST_WINDOW_MS: i64 = 100;
+
+    fn stuck_test_registry(mode: &str) -> TerminalRegistry {
+        // Agent-mode row construction mirroring
+        // `enforce_idle_kills_spares_agent_mode_terminals_past_threshold`.
+        let reg = TerminalRegistry::new();
+        reg.register_headless(HeadlessTerminal {
+            terminal_id: "T".to_string(),
+            stream_id: "S".to_string(),
+            mode: mode.to_string(),
+            resume_session_id: None,
+            create_request_id: None,
+            created_at: Some(now_ms()),
+        });
+        reg.set_stuck_window_ms(STUCK_TEST_WINDOW_MS);
+        reg
+    }
+
+    /// Attach a collector subscriber, mirroring
+    /// `enforce_idle_kills_never_kills_an_attached_terminal`'s attach shape.
+    fn attach_test_subscriber(reg: &TerminalRegistry) {
+        let (sink, _seen) = collector();
+        let outcome = reg.attach("T", 1, sink, Some("a".into()), 0, false, None, None);
+        assert!(outcome.found);
+    }
+
+    /// The shared flag-setup: warm the fingerprint ring with one meaningful
+    /// first-occurrence frame, backdate BOTH clocks past the window, then feed
+    /// ring-repeat repaint variants (noise → activity fresh, meaningful stale).
+    /// This is the ONLY way a row reaches the flagged state — both the flag
+    /// test and the clear tests must start from here (round-3 review Major:
+    /// backdating alone can never flag, because the predicate also requires
+    /// activity freshness).
+    fn flag_stuck_row(reg: &TerminalRegistry) {
+        reg.feed("T", frame(1, "\r\x1b[2K⠋ (1s • esc to interrupt)", "S"));
+        reg.backdate_last_activity("T", now_ms() - (STUCK_TEST_WINDOW_MS + 1));
+        for (i, glyph) in ["⠙", "⠹", "⠸", "⠼"].iter().enumerate() {
+            reg.feed(
+                "T",
+                frame(
+                    2 + i as i64,
+                    &format!("\r\x1b[2K{glyph} ({}s • esc to interrupt)", i + 2),
+                    "S",
+                ),
+            );
+        }
+        let transitions = reg.enforce_stuck_detection();
+        assert_eq!(transitions.len(), 1);
+        assert!(transitions[0].stuck);
+        assert_eq!(transitions[0].terminal_id, "T");
+        assert_eq!(transitions[0].mode, "opencode");
+        // Idempotent: a second sweep emits no transition.
+        assert!(reg.enforce_stuck_detection().is_empty());
+    }
+
+    #[test]
+    fn stuck_detection_flags_attached_agent_pane_with_only_repaint_noise() {
+        let reg = stuck_test_registry("opencode");
+        // Attach a subscriber FIRST — the deliberate divergence from the idle
+        // reaper: attached panes are the primary target class (the reaper
+        // exempts them by design). The flag transition and its shape are
+        // asserted by the helper — an ATTACHED row flagging is the whole
+        // point of this test.
+        attach_test_subscriber(&reg);
+        flag_stuck_row(&reg);
+    }
+
+    #[test]
+    fn stuck_detection_clears_on_meaningful_output() {
+        let reg = stuck_test_registry("opencode");
+        flag_stuck_row(&reg);
+        // Genuinely-new content refreshes the meaningful clock (ingest path).
+        reg.feed("T", frame(9, "meaningful new text line\n", "S"));
+        let cleared = reg.enforce_stuck_detection();
+        assert_eq!(cleared.len(), 1);
+        assert!(!cleared[0].stuck);
+    }
+
+    #[test]
+    fn stuck_detection_clears_on_user_input() {
+        // Input bumps BOTH clocks (registry.rs:1818-1820) and returns
+        // `InputOutcome` (NOT a Result — no unwrap).
+        let reg = stuck_test_registry("opencode");
+        flag_stuck_row(&reg);
+        assert!(reg.input("T", b"x").found);
+        let cleared = reg.enforce_stuck_detection();
+        assert_eq!(cleared.len(), 1);
+        assert!(!cleared[0].stuck);
+    }
+
+    #[test]
+    fn stuck_detection_ignores_shell_mode_and_exited_rows_and_under_window() {
+        // shell-mode row past the window with fresh activity → no transition.
+        // agent-mode row under the window → no transition.
+        // agent-mode row with status != Running → no transition (the 5320
+        // suite's headless exit shape, `finish_pty_exit`).
+        let reg = stuck_test_registry("opencode");
+        // `T` (opencode, just created) IS the under-window arm: its
+        // meaningful clock is fresh, so it must never flag.
+
+        // Shell-mode row: identical wedge shape, wrong mode.
+        reg.register_headless(HeadlessTerminal {
+            terminal_id: "T-shell".to_string(),
+            stream_id: "S-shell".to_string(),
+            mode: "shell".to_string(),
+            resume_session_id: None,
+            create_request_id: None,
+            created_at: Some(now_ms()),
+        });
+        reg.feed(
+            "T-shell",
+            frame(1, "\r\x1b[2K⠋ (1s • esc to interrupt)", "S-shell"),
+        );
+        reg.backdate_last_activity("T-shell", now_ms() - (STUCK_TEST_WINDOW_MS + 1));
+        reg.feed(
+            "T-shell",
+            frame(2, "\r\x1b[2K⠙ (2s • esc to interrupt)", "S-shell"),
+        );
+
+        // Agent-mode row that WEDGED and then exited: Running is required.
+        reg.register_headless(HeadlessTerminal {
+            terminal_id: "T-exited".to_string(),
+            stream_id: "S-exited".to_string(),
+            mode: "opencode".to_string(),
+            resume_session_id: None,
+            create_request_id: None,
+            created_at: Some(now_ms()),
+        });
+        reg.feed(
+            "T-exited",
+            frame(1, "\r\x1b[2K⠋ (1s • esc to interrupt)", "S-exited"),
+        );
+        reg.backdate_last_activity("T-exited", now_ms() - (STUCK_TEST_WINDOW_MS + 1));
+        reg.feed(
+            "T-exited",
+            frame(2, "\r\x1b[2K⠙ (2s • esc to interrupt)", "S-exited"),
+        );
+        assert!(reg.finish_pty_exit("T-exited", 3));
+
+        assert!(
+            reg.enforce_stuck_detection().is_empty(),
+            "shell-mode, under-window, and exited rows must never transition"
+        );
+    }
+
+    #[test]
+    fn stuck_detection_ignores_prompt_idle_rows_where_both_clocks_are_stale() {
+        // The round-1 review pin: a pane sitting quietly at a prompt emits
+        // NOTHING — both clocks age together, so there is no repaint loop and
+        // the pane must NOT be flagged (flagging it would alter a non-wedged
+        // pane). Backdate BOTH clocks equally past BOTH bounds (the window
+        // AND the activity-freshness bound); do NOT feed.
+        let reg = stuck_test_registry("opencode");
+        reg.backdate_last_activity(
+            "T",
+            now_ms() - (STUCK_ACTIVITY_FRESH_MS + STUCK_TEST_WINDOW_MS + 1),
+        );
+        assert!(reg.enforce_stuck_detection().is_empty());
+    }
+
+    #[test]
+    fn stuck_detection_clears_when_output_freezes_entirely() {
+        // A flagged pane whose repaint stream stops (activity goes stale) is no
+        // longer provably a repaint loop: clear the flag with a transition.
+        let reg = stuck_test_registry("opencode");
+        flag_stuck_row(&reg);
+        // Backdate BOTH clocks far past the freshness bound, feed nothing
+        // (the ring-warm discipline lives in the helper — a bare "⠋ repaint"
+        // feed here would carry the significant word "repaint" and refresh the
+        // MEANINGFUL clock, breaking the test).
+        reg.backdate_last_activity(
+            "T",
+            now_ms() - (STUCK_ACTIVITY_FRESH_MS + STUCK_TEST_WINDOW_MS + 1),
+        );
+        let cleared = reg.enforce_stuck_detection();
+        assert_eq!(cleared.len(), 1);
+        assert!(!cleared[0].stuck);
+    }
+
+    #[test]
+    fn stuck_detection_disabled_when_window_zero_or_negative() {
+        let reg = stuck_test_registry("opencode");
+        reg.set_stuck_window_ms(0);
+        // The full wedge shape (meaningful stale past the window, activity
+        // fresh via a braille-only repaint) — must flag NOTHING while the
+        // sweep is disabled.
+        reg.backdate_last_activity("T", now_ms() - (STUCK_TEST_WINDOW_MS + 1));
+        reg.feed("T", frame(1, "\r\x1b[2K⠋", "S"));
+        assert!(reg.enforce_stuck_detection().is_empty());
+        reg.set_stuck_window_ms(-1);
+        assert!(reg.enforce_stuck_detection().is_empty());
     }
 
     // `compute_scrollback_max_bytes` (TERM-13, `settings.terminal.scrollback`):

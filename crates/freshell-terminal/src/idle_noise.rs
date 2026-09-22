@@ -382,4 +382,58 @@ mod tests {
         }
         assert!(n.observe("line zero"));
     }
+
+    #[test]
+    fn opencode_tui_gradient_bar_spinner_cycle_is_noise_after_first_sweep() {
+        // REAL opencode TUI animation shape (capture of 2026-09-20, plan-frame-
+        // evidence.md §3.2): each repaint unit hides the cursor, repaints the
+        // 8-cell bar at row 38 cols 4-11 with per-cell SGR colors, and parks the
+        // cursor. ■ U+25A0 / ⬝ U+2B1D are NOT in the strip set — they are the
+        // only significant chars. The sweep walks 14 distinct compositions
+        // (bright-segment position 1..8, then the reverse fade), so after the
+        // first ~30 frames the ring holds every composition and all later
+        // frames classify as noise forever.
+        let dim = "\u{1b}[38;2;36;57;86m\u{1b}[48;2;10;10;10m";
+        let bright = "\u{1b}[38;2;92;156;245m\u{1b}[48;2;10;10;10m";
+        let park = "\u{1b}[0m\u{1b}[0m\u{1b}[34;6H\u{1b}[?25h";
+        let unit = |cells: &str| format!("\u{1b}[?25l\u{1b}[38;4H{cells}{park}");
+        // 14 compositions: n ⬝ then 8-n ■, then the reverse walk (per the capture
+        // census at plan-frame-evidence.md §3.2).
+        let compositions: Vec<String> = (0..8)
+            .map(|n| {
+                format!(
+                    "{dim}{}\u{1b}[0m{bright}{}",
+                    "⬝".repeat(n),
+                    "■".repeat(8 - n)
+                )
+            })
+            .chain((1..7).map(|n| {
+                format!(
+                    "{bright}{}\u{1b}[0m{dim}{}",
+                    "■".repeat(n),
+                    "⬝".repeat(8 - n)
+                )
+            }))
+            .map(|cells| unit(&cells))
+            .collect();
+        assert_eq!(compositions.len(), 14);
+        let mut n = NoiseScanner::new();
+        // First sweep: each distinct composition is new content (fail-open).
+        for c in &compositions {
+            n.observe(c);
+        }
+        // Spinner-only unit (braille glyph, zero significant chars) is noise even
+        // the first time — registry.rs:185-186 count==0 path.
+        assert!(!n.observe("\u{1b}[?25l\u{1b}[6;6H\u{1b}[38;2;128;128;128m\u{1b}[48;2;10;10;10m⠦\u{1b}[0m\u{1b}[0m\u{1b}[34;6H\u{1b}[?25h"));
+        // Many later sweeps — colors change each frame (new SGR params), the
+        // significant content does not — all noise.
+        for cycle in 0..20 {
+            for c in &compositions {
+                let recolored = c.replace("92;156;245", &format!("{};156;245", 92 - (cycle % 5)));
+                assert!(!n.observe(&recolored), "cycle {cycle} must be noise");
+            }
+        }
+        // Genuinely-new text still classifies as meaningful.
+        assert!(n.observe("\u{1b}[?25lquestion is moot. Run task 3 of 4 froze at 18:06:47Z"));
+    }
 }
