@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -725,6 +725,15 @@ struct Inner {
     /// at the initial delay while a crash-looping daemon still escalates to
     /// and retries at the capped interval.
     re_warm_attempts: AtomicUsize,
+    /// The DISPATCH ERA (ep2-r2 fresheyes Major — cross-generation event
+    /// contamination): a monotonic counter retired (incremented) by every
+    /// running-entry TAKE under the `running` lock — the two `lose_daemon`
+    /// arms and `shutdown`. Each daemon's dispatch sink captures the era at
+    /// its connect (inside the cold-start critical section, so no take can
+    /// interleave) and drops every event once the era has moved past it:
+    /// no event originating from a daemon whose loss has been taken can
+    /// dispatch into the successor era.
+    event_era: AtomicU64,
     /// When the running daemon completed its (healthy) cold start — the
     /// fresh-incident clock for the re-warm backoff.
     last_cold_start_at: Mutex<Option<Instant>>,
@@ -747,6 +756,7 @@ impl OpencodeServeManager {
                 session_emitters: Mutex::new(HashMap::new()),
                 daemon_signals: broadcast::Sender::new(DAEMON_CHANNEL_CAPACITY),
                 re_warm_attempts: AtomicUsize::new(0),
+                event_era: AtomicU64::new(0),
                 last_cold_start_at: Mutex::new(None),
             }),
         }
@@ -948,13 +958,51 @@ impl OpencodeServeManager {
         })
     }
 
+    /// The per-connection dispatch sink, ERA-GATED (ep2-r2 fresheyes Major —
+    /// cross-generation event contamination): the sink captures the CURRENT
+    /// [`Inner::event_era`] at its daemon's connect (called from
+    /// `ensure_started` inside the cold-start `running` critical section,
+    /// so no take can interleave with the capture) and drops every event
+    /// once the era has moved past it. Every daemon removal is a TAKE under
+    /// that same lock (`lose_daemon`'s two arms, `shutdown`), and each take
+    /// retires the era via [`Self::retire_event_era`] BEFORE the lock
+    /// releases — so by construction NO event originating from a daemon
+    /// whose loss has been taken can dispatch into the successor era: a
+    /// buffered/late `session.idle` from the lost generation can never
+    /// satisfy the successor's `await_idle` (the false
+    /// `freshAgent.turn.complete` the no-chime-on-loss contract forbids),
+    /// and no other late event can contaminate a successor-era bridge. The
+    /// gate lives at the SINK — the one point every dispatched event must
+    /// pass — because dropping the [`EventStreamHandle`] only ABORTS the
+    /// transport's reader task (`SseHandle`'s drop), and an
+    /// already-in-flight dispatch can still land after that; the era check
+    /// is the airtight fence.
     fn make_dispatch_sink(&self) -> EventSink {
         let weak = Arc::downgrade(&self.inner);
+        let era = self.inner.event_era.load(Ordering::Acquire);
         Arc::new(move |event: ParsedServeEvent| {
-            if let Some(inner) = weak.upgrade() {
-                dispatch_event_on(&inner, event);
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            if inner.event_era.load(Ordering::Acquire) != era {
+                // A superseded generation's late/buffered event: dropped at
+                // the gate, never reaching the successor era's emitters.
+                return;
             }
+            dispatch_event_on(&inner, event);
         })
+    }
+
+    /// Retire the current dispatch era — the take-side half of the era gate
+    /// ([`Self::make_dispatch_sink`]). Called ONLY while the `running` lock
+    /// is held for a take (the two `lose_daemon` arms, `shutdown`): from
+    /// this moment no event from the daemon being taken can dispatch into
+    /// the session-emitter map, whatever its SSE connection still buffers —
+    /// a successor era's emitters can never be contaminated by the lost
+    /// generation, and a successor (which can only cold-start after the
+    /// lock releases) always connects a strictly newer era.
+    fn retire_event_era(&self) {
+        self.inner.event_era.fetch_add(1, Ordering::Release);
     }
 
     /// Spawn the daemon exit watcher for one cold-started daemon (Task 3,
@@ -1013,6 +1061,15 @@ impl OpencodeServeManager {
     /// had already seen a live B-stamped bridge, the `Lost` pass never
     /// revives, and A's re-warm takes B's fast path silently) — the exact
     /// dead-ended pane this recovery exists to heal.
+    ///
+    /// **Era retirement (ep2-r2 fresheyes Major):** the take also retires
+    /// the lost daemon's DISPATCH ERA inside the same critical section
+    /// ([`Self::retire_event_era`]) — the taken daemon's event sink drops
+    /// every event from this moment on, so a buffered/late event from the
+    /// lost generation can never dispatch into the successor era's
+    /// emitters (the cross-generation `session.idle` that would falsely
+    /// satisfy a successor's `await_idle` and produce a chime). See
+    /// [`Self::make_dispatch_sink`].
     async fn lose_daemon(&self, arm: LossArm<'_>) {
         let (taken, lost_senders) = {
             let mut running = self.inner.running.lock().await;
@@ -1021,10 +1078,12 @@ impl OpencodeServeManager {
                     base_url: _,
                     ownership_id,
                 } => match running.as_ref() {
-                    // Still OUR daemon: take it (the loss is ours to handle)
-                    // and sweep the shared session-emitter map while no
-                    // successor can be starting.
+                    // Still OUR daemon: retire its dispatch era, take it
+                    // (the loss is ours to handle) and sweep the shared
+                    // session-emitter map while no successor can be
+                    // starting.
                     Some(r) if r.ownership_id == ownership_id => {
+                        self.retire_event_era();
                         let senders = self.take_session_emitters();
                         (running.take(), senders)
                     }
@@ -1045,6 +1104,9 @@ impl OpencodeServeManager {
                         if let Some(watch) = &r._exit_watch {
                             watch.abort();
                         }
+                        // The take retires the taken daemon's dispatch era
+                        // under the same lock (the era-gate invariant).
+                        self.retire_event_era();
                         let senders = self.take_session_emitters();
                         (running.take(), senders)
                     }
@@ -1900,7 +1962,14 @@ impl OpencodeServeManager {
     /// the dropped handle), and signal all sessions lost (`shutdown`, `serve-manager.ts:573-591`).
     pub async fn shutdown(&self) {
         self.inner.shutdown.store(true, Ordering::SeqCst);
-        let taken = self.inner.running.lock().await.take();
+        let taken = {
+            let mut running = self.inner.running.lock().await;
+            // The take retires the dispatch era under the lock — the same
+            // era-gate invariant as the loss path (a late event from the
+            // daemon being taken must never dispatch past the take).
+            self.retire_event_era();
+            running.take()
+        };
         if let Some(running) = taken {
             // The requested-loss discipline: abort the watcher so the shutdown
             // kill never raises the crash event. No `Lost` signal, no re-warm —

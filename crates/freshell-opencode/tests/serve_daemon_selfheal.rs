@@ -717,6 +717,164 @@ async fn stale_request_timeout_never_discards_the_replacement_daemon() {
     );
 }
 
+// ── ep2-r2 fresheyes Major: cross-generation event contamination ────────────────
+
+/// An [`EventSource`] that RECORDS every sink it is handed (one per cold
+/// start, in connect order) — the REAL per-connection dispatch closures
+/// [`OpencodeServeManager`] mints at each daemon's connect, so a test can
+/// dispatch a late event through the exact path the transport would,
+/// carrying the CONNECTING daemon's identity. The ep2-r2 requirement: the
+/// prior successor-emitter test dispatched through the generation-less
+/// `dispatch_event` seam and could not observe this defect class at all.
+struct RecordingEventSource {
+    sinks: std::sync::Mutex<Vec<EventSink>>,
+}
+impl EventSource for RecordingEventSource {
+    fn connect(&self, _url: String, sink: EventSink) -> Box<dyn EventStreamHandle> {
+        self.sinks.lock().expect("recorded sinks mutex").push(sink);
+        Box::new(NoopEventHandle)
+    }
+}
+
+/// A late event from a LOST daemon generation must NEVER reach the
+/// successor era (ep2-r2 fresheyes Major — cross-generation event
+/// contamination, the false-chime precursor). The review's interleaving,
+/// forced deterministically: daemon A is lost through the REAL watcher
+/// arm (take + sweep + Lost), the re-warm installs the successor B, a
+/// B-era `await_idle` is subscribed and IN FLIGHT for a durable session —
+/// and only then does A's connection sink (the real dispatch closure
+/// minted at A's cold start, still alive in the taken `RunningServe`'s
+/// SSE-handle window) deliver a buffered `session.idle`. It must NOT
+/// satisfy the successor's `await_idle` — the exact event that would
+/// falsely produce `freshAgent.turn.complete` and clear busy for a
+/// still-running B turn (the no-chime-on-daemon-loss contract). A
+/// genuine B-era idle delivered through B's OWN sink must still satisfy
+/// it (the dispatch is generation-fenced, not broken). Pre-fix, the
+/// sink was generation-less: the late A event dispatched straight into
+/// the shared emitter map and the successor's await resolved Ok.
+#[tokio::test]
+async fn a_lost_daemons_late_events_never_satisfy_the_successors_await_idle() {
+    let exited = Arc::new(AtomicBool::new(false));
+    let killed = Arc::new(AtomicUsize::new(0));
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let events = Arc::new(RecordingEventSource {
+        sinks: std::sync::Mutex::new(Vec::new()),
+    });
+    let deps = ServeDeps {
+        spawner: Arc::new(FlagExitSpawner {
+            exited: exited.clone(),
+            killed: killed.clone(),
+            spawns: spawns.clone(),
+        }),
+        http: Arc::new(HealthyHttp {
+            prompt_pending: false,
+        }),
+        ports: Arc::new(CountingAllocator {
+            next: AtomicU16::new(0),
+        }),
+        events: events.clone(),
+    };
+    let manager = started_manager(deps, selfheal_config(10, 5, 50)).await;
+    let mut signals = manager.subscribe_daemon_signals();
+
+    // Daemon A's connection sink — the REAL dispatch closure, carrying A's
+    // daemon-generation identity.
+    let sink_a = events
+        .sinks
+        .lock()
+        .expect("recorded sinks mutex")
+        .first()
+        .expect("A's cold start connected its event stream")
+        .clone();
+
+    // Daemon A dies — the watcher arm's REAL loss path (take + sweep +
+    // Lost all complete before the Lost broadcast is observable here).
+    exited.store(true, Ordering::SeqCst);
+    let lost = tokio::time::timeout(Duration::from_secs(2), signals.recv())
+        .await
+        .expect("loss signal within budget")
+        .expect("channel alive");
+    assert!(
+        matches!(
+            lost,
+            DaemonSignal::Lost {
+                reason: "process_exit"
+            }
+        ),
+        "got {lost:?}"
+    );
+    // The re-warm installs the successor daemon B — a NEW generation with
+    // its own connection sink.
+    exited.store(false, Ordering::SeqCst);
+    let started = tokio::time::timeout(Duration::from_secs(2), signals.recv())
+        .await
+        .expect("re-warm within budget")
+        .expect("channel alive");
+    assert!(matches!(started, DaemonSignal::Started), "got {started:?}");
+    assert_eq!(
+        events.sinks.lock().expect("recorded sinks mutex").len(),
+        2,
+        "fixture: exactly two daemon generations have connected"
+    );
+    let sink_b = events
+        .sinks
+        .lock()
+        .expect("recorded sinks mutex")
+        .get(1)
+        .expect("B's cold start connected its event stream")
+        .clone();
+    let idle_event = || {
+        parse_serve_event(&json!({
+            "type": "session.idle",
+            "properties": { "sessionID": "ses_late" }
+        }))
+        .expect("parseable serve event")
+    };
+
+    // B's `await_idle`, subscribed and IN FLIGHT for the durable session
+    // (the successor-era registration the late event must not reach).
+    let rx = manager.subscribe("ses_late");
+    let idle_manager = manager.clone();
+    let mut await_idle = tokio::spawn(async move {
+        idle_manager
+            .await_idle("ses_late", rx, Duration::from_secs(5), None)
+            .await
+    });
+    // Let the await enter its select loop. (Broadcast buffers the event
+    // for an existing subscriber either way, but a live loop makes the
+    // in-flight premise unambiguous.)
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // THE LATE A-ERA EVENT: dispatched through A's REAL sink — after A's
+    // take, with B installed and B's await_idle in flight. On the
+    // pre-fix generation-less sink this buffered `session.idle`
+    // satisfied the successor's await.
+    sink_a(idle_event());
+
+    // It must NOT satisfy: the await stays pending through the grace
+    // window.
+    match tokio::time::timeout(Duration::from_millis(300), &mut await_idle).await {
+        Err(_still_pending) => {}
+        Ok(Ok(Ok(()))) => panic!(
+            "a late event from the LOST daemon generation satisfied the \
+             successor's await_idle — the false freshAgent.turn.complete \
+             precursor (ep2-r2 cross-generation contamination)"
+        ),
+        other => panic!("await_idle settled unexpectedly: {other:?}"),
+    }
+
+    // A GENUINE B-era idle through B's OWN sink still satisfies it — the
+    // gate is a generation fence, not a broken dispatch.
+    sink_b(idle_event());
+    let outcome = tokio::time::timeout(Duration::from_secs(2), await_idle)
+        .await
+        .expect("the genuine B-era idle resolves within budget");
+    assert!(
+        matches!(outcome, Ok(Ok(()))),
+        "the successor's own idle edge must satisfy await_idle, got {outcome:?}"
+    );
+}
+
 // ── ep2-r1 fresheyes Major: A's late emitter cleanup vs. B's fresh sender ────────
 
 /// A daemon-loss cleanup must NEVER remove session emitters registered by a
