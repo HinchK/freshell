@@ -40,23 +40,22 @@
  * assertion is satisfied and the pinned path is the one the incident
  * actually exercised.
  *
-   * Scenario 4 mechanism note (the task-5 M-3 carry, revised for the
-   * clean-restore-success accounting): there is no WS-level
-   * fault-injection seam in helpers/; the honest page-level seam is the
-   * harness's own forceDisconnect loop. A CLEANLY completed restore
-   * (ready received, window completed, no gap in the generation) now
-   * resets the progressless streak — a converged idle pane's ordinary
-   * flaps re-attach with empty deltas that complete cleanly, so they can
-   * never strand the pane. The BOUND therefore trips on the genuinely
-   * broken cycle this fixture can build deterministically: the
-   * retention-expired pane (T08), whose every reconnect attach is
-   * gap-tainted (the retention loss re-arrives with every resume from
-   * the coverage-pinned cursor) with no coverage progress — each flap
-   * costs one counted attempt, the bound stops the automatic cycling
-   * once the attempts are spent, the visible retry strip shows, and an
-   * explicit retry re-arms it. The healthy converged pane (a
-   * full-retention tag) is flapped in the same test to pin the opposite:
-   * clean restores never reach the strip.
+    * Scenario 4 mechanism note (the round-4 plan:166 reversal): there is
+    * no WS-level fault-injection seam in helpers/; the honest page-level
+    * seam is the harness's own forceDisconnect loop. Recovery accounting
+    * resets ONLY on genuine parser progress or an explicit user retry —
+    * "not merely on receiving attach.ready or another reconnect"
+    * (plan:166). A converged idle pane's flaps re-attach with empty
+    * cursor-CONFIRMED deltas that complete cleanly, and that clean
+    * completion is NOT progress: no bytes applied, no coverage advance,
+    * so the streak is never reset and the flap cycle EXHAUSTS to the
+    * retry strip exactly like any progressless cycle. The bound therefore
+    * trips for BOTH panes this fixture can build deterministically: the
+    * retention-expired pane (T08), whose every reconnect attach is
+    * gap-tainted with no coverage progress, AND the healthy converged
+    * pane (a full-retention tag) whose flaps are clean but progressless.
+    * In both shapes the content is PRESERVED at the strip and an
+    * explicit retry re-arms the automatic recovery.
  *
  * Scenario 5 mechanism note: "any spill produces the honest gap notice" —
  * on the NEGOTIATED browser lane a spill is structurally unreachable
@@ -974,16 +973,15 @@ test.describe('paced-restore convergence (incident-shaped, rust)', () => {
     }
   })
 
-  test('the recovery bound trips for a retention-pinned cycle, never for clean converged-pane flaps, and an explicit retry re-arms', async ({ browser }, testInfo) => {
+  test('the recovery bound trips for a retention-pinned cycle and for clean converged-pane flaps (plan:166), preserving content and re-arming on retry', async ({ browser }, testInfo) => {
     // The BOUND pane: the retention-expired terminal (T08). Its every
     // reconnect attach resumes from the coverage-pinned cursor, hits the
     // retention loss again, and completes GAP-TAINTED with no coverage
     // progress and no cursor confirmation — the genuinely NON-CONVERGED
-    // restore cycle the bound exists to stop (the round-2 empty-reconnect
-    // fix: converged cycles no longer exhaust, so this scenario stays
-    // reachable precisely because every cycle is gap-tainted). (A clean
-    // converged idle pane's flaps confirm the cursor and reset the
-    // streak — pinned below with a full-retention pane.)
+    // restore cycle the bound exists to stop. (The healthy converged
+    // pane below pins the round-4 plan:166 reversal: its cursor-confirmed
+    // CLEAN flaps are not progress either, so its cycle exhausts to the
+    // same strip and only an explicit retry re-arms it.)
     const targetIndex = TAGS.indexOf(EXPIRED_TAG)
     const healthyIndex = 3
     const incident = await bootIncident(browser, { activeIndex: targetIndex })
@@ -1136,18 +1134,19 @@ test.describe('paced-restore convergence (incident-shaped, rust)', () => {
       expect(exhaustedEvent, 'terminal.restore.recovery_exhausted perf event').toBeTruthy()
       expect(retryEvent, 'terminal.restore.recovery_retry perf event').toBeTruthy()
 
-      // The HEALTHY counterpart (the remediation's clean-restore
-      // contract): a converged idle pane's reconnect restores complete
-      // cleanly (no gap, and the server CONFIRMS the client's cursor on
-      // each delta resume — full retention, so effectiveSinceSeq equals
-      // the requested sinceSeq), and a cursor-confirmed clean restore is
-      // SUCCESS, not stagnation — the streak resets on every completed
-      // confirmed restore, the bound can never trip, and the pane keeps
-      // auto-attaching. Each flap WAITS for the pane to restore back to
-      // its converged screen before the next one (a successful
-      // reconnect-restore); without the settle the flap cadence itself
-      // interrupts restores mid-window, which is a genuinely broken
-      // cycle the bound is SUPPOSED to stop.
+      // The HEALTHY counterpart (the round-4 plan:166 reversal): a
+      // converged idle pane's reconnect restores complete cleanly — no
+      // gap, and the server CONFIRMS the client's cursor on each delta
+      // resume (full retention, so effectiveSinceSeq equals the requested
+      // sinceSeq). Under plan:166 that clean completion is NOT progress —
+      // nothing applied, no coverage advanced — so the streak is never
+      // reset and the flap cycle EXHAUSTS to the retry strip exactly like
+      // the retention-pinned cycle; only an explicit retry re-arms it.
+      // The reveal attach below is the pane's INITIAL hydration (exempt);
+      // every flap after it counts: three clean-but-progressless flaps
+      // spend the bound, the fourth is declined, the fifth confirms the
+      // decline. Each flap still SETTLES on the converged screen — what
+      // stays through restores AND declines is the PRESERVED content.
       const healthyTag = TAGS[healthyIndex]
       const healthyTabId = tabIds[healthyIndex]
       const healthyTerminalId = terminalIds[healthyIndex]
@@ -1157,36 +1156,70 @@ test.describe('paced-restore convergence (incident-shaped, rust)', () => {
       for (let flap = 0; flap < 5; flap += 1) {
         await harness.forceDisconnect()
         await harness.waitForConnection()
-        // The flap's reconnect-restore must SUCCEED (converge again) before
-        // the next flap: this is the "successful reconnect-restore" the
-        // clean-restore reset covers.
+        // Settle on the converged screen after every flap: the counted
+        // flaps restore back to it (clean delta resumes never wipe), and
+        // the declined flaps leave it untouched — the strip-time content
+        // below must be the COMPLETED converged screen either way.
         await waitPaneConverged(harness, healthyTerminalId, healthyExpected, CONVERGENCE_BOUND_MS)
       }
-      // RESTORED preserved-content assertion (focused-e1r1 finding 3): the
-      // round-1 revision removed the strip-time flood-row floor as a
-      // timing race for the RETENTION-PINNED pane (whose rebuilds
-      // legitimately clear mid-interruption). Restored here under the
-      // correct semantics — on the RETAINED pane, whose every restore is
-      // a checkpoint delta resume: after five reconnect-restores the
-      // surface still holds its pre-gap flood rows (no destructive
-      // clear-and-rebuild ever wiped them) AND every restore completed
-      // (the per-flap convergence above). A sinceSeq-0 viewport wipe
-      // repair would blank these rows mid-rebuild; the preserved delta
-      // resume never does.
+
+      // The clean pane EXHAUSTS (plan:166): the strip shows with the same
+      // preserved-content contract as the retention-pinned pane.
+      const healthyStrip = page.getByTestId('restore-recovery-retry')
+      await expect(
+        healthyStrip,
+        'a clean converged pane exhausts to the retry strip — a clean restore is not progress (plan:166)',
+      ).toBeVisible({ timeout: 15_000 })
+      await expect(healthyStrip).toContainText('not making progress')
+      await expect(healthyStrip).toContainText('What is on screen is unchanged')
+
+      // Preserved-content at the strip (focused-e1r1 finding 3's shape,
+      // under the corrected semantics): the retained pane's restores are
+      // checkpoint delta resumes — no destructive clear-and-rebuild ever
+      // wipes the surface — and the DECLINED flaps mutate nothing either.
+      // The strip-time screen is the full converged content: the done
+      // marker and the pre-gap flood rows, never a mid-rebuild partial.
       const healthyPreservedBuffer = await paneBuffer(harness, healthyTerminalId)
       expect(
+        healthyPreservedBuffer.includes(healthyExpected.doneMarker),
+        'the converged done marker is still on screen at the healthy pane’s strip',
+      ).toBe(true)
+      expect(
         floodLineCount(healthyPreservedBuffer, healthyTag),
-        'the retained pane’s pre-gap surface is preserved across its completed restores',
+        'the retained pane’s pre-gap surface is preserved at its recovery strip',
       ).toBeGreaterThan(0)
-      // Five successful-but-progressless flaps later: the pane never
-      // exhausted, and the NEXT flap still auto-attaches. (Diagnostics
-      // attach BEFORE the assertion so a failure is self-explaining; the
-      // sent-message ledger is a 500-frame ring, so read the behavioral
-      // evidence from the perf-event history, not the ledger.)
+
+      // The bound never kills or replaces the clean pane either.
+      expect(
+        ((await harness.getSentWsMessages()) as Array<Record<string, any>>).find(
+          (m) => (m?.type === 'terminal.kill' || m?.type === 'terminal.create')
+            && m.terminalId === healthyTerminalId,
+        ),
+        'the healthy pane’s bound never kills or replaces it',
+      ).toBeUndefined()
+
+      // The bound HOLDS: a further flap is declined — no automatic attach
+      // for the exhausted clean pane.
       await harness.clearSentWsMessages()
       await harness.forceDisconnect()
       await harness.waitForConnection()
+      await sleep(1_500)
+      const sentAfterHealthyExhaustion = (await harness.getSentWsMessages()) as Array<Record<string, any>>
+      expect(
+        sentAfterHealthyExhaustion.filter((m) => m?.type === 'terminal.attach' && m.terminalId === healthyTerminalId),
+        'no automatic attach for the exhausted clean pane on a further flap',
+      ).toEqual([])
+
+      // Exhaustion evidence for the clean pane (plan:166's own record):
+      // diagnostics attach BEFORE the retry so a failure is self-explaining.
       const healthyEvents = (await harness.getPerfAuditSnapshot())?.perfEvents ?? []
+      expect(
+        healthyEvents.find(
+          (event) => event.event === 'terminal.restore.recovery_exhausted'
+            && String((event as Record<string, unknown>).terminalId) === healthyTerminalId,
+        ),
+        'the clean converged pane recorded a recovery exhaustion',
+      ).toBeTruthy()
       await attachEvidence(testInfo, 'prc09-healthy-pane-diagnostics.json', {
         healthyTerminalId,
         healthyRecoveryEvents: healthyEvents
@@ -1197,10 +1230,6 @@ test.describe('paced-restore convergence (incident-shaped, rust)', () => {
             intent: (event as Record<string, unknown>).intent,
             reason: (event as Record<string, unknown>).reason,
           })),
-        healthySuccessCount: healthyEvents.filter(
-          (event) => event.event === 'terminal.restore.recovery_success'
-            && String((event as Record<string, unknown>).terminalId) === healthyTerminalId,
-        ).length,
         allExhaustions: healthyEvents
           .filter((event) => event.event === 'terminal.restore.recovery_exhausted')
           .map((event) => ({
@@ -1208,24 +1237,21 @@ test.describe('paced-restore convergence (incident-shaped, rust)', () => {
             attempts: (event as Record<string, unknown>).attempts,
           })),
       })
-      await expect
-        .poll(async () => {
-          const healthySent = (await harness.getSentWsMessages()) as Array<Record<string, any>>
-          return Boolean(
-            healthySent.find(
-              (m) => m?.type === 'terminal.attach' && m.terminalId === healthyTerminalId,
-            ),
-          )
-        }, { timeout: 15_000 })
-        .toBe(true)
-      const healthyExhausted = (await harness.getPerfAuditSnapshot())?.perfEvents ?? []
+
+      // Explicit retry re-arms the clean pane too (the user's control —
+      // plan:166's only other reset): the strip clears, a fresh attach
+      // goes out, and the pane converges again on its preserved surface.
+      await harness.clearSentWsMessages()
+      await page.getByRole('button', { name: /Retry terminal restore/i }).click()
+      await expect(healthyStrip).toBeHidden({ timeout: 10_000 })
+      const healthyRetrySent = (await harness.getSentWsMessages()) as Array<Record<string, any>>
       expect(
-        healthyExhausted.find(
-          (event) => event.event === 'terminal.restore.recovery_exhausted'
-            && (event as Record<string, unknown>).terminalId === healthyTerminalId,
+        healthyRetrySent.find(
+          (m) => m?.type === 'terminal.attach' && m.terminalId === healthyTerminalId,
         ),
-        'a healthy converged pane never reaches the recovery bound',
-      ).toBeUndefined()
+        'the healthy pane’s retry sent a fresh attach',
+      ).toBeTruthy()
+      await waitPaneConverged(harness, healthyTerminalId, healthyExpected, 90_000)
 
       const stats = analyzeLogWindow(await readLogWindow(logPath, windowStartOffset))
       assertNoDisconnectLoop(stats)
@@ -1239,7 +1265,7 @@ test.describe('paced-restore convergence (incident-shaped, rust)', () => {
       })
       testInfo.annotations.push({
         type: 'prc09-recovery-bound',
-        description: 'the bound stopped the retention-pinned cycle and re-armed on retry; clean converged-pane flaps never reached it',
+        description: 'the bound stopped both the retention-pinned and the clean converged cycles (plan:166) and re-armed each on retry',
       })
     } finally {
       await teardownIncident(incident)

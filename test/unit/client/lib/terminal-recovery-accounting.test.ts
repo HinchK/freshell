@@ -3,7 +3,6 @@ import {
   beginRecoveryAttempt,
   createTerminalRecoveryAccounting,
   recordRecoveryProgress,
-  recordRecoveryRestoreSuccess,
   resetRecoveryAccounting,
   TERMINAL_RECOVERY_MAX_ATTEMPTS,
   TERMINAL_RECOVERY_NO_PROGRESS_DEADLINE_MS,
@@ -150,32 +149,7 @@ describe('terminal-recovery-accounting', () => {
     expect(retried.state.attempts).toBe(1)
   })
 
-  it('a clean restore success resets the streak without touching the progress record', () => {
-    let state = createTerminalRecoveryAccounting()
-    state = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1000 }).state
-    state = recordRecoveryProgress(state, 5, 1001)
-    state = beginRecoveryAttempt(state, { coverageSeq: 5, now: 1002 }).state
-    expect(state.attempts).toBe(1)
-    expect(state.lastProgressSeq).toBe(5)
-
-    // A clean, completed restore (attach.ready received, session completes,
-    // no gap) is restore SUCCESS, not stagnation — it must reset the
-    // progressless streak, or N ordinary reconnects of an idle converged
-    // pane strand it on the retry strip.
-    state = recordRecoveryRestoreSuccess(state)
-    expect(state.attempts).toBe(0)
-    expect(state.streakStartedAt).toBeNull()
-    expect(state.exhausted).toBe(false)
-    expect(state.lastAttemptKey).toBeNull()
-    expect(state.lastProgressSeq).toBe(5, 'the coverage record is untouched by the streak reset')
-    expect(state.initialAttachConsumed).toBe(true, 'the initial-attach exemption stays consumed')
-
-    const next = beginRecoveryAttempt(state, { coverageSeq: 5, now: 1003 })
-    expect(next.allowed).toBe(true)
-    expect(next.state.attempts).toBe(1)
-  })
-
-  it('a clean restore success clears exhaustion and re-arms the bound', () => {
+  it('plan:166 literal: an advance of the coverage cursor is the ONLY mid-cycle reset — it clears exhaustion and re-arms the bound', () => {
     let state = createTerminalRecoveryAccounting()
     state = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1000 }).state
     for (let i = 0; i < TERMINAL_RECOVERY_MAX_ATTEMPTS + 1; i += 1) {
@@ -183,22 +157,47 @@ describe('terminal-recovery-accounting', () => {
     }
     expect(state.exhausted).toBe(true)
 
-    state = recordRecoveryRestoreSuccess(state)
+    // GENUINE parser progress (the applied surface ADVANCES — the frames
+    // applied on the stuck pane prove the surface is alive): the streak
+    // resets and exhaustion clears.
+    state = recordRecoveryProgress(state, 5, 2000)
+    expect(state.attempts).toBe(0)
+    expect(state.streakStartedAt).toBeNull()
     expect(state.exhausted).toBe(false)
-    const after = beginRecoveryAttempt(state, { coverageSeq: 0, now: 5000 })
+    expect(state.lastProgressSeq).toBe(5)
+    expect(state.initialAttachConsumed).toBe(true, 'the initial-attach exemption stays consumed')
+
+    const after = beginRecoveryAttempt(state, { coverageSeq: 5, now: 2001 })
     expect(after.allowed).toBe(true)
+    expect(after.state.attempts).toBe(1)
   })
 
-  it('many clean restores in a row never reach the bound', () => {
+  it('plan:166 literal: clean converged reconnect flaps are NOT progress — the cycle exhausts and only an explicit retry re-arms', () => {
+    // The round-4 reversal: "Reset recovery accounting on genuine parser
+    // progress or explicit retry, not merely on receiving attach.ready or
+    // another reconnect." A converged idle pane's clean, gap-free,
+    // empty-window reconnect cycle has NO reset event under the plan's
+    // rule — the flaps accumulate to the bound exactly like any other
+    // progressless cycle, and only the explicit retry (or real coverage
+    // progress) re-arms.
     let state = createTerminalRecoveryAccounting()
     state = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1000 }).state
-    for (let flap = 0; flap < 20; flap += 1) {
+    for (let flap = 0; flap < TERMINAL_RECOVERY_MAX_ATTEMPTS; flap += 1) {
       const attempt = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1010 + flap })
-      expect(attempt.allowed, `flap ${flap} must stay auto-attaching`).toBe(true)
-      state = recordRecoveryRestoreSuccess(attempt.state)
+      expect(attempt.allowed, `flap ${flap} stays within the bound`).toBe(true)
+      state = attempt.state
+      // The flap's clean, cursor-confirmed, empty-window completion fires
+      // NO reset — there is no restore-success entry point anymore.
     }
-    expect(state.attempts).toBe(0)
-    expect(state.exhausted).toBe(false)
+    expect(state.attempts).toBe(TERMINAL_RECOVERY_MAX_ATTEMPTS)
+    const declined = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1100 })
+    expect(declined.allowed, 'the converged flap cycle is bounded').toBe(false)
+    expect(declined.state.exhausted).toBe(true)
+
+    // The explicit retry is the other reset path.
+    state = resetRecoveryAccounting(state, 0, 1200)
+    const after = beginRecoveryAttempt(state, { coverageSeq: 0, now: 1201 })
+    expect(after.allowed).toBe(true)
   })
 
   it('exposes the documented bounds', () => {

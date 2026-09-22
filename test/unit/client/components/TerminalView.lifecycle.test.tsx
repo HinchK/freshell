@@ -12176,8 +12176,20 @@ describe('TerminalView lifecycle updates', () => {
       expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
     })
 
-    it('recovery bounding: a cleanly completed reconnect-restore resets the streak — an idle converged pane never strands', async () => {
-      const { terminalId } = await renderResumablePane('recovery-clean')
+    it('recovery bounding: a converged idle pane’s cursor-confirmed flap cycle is not parser progress — it exhausts to the retry strip with the content preserved', async () => {
+      // Round-4 REVERSAL to plan:166's literal rule: the streak resets
+      // ONLY on genuine parser progress (an ADVANCE of the applied
+      // surface) or an explicit user retry — "not merely on receiving
+      // attach.ready or another reconnect". A converged idle pane's
+      // reconnect flap completes cleanly and the server CONFIRMS the
+      // cursor (effectiveSinceSeq == requested) — but the empty window
+      // delivered no bytes, nothing applied, NO parser surface advanced:
+      // per the plan that is NOT progress, and the flap cycle EXHAUSTS
+      // to the visible retry strip with the content preserved and an
+      // accessible retry state (plan:166's explicit design). The prior
+      // never-strand disposition (delta-R1-F5 / 40afe39b7) contradicted
+      // the plan's sentence and is superseded.
+      const { terminalId, term } = await renderResumablePane('recovery-clean')
 
       const attachCount = () => attachMessagesFor(terminalId).length
       // The mount attach is the pane's INITIAL hydration (never counted).
@@ -12196,55 +12208,90 @@ describe('TerminalView lifecycle updates', () => {
         })
         messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 4, data: 'CONVERGED' })
       })
+      term.clear.mockClear()
 
       // Each flap's reconnect attach completes CLEANLY and with the
-      // cursor CONFIRMED: the ready carries effectiveSinceSeq == the
-      // requested sinceSeq (the server confirmed the client's surface
-      // cursor) with an empty window and no gap — the ordinary shape of
-      // an idle converged pane's reconnect (it delivers no new coverage
-      // bytes, yet the server CONFIRMED convergence, so it is a
-      // SUCCESSFUL restore, not a broken cycle).
+      // cursor CONFIRMED (effectiveSinceSeq == the requested sinceSeq,
+      // an empty window, no gap) — the ordinary shape of an idle
+      // converged pane's reconnect. Under plan:166 it is still NOT
+      // progress: no bytes delivered, nothing applied.
+      let convergedCursor = 4
       const ackCleanRestore = () => {
         const attach = attachMessagesFor(terminalId).at(-1)
         expect(attach?.attachRequestId).toBeTruthy()
-        expect(attach?.sinceSeq).toBe(4)
+        expect(attach?.sinceSeq).toBe(convergedCursor)
         act(() => {
           messageHandler!({
             type: 'terminal.attach.ready',
             terminalId,
-            headSeq: 4,
-            replayFromSeq: 5,
-            replayToSeq: 4,
+            headSeq: convergedCursor,
+            replayFromSeq: convergedCursor + 1,
+            replayToSeq: convergedCursor,
             attachRequestId: attach!.attachRequestId,
-            effectiveSinceSeq: 4,
-            requestedSinceSeq: 4,
+            effectiveSinceSeq: convergedCursor,
+            requestedSinceSeq: convergedCursor,
           })
         })
       }
 
-      // FAR past the bound (3): every flap still auto-attaches because each
-      // cursor-confirmed clean completion resets the progressless streak.
-      for (let flap = 0; flap < 6; flap += 1) {
+      // Three progressless flaps consume the bound (the mount attach is
+      // exempt); the FOURTH is declined and the accessible retry state
+      // shows — the converged pane's flap cycle is bounded exactly like
+      // any other progressless cycle.
+      for (let flap = 0; flap < 3; flap += 1) {
         act(() => { reconnectHandler?.() })
         expect(attachCount(), `flap ${flap} attaches`).toBe(2 + flap)
         ackCleanRestore()
       }
-      expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
-
-      // And the pane keeps auto-attaching on the next flap after that.
       act(() => { reconnectHandler?.() })
-      expect(attachCount()).toBe(8)
+      expect(attachCount()).toBe(4)
+      const retryStrip = screen.getByTestId('restore-recovery-retry')
+      expect(retryStrip).toHaveAttribute('role', 'alert')
+      const retryButton = screen.getByRole('button', { name: 'Retry terminal restore' })
+      expect(retryButton).toBeTruthy()
+
+      // The visible content is PRESERVED at the strip (plan:166):
+      // no wipe, no kill, no replacement.
+      expect(term.clear).not.toHaveBeenCalled()
+      expect(sentMessages().some((msg) => msg?.type === 'terminal.kill')).toBe(false)
+      expect(sentMessages().some((msg) => msg?.type === 'terminal.create')).toBe(false)
+
+      // GENUINE parser progress un-exhausts the pane: real frames apply
+      // (the applied surface ADVANCES past 4), the streak resets, and
+      // automatic re-attach resumes — the pane is never stranded.
+      act(() => {
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 5, seqEnd: 6, data: 'PROGRESS' })
+      })
+      convergedCursor = 6
       expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+      act(() => { reconnectHandler?.() })
+      expect(attachCount()).toBe(5)
+
+      // The explicit retry also re-arms (the user's control). The re-armed
+      // streak covers the post-progress reconnect plus two more flaps; the
+      // THIRD flap's reconnect is already declined — cursor-confirmed clean
+      // restores are NOT progress toward the re-armed bound either.
+      for (let flap = 0; flap < 2; flap += 1) {
+        act(() => { reconnectHandler?.() })
+        expect(attachCount(), `flap ${flap} attaches`).toBe(6 + flap)
+        ackCleanRestore()
+      }
+      act(() => { reconnectHandler?.() })
+      expect(attachCount()).toBe(7)
+      expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+      act(() => {
+        fireEvent.click(screen.getByRole('button', { name: 'Retry terminal restore' }))
+      })
+      expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+      expect(attachCount()).toBe(8)
     })
 
     it('recovery bounding: an empty-window ready that never confirms the surface cursor is not a clean restore — the cycle still exhausts', async () => {
-      // Round-2 bound precision: a mere empty-window attach.ready does NOT
-      // reset the progressless streak. Without cursor confirmation (the
-      // ready carries no effectiveSinceSeq — the legacy shape, or any
-      // answer that never says "your cursor is valid") and with no
-      // coverage advance, the cycle is exactly the flapping
-      // reconnect-loop the recovery bound exists to stop: the pane may
-      // reach attach.ready forever while never converging.
+      // Round-4 plan:166 literal rule: NO attach.ready — confirmed or not —
+      // resets the progressless streak. Without an advance of the applied
+      // surface and without an explicit retry, the cycle is exactly the
+      // flapping reconnect-loop the recovery bound exists to stop: the
+      // pane may reach attach.ready forever while never converging.
       const { terminalId } = await renderResumablePane('recovery-unconfirmed')
 
       const attachCount = () => attachMessagesFor(terminalId).length
@@ -12302,11 +12349,12 @@ describe('TerminalView lifecycle updates', () => {
     })
 
     it('recovery bounding: an empty-window ready whose effectiveSinceSeq is not the requested cursor is not a clean restore', async () => {
-      // The second unconfirmed shape: the server DID answer with the
+      // The second non-progress shape: the server DID answer with the
       // contract fields but adjusted the baseline (retention loss or a
-      // stream swap rewound the head below the client's cursor) — the
-      // client's surface cursor was NOT confirmed, so the completion is
-      // not convergence evidence either.
+      // stream swap rewound the head below the client's cursor). Under
+      // the round-4 plan:166 rule NO ready resets the streak at all;
+      // this shape stays pinned so a future ready-keyed reset cannot
+      // sneak back in through the retention-adjusted arm either.
       const { terminalId } = await renderResumablePane('recovery-adjusted')
 
       const attachCount = () => attachMessagesFor(terminalId).length

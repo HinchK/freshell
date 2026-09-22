@@ -104,7 +104,6 @@ import {
   beginRecoveryAttempt,
   createTerminalRecoveryAccounting,
   recordRecoveryProgress,
-  recordRecoveryRestoreSuccess,
   resetRecoveryAccounting,
   type TerminalRecoveryAccounting,
 } from '@/lib/terminal-recovery-accounting'
@@ -1021,37 +1020,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // Bounded automatic recovery accounting (WS2): consecutive progressless
   // attach attempts vs the coverage cursor; gates automatic re-attach
   // cycling and drives the visible retry state. Never kills or replaces.
+  // Round-4 reversal (plan:166): the streak resets ONLY on genuine parser
+  // progress (an ADVANCE of the applied surface) or an explicit user
+  // retry — never on attach.ready/reconnect completions.
   const recoveryAccountingRef = useRef<TerminalRecoveryAccounting>(createTerminalRecoveryAccounting())
-  // Clean-restore success (WS2): per-attach-generation taint tracking for
-  // the recovery-streak reset. `generationGapFreeRef` turns false the
-  // moment the current generation reports any output loss (a gap frame, a
-  // stream-identity mismatch, an invalid-message lost range) — a
-  // completion is only a CLEAN restore (and only a clean reset resets the
-  // progressless streak) when the generation stayed gap-free; broken
-  // cycles (no ready, gaps, failures) still exhaust the bound.
-  // `generationSuppressCleanResetRef` marks a gap-initiated REPAIR
-  // generation: repeated queue_overflow repairs must still exhaust to the
-  // retry strip, so their clean completions do not refund the streak.
-  // `gapRepairPendingRef` is the one-shot pending marker between the gap
-  // arm initiating the repair and the repair attach's install (the next
-  // install consumes it).
-  const generationGapFreeRef = useRef(true)
-  const generationSuppressCleanResetRef = useRef(false)
-  const gapRepairPendingRef = useRef(false)
-  // Clean-restore convergence evidence for the CURRENT attach generation
-  // (the round-2 empty-reconnect bound): the streak resets ONLY on
-  // cursor-CONFIRMED convergence — an `attach.ready` whose
-  // `effectiveSinceSeq` equals THIS client's requested sinceSeq (the
-  // server confirmed the client's surface cursor) — or on a completed
-  // session that actually advanced surface coverage (the baseline ref
-  // below). A mere empty-window attach.ready WITHOUT cursor confirmation
-  // is not progress and must not reset the progressless streak.
-  const generationCursorConfirmedRef = useRef(false)
-  // The surface-coverage cursor at THIS generation's attach mint: a
-  // completion may count as a clean restore only if the session actually
-  // DELIVERED coverage past this baseline (an empty reconnect that
-  // delivered nothing cannot claim a converged restore on its own).
-  const generationCoverageBaselineRef = useRef(0)
   // Delivery-loss repair fallback (responsive-terminal-restore WS3): the
   // attach generation of a full-hydrate repair that must NOT clear the
   // viewport at attach time — the surface is replaced only when that
@@ -3167,44 +3139,17 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       pendingSinceSeq: 0,
       pendingReason: 'initial_hydrate',
     }
-    // Clean-restore success (WS2, round-2 precision): a completion on a
-    // gap-free, non-repair generation is a SUCCESSFUL restore — and
-    // therefore resets the progressless streak — ONLY when it is
-    // CONVERGENCE EVIDENCE: either the server CONFIRMED the client's
-    // surface cursor (this generation's attach.ready carried an
-    // effectiveSinceSeq equal to the requested sinceSeq, with no gap), or
-    // the completed session actually DELIVERED coverage past its
-    // attach-mint baseline. A mere empty-window attach.ready without
-    // cursor confirmation delivers nothing and confirms nothing — it is
-    // NOT progress, and a reconnect cycle of them must still exhaust the
-    // bound. The gap-tainted completion paths (retention/delivery gaps,
-    // stream-identity mismatches) call this with generationGapFreeRef
-    // false, so broken cycles still exhaust regardless.
-    if (
-      currentAttachRef.current
-      && generationGapFreeRef.current
-      && !generationSuppressCleanResetRef.current
-      && (
-        generationCursorConfirmedRef.current
-        || surfaceCoverageSeqRef.current > generationCoverageBaselineRef.current
-      )
-    ) {
-      const terminalId = currentAttachRef.current.terminalId
-      const attachRequestId = currentAttachRef.current.requestId
-      const wasExhausted = recoveryAccountingRef.current.exhausted
-      const attemptsBefore = recoveryAccountingRef.current.attempts
-      if (attemptsBefore > 0 || wasExhausted) {
-        recoveryAccountingRef.current = recordRecoveryRestoreSuccess(recoveryAccountingRef.current)
-        if (wasExhausted) {
-          setRecoveryExhausted(false)
-        }
-        recordTerminalPerfAuditEvent('terminal.restore.recovery_success', {
-          terminalId,
-          attachRequestId,
-          attempts: attemptsBefore,
-        })
-      }
-    }
+    // Round-4 reversal to plan:166's literal rule: the progressless
+    // streak resets ONLY on genuine parser progress (an ADVANCE of the
+    // applied surface — recorded at the frame-application site through
+    // recordRecoveryProgress) or an explicit user retry
+    // (resetRecoveryAccounting). Receiving attach.ready or another
+    // reconnect — however clean, cursor-confirmed, or gap-free — is NOT
+    // progress and must never reset the accounting: a converged idle
+    // pane's flap cycle exhausts to the visible retry strip exactly
+    // like any other progressless cycle (the empty-window ready path
+    // calling this is the plan's own example). The 81566b88f/40afe39b7
+    // ready-keyed reset contradicted the plan's sentence and is removed.
     const queue = getHydrationQueue()
     if (hiddenRef.current) {
       queue.onHydrationComplete(paneId)
@@ -3223,9 +3168,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     reason: string
     invalidReason?: string
   }) => {
-    // A known lost range taints the current attach generation: its
-    // completion is not a clean restore (no streak reset).
-    generationGapFreeRef.current = false
     const previousSeqState = seqStateRef.current
     const explicitFromSeq = input.fromSeq
     const explicitToSeq = input.toSeq
@@ -3387,9 +3329,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       ? msg.seqEnd
       : (typeof msg.toSeq === 'number' ? msg.toSeq : undefined)
     if (typeof fromSeq === 'number' && typeof toSeq === 'number') {
-      // A stream-identity-mismatch loss taints the current generation:
-      // its completion is not a clean restore (no streak reset).
-      generationGapFreeRef.current = false
       const previousSeqState = seqStateRef.current
       const gapDecision = onOutputGap(previousSeqState, { fromSeq, toSeq })
       const nextSeqState = gapDecision.state
@@ -3680,20 +3619,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       ? beginPacedReplayConsumption({ terminalId: tid, attachRequestId, sinceSeq })
       : null
 
-    // Re-arm the clean-restore taint tracking for the NEW generation: it
-    // starts gap-free, and consumes the one-shot gap-repair pending marker
-    // (a repair generation's clean completion does not refund the streak —
-    // repeated gaps must still exhaust to the retry strip).
-    generationGapFreeRef.current = true
-    generationSuppressCleanResetRef.current = gapRepairPendingRef.current
-    gapRepairPendingRef.current = false
-    // Clean-restore convergence evidence starts EMPTY for the new
-    // generation: no cursor confirmation yet, and the coverage baseline
-    // this session must beat (deliver past) is the cursor as of THIS
-    // attach mint. An empty reconnect that confirms nothing and delivers
-    // nothing is not convergence evidence (round-2 empty-reconnect bound).
-    generationCursorConfirmedRef.current = false
-    generationCoverageBaselineRef.current = surfaceCoverageSeqRef.current
     // Per-generation deferred content reset (delivery-loss repair
     // fallback): armed only for the hydrate that asked to defer its
     // viewport clear until its content establishes the new baseline.
@@ -4857,10 +4782,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             // forward across sequences no gap frame declared. The seq state
             // already folded the hole (known lost range + quarantine, the
             // applied cursor pinned below it); surface it honestly — the
-            // generation is gap-tainted, the quarantine is observable, and
-            // a local notice names the exact lost range. Never a silent
-            // applied-cursor advance.
-            generationGapFreeRef.current = false
+            // quarantine is observable, and a local notice names the
+            // exact lost range. Never a silent applied-cursor advance.
             for (const implicitGap of batchDecision.implicitGaps) {
               recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
                 terminalId: tid,
@@ -4979,10 +4902,8 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             // forward across sequences no gap frame declared. The seq state
             // already folded the hole (known lost range + quarantine, the
             // applied cursor pinned below it); surface it honestly — the
-            // generation is gap-tainted, the quarantine is observable, and
-            // a local notice names the exact lost range. Never a silent
-            // applied-cursor advance.
-            generationGapFreeRef.current = false
+            // quarantine is observable, and a local notice names the exact
+            // lost range. Never a silent applied-cursor advance.
             recordTerminalPerfAuditEvent('terminal.catchup.surface_quarantined', {
               terminalId: tid,
               attachRequestId: msg.attachRequestId,
@@ -5127,10 +5048,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
                 : 'slow link backlog'
             writeLocalXtermNotice(term, `\r\n[Output gap ${msg.fromSeq}-${msg.toSeq}: ${reason}]\r\n`)
           }
-          // The generation is gap-tainted from here on: any completion it
-          // reaches is NOT a clean restore (the clean-restore streak reset
-          // must never fire for it).
-          generationGapFreeRef.current = false
           const previousSeqState = seqStateRef.current
           const gapDecision = onOutputGap(previousSeqState, { fromSeq: msg.fromSeq, toSeq: msg.toSeq })
           const nextSeqState = gapDecision.state
@@ -5195,9 +5112,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               toSeq: msg.toSeq,
               reason: msg.reason,
             })
-            // The repair generation must not refund the streak on a clean
-            // completion: repeated gaps still exhaust to the retry strip.
-            gapRepairPendingRef.current = true
             // The gap's local-notice invalidation bumped the surface
             // epoch; re-save the quarantined surface's pinned cursor under
             // the new epoch so the delta repair's checkpoint decision
@@ -5379,21 +5293,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               streamId: readyStreamId,
               geometryAuthority: readyGeometryAuthority,
               geometryEpoch: readyGeometryEpoch,
-            }
-            // Cursor-CONFIRMED convergence (round-2 empty-reconnect
-            // bound): this generation's ready says the server resumed
-            // from EXACTLY the sinceSeq this client requested — the
-            // client's surface cursor is valid and the pane is converged
-            // at the server. Recorded here (not at completion time) so
-            // every completion path (empty-window ready, session
-            // completion) can consult it. A ready without
-            // effectiveSinceSeq (the legacy shape) or with an adjusted
-            // baseline (retention loss, a rewound head) confirms nothing.
-            if (
-              typeof msg.effectiveSinceSeq === 'number'
-              && msg.effectiveSinceSeq === activeAttach.sinceSeq
-            ) {
-              generationCursorConfirmedRef.current = true
             }
           }
           if (readyStreamId) {
