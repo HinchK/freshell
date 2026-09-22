@@ -13299,7 +13299,7 @@ mod tests {
 
         // The EARLIER turn: a REAL send drive, parked on daemon-busy status
         // polls (daemon_busy holds — the drive can never settle on its own,
-        // so the interrupt's live-turn sample deterministically sees it).
+        // so it is deterministically still live when the interrupt takes it).
         st.handle_send(send_msg(placeholder, "first")).await;
         tokio::time::sleep(Duration::from_millis(25)).await;
 
@@ -13318,8 +13318,8 @@ mod tests {
 
         // Deterministic wait: the fake's `abort_started` knob flips the
         // moment the interrupt's take block finished and the RPC leg began —
-        // the take-block live-turn sample necessarily already saw the earlier
-        // drive LIVE (it cannot settle while daemon_busy holds).
+        // the earlier drive is necessarily still live at that point (it
+        // cannot settle while daemon_busy holds).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         while !http.abort_started.load(Ordering::SeqCst) {
             assert!(
