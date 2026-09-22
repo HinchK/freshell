@@ -188,6 +188,42 @@ check "e2e build lane under a real TTY leaves prompts enabled" \
     ! grep -q "PROMPTS_DISABLED=1" "$2"
   ' _ "$FAKE_DIR" "$FAKE_GCLOUD_LOG"
 
+# Check 21 (kata e83z delta review F2): the DIRECT build lane must surface
+# loud dirty-tree state when the -dirty image path is taken. `build` computes
+# the same `-dirty` sentinel tag the run lane warns about, and a direct
+# `npm run test:cloud:build` on a dirty tree must lead the build work with the
+# same WARNING shape (the run lane's own WARNING is pinned by V10/W15c).
+# Hermetic dirty-forcing: a temporary untracked file (untracked counts as
+# dirty — the image bakes the working tree), removed right after the runs.
+BUILD_DIRTY_MARKER="$ROOT/.cloud-build-dirty-check-$$"
+touch "$BUILD_DIRTY_MARKER"
+
+rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
+VITEST_BUILD_DIRTY_OUT=$(env PATH="$FAKE_DIR:$PATH" bash scripts/vitest-cloud.sh build 2>&1 </dev/null) && VB_RC=0 || VB_RC=$?
+check "vitest build lane on a dirty tree: loud WARNING precedes the build work" \
+  bash -c '
+    [ "$1" = "0" ] &&
+    grep -q "WARNING: dirty worktree" <<<"$2" &&
+    grep -q "not content-addressed" <<<"$2" &&
+    warn="$(grep -n "WARNING: dirty worktree" <<<"$2" | head -1 | cut -d: -f1)" &&
+    build="$(grep -n "Building Docker image" <<<"$2" | head -1 | cut -d: -f1)" &&
+    [ -n "$warn" ] && [ -n "$build" ] && [ "$warn" -lt "$build" ]
+  ' _ "$VB_RC" "$VITEST_BUILD_DIRTY_OUT"
+
+rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
+E2E_BUILD_DIRTY_OUT=$(env PATH="$FAKE_DIR:$PATH" bash scripts/e2e-cloud.sh build 2>&1 </dev/null) && EB_RC=0 || EB_RC=$?
+check "e2e build lane on a dirty tree: loud WARNING precedes the build work" \
+  bash -c '
+    [ "$1" = "0" ] &&
+    grep -q "WARNING: dirty worktree" <<<"$2" &&
+    grep -q "not content-addressed" <<<"$2" &&
+    warn="$(grep -n "WARNING: dirty worktree" <<<"$2" | head -1 | cut -d: -f1)" &&
+    build="$(grep -n "Building Docker image" <<<"$2" | head -1 | cut -d: -f1)" &&
+    [ -n "$warn" ] && [ -n "$build" ] && [ "$warn" -lt "$build" ]
+  ' _ "$EB_RC" "$E2E_BUILD_DIRTY_OUT"
+
+rm -f "$BUILD_DIRTY_MARKER"
+
 # Cleanup
 rm -rf "$FAKE_DIR"
 

@@ -281,6 +281,15 @@ cmd_build() {
     exit 1
   fi
 
+  # kata e83z (delta review F2): a direct `build` computes the same `-dirty`
+  # sentinel tag the run lane warns about — surface it loudly HERE too, so
+  # the direct build path leads its build work with the same WARNING shape
+  # (cmd_run's own WARNING stays put; its rebuild path re-enters here and the
+  # first occurrence is what the ordering checks pin).
+  if [[ "$tag" == *-dirty ]]; then
+    echo "[e2e-cloud] WARNING: dirty worktree - image tag ${tag} is not content-addressed; this build bakes the uncommitted tree and the result is not reusable."
+  fi
+
   if $local_build; then
     echo "[e2e-cloud] Building Docker image locally (tag: $tag)..."
     docker build -f "$ROOT/docker/cloud-run/Dockerfile" \
