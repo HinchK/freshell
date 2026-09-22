@@ -1038,6 +1038,20 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const generationGapFreeRef = useRef(true)
   const generationSuppressCleanResetRef = useRef(false)
   const gapRepairPendingRef = useRef(false)
+  // Clean-restore convergence evidence for the CURRENT attach generation
+  // (the round-2 empty-reconnect bound): the streak resets ONLY on
+  // cursor-CONFIRMED convergence — an `attach.ready` whose
+  // `effectiveSinceSeq` equals THIS client's requested sinceSeq (the
+  // server confirmed the client's surface cursor) — or on a completed
+  // session that actually advanced surface coverage (the baseline ref
+  // below). A mere empty-window attach.ready WITHOUT cursor confirmation
+  // is not progress and must not reset the progressless streak.
+  const generationCursorConfirmedRef = useRef(false)
+  // The surface-coverage cursor at THIS generation's attach mint: a
+  // completion may count as a clean restore only if the session actually
+  // DELIVERED coverage past this baseline (an empty reconnect that
+  // delivered nothing cannot claim a converged restore on its own).
+  const generationCoverageBaselineRef = useRef(0)
   // Delivery-loss repair fallback (responsive-terminal-restore WS3): the
   // attach generation of a full-hydrate repair that must NOT clear the
   // viewport at attach time — the surface is replaced only when that
@@ -3091,17 +3105,27 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       pendingSinceSeq: 0,
       pendingReason: 'initial_hydrate',
     }
-    // Clean-restore success (WS2): a completion on a generation that
-    // received its attach.ready, stayed gap-free, and was not a
-    // gap-initiated repair is a SUCCESSFUL restore, not stagnation — an
-    // idle converged pane's ordinary empty-delta reconnects must never
-    // strand it on the retry strip. The gap-tainted completion paths
-    // (retention/delivery gaps, stream-identity mismatches) call this with
-    // generationGapFreeRef false, so broken cycles still exhaust the bound.
+    // Clean-restore success (WS2, round-2 precision): a completion on a
+    // gap-free, non-repair generation is a SUCCESSFUL restore — and
+    // therefore resets the progressless streak — ONLY when it is
+    // CONVERGENCE EVIDENCE: either the server CONFIRMED the client's
+    // surface cursor (this generation's attach.ready carried an
+    // effectiveSinceSeq equal to the requested sinceSeq, with no gap), or
+    // the completed session actually DELIVERED coverage past its
+    // attach-mint baseline. A mere empty-window attach.ready without
+    // cursor confirmation delivers nothing and confirms nothing — it is
+    // NOT progress, and a reconnect cycle of them must still exhaust the
+    // bound. The gap-tainted completion paths (retention/delivery gaps,
+    // stream-identity mismatches) call this with generationGapFreeRef
+    // false, so broken cycles still exhaust regardless.
     if (
       currentAttachRef.current
       && generationGapFreeRef.current
       && !generationSuppressCleanResetRef.current
+      && (
+        generationCursorConfirmedRef.current
+        || surfaceCoverageSeqRef.current > generationCoverageBaselineRef.current
+      )
     ) {
       const terminalId = currentAttachRef.current.terminalId
       const attachRequestId = currentAttachRef.current.requestId
@@ -3601,6 +3625,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     generationGapFreeRef.current = true
     generationSuppressCleanResetRef.current = gapRepairPendingRef.current
     gapRepairPendingRef.current = false
+    // Clean-restore convergence evidence starts EMPTY for the new
+    // generation: no cursor confirmation yet, and the coverage baseline
+    // this session must beat (deliver past) is the cursor as of THIS
+    // attach mint. An empty reconnect that confirms nothing and delivers
+    // nothing is not convergence evidence (round-2 empty-reconnect bound).
+    generationCursorConfirmedRef.current = false
+    generationCoverageBaselineRef.current = surfaceCoverageSeqRef.current
     // Per-generation deferred content reset (delivery-loss repair
     // fallback): armed only for the hydrate that asked to defer its
     // viewport clear until its content establishes the new baseline.
@@ -5222,6 +5253,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               streamId: readyStreamId,
               geometryAuthority: readyGeometryAuthority,
               geometryEpoch: readyGeometryEpoch,
+            }
+            // Cursor-CONFIRMED convergence (round-2 empty-reconnect
+            // bound): this generation's ready says the server resumed
+            // from EXACTLY the sinceSeq this client requested — the
+            // client's surface cursor is valid and the pane is converged
+            // at the server. Recorded here (not at completion time) so
+            // every completion path (empty-window ready, session
+            // completion) can consult it. A ready without
+            // effectiveSinceSeq (the legacy shape) or with an adjusted
+            // baseline (retention loss, a rewound head) confirms nothing.
+            if (
+              typeof msg.effectiveSinceSeq === 'number'
+              && msg.effectiveSinceSeq === activeAttach.sinceSeq
+            ) {
+              generationCursorConfirmedRef.current = true
             }
           }
           if (readyStreamId) {

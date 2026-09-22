@@ -4,9 +4,23 @@
  * attach/hydrate cycling.
  *
  * The progress signal is the SURFACE COVERAGE CURSOR — genuine consumption of
- * stream content (applied or fully pre-filtered). Receiving `attach.ready` or
- * another reconnect is NOT progress. The accounting resets on genuine
- * coverage progress or an explicit user retry; it NEVER triggers a kill, a
+ * stream content (applied or fully pre-filtered). Receiving a RECONNECT is
+ * not progress by itself; what a cycle ACCOMPLISHES is:
+ * - an `attach.ready` IS convergence evidence only when it CONFIRMS the
+ *   client's surface cursor — its `effectiveSinceSeq` equals the sinceSeq
+ *   the client requested, with no gap in the generation (the server
+ *   validated the checkpoint and says the pane is caught up); an
+ *   empty-window ready WITHOUT that confirmation (the legacy ready shape,
+ *   or a retention-adjusted / rewound baseline) delivers nothing and
+ *   confirms nothing — it is NOT progress;
+ * - a completed session IS a clean restore when it actually delivered
+ *   coverage past its attach-mint baseline (or confirmed the cursor as
+ *   above); a gap-tainted generation is never a clean restore.
+ * Clean, cursor-confirmed convergence resets the progressless streak
+ * (the `recordRecoveryRestoreSuccess` entry point — a converged idle
+ * pane's ordinary confirmed flaps must never strand it on the retry
+ * strip); anything else — no ready, gaps, unconfirmed empty reconnects —
+ * accumulates to the bound. The accounting NEVER triggers a kill, a
  * replacement, or an identity change — reaching the bound only stops
  * automatic attaches and shows a visible retry state.
  *
@@ -82,15 +96,19 @@ export function recordRecoveryProgress(
 }
 
 /**
- * Record a CLEAN, COMPLETED restore: attach.ready received, the attach's
- * window completed, and no gap quarantined the generation. Restore SUCCESS
- * is distinct from stagnation — a converged pane's ordinary empty-delta
- * reconnects deliver no new coverage bytes, yet each one proves the
- * surface is valid and live; charging them as progressless attempts
- * strands a healthy pane on the retry strip after N ordinary flaps
- * (WS2's bound targets broken restore CYCLES — no ready, gaps, failures —
- * not successful restores). Resets the progressless streak and clears
- * exhaustion; the coverage record (lastProgressSeq) and the
+ * Record a CLEAN, CONVERGED restore completion: either the generation's
+ * `attach.ready` confirmed the client's surface cursor
+ * (`effectiveSinceSeq` == the requested sinceSeq, no gap) or the
+ * completed session delivered coverage past its attach-mint baseline
+ * (the caller in TerminalView gates on exactly that evidence before
+ * calling). Restore SUCCESS is distinct from stagnation — a converged
+ * pane's ordinary confirmed empty-delta reconnects deliver no new
+ * coverage bytes, yet each one proves the surface is valid and
+ * server-confirmed; charging them as progressless attempts strands a
+ * healthy pane on the retry strip after N ordinary flaps (WS2's bound
+ * targets broken restore CYCLES — no ready, gaps, UNCONFIRMED empty
+ * reconnects — not successful restores). Resets the progressless streak
+ * and clears exhaustion; the coverage record (lastProgressSeq) and the
  * initial-attach exemption are untouched.
  */
 export function recordRecoveryRestoreSuccess(
