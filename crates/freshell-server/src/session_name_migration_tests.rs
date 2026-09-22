@@ -453,6 +453,204 @@ async fn known_automatic_rows_keep_their_source() {
     drop(tmp);
 }
 
+// ---------------------------------------------------------------------------
+// Delta-review round 4, finding 1 — kilroy-mode rows stay in the legacy lane
+// ---------------------------------------------------------------------------
+
+/// A KILROY-MODE override row (the metadata store types its session kilroy;
+/// the row's provider string is `claude`) stays in the legacy lane: the
+/// consolidation never imports it into a canonical record — never the
+/// Global Constraint's forbidden competing Kilroy record — and never makes
+/// it a cleanup target, so the title fields the sweep still writes for
+/// kilroy keep serving kilroy's existing UI verbatim.
+#[tokio::test]
+async fn kilroy_mode_override_rows_stay_legacy_never_imported_or_cleaned() {
+    let (tmp, home) = fresh_home();
+    seed_config(
+        &home,
+        json!({
+            "claude:k1": { "titleOverride": "Kilroy Label", "titleSource": "user",
+                           "summaryOverride": "keep", "archived": true },
+        }),
+        json!({}),
+    );
+    let settings = Arc::new(store_at(&home));
+    let names = open_store(&home).await;
+    let metadata = open_metadata(&home).await;
+    metadata
+        .set("claude", "k1", "kilroy", Some("explicit"))
+        .await
+        .unwrap();
+    run_session_name_consolidation(consolidation_inputs(
+        &home,
+        names.clone(),
+        settings.clone(),
+        metadata.clone(),
+        TerminalIdentityRegistry::new(),
+    ))
+    .await;
+
+    // Never a competing kilroy record.
+    assert!(
+        record_of(&names, NamedProvider::Claude, "k1")
+            .await
+            .is_none(),
+        "a kilroy-mode row never enters the naming authority"
+    );
+    // The legacy row survives verbatim — title fields intact (never a
+    // cleanup target), non-title fields untouched.
+    let row = settings
+        .session_overrides()
+        .get("claude:k1")
+        .cloned()
+        .expect("the kilroy row survives the consolidation");
+    assert_eq!(row["titleOverride"], json!("Kilroy Label"));
+    assert_eq!(row["titleSource"], json!("user"));
+    assert_eq!(row["summaryOverride"], json!("keep"));
+    assert_eq!(row["archived"], json!(true));
+    drop(tmp);
+}
+
+/// The singular-name half (the plan's Global Constraint): a session the
+/// metadata ALSO types kilroy, but whose canonical record already exists
+/// through the claude mode (the dual-mode scenario — here the record a
+/// landed earlier path left), still migrates its legacy row exactly like
+/// any scoped row: the user title wins into the ONE canonical record, the
+/// migrated title fields are cleaned, and the exclusion can never be
+/// per-underlying-session — only per kilroy-ONLY evidence.
+#[tokio::test]
+async fn a_dual_mode_session_with_a_canonical_record_still_migrates_its_legacy_row() {
+    let (tmp, home) = fresh_home();
+    seed_config(
+        &home,
+        json!({
+            "claude:d1": { "titleOverride": "Dual Mode Rename", "titleSource": "user",
+                           "summaryOverride": "keep" },
+        }),
+        json!({}),
+    );
+    let settings = Arc::new(store_at(&home));
+    let names = open_store(&home).await;
+    let metadata = open_metadata(&home).await;
+    // The canonical record through the claude mode (the index-adopted
+    // hydration path), BEFORE the boot consolidation runs — the operative
+    // dual-mode evidence at migration time.
+    names
+        .hydrate_indexed(
+            crate::session_name_generation::IndexedNameInput {
+                provider: NamedProvider::Claude,
+                session_id: "d1".to_string(),
+                cwd: Some("/p".to_string()),
+                first_user_message: Some("Scoped first".to_string()),
+                provider_title: None,
+            },
+            false,
+        )
+        .await
+        .unwrap();
+    metadata
+        .set("claude", "d1", "kilroy", Some("explicit"))
+        .await
+        .unwrap();
+    run_session_name_consolidation(consolidation_inputs(
+        &home,
+        names.clone(),
+        settings.clone(),
+        metadata.clone(),
+        TerminalIdentityRegistry::new(),
+    ))
+    .await;
+
+    // The legacy row still migrated: the proven user rename won into the
+    // ONE canonical record...
+    let record = record_of(&names, NamedProvider::Claude, "d1")
+        .await
+        .expect("the canonical record keeps owning the dual-mode session");
+    assert_eq!(record.record.name, "Dual Mode Rename");
+    assert_eq!(record.record.source, NameSource::Manual);
+    // ...the migrated title fields were cleaned (the existing suppression
+    // logic still works)...
+    let row = settings
+        .session_overrides()
+        .get("claude:d1")
+        .cloned()
+        .expect("the row itself survives (never a whole-row delete)");
+    assert!(row.get("titleOverride").is_none(), "cleaned row: {row}");
+    assert!(row.get("titleSource").is_none(), "cleaned row: {row}");
+    // ...and the never-migrated fields survive.
+    assert_eq!(row["summaryOverride"], json!("keep"));
+    drop(tmp);
+}
+
+/// The boot-loop half of the same defect: the sweep still writes
+/// legacy-ladder titles for kilroy-only sessions, so after the receipt
+/// commits a FRESH kilroy title is post-migration evidence. The next
+/// boot's re-consolidation must not absorb it as "late legacy evidence" —
+/// no backup-and-wipe, the row stays live in the legacy lane.
+#[tokio::test]
+async fn post_migration_kilroy_titles_survive_the_late_evidence_pass() {
+    let (tmp, home) = fresh_home();
+    seed_config(&home, json!({}), json!({}));
+    let settings = Arc::new(store_at(&home));
+    let names = open_store(&home).await;
+    let metadata = open_metadata(&home).await;
+    metadata
+        .set("claude", "k1", "kilroy", Some("explicit"))
+        .await
+        .unwrap();
+    let run = || {
+        run_session_name_consolidation(consolidation_inputs(
+            &home,
+            names.clone(),
+            settings.clone(),
+            metadata.clone(),
+            TerminalIdentityRegistry::new(),
+        ))
+    };
+    run().await;
+    assert!(
+        names.migration_completed(),
+        "the receipt committed on the first boot"
+    );
+
+    // The sweep's legacy ladder writes a fresh kilroy title
+    // POST-migration (kilroy keeps its existing behavior).
+    settings
+        .patch_session_override(
+            "claude:k1",
+            &[
+                ("titleOverride", Some(json!("Fresh Kilroy Title"))),
+                ("titleSource", Some(json!("first-message"))),
+            ],
+        )
+        .await;
+
+    // The next boot must NOT treat it as late legacy evidence.
+    run().await;
+    let row = settings
+        .session_overrides()
+        .get("claude:k1")
+        .cloned()
+        .expect("the kilroy title survives the late-evidence pass");
+    assert_eq!(row["titleOverride"], json!("Fresh Kilroy Title"));
+    assert_eq!(row["titleSource"], json!("first-message"));
+    let late_dir = home
+        .join(".freshell")
+        .join(NAME_MIGRATION_DIR_NAME)
+        .join("late-legacy-evidence");
+    assert!(
+        !late_dir.exists(),
+        "a kilroy-mode row is never late legacy evidence"
+    );
+    assert!(
+        record_of(&names, NamedProvider::Claude, "k1")
+            .await
+            .is_none(),
+        "the late pass never mints a canonical record either"
+    );
+    drop(tmp);
+}
+
 /// Scope + evidence-key tie-breaks: session > pane > source_tab > terminal >
 /// derived, then ascending evidenceKey — the same winner from either import
 /// order.

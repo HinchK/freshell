@@ -50,10 +50,11 @@
 //! requires an approved stopped scratch/maintenance restore; automatic
 //! rollback is not part of this feature.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use freshell_freshagent::naming::SessionNaming;
 use freshell_protocol::session_names::{
     legacy_name_candidate_id, LegacyCandidateIdInput, LegacyCandidateScope, LegacyEvidenceEnvelope,
     LegacyNameCandidate, LegacyNameImport, LegacyNameTarget, LegacyProtectionEvidence, NameSource,
@@ -110,8 +111,14 @@ pub(crate) async fn run_session_name_consolidation(inputs: SessionNameConsolidat
         snapshots_dir,
     } = inputs;
 
-    let mut evidence =
-        gather_legacy_evidence(&settings, &metadata, &identity, snapshots_dir.as_deref()).await;
+    let mut evidence = gather_legacy_evidence(
+        &settings,
+        &metadata,
+        &identity,
+        &names,
+        snapshots_dir.as_deref(),
+    )
+    .await;
 
     // The immutable server backup: durable create-once, byte-equivalent
     // original content plus the ambiguous/unresolved evidence index. A
@@ -312,10 +319,34 @@ pub(crate) struct SessionNameConsolidationInputs {
 /// Gather every supported legacy title-evidence source for the scoped
 /// providers. Missing files mean no evidence; a corrupt source is retained
 /// verbatim in the backup and diagnosed, never silently replaced.
+///
+/// Delta-review round 4, finding 1: the KILROY-MODE rows among the
+/// candidates are excluded by the shared kilroy-lane seam
+/// (`crate::kilroy_lane`) — a kilroy-only session never imports (never the
+/// Global Constraint's forbidden competing Kilroy record) and is never a
+/// cleanup target, so its rows stay in the legacy lane the sweep still
+/// serves. The dual-mode reasoning (the Global Constraint's singular-name
+/// rule, made explicit): the exclusion is per-ROW — a row is excluded only
+/// when its session is kilroy-ONLY, i.e. metadata-typed kilroy AND holding
+/// NO canonical record. At consolidation time the identity ledger is empty
+/// (the boot runs before any terminal restore), so the live-scoped-terminal
+/// component is vacuous and the RECORD is the operative dual-mode evidence:
+/// a session whose canonical record already exists (a previously landed
+/// chunk of this same migration, an earlier boot's sweep hydration, a
+/// create-lane bind) is NOT kilroy-only — its legacy rows still import and
+/// clean exactly like any scoped row, the supported-mode record keeps
+/// owning its ONE singular name, and no second record is ever minted. A
+/// first-boot kilroy-typed row with no other evidence stays legacy, which
+/// matches the sweep's judgment of that same instant; if the session later
+/// opens through a supported mode, the sweep hydrates it as scoped and the
+/// directory's lane closes on the record — the retained legacy string
+/// stays recoverable through the immutable `server.json` backup and a
+/// deliberate canonical rename.
 async fn gather_legacy_evidence(
     settings: &SettingsStore,
     metadata: &SessionMetadataStore,
     identity: &TerminalIdentityRegistry,
+    names: &Arc<SessionNames>,
     snapshots_dir: Option<&Path>,
 ) -> LegacyEvidence {
     let mut evidence = LegacyEvidence {
@@ -328,23 +359,57 @@ async fn gather_legacy_evidence(
         raw_sources: Map::new(),
     };
 
-    gather_session_overrides(settings, &mut evidence);
+    let overrides = settings.session_overrides();
+    let metadata_entries = metadata.get_all().await;
+    let kilroy_only = {
+        let mut candidates: Vec<crate::kilroy_lane::KilroyLaneCandidate> = Vec::new();
+        for key in overrides.keys().chain(metadata_entries.keys()) {
+            let Some((provider, session_id)) = key.split_once(':') else {
+                continue;
+            };
+            candidates.push(crate::kilroy_lane::KilroyLaneCandidate {
+                provider: provider.to_string(),
+                session_id: session_id.to_string(),
+                cwd: None, // config/metadata rows carry no cwd
+            });
+        }
+        let naming: Arc<dyn SessionNaming> = names.clone();
+        crate::kilroy_lane::kilroy_only_keys(
+            &metadata_entries,
+            Some(&naming),
+            identity,
+            // No terminal registry at consolidation time — see the doc
+            // comment above for why the record component is the operative
+            // dual-mode evidence here.
+            None,
+            &candidates,
+        )
+        .await
+    };
+
+    gather_session_overrides(&overrides, &kilroy_only, &mut evidence);
     let snapshot_pane_terminals = gather_snapshot_evidence(snapshots_dir, &mut evidence);
     gather_terminal_overrides(settings, identity, &snapshot_pane_terminals, &mut evidence);
-    gather_metadata_derived_titles(metadata, &mut evidence).await;
+    gather_metadata_derived_titles(&metadata_entries, &kilroy_only, &mut evidence);
     evidence
 }
 
 /// `config.sessionOverrides` — the old durable session-title ladder. Only
 /// the three scoped providers migrate; every other provider's rows stay
-/// untouched (Kilroy, Amplifier, Gemini, …).
-fn gather_session_overrides(settings: &SettingsStore, evidence: &mut LegacyEvidence) {
-    let overrides = settings.session_overrides();
+/// untouched (Amplifier, Gemini, …), and — since delta-review round 4,
+/// finding 1 — the KILROY-MODE rows among the scoped providers stay in the
+/// legacy lane too (never a candidate, never a cleanup target), keeping
+/// the module's "Kilroy rows stay untouched" contract true.
+fn gather_session_overrides(
+    overrides: &Map<String, Value>,
+    kilroy_only: &HashSet<String>,
+    evidence: &mut LegacyEvidence,
+) {
     evidence.raw_sources.insert(
         "config.sessionOverrides".to_string(),
         Value::Object(overrides.clone()),
     );
-    for (key, row) in &overrides {
+    for (key, row) in overrides {
         let Some((provider, session_id)) = key.split_once(':') else {
             // A key with no ':' is a legacy pre-provider row ("claude" by
             // Node's convention). It is out of the three scoped providers'
@@ -352,6 +417,11 @@ fn gather_session_overrides(settings: &SettingsStore, evidence: &mut LegacyEvide
             continue;
         };
         if freshell_freshagent::naming::named_provider_for(Some(provider), None).is_none() {
+            continue;
+        }
+        // A kilroy-mode row keeps the legacy lane — the sweep still writes
+        // and reads these titles for kilroy's existing UI.
+        if kilroy_only.contains(key) {
             continue;
         }
         let has_title_fields =
@@ -745,18 +815,23 @@ pub(crate) fn resolve_terminal_identity(
 /// `session-metadata.json` `derivedTitle` fields: the indexer's parsed
 /// provider-title fallback ("genuinely active" = non-empty), at derived
 /// scope and provider-AI rank — never rename recency, never protection.
-async fn gather_metadata_derived_titles(
-    metadata: &SessionMetadataStore,
+/// Delta-review round 4, finding 1: a KILROY-MODE entry stays in the legacy
+/// lane — never a candidate, never a `clear_derived_title` cleanup target.
+fn gather_metadata_derived_titles(
+    entries: &HashMap<String, Value>,
+    kilroy_only: &HashSet<String>,
     evidence: &mut LegacyEvidence,
 ) {
-    let entries = metadata.get_all().await;
     let mut raw = Map::new();
-    for (key, entry) in &entries {
+    for (key, entry) in entries {
         raw.insert(key.clone(), entry.clone());
         let Some((provider, session_id)) = key.split_once(':') else {
             continue;
         };
         if freshell_freshagent::naming::named_provider_for(Some(provider), None).is_none() {
+            continue;
+        }
+        if kilroy_only.contains(key) {
             continue;
         }
         let Some(title) = entry
