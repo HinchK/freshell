@@ -373,30 +373,34 @@ async fn daemon_loss_re_warm_backs_off_exponentially() {
 // Plan-review round 1: a failed re-warm attempt must RETRY (the loop), not
 // give up — a transient spawn/health failure (e.g. disk pressure) must not
 // leave the daemon permanently absent until unrelated user activity.
+// Plan-review round 2: the exit watcher arms only after a SUCCESSFUL health
+// check — so the test must first start a HEALTHY daemon, make THAT daemon
+// exit (the watcher's loss path schedules the re-warm), and only then script
+// the re-warm attempts to fail-fail-succeed.
 #[tokio::test]
 async fn a_failed_re_warm_retries_until_the_daemon_starts() {
-    // Scripted spawner/health: the first two cold starts FAIL health, the
-    // third succeeds (a spawner whose fake process exits before health, then
-    // a healthy one — or an http fake scripted 500/500/200 on /global/health).
     let spawns = Arc::new(AtomicUsize::new(0));
-    let (manager, _http) = started_manager_with_failing_then_healthy(
-        /* fail_twice_then_healthy */ spawns.clone(),
+    // Scripted topology: spawn #1 healthy (watcher armed) and exits on demand;
+    // re-warm spawns #2 and #3 fail health; spawn #4 is healthy.
+    let (manager, http) = started_manager_with(
+        HealthyThenDyingThenFailFailThenHealthy::new(spawns.clone()),
         ServeConfig {
             daemon_watch_interval: Duration::from_millis(5),
             re_warm_backoff_initial_ms: 10,
             re_warm_backoff_max_ms: 50,
             ..ServeConfig::default()
         });
-    manager.ensure_started().await.expect_err("first start fails (scripted)");
-    // Drive the FIRST loss (watcher fires on the dead fake process), then the
-    // retry loop must keep trying until the scripted success:
+    manager.ensure_started().await.expect("first start is healthy");
+    make_fake_daemon_exit(&manager).await; // the unrequested exit the watcher detects
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             if manager.base_url().await.is_some() { break; }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-    }).await.expect("the re-warm loop must eventually succeed");
-    assert!(spawns.load(Ordering::SeqCst) >= 3, "failed attempts must be retried (observed {})", spawns.load(Ordering::SeqCst));
+    }).await.expect("the re-warm loop must eventually succeed (fail, fail, then healthy)");
+    assert!(spawns.load(Ordering::SeqCst) >= 4,
+        "the failed re-warm attempts must be retried (observed {} spawns: initial + 2 failures + success)",
+        spawns.load(Ordering::SeqCst));
 }
 
 // A discard (the intentional kill path) must ALSO signal daemon loss so the
@@ -493,6 +497,10 @@ fn schedule_re_warm(&self) {
             if manager.inner.shutdown.load(Ordering::SeqCst) { return; }
             match manager.ensure_started().await {
                 Ok(_) => {
+                    // Plan-review round 2 (Minor): reset the attempts counter
+                    // on success — historical incidents must not accumulate
+                    // into a permanent 60 s first delay for the NEXT loss.
+                    manager.inner.re_warm_attempts.store(0, Ordering::SeqCst);
                     tracing::info!(attempt = attempts, "freshagent.opencode.daemon_re_warm");
                     return; // started — the loop ends; the exit watcher arms again for this daemon
                 }
@@ -547,7 +555,7 @@ git commit -m "feat(opencode): daemon exit watcher, loss signal, and backoff re-
 
 **Interfaces:**
 - Consumes: Task 3's `subscribe_daemon_signals()` / `DaemonSignal`; `event_frame`/`emit_fresh_agent_error` (opencode_ws.rs:6068/686), `spawn_serve_bridge` (opencode_ws.rs:5971), `FreshAgentState.broadcast_tx` (lib.rs:1917), `set_manager_for_test` (lib.rs:2837), `ensure_manager` (lib.rs:2803 — the real seam; there is no `peek_or_ensure_manager`).
-- Produces: 
+- Produces:
   - A per-materialized-session typed edge on daemon loss: `freshAgent.event{provider:"opencode", sessionType:"freshopencode", event:{type:"freshAgent.error", code:"OPENCODE_DAEMON_LOST", message:"The opencode serve daemon was lost unexpectedly - it is restarting automatically."}}` — folds client-side through the EXISTING generic `sessionError` path (fresh-agent-ws.ts:514-520), showing the dismissible "Agent error:" banner and clearing busy.
   - Level-triggered bridge revival: on arming, and again on every `DaemonSignal::Started`, restart bridges that are dead/absent for materialized sessions and push `freshAgent.session.snapshot{status:"idle"}` ONLY to sessions whose bridge was actually restarted (which the client treats as snapshot-invalidating → transcript refetch). No `saw_loss` heuristic — tokio broadcast does not replay history, so revival must not depend on having seen the `Lost` edge (LB-02).
   - **The fenced attach becomes a real recovery verb (LB-05 redesign):** `handle_attach`'s dead-bridge restart arm (opencode_ws.rs:5460-5473) gains `manager.ensure_started().await` before `spawn_serve_bridge` — a map-hit fenced attach against a daemon-absent manager now respawns the shared daemon and re-bridges, exactly as `resume_durable_session` already does for map-misses. No chime: the recovery must never emit `freshAgent.turn.complete`.
@@ -734,16 +742,18 @@ git commit -m "feat(freshopencode): daemon-loss self-heal edge, respawn revival,
 
 **Files:**
 - Modify: `src/components/fresh-agent/FreshAgentView.tsx` (predicate beside `isLostFreshOpencodeThreadError` at ~:455-463; new arm in `handleSnapshotError` at ~:2770-2827; a one-shot guard ref; the pane-refresh attach-decision lane at ~:1718-1761 is the reuse pattern)
-- Test: `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx` (beside the 404 test at ~:1887-1930)
+- Modify: the runtime-owner store fold (the slice/action behind `src/store/selectors/runtimeOwner.ts` + the WS refusal fold at `src/lib/fresh-agent-ws.ts:224` — reuse the existing "refresh the observed fence from the refusal" action if one exists; otherwise add a minimal reducer action mirroring that fold, e.g. `applyRefusalFence({ sessionId, ownerKind, ownerGeneration })` that advances the record's generation to the refusal's while preserving its epoch)
+- Test: `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx` (beside the 404 test at ~:1887-1930; owner-record seeding follows the patterns in `test/unit/client/store/selectors-runtime-owner.test.ts`)
 
 **Interfaces:**
 - Consumes: `ApiError.details` (the full 409 body: `code`, `ownerKind`, `ownerGeneration`), `captureFreshAgentAttachmentAttempt` (the real wrapper at FreshAgentView.tsx — R-1: the pane-refresh reaction pattern at :1718-1761 is the exact reuse: bump `attachDecisionSerialRef`, capture, `sendFencedFreshAgentAttach(attempt)`), `sendFencedFreshAgentAttach` (:1262-1275), `requestSnapshotRefresh` / `requestRevealRefresh`, `selectPaneOwnerFence`.
-- Produces: on a 409 `RESTORE_UNAVAILABLE` snapshot error for a freshopencode pane whose refusal names a `fresh-agent` owner (the incident class — the pane's own stale claim; LB-05 scoped terminal owners out to the session-directory handoff door): ONE generation-fenced `freshAgent.attach` followed by a snapshot refetch. Bounded (LB-03): the ENTIRE recovery — attach + refetch — runs once per pane identity (`createRequestId` + `snapshotThreadId`); a second 409 falls through to the existing error surfaces (loadError banner / reveal error), never re-triggering fetches. When the 409 arrived on the reveal lane with `snapshotDirty` set, the recovery drives the reveal-refresh path (`requestRevealRefresh(true)`) so the success-path reveal-dirty clear can run and the "Refreshing conversation" overlay lifts (LB-04). The pane identity is NOT reset (unlike the 404 lost-thread path).
+- Produces: on a 409 `RESTORE_UNAVAILABLE` snapshot error for a freshopencode pane whose refusal names a `fresh-agent` owner (the incident class — the pane's own stale claim; LB-05 scoped terminal owners out to the session-directory handoff door): ONE generation-fenced `freshAgent.attach` whose `observedGeneration` is refreshed from the 409's own `ownerGeneration` (plan-review round 2: the fence binds to the refusal, not the possibly-stale owner record — an unfenced or stale attach is refused `FENCE_REQUIRED` and preserves the dead-end), followed by a snapshot refetch. Bounded (LB-03): the ENTIRE recovery — attach + refetch — runs once per pane identity (`createRequestId` + `snapshotThreadId`); a suppressed attach (`sendFencedFreshAgentAttach` returning false) does NOT consume the one-shot guard and does NOT refetch; a second 409 falls through to the existing error surfaces (loadError banner / reveal error), never re-triggering fetches. When the 409 arrived on the reveal lane with `snapshotDirty` set, the recovery drives the reveal-refresh path (`requestRevealRefresh(true)`) so the success-path reveal-dirty clear can run and the "Refreshing conversation" overlay lifts (LB-04). The pane identity is NOT reset (unlike the 404 lost-thread path).
 
 - [ ] **Step 1: Write the failing behavioral test**
 
 In FreshAgentView.test.tsx (draft — template is the 404 test at :1887-1930; reuse its harness: `apiMock.getFreshAgentThreadSnapshot.mockRejectedValueOnce`, `StoreBackedFreshAgentView`, `sentFreshAgentMessages`):
 
+```ts
 ```ts
 // 2026-09-20 incident (log-validated): the daemon died, the reveal GET
 // answered the typed 409 RESTORE_UNAVAILABLE for the pane's OWN stale
@@ -756,7 +766,13 @@ In FreshAgentView.test.tsx (draft — template is the 404 test at :1887-1930; re
 // Plan-review round 1: DEFER the first rejection until after the baseline is
 // read — an immediately-rejected mock races the mount fetch (the recovery
 // attach may land before the test snapshots the count).
+// Plan-review round 2: seed the runtime-owner record and make the 409 name a
+// NEWER generation — the recovery attach MUST carry the 409's generation
+// (fence bound to the refusal), or the wired server refuses it with
+// FENCE_REQUIRED and the dead-end persists. Also: reject with a real ApiError
+// instance so the banner text is the 409's own message.
 it('recovers a freshopencode pane from a snapshot 409 with one fenced attach and a refetch', async () => {
+  seedRuntimeOwnerRecord(store, { sessionId: 'ses_live', ownerKind: 'fresh-agent', epoch: 1, generation: 1 }) // follow the selectors-runtime-owner test fold patterns
   let rejectFirstSnapshot!: (error: unknown) => void
   apiMock.getFreshAgentThreadSnapshot
     .mockImplementationOnce(() => new Promise<never>((_, reject) => { rejectFirstSnapshot = reject }))
@@ -765,14 +781,15 @@ it('recovers a freshopencode pane from a snapshot 409 with one fenced attach and
   await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
   const attachCountBeforeRecovery = sentFreshAgentMessages('freshAgent.attach').length // the mount attach, settled
   await act(async () => {
-    rejectFirstSnapshot({
-      status: 409,
-      message: 'Session ses_live is still running on the server.',
-      details: { code: 'RESTORE_UNAVAILABLE', ownerKind: 'fresh-agent', ownerGeneration: 1 },
-    })
+    rejectFirstSnapshot(new ApiError(409, 'Session ses_live is still running on the server.', {
+      code: 'RESTORE_UNAVAILABLE', ownerKind: 'fresh-agent', ownerGeneration: 2,
+    }))
   })
   await waitFor(() => {
     expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(attachCountBeforeRecovery + 1) // the RECOVERY attach (LB-09)
+    const recoveryAttach = sentFreshAgentMessages('freshAgent.attach').at(-1)
+    expect(recoveryAttach?.observedEpoch).toBe(1) // the record's epoch
+    expect(recoveryAttach?.observedGeneration).toBe(2) // the 409's CURRENT generation, not the stale record's 1
   })
   await waitFor(() => {
     expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2) // exactly one recovery refetch
@@ -784,19 +801,24 @@ it('recovers a freshopencode pane from a snapshot 409 with one fenced attach and
 })
 
 it('does not loop recovery fetches on repeated 409s', async () => {
-  apiMock.getFreshAgentThreadSnapshot.mockRejectedValue({
-    status: 409, message: 'Session ses_live is still running on the server.',
-    details: { code: 'RESTORE_UNAVAILABLE', ownerKind: 'fresh-agent', ownerGeneration: 1 },
-  })
-  renderFreshAgentPane({ provider: 'opencode', sessionId: 'ses_live', status: 'connected' })
-  // Plan-review round 1: AWAIT the banner — findByText returns a promise;
-  // asserting its truthiness is always true and leaves the baseline unordered.
-  await screen.findByText(/still running on the server/i)
-  const baseline = sentFreshAgentMessages('freshAgent.attach').length
-  // Let any would-be refetch loop run (fake timers or a short flush):
-  await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
-  expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(baseline) // one recovery total, not per fetch (LB-03)
-  expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeLessThanOrEqual(3) // mount + recovery only — no loop
+  vi.useFakeTimers() // plan-review round 2: timers must be ENABLED before advancing
+  try {
+    apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(409, 'Session ses_live is still running on the server.', {
+      code: 'RESTORE_UNAVAILABLE', ownerKind: 'fresh-agent', ownerGeneration: 2,
+    }))
+    renderFreshAgentPane({ provider: 'opencode', sessionId: 'ses_live', status: 'connected' })
+    // Plan-review round 1: AWAIT the banner — findByText returns a promise.
+    // Plan-review round 2: reject with a real ApiError (an Error instance) so
+    // handleSnapshotError preserves the 409's message — plain objects render
+    // 'Failed to load session' instead.
+    await screen.findByText(/still running on the server/i)
+    const baseline = sentFreshAgentMessages('freshAgent.attach').length
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(baseline) // one recovery total, not per fetch (LB-03)
+    expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeLessThanOrEqual(3) // mount + recovery only — no loop
+  } finally {
+    vi.useRealTimers()
+  }
 })
 ```
 
@@ -844,24 +866,43 @@ In `handleSnapshotError`, after the opencode lost-404 arm and BEFORE the reveal 
 if (paneContent.provider === 'opencode' && isRestoreUnavailableSnapshotError(error)) {
   const fresh = paneContentRef.current
   const recoveryKey = `${fresh.createRequestId}:${sessionId}`
+  const refusal = (error as ApiError).details as { ownerGeneration: number }
   if (restoreUnavailableRecoveryRef.current !== recoveryKey) {
+    const previousRecoveryKey = restoreUnavailableRecoveryRef.current
     restoreUnavailableRecoveryRef.current = recoveryKey
+    // Plan-review round 2: bind the fence to the 409's CURRENT generation —
+    // refresh the observed owner fence from the refusal itself (the same
+    // fold the WS create.failed lane uses for its ownerKind/ownerGeneration/
+    // ownerEpoch fields, fresh-agent-ws.ts:224). Without this, a stale or
+    // absent owner record sends an unfenced or stale-generation attach the
+    // wired server refuses with FENCE_REQUIRED — preserving the dead-end.
+    dispatch(refreshObservedFenceFromRefusal({
+      sessionId, ownerKind: 'fresh-agent', ownerGeneration: refusal.ownerGeneration,
+    }))
     attachDecisionSerialRef.current += 1
     const attempt = captureFreshAgentAttachmentAttempt(fresh) // R-1: the real wrapper's call shape
-    sendFencedFreshAgentAttach(attempt)
-    // LB-04: a reveal-lane 409 with snapshotDirty set must refetch through
-    // the reveal path ('reveal' trigger), or the success-path reveal-dirty
-    // clear never runs and the pane hides behind the "Refreshing
-    // conversation" overlay forever. Otherwise refetch via 'manual'.
-    if (trigger === 'reveal' && snapshotDirtyRef.current) {
-      revealRefreshStartedAtRef.current = null
-      setSnapshotRevealError(null)
-      requestRevealRefresh(true)
+    const sent = sendFencedFreshAgentAttach(attempt)
+    if (!sent) {
+      // Plan-review round 2: the attach was suppressed (lifecycle superseded
+      // or attempt-key mismatch). Do NOT consume the one-shot recovery and do
+      // NOT refetch — restore the guard and fall through to the honest error
+      // surfaces below.
+      restoreUnavailableRecoveryRef.current = previousRecoveryKey
     } else {
-      setLoadError(null)
-      requestSnapshotRefresh('manual')
+      // LB-04: a reveal-lane 409 with snapshotDirty set must refetch through
+      // the reveal path ('reveal' trigger), or the success-path reveal-dirty
+      // clear never runs and the pane hides behind the "Refreshing
+      // conversation" overlay forever. Otherwise refetch via 'manual'.
+      if (trigger === 'reveal' && snapshotDirtyRef.current) {
+        revealRefreshStartedAtRef.current = null
+        setSnapshotRevealError(null)
+        requestRevealRefresh(true)
+      } else {
+        setLoadError(null)
+        requestSnapshotRefresh('manual')
+      }
+      return // recovery fired for this error — the honest error surfaces below are for SUBSEQUENT 409s only
     }
-    return // recovery fired for this error — the honest error surfaces below are for SUBSEQUENT 409s only
   }
   // Recovery already attempted for this identity: do NOT clear errors and do
   // NOT refetch again — fall through to the reveal error arm / setLoadError
@@ -869,7 +910,7 @@ if (paneContent.provider === 'opencode' && isRestoreUnavailableSnapshotError(err
 }
 ```
 
-(Adapt: the ref `restoreUnavailableRecoveryRef = useRef<string | null>(null)` beside the other reveal refs ~:800-804; `captureFreshAgentAttachmentAttempt`'s real signature follows the pane-refresh reaction lane at :1735-1739. Verify the reveal-refresh request helper's exact name/behavior (`requestRevealRefresh(true)` forces a reveal-tagged refresh) against the state machine at :2601-2624 and the arming sites ~:1233.)
+(Adapt: the ref `restoreUnavailableRecoveryRef = useRef<string | null>(null)` beside the other reveal refs ~:800-804; `captureFreshAgentAttachmentAttempt`'s real signature follows the pane-refresh reaction lane at :1735-1739; `refreshObservedFenceFromRefusal` is the reuse-or-add-mirror of the WS refusal fold at fresh-agent-ws.ts:224 — if the exact action differs in the slice, reuse it; the TEST pins the observable contract: the recovery attach carries `observedGeneration === <the 409's ownerGeneration>`. Verify the reveal-refresh request helper's exact name/behavior (`requestRevealRefresh(true)` forces a reveal-tagged refresh) against the state machine at :2601-2624 and the arming sites ~:1233.)
 
 - [ ] **Step 4: Run the focused test**
 
@@ -1017,7 +1058,7 @@ No commit (verification only). Record the gate results in the run state; the coo
 
 1. **Spec coverage:** defect 1 → Tasks 1 (compact/config no-kill, FR2 mirror); defect 2 → Task 2 (structured discard log); defect 3 → Tasks 3+4 (exit watcher + loss signal + retrying backoff re-warm + runtime fan-out edge + level-triggered bridge revival — the freshcodex-onExit mirror adapted to shared-daemon topology); defect 4 → Tasks 4a+5+6 (the fenced attach made a real recovery verb by respawning the daemon on map-hits, the client 409 arm driving it once, cloud-legal e2e). E2E coverage: Task 6 (cloud-legal client recovery) + Task 7 (local-lane real-daemon self-heal chain) + Rust unit tests (server lanes). Gates: Task 8 runs fmt/clippy/typecheck/lint + the focused suites on the final HEAD; the coordinated full suite runs at the-usual Stage-5 exit. The "backoff-guarded respawn" and "client-visible status edge" elements of defect 3 are both explicit (Task 3 re-warm config + retry loop; Task 4 `OPENCODE_DAEMON_LOST` edge).
 2. **No silent deferrals:** the deliberate residuals (prompt_async and thin wrappers keep `DiscardOnTimeout::Yes`; frozen 409 text; terminal-owner 409s recover via the session-directory handoff door; REST-only never-viewed panes miss the banner until first WS interaction) are stated in Global Constraints, each with its reason and precedent. The real-daemon e2e is local-lane with an honest CLOUD_SKIP_SPECS entry (cloud PR coverage carried by Task 6).
-3. **File and interface consistency:** all paths/signatures cross-checked against the six exploration reports at base 855dae72a, then corrected against the load-bearing ledger (LB-01 map lock order, LB-02 no-replay → level-triggered revival + arming pass, LB-03 bounded recovery, LB-04 reveal-trigger refetch, LB-05 attach-respawn redesign + fresh-agent-owner scoping, LB-06 Arc process + ownership_id, LB-07 exactly-once take, LB-08 Lagged tolerance, LB-09 attach-count delta, LB-10 state clone, R-1 `captureFreshAgentAttachmentAttempt`, N-3 `ensure_manager` seam) AND plan-review round 1 (routed `get_config(route)`, retrying re-warm with a fail-then-succeed test, single-filter cargo commands, deferred-rejection + awaited-banner client tests, dual-key dedupe, Tasks 7/8).
+3. **File and interface consistency:** all paths/signatures cross-checked against the six exploration reports at base 855dae72a, then corrected against the load-bearing ledger (LB-01 map lock order, LB-02 no-replay → level-triggered revival + arming pass, LB-03 bounded recovery, LB-04 reveal-trigger refetch, LB-05 attach-respawn redesign + fresh-agent-owner scoping, LB-06 Arc process + ownership_id, LB-07 exactly-once take, LB-08 Lagged tolerance, LB-09 attach-count delta, LB-10 state clone, R-1 `captureFreshAgentAttachmentAttempt`, N-3 `ensure_manager` seam), plan-review round 1 (routed `get_config(route)`, retrying re-warm with a fail-then-succeed test, single-filter cargo commands, deferred-rejection + awaited-banner client tests, dual-key dedupe, Tasks 7/8), AND plan-review round 2 (the re-warm retry test now starts healthy → kills the watched daemon → scripts failing re-warms; the recovery fence binds to the 409's `ownerGeneration` via the refusal-fold, suppressed attaches do not consume the one-shot guard; ApiError instances + fake timers in the client tests; the re-warm attempts counter resets on success; no trailing whitespace).
 4. **Executable tests:** each red test names its exact lane failure (killed counter, missing frame, missing spawn, missing attach) and reuses pinned fake/harness idioms (NeverExitsProcess kill counters, config_capture tracing capture, state_with_bus + set_manager_for_test, the 404 ApiError-mock template with delta-based attach counting and an explicit synchronization point). Every cargo invocation uses a single positional TESTNAME filter that matches the named tests.
 5. **Placeholder scan:** drafts reference real helpers; where a fake needs a small extension (ExitingProcess, summarize/config hang scripting, fail-twice-then-healthy scripting, the fake-opencode death verb), the extension is named and its model (existing fakes) is cited — no TBDs.
 6. **Operational completeness:** new structured event names are logged (Task 3/4) and registered in the logging docs if enumerated; AGENTS.md architecture prose updated (Task 4); no migrations; rollback = revert the commits (no persisted-state changes); verification gates explicit (Task 8 + the Stage-5 full suite).
