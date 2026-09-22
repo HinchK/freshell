@@ -18,12 +18,16 @@
  * Cadence recipe (HARNESS-14, NOT wall-clock bounds): boot with
  * FRESHELL_TEST_CLOCK=1 (mounts the /api/test-clock verbs behind
  * x-auth-token, drops the stuck sweep to 250ms ticks) +
- * FRESHELL_TERMINAL_STUCK_WINDOW_MS=4000; ring-warm ~3s in REAL time with
- * the false-start assertion (freeze-after-quiet discipline — frames landing
- * after an advance would re-stamp the meaningful clock at the advanced
- * instant, so the ring must be warmed BEFORE freezing), then
- * POST /api/test-clock/freeze + POST /api/test-clock/advance {"ms":5000}
- * (window + 1000 margin), then poll the alert with a ~5s bound. The
+ * FRESHELL_TERMINAL_STUCK_WINDOW_MS=4000; ring-warm from an OBSERVED
+ * start — poll the pane's xterm buffer for the shim's spinner cell (its
+ * presence proves the full 14-composition cycle already first-occurred,
+ * so the noise ring is warm regardless of pane-boot lag) — then a ~2s
+ * REAL-time window with the false-start assertion (freeze-after-quiet
+ * discipline — frames landing after an advance would re-stamp the
+ * meaningful clock at the advanced instant, so the ring must be warmed
+ * BEFORE freezing), then POST /api/test-clock/freeze + POST
+ * /api/test-clock/advance {"ms":5000} (window + 1000 margin), then poll
+ * the alert with a ~5s bound. The
  * kill/ack/created restart round runs on REAL ws time — the virtual clock
  * stays frozen and cannot interfere (a row created at a frozen instant can
  * never age past the window, so the recovered pane deterministically stays
@@ -52,7 +56,9 @@ import { openPanePicker } from '../helpers/pane-picker.js'
 
 /** Deterministic stuck window: 4s of MEANINGFUL silence (while raw output
  *  keeps flowing) flags an agent pane. The 5000ms advance crosses it with
- *  1s of margin for late first-occurrence frames during warm-up. */
+ *  1s of margin even from a zero-staleness freeze (the observed warm-up
+ *  start proves the ring is already warm before the freeze, so no
+ *  first-occurrence frame can land post-advance). */
 const STUCK_WINDOW_MS = 4_000
 const STUCK_ADVANCE_MS = 5_000
 
@@ -262,6 +268,34 @@ async function stuckEntryOf(harness: TestHarness, paneId: string): Promise<any> 
   return state?.terminalLifecycle?.stuckAtByPaneId?.[paneId] ?? null
 }
 
+/** OBSERVED ring-warm start (Task-5 review Minor-1): poll the pane's
+ *  xterm buffer for deterministic evidence that the shim's frames are
+ *  actually flowing BEFORE the fixed warm-up window begins, so pane-boot
+ *  lag can never eat the warm-up margin (which could leave the ring
+ *  under-warmed at the freeze and let a first-occurrence frame land
+ *  post-advance, re-stamping the meaningful clock and delaying the flag
+ *  by a full window past the 5s alert poll).
+ *
+ *  Wedge needle (⠦): the shim paints the braille spinner cell once every
+ *  15 frames and nothing ever overwrites it (bar units repaint only the
+ *  bar row), so its presence proves ≥15 consecutive frames were INGESTED
+ *  in PTY order — the first 14 are the complete bar-composition cycle,
+ *  so at this observed start the noise ring is provably FULLY WARM and
+ *  the meaningful clock was stamped by the immediately-preceding
+ *  first-occurrence frame (~one frame interval ago).
+ *  Meaningful needle ('progress '): the live meaningful frame stream
+ *  itself (every line re-stamps the meaningful clock). */
+async function waitForObservedFrames(
+  harness: TestHarness,
+  terminalId: string,
+  needle: string,
+): Promise<void> {
+  await expect.poll(async () => {
+    const buffer = await harness.getTerminalBuffer(terminalId)
+    return typeof buffer === 'string' && buffer.includes(needle)
+  }, { timeout: 15_000 }).toBe(true)
+}
+
 /**
  * One owned server per rig: each test needs a different shim behavior env,
  * and the gated clock + window must be scoped to the test's own server.
@@ -353,16 +387,23 @@ test.describe('terminal stuck backstop (rust only)', () => {
         return typeof buffer === 'string' && buffer.includes('wedge-shim booted')
       }, { timeout: 15_000 }).toBe(true)
 
-      // Ring-warm ~3s in REAL time (freeze-after-quiet): every one of the
-      // 14 bar compositions has first-occurred by ~1.5s, so all later frames
-      // are ring-known noise — the MEANINGFUL clock stops advancing while
-      // raw output keeps flowing. False-start bound: an animated pane UNDER
-      // the window must NOT flag (the last first-occurrence was ~2.5s ago,
-      // well inside the 4s window), so the card cannot legitimately appear
-      // yet — assert it hasn't.
-      await page.waitForTimeout(2_000)
+      // OBSERVED ring-warm start: the spinner cell proves the full
+      // 14-composition cycle already first-occurred (frames ingest in PTY
+      // order and the spinner is the 15th frame), so the noise ring is
+      // fully warm and the meaningful clock is freshly stamped at this
+      // observed start — regardless of how long pane boot lagged.
+      await waitForObservedFrames(harness, terminalId, '⠦')
+
+      // Ring-warm ~2s from the OBSERVED start, in REAL time
+      // (freeze-after-quiet): every frame from here on is ring-known
+      // noise — the MEANINGFUL clock stops advancing while raw output
+      // keeps flowing. False-start bound: an animated pane UNDER the
+      // window must NOT flag (at the freeze the last first-occurrence was
+      // ~2s ago, well inside the 4s window), so the card cannot
+      // legitimately appear yet — assert it hasn't.
+      await page.waitForTimeout(1_000)
       await expect(stuckAlert(page), 'under-window mid-warm check').toHaveCount(0)
-      await page.waitForTimeout(2_000)
+      await page.waitForTimeout(1_000)
       await expect(stuckAlert(page), 'false-start bound: an animated but under-window pane must not flag').toHaveCount(0)
 
       // Freeze-after-quiet, then step 5s past the 4s window: the continuing
@@ -432,14 +473,14 @@ test.describe('terminal stuck backstop (rust only)', () => {
       const paneId: string = leaf.id
       const terminalId: string = leaf.content.terminalId
 
-      await expect.poll(async () => {
-        const buffer = await harness.getTerminalBuffer(terminalId)
-        return typeof buffer === 'string' && buffer.includes('progress ')
-      }, { timeout: 15_000 }).toBe(true)
+      // OBSERVED start: a `progress ` line proves the meaningful frame
+      // stream is flowing (every line re-stamps the MEANINGFUL clock at
+      // its arrival instant, so this pane can never go meaningful-stale).
+      await waitForObservedFrames(harness, terminalId, 'progress ')
 
-      // Same warm-up shape as the wedged pane: real time, live clock, and
-      // no card during it.
-      await page.waitForTimeout(4_000)
+      // Warm-up window from the OBSERVED start: real time, live clock,
+      // and no card during it.
+      await page.waitForTimeout(2_000)
       await expect(stuckAlert(page), 'warm-up must not flag a healthy pane').toHaveCount(0)
 
       // SAME freeze + advance past the window — then the load-bearing
@@ -488,9 +529,11 @@ test.describe('terminal stuck backstop (rust only)', () => {
         return typeof buffer === 'string' && buffer.includes('wedge-shim booted')
       }, { timeout: 15_000 }).toBe(true)
 
-      // Warm-up + freeze + advance: identical to the wedged-pane test, so
-      // the card appears deterministically right after the advance.
-      await page.waitForTimeout(4_000)
+      // OBSERVED ring-warm start (same spinner proof as the wedged-pane
+      // test), then the same warm-up + freeze + advance: the card appears
+      // deterministically right after the advance.
+      await waitForObservedFrames(harness, terminalId, '⠦')
+      await page.waitForTimeout(2_000)
       await expect(stuckAlert(page), 'false-start bound before the freeze').toHaveCount(0)
       await clockFreeze(rig.info)
       await clockAdvance(rig.info, STUCK_ADVANCE_MS)
