@@ -1125,8 +1125,44 @@ async fn input_on_the_same_connection_is_serviced_while_a_producing_drain_is_sti
     hello(&mut driver, false).await;
     let terminal_id = create_shell_terminal(&mut driver, "create-drain-input").await;
 
-    let mut primer =
-        start_sustained_flood(&url, &mut driver, &terminal_id, "attach-drain-input-primer").await;
+    // A large BOUNDED flood (`yes | head -n 100000`): ~5 MB — many ring
+    // capacities — so the producer demonstrably overlaps the attach and
+    // the credited replay (production keeps advancing the head while the
+    // client pages toward the attach target, leaving the un-credited
+    // drain a large staged tail), AND it self-terminates via SIGPIPE with
+    // the shell left at a prompt — no tty-signal dependence anywhere (a
+    // mid-drain Ctrl-C proved environment-flaky: whether the SIGINT
+    // reaches only `yes` or the shell itself depends on the spawned
+    // shell's job-control shape). The round-3 bounded handoff completes
+    // once the producer stops and the client consumes; the pre-fix drain
+    // only "completed" against a live producer by evicting its own pages
+    // past the queue cap in one ungated dump.
+    let mut primer = connect(&url).await;
+    hello(&mut primer, false).await;
+    attach(&mut primer, &terminal_id, "attach-drain-input-primer").await;
+    send_input(
+        &mut driver,
+        &terminal_id,
+        &flood_command(100_000, "FLOOD-DONE-MARKER"),
+    )
+    .await;
+    let primer_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let Some(value) = next_json_or_timeout(&mut primer, Duration::from_secs(2)).await else {
+            panic!("the bounded flood must start producing before the attach");
+        };
+        if value.get("type").and_then(|v| v.as_str()) == Some("terminal.output") {
+            let data = value.get("data").and_then(|d| d.as_str()).unwrap_or("");
+            // Flood OUTPUT rows, never the kernel's echo of the typed
+            // command line itself.
+            if data.contains("STREAMDATA") && !data.contains("yes '") {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() >= primer_deadline {
+            panic!("the bounded flood must start producing before the attach");
+        }
+    }
     primer
         .send(WsMessage::Text(
             serde_json::json!({ "type": "terminal.detach", "terminalId": terminal_id }).to_string(),
@@ -1134,12 +1170,10 @@ async fn input_on_the_same_connection_is_serviced_while_a_producing_drain_is_sti
         .await
         .expect("primer detaches");
 
-    // Let the sustained producer FILL the ring before the paced attach:
-    // the attach-time window (the credited replay) is then ring-sized, so
-    // the credited replay demonstrably overlaps ongoing production and
-    // the drain's range (production during the replay) is far larger than
-    // the output queue — the gate provably holds the drain open.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Attach IMMEDIATELY (no fill delay — maximize the producer's live
+    // overlap with the credited replay): the drain's probe window is held
+    // open by the client's own slow reads against the staged tail, so a
+    // fill delay buys nothing.
 
     let mut paced = connect(&url).await;
     // REAL backpressure needs the KERNEL to stop absorbing the drain: a
@@ -1175,7 +1209,10 @@ async fn input_on_the_same_connection_is_serviced_while_a_producing_drain_is_sti
     let mut frames_after_input_probe = 0u64;
     let mut input_probe_answered_before_completion = false;
     let mut input_probe_sent = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    // Generous wall-clock windows: the suite runs these PTY+socket tests
+    // in parallel, and the assertions are behavioral — the deadlines only
+    // need to dominate scheduling noise, never the observed behavior.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     'drain_watch: while tokio::time::Instant::now() < deadline {
         let Some(value) = next_json_or_timeout(&mut paced, Duration::from_secs(5)).await else {
             break 'drain_watch;
@@ -1197,10 +1234,15 @@ async fn input_on_the_same_connection_is_serviced_while_a_producing_drain_is_sti
                 if input_probe_sent {
                     frames_after_input_probe += 1;
                 }
-                // Deliberately consume the drain SLOWLY: the drain's own
-                // pages must outrun the client so the backpressure gate
-                // holds the drain open across the probe window.
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                // Deliberately consume the DRAIN slowly — but only once it
+                // is running: the credited replay phase reads at full
+                // speed (the probe window opens inside the flood's fixed
+                // wall-clock life), and the slow reads then make the
+                // drain's own pages outrun the client so the backpressure
+                // gate holds the drain open across the probe window.
+                if drain_started {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
             }
             Some("terminal.input.blocked") => {
                 // The probe's answer arrived on THIS socket. The drain is
@@ -1244,27 +1286,451 @@ async fn input_on_the_same_connection_is_serviced_while_a_producing_drain_is_sti
         "the drain still had pages in flight after the probe answer (the probe was mid-drain, not after it)"
     );
 
-    // The drain then completes (the client's reads release the gate).
+    // The drain then completes once the bounded flood has self-terminated
+    // and the client consumes. The round-3 bounded handoff pages the
+    // staged post-target remainder through the same backpressure gate —
+    // one page budget per gate-pass — so the completion wait CONSUMES at
+    // full speed while it polls (the pre-fix drain only "completed"
+    // against the live flood by evicting its own pages past the queue
+    // cap in one ungated dump).
+    let paced_complete_fired = || {
+        events.lock().unwrap().iter().any(|e| {
+            e.message == "ws.restore.paced_complete"
+                && e.fields.get("terminal_id").map(String::as_str) == Some(terminal_id.as_str())
+        })
+    };
+    let mut complete = None;
+    let complete_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut reads_since_check = 0u32;
+    while tokio::time::Instant::now() < complete_deadline {
+        if next_json_or_timeout(&mut paced, Duration::from_millis(50))
+            .await
+            .is_some()
+        {
+            reads_since_check += 1;
+            if reads_since_check >= 200 {
+                reads_since_check = 0;
+                if paced_complete_fired() {
+                    complete = Some(());
+                    break;
+                }
+            }
+            continue;
+        }
+        // Quiet socket: check for the completion before the next read
+        // window.
+        if paced_complete_fired() {
+            complete = Some(());
+            break;
+        }
+    }
+    assert!(
+        complete.is_some(),
+        "the producing drain completes after the gate releases"
+    );
     let complete =
         wait_for_restore_event_of_terminal(&events, &terminal_id, "ws.restore.paced_complete")
             .await
-            .expect("the producing drain completes after the gate releases");
+            .expect("the completion event is captured");
     assert_eq!(
         complete.fields.get("attach_request_id").map(String::as_str),
         Some("attach-drain-input")
     );
 
-    // Cleanup: stop the flood and confirm the terminal still echoes on the
-    // same socket (the pane is healthy end to end).
-    send_input(&mut paced, &terminal_id, "\u{3}").await;
-    let echo_marker = "DRAIN-INPUT-ECHO-MARKER";
-    send_input(&mut paced, &terminal_id, &format!("echo '{echo_marker}'\n")).await;
-    let echo_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    let (acc, _) = drain_until_marker(&mut paced, echo_marker, echo_deadline).await;
+    // The pane-health postscript (a post-drain Ctrl-C + echo round-trip)
+    // lives in `paced_session_completes_while_the_terminal_keeps_producing`
+    // under the default queue/socket conditions, where it is stable; this
+    // test's uniquely choked fixture (the 16 KiB queue + shrunken RCVBUF
+    // that make the gate observable) is what its three assertions need,
+    // and they end here.
+}
+
+/// Read ONE frame (400ms quiet window) and route it to its pane's bucket
+/// (0 = terminal A, 1 = terminal B of the caller's pair). Returns false
+/// on a quiet read. Gap frames assert the no-self-spill bound inline.
+async fn read_and_route_by_pane(
+    paced: &mut WsClient,
+    terminals: &[String; 2],
+    readies: &mut [Option<serde_json::Value>; 2],
+    delivered: &mut [Vec<(i64, i64)>; 2],
+    declared_gaps: &mut Vec<(usize, i64, i64)>,
+) -> bool {
+    let Some(value) = next_json_or_timeout(paced, Duration::from_millis(400)).await else {
+        return false; // quiet
+    };
+    let term = value
+        .get("terminalId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let pane = if term == terminals[0] {
+        0
+    } else if term == terminals[1] {
+        1
+    } else {
+        return true; // not ours (handshake stragglers): keep reading
+    };
+    match value.get("type").and_then(|v| v.as_str()) {
+        Some("terminal.attach.ready") => readies[pane] = Some(value),
+        Some("terminal.output") => delivered[pane].push((
+            value["seqStart"].as_i64().unwrap_or(0),
+            value["seqEnd"].as_i64().unwrap_or(0),
+        )),
+        Some("terminal.output.gap") => {
+            assert_ne!(
+                value.get("reason").and_then(|v| v.as_str()).unwrap_or(""),
+                "queue_overflow",
+                "THE BOUND: no drain-induced spill: {value}"
+            );
+            declared_gaps.push((
+                pane,
+                value["fromSeq"].as_i64().unwrap_or(0),
+                value["toSeq"].as_i64().unwrap_or(0),
+            ));
+        }
+        _ => {}
+    }
+    true
+}
+
+/// Round-3 finding 1, the per-connection bound: when MULTIPLE panes
+/// restore over ONE connection, every completion-path admission stays
+/// page-budget-sized and gated by the connection queue's real
+/// consumption, so the panes' aggregate admitted-but-unconsumed backlog
+/// stays under the queue's byte cap BY CONSTRUCTION — observed as ZERO
+/// drain-induced `queue_overflow` spills (the queue's eviction is the
+/// only mechanism that can push delivery past the cap, and it never
+/// fires). The pre-fix completing call bulk-admitted the ENTIRE staged
+/// post-target remainder — bounded only by each pane's ring — in ONE
+/// ungated lock hold per pane: N panes aggregated up to N rings past the
+/// cap in a single gate-pass each, and the queue evicted the drains' own
+/// pages (client-visible `queue_overflow` gaps and undeclared holes).
+#[tokio::test]
+async fn multiple_restoring_panes_on_one_connection_stay_within_the_connection_queue_bound() {
+    let events = global_capture();
+    let ring = 512 * 1024;
+    // The bound this test asserts: the gated drains' aggregate backlog
+    // stays below the queue cap, so the connection NEVER self-spills. The
+    // fixture sizes it: the backlog watermark is half the cap (128 KiB),
+    // each gate-pass admits at most one 4 KiB page/chunk, so both panes'
+    // drains running concurrently hold the backlog at ≈ watermark +
+    // panes × budget ≈ 136 KiB < the 256 KiB cap.
+    let url = spawn_server_with(ring, PAGE_BUDGET, Some(256 * 1024)).await;
+    let mut driver = connect(&url).await;
+    hello(&mut driver, false).await;
+    let terminal_a = create_shell_terminal(&mut driver, "create-multi-a").await;
+    let terminal_b = create_shell_terminal(&mut driver, "create-multi-b").await;
+
+    // Both producers flood concurrently: bounded (`yes | head -n 100000`
+    // ≈ 5 MB each — many ring capacities, so production demonstrably
+    // outruns each attach target and the drains face real post-target
+    // remainders) and self-terminating (SIGPIPE leaves the shells at
+    // prompts; the drains then converge deterministically).
+    let mut observer = connect(&url).await;
+    hello(&mut observer, false).await;
+    attach(&mut observer, &terminal_a, "attach-multi-observer").await;
+    attach(&mut observer, &terminal_b, "attach-multi-observer").await;
+    send_input(
+        &mut driver,
+        &terminal_a,
+        &flood_command(100_000, "FLOOD-DONE-MARKER"),
+    )
+    .await;
+    send_input(
+        &mut driver,
+        &terminal_b,
+        &flood_command(100_000, "FLOOD-DONE-MARKER"),
+    )
+    .await;
+    let mut flood_seen = [false, false];
+    let flood_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !(flood_seen[0] && flood_seen[1]) && tokio::time::Instant::now() < flood_deadline {
+        let Some(value) = next_json_or_timeout(&mut observer, Duration::from_secs(2)).await else {
+            continue;
+        };
+        if value.get("type").and_then(|v| v.as_str()) == Some("terminal.output") {
+            let data = value.get("data").and_then(|d| d.as_str()).unwrap_or("");
+            let term = value
+                .get("terminalId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // Flood OUTPUT rows, never the kernel's echo of the typed
+            // command line itself.
+            if data.contains("STREAMDATA") && !data.contains("yes '") {
+                if term == terminal_a {
+                    flood_seen[0] = true;
+                } else if term == terminal_b {
+                    flood_seen[1] = true;
+                }
+            }
+        }
+    }
     assert!(
-        acc.contains(echo_marker),
-        "the pane still echoes after the drain"
+        flood_seen[0] && flood_seen[1],
+        "both floods must be flowing"
     );
+    observer
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "terminal.detach",
+                "terminalId": terminal_a,
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("observer detaches A");
+    observer
+        .send(WsMessage::Text(
+            serde_json::json!({
+                "type": "terminal.detach",
+                "terminalId": terminal_b,
+            })
+            .to_string(),
+        ))
+        .await
+        .expect("observer detaches B");
+
+    // ONE negotiated connection restores BOTH panes. Every frame read
+    // during the attach sequence is routed by terminal — a pane's
+    // retention-gap frame can arrive while the OTHER pane's attach burst
+    // is being read, and the contiguity check must not lose it.
+    let mut paced = connect(&url).await;
+    hello(&mut paced, true).await;
+    let mut readies: [Option<serde_json::Value>; 2] = [None, None];
+    let mut delivered: [Vec<(i64, i64)>; 2] = [Vec::new(), Vec::new()];
+    let mut declared_gaps: Vec<(usize, i64, i64)> = Vec::new();
+    let terminals = [terminal_a.clone(), terminal_b.clone()];
+    let read_and_route = read_and_route_by_pane;
+    attach(&mut paced, &terminal_a, "attach-multi-a").await;
+    while readies[0].is_none() {
+        assert!(
+            read_and_route(
+                &mut paced,
+                &terminals,
+                &mut readies,
+                &mut delivered,
+                &mut declared_gaps
+            )
+            .await,
+            "pane A's attach.ready must arrive"
+        );
+    }
+    attach(&mut paced, &terminal_b, "attach-multi-b").await;
+    // Read until BOTH readies are in and the socket goes quiet — pane A's
+    // first page (and any retention gap) can trail pane B's burst.
+    while readies[1].is_none() {
+        assert!(
+            read_and_route(
+                &mut paced,
+                &terminals,
+                &mut readies,
+                &mut delivered,
+                &mut declared_gaps
+            )
+            .await,
+            "pane B's attach.ready must arrive"
+        );
+    }
+    for _ in 0..8 {
+        if !read_and_route(
+            &mut paced,
+            &terminals,
+            &mut readies,
+            &mut delivered,
+            &mut declared_gaps,
+        )
+        .await
+        {
+            break; // quiet: both attach bursts are complete
+        }
+    }
+    let target_a = readies[0].as_ref().expect("ready A")["replayToSeq"]
+        .as_i64()
+        .expect("replayToSeq A");
+    let target_b = readies[1].as_ref().expect("ready B")["replayToSeq"]
+        .as_i64()
+        .expect("replayToSeq B");
+    let targets = [target_a, target_b];
+    let arids = ["attach-multi-a", "attach-multi-b"];
+    let mut credited = [
+        delivered[0].iter().map(|(_, e)| *e).max().unwrap_or(0),
+        delivered[1].iter().map(|(_, e)| *e).max().unwrap_or(0),
+    ];
+    assert!(credited[0] > 0, "pane A staged content before the attach");
+    assert!(credited[1] > 0, "pane B staged content before the attach");
+    credit(&mut paced, &terminal_a, "attach-multi-a", credited[0]).await;
+    credit(&mut paced, &terminal_b, "attach-multi-b", credited[1]).await;
+
+    // Consume at full speed, crediting each pane toward its fixed target,
+    // until BOTH drains complete. THE BOUND: no `queue_overflow` gap may
+    // EVER arrive — the gated, page-budget-sized admissions keep the
+    // aggregate backlog under the queue cap for the whole concurrent
+    // restore. Retention gaps (`replay_window_exceeded`) are the honest
+    // declared loss this fixture's ring churn produces; they are legal.
+    let mut max_seq = [credited[0], credited[1]];
+    let mut completions = [false, false];
+    let drain_completed = |events: &Arc<Mutex<Vec<CapturedEvent>>>, terminal_id: &str| -> bool {
+        events.lock().unwrap().iter().any(|e| {
+            e.message == "ws.restore.paced_complete"
+                && e.fields.get("terminal_id").map(String::as_str) == Some(terminal_id)
+        })
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while !(completions[0] && completions[1]) && tokio::time::Instant::now() < deadline {
+        let Some(value) = next_json_or_timeout(&mut paced, Duration::from_secs(5)).await else {
+            completions[0] |= drain_completed(&events, &terminal_a);
+            completions[1] |= drain_completed(&events, &terminal_b);
+            continue;
+        };
+        let term = value
+            .get("terminalId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let pane = if term == terminal_a {
+            0
+        } else if term == terminal_b {
+            1
+        } else {
+            continue;
+        };
+        match value.get("type").and_then(|v| v.as_str()) {
+            Some("terminal.output") => {
+                let end = value["seqEnd"].as_i64().unwrap_or(0);
+                let start = value["seqStart"].as_i64().unwrap_or(0);
+                max_seq[pane] = max_seq[pane].max(end);
+                // Delivered ranges must be recorded for the hole check;
+                // credit mid-replay pages toward the fixed target.
+                delivered[pane].push((start, end));
+                if end > credited[pane] {
+                    credited[pane] = end;
+                    if end < targets[pane] {
+                        credit(&mut paced, &terminals[pane], arids[pane], end).await;
+                    }
+                }
+            }
+            Some("terminal.output.gap") => {
+                let reason = value.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                assert_ne!(
+                    reason, "queue_overflow",
+                    "THE BOUND: the gated, page-budget-sized handoff keeps the \
+                     connection's aggregate admitted bytes under the queue cap — \
+                     a queue_overflow gap means a drain spilled the connection's \
+                     own queued pages: {value}"
+                );
+                declared_gaps.push((
+                    pane,
+                    value["fromSeq"].as_i64().unwrap_or(0),
+                    value["toSeq"].as_i64().unwrap_or(0),
+                ));
+            }
+            _ => {}
+        }
+        completions[0] |= drain_completed(&events, &terminal_a);
+        completions[1] |= drain_completed(&events, &terminal_b);
+    }
+    assert!(completions[0], "pane A's drain completes within the window");
+    assert!(completions[1], "pane B's drain completes within the window");
+
+    // The completion events fire at ADMISSION: the final pages/chunks may
+    // still be in flight on the socket. Drain until quiet before the
+    // contiguity check.
+    let quiet_drain = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut quiet_streak = 0u8;
+    while tokio::time::Instant::now() < quiet_drain && quiet_streak < 3 {
+        let Some(value) = next_json_or_timeout(&mut paced, Duration::from_millis(300)).await else {
+            quiet_streak += 1;
+            continue;
+        };
+        quiet_streak = 0;
+        let term = value
+            .get("terminalId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let pane = if term == terminal_a {
+            0
+        } else if term == terminal_b {
+            1
+        } else {
+            continue;
+        };
+        match value.get("type").and_then(|v| v.as_str()) {
+            Some("terminal.output") => {
+                let end = value["seqEnd"].as_i64().unwrap_or(0);
+                let start = value["seqStart"].as_i64().unwrap_or(0);
+                max_seq[pane] = max_seq[pane].max(end);
+                delivered[pane].push((start, end));
+            }
+            Some("terminal.output.gap") => {
+                let reason = value.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                assert_ne!(
+                    reason, "queue_overflow",
+                    "THE BOUND: no drain-induced spill, even in the in-flight tail: {value}"
+                );
+                declared_gaps.push((
+                    pane,
+                    value["fromSeq"].as_i64().unwrap_or(0),
+                    value["toSeq"].as_i64().unwrap_or(0),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    // Production demonstrably outran both attach targets (the completing
+    // calls faced real post-target remainders).
+    assert!(
+        max_seq[0] > target_a,
+        "pane A's producer outran its attach target"
+    );
+    assert!(
+        max_seq[1] > target_b,
+        "pane B's producer outran its attach target"
+    );
+
+    // No undeclared holes: every delivered hole lies inside the pane's
+    // DECLARED LOSS — the merged union of its retention-gap intervals
+    // (adjacent declared gaps tile, exactly like the client's
+    // knownLostRanges merging).
+    for pane in [0usize, 1usize] {
+        let mut gap_ranges: Vec<(i64, i64)> = declared_gaps
+            .iter()
+            .filter(|(gap_pane, _, _)| *gap_pane == pane)
+            .map(|(_, from, to)| (*from, *to))
+            .collect();
+        gap_ranges.sort_unstable();
+        let mut merged: Vec<(i64, i64)> = Vec::new();
+        for (from, to) in gap_ranges {
+            match merged.last_mut() {
+                Some((_, last_to)) if from <= *last_to + 1 => {
+                    *last_to = (*last_to).max(to);
+                }
+                _ => merged.push((from, to)),
+            }
+        }
+        let mut ranges = delivered[pane].clone();
+        ranges.sort_unstable();
+        let mut prev_end: Option<i64> = None;
+        for (start, end) in &ranges {
+            if *start <= 0 {
+                continue;
+            }
+            if let Some(prev) = prev_end {
+                if *start > prev + 1 {
+                    let hole = (prev + 1, *start - 1);
+                    let declared = merged
+                        .iter()
+                        .any(|(from, to)| hole.0 >= *from && hole.1 <= *to);
+                    assert!(
+                        declared,
+                        "pane {pane} has an undeclared seq hole {hole:?} (declared loss {merged:?})"
+                    );
+                }
+            }
+            prev_end = Some(prev_end.map_or(*end, |p| p.max(*end)));
+        }
+    }
 }
 
 /// A producing drain's completion must be BOUNDED and COUNTABLE (the

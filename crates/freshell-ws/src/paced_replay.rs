@@ -309,27 +309,32 @@ pub(crate) fn drive_session(
 /// starving same-connection input).
 ///
 /// The drain target is the head captured ONCE at drain start — NEVER
-/// re-captured: when the target is covered, the registry's completing
-/// verdict re-fans the frames produced after it through the normal live
-/// fan-out path and clears the deferral atomically in the same lock hold
-/// (`PacedTailCompletion::Completed`), so a sustained producer can never
-/// turn the drain into a moving-head chase. Between pages the task waits
-/// on the connection queue's REAL backpressure (the writer's backlog
-/// watermark — the sink itself admits without yielding and evicts past
-/// the byte limit, so this gate is what bounds the drain and keeps it
-/// from self-spilling its own unconsumed pages). `cancel` fires on the
-/// connection's teardown (any exit reason), bounding the task's lifetime
-/// with the connection's own.
+/// re-captured: when the target is covered, the registry's
+/// `TargetCovered` verdict hands the staged post-target remainder to the
+/// BOUNDED post-target handoff (`handoff_paced_tail`), which delivers it
+/// page-budget-sized per lock hold — the lock released between chunks,
+/// the same backlog-gated loop — until a chunk covers the terminal's
+/// current head and the deferral clears atomically in that hold. No
+/// completion or handoff path ever bulk-clones a retained suffix or
+/// admits data outside the page budget; a sustained producer can never
+/// turn the drain into a moving-head chase. Between pages the task
+/// waits on the connection queue's REAL backpressure (the writer's
+/// backlog watermark — the sink itself admits without yielding and
+/// evicts past the byte limit, so this gate is what bounds the drain
+/// and keeps it from self-spilling its own unconsumed pages). `cancel`
+/// fires on the connection's teardown (any exit reason), bounding the
+/// task's lifetime with the connection's own.
 ///
 /// Page order, the deferral contract, and lock discipline are preserved:
 /// the session leaves `PacedSessions` when it enters the drain (credits
 /// during the drain are stale generations — observed, inert), only this
 /// task produces the drain's pages (single producer, ascending seq), the
 /// registry's per-terminal lock is never held across pages, and the
-/// generation guard inside `TerminalRegistry::complete_paced_tail`
-/// refuses the drain the moment a re-attach supersedes its attach
-/// generation (the off-dispatch drain can race the dispatcher's
-/// re-attach handling; the guard makes that race inert).
+/// generation guard inside `TerminalRegistry::complete_paced_tail` /
+/// `TerminalRegistry::handoff_paced_tail` refuses the drain the moment a
+/// re-attach supersedes its attach generation (the off-dispatch drain can
+/// race the dispatcher's re-attach handling; the guard makes that race
+/// inert).
 pub(crate) fn spawn_paced_drain(
     registry: TerminalRegistry,
     conn_id: u64,
@@ -355,11 +360,19 @@ pub(crate) fn spawn_paced_drain(
                 return;
             }
         };
+        // The drain's two phases share ONE gated loop: paging toward the
+        // FIXED target, then — once it is covered — the bounded post-target
+        // handoff toward the terminal's current head. The phase never
+        // re-captures the drain target.
+        let mut handing_off = false;
         loop {
             // REAL backpressure first: while the connection queue holds a
             // backlog at/above the watermark, wait for the writer pump to
             // drain real frames (or the connection to die — the cancel
-            // path is the escape).
+            // path is the escape). The gate runs before EVERY page and
+            // EVERY handoff chunk, so no completion path can admit data
+            // outside the page budget against the connection's real
+            // consumption.
             tokio::select! {
                 _ = writer.wait_backlog_below_watermark() => {}
                 _ = cancel.changed() => {
@@ -371,14 +384,25 @@ pub(crate) fn spawn_paced_drain(
                     return;
                 }
             }
-            match registry.complete_paced_tail(
-                &terminal_id,
-                conn_id,
-                &attach_request_id,
-                session.page_end,
-                drain_target,
-                budget,
-            ) {
+            let verdict = if handing_off {
+                registry.handoff_paced_tail(
+                    &terminal_id,
+                    conn_id,
+                    &attach_request_id,
+                    session.page_end,
+                    budget,
+                )
+            } else {
+                registry.complete_paced_tail(
+                    &terminal_id,
+                    conn_id,
+                    &attach_request_id,
+                    session.page_end,
+                    drain_target,
+                    budget,
+                )
+            };
+            match verdict {
                 PacedTailCompletion::Handoff {
                     end_seq,
                     serialized_bytes,
@@ -391,6 +415,26 @@ pub(crate) fn spawn_paced_drain(
                     );
                     session.page_end = end_seq;
                     session.pages += 1;
+                }
+                PacedTailCompletion::TargetCovered {
+                    end_seq,
+                    serialized_bytes,
+                } => {
+                    // THE FIXED TARGET IS COVERED — never re-captured: the
+                    // staged post-target remainder now flows through the
+                    // bounded handoff (page-budget-sized chunks, gated,
+                    // lock released between them) instead of a bulk
+                    // re-fan.
+                    tracing::debug!(
+                        terminal_id = %terminal_id,
+                        attach_request_id = %attach_request_id,
+                        end_seq,
+                        serialized_bytes,
+                        "ws.restore.paced_target_covered"
+                    );
+                    session.page_end = end_seq;
+                    session.pages += 1;
+                    handing_off = true;
                 }
                 PacedTailCompletion::Expired {
                     lost_from,
@@ -419,8 +463,8 @@ pub(crate) fn spawn_paced_drain(
                 }
                 PacedTailCompletion::CaughtUp => {
                     // The ring drained at or below the cursor (a quiet or
-                    // slower terminal): the registry's atomic clear
-                    // already fired inside the page read.
+                    // slower terminal): the registry's atomic clear already
+                    // fired inside the page read.
                     tracing::info!(
                         terminal_id = %terminal_id,
                         attach_request_id = %attach_request_id,
@@ -431,11 +475,9 @@ pub(crate) fn spawn_paced_drain(
                     return;
                 }
                 PacedTailCompletion::Completed { end_seq, .. } => {
-                    // THE FIXED-TARGET ATOMIC LIVE HANDOFF: the page
-                    // covered the drain target, the frames produced
-                    // after it were re-fanned through the live path, and
-                    // the deferral cleared — all under the completing
-                    // page read's lock hold.
+                    // The page/chunk covered the terminal's current head:
+                    // everything staged was delivered in that hold and the
+                    // deferral cleared atomically with it.
                     session.page_end = session.page_end.max(end_seq);
                     session.pages += 1;
                     tracing::info!(
