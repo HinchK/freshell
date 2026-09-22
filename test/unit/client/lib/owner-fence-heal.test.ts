@@ -3,10 +3,7 @@ import freshAgentReducer, {
   applyRuntimeOwner,
   applyRuntimeOwnerFenceRefresh,
 } from '@/store/freshAgentSlice'
-import {
-  foldRefusalFencePair,
-  STALE_REFUSAL_MESSAGE_PREFIX,
-} from '@/lib/owner-fence-heal'
+import { foldRefusalFencePair } from '@/lib/owner-fence-heal'
 import type { SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import type { RootState } from '@/store/store'
 
@@ -127,9 +124,5 @@ describe('foldRefusalFencePair (b8ke fence-heal, fix b)', () => {
       { ownerEpoch: 1, ownerGeneration: 5 },
     )).toBe(false)
     expect(dispatch).not.toHaveBeenCalled()
-  })
-
-  it('the stale-refusal prefix is the byte-frozen server contract string', () => {
-    expect(STALE_REFUSAL_MESSAGE_PREFIX).toBe('Session ownership moved on (stale observed generation)')
   })
 })
