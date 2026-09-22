@@ -1538,7 +1538,13 @@ fn adopt_if_newer(
 }
 
 /// The adopted-change delta: records whose revision changed or appeared,
-/// plus each record's current inbound redirects.
+/// plus each record's current inbound redirects. Round-2 carried finding F5
+/// (adjudicated): a record whose nativeSync PROJECTION moved (a foreign
+/// same-home process's status-only transition — a native fold/rearm with no
+/// visible name change) is republished too, with `changed:false` — the
+/// status-only fold discipline clients already apply by documentGeneration.
+/// Without it, the adopting process's own subscribers stayed blind to the
+/// foreign status until a bootstrap or a later revision change.
 fn delta_updates(prior: &StoredDocument, next: &StoredDocument) -> Vec<SessionNameUpdate> {
     let mut updates = Vec::new();
     for (key, record) in &next.records {
@@ -1548,6 +1554,10 @@ fn delta_updates(prior: &StoredDocument, next: &StoredDocument) -> Vec<SessionNa
         };
         if changed {
             if let Some(update) = update_for_key(next, key, true, RedirectScope::ToRecord) {
+                updates.push(update);
+            }
+        } else if native_sync_projection(prior, key) != native_sync_projection(next, key) {
+            if let Some(update) = update_for_key(next, key, false, RedirectScope::ToRecord) {
                 updates.push(update);
             }
         }

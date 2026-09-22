@@ -921,6 +921,116 @@ async fn two_store_participants_converge_through_unconditional_refresh() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// Round-2 carried finding F5 (adjudicated): a foreign STATUS-ONLY nativeSync
+/// transition (a cooperating same-home process's worker folds an unsynced
+/// outcome — the record's name/revision/source do not move) must reach the
+/// ADOPTING process's subscribers too: cross-process adoption used to
+/// publish only revision/source-changed records, so the status change was
+/// invisible to this process's WS clients until a bootstrap or later
+/// change. The client folds status-only updates by documentGeneration, so
+/// the adopted frame carries `changed:false` with the new projection.
+#[tokio::test]
+async fn a_foreign_status_only_native_sync_transition_republishes_on_adoption() {
+    let home = temp_home();
+    let a = SessionNames::open(home.join(".freshell")).unwrap();
+    let b = SessionNames::open(home.join(".freshell")).unwrap();
+    let mut sub_b = b.subscribe();
+    let target = SessionNameRef::Pending {
+        id: "handle-status".into(),
+    };
+
+    // A arms a manual series with a verified route.
+    admit_pending(&a, "handle-status", NamedProvider::Claude, Some("/w")).await;
+    a.rename(RenameNameInput {
+        target: target.clone(),
+        name: "Manually Named".into(),
+        intent: NameIntent::User,
+        if_revision: None,
+    })
+    .await
+    .unwrap();
+    a.record_acquisition(
+        target.clone(),
+        NativeAcquisition {
+            location: NativeLocation::Claude {
+                config_root: "/w/homes/status".into(),
+                transcript_path: Some("/w/homes/status/projects/x/see.jsonl".into()),
+                project_directory_key: None,
+                transcript_cwd: None,
+                effective_project_key_override: None,
+            },
+            evidence: NativeEvidenceKind::IndexedFile,
+            persistence: NativePersistence::Verified,
+        },
+    )
+    .await
+    .unwrap();
+
+    // B adopts A's committed rename (drain that frame).
+    b.refresh_current().await.expect("B adopts the rename");
+    let _ = sub_b.try_recv();
+
+    // A's worker folds a status-only outcome: the record itself is unchanged
+    // (same name, same revision, same source) — only the native series moved.
+    let revision_before = a
+        .get(vec![target.clone()])
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .record
+        .revision;
+    let claim = a
+        .claim_native_cycle(target.clone(), "status-cycle-1".to_string())
+        .await
+        .unwrap()
+        .expect("A's series claims its first cycle");
+    a.fold_native_outcome(
+        target.clone(),
+        claim.location_revision,
+        claim.series_epoch,
+        crate::session_name_native::NativeOutcomeFold::Undelivered {
+            reason: "connect refusal".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    let after = a
+        .get(vec![target.clone()])
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(after.record.revision, revision_before, "status-only fold");
+    assert_eq!(after.record.name, "Manually Named");
+
+    // B's refresh adopts A's committed status-only generation: B's idle
+    // subscriber must receive the frame (changed:false, unsynced reason).
+    b.refresh_current()
+        .await
+        .expect("B adopts the status-only change");
+    let received = sub_b
+        .try_recv()
+        .expect("the adopted status-only transition republishes to B's subscriber");
+    assert_eq!(received.record.name, "Manually Named");
+    assert!(
+        !received.changed,
+        "a status-only frame never claims a rename"
+    );
+    assert_eq!(
+        received.native_sync.as_ref().expect("projection").status,
+        freshell_protocol::session_names::NativeSyncStatus::Unsynced,
+        "the folded status reached B's subscriber"
+    );
+    assert_eq!(
+        received.native_sync.as_ref().unwrap().reason.as_deref(),
+        Some("connect refusal")
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// The read route chunks: more than 100 refs is a visible 400 (the client
 /// batches), and unknown refs are omitted rather than erroring.
 #[tokio::test]
