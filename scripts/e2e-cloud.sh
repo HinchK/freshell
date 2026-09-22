@@ -513,6 +513,16 @@ cmd_run() {
   image_tag="$(image_tag_for_head)"
   IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}:${image_tag}"
 
+  # kata e83z: lead the lane output with identity attribution and loud
+  # dirty-tree state, BEFORE the image-lookup/rebuild decision below — the
+  # decision can run a ~13-minute build, and these lines must not trail it.
+  # The mid-run dirty line inside the decision block and the `Running on
+  # Cloud Run Jobs...` block below keep their existing positions.
+  if [[ "$image_tag" == *-dirty ]]; then
+    echo "[e2e-cloud] WARNING: dirty worktree - image tag ${image_tag} is not content-addressed; this run cold-rebuilds the image (~13 min) and the result is not reusable."
+  fi
+  echo "[e2e-cloud] Identity: ${GCP_ACCOUNT:-(ambient gcloud)} (source: ${FRESHELL_GCP_IDENTITY_SOURCE:-unresolved})"
+
   # Cloud mode
   if $force_build; then
     if $local_build_flag; then

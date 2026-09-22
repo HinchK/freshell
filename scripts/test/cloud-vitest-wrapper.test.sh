@@ -431,6 +431,43 @@ check "failed preflight exits fast: no builds submit, no job create, loud attrib
     ! grep -qE "FAKE_GCLOUD:.*(builds submit|run jobs create)" "$3"
   ' _ "$V8F_RC" "$V8F_OUT" "$FAKE8_LOG"
 
+# --- V9/V10 (kata e83z Task 3): run-lane banner identity attribution + loud
+# dirty-tree surfacing. The top-of-file GCLOUD_IDENT pin makes the resolved
+# identity deterministic, so the banner text is assertable exactly.
+rm -f "$FAKE8_LOG"; touch "$FAKE8_LOG"
+V9_OUT=$(run8 < /dev/null) || true
+check "run-lane startup banner reports the resolved identity and its source" \
+  bash -c '
+    grep -q "\[vitest-cloud\] Identity: suite-pinned-identity@example.invalid (source: GCLOUD_IDENT (explicit env bypass))" <<<"$1"
+  ' _ "$V9_OUT"
+check "identity line leads the lane output (before any build work and the banner)" \
+  bash -c '
+    ident="$(grep -n "\[vitest-cloud\] Identity:" <<<"$1" | head -1 | cut -d: -f1)"
+    [ -n "$ident" ] || exit 1
+    firstwork="$(grep -nE "Building Docker image|Running on Cloud Run Jobs" <<<"$1" | head -1 | cut -d: -f1)"
+    [ -n "$firstwork" ] && [ "$ident" -lt "$firstwork" ]
+  ' _ "$V9_OUT"
+
+V10_DIRTY="$ROOT/.vitest-cloud-dirty-check-$$"
+touch "$V10_DIRTY"
+rm -f "$FAKE8_LOG"; touch "$FAKE8_LOG"
+V10_OUT=$(run8 < /dev/null) || true
+rm -f "$V10_DIRTY"
+check "loud stdout WARNING when the -dirty image path is taken" \
+  bash -c '
+    grep -q "WARNING: dirty worktree" <<<"$1" &&
+    grep -q "not content-addressed" <<<"$1"
+  ' _ "$V10_OUT"
+check "dirty WARNING precedes the rebuild work itself, not just the banner" \
+  bash -c '
+    warn="$(grep -n "WARNING: dirty worktree" <<<"$1" | head -1 | cut -d: -f1)"
+    [ -n "$warn" ] || exit 1
+    build="$(grep -n "Building Docker image" <<<"$1" | head -1 | cut -d: -f1)"
+    banner="$(grep -n "Running on Cloud Run Jobs" <<<"$1" | head -1 | cut -d: -f1)"
+    [ -n "$build" ] && [ "$warn" -lt "$build" ] &&
+    [ -n "$banner" ] && [ "$warn" -lt "$banner" ]
+  ' _ "$V10_OUT"
+
 # Cleanup
 rm -rf "$FAKE_GCLOUD_DIR"
 rm -rf "$FAKE8_DIR"

@@ -785,6 +785,51 @@ check "W14 e2e run: preflight token mint precedes run jobs create; prompts disab
 check "W14 e2e run: every gcloud call still pinned (preflight included)" \
   accounts_all_equal "$RUNG2_IDENT"
 
+# --- W15: e2e run-lane banner attribution (stdout) + untouched stderr proof --
+reset_green
+W15_ERR="$TDIR/w15.err"
+W15_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" HOME="$EMPTY_HOME" \
+  GCLOUD_IDENT="$RUNG2_IDENT" \
+  "$WRAPPER_E2E" run --cloud --shards=1 2>"$W15_ERR" < /dev/null) && W15_RC=0 || W15_RC=$?
+check "W15 e2e banner: pinned identity + GCLOUD_IDENT source on stdout" \
+  bash -c '
+    grep -q "\[e2e-cloud\] Identity: rung2-bypass@example.invalid (source: GCLOUD_IDENT (explicit env bypass))" <<<"$2"
+  ' _ "$W15_RC" "$W15_OUT"
+check "W15 e2e banner: identity line precedes the first build work and the banner" \
+  bash -c '
+    ident="$(grep -n "\[e2e-cloud\] Identity:" <<<"$2" | head -1 | cut -d: -f1)"
+    [ -n "$ident" ] || exit 1
+    firstwork="$(grep -nE "Building Docker image|Running on Cloud Run Jobs" <<<"$2" | head -1 | cut -d: -f1)"
+    [ -n "$firstwork" ] && [ "$ident" -lt "$firstwork" ]
+  ' _ "$W15_RC" "$W15_OUT"
+
+reset_green
+W15B_ERR="$TDIR/w15b.err"
+W15B_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" HOME="$EMPTY_HOME" \
+  "$WRAPPER_E2E" run --cloud --shards=1 2>"$W15B_ERR" < /dev/null) && W15B_RC=0 || W15B_RC=$?
+check "W15b e2e ambient banner: (ambient gcloud) identity + no-robot-skill source; stderr still exactly the one ambient note" \
+  bash -c '
+    [ "$1" = "0" ] &&
+    grep -q "\[e2e-cloud\] Identity: (ambient gcloud) (source: ambient gcloud (no robot skill found))" <<<"$2" &&
+    [ "$(wc -l < "$3")" = "1" ] &&
+    grep -q "skill not found .* using ambient gcloud" "$3"
+  ' _ "$W15B_RC" "$W15B_OUT" "$W15B_ERR"
+
+W15C_ERR="$TDIR/w15c.err"
+W15C_DIRTY="$ROOT/.e2e-cloud-dirty-w15c"
+touch "$W15C_DIRTY"
+W15C_OUT=$(env "${SCRUB[@]}" PATH="$GTDIR:$PATH" HOME="$EMPTY_HOME" \
+  "$WRAPPER_E2E" run --cloud --shards=1 2>"$W15C_ERR" < /dev/null) && W15C_RC=0 || W15C_RC=$?
+rm -f "$W15C_DIRTY"
+check "W15c e2e dirty tree: loud WARNING before the rebuild work itself" \
+  bash -c '
+    grep -q "\[e2e-cloud\] WARNING: dirty worktree" <<<"$2" &&
+    grep -q "not content-addressed" <<<"$2" &&
+    warn="$(grep -n "WARNING: dirty worktree" <<<"$2" | head -1 | cut -d: -f1)"
+    build="$(grep -n "Building Docker image" <<<"$2" | head -1 | cut -d: -f1)"
+    [ -n "$build" ] && [ "$warn" -lt "$build" ]
+  ' _ "$W15C_RC" "$W15C_OUT"
+
 # --- W16: the TTY-gated export reaches the selector's environment, before
 # the preflight — the selector is the only pre-preflight component that can
 # prompt (every other prompt check pins GCLOUD_IDENT and bypasses the probe).
