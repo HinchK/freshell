@@ -1604,6 +1604,7 @@ impl FreshOpencodeState {
             msg,
             session_id,
             send_fence,
+            None,
             false,
         )
         .await;
@@ -1617,9 +1618,13 @@ impl FreshOpencodeState {
     /// session→map lock pair stays the only permitted ordering).
     /// `already_accepted` suppresses the `freshAgent.send.accepted`
     /// broadcast when the queue arm already emitted it (never
-    /// double-fire). Task 5 adds the `op_guard` parameter (the armed
-    /// attach guard moved into the drive and released at the prompt's
-    /// dispatch boundary); this task's signature stays as written.
+    /// double-fire). `op_guard` (Task 5): the ownership attach guard the
+    /// drain's fence re-validation armed over this entry's captured pair
+    /// — moved into the spawned drive and released at the prompt POST's
+    /// DISPATCH boundary (the select! racing a fresh per-drive dispatch
+    /// witness, the compact drive's own discipline); the direct
+    /// `handle_send` path passes `None` (it never arms the guard).
+    #[allow(clippy::too_many_arguments)] // the send field set + the drain's armed guard (the compact precedent)
     async fn send_locked(
         &self,
         session_arc: &Arc<TokioMutex<OpencodeSession>>,
@@ -1627,6 +1632,7 @@ impl FreshOpencodeState {
         msg: FreshAgentSend,
         session_id: String,
         send_fence: Option<freshell_ownership::ObservedFence>,
+        op_guard: Option<freshell_ownership::AttachGuard>,
         already_accepted: bool,
     ) {
         let request_id = msg.request_id.clone();
@@ -2079,6 +2085,15 @@ impl FreshOpencodeState {
         let settling = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let settling_task = Arc::clone(&settling);
 
+        // The FRESH per-drive dispatch witness (NOT the session's
+        // `daemon_turn_accepted` flag — that one is session-lifetime and
+        // can be stale-armed by an earlier ambiguous failure, which would
+        // release the guard pre-dispatch). Constructed OUTSIDE the block,
+        // moved in — the compact drive's own constructed-outside
+        // discipline: a never-started future still drops the guard with
+        // its captures.
+        let prompt_dispatched = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         let turn_task = tokio::spawn(async move {
             // `run_turn` (freshell-opencode/serve.rs) prompts + awaits idle against the
             // REAL opencode serve session (adapter.ts materializeOrSend:363-368). The
@@ -2089,17 +2104,45 @@ impl FreshOpencodeState {
             // INSIDE the shared daemon (delivery precedes the response, and an
             // ambiguous response failure counts as accepted), and only a
             // settled outcome below (or a confirmed abort) may disarm it.
-            let result = manager
-                .run_turn(
-                    &real_id,
-                    &text,
-                    model.as_deref(),
-                    effort.as_deref(),
-                    DEFAULT_TURN_TIMEOUT,
-                    route,
-                    Some(daemon_turn_accepted.clone()),
-                )
-                .await;
+            let mut op_guard = op_guard; // Option<AttachGuard>, owned here
+            let dispatch_witness = prompt_dispatched.clone();
+            let mut turn_fut = Box::pin(manager.run_turn(
+                &real_id,
+                &text,
+                model.as_deref(),
+                effort.as_deref(),
+                DEFAULT_TURN_TIMEOUT,
+                route.clone(),
+                Some(daemon_turn_accepted.clone()),
+                Some(dispatch_witness),
+            ));
+            // The compact drive's own guard-release discipline: race the
+            // fresh dispatch witness against the drive. The guard releases
+            // at the DISPATCH boundary — the prompt POST's request leg —
+            // the mutation's point of no return; it must NOT live through
+            // the turn's await-idle tail (a handoff would block on a
+            // read-only poll), and it must NOT release before dispatch
+            // (the arm→dispatch check-then-act window is exactly what the
+            // guard exists to close). Whichever resolves first drops the
+            // guard exactly once.
+            let mut released_at_dispatch = Box::pin(async {
+                loop {
+                    if prompt_dispatched.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            });
+            let turn_result = tokio::select! {
+                _ = &mut released_at_dispatch => {
+                    drop(op_guard.take());
+                    turn_fut.as_mut().await
+                }
+                result = turn_fut.as_mut() => result,
+            };
+            drop(released_at_dispatch);
+            drop(op_guard.take()); // never-dispatched paths (errors, aborts)
+            let result = turn_result;
             match &result {
                 // The idle edge was observed (or the daemon itself is gone —
                 // nothing runs daemon-side): the accepted turn is settled.
@@ -2206,10 +2249,53 @@ impl FreshOpencodeState {
                     continue;
                 }
             };
-            // (Task 5 inserts the guard-based fence re-validation here.)
+            // Drain-time fence re-validation (the user constraint): the
+            // entry's captured pair is validated ATOMICALLY via the
+            // lane's op guard — never a bare unlocked observe-then-act
+            // (the exact TOCTOU the guard's docs exist to close). FENCED
+            // entries only: an unfenced entry keeps the direct send
+            // path's parse-only tolerance (the queue re-enters the send
+            // path; it is not stricter than the path it re-enters — the
+            // no-laundering discipline binds the history-restructuring
+            // lanes, not the append-a-turn send lane).
+            let op_guard = match send_fence {
+                None => None, // unfenced: direct-path tolerance
+                Some(fence) => {
+                    let op_id = format!("send-drain-{}", uuid::Uuid::new_v4());
+                    match crate::ownership_lane::arm_reclaimless_op_guard(
+                        &self.fresh_agent.ownership,
+                        PROVIDER,
+                        &real_id,
+                        &op_id,
+                        Some(fence),
+                        "freshopencode/send-drain",
+                    ) {
+                        crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
+                        crate::ownership_lane::LaneOpGuard::Unwired => None,
+                        crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                            session.pending_sends.pop_front();
+                            tracing::warn!(target: "freshell_freshagent::opencode",
+                                session_id = %lookup_id, request_id = ?msg.request_id,
+                                observed_epoch = fence.epoch,
+                                observed_generation = fence.generation,
+                                "fresh_agent_send_drain_refused: ownership guard refused");
+                            self.send_error(&msg.request_id, "SESSION_RESERVED", &message);
+                            continue;
+                        }
+                    }
+                }
+            };
             session.pending_sends.pop_front();
-            self.send_locked(&session_arc, &mut session, msg, real_id, send_fence, true)
-                .await;
+            self.send_locked(
+                &session_arc,
+                &mut session,
+                msg,
+                real_id,
+                send_fence,
+                op_guard,
+                true,
+            )
+            .await;
             return; // one entry driven; its settle tail continues the FIFO
         }
     }
@@ -16573,6 +16659,150 @@ mod tests {
         })
         .await;
         await_prompt_posted(&http, "drains past the failure").await;
+    }
+
+    /// Task 5: the drain-time fence re-validation. A queued send whose
+    /// CAPTURED observed pair went stale (the session moved to a newer
+    /// ownership generation while it sat behind the compact) is refused
+    /// TYPED at drain time — the lane's op guard validates the pair
+    /// atomically and answers the guard's stale message — and the refusal
+    /// is REQUEST-CORRELATED: a top-level `error` frame carrying the
+    /// send's requestId (the send_error idiom — the wire `error.code` is
+    /// always INTERNAL_ERROR, the typed code rides in the message),
+    /// never an uncorrelated session-scoped broadcast. The refused entry
+    /// never POSTs, is discarded (never retried), and the queue CONTINUES
+    /// with the next entry: a current-observed send queued behind the
+    /// stale one still drains and POSTs.
+    #[tokio::test]
+    async fn a_stale_queued_fence_refuses_typed_at_drain_and_the_queue_continues() {
+        // Same gated rig, plus a coordinator registry seeded Live{FreshAgent}
+        // on the durable key — the SAME seeding the parked-compact tests use
+        // (the compact itself MUST be fenced with the current pair: an
+        // unfenced compact against a Live{FreshAgent} key is the typed
+        // FENCE_REQUIRED refusal and the drive never spawns).
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (mut st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q6", Some("prov/model")).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        seed_live_fresh_owner(&registry, "ses_q6"); // Live{FreshAgent} at generation G
+        let (epoch, generation) = fenced_observed(&registry, "ses_q6"); // the current pair
+
+        // The compact, FENCED with the current pair.
+        let mut compact = compact_msg("ses_q6");
+        (compact.observed_epoch, compact.observed_generation) = (epoch, generation);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact),
+        )
+        .await
+        .expect("compact registers (fenced)");
+        await_summarize_posted(&http).await;
+
+        // A STALE-observed send (generation behind the Live record) and a
+        // CURRENT-observed send both queue during the compact.
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg_fenced(
+                "ses_q6",
+                "stale one",
+                epoch,
+                generation.map(|g| g.saturating_sub(1)),
+            )),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg_fenced("ses_q6", "current one", epoch, generation)),
+        )
+        .await;
+
+        summarize_gate.notify_waiters();
+
+        // (1) The stale entry is refused REQUEST-CORRELATED: a top-level
+        // `error` frame carrying its requestId. The wire `error.code` is
+        // always INTERNAL_ERROR (the send_error idiom); the typed code
+        // rides in the MESSAGE — assert the requestId and the guard's
+        // stale wording (STALE_OP_GUARD_MESSAGE) in the message, never a
+        // wire code.
+        let frames = frames_until(&mut rx, |f| {
+            f["type"] == "error" && f["requestId"] == "req-stale one"
+        })
+        .await;
+        assert!(
+            frames.iter().any(|f| f["message"]
+                .to_string()
+                .to_lowercase()
+                .contains("newer ownership generation")),
+            "the stale queued send refuses with the guard's stale-fence message: {frames:?}"
+        );
+        // (2) It never POSTs.
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async") && r_body_contains(r, "stale one")),
+            "the refused stale entry must never reach the prompt POST"
+        );
+        // (3) The queue CONTINUES: the current entry drains and POSTs.
+        await_prompt_posted(&http, "current one").await;
+        let session_arc = st.sessions.lock().await.get("ses_q6").cloned().unwrap();
+        assert!(
+            session_arc.lock().await.pending_sends.is_empty(),
+            "the refused entry was discarded; the current entry drained"
+        );
+    }
+
+    /// Task 5: the settled tolerance pin — an UNFENCED queued send (the
+    /// legacy client shape: no observed pair on the wire message) queued
+    /// behind a fenced compact on a WIRED Live key proceeds at drain
+    /// exactly like the direct send path: the queue re-enters the send
+    /// path and is not stricter than the path it re-enters. The op
+    /// guard's no-laundering discipline (an unfenced None against a Live
+    /// key is the typed FENCE_REQUIRED refusal) binds the
+    /// history-RESTRUCTURING lanes (compact/rollback/fork), not the
+    /// append-a-turn send lane — `handle_send`'s direct path is
+    /// fence-parse-only, and the drain matches it.
+    #[tokio::test]
+    async fn an_unfenced_queued_send_drains_like_a_direct_send_against_a_wired_owner() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (mut st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q7", Some("prov/model")).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        seed_live_fresh_owner(&registry, "ses_q7");
+        let (epoch, generation) = fenced_observed(&registry, "ses_q7");
+        let mut compact = compact_msg("ses_q7");
+        (compact.observed_epoch, compact.observed_generation) = (epoch, generation);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact),
+        )
+        .await
+        .expect("compact registers (fenced)");
+        await_summarize_posted(&http).await;
+        // UNFENCED (send_msg sends no observed pair).
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q7", "unfenced but queued")),
+        )
+        .await;
+        summarize_gate.notify_waiters();
+        await_prompt_posted(&http, "unfenced but queued").await;
+        let session_arc = st.sessions.lock().await.get("ses_q7").cloned().unwrap();
+        assert!(session_arc.lock().await.pending_sends.is_empty());
     }
 
     // ── freshAgent.fork (AGENT-07, approval-respond Task 5) ────────────────
