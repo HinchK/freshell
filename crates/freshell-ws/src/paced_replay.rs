@@ -330,6 +330,25 @@ pub(crate) fn drive_session(
     DriveOutcome::DrainReady
 }
 
+/// The drain's per-iteration admission reservation (E2R1 finding 2b):
+/// the reservation must account what the drain can actually admit. A
+/// page packs within the session's budget, but the page builder always
+/// includes the window's FIRST frame even when it alone exceeds the
+/// budget — the ATOMIC single-frame page — so a sub-cap budget (a
+/// client's small `replayPageBytes` request) can still admit a page up
+/// to the fragment-cap ceiling. Reserving only the requested budget let
+/// concurrent pane drains each be granted against the same
+/// just-under-watermark backlog and each admit a full atomic page on
+/// top of it, overbooking the admission gate and self-spilling the
+/// connection's own queued pages. The reservation is therefore
+/// max(session budget, the atomic page ceiling); a budget at-or-above
+/// the ceiling (every supported default) reserves exactly the budget,
+/// byte-identical to the pre-fix behavior.
+pub(crate) fn drain_admission_bytes(page_budget: i64) -> usize {
+    let atomic_ceiling = freshell_terminal::paced_atomic_page_serialized_ceiling() as i64;
+    page_budget.max(atomic_ceiling).max(0) as usize
+}
+
 /// Spawn the session's UN-CREDITED drain (the accumulated live range after
 /// the credited replay covered its fixed target). The drain runs OFF the
 /// connection dispatcher — a sustained producer can hold it open through
@@ -407,7 +426,7 @@ pub(crate) fn spawn_paced_drain(
         // re-captures the drain target.
         //
         // RESERVE-THEN-ADMIT (round-5 finding 1): every page and every
-        // handoff chunk reserves its full budget under the connection
+        // handoff chunk reserves its admission bytes under the connection
         // queue's own lock BEFORE the registry builds and sinks it, so the
         // reservation accounts for the page about to be admitted AND for
         // every other concurrent pane drain's in-flight reservation — the
@@ -419,8 +438,12 @@ pub(crate) fn spawn_paced_drain(
         // page budget to the connection queue's admission ceiling, so the
         // grant is always reachable — and the gate itself can never
         // deadlock whatever the budget (a page larger than the watermark
-        // admits into a fully drained queue).
-        let admission_bytes = budget.max(0) as usize;
+        // admits into a fully drained queue). E2R1 finding 2b: the
+        // reserved bytes are [`drain_admission_bytes`] — max(budget, the
+        // atomic page ceiling) — because a sub-cap budget can still admit
+        // the builder's atomic single-frame page, and a reservation of
+        // only the requested bytes under-books exactly that page.
+        let admission_bytes = drain_admission_bytes(budget);
         let mut handing_off = false;
         loop {
             // The RAII permit is held to the END of the loop body (dropped
@@ -709,6 +732,40 @@ mod tests {
             attach_request_id: arid.into(),
             consumed_seq,
         }
+    }
+
+    #[test]
+    fn drain_admission_never_under_reserves_for_an_atomic_page() {
+        // E2R1 finding 2(b): a sub-cap page budget can still admit the
+        // page builder's ATOMIC single-frame result (a frame larger than
+        // the request forms its own page, bounded by the fragment-cap
+        // ceiling), so the reservation must cover that ceiling —
+        // reserving only the request under-books the admission gate for
+        // exactly the pages that exceed it, and concurrent drains then
+        // overbook the gate (the ws sub-cap canary's queue_overflow RED).
+        let ceiling = freshell_terminal::paced_atomic_page_serialized_ceiling() as i64;
+        assert!(
+            drain_admission_bytes(2048) >= ceiling as usize,
+            "a sub-cap budget reserves at least the atomic page ceiling \
+             (got {})",
+            drain_admission_bytes(2048)
+        );
+        assert_eq!(
+            drain_admission_bytes(128 * 1024),
+            128 * 1024,
+            "a budget at-or-above the ceiling reserves the budget (the supported default)"
+        );
+        assert_eq!(
+            drain_admission_bytes(ceiling),
+            ceiling as usize,
+            "at the ceiling the reservation is the ceiling"
+        );
+        assert_eq!(
+            drain_admission_bytes(0),
+            ceiling as usize,
+            "a degenerate zero budget still reserves the atomic ceiling \
+             (its pages are single frames, each bounded by the ceiling)"
+        );
     }
 
     #[test]

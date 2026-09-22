@@ -413,7 +413,11 @@ pub struct TerminalAttach {
     /// failing the whole attach frame). Integer-valued number spellings
     /// (`2048.0`, `2e3`) carry the same value as their canonical integer
     /// forms and are accepted and validated the same way (E2R1 finding 3)
-    /// — never silently dropped.
+    /// — never silently dropped. E2R1 finding 2 (the honest bound): pages
+    /// are bounded by max(requested, the atomic frame size) — a single
+    /// frame larger than the request forms its own ATOMIC single-frame
+    /// page, bounded by the server's fragment cap (every frame is
+    /// pre-fragmented, so one frame's serialized size never exceeds it).
     #[serde(
         default,
         deserialize_with = "lossy_positive_i64",

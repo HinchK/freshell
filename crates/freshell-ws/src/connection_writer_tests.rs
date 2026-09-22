@@ -399,6 +399,173 @@ async fn concurrent_full_size_drain_admissions_never_self_spill_the_queue() {
     let _ = join(task).await;
 }
 
+/// E2R1 finding 2(b) — the SUB-CAP twin of
+/// [`concurrent_full_size_drain_admissions_never_self_spill_the_queue`]:
+/// a client's `replayPageBytes` request far below the production frame
+/// size makes every page the builder's ATOMIC single-frame result, so
+/// the drain's reservation must be max(requested budget, the atomic
+/// page ceiling) — reserving only the requested bytes lets all three
+/// concurrent pane drains be granted together against the same
+/// just-under-watermark backlog, each admitting a full atomic page on
+/// top of it, and the queue evicts the drains' own pages. The numbers
+/// mirror the full-size twin's shape at the supported 64 KiB queue
+/// floor: watermark 32 KiB, requested budget 2048 bytes, atomic pages
+/// ~8.4 KiB (a maximal PTY read under the fragment cap).
+#[tokio::test]
+async fn concurrent_sub_cap_drain_admissions_never_under_reserve_the_atomic_page() {
+    let events = crate::invariants::capture::capture();
+    let (sender, pump) = WriterSender::new(64 * 1024, 4096, Duration::from_secs(10));
+    let capture = Arc::new(Capture::default());
+    capture.block_flush.store(true, Ordering::SeqCst);
+    let watermark = sender.backlog_watermark();
+    assert_eq!(
+        watermark,
+        32 * 1024,
+        "the supported 64 KiB queue floor's watermark"
+    );
+
+    // One ATOMIC page: a single output frame whose serialized size is a
+    // full PTY read (~8 KiB data) — far above the 2048-byte requested
+    // page budget, and within the fragment cap (frames are
+    // pre-fragmented, so this is the worst case production can stage).
+    let page = |terminal_id: &'static str, seq: i64| {
+        let mut message = output(seq);
+        if let ServerMessage::TerminalOutput(frame) = &mut message {
+            frame.terminal_id = terminal_id.to_string();
+            frame.data = "P".repeat(8 * 1024);
+        }
+        message
+    };
+    let page_bytes = serde_json::to_string(&page("drain-subcap-probe", 1))
+        .unwrap()
+        .len();
+    let ceiling = freshell_terminal::paced_atomic_page_serialized_ceiling();
+    assert!(
+        page_bytes <= ceiling,
+        "the fixture's atomic page is a real single frame under the ceiling \
+         ({page_bytes} <= {ceiling})"
+    );
+    assert!(
+        page_bytes > 2048,
+        "the atomic page provably exceeds the sub-cap request (the under-booked page)"
+    );
+
+    // Fill the backlog to JUST UNDER the grant threshold for three
+    // 2048-byte reservations (the wake state where the pre-fix gate
+    // granted all of them together) with the socket blocked.
+    let admission_bytes = crate::paced_replay::drain_admission_bytes(2048);
+    let grant_backlog_cap = watermark.saturating_sub(3 * 2048);
+    let mut seq = 0;
+    while sender.pending_output_bytes() < grant_backlog_cap.saturating_sub(4096) {
+        seq += 1;
+        assert!(sender.push_server(named_output("drain-subcap-fill", seq)));
+    }
+    let task = tokio::spawn(pump.run(TestSink(Arc::clone(&capture))));
+    started(&capture).await;
+    let backlog_at_wake = sender.pending_output_bytes();
+    assert!(
+        backlog_at_wake < grant_backlog_cap,
+        "the fixture wakes the drains just under the {grant_backlog_cap}-byte grant \
+         threshold ({backlog_at_wake})"
+    );
+    let spill_count = || {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e.message.contains("queue_overflow_spill")
+                    && e.fields
+                        .get("terminal_id")
+                        .is_some_and(|id| id.starts_with("drain-subcap"))
+            })
+            .count()
+    };
+    assert_eq!(spill_count(), 0, "no spill before the drains wake");
+
+    // THE CONCURRENT WAKE: three pane drains reserve their sub-cap
+    // admissions together against the just-under-watermark backlog. The
+    // gate must grant NONE of them while the backlog stands — a
+    // reservation of only the requested 2048 bytes would admit all
+    // three, and their ~8.4 KiB atomic pages (+ the standing backlog)
+    // would blow past the 64 KiB queue and evict the drains' own pages.
+    let max_observed = Arc::new(AtomicUsize::new(0));
+    let mut drains = Vec::new();
+    for (drain, terminal_id) in ["drain-subcap-a", "drain-subcap-b", "drain-subcap-c"]
+        .into_iter()
+        .enumerate()
+    {
+        let sender = sender.clone();
+        let max_observed = Arc::clone(&max_observed);
+        drains.push(tokio::spawn(async move {
+            let permit = sender
+                .reserve_drain_admission(admission_bytes)
+                .await
+                .expect("the writer is alive");
+            assert!(sender.push_server(page(terminal_id, 1 + drain as i64)));
+            let observed = sender.pending_output_bytes();
+            max_observed.fetch_max(observed, Ordering::SeqCst);
+            drop(permit);
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    {
+        let queues = sender.shared.queues.lock().unwrap();
+        assert_eq!(
+            queues.drain_reserved, 0,
+            "no sub-cap reservation is granted against a backlog the atomic page \
+             cannot join without crossing the watermark"
+        );
+    }
+    assert_eq!(
+        spill_count(),
+        0,
+        "no atomic page was admitted while the backlog stood (the socket is blocked)"
+    );
+    assert_eq!(
+        max_observed.load(Ordering::SeqCst),
+        0,
+        "no drain admitted anything before the queue drained"
+    );
+
+    // REAL consumption releases the admissions: the pump drains the
+    // backlog, the reservations grant (serialized by their atomic-page
+    // size), and every drain completes its page.
+    unblock(&capture);
+    for drain in drains {
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("each reserved sub-cap drain completes")
+            .unwrap();
+    }
+
+    // THE BOUND: zero drain-induced queue_overflow evictions, and the
+    // admitted aggregate never exceeded the watermark + one atomic page.
+    let observed = max_observed.load(Ordering::SeqCst);
+    assert_eq!(
+        spill_count(),
+        0,
+        "THE BOUND: concurrent sub-cap pane drains must never evict the connection's \
+         own pages by under-reserving their atomic pages (observed aggregate \
+         {observed}B vs watermark {watermark}B + one atomic page {page_bytes}B)"
+    );
+    assert!(
+        observed <= watermark + page_bytes,
+        "THE BOUND: the admitted aggregate ({observed}) must never exceed the \
+         watermark ({watermark}) + one atomic page ({page_bytes})"
+    );
+    {
+        let queues = sender.shared.queues.lock().unwrap();
+        assert_eq!(
+            queues.drain_reserved, 0,
+            "every reservation was released after its page became real backlog"
+        );
+    }
+
+    sender.stop_without_close();
+    let _ = join(task).await;
+}
+
 #[tokio::test]
 async fn blocked_flush_does_not_block_producers_and_is_still_accounted() {
     let (mut sender, pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));

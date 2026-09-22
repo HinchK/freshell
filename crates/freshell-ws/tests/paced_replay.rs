@@ -656,11 +656,46 @@ async fn paced_attach_first_page(
     arid: &str,
 ) -> (serde_json::Value, Vec<serde_json::Value>) {
     attach(ws, terminal_id, arid).await;
+    read_attach_burst(ws, arid).await
+}
+
+/// [`paced_attach_first_page`] with a negotiated `replayPageBytes` bound
+/// (E2R1 finding 2's sub-cap fixtures request a page budget BELOW the
+/// production frame size, so every page the session produces is the page
+/// builder's atomic single-frame result).
+async fn paced_attach_first_page_with_budget(
+    ws: &mut WsClient,
+    terminal_id: &str,
+    arid: &str,
+    replay_page_bytes: serde_json::Value,
+) -> (serde_json::Value, Vec<serde_json::Value>) {
+    attach_with_page_budget(ws, terminal_id, arid, replay_page_bytes).await;
+    read_attach_burst(ws, arid).await
+}
+
+/// The attach burst after the attach frame was sent: the ready (matched
+/// by `attachRequestId`) plus every output frame of the first page, read
+/// to the first quiet gap after the ready.
+async fn read_attach_burst(
+    ws: &mut WsClient,
+    arid: &str,
+) -> (serde_json::Value, Vec<serde_json::Value>) {
+    read_attach_burst_with_quiet(ws, arid, Duration::from_millis(400)).await
+}
+
+/// [`read_attach_burst`] with an explicit quiet window (the paced
+/// sub-cap fixture's bursts are the only traffic on their connection, so
+/// a short window keeps its per-pane attach dance tight).
+async fn read_attach_burst_with_quiet(
+    ws: &mut WsClient,
+    arid: &str,
+    quiet: Duration,
+) -> (serde_json::Value, Vec<serde_json::Value>) {
     let mut ready = None;
     let mut outputs = Vec::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while tokio::time::Instant::now() < deadline {
-        match next_json_or_timeout(ws, Duration::from_millis(400)).await {
+        match next_json_or_timeout(ws, quiet).await {
             None => {
                 if ready.is_some() {
                     break; // the unprompted burst is complete
@@ -904,6 +939,22 @@ async fn attach_with_page_budget(
     attach_request_id: &str,
     replay_page_bytes: serde_json::Value,
 ) {
+    attach_with_page_budget_and_since(ws, terminal_id, attach_request_id, replay_page_bytes, 0)
+        .await
+}
+
+/// [`attach_with_page_budget`] with an explicit `sinceSeq` baseline (the
+/// paced restore contract's coverage cursor — E2R1 finding 2's sub-cap
+/// fixture attaches each pane from just below its observed head, so the
+/// credited window is a couple of frames and the session HOLDS on its
+/// first page until the client credits).
+async fn attach_with_page_budget_and_since(
+    ws: &mut WsClient,
+    terminal_id: &str,
+    attach_request_id: &str,
+    replay_page_bytes: serde_json::Value,
+    since_seq: i64,
+) {
     ws.send(WsMessage::Text(
         serde_json::json!({
             "type": "terminal.attach",
@@ -912,7 +963,7 @@ async fn attach_with_page_budget(
             "cols": 80,
             "rows": 24,
             "attachRequestId": attach_request_id,
-            "sinceSeq": 0,
+            "sinceSeq": since_seq,
             "replayPageBytes": replay_page_bytes,
         })
         .to_string(),
@@ -1005,8 +1056,17 @@ async fn negotiated_attach_honors_the_requested_replay_page_bytes() {
     // either packs strictly within it or carries exactly ONE frame (the
     // atomic over-budget result for a frame larger than the bound — the
     // flood's ~8.5 KiB frames), and the session converges.
+    //
+    // E2R1 finding 2 — the single-frame assertions, added honestly: the
+    // atomic exception is DOCUMENTED, not hidden. A single-frame page MAY
+    // exceed the request (the builder always includes the window's first
+    // frame), but it reaches ONLY the atomic page ceiling — the fragment
+    // cap plus the page-envelope slack, the same bound the drain
+    // admission reserves for sub-cap budgets.
+    let atomic_ceiling = freshell_terminal::paced_atomic_page_serialized_ceiling();
     let mut pages = 0usize;
     let mut last_seq = 0i64;
+    let mut saw_atomic_over_budget = false;
     loop {
         let page_bytes: usize = page.iter().map(|f| f.to_string().len()).sum();
         if page.len() > 1 {
@@ -1014,6 +1074,15 @@ async fn negotiated_attach_honors_the_requested_replay_page_bytes() {
                 page_bytes <= requested,
                 "a multi-frame page must pack within the {requested}-byte bound, got {page_bytes}"
             );
+        } else if page.len() == 1 {
+            assert!(
+                page_bytes <= atomic_ceiling,
+                "a single-frame page may reach only the documented atomic ceiling \
+                 ({atomic_ceiling}), got {page_bytes}"
+            );
+            if page_bytes > requested {
+                saw_atomic_over_budget = true;
+            }
         }
         pages += 1;
         last_seq = page
@@ -1047,6 +1116,12 @@ async fn negotiated_attach_honors_the_requested_replay_page_bytes() {
         );
     }
     assert!(pages > 1, "the window must page repeatedly ({pages})");
+    assert!(
+        saw_atomic_over_budget,
+        "the fixture exercises the documented atomic exception: at least one \
+         single-frame page exceeds the {requested}-byte request (the flood's \
+         ~8.5 KiB frames against the 2048-byte bound)"
+    );
 
     // A MALFORMED bound (wrong-typed) keeps the server default and never
     // fails the attach frame — the pre-contract accept-and-strip
@@ -2192,6 +2267,318 @@ async fn multiple_restoring_panes_on_one_connection_stay_within_the_connection_q
     }
 }
 
+/// E2R1 finding 2(b) — the multi-pane zero-spill canary extended with
+/// SUB-CAP page requests: the end-to-end shape. Multiple panes restore
+/// over ONE connection with `replayPageBytes` far below the production
+/// frame size (128 bytes), so every page the session produces is the
+/// builder's ATOMIC single-frame result (~4-8.5 KiB, the documented
+/// exception to the requested bound). At the canary's own production
+/// sizing this proves the whole chain: the sub-cap request is honored
+/// as every session's budget, the atomic pages flow and converge, the
+/// concurrent drains complete against real post-target remainders, and
+/// the connection never self-spills (`queue_overflow` never appears).
+///
+/// The TIGHT-WATERMARK aggregate bound — the reservation must account
+/// max(requested budget, the atomic page ceiling) so concurrent
+/// sub-cap drains cannot overbook the admission gate — is pinned
+/// deterministically at the writer unit lane
+/// (`concurrent_sub_cap_drain_admissions_never_under_reserve_the_atomic_page`),
+/// exactly the split the round-5 canary itself uses for its full-size
+/// twin (an end-to-end test at a queue small enough to weaponize every
+/// legal in-flight shape times out on fixture noise, not on the bound).
+#[tokio::test]
+async fn sub_cap_page_requests_restore_end_to_end_at_the_atomic_page_bound() {
+    const PANES: usize = 2;
+    let events = global_capture();
+    let ring = 512 * 1024;
+    let url = spawn_server_with(ring, PAGE_BUDGET, None).await;
+    let mut driver = connect(&url).await;
+    hello(&mut driver, false).await;
+    let mut terminals: Vec<String> = Vec::new();
+    for pane in 0..PANES {
+        terminals.push(create_shell_terminal(&mut driver, &format!("create-subcap-{pane}")).await);
+    }
+    let arids: Vec<String> = (0..PANES)
+        .map(|pane| format!("attach-subcap-{pane}"))
+        .collect();
+
+    // The canary's flood discipline: the observer attaches before any
+    // flood exists, both panes flood concurrently (bounded,
+    // self-terminating), production demonstrably outruns every attach
+    // target, and the observer detaches before the restore.
+    let mut observer = connect(&url).await;
+    hello(&mut observer, false).await;
+    for terminal in &terminals {
+        attach(&mut observer, terminal, "attach-subcap-observer").await;
+    }
+    for terminal in &terminals {
+        send_input(
+            &mut driver,
+            terminal,
+            &flood_command(100_000, "FLOOD-DONE-MARKER"),
+        )
+        .await;
+    }
+    let mut flood_seen = [false; PANES];
+    let flood_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !flood_seen.iter().all(|seen| *seen) && tokio::time::Instant::now() < flood_deadline {
+        let Some(value) = next_json_or_timeout(&mut observer, Duration::from_secs(2)).await else {
+            continue;
+        };
+        if value.get("type").and_then(|v| v.as_str()) == Some("terminal.output") {
+            let data = value.get("data").and_then(|d| d.as_str()).unwrap_or("");
+            let term = value
+                .get("terminalId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if data.contains("STREAMDATA") && !data.contains("yes '") {
+                if let Some(pane) = terminals
+                    .iter()
+                    .position(|terminal| terminal.as_str() == term)
+                {
+                    flood_seen[pane] = true;
+                }
+            }
+        }
+    }
+    assert!(
+        flood_seen.iter().all(|seen| *seen),
+        "both floods must be flowing before the restore"
+    );
+    for terminal in &terminals {
+        observer
+            .send(WsMessage::Text(
+                serde_json::json!({
+                    "type": "terminal.detach",
+                    "terminalId": terminal,
+                })
+                .to_string(),
+            ))
+            .await
+            .expect("observer detaches");
+    }
+    drop(observer);
+
+    // ONE negotiated connection restores BOTH panes with the sub-cap
+    // budget. Each attach's first page is read before the next attach.
+    let mut paced = connect(&url).await;
+    hello(&mut paced, true).await;
+    let mut targets = [0i64; PANES];
+    let mut delivered: Vec<Vec<(i64, i64)>> = vec![Vec::new(); PANES];
+    let mut credited = [0i64; PANES];
+    for pane in 0..PANES {
+        let (ready, page) = paced_attach_first_page_with_budget(
+            &mut paced,
+            &terminals[pane],
+            &arids[pane],
+            serde_json::json!(128),
+        )
+        .await;
+        targets[pane] = ready["replayToSeq"].as_i64().expect("replayToSeq");
+        for frame in &page {
+            delivered[pane].push((
+                frame["seqStart"].as_i64().unwrap_or(0),
+                frame["seqEnd"].as_i64().unwrap_or(0),
+            ));
+        }
+        credited[pane] = page
+            .iter()
+            .map(|f| f["seqEnd"].as_i64().unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            credited[pane] > 0,
+            "pane {pane}'s first page carries content"
+        );
+    }
+    for pane in 0..PANES {
+        credit(&mut paced, &terminals[pane], &arids[pane], credited[pane]).await;
+    }
+
+    // Consume at full speed, crediting each pane toward its fixed target
+    // and then through the concurrent drains, until BOTH complete. THE
+    // BOUND (the canary's): no `queue_overflow` gap may EVER arrive.
+    // Retention gaps (`replay_window_exceeded`) are the honest declared
+    // loss this fixture's ring churn produces; they are legal.
+    let mut declared_gaps: Vec<(usize, i64, i64)> = Vec::new();
+    let mut max_seq = [0i64; PANES];
+    // The sub-cap contract's load-bearing evidence: the sessions page
+    // single frames whose serialized size EXCEEDS the 128-byte request —
+    // the documented atomic exception, real on the wire.
+    let mut saw_frame_over_budget = false;
+    let drain_completed = |terminal_id: &str| -> bool {
+        events.lock().unwrap().iter().any(|e| {
+            e.message == "ws.restore.paced_complete"
+                && e.fields.get("terminal_id").map(String::as_str) == Some(terminal_id)
+        })
+    };
+    let pane_of = |term: &str| -> Option<usize> {
+        terminals
+            .iter()
+            .position(|terminal| terminal.as_str() == term)
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "both sub-cap drains must complete within the window"
+        );
+        // Completion is checked only when the socket goes QUIET: the
+        // shared capture vec is process-global, and scanning it per
+        // frame would starve this client's reads.
+        let Some(value) = next_json_or_timeout(&mut paced, Duration::from_secs(2)).await else {
+            if terminals.iter().all(|terminal| drain_completed(terminal)) {
+                break;
+            }
+            continue;
+        };
+        let term = value
+            .get("terminalId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let Some(pane) = pane_of(&term) else {
+            continue;
+        };
+        match value.get("type").and_then(|v| v.as_str()) {
+            Some("terminal.output") => {
+                let start = value["seqStart"].as_i64().unwrap_or(0);
+                let end = value["seqEnd"].as_i64().unwrap_or(0);
+                if value.to_string().len() > 128 {
+                    saw_frame_over_budget = true;
+                }
+                max_seq[pane] = max_seq[pane].max(end);
+                delivered[pane].push((start, end));
+                // Credit each page toward the pane's fixed target; the
+                // FINAL page (end >= target) is not credited — the credit
+                // that produced it already started the pane's drain.
+                if end > credited[pane] && end < targets[pane] {
+                    credited[pane] = end;
+                    credit(&mut paced, &terminals[pane], &arids[pane], end).await;
+                } else if end > credited[pane] {
+                    credited[pane] = end;
+                }
+            }
+            Some("terminal.output.gap") => {
+                let reason = value.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                assert_ne!(
+                    reason, "queue_overflow",
+                    "THE BOUND: the gated sub-cap drains must never spill the \
+                     connection's own queued pages: {value}"
+                );
+                declared_gaps.push((
+                    pane,
+                    value["fromSeq"].as_i64().unwrap_or(0),
+                    value["toSeq"].as_i64().unwrap_or(0),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    // Drain until quiet before the contiguity check (the completion events
+    // fire at admission; the final pages may still be in flight).
+    let quiet_drain = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut quiet_streak = 0u8;
+    while tokio::time::Instant::now() < quiet_drain && quiet_streak < 3 {
+        let Some(value) = next_json_or_timeout(&mut paced, Duration::from_millis(300)).await else {
+            quiet_streak += 1;
+            continue;
+        };
+        quiet_streak = 0;
+        let term = value
+            .get("terminalId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let Some(pane) = pane_of(&term) else {
+            continue;
+        };
+        match value.get("type").and_then(|v| v.as_str()) {
+            Some("terminal.output") => delivered[pane].push((
+                value["seqStart"].as_i64().unwrap_or(0),
+                value["seqEnd"].as_i64().unwrap_or(0),
+            )),
+            Some("terminal.output.gap") => {
+                let reason = value.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+                assert_ne!(
+                    reason, "queue_overflow",
+                    "THE BOUND: no spill, even in the in-flight tail: {value}"
+                );
+                declared_gaps.push((
+                    pane,
+                    value["fromSeq"].as_i64().unwrap_or(0),
+                    value["toSeq"].as_i64().unwrap_or(0),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_frame_over_budget,
+        "the sub-cap sessions page atomic frames that exceed the 128-byte request \
+         (the documented exception, real on the wire)"
+    );
+    for pane in 0..PANES {
+        let start_ev = wait_for_restore_event(
+            &events,
+            &terminals[pane],
+            "ws.restore.paced_start",
+            "attach_request_id",
+            &arids[pane],
+        )
+        .await
+        .expect("the sub-cap attach emits its paced_start event");
+        assert_eq!(
+            start_ev.fields.get("page_budget").map(String::as_str),
+            Some("128"),
+            "the 128-byte replayPageBytes request is pane {pane}'s session budget"
+        );
+        assert!(
+            max_seq[pane] > targets[pane],
+            "pane {pane}'s producer outran its attach target (the drain faced a real remainder)"
+        );
+        // No undeclared holes: every delivered hole lies inside the pane's
+        // declared retention loss (the canary's contiguity contract).
+        let mut gap_ranges: Vec<(i64, i64)> = declared_gaps
+            .iter()
+            .filter(|(gap_pane, _, _)| *gap_pane == pane)
+            .map(|(_, from, to)| (*from, *to))
+            .collect();
+        gap_ranges.sort_unstable();
+        let mut merged: Vec<(i64, i64)> = Vec::new();
+        for (from, to) in gap_ranges {
+            match merged.last_mut() {
+                Some((_, last_to)) if from <= *last_to + 1 => {
+                    *last_to = (*last_to).max(to);
+                }
+                _ => merged.push((from, to)),
+            }
+        }
+        let mut ranges = delivered[pane].clone();
+        ranges.sort_unstable();
+        let mut prev_end: Option<i64> = None;
+        for (start, end) in &ranges {
+            if *start <= 0 {
+                continue;
+            }
+            if let Some(prev) = prev_end {
+                if *start > prev + 1 {
+                    let hole = (prev + 1, *start - 1);
+                    let declared = merged
+                        .iter()
+                        .any(|(from, to)| hole.0 >= *from && hole.1 <= *to);
+                    assert!(
+                        declared,
+                        "pane {pane} has an undeclared seq hole {hole:?} (declared loss {merged:?})"
+                    );
+                }
+            }
+            prev_end = Some(prev_end.map_or(*end, |p| p.max(*end)));
+        }
+    }
+}
 /// A producing drain's completion must be BOUNDED and COUNTABLE (the
 /// round-2 recapture-loophole fix): the drain completes against a
 /// sustained producer with a page count bounded by the ring capacity

@@ -57,7 +57,7 @@ pub use batch::{
 };
 pub use chunk_ring::{snapshot_seed_if_ring_empty, ChunkRingBuffer};
 pub use decode::Utf8StreamDecoder;
-pub use fragment::PACED_PAGE_BUDGET_FLOOR_BYTES;
+pub use fragment::{paced_atomic_page_serialized_ceiling, PACED_PAGE_BUDGET_FLOOR_BYTES};
 pub use framing::{reassemble_stream, OutputFramer};
 pub use mode_tracker::ModeTracker;
 pub use pty::{build_child_env, build_child_env_from_process, MessageSink, PtyTerminal};

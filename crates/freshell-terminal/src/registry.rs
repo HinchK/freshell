@@ -6368,6 +6368,83 @@ mod tests {
         );
     }
 
+    /// E2R1 finding 2: a request below the frame cap can still receive an
+    /// ATOMIC single-frame page — the page builder always includes the
+    /// window's first frame even when it alone exceeds the requested
+    /// budget (a single frame larger than the request forms its own page)
+    /// — and that page is bounded by the DOCUMENTED ceiling: the fragment
+    /// cap plus the page-envelope slack, never unbounded. Pinned in BOTH
+    /// wire forms (the plain per-frame arm and the batch arm), because
+    /// the drain-admission reservation accounts exactly this ceiling for
+    /// sub-cap budgets.
+    #[test]
+    fn the_atomic_single_frame_page_stays_within_the_documented_ceiling() {
+        let reg = TerminalRegistry::new();
+        reg.set_paced_page_max_bytes(4096);
+        reg.insert_headless("T", "S");
+        // One maximal frame (the worst case production can stage: every
+        // PTY byte is ingested through the fragment splitter, so a
+        // frame's serialized payload never exceeds the fragment cap) plus
+        // a small successor, so the window provably has more to page
+        // after the atomic result.
+        let cap = crate::fragment::terminal_stream_batch_max_bytes();
+        let mut len = cap;
+        while crate::fragment::measure_terminal_output_budget_payload_bytes(
+            "T",
+            "S",
+            &"A".repeat(len),
+        ) > cap
+        {
+            len -= 1;
+        }
+        reg.feed("T", frame(1, &"A".repeat(len), "S"));
+        reg.feed("T", frame(2, "after\r\n", "S"));
+        let ceiling = crate::fragment::paced_atomic_page_serialized_ceiling();
+
+        for (arid, batch_mode) in [("paced-atomic-plain", false), ("paced-atomic-batch", true)] {
+            let (sink, _seen) = collector();
+            let out = reg.attach(
+                "T",
+                1,
+                sink,
+                Some(arid.into()),
+                0,
+                batch_mode,
+                true,
+                None,
+                None,
+                None,
+                PacedAttachOptions {
+                    replay_page_bytes: Some(2048),
+                    ..PacedAttachOptions::default()
+                },
+            );
+            let start = out.paced.expect("paced session");
+            assert_eq!(
+                start.session.page_budget, 2048,
+                "the sub-cap request is the session's budget ({arid})"
+            );
+            assert_eq!(
+                start.first_page.len(),
+                1,
+                "a frame larger than the request forms its own atomic single-frame page ({arid})"
+            );
+            let page_bytes = page_serialized_bytes(&start.first_page);
+            assert!(
+                page_bytes > 2048,
+                "the atomic exception is REAL: the page provably exceeds the request ({arid}, {page_bytes}B)"
+            );
+            assert!(
+                page_bytes <= ceiling,
+                "the atomic page reaches only the documented ceiling ({arid}: {page_bytes}B > {ceiling}B)"
+            );
+            assert!(
+                start.session.page_end < start.session.target,
+                "the atomic page leaves the window's remainder for later pages ({arid})"
+            );
+        }
+    }
+
     /// Round-2 finding F1 (Major): a natural exit while a paced
     /// subscriber's deferral is armed must NOT sink terminal.exit ahead
     /// of the still-deferred final output — the exit is STAGED on the

@@ -90,6 +90,36 @@ pub fn terminal_stream_batch_max_bytes_for_env(
 /// `paced_page_budget_ceiling(TERM09_QUEUE_MAX_BYTES_FLOOR) == this`.)
 pub const PACED_PAGE_BUDGET_FLOOR_BYTES: usize = 32 * 1024;
 
+/// The fixed page-envelope slack atop one frame's fragment-cap measure
+/// (E2R1 finding 2): a page message wraps the frame with the real
+/// envelope — a plain `terminal.output` (already accounted by the
+/// fragment measure's worst-case seq and 512-char attachRequestId
+/// reserve) or a `terminal.output.batch` (whose envelope adds the type
+/// delta, `serializedBytes` digits, the `source` literal, and one
+/// segment's metadata on top of the legacy measure). 512 bytes provably
+/// covers both forms for a maximal fragment (pinned by
+/// [`paced_atomic_page_serialized_ceiling`]'s test and the registry's
+/// atomic-page ceiling test).
+pub const ATOMIC_PAGE_ENVELOPE_OVERHEAD_BYTES: usize = 512;
+
+/// The worst-case serialized size of ONE paced replay page's ATOMIC
+/// single-frame result (E2R1 finding 2): the page builder always
+/// includes the first frame of a window even when that frame alone
+/// exceeds the requested page budget — a single frame larger than the
+/// request forms its own atomic page — and every frame is
+/// pre-fragmented to at most [`terminal_stream_batch_max_bytes`]
+/// (measured as the full `terminal.output` payload with a worst-case
+/// seq and a 512-char attachRequestId reserve). A page therefore never
+/// exceeds this ceiling WHATEVER the client requested: pages are bounded
+/// by max(requested, the atomic frame size), and the atomic frame size
+/// is bounded by the fragment cap plus the page envelope. Connection
+/// drain admission reserves THIS ceiling when the requested page budget
+/// sits below it, so a sub-cap request can never under-reserve what its
+/// drain can actually admit.
+pub fn paced_atomic_page_serialized_ceiling() -> usize {
+    terminal_stream_batch_max_bytes() + ATOMIC_PAGE_ENVELOPE_OVERHEAD_BYTES
+}
+
 /// `measureSerializedJsonBytes` — UTF-8 byte length of the compact JSON serialization.
 pub fn measure_serialized_json_bytes(payload: &serde_json::Value) -> usize {
     // `to_string` is compact (no spaces), matching `JSON.stringify` separators.
@@ -273,6 +303,98 @@ mod tests {
                 "every frame fits the smallest supported page budget ({frame_bytes})"
             );
         }
+    }
+
+    #[test]
+    fn paced_atomic_page_ceiling_covers_a_maximal_fragment_in_every_page_form() {
+        // E2R1 finding 2: the ceiling is the honest bound for the page
+        // builder's ATOMIC single-frame result — a frame larger than the
+        // requested page budget forms its own page, and that page must
+        // fit cap + envelope slack in EVERY wire form the projection can
+        // take for it. Build a MAXIMAL fragment (its budgeted
+        // terminal.output measure fits the fragment cap; one more ASCII
+        // char would not) and prove both forms.
+        let cap = terminal_stream_batch_max_bytes();
+        let ceiling = paced_atomic_page_serialized_ceiling();
+        assert!(ceiling > cap, "the ceiling is the cap plus envelope slack");
+
+        let mut len = cap;
+        while measure_terminal_output_budget_payload_bytes(
+            "term-atomic",
+            "stream",
+            &"A".repeat(len),
+        ) > cap
+        {
+            len -= 1;
+        }
+        let data = "A".repeat(len);
+        let measured = measure_terminal_output_budget_payload_bytes("term-atomic", "stream", &data);
+        assert!(
+            measured <= cap,
+            "the maximal fragment fits the fragment cap"
+        );
+        assert!(
+            measure_terminal_output_budget_payload_bytes(
+                "term-atomic",
+                "stream",
+                &"A".repeat(len + 1)
+            ) > cap,
+            "maximality: one more char would exceed the cap"
+        );
+
+        // Form 1 — the plain `terminal.output` page message, stamped with
+        // the WORST-CASE attachRequestId (512 chars) and real seq digits
+        // (far under the measure's placeholder width).
+        let page = json!({
+            "type": "terminal.output",
+            "terminalId": "term-atomic",
+            "streamId": "stream",
+            "seqStart": 1,
+            "seqEnd": 2,
+            "data": data,
+            "attachRequestId": attach_request_id_reserve_value(),
+            "source": "replay",
+        });
+        let plain_bytes = measure_serialized_json_bytes(&page);
+        assert!(
+            plain_bytes <= ceiling,
+            "the plain page form fits the atomic ceiling ({plain_bytes} > {ceiling})"
+        );
+
+        // Form 2 — the real batch projection over the same frame, at the
+        // production budget (batch_max = the fragment cap): whatever wire
+        // shape the single maximal frame takes — the full
+        // `terminal.output.batch`, or the oversize single-segment
+        // fallback — its serialized size must fit the ceiling.
+        let mut scanner = crate::barrier_scanner::BarrierScanner::new();
+        let frame = crate::batch::BatchInputFrame::classified(7, &data, &mut scanner, "stream");
+        let payloads = crate::batch::frames_to_wire_payloads(
+            &[frame],
+            "term-atomic",
+            "arid-max",
+            "replay",
+            cap as i64,
+        );
+        assert_eq!(
+            payloads.len(),
+            1,
+            "one maximal frame projects to exactly one page payload"
+        );
+        let batch_bytes = measure_serialized_json_bytes(&payloads[0]);
+        assert!(
+            batch_bytes <= ceiling,
+            "the batch page form fits the atomic ceiling ({batch_bytes} > {ceiling})"
+        );
+        // The envelope slack is honest, not arbitrary: the batch form's
+        // fixed envelope (type delta, serializedBytes digits, the source
+        // literal, one segment's metadata) fits inside the documented
+        // overhead constant.
+        assert!(
+            batch_bytes.saturating_sub(measured) <= ATOMIC_PAGE_ENVELOPE_OVERHEAD_BYTES,
+            "the batch envelope overhead stays within the documented slack ({} > {})",
+            batch_bytes.saturating_sub(measured),
+            ATOMIC_PAGE_ENVELOPE_OVERHEAD_BYTES
+        );
     }
 
     #[test]
