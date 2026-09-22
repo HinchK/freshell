@@ -410,7 +410,10 @@ pub struct TerminalAttach {
     /// optional; a missing, malformed, or non-positive value falls back to
     /// the server's default exactly like the pre-contract accept-and-strip
     /// behavior (the lossy deserializer keeps a wrong-typed value from
-    /// failing the whole attach frame).
+    /// failing the whole attach frame). Integer-valued number spellings
+    /// (`2048.0`, `2e3`) carry the same value as their canonical integer
+    /// forms and are accepted and validated the same way (E2R1 finding 3)
+    /// — never silently dropped.
     #[serde(
         default,
         deserialize_with = "lossy_positive_i64",
@@ -451,12 +454,37 @@ pub struct TerminalAttach {
 /// deserializes to `None` — the server's default — instead of failing the
 /// whole attach frame. This preserves the pre-contract accept-and-strip
 /// tolerance for buggy senders exactly.
+///
+/// E2R1 finding 3: integer-VALUED number spellings (`2048.0`, `2e3`)
+/// deserialize through Serde JSON's float storage variant, but they carry
+/// the same VALUE as their canonical integer spellings — JSON has one
+/// number type, and the TS/Zod side (`z.number().int().positive()`) plus
+/// the generated JSON Schema accept that value as an integer. The lossy
+/// deserializer accepts and validates them exactly like the canonical
+/// form; a protocol field a client emits is never silently ignored.
 fn lossy_positive_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let value: Option<serde_json::Value> = Option::deserialize(deserializer)?;
-    Ok(value.as_ref().and_then(|v| v.as_i64()).filter(|n| *n > 0))
+    Ok(value
+        .as_ref()
+        .and_then(positive_integer_value)
+        .filter(|n| *n > 0))
+}
+
+/// The positive-integer VALUE of one JSON number: Serde JSON's integer
+/// storage directly, or its float storage when the value is integral
+/// (E2R1 finding 3 — `2048.0`/`2e3` parse as floats). Fractional,
+/// non-finite, non-positive, and out-of-i64-range values are `None` (the
+/// malformed/non-positive fallback, never a wrong bound).
+fn positive_integer_value(v: &serde_json::Value) -> Option<i64> {
+    let n = v.as_number()?;
+    if let Some(i) = n.as_i64() {
+        return Some(i);
+    }
+    let f = n.as_f64()?;
+    (f.is_finite() && f.fract() == 0.0 && f > 0.0 && f <= i64::MAX as f64).then_some(f as i64)
 }
 
 /// `terminal.replay.credit` (responsive-terminal-restore Workstream 1): one

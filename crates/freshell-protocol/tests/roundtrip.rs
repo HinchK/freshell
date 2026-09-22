@@ -430,6 +430,37 @@ fn rich_client_messages() {
         }
     }
 
+    // E2R1 finding 3: integer-VALUED number spellings. JSON has one
+    // number type, so `2048.0` and `2e3` carry the same VALUE as the
+    // canonical `2048`/`2000`, and the TS/Zod contract
+    // (`z.number().int().positive()`) accepts that value as an integer —
+    // the frozen JSON Schema agrees (an integer-valued float satisfies
+    // `"type": "integer"`). The lossy deserializer must accept and
+    // validate them the same way, never silently drop the requested
+    // bound to the server default. (These parse directly, not via
+    // `client_roundtrip`, because the re-serialized canonical form
+    // legitimately differs from the non-canonical input spelling.)
+    for (spelling, expected) in [("2048.0", 2048i64), ("2e3", 2000i64)] {
+        let wire = format!(
+            r#"{{"type":"terminal.attach","terminalId":"t1","intent":"viewport_hydrate","cols":80,"rows":24,"attachRequestId":"a1","replayPageBytes":{spelling}}}"#
+        );
+        let raw: Value = serde_json::from_str(&wire).expect("the spelling is JSON");
+        let schema = inbound_schema()["schemas"]["ClientMessageSchema"].clone();
+        assert_conforms(&validator(&schema), &raw, "replayPageBytes {spelling}");
+        match serde_json::from_str::<ClientMessage>(&wire)
+            .expect("an integer-valued spelling must not fail the attach frame")
+        {
+            ClientMessage::TerminalAttach(a) => {
+                assert_eq!(
+                    a.replay_page_bytes,
+                    Some(expected),
+                    "the {spelling} spelling keeps the client's requested bound"
+                );
+            }
+            other => panic!("expected TerminalAttach, got {other:?}"),
+        }
+    }
+
     // ping — unit variant.
     match client_roundtrip(r#"{"type":"ping"}"#, "ping") {
         ClientMessage::Ping => {}
