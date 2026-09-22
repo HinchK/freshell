@@ -11363,3 +11363,547 @@ mod host_stats_dispatch_tests {
         assert!(host_stats_last_refresh_at.is_none());
     }
 }
+
+/// E2R2 finding (the credited natural-exit exit-arming race): focused,
+/// DETERMINISTIC exercises of the transition's two race windows. The
+/// production entry points run against a REAL in-process PTY registry —
+/// the staging is real (`finish_pty_exit` from the PTY reader thread),
+/// the pages are real, the spawned drain is a real tokio task — but the
+/// DISPATCHER is the test itself: each credit is a direct
+/// `handle_replay_credit` call, so the "notify queued but not yet
+/// dispatched" window (the exact race state the integration socket cannot
+/// order deterministically) is constructed by simply not dispatching
+/// anything else. Credit timing is controlled explicitly — the
+/// parser-consumption boundary is the thing under test.
+///
+/// THE INVARIANT under test (E2R2, stated per the finding):
+/// 1. Arming always precedes driving: an arm that extends `phase_target`
+///    beyond `credited` MUST be followed by a drive that produces the
+///    next page — no state may exist where the target exceeds the
+///    credited cursor and no page was just emitted (the WEDGE).
+/// 2. `terminal.exit` rides the CREDIT verdict that acknowledges
+///    consumption of the page reaching `exit_head` — never the drive
+///    that emits it.
+/// 3. Monotone arming: a restaging never moves `exit_head` backward and
+///    never double-delivers.
+/// 4. Retention loss mid-wait reports the exact bounds-carrying gap;
+///    the exit still rides the acknowledging credit.
+#[cfg(test)]
+mod paced_exit_race_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Everything the session sinks (pages, gaps, exits), in order.
+    type Collector = Arc<Mutex<Vec<ServerMessage>>>;
+
+    fn collector_sink(collector: &Collector) -> FrameSink {
+        let collector = Arc::clone(collector);
+        Arc::new(move |message| {
+            collector.lock().expect("collector lock").push(message);
+        })
+    }
+
+    fn outputs(collector: &Collector) -> Vec<String> {
+        collector
+            .lock()
+            .expect("collector lock")
+            .iter()
+            .filter_map(|m| match m {
+                ServerMessage::TerminalOutput(frame) => Some(frame.data.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn exit_count(collector: &Collector) -> usize {
+        collector
+            .lock()
+            .expect("collector lock")
+            .iter()
+            .filter(|m| matches!(m, ServerMessage::TerminalExit(_)))
+            .count()
+    }
+
+    fn last_is_exit(collector: &Collector) -> bool {
+        collector
+            .lock()
+            .expect("collector lock")
+            .last()
+            .is_some_and(|m| matches!(m, ServerMessage::TerminalExit(_)))
+    }
+
+    /// Poll `probe` until it returns `Some` or the deadline passes —
+    /// the deterministic observation points (output landed in the ring,
+    /// the exit staged, the drain delivered).
+    async fn wait_for<T>(
+        mut probe: impl FnMut() -> Option<T>,
+        what: &str,
+    ) -> T {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if let Some(value) = probe() {
+                return value;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The deterministic terminal under test: a shell script that produces
+    /// output only in response to input lines, then a final marker, then
+    /// exits. Nothing is emitted before the first input, so the ring's
+    /// head is deterministically 0 until the test writes.
+    fn race_script(pads: usize, final_marker: &str) -> String {
+        let mut script = String::new();
+        for _ in 0..pads {
+            script.push_str("read x; printf 'PAD-STEP\\n'; ");
+        }
+        script.push_str(&format!(
+            "read x; printf '{}\\n'; exit\n",
+            final_marker
+        ));
+        script
+    }
+
+    struct RaceHarness {
+        registry: freshell_terminal::TerminalRegistry,
+        terminal_id: String,
+        collector: Collector,
+        sink: FrameSink,
+        writer: connection_writer::WriterSender,
+        /// The cancel channel's sender stays alive with the harness (the
+        /// production run_loop holds it for the connection's lifetime) —
+        /// a closed channel wakes the drain's cancel arm immediately.
+        _cancel_tx: tokio::sync::watch::Sender<bool>,
+        /// The writer pump stays alive with the harness (in production it
+        /// owns the socket until the connection ends): its Drop closes the
+        /// writer queue, and a closed queue makes every drain-admission
+        /// reservation return None (the drain would exit silently). It is
+        /// never polled here — the pages and the exit sink through the
+        /// registry subscriber, not the writer.
+        _writer_pump: connection_writer::WriterPump,
+        cancel_rx: tokio::sync::watch::Receiver<bool>,
+        sessions: crate::paced_replay::PacedSessions,
+        conn_id: u64,
+        arid: String,
+    }
+
+    impl RaceHarness {
+        /// Spawn the script PTY, negotiate nothing (the registry attach is
+        /// the production paced path), and wire the session table, the
+        /// collector sink, and a real (pump-less) writer. The writer's
+        /// admission gate grants a reservation whenever the queue is empty,
+        /// so the spawned drain completes its CaughtUp hold in-process.
+        fn new(name: &str, pads: usize, final_marker: &str) -> Self {
+            let registry = freshell_terminal::TerminalRegistry::new();
+            // Small pages: every drive emits at most a couple of frames,
+            // so the credit-by-credit walk crosses the target boundary in
+            // observable steps.
+            registry.set_paced_page_max_bytes(240);
+            let terminal_id = format!("T-{name}");
+            let exit_registry = registry.clone();
+            let exit_terminal_id = terminal_id.clone();
+            let on_exit: freshell_terminal::pty::ExitHook =
+                Box::new(move |exit_code: i64| {
+                    exit_registry.finish_pty_exit(&exit_terminal_id, exit_code);
+                });
+            let spec = freshell_platform::SpawnSpec {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), race_script(pads, final_marker)],
+                env_overrides: BTreeMap::new(),
+                cwd: None,
+                cols: 120,
+                rows: 30,
+            };
+            registry
+                .create(
+                    &spec,
+                    &BTreeMap::new(),
+                    terminal_id.clone(),
+                    "S".into(),
+                    "shell",
+                    None,
+                    None,
+                    None,
+                    Some(on_exit),
+                )
+                .expect("spawn race-script PTY");
+            let collector: Collector = Arc::new(Mutex::new(Vec::new()));
+            let sink = collector_sink(&collector);
+            let (writer, writer_pump) = connection_writer::WriterSender::new(
+                16 * 1024 * 1024,
+                1024 * 1024,
+                std::time::Duration::from_secs(5),
+            );
+            let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+            Self {
+                registry,
+                terminal_id,
+                collector,
+                sink,
+                writer,
+                _cancel_tx: cancel_tx,
+                _writer_pump: writer_pump,
+                cancel_rx,
+                sessions: crate::paced_replay::PacedSessions::default(),
+                conn_id: 1,
+                arid: format!("arid-{name}"),
+            }
+        }
+
+        fn attach_paced(&self, since_seq: i64) -> freshell_terminal::PacedAttachStart {
+            let outcome = self.registry.attach(
+                &self.terminal_id,
+                self.conn_id,
+                Arc::clone(&self.sink),
+                Some(self.arid.clone()),
+                since_seq,
+                false,
+                true,
+                None,
+                None,
+                None,
+                freshell_terminal::PacedAttachOptions::default(),
+            );
+            outcome.paced.expect("the paced attach path")
+        }
+
+        fn start_session(&mut self, start: freshell_terminal::PacedAttachStart, since: i64) {
+            crate::paced_replay::start_session(
+                &self.registry,
+                self.conn_id,
+                &self.sink,
+                &mut self.sessions,
+                start,
+                since,
+                None,
+                self.writer.clone(),
+                self.cancel_rx.clone(),
+            );
+        }
+
+        fn session(&mut self) -> crate::paced_replay::PacedSession {
+            self.try_session()
+                .expect("the session is in the credited table")
+        }
+
+        fn try_session(&mut self) -> Option<crate::paced_replay::PacedSession> {
+            self.sessions
+                .get_mut(&self.terminal_id)
+                .map(|session| session.clone())
+        }
+
+        fn credit(&mut self, consumed_seq: i64) {
+            let credit = freshell_protocol::TerminalReplayCredit {
+                terminal_id: self.terminal_id.clone(),
+                stream_id: "S".into(),
+                attach_request_id: self.arid.clone(),
+                consumed_seq,
+            };
+            handle_replay_credit(
+                &credit,
+                &self.registry,
+                self.conn_id,
+                &self.sink,
+                &mut self.sessions,
+                &self.writer,
+                &self.cancel_rx,
+            );
+        }
+
+        /// Write one input line and wait for the marker it produces to be
+        /// observable in the ring (the deterministic per-step barrier).
+        async fn step(&self, line: &str, marker: &str) {
+            let registry = self.registry.clone();
+            let terminal_id = self.terminal_id.clone();
+            let wanted = marker.to_string();
+            let outcome = self
+                .registry
+                .input(&self.terminal_id, format!("{line}\n").as_bytes());
+            assert!(outcome.found, "the input write reaches the live PTY");
+            wait_for(
+                move || {
+                    registry
+                        .directory()
+                        .iter()
+                        .find(|entry| entry.terminal_id == terminal_id)
+                        .map(|entry| entry.snapshot.clone())
+                        .filter(|snapshot| snapshot.contains(&wanted))
+                },
+                &format!("the ring to hold {marker}"),
+            )
+            .await;
+        }
+
+        async fn wait_staged(&self) -> i64 {
+            let registry = self.registry.clone();
+            let terminal_id = self.terminal_id.clone();
+            let conn_id = self.conn_id;
+            wait_for(
+                move || registry.staged_paced_exit(&terminal_id, conn_id),
+                "the natural exit to stage behind the armed deferral",
+            )
+            .await
+        }
+
+        fn head(&self) -> i64 {
+            self.registry
+                .replay_bounds(&self.terminal_id)
+                .expect("replay bounds")
+                .head_seq
+        }
+
+        /// Assert NO terminal.exit is delivered while an exit page sits
+        /// uncredited — the invariant-2 hold, over a deterministic window.
+        async fn assert_exit_held(&self) {
+            let before = exit_count(&self.collector);
+            let hold = std::time::Instant::now() + std::time::Duration::from_millis(1_500);
+            while std::time::Instant::now() < hold {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let now = exit_count(&self.collector);
+                assert_eq!(
+                    now, before,
+                    "terminal.exit must NOT deliver while the page reaching the \
+                     armed exit head is uncredited — it rides the credit that \
+                     acknowledges that page (invariant 2)"
+                );
+            }
+        }
+
+        async fn assert_exit_arrives_and_is_last(&self, expected_code: i64) {
+            let collector = Arc::clone(&self.collector);
+            wait_for(
+                move || (exit_count(&collector) > 0).then_some(()),
+                "terminal.exit to arrive on the acknowledging credit",
+            )
+            .await;
+            assert_eq!(
+                exit_count(&self.collector),
+                1,
+                "exactly one terminal.exit may ever arrive (invariant 3)"
+            );
+            assert!(
+                last_is_exit(&self.collector),
+                "terminal.exit must be the client's last frame"
+            );
+            let code = self
+                .collector
+                .lock()
+                .expect("collector lock")
+                .iter()
+                .find_map(|m| match m {
+                    ServerMessage::TerminalExit(exit) => Some(exit.exit_code),
+                    _ => None,
+                })
+                .expect("the exit frame");
+            assert_eq!(code, expected_code);
+        }
+    }
+
+    /// (a) THE WEDGE, at the attach boundary — the same drive-before-arm
+    /// ordering the finding pins at the credit handler, in the one state
+    /// where it strands the stream: the client's first page was EMPTY (its
+    /// cursor already sat at the attach head: `credited == page_end ==
+    /// target`), and the exit staged between the attach and
+    /// `start_session` with NEW output past that target. The arm extends
+    /// the phase target beyond the credited cursor, so the drive MUST
+    /// produce the next page — a keep-with-no-page wedges the session
+    /// forever (nothing outstanding, so no credit can ever come).
+    #[tokio::test]
+    async fn empty_first_page_exit_race_extends_the_drive_not_a_wedge() {
+        let mut harness = RaceHarness::new("wedge", 0, "FINAL-WEDGE");
+        // The client attaches fully caught up: since == head == 0 (the
+        // script emits nothing before its first input), so the first page
+        // is empty and the session starts with nothing outstanding.
+        let head_at_attach = harness.head();
+        assert_eq!(head_at_attach, 0, "the script is quiet until driven");
+        let start = harness.attach_paced(head_at_attach);
+        assert_eq!(
+            start.session.page_end, start.session.effective_since,
+            "the empty first page leaves nothing outstanding"
+        );
+        // The exit stages with new output while the notify is still
+        // queued (the test IS the undispatched dispatcher window).
+        harness.step("go", "FINAL-WEDGE").await;
+        let exit_code = harness.wait_staged().await;
+        let exit_head = harness.head();
+        assert!(
+            exit_head > start.session.target,
+            "the exit added output past the original target"
+        );
+        harness.start_session(start, head_at_attach);
+        // INVARIANT 1: the arm extended the target beyond the credited
+        // cursor, so the drive MUST have produced the next page — the
+        // pre-fix keep-with-no-page wedged here (no page, no exit, ever).
+        wait_for(
+            {
+                let collector = Arc::clone(&harness.collector);
+                move || {
+                    outputs(&collector)
+                        .iter()
+                        .any(|data| data.contains("FINAL-WEDGE"))
+                        .then_some(())
+                }
+            },
+            "the deferred final output to page on the extended phase target",
+        )
+        .await;
+        let session = harness.session();
+        assert!(
+            session.credited < session.page_end,
+            "the session owes exactly one uncredited page (no wedge state)"
+        );
+        // INVARIANT 2: the exit waits for the credit that acknowledges
+        // the page reaching the armed exit head.
+        harness.assert_exit_held().await;
+        // Drive the credits until the page reaching the frozen head is
+        // outstanding, then acknowledge it — the exit rides THAT credit.
+        loop {
+            let session = harness.session();
+            assert!(
+                session.page_end <= exit_head,
+                "pages never overshoot the frozen head"
+            );
+            if session.page_end == exit_head {
+                break;
+            }
+            let consumed = session.page_end;
+            harness.credit(consumed);
+        }
+        harness.assert_exit_held().await;
+        harness.credit(exit_head);
+        harness
+            .assert_exit_arrives_and_is_last(exit_code)
+            .await;
+        assert!(
+            outputs(&harness.collector)
+                .iter()
+                .any(|data| data.contains("FINAL-WEDGE")),
+            "the deferred final output was delivered before the exit"
+        );
+        assert!(
+            harness.sessions.get_mut(&harness.terminal_id).is_none(),
+            "the session left the credited table on the acknowledging credit"
+        );
+        assert_eq!(
+            harness.registry.staged_paced_exit(&harness.terminal_id, harness.conn_id),
+            None,
+            "the subscriber retired with the delivered exit"
+        );
+    }
+
+    /// (b) THE PREMATURE EXIT, through the credit path: the exit stages
+    /// mid-restore (the staging is in the registry before any credit
+    /// runs — the notify-undispatched window), the credits drive the
+    /// session through the original target and on to the exit page, and
+    /// the page that reaches the armed exit head is read but NOT
+    /// credited. No exit may deliver on the drive that emitted it — the
+    /// removal rides the credit that acknowledges that page.
+    #[tokio::test]
+    async fn exit_page_read_uncredited_holds_the_exit_for_its_credit() {
+        let mut harness = RaceHarness::new("preempt", 8, "FINAL-PREEMPT");
+        // Seed the pre-exit window: every pad step lands in the ring
+        // deterministically before the paced attach.
+        for step in 0..8 {
+            harness.step("pad", "PAD-STEP").await;
+            let _ = step;
+        }
+        let head_at_attach = harness.head();
+        assert!(head_at_attach > 0, "the pre-exit window is non-empty");
+        let start = harness.attach_paced(0);
+        assert!(
+            start.session.page_end < start.session.target,
+            "the first page is a bounded prefix (mid-restore)"
+        );
+        harness.start_session(start, 0);
+        // The exit stages with new output past the attach target, before
+        // any credit runs (the undispatched-notify race window).
+        harness.step("go", "FINAL-PREEMPT").await;
+        let exit_code = harness.wait_staged().await;
+        let exit_head = harness.head();
+        assert!(
+            exit_head > head_at_attach,
+            "the exit added output past the original target"
+        );
+        // Credit the pages one by one — the drive must keep producing
+        // (invariant 1) — until the page reaching the FROZEN exit head is
+        // outstanding. THE PARSER-CONSUMPTION BOUNDARY: that page is
+        // read (sunk) but NOT credited.
+        let mut guards = 0;
+        let converged = loop {
+            let Some(session) = harness.try_session() else {
+                // The session left the credited table mid-walk — the
+                // pre-fix premature removal (the armed session was
+                // removed on the drive that EMITTED the exit page, while
+                // that page was still uncredited).
+                break false;
+            };
+            assert!(
+                session.page_end <= exit_head,
+                "pages never overshoot the frozen head"
+            );
+            if session.page_end == exit_head {
+                break true;
+            }
+            let consumed = session.page_end;
+            harness.credit(consumed);
+            guards += 1;
+            assert!(guards < 10_000, "the credit walk must converge");
+        };
+        assert!(
+            outputs(&harness.collector)
+                .iter()
+                .any(|data| data.contains("FINAL-PREEMPT")),
+            "the exit page carrying the final marker was read"
+        );
+        if !converged {
+            // THE PREMATURE-EXIT RACE (RED pre-fix): the removal already
+            // delivered (or is about to deliver) terminal.exit through the
+            // drain's CaughtUp hold — BEFORE any credit could acknowledge
+            // the page reaching the armed exit head.
+            let collector = Arc::clone(&harness.collector);
+            wait_for(
+                move || (exit_count(&collector) > 0).then_some(()),
+                "the premature exit (the violation under test)",
+            )
+            .await;
+            panic!(
+                "invariant 2 violated: the session was removed from the \
+                 credited table on the drive that EMITTED the page reaching \
+                 the armed exit head, and terminal.exit delivered while that \
+                 page was uncredited — the exit must ride the credit that \
+                 acknowledges it"
+            );
+        }
+        // THE HOLD (invariant 2): the page reaching exit_head is
+        // uncredited — the pre-fix removal delivered terminal.exit here.
+        harness.assert_exit_held().await;
+        // The acknowledging credit: the exit arrives and is the last frame.
+        harness.credit(exit_head);
+        harness
+            .assert_exit_arrives_and_is_last(exit_code)
+            .await;
+        assert!(
+            harness.sessions.get_mut(&harness.terminal_id).is_none(),
+            "the session left the credited table on the acknowledging credit"
+        );
+        // (c) no double-delivery: a spurious duplicate credit after the
+        // exit is inert, and the terminal cannot stage a second exit.
+        let before = exit_count(&harness.collector);
+        harness.credit(exit_head);
+        assert_eq!(
+            exit_count(&harness.collector),
+            before,
+            "a post-exit credit grants nothing (no second exit)"
+        );
+        assert!(
+            !harness
+                .registry
+                .finish_pty_exit(&harness.terminal_id, 99),
+            "a second exit never restages (monotone, once-only)"
+        );
+    }
+}

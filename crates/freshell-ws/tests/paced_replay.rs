@@ -4119,3 +4119,332 @@ async fn natural_exit_mid_restore_retention_expiry_reports_the_exact_gap_then_ex
     sorted.sort_unstable();
     assert_eq!(seqs, sorted, "the continuation pages ascend");
 }
+
+/// E2R2 finding (the exit-arming race), test-side page reader: read the
+/// ONE page a credit grants (its frames arrive back-to-back; a quiet gap
+/// closes the page — nothing further flows without a credit). Carries
+/// INVARIANT 2's read-side guard: a terminal.exit observed while the page
+/// that reaches the armed exit head is still uncredited IS the
+/// premature-exit violation under test — panic with the frame. Gaps are
+/// collected, not fatal (the retention fixture's first credit reports
+/// the exact gap before its continuation frames).
+async fn read_credited_page(
+    ws: &mut WsClient,
+    quiet: Duration,
+) -> (String, i64, Vec<serde_json::Value>) {
+    let mut acc = String::new();
+    let mut max_seq_end = 0i64;
+    let mut gaps = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a credit must grant its page"
+        );
+        let window = if acc.is_empty() && gaps.is_empty() {
+            Duration::from_secs(5)
+        } else {
+            quiet
+        };
+        match next_json_or_timeout(ws, window).await {
+            Some(value) => match value.get("type").and_then(|v| v.as_str()) {
+                Some("terminal.output") => {
+                    if let Some(data) = value.get("data").and_then(|v| v.as_str()) {
+                        acc.push_str(data);
+                    }
+                    max_seq_end = max_seq_end.max(value["seqEnd"].as_i64().unwrap_or(0));
+                }
+                Some("terminal.output.gap") => gaps.push(value),
+                Some("terminal.exit") => panic!(
+                    "invariant 2 violated: terminal.exit delivered while the page \
+                     reaching the armed exit head was still uncredited (the exit \
+                     must ride the CREDIT that acknowledges that page): {value}"
+                ),
+                _ => {}
+            },
+            None => {
+                assert!(
+                    !acc.is_empty() || !gaps.is_empty(),
+                    "the credit must produce a page or a gap"
+                );
+                return (acc, max_seq_end, gaps);
+            }
+        }
+    }
+}
+
+/// The quiet-window hold: while the client withholds the credit for a page
+/// it has READ, no PACING-CONTRACT frame may arrive — no page, no gap, and
+/// in particular no terminal.exit. Unrelated control-plane broadcasts
+/// (the exit's terminal.meta.updated retire, sessions.changed, ...) are
+/// not pacing frames and pass through, exactly as in the crediting-
+/// promptly tests.
+async fn assert_quiet_hold(ws: &mut WsClient, ms: u64, what: &str) {
+    let hold = tokio::time::Instant::now() + Duration::from_millis(ms);
+    while tokio::time::Instant::now() < hold {
+        if let Some(value) = next_json_or_timeout(ws, Duration::from_millis(250)).await {
+            match value.get("type").and_then(|v| v.as_str()) {
+                Some("terminal.output") => panic!(
+                    "no page may flow while credits are withheld ({what}): {value}"
+                ),
+                Some("terminal.output.gap") => panic!(
+                    "no gap may flow while credits are withheld ({what}): {value}"
+                ),
+                Some("terminal.exit") => panic!(
+                    "terminal.exit must ride the credit that acknowledges the page                      reaching the armed exit head ({what}): {value}"
+                ),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// E2R2 finding, required test (b) — THE PREMATURE-EXIT ORDERING, over the
+/// real socket with EXPLICITLY controlled credit timing (the
+/// parser-consumption boundary is the thing under test; the crediting-
+/// promptly tests cannot see this race). The exit stages mid-restore, the
+/// credits walk the pages to the one that reaches the frozen exit head,
+/// and THAT PAGE IS READ BUT NOT CREDITED: no exit may deliver on the
+/// drive that emitted it. Only the credit acknowledging that page may
+/// deliver the exit — and it must be the client's last frame.
+#[tokio::test]
+async fn natural_exit_exit_page_read_uncredited_holds_the_exit_for_its_credit() {
+    let ring = 512 * 1024;
+    let url = spawn_server(ring).await;
+    let mut driver = connect(&url).await;
+    hello(&mut driver, false).await;
+    let terminal_id = create_shell_terminal(&mut driver, "create-exit-hold-credit").await;
+    flood_until_complete(&url, &mut driver, &terminal_id, 700).await;
+
+    // Paced attach mid-restore; the first page is outstanding and NOT
+    // credited yet.
+    let mut paced = connect(&url).await;
+    hello(&mut paced, true).await;
+    let (ready, page1) =
+        paced_attach_first_page(&mut paced, &terminal_id, "attach-exit-holdc").await;
+    let head = ready["headSeq"].as_i64().expect("headSeq");
+    let mut credited = page1
+        .iter()
+        .map(|f| f["seqEnd"].as_i64().unwrap_or(0))
+        .max()
+        .expect("first page frames");
+    assert!(credited < head, "the session is mid-restore when the shell exits");
+
+    // The shell produces one FINAL marker line and exits naturally while
+    // the first page is uncredited (octal escapes keep the echoed command
+    // from containing the literal marker).
+    send_input(
+        &mut paced,
+        &terminal_id,
+        "printf '\\106\\111\\116\\101\\114\\063\\055\\115\\101\\122\\113\\105\\122\\012'; exit\n",
+    )
+    .await;
+    // The withhold: nothing flows without credits (no page, no exit).
+    assert_quiet_hold(&mut paced, 1_500, "after the exit staged").await;
+
+    // Walk the pages ONE CREDIT AT A TIME: credit the outstanding first
+    // page, read the page that credit grants, credit it in turn, until the
+    // page carrying the literal marker — the page that reached the frozen
+    // exit head. That page is then HELD uncredited: the parser-consumption
+    // boundary.
+    let marker = "FINAL3-MARKER";
+    let mut pages = 0usize;
+    credit(&mut paced, &terminal_id, "attach-exit-holdc", credited).await;
+    let marker_page_end = loop {
+        let (acc, page_end, gaps) =
+            read_credited_page(&mut paced, Duration::from_millis(400)).await;
+        assert!(gaps.is_empty(), "no retention loss in this fixture: {gaps:?}");
+        pages += 1;
+        assert!(pages < 500, "the page walk must converge");
+        if acc.contains(marker) {
+            break page_end;
+        }
+        credit(&mut paced, &terminal_id, "attach-exit-holdc", page_end).await;
+        credited = credited.max(page_end);
+    };
+    assert!(
+        marker_page_end >= head,
+        "the marker page reached the frozen head (page end {marker_page_end}, head {head})"
+    );
+    assert!(
+        credited < marker_page_end,
+        "the marker page is UN-CREDITED at the hold (credited {credited})"
+    );
+
+    // THE HOLD: the page reaching the armed exit head is read but not
+    // credited — NO exit may deliver. (The pre-fix removal delivered it
+    // here, straight off the drive that emitted the page.)
+    assert_quiet_hold(
+        &mut paced,
+        1_500,
+        "the exit page's parser-consumption boundary",
+    )
+    .await;
+
+    // The acknowledging credit: the exit arrives NOW, and it is the
+    // client's LAST frame (the full-stream ordering — a post-exit quiet
+    // window proves nothing follows).
+    credit(
+        &mut paced,
+        &terminal_id,
+        "attach-exit-holdc",
+        marker_page_end,
+    )
+    .await;
+    let exit = next_json_or_timeout(&mut paced, Duration::from_secs(5))
+        .await
+        .expect("the exit rides the credit acknowledging the marker page");
+    assert_eq!(
+        exit.get("type").and_then(|v| v.as_str()),
+        Some("terminal.exit"),
+        "the acknowledging credit delivers the staged exit: {exit}"
+    );
+    let post_exit = tokio::time::Instant::now() + Duration::from_millis(1_000);
+    while tokio::time::Instant::now() < post_exit {
+        if let Some(value) = next_json_or_timeout(&mut paced, Duration::from_millis(250)).await {
+            match value.get("type").and_then(|v| v.as_str()) {
+                Some("terminal.exit") => {
+                    panic!("exactly one terminal.exit may ever arrive: {value}")
+                }
+                Some("terminal.output") | Some("terminal.output.gap") => panic!(
+                    "no page or gap may follow terminal.exit (the exit is the                      terminal's last pacing frame): {value}"
+                ),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// E2R2 finding, required test (d) — RETENTION OVERRUN mid-wait: the ring
+/// evicts the credited window's next-needed frames while the client
+/// withholds, the exit then stages behind the armed deferral, and the next
+/// credit reports the EXACT bounds-carrying gap before paging the retained
+/// window — with the FINAL page (the one reaching the frozen exit head)
+/// held uncredited across the parser-consumption boundary: the gap first,
+/// the pages on credits, and the exit only on the credit that
+/// acknowledges the final page.
+#[tokio::test]
+async fn natural_exit_retention_gap_then_held_final_page_delivers_exit_on_its_credit() {
+    let ring = 12 * 1024;
+    let url = spawn_server(ring).await;
+    let mut driver = connect(&url).await;
+    hello(&mut driver, false).await;
+    let terminal_id = create_shell_terminal(&mut driver, "create-exit-gap-hold").await;
+    flood_until_complete(&url, &mut driver, &terminal_id, 100).await;
+
+    // Paced attach mid-restore; the first page is outstanding, uncredited.
+    let mut paced = connect(&url).await;
+    hello(&mut paced, true).await;
+    let (ready, page1) =
+        paced_attach_first_page(&mut paced, &terminal_id, "attach-exit-gaph").await;
+    let head = ready["headSeq"].as_i64().expect("headSeq");
+    let credited = page1
+        .iter()
+        .map(|f| f["seqEnd"].as_i64().unwrap_or(0))
+        .max()
+        .expect("first page frames");
+    assert!(credited < head, "the session is mid-restore when the ring churns");
+
+    // Evict the credited window's middle while the client withholds.
+    let mut evictor = connect(&url).await;
+    hello(&mut evictor, false).await;
+    attach(&mut evictor, &terminal_id, "attach-exit-gap-evictor").await;
+    let marker2 = "FLOOD-DONE-MARKER";
+    send_input(&mut evictor, &terminal_id, &flood_command(400, marker2)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let (evictor_acc, _) = drain_until_marker(&mut evictor, marker2, deadline).await;
+    assert!(evictor_acc.contains(marker2), "the evicting flood completes");
+    drop(evictor);
+
+    // The exit stages behind the still-armed deferral; the withhold holds.
+    send_input(
+        &mut paced,
+        &terminal_id,
+        "printf '\\106\\111\\116\\101\\114\\064\\055\\115\\101\\122\\113\\105\\122\\012'; exit\n",
+    )
+    .await;
+    assert_quiet_hold(&mut paced, 1_500, "after the exit staged behind the gap").await;
+
+    // THE CREDIT: the first product is the EXACT bounds-carrying gap.
+    credit(&mut paced, &terminal_id, "attach-exit-gaph", credited).await;
+    let marker = "FINAL4-MARKER";
+    let mut gap_seen: Option<serde_json::Value> = None;
+    let mut pages = 0usize;
+    let mut cursor = credited;
+    let marker_page_end = loop {
+        let (acc, page_end, gaps) =
+            read_credited_page(&mut paced, Duration::from_millis(400)).await;
+        if let Some(gap) = gaps.first() {
+            let first = gap_seen.replace(gap.clone());
+            assert!(
+                first.is_none(),
+                "exactly one retention gap may report: {gap_seen:?}"
+            );
+            assert_eq!(
+                gap.get("type").and_then(|v| v.as_str()),
+                Some("terminal.output.gap"),
+                "the overrun reports as the negotiated gap: {gap}"
+            );
+            assert_eq!(gap["reason"], "replay_window_exceeded", "the gap names retention loss: {gap}");
+            assert_eq!(
+                gap["fromSeq"].as_i64(),
+                Some(credited + 1),
+                "the lost interval starts at the credited cursor+1: {gap}"
+            );
+            let gap_oldest = gap["oldestRetainedSeq"].as_i64().expect("oldestRetainedSeq");
+            assert_eq!(
+                gap["toSeq"].as_i64(),
+                Some(gap_oldest - 1),
+                "the lost interval ends just before the new ring front: {gap}"
+            );
+            assert_eq!(gap["attachRequestId"], "attach-exit-gaph");
+            cursor = cursor.max(gap_oldest - 1);
+        }
+        pages += 1;
+        assert!(pages < 500, "the page walk must converge");
+        let start_ok = acc.is_empty() || gap_seen.is_some();
+        assert!(start_ok, "frames without a gap would be a silent forward jump");
+        if acc.contains(marker) {
+            break page_end;
+        }
+        credit(&mut paced, &terminal_id, "attach-exit-gaph", page_end).await;
+        cursor = cursor.max(page_end);
+    };
+    assert!(gap_seen.is_some(), "the retention gap reported before the continuation");
+    assert!(
+        cursor < marker_page_end,
+        "the marker page is UN-CREDITED at the hold (cursor {cursor})"
+    );
+
+    // THE HOLD: the final page (reaching the frozen exit head) is read but
+    // not credited — no exit may deliver on the drive that emitted it.
+    assert_quiet_hold(
+        &mut paced,
+        1_500,
+        "the final page's parser-consumption boundary",
+    )
+    .await;
+
+    // The acknowledging credit: the exit arrives and is the last frame.
+    credit(&mut paced, &terminal_id, "attach-exit-gaph", marker_page_end).await;
+    let exit = next_json_or_timeout(&mut paced, Duration::from_secs(5))
+        .await
+        .expect("the exit rides the credit acknowledging the final page");
+    assert_eq!(
+        exit.get("type").and_then(|v| v.as_str()),
+        Some("terminal.exit"),
+        "the acknowledging credit delivers the staged exit: {exit}"
+    );
+    let post_exit = tokio::time::Instant::now() + Duration::from_millis(1_000);
+    while tokio::time::Instant::now() < post_exit {
+        if let Some(value) = next_json_or_timeout(&mut paced, Duration::from_millis(250)).await {
+            match value.get("type").and_then(|v| v.as_str()) {
+                Some("terminal.exit") => panic!("exactly one terminal.exit may ever arrive: {value}"),
+                Some("terminal.output") | Some("terminal.output.gap") => panic!(
+                    "no page or gap may follow terminal.exit (the exit is the                      terminal's last pacing frame): {value}"
+                ),
+                _ => {}
+            }
+        }
+    }
+}
