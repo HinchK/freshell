@@ -32,6 +32,7 @@ Proposed package-manager migration: [pnpm migration plan](docs/plans/2026-09-19-
 ## Test Coordination
 - Broad repo-supported test runs wait for the shared coordinator gate; if another agent holds it, wait rather than kill a foreign holder.
 - Pre-worktree green-base checks (and any broad gate intended to validate `origin/main` itself, as opposed to a branch under test) go through `scripts/base-gate.sh` (e.g. `scripts/base-gate.sh test`), which runs the command from a clean scratch worktree at `origin/main`. The main checkout accumulates untracked litter; the cloud runners treat that as a non-addressable `-dirty` image and pay a ~13 min cold rebuild every time, whereas a clean worktree uses the content-addressed commit tag — built at most once per commit and shared by every later run.
+- Agent-launched broad gates should export `GCLOUD_ROBOT_REQUIRE=1` (the recommended default): fail closed when no robot identity resolves, instead of silently running as a possibly-stale human identity. Machines with a standard gcloud-robot install don't need `GCLOUD_ROBOT_HOME` exported — the lanes probe the well-known install locations (`~/.codex/skills/gcloud-robot`, `~/.claude/skills/gcloud-robot`, `~/code/skill-gcloud-robot/gcloud-robot`) when it's unset, and non-TTY (agent) invocations disable gcloud prompts and preflight the credential so a dead identity fails in seconds instead of hanging. To guarantee the robot identity itself — rather than the selector's first passing candidate — export `GCLOUD_ROBOT_ACCOUNT=<robot>`: the selector probes that account first, so no other identity (including an ambient human with lane permissions) can win; for PTY-launched agent lanes (Freshell terminal panes, where prompts are deliberately NOT disabled) this also prevents the selector from ever minting the ambient human credential.
 - Set `FRESHELL_TEST_SUMMARY` when you want holder/status output to show a human-meaningful reason for a broad run.
 - Use `npm run test:status` to inspect the current holder, recent results, and any advisory reusable baseline.
 - Use `npm run test:vitest -- ...` for a repo-owned direct Vitest path. Raw `npx vitest` is not a coordinated workflow.
@@ -180,10 +181,12 @@ npm run test:cloud:build    # Build and push the Docker image to Artifact Regist
 
 **Identity:** cloud lanes never require an interactive `gcloud auth login`.
 They resolve a gcloud identity lazily, in this order: `--account=` flag >
-`FRESHELL_GCP_ACCOUNT` > `GCLOUD_IDENT` > gcloud-robot probe (needs
-`GCLOUD_ROBOT_HOME`, the installed gcloud-robot skill directory) > ambient
-gcloud (with a one-line stderr note). Provisioning, rotation, and revocation
-live in [docs/development/gcloud-robot.md](docs/development/gcloud-robot.md).
+`FRESHELL_GCP_ACCOUNT` > `GCLOUD_IDENT` > gcloud-robot probe (via
+`GCLOUD_ROBOT_HOME`, or the first well-known gcloud-robot skill install:
+`~/.codex/skills/gcloud-robot`, `~/.claude/skills/gcloud-robot`,
+`~/code/skill-gcloud-robot/gcloud-robot`) > ambient gcloud (with a one-line
+stderr note). Provisioning, rotation, and revocation live in
+[docs/development/gcloud-robot.md](docs/development/gcloud-robot.md).
 `GCLOUD_ROBOT_REQUIRE=1` fails closed when no robot identity resolves.
 
 ### E2E Test Backend (Cloud Run Jobs)
@@ -204,10 +207,12 @@ npm run test:e2e:cloud      # Force cloud
 
 **Identity:** cloud lanes never require an interactive `gcloud auth login`.
 They resolve a gcloud identity lazily, in this order: `--account=` flag >
-`FRESHELL_GCP_ACCOUNT` > `GCLOUD_IDENT` > gcloud-robot probe (needs
-`GCLOUD_ROBOT_HOME`, the installed gcloud-robot skill directory) > ambient
-gcloud (with a one-line stderr note). Provisioning, rotation, and revocation
-live in [docs/development/gcloud-robot.md](docs/development/gcloud-robot.md).
+`FRESHELL_GCP_ACCOUNT` > `GCLOUD_IDENT` > gcloud-robot probe (via
+`GCLOUD_ROBOT_HOME`, or the first well-known gcloud-robot skill install:
+`~/.codex/skills/gcloud-robot`, `~/.claude/skills/gcloud-robot`,
+`~/code/skill-gcloud-robot/gcloud-robot`) > ambient gcloud (with a one-line
+stderr note). Provisioning, rotation, and revocation live in
+[docs/development/gcloud-robot.md](docs/development/gcloud-robot.md).
 `GCLOUD_ROBOT_REQUIRE=1` fails closed when no robot identity resolves.
 
 ## Architecture

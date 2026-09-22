@@ -100,6 +100,7 @@ FAKE_DIR=$(mktemp -d)
 cat > "$FAKE_DIR/gcloud" << 'FAKE'
 #!/usr/bin/env bash
 echo "FAKE_GCLOUD: $@" >> "${FAKE_GCLOUD_LOG:-/dev/null}"
+[ -n "${CLOUDSDK_CORE_DISABLE_PROMPTS:-}" ] && echo "PROMPTS_DISABLED=1" >> "${FAKE_GCLOUD_LOG:-/dev/null}"
 if [[ "$*" == *"artifacts docker images describe"* ]]; then exit 0; fi
 if [[ "$*" == *"artifacts repositories describe"* ]]; then exit 0; fi
 if [[ "$*" == *"auth print-access-token"* ]]; then echo "fake-token"; exit 0; fi
@@ -154,6 +155,74 @@ rm -f "$FAKE_GCLOUD_LOG" "$FAKE_DOCKER_LOG"; touch "$FAKE_GCLOUD_LOG" "$FAKE_DOC
 bash scripts/vitest-cloud.sh build --local-build 2>&1 > /dev/null || true
 check "vitest-cloud.sh build --local-build calls docker build" \
   grep -q 'build' "$FAKE_DOCKER_LOG"
+
+# Check 20 (kata e83z): the build lanes run non-interactive under agents —
+# the wrapper must disable gcloud prompts (TTY-gated) and mint an identity
+# preflight token BEFORE any build/submit work. Every invocation runs under
+# `env -u CLOUDSDK_CORE_DISABLE_PROMPTS` so a host export cannot skew the
+# TTY-side assertion.
+rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
+env -u CLOUDSDK_CORE_DISABLE_PROMPTS PATH="$FAKE_DIR:$PATH" bash scripts/vitest-cloud.sh build >/dev/null 2>&1 </dev/null || true
+check "vitest build lane: prompts disabled (non-TTY) + preflight token mint precedes builds submit" \
+  bash -c '
+    grep -q "PROMPTS_DISABLED=1" "$1" || exit 1
+    tok="$(grep -n "auth print-access-token" "$1" | head -1 | cut -d: -f1)"
+    sub="$(grep -n "builds submit" "$1" | head -1 | cut -d: -f1)"
+    [ -n "$tok" ] && [ -n "$sub" ] && [ "$tok" -lt "$sub" ]
+  ' _ "$FAKE_GCLOUD_LOG"
+
+rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
+env -u CLOUDSDK_CORE_DISABLE_PROMPTS PATH="$FAKE_DIR:$PATH" bash scripts/e2e-cloud.sh build >/dev/null 2>&1 </dev/null || true
+check "e2e build lane: prompts disabled (non-TTY) + preflight token mint precedes builds submit" \
+  bash -c '
+    grep -q "PROMPTS_DISABLED=1" "$1" || exit 1
+    tok="$(grep -n "auth print-access-token" "$1" | head -1 | cut -d: -f1)"
+    sub="$(grep -n "builds submit" "$1" | head -1 | cut -d: -f1)"
+    [ -n "$tok" ] && [ -n "$sub" ] && [ "$tok" -lt "$sub" ]
+  ' _ "$FAKE_GCLOUD_LOG"
+
+rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
+check "e2e build lane under a real TTY leaves prompts enabled" \
+  bash -c '
+    script -qec "env -u CLOUDSDK_CORE_DISABLE_PROMPTS PATH=\"$1:\$PATH\" bash scripts/e2e-cloud.sh build" /dev/null >/dev/null 2>&1 || true
+    ! grep -q "PROMPTS_DISABLED=1" "$2"
+  ' _ "$FAKE_DIR" "$FAKE_GCLOUD_LOG"
+
+# Check 21 (kata e83z delta review F2): the DIRECT build lane must surface
+# loud dirty-tree state when the -dirty image path is taken. `build` computes
+# the same `-dirty` sentinel tag the run lane warns about, and a direct
+# `npm run test:cloud:build` on a dirty tree must lead the build work with the
+# same WARNING shape (the run lane's own WARNING is pinned by V10/W15c).
+# Hermetic dirty-forcing: a temporary untracked file (untracked counts as
+# dirty — the image bakes the working tree), removed right after the runs.
+BUILD_DIRTY_MARKER="$ROOT/.cloud-build-dirty-check-$$"
+touch "$BUILD_DIRTY_MARKER"
+
+rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
+VITEST_BUILD_DIRTY_OUT=$(env PATH="$FAKE_DIR:$PATH" bash scripts/vitest-cloud.sh build 2>&1 </dev/null) && VB_RC=0 || VB_RC=$?
+check "vitest build lane on a dirty tree: loud WARNING precedes the build work" \
+  bash -c '
+    [ "$1" = "0" ] &&
+    grep -q "WARNING: dirty worktree" <<<"$2" &&
+    grep -q "not content-addressed" <<<"$2" &&
+    warn="$(grep -n "WARNING: dirty worktree" <<<"$2" | head -1 | cut -d: -f1)" &&
+    build="$(grep -n "Building Docker image" <<<"$2" | head -1 | cut -d: -f1)" &&
+    [ -n "$warn" ] && [ -n "$build" ] && [ "$warn" -lt "$build" ]
+  ' _ "$VB_RC" "$VITEST_BUILD_DIRTY_OUT"
+
+rm -f "$FAKE_GCLOUD_LOG"; touch "$FAKE_GCLOUD_LOG"
+E2E_BUILD_DIRTY_OUT=$(env PATH="$FAKE_DIR:$PATH" bash scripts/e2e-cloud.sh build 2>&1 </dev/null) && EB_RC=0 || EB_RC=$?
+check "e2e build lane on a dirty tree: loud WARNING precedes the build work" \
+  bash -c '
+    [ "$1" = "0" ] &&
+    grep -q "WARNING: dirty worktree" <<<"$2" &&
+    grep -q "not content-addressed" <<<"$2" &&
+    warn="$(grep -n "WARNING: dirty worktree" <<<"$2" | head -1 | cut -d: -f1)" &&
+    build="$(grep -n "Building Docker image" <<<"$2" | head -1 | cut -d: -f1)" &&
+    [ -n "$warn" ] && [ -n "$build" ] && [ "$warn" -lt "$build" ]
+  ' _ "$EB_RC" "$E2E_BUILD_DIRTY_OUT"
+
+rm -f "$BUILD_DIRTY_MARKER"
 
 # Cleanup
 rm -rf "$FAKE_DIR"
