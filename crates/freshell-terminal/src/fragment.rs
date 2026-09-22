@@ -48,14 +48,47 @@ pub fn attach_request_id_reserve_value() -> String {
 /// `TERMINAL_STREAM_BATCH_MAX_BYTES = max(1024, env.TERMINAL_STREAM_BATCH_MAX_BYTES
 /// || MAX_REALTIME_MESSAGE_BYTES)` (`constants.ts:3-6`). Env override honored for
 /// fidelity; unset -> 16384.
+///
+/// Round-2 finding F2 — the frame-fits-page invariant, enforced at the
+/// source: the result is CLAMPED to [`PACED_PAGE_BUDGET_FLOOR_BYTES`] (the
+/// smallest paced page budget any supported TERM-09 queue setting can
+/// produce), so no env override can mint a terminal.output frame whose
+/// serialized size exceeds the page budget floor. Every PTY byte is
+/// ingested through this cap (the OutputFramer fragments at construction),
+/// which makes the paced page builder's over-budget first frame — its
+/// atomic single-frame page — unreachable under supported settings; that
+/// arm stays as defense-in-depth.
 pub fn terminal_stream_batch_max_bytes() -> usize {
-    let from_env = std::env::var("TERMINAL_STREAM_BATCH_MAX_BYTES")
+    terminal_stream_batch_max_bytes_for_env(std::env::var("TERMINAL_STREAM_BATCH_MAX_BYTES"))
+}
+
+/// [`terminal_stream_batch_max_bytes`] resolved against an injected env
+/// read (the pure core — testable without process-env races).
+pub fn terminal_stream_batch_max_bytes_for_env(
+    from_env: Result<String, std::env::VarError>,
+) -> usize {
+    let from_env = from_env
         .ok()
         .and_then(|v| v.trim().parse::<f64>().ok())
         .filter(|n| n.is_finite() && *n > 0.0)
         .map(|n| n.floor() as usize);
-    from_env.unwrap_or(MAX_REALTIME_MESSAGE_BYTES).max(1024)
+    from_env
+        .unwrap_or(MAX_REALTIME_MESSAGE_BYTES)
+        .clamp(1024, PACED_PAGE_BUDGET_FLOOR_BYTES)
 }
+
+/// The paced page-budget FLOOR (responsive-terminal-restore round-2
+/// finding F2): the smallest page budget any supported deployment can hand
+/// the paced page builder. The page budget is clamped at server boot to
+/// `paced_page_budget_ceiling(queue_max_bytes) = queue/2`
+/// (`freshell_ws::backpressure`), and the queue cap is floor-enforced at
+/// 64 KiB (`TERM09_QUEUE_MAX_BYTES_FLOOR`, `Term09Config::validate`) — so
+/// 32 KiB is the minimum ceiling any supported settings can produce. The
+/// fragment cap is clamped to this floor so the frame-fits-page invariant
+/// holds structurally, whatever `TERMINAL_STREAM_BATCH_MAX_BYTES` says.
+/// (freshell-ws pins the cross-crate agreement:
+/// `paced_page_budget_ceiling(TERM09_QUEUE_MAX_BYTES_FLOOR) == this`.)
+pub const PACED_PAGE_BUDGET_FLOOR_BYTES: usize = 32 * 1024;
 
 /// `measureSerializedJsonBytes` — UTF-8 byte length of the compact JSON serialization.
 pub fn measure_serialized_json_bytes(payload: &serde_json::Value) -> usize {
@@ -169,9 +202,77 @@ mod tests {
     fn batch_max_defaults_to_16k() {
         // Env unset in the test harness -> max(1024, 16384).
         assert_eq!(
-            terminal_stream_batch_max_bytes(),
+            terminal_stream_batch_max_bytes_for_env(Err(std::env::VarError::NotPresent)),
             MAX_REALTIME_MESSAGE_BYTES
         );
+    }
+
+    #[test]
+    fn fragment_cap_is_clamped_to_the_paced_page_budget_floor() {
+        // Round-2 finding F2 (the boot-clamp, applied at the source): an
+        // env override LARGER than the paced page budget floor must not
+        // survive — the effective fragment cap can never exceed the
+        // smallest page budget any supported queue setting can produce,
+        // or the env could mint a frame the page builder cannot pack.
+        assert_eq!(
+            terminal_stream_batch_max_bytes_for_env(Ok("1048576".to_string())),
+            PACED_PAGE_BUDGET_FLOOR_BYTES,
+            "a 1 MiB TERMINAL_STREAM_BATCH_MAX_BYTES override clamps to the 32 KiB page floor"
+        );
+        // A value BELOW the floor keeps fidelity (the clamp is an upper
+        // bound, not a fixed size).
+        assert_eq!(
+            terminal_stream_batch_max_bytes_for_env(Ok("2048".to_string())),
+            2048
+        );
+        // Garbage and non-positive values keep the default.
+        assert_eq!(
+            terminal_stream_batch_max_bytes_for_env(Ok("not-a-number".to_string())),
+            MAX_REALTIME_MESSAGE_BYTES
+        );
+        assert_eq!(
+            terminal_stream_batch_max_bytes_for_env(Ok("0".to_string())),
+            MAX_REALTIME_MESSAGE_BYTES
+        );
+    }
+
+    #[test]
+    fn a_control_heavy_chunk_measures_far_above_the_page_floor_but_splits_within_the_clamp() {
+        // The round-2 reviewer's reachability arithmetic, pinned as the
+        // class-closing evidence: the PTY reads at most 8 KiB per chunk,
+        // and a control-char-heavy chunk serializes to ~6 bytes per char
+        // under JSON escaping (~48 KiB for 8192 chars) — FAR above the
+        // 32 KiB page floor. But every PTY byte is ingested through the
+        // fragment splitter whose budget measure is the full serialized
+        // terminal.output JSON with the worst-case seq placeholder and
+        // the 512-char attachRequestId reserve, so the emitted FRAMES can
+        // never exceed the clamped cap — the frame-fits-page invariant.
+        let chunk = "\u{1}".repeat(8192);
+        let measured = measure_terminal_output_budget_payload_bytes("term", "stream", &chunk);
+        assert!(
+            measured > 48 * 1024,
+            "the reviewer's ~49 KiB measure: 8192 control chars escape to ~6 bytes each ({measured})"
+        );
+        assert!(
+            measured > PACED_PAGE_BUDGET_FLOOR_BYTES,
+            "the raw chunk measurably exceeds the page floor — only the splitter's fragments reach the ring ({measured})"
+        );
+        let fragments = fragment_terminal_output_for_payload_budget(
+            &chunk,
+            terminal_stream_batch_max_bytes_for_env(Ok("1048576".to_string())),
+            |c| measure_terminal_output_budget_payload_bytes("term", "stream", c),
+        )
+        .expect("the clamped budget always fits one code point");
+        assert!(fragments.len() > 1, "the chunk must split");
+        assert_eq!(fragments.concat(), chunk, "the split is lossless");
+        for fragment in &fragments {
+            let frame_bytes =
+                measure_terminal_output_budget_payload_bytes("term", "stream", fragment);
+            assert!(
+                frame_bytes <= PACED_PAGE_BUDGET_FLOOR_BYTES,
+                "every frame fits the smallest supported page budget ({frame_bytes})"
+            );
+        }
     }
 
     #[test]

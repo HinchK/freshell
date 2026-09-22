@@ -336,6 +336,23 @@ mod tests {
     }
 
     #[test]
+    fn the_page_floor_equals_the_terminal_crates_fragment_cap_floor() {
+        // Round-2 finding F2 (cross-crate consistency pin): the terminal
+        // crate clamps its fragment cap to "the smallest page budget any
+        // supported queue setting can produce", computed on THIS side as
+        // the ceiling at the queue floor. The two constants must agree —
+        // if either drifts, the frame-fits-page invariant silently breaks
+        // (a fragment cap above the floor could mint frames the page
+        // builder cannot pack; a floor above the fragment clamp would
+        // re-open the env-override gap).
+        assert_eq!(
+            paced_page_budget_ceiling(TERM09_QUEUE_MAX_BYTES_FLOOR),
+            freshell_terminal::PACED_PAGE_BUDGET_FLOOR_BYTES as i64,
+            "the fragment-cap floor must equal the paced page budget floor at the queue floor"
+        );
+    }
+
+    #[test]
     fn term09_config_defaults_spill_before_disconnect() {
         // Responsive-terminal-restore Workstream 3: the defaults must place
         // the spill bound (eviction + gap) STRICTLY below the

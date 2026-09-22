@@ -4815,7 +4815,13 @@ const BATCH_ENVELOPE_FIXED_BYTES: i64 = 41;
 /// wire cost, so every produced page's real serialized bytes stay within
 /// the budget. A single frame whose own envelope exceeds the budget forms
 /// its own atomic single-frame page (guaranteed progress; the oversize
-/// result is explicit, never silently coalesced).
+/// result is explicit, never silently coalesced). That arm is
+/// UNREACHABLE under supported settings (round-2 finding F2): the
+/// fragment splitter's cap is clamped to
+/// [`crate::fragment::PACED_PAGE_BUDGET_FLOOR_BYTES`] — the smallest page
+/// budget any supported queue setting can produce — so a production
+/// frame can never exceed the page budget; the arm is retained as
+/// defense-in-depth for the unsupported residue.
 fn paced_page_build(
     s: &TerminalShared,
     conn_id: u64,
@@ -8054,11 +8060,19 @@ mod tests {
         );
     }
 
-    /// A single frame whose own envelope exceeds the page budget forms its
-    /// own atomic single-frame page (guaranteed progress, never split, never
-    /// silently coalesced into a "budget" page).
+    /// Round-2 finding F2 — the DEFENSE-IN-DEPTH pin: a single frame whose
+    /// own envelope exceeds the page budget still forms its own atomic
+    /// single-frame page (guaranteed progress, never split, never silently
+    /// coalesced into a "budget" page). UNREACHABLE under supported
+    /// settings: every PTY byte is ingested through the fragment splitter
+    /// whose cap is clamped to [`crate::fragment::PACED_PAGE_BUDGET_FLOOR_BYTES`]
+    /// (the smallest page budget any supported queue setting can produce),
+    /// so a production frame can never exceed the page budget — this arm
+    /// exists exactly for the unsupported residue (a test-injected budget
+    /// below the floor, a future ingest path that bypasses the splitter)
+    /// and must never be removed.
     #[test]
-    fn paced_replay_oversized_frame_forms_its_own_atomic_page() {
+    fn paced_replay_oversized_frame_atomic_page_is_defense_in_depth_beyond_the_boot_clamp() {
         let reg = TerminalRegistry::new();
         reg.set_paced_page_max_bytes(256);
         reg.insert_headless("T", "S");
