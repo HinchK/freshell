@@ -309,10 +309,13 @@ async fn armed_pending(store: &Arc<SessionNames>, handle: &str, root: &str) -> S
 // On-demand route discovery (the index-adopted flow)
 // ---------------------------------------------------------------------------
 
-/// `locate_transcript_selected` reads process-global env (the ordered
-/// candidate roots) — serialize every discovery test and restore the prior
-/// values (the repo's ENV_LOCK convention).
-static CLAUDE_DISCOVERY_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// `locate_transcript_selected` reads process-global env (the ordered
+// candidate roots). Both discovery tests below MUTATE `CLAUDE_HOME` /
+// `CLAUDE_CONFIG_DIR` for their whole set…restore window, so they hold the
+// crate-wide `CLAUDE_ENV_TEST_LOCK` — shared with every other same-binary
+// mutator of those vars and with the `claude_home`-resolving readers (the
+// final-suite gate's unreadable-projects deferral flake; see
+// `crate::test_env_lock` for the full discipline).
 
 /// Unified agent names (Task 8 acceptance): a session adopted ONLY through
 /// the index (the auto-title sweep's hydration — the sidebar/history rename
@@ -323,7 +326,7 @@ static CLAUDE_DISCOVERY_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::c
 /// attach the acquisition so the series runs to `synced`.
 #[tokio::test]
 async fn an_index_adopted_claude_series_discovers_its_route_on_demand() {
-    let _guard = CLAUDE_DISCOVERY_ENV_LOCK.lock().await;
+    let _guard = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.lock().await;
     let home = tempfile::tempdir().expect("claude home tempdir");
     let session_id = "4a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d";
     let project_cwd = home.path().join("proj");
@@ -429,7 +432,7 @@ async fn an_index_adopted_claude_series_discovers_its_route_on_demand() {
 /// and a successful discovery clears the entry and unpauses the series.
 #[tokio::test]
 async fn a_failed_route_discovery_backs_off_instead_of_rescanning_every_pass() {
-    let _guard = CLAUDE_DISCOVERY_ENV_LOCK.lock().await;
+    let _guard = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.lock().await;
     let home = tempfile::tempdir().expect("claude home tempdir");
     let session_id = "6c3d4e5f-6a7b-4c8d-9e0f-1a2b3c4d5e6f";
     let project_cwd = home.path().join("proj");

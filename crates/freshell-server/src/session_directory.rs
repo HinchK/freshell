@@ -2449,6 +2449,10 @@ mod tests {
 
     #[test]
     fn invalid_utf8_transcript_is_indexed_lossily_like_node() {
+        // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
+        // while a same-binary mutator holds `CLAUDE_HOME`) — take the
+        // crate-wide lock (see `crate::test_env_lock`).
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         // Regression (bug #7 class, found by the 007 seeded-home differential):
         // Node reads transcripts with `fs.readFile(file,'utf8')` -> invalid
         // bytes become U+FFFD and the session IS indexed; `read_to_string`
@@ -2487,6 +2491,10 @@ mod tests {
 
     #[test]
     fn default_query_hides_non_interactive_fixtures() {
+        // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
+        // while a same-binary mutator holds `CLAUDE_HOME`) — take the
+        // crate-wide lock (see `crate::test_env_lock`).
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         // `real-corrupted.jsonl` has a `cwd` and parses as non-interactive → the
         // default History browse (no includeNonInteractive) hides it → empty
         // page. `healthy.jsonl` has NO `cwd` anywhere → excluded entirely at
@@ -2508,6 +2516,10 @@ mod tests {
 
     #[test]
     fn include_non_interactive_surfaces_titled_session() {
+        // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
+        // while a same-binary mutator holds `CLAUDE_HOME`) — take the
+        // crate-wide lock (see `crate::test_env_lock`).
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let home = claude_home_with(&["real-corrupted.jsonl", "healthy.jsonl"]);
         let items = list_claude_sessions(&claude_home(&home));
         let q = DirQuery {
@@ -2526,6 +2538,10 @@ mod tests {
 
     #[test]
     fn include_empty_surfaces_untitled_sessions_sorted_desc() {
+        // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
+        // while a same-binary mutator holds `CLAUDE_HOME`) — take the
+        // crate-wide lock (see `crate::test_env_lock`).
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         // `healthy.jsonl` has no `cwd` → excluded at discovery (R10b) even with
         // every include flag set; only the cwd-bearing `real-corrupted.jsonl`
         // (itself untitled-if-you-squint but DOES have a title) surfaces here.
@@ -2749,6 +2765,10 @@ mod tests {
 
     #[test]
     fn r10b_cwdless_repair_fixture_never_surfaces_under_any_flags() {
+        // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
+        // while a same-binary mutator holds `CLAUDE_HOME`) — take the
+        // crate-wide lock (see `crate::test_env_lock`).
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         // Byte-matched against a live probe of the ORIGINAL: seeding
         // `healthy.jsonl` (renamed to a canonical UUID filename, exactly as
         // `port/oracle/rest-parity/sweep.mjs#seedClaudeSessions` does) and
@@ -2786,6 +2806,10 @@ mod tests {
 
     #[test]
     fn title_search_matches_and_annotates() {
+        // Env-first reader (`claude_home(&home)` may resolve a FOREIGN root
+        // while a same-binary mutator holds `CLAUDE_HOME`) — take the
+        // crate-wide lock (see `crate::test_env_lock`).
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let home = claude_home_with(&["real-corrupted.jsonl"]);
         let items = list_claude_sessions(&claude_home(&home));
         let q = DirQuery {

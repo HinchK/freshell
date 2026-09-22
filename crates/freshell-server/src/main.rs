@@ -68,6 +68,8 @@ mod terminals;
 #[cfg(test)]
 pub(crate) mod test_clock_gate;
 mod test_clock_router;
+#[cfg(test)]
+pub(crate) mod test_env_lock;
 mod updater;
 
 use std::net::IpAddr;
@@ -3712,6 +3714,9 @@ mod tests {
         let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Mutates `CLAUDE_HOME` (unset) — hold the crate-wide CLAUDE env
+        // lock too, AFTER the HOME lock (`crate::test_env_lock`'s order).
+        let _claude_env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let home = env_test_temp_dir("claude-fallback");
         let _home = EnvVarGuard::set("HOME", home.to_str().unwrap());
         let _claude_home = EnvVarGuard::unset("CLAUDE_HOME");
@@ -3744,6 +3749,9 @@ mod tests {
         let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Mutates `CLAUDE_HOME` (unset) — hold the crate-wide CLAUDE env
+        // lock too, AFTER the HOME lock (`crate::test_env_lock`'s order).
+        let _claude_env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let profile = env_test_temp_dir("claude-fallback-userprofile");
         let _home = EnvVarGuard::unset("HOME");
         let _claude_home = EnvVarGuard::unset("CLAUDE_HOME");
@@ -3778,6 +3786,9 @@ mod tests {
         let _lock = crate::session_directory::HOME_ENV_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Mutates `CLAUDE_HOME` (unset) — hold the crate-wide CLAUDE env
+        // lock too, AFTER the HOME lock (`crate::test_env_lock`'s order).
+        let _claude_env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let home = env_test_temp_dir("claude-fallback");
         let _claude_home = EnvVarGuard::unset("CLAUDE_HOME");
         let _userprofile = EnvVarGuard::set("USERPROFILE", home.to_str().unwrap());
@@ -3838,6 +3849,10 @@ mod tests {
 
     #[test]
     fn claude_transcript_present_is_not_absent() {
+        // Env-first reader (`claude_home` may resolve a FOREIGN root while a
+        // same-binary mutator holds `CLAUDE_HOME`) — take the crate-wide
+        // lock (see `crate::test_env_lock`).
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let home = tempfile::tempdir().expect("tempdir");
         let proj = home.path().join(".claude").join("projects").join("-p");
         std::fs::create_dir_all(&proj).expect("mkdir projects/-p");
@@ -3850,6 +3865,8 @@ mod tests {
 
     #[test]
     fn claude_empty_projects_tree_is_definitively_absent() {
+        // Env-first reader — take the crate-wide lock (`crate::test_env_lock`).
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let home = tempfile::tempdir().expect("tempdir");
         std::fs::create_dir_all(home.path().join(".claude").join("projects"))
             .expect("mkdir empty projects");
@@ -3863,6 +3880,12 @@ mod tests {
     #[test]
     fn claude_unreadable_projects_root_defers() {
         use std::os::unix::fs::PermissionsExt;
+        // Env-first reader — take the crate-wide lock (`crate::test_env_lock`).
+        // This is the final-suite gate flake: without the guard a
+        // concurrently running discovery test's CLAUDE_HOME (readable tree,
+        // no sess-1.jsonl) flipped the gate to "definitively absent" and
+        // failed the must-DEFER assert.
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let home = tempfile::tempdir().expect("tempdir");
         let projects = home.path().join(".claude").join("projects");
         std::fs::create_dir_all(&projects).expect("mkdir projects");
@@ -3882,6 +3905,9 @@ mod tests {
     #[test]
     fn claude_unreadable_project_subdir_defers() {
         use std::os::unix::fs::PermissionsExt;
+        // Env-first reader — take the crate-wide lock (`crate::test_env_lock`):
+        // the gate-flake twin of the projects-root case above.
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let home = tempfile::tempdir().expect("tempdir");
         let projects = home.path().join(".claude").join("projects");
         let proj = projects.join("-p");
@@ -3901,6 +3927,10 @@ mod tests {
 
     #[test]
     fn missing_projects_root_defers() {
+        // Env-first reader — take the crate-wide lock (`crate::test_env_lock`):
+        // a concurrent mutator's foreign CLAUDE_HOME HAS a projects root, so
+        // the no-root defer branch would flip to "definitively absent".
+        let _env = crate::test_env_lock::CLAUDE_ENV_TEST_LOCK.blocking_lock();
         let home = tempfile::tempdir().expect("tempdir");
         assert!(
             !transcript_definitively_absent(home.path(), "claude", "sess-1"),
