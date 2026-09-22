@@ -18040,6 +18040,15 @@ pub(crate) mod tests {
     /// flight). The unified attention edge MUST fire at the close — exactly
     /// once — and both later observers (a sidecar kill, the turn's own late
     /// completion) add NOTHING.
+    ///
+    /// FE3R2-2: the late completion AND a TRAILING DUPLICATE for the same
+    /// already-rang end are each followed by a bounded quiet-window drain
+    /// BEFORE the sidecar-kill phase. A wrongly minted edge TRAILS the idle
+    /// snapshot in the same fold, and the pre-fix shape of this test stopped
+    /// collecting at the snapshot — the kill wait below then silently
+    /// swallowed the forbidden frame, so deleting the ThreadClosed arm's
+    /// rang-set push still passed. The pre-kill drains close that hole:
+    /// this test now FAILS if the ThreadClosed push is removed.
     #[tokio::test]
     async fn thread_closed_with_a_turn_in_flight_rings_the_unified_edge_exactly_once() {
         let (transport, peer) = freshell_codex::new_channel_transport();
@@ -18126,10 +18135,65 @@ pub(crate) mod tests {
             completion.frames
         );
 
+        // FE3R2-2: the collect above STOPS at the idle snapshot, but a
+        // wrongly minted edge TRAILS the snapshot in the same fold — the
+        // sidecar-kill wait below would silently swallow it, so deleting
+        // the ThreadClosed arm's rang-set push passed the pre-fix shape of
+        // this test. A bounded quiet-window drain BEFORE the kill phase
+        // closes that hole: the push's gate must hold with no kill-phase
+        // consumption to hide behind.
+        let trailing = collect_frames_until(&mut rx, std::time::Duration::from_millis(400), |w| {
+            w["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert!(
+            !trailing.matched,
+            "the late matching completion's fold carries NO trailing second edge \
+             (the ThreadClosed mint's rang-set push gates it): {:?}",
+            trailing.frames
+        );
+
+        // FE3R2-2 (the ThreadClosed-created gate is DURABLE): a TRAILING
+        // DUPLICATE completion for the same already-rang end must be gated
+        // too — the set entry is never consumed on match. The duplicate
+        // still publishes its idle bookkeeping.
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-close-in-flight", "turnId": "turn-1", "status": "failed" }),
+        );
+        let duplicate = collect_frames_until(&mut rx, std::time::Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.session.snapshot" && w["event"]["status"] == "idle"
+        })
+        .await;
+        assert!(
+            duplicate.matched,
+            "the trailing duplicate completion still publishes its idle snapshot: {:?}",
+            duplicate.frames
+        );
+        assert!(
+            !duplicate
+                .frames
+                .iter()
+                .any(|w| w["event"]["type"] == "freshAgent.turn.complete"),
+            "the trailing duplicate completion carries NO edge before its snapshot: {:?}",
+            duplicate.frames
+        );
+        let duplicate_trailing =
+            collect_frames_until(&mut rx, std::time::Duration::from_millis(400), |w| {
+                w["event"]["type"] == "freshAgent.turn.complete"
+            })
+            .await;
+        assert!(
+            !duplicate_trailing.matched,
+            "the trailing duplicate completion adds NO second edge (the ThreadClosed \
+             mint's gate is durable — never consumed on match): {:?}",
+            duplicate_trailing.frames
+        );
+
         // A subsequent sidecar death (an unrequested exit) broadcasts the
         // `exited` frame and rings NOTHING extra — the latch retired at the
         // close, so the crash arm cannot misattribute a phantom edge.
-        // Safety: a targeted SIGKILL of this test's own fixture child (the
+        // Safety: a targeted SIGKILL of this test's OWN fixture child (the
         // `sleep` process spawned above) — never a broad kill pattern.
         unsafe { libc::kill(pid as i32, libc::SIGKILL) };
         let exited = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |w| {
