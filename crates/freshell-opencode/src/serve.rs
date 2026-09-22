@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -581,6 +581,17 @@ pub struct ServeConfig {
     /// 600 s opencode turn budget that also bounds the compact's await-idle
     /// tail (`opencode_ws.rs`'s `DEFAULT_TURN_TIMEOUT`).
     pub compact_timeout: Duration,
+    /// Daemon exit-watcher poll cadence (`Task 3`): how often the running
+    /// daemon's `exited()` is consulted between request traffic.
+    pub daemon_watch_interval: Duration,
+    /// Re-warm backoff: the initial delay before the first respawn attempt
+    /// after a daemon loss, doubling per failed attempt, capped at
+    /// [`ServeConfig::re_warm_backoff_max_ms`].
+    pub re_warm_backoff_initial_ms: u64,
+    /// Re-warm backoff ceiling: the escalation stops here (a crash-looping
+    /// daemon retries at this interval forever — it self-heals when e.g.
+    /// disk frees).
+    pub re_warm_backoff_max_ms: u64,
 }
 
 impl Default for ServeConfig {
@@ -598,6 +609,9 @@ impl Default for ServeConfig {
             required_idle_status_polls: 2,
             request_timeout: Duration::from_millis(30_000),
             compact_timeout: Duration::from_millis(600_000),
+            daemon_watch_interval: Duration::from_millis(1_000),
+            re_warm_backoff_initial_ms: 2_000,
+            re_warm_backoff_max_ms: 60_000,
         }
     }
 }
@@ -640,10 +654,54 @@ pub enum SessionSignal {
 
 const SESSION_CHANNEL_CAPACITY: usize = 256;
 
+/// The daemon-level channel capacity for [`DaemonSignal`] broadcasts.
+const DAEMON_CHANNEL_CAPACITY: usize = 16;
+
+/// A daemon-lifecycle edge broadcast by the manager (the client-facing
+/// runtime's Task-4 revival design consumes this): `Lost` when the shared
+/// daemon is gone (a requested discard with its reason, or an unrequested
+/// process exit), `Started` on every successful COLD start (not on the
+/// fast-path return of an already-running daemon).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DaemonSignal {
+    /// The running daemon is gone. `reason` is the loss class: `"process_exit"`
+    /// for an unrequested exit, the discard's reason (e.g. `"request_timeout"`)
+    /// for a requested kill.
+    Lost { reason: &'static str },
+    /// A previously-lost (or never-started) daemon completed a cold start and
+    /// is healthy again.
+    Started,
+}
+
+/// Which loss arm is running the shared exactly-once path
+/// ([`OpencodeServeManager::lose_daemon`]).
+enum LossArm<'a> {
+    /// The exit watcher observed an unrequested process exit. `ownership_id`
+    /// gates staleness (a watcher for a superseded daemon must not run the
+    /// loss path on its successor); `base_url` rides the crash WARN.
+    Watcher {
+        base_url: &'a str,
+        ownership_id: &'a str,
+    },
+    /// A requested discard (kill). The watcher is aborted first (a requested
+    /// kill never raises the crash event); `reason` names the discard cause
+    /// and rides both the WARN and the `Lost` signal.
+    Discard { reason: &'static str },
+}
+
 struct RunningServe {
     base_url: String,
-    process: Box<dyn ServeProcess>,
+    /// The shared daemon handle. `Arc` (LB-06): the exit watcher keeps a clone
+    /// that outlives this entry — the watcher polls ITS Arc, the entry keeps
+    /// its own, nothing is moved out.
+    process: Arc<dyn ServeProcess>,
+    /// THIS daemon's spawn identity: the stale-watcher gate (a watcher for a
+    /// superseded daemon must not run the loss path on its successor).
+    ownership_id: String,
     _event_handle: Box<dyn EventStreamHandle>,
+    /// The exit watcher's abort handle — aborted on the requested-loss paths
+    /// (discard/shutdown) so a killed daemon never raises the crash event.
+    _exit_watch: Option<tokio::task::AbortHandle>,
 }
 
 struct Inner {
@@ -652,6 +710,16 @@ struct Inner {
     shutdown: AtomicBool,
     running: tokio::sync::Mutex<Option<Arc<RunningServe>>>,
     session_emitters: Mutex<HashMap<String, broadcast::Sender<SessionSignal>>>,
+    daemon_signals: broadcast::Sender<DaemonSignal>,
+    /// The re-warm backoff's attempt counter: incremented per re-warm attempt
+    /// and reset when a loss is a FRESH incident (see
+    /// [`OpencodeServeManager::schedule_re_warm`]) — each new incident starts
+    /// at the initial delay while a crash-looping daemon still escalates to
+    /// and retries at the capped interval.
+    re_warm_attempts: AtomicUsize,
+    /// When the running daemon completed its (healthy) cold start — the
+    /// fresh-incident clock for the re-warm backoff.
+    last_cold_start_at: Mutex<Option<Instant>>,
 }
 
 /// The opencode serve sidecar client. Cheap to clone (`Arc`-backed).
@@ -669,6 +737,9 @@ impl OpencodeServeManager {
                 shutdown: AtomicBool::new(false),
                 running: tokio::sync::Mutex::new(None),
                 session_emitters: Mutex::new(HashMap::new()),
+                daemon_signals: broadcast::Sender::new(DAEMON_CHANNEL_CAPACITY),
+                re_warm_attempts: AtomicUsize::new(0),
+                last_cold_start_at: Mutex::new(None),
             }),
         }
     }
@@ -734,7 +805,7 @@ impl OpencodeServeManager {
             OPENCODE_CONFIG_CONTENT_ENV.to_string(),
             merged_opencode_config_content(inherited.as_deref()),
         ));
-        let process = self
+        let process: Arc<dyn ServeProcess> = self
             .inner
             .deps
             .spawner
@@ -742,18 +813,26 @@ impl OpencodeServeManager {
                 command: self.config().command.clone(),
                 hostname: endpoint.hostname.clone(),
                 port: endpoint.port,
-                ownership_id,
+                ownership_id: ownership_id.clone(),
                 env,
                 pure: false,
                 cwd: None,
             })
-            .map_err(ServeError::Spawn)?;
+            .map_err(ServeError::Spawn)?
+            .into();
 
         if let Err(e) = self.wait_for_health(&base_url, process.as_ref()).await {
             process.kill();
             return Err(e);
         }
 
+        // Arm the exit watcher BEFORE storing the entry — the spawn is
+        // synchronous (the guard is never held across an await here) and the
+        // watcher's first action is a sleep, so by the time it first consults
+        // `exited()` the entry is stored; its loss path still re-verifies
+        // ownership, so a store-visibility race can only no-op, never mis-fire.
+        let watch =
+            self.spawn_exit_watch(base_url.clone(), Arc::clone(&process), ownership_id.clone());
         let sink = self.make_dispatch_sink();
         let handle = self
             .inner
@@ -764,8 +843,20 @@ impl OpencodeServeManager {
         *guard = Some(Arc::new(RunningServe {
             base_url: base_url.clone(),
             process,
+            ownership_id,
             _event_handle: handle,
+            _exit_watch: Some(watch),
         }));
+        // The fresh-incident clock for the re-warm backoff: this daemon's
+        // healthy-service lifetime starts now.
+        *self
+            .inner
+            .last_cold_start_at
+            .lock()
+            .expect("cold-start clock mutex") = Some(Instant::now());
+        // COLD-start edge only — the fast path above (already running) never
+        // re-broadcasts this.
+        let _ = self.inner.daemon_signals.send(DaemonSignal::Started);
         Ok(base_url)
     }
 
@@ -840,6 +931,176 @@ impl OpencodeServeManager {
                 dispatch_event_on(&inner, event);
             }
         })
+    }
+
+    /// Spawn the daemon exit watcher for one cold-started daemon (Task 3,
+    /// the shared-daemon adaptation of the freshcodex onExit self-heal): poll
+    /// the SHARED process Arc's `exited()` every `daemon_watch_interval`; on
+    /// `Some` run the staleness-gated loss path and end. The manager clone is
+    /// cheap (`Arc`-backed); the process Arc and ownership id move in with
+    /// the task — the running entry keeps its own Arc (LB-06: share, never
+    /// move the daemon out of the entry).
+    fn spawn_exit_watch(
+        &self,
+        base_url: String,
+        process: Arc<dyn ServeProcess>,
+        ownership_id: String,
+    ) -> tokio::task::AbortHandle {
+        let manager = self.clone();
+        let interval = self.config().daemon_watch_interval;
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                if process.exited().is_some() {
+                    manager
+                        .lose_daemon(LossArm::Watcher {
+                            base_url: &base_url,
+                            ownership_id: &ownership_id,
+                        })
+                        .await;
+                    return;
+                }
+            }
+        });
+        handle.abort_handle()
+    }
+
+    /// The shared exactly-once daemon-loss path: a daemon that died on its own
+    /// (the watcher arm) or was discarded (the requested-kill arm) must not
+    /// leave a poisoned running entry (the 2026-09-20 incident's silent
+    /// half). **Exactly-once (LB-07):** the running-entry take is the race
+    /// arbiter — a `None` take means the other arm already handled this loss,
+    /// and the whole path is a silent no-op: no log, no Lost, no re-warm. The
+    /// arm selects the pre-take gate and the structured WARN (a requested kill
+    /// never raises the crash event; a watcher's WARN names the dead daemon).
+    async fn lose_daemon(&self, arm: LossArm<'_>) {
+        let taken = {
+            let mut running = self.inner.running.lock().await;
+            match arm {
+                LossArm::Watcher {
+                    base_url: _,
+                    ownership_id,
+                } => match running.as_ref() {
+                    // Still OUR daemon: take it (the loss is ours to handle).
+                    Some(r) if r.ownership_id == ownership_id => running.take(),
+                    // Stale watcher — a newer daemon owns the entry: no-op.
+                    _ => return,
+                },
+                LossArm::Discard { reason: _ } => {
+                    // Abort the watcher FIRST (inside the lock, before the
+                    // take and the WARN/kill sequence) — the requested kill
+                    // must never raise the crash event. After the take the
+                    // watcher can never win its own take; if it already won,
+                    // our take below is the silent no-op.
+                    if let Some(r) = running.as_ref() {
+                        if let Some(watch) = &r._exit_watch {
+                            watch.abort();
+                        }
+                    }
+                    running.take()
+                }
+            }
+        };
+        let Some(running) = taken else {
+            return;
+        };
+        let reason = match arm {
+            LossArm::Watcher { base_url, .. } => {
+                tracing::warn!(
+                    reason = "process_exit",
+                    base_url = %base_url,
+                    "freshagent.opencode.daemon_crash_detected"
+                );
+                "process_exit"
+            }
+            LossArm::Discard { reason } => {
+                tracing::warn!(reason = reason, "freshagent.opencode.daemon_discarded");
+                reason
+            }
+        };
+        // The watcher arm's kill is reaper parity only (the process already
+        // exited); the discard arm's kill is the requested kill. Either way
+        // kill() reaps the /proc-scoped ownership tree.
+        running.process.kill();
+        self.emit_lost_for_all();
+        let _ = self
+            .inner
+            .daemon_signals
+            .send(DaemonSignal::Lost { reason });
+        self.schedule_re_warm();
+    }
+
+    /// Schedule the backoff-guarded respawn after a daemon loss: a RETRY loop
+    /// that sleeps `re_warm_backoff_initial_ms * 2^(attempts-1)` (capped at
+    /// `re_warm_backoff_max_ms`), then calls `ensure_started`. A FAILED
+    /// attempt logs and schedules the next (escalating) attempt — a transient
+    /// spawn/health failure (e.g. disk pressure) must not strand the daemon
+    /// permanently absent. A SUCCESSFUL attempt ends the loop; the fresh
+    /// daemon's own exit watcher is armed by `ensure_started`. Never spawns
+    /// (nor retries) once shutdown is set.
+    ///
+    /// **Fresh-incident gate** (the round-2 "no permanent 60 s first delay"
+    /// finding, reconciled with the behavior list's crash-loop escalation):
+    /// a daemon that OUTLIVED the whole backoff ladder makes this loss a NEW
+    /// incident — the attempt counter resets so its re-warm starts at the
+    /// initial delay. A daemon that died faster KEEPS the accumulated
+    /// escalation: a daemon dying immediately after every successful start
+    /// must climb the ladder (50→100→200→400 ms…), never respawn at the
+    /// floor every cycle. The counter therefore persists across re-warm
+    /// successes and resets only here, at the next loss, when the lost
+    /// daemon's healthy lifetime reached the ladder's cap.
+    fn schedule_re_warm(&self) {
+        if self.inner.shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        let fresh_incident = {
+            let last_cold_start = *self
+                .inner
+                .last_cold_start_at
+                .lock()
+                .expect("cold-start clock mutex");
+            last_cold_start
+                .map(|started_at| {
+                    started_at.elapsed()
+                        >= Duration::from_millis(self.config().re_warm_backoff_max_ms)
+                })
+                .unwrap_or(true)
+        };
+        if fresh_incident {
+            self.inner.re_warm_attempts.store(0, Ordering::SeqCst);
+        }
+        let manager = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let attempts = manager
+                    .inner
+                    .re_warm_attempts
+                    .fetch_add(1, Ordering::SeqCst)
+                    + 1;
+                let delay_ms = (manager
+                    .config()
+                    .re_warm_backoff_initial_ms
+                    .saturating_mul(1u64 << (attempts - 1).min(16)))
+                .min(manager.config().re_warm_backoff_max_ms);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                if manager.inner.shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
+                match manager.ensure_started().await {
+                    Ok(_) => {
+                        tracing::info!(attempt = attempts, "freshagent.opencode.daemon_re_warm");
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            attempt = attempts,
+                            error = %err,
+                            "freshagent.opencode.daemon_re_warm"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     async fn require_base(&self) -> Result<String, ServeError> {
@@ -1347,6 +1608,18 @@ impl OpencodeServeManager {
         self.emitter_for(session_id).subscribe()
     }
 
+    /// Subscribe to the daemon-level lifecycle stream ([`DaemonSignal`]).
+    ///
+    /// NOTE (LB-02a, source-verified at the locked tokio version): tokio
+    /// broadcast does NOT replay history to late subscribers — a receiver
+    /// created here starts at the channel's current TAIL and observes only
+    /// signals sent AFTER this call. Consumers (Task 4's bridge revival) must
+    /// therefore be LEVEL-TRIGGERED (query daemon state on receipt), never
+    /// event-history-dependent.
+    pub fn subscribe_daemon_signals(&self) -> broadcast::Receiver<DaemonSignal> {
+        self.inner.daemon_signals.subscribe()
+    }
+
     /// Feed one parsed SSE event into the per-session fan-out. This is the ingestion
     /// point the [`EventSource`] sink calls (`dispatchEvent`, `serve-manager.ts:429-432`).
     pub fn dispatch_event(&self, event: ParsedServeEvent) {
@@ -1371,13 +1644,13 @@ impl OpencodeServeManager {
         }
     }
 
-    async fn discard_running(&self, reason: &str) {
-        let taken = self.inner.running.lock().await.take();
-        if let Some(running) = taken {
-            tracing::warn!(reason = reason, "freshagent.opencode.daemon_discarded");
-            running.process.kill();
-        }
-        self.emit_lost_for_all();
+    /// The requested-loss arm: discard the running daemon (a Yes-lane request
+    /// timeout, a shutdown-adjacent lane, …), WARN the Task-2 structured
+    /// event, then run the shared exactly-once loss path (Lost signal +
+    /// backoff re-warm). `reason` is `&'static` because it rides the
+    /// [`DaemonSignal::Lost`] broadcast to daemon-signal subscribers.
+    async fn discard_running(&self, reason: &'static str) {
+        self.lose_daemon(LossArm::Discard { reason }).await;
     }
 
     // ── the IDLE edge (once_idle / await_idle, serve-manager.ts:440-520) ─────────
@@ -1538,6 +1811,13 @@ impl OpencodeServeManager {
         self.inner.shutdown.store(true, Ordering::SeqCst);
         let taken = self.inner.running.lock().await.take();
         if let Some(running) = taken {
+            // The requested-loss discipline: abort the watcher so the shutdown
+            // kill never raises the crash event. No `Lost` signal, no re-warm —
+            // the shutdown flag set above blocks `schedule_re_warm`, and the
+            // server is going down.
+            if let Some(watch) = &running._exit_watch {
+                watch.abort();
+            }
             running.process.kill();
         }
         self.emit_lost_for_all();
@@ -2996,6 +3276,112 @@ mod tests {
             discard.get("reason").map(String::as_str),
             Some("request_timeout"),
             "the discard warn carries its reason: {discard:?}"
+        );
+    }
+
+    // ── Task 3: the daemon exit watcher's loss path (unit side) ──────────────
+
+    /// A serve whose "exit" is test-controlled: `exited()` reports `Some(0)`
+    /// once the shared flag is set (the `tests/serve_daemon_selfheal.rs`
+    /// `FlagExitProcess` shape, unit-side).
+    struct FlagExitProcess {
+        exited: Arc<AtomicBool>,
+        killed: Arc<AtomicUsize>,
+    }
+    impl ServeProcess for FlagExitProcess {
+        fn exited(&self) -> Option<i32> {
+            self.exited.load(Ordering::SeqCst).then_some(0)
+        }
+        fn take_fatal_startup_error(&self) -> Option<String> {
+            None
+        }
+        fn kill(&self) {
+            self.killed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct FlagExitSpawner {
+        exited: Arc<AtomicBool>,
+        killed: Arc<AtomicUsize>,
+    }
+    impl ProcessSpawner for FlagExitSpawner {
+        fn spawn(&self, _req: SpawnRequest) -> Result<Box<dyn ServeProcess>, String> {
+            Ok(Box::new(FlagExitProcess {
+                exited: self.exited.clone(),
+                killed: self.killed.clone(),
+            }))
+        }
+    }
+
+    /// The watcher's unrequested-exit arm must WARN
+    /// `freshagent.opencode.daemon_crash_detected` with the loss reason and
+    /// the dead daemon's base URL — the diagnosability complement of the
+    /// Task-2 discard log (a silent shared-daemon death was the incident's
+    /// undiagnosable half). The watcher task runs on this current-thread
+    /// runtime, so the thread-local capture sees its WARN; awaiting the
+    /// `DaemonSignal::Lost` edge first guarantees the loss path already ran.
+    #[tokio::test]
+    async fn unrequested_daemon_exit_warns_daemon_crash_detected_with_reason_and_base_url() {
+        let exited = Arc::new(AtomicBool::new(false));
+        let killed = Arc::new(AtomicUsize::new(0));
+        let deps = ServeDeps {
+            spawner: Arc::new(FlagExitSpawner {
+                exited: exited.clone(),
+                killed: killed.clone(),
+            }),
+            http: Arc::new(RecordingHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            daemon_watch_interval: Duration::from_millis(5),
+            re_warm_backoff_initial_ms: 5,
+            re_warm_backoff_max_ms: 50,
+            ..ServeConfig::default()
+        };
+        let mgr = OpencodeServeManager::new(deps, config);
+        mgr.ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        let mut signals = mgr.subscribe_daemon_signals();
+        let (events, _guard) = config_capture::capture();
+
+        exited.store(true, Ordering::SeqCst); // the daemon "exits"
+        let signal = tokio::time::timeout(Duration::from_secs(2), signals.recv())
+            .await
+            .expect("loss signal within budget")
+            .expect("channel alive");
+        assert!(
+            matches!(
+                signal,
+                DaemonSignal::Lost {
+                    reason: "process_exit"
+                }
+            ),
+            "got {signal:?}"
+        );
+        assert!(
+            killed.load(Ordering::SeqCst) >= 1,
+            "the already-exited daemon is still kill()ed for /proc-reaper parity"
+        );
+
+        let events = events.lock().expect("capture lock");
+        let warn = events
+            .iter()
+            .find(|fields| {
+                fields.get("message").map(String::as_str)
+                    == Some("freshagent.opencode.daemon_crash_detected")
+            })
+            .expect("an unrequested daemon exit must WARN daemon_crash_detected");
+        assert_eq!(
+            warn.get("reason").map(String::as_str),
+            Some("process_exit"),
+            "the crash warn names the loss reason: {warn:?}"
+        );
+        assert_eq!(
+            warn.get("base_url").map(String::as_str),
+            Some("http://127.0.0.1:1"),
+            "the crash warn names the dead daemon's base URL: {warn:?}"
         );
     }
 
