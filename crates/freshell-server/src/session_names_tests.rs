@@ -1947,6 +1947,88 @@ async fn observe_native_folds_provider_titles_and_own_write_echoes() {
     );
 }
 
+/// Delta-review round 4, finding 2: the mutate-then-`Decision::Read` hazard.
+/// `observe_native_decision` stamped a `None` next_due to now even when
+/// nothing else changed (a non-settled armed series observing divergence),
+/// then returned the early Read — and when that same transaction was the
+/// first to adopt a newer external generation, `adopt_if_newer` installed
+/// the locally-mutated copy into the view while the digest described the
+/// UNMUTATED disk bytes. The invariant this pins: the early Read path
+/// adopts the freshly-read document byte-identically — the in-transaction
+/// document is never locally mutated on a Read. (The stamp was semantically
+/// inert — a `None` due is immediately ready — so guarding it behind the
+/// rearm commit changes no observable scheduling.)
+#[tokio::test]
+async fn an_observation_read_path_never_mutates_the_adopted_document() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = pending("h-read-mut");
+    ensure(
+        &store,
+        "h-read-mut",
+        NamedProvider::Claude,
+        Some("/w/read-mut"),
+    )
+    .await
+    .expect("ensure pending");
+    // A manual rename arms the bounded native series: desired revision/name
+    // set, status Pending, NOT settled, next_due None (immediately ready).
+    rename_user(&store, target.clone(), "Chosen Name")
+        .await
+        .expect("manual rename arms the series");
+
+    // A cooperating same-home process commits a newer generation (an
+    // unrelated pending record), so the observation's Read-path transaction
+    // below is the first to ADOPT it.
+    let other = open_store(dir.path());
+    ensure(&other, "h-other", NamedProvider::Claude, Some("/w/other"))
+        .await
+        .expect("foreign write bumps the generation");
+
+    // A diverging current-location observation on the non-settled series:
+    // the offer loses to the manual name, the rearm cannot fire (not
+    // settled), so the decision is the early Read — the exact path that
+    // used to stamp `next_due` in-transaction.
+    let observed = store
+        .observe_native(observe(
+            target.clone(),
+            "External Divergent Title",
+            NativeNameOrigin::Snapshot,
+            0,
+        ))
+        .await
+        .expect("the observation answers the early Read");
+    assert!(!observed.changed);
+    assert_eq!(observed.record.name, "Chosen Name");
+
+    // THE INVARIANT: the adopted view is exactly the freshly-parsed disk
+    // document — the Read path never installs a locally-mutated copy (the
+    // stored digest describes these exact bytes).
+    let view = store.core.current_view();
+    assert_eq!(
+        view.document,
+        read_raw_document(dir.path()),
+        "the adopted document is byte-identical to the bytes on disk"
+    );
+    assert!(
+        view.document.document_generation > 1,
+        "the transaction really adopted the foreign newer generation"
+    );
+    // The observable behind the invariant: the armed series' due stamp is
+    // still unarmed on the adopted view — exactly what the disk bytes say
+    // (a `None` due is immediately ready, so no scheduling behavior moved).
+    let series = view
+        .document
+        .native_write
+        .values()
+        .next()
+        .expect("the manual rename armed the series");
+    assert_eq!(
+        series.next_due, None,
+        "no phantom due stamp leaked into the adopted view"
+    );
+}
+
 /// Delta-review round 3, finding 5: every native title observation used to
 /// commit a bookkeeping-only document rewrite (full-document replace +
 /// fsync) merely to persist `last_observation.at` when nothing user-visible

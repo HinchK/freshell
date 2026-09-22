@@ -2875,9 +2875,22 @@ fn observe_native_decision(
                         state.settled = false;
                         state.unsynced_reason = Some("native divergence observed".to_string());
                         status_changed = true;
-                    }
-                    if state.next_due.is_none() {
-                        state.next_due = Some(meta.now_ms);
+                        // Delta-review round 4, finding 2: the due-stamp
+                        // rides ONLY a change this transaction commits. The
+                        // stamp used to fire outside the rearm guard too,
+                        // mutating the in-transaction document on the early
+                        // `Decision::Read` path — and when that transaction
+                        // was the first to adopt a newer external
+                        // generation, `adopt_if_newer` installed the
+                        // locally-mutated copy while the stored digest
+                        // described the unmutated disk bytes. The stamp is
+                        // semantically inert on the non-rearm paths anyway:
+                        // a `None` due is immediately ready (the work
+                        // snapshot's convention), and an unsupported series
+                        // never enters the snapshot.
+                        if state.next_due.is_none() {
+                            state.next_due = Some(meta.now_ms);
+                        }
                     }
                 }
             }
