@@ -972,6 +972,9 @@ mod tests {
             notice: None,
             restore_error: None,
             session_ref: None,
+            owner_kind: None,
+            owner_epoch: None,
+            owner_generation: None,
         })
     }
 }

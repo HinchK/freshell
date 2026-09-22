@@ -796,7 +796,12 @@ pub(crate) fn broadcast_owner_frame_if_authoritative(
     }
 }
 
-fn broadcast_owner_frame(
+/// b8ke fence-heal: `pub(crate)` so the terminal lane's create-settle call
+/// site (and the auto-resume respawn settle) can route their commit-to-Live
+/// broadcasts through the SAME committed-pair helper — never through
+/// `broadcast_owner_frame_if_authoritative` (it re-observes the generation;
+/// the r32 F2 constraint forbids it for commit broadcasts).
+pub(crate) fn broadcast_owner_frame(
     state: &WsState,
     provider: &str,
     session_id: &str,
@@ -1120,5 +1125,59 @@ mod tests {
             Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {}
             Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
         }
+    }
+
+    /// b8ke fence-heal (plan-review round 3, finding 1): the emission-time
+    /// r32 F2 discriminator for `broadcast_owner_frame` — the frame carries
+    /// the CALLER's committed pair, never a re-observed current generation.
+    /// The deterministic probe mirrors the vacant-frame F2 test
+    /// (`codex_association.rs`'s
+    /// `broadcast_vacant_frame_carries_the_committed_pair_not_the_current_generation`):
+    /// a key with NO record observes generation 0, while the caller-supplied
+    /// pair says 7 — a re-observing emission would fold the current 0 over
+    /// the transition's own 7 (the same defect that, on an ADVANCED key,
+    /// would let an older transition's frame overwrite a newer lifecycle's
+    /// state because the client accepts all same-generation frames). The
+    /// end-to-end settle path cannot build this divergence deterministically
+    /// (no transition can land between the commit and the same-handler-turn
+    /// broadcast), so the discrimination lives HERE.
+    #[tokio::test]
+    async fn a_broadcast_owner_frame_carries_the_committed_pair_not_the_current_generation() {
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let (state, mut rx) = race_state(ownership.clone());
+        while rx.try_recv().is_ok() {}
+
+        let sid = "ses-fenceheal-f2-missing";
+        assert_eq!(
+            ownership.observe("codex", sid).generation,
+            0,
+            "fixture: the missing key's observed generation is 0"
+        );
+        broadcast_owner_frame(
+            &state,
+            "codex",
+            sid,
+            TID,
+            "op-fenceheal-f2",
+            7,
+            "handoff-committed",
+        );
+        let frame = rx.try_recv().expect("the owner frame was broadcast");
+        let value: serde_json::Value = serde_json::from_str(&frame).expect("json frame");
+        assert_eq!(value["type"], "session.runtimeOwner");
+        assert_eq!(
+            value["generation"],
+            serde_json::json!(7),
+            "the owner frame carries the SUPPLIED committed pair's generation, \
+             never the re-observed current generation: {value}"
+        );
+        assert_eq!(
+            value["epoch"],
+            serde_json::json!(ownership.boot_epoch()),
+            "the owner frame carries the emitting coordinator's boot epoch: {value}"
+        );
+        assert_eq!(value["ownerKind"], "terminal");
+        assert_eq!(value["terminalId"], TID);
+        assert_eq!(value["transition"], "handoff-committed");
     }
 }

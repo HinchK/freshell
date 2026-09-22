@@ -3422,6 +3422,9 @@ pub(crate) async fn handle_create(
                     notice: None,
                     restore_error: None,
                     session_ref: state.identity.session_ref_for(&existing),
+                    owner_kind: None,
+                    owner_epoch: None,
+                    owner_generation: None,
                 });
                 // An adoption IS a successful create for this requestId:
                 // settle the server-wide dedupe entry exactly like the main
@@ -3875,6 +3878,9 @@ pub(crate) async fn handle_create(
                                 .identity
                                 .session_ref_for(&terminal_id)
                                 .or(Some(locator)),
+                            owner_kind: None,
+                            owner_epoch: None,
+                            owner_generation: None,
                         });
                         // Attaching to the winner IS a successful create for
                         // this requestId: settle the dedupe entry exactly
@@ -5627,8 +5633,23 @@ pub(crate) async fn handle_create(
             }
         }
     }
+    // b8ke fence-heal (fixes a + c): the terminal lane's commit-to-Live now
+    // BROADCASTS the authoritative owner record (the r29 F1 "every ownership
+    // transition broadcasts" invariant, extended to the terminal lane) and
+    // rides the commit's OWN pair on `terminal.created` — both carry the
+    // (epoch, generation) captured from the claim ticket BEFORE the
+    // consuming commit (r32 F2 — never a re-observed current generation), so
+    // every connected client folds the fresh fence and the creating pane's
+    // first attach is born fresh. Pre-fix this settle committed Live with NO
+    // broadcast, so every connected client kept its pre-create observed
+    // fence until a page reload and the pane's queued attach / later kills
+    // and recreates were refused typed ("moved to a newer runtime; refresh
+    // and retry").
+    let mut committed_owner_generation: Option<u64> = None;
     if let Some(ownership_claim) = terminal_ownership.take() {
         let locator = ownership_claim.locator.clone();
+        let owner_operation_id = ownership_claim.ticket.operation_id().to_string();
+        let owner_generation = ownership_claim.ticket.generation();
         match ownership_claim.commit(&terminal_id) {
             Ok(()) => {
                 tracing::info!(
@@ -5637,6 +5658,16 @@ pub(crate) async fn handle_create(
                     session_id = %locator.session_id,
                     "session_ref.ownership_committed (terminal lane)"
                 );
+                crate::identity_ownership::broadcast_owner_frame(
+                    state,
+                    &locator.provider,
+                    &locator.session_id,
+                    &terminal_id,
+                    &owner_operation_id,
+                    owner_generation,
+                    "handoff-committed",
+                );
+                committed_owner_generation = Some(owner_generation);
             }
             Err(outcome) => {
                 tracing::error!(target: "invariant",
@@ -5666,6 +5697,15 @@ pub(crate) async fn handle_create(
     let dedupe_terminal_id = terminal_id.clone();
     let dedupe_restore = create.restore;
 
+    // b8ke fence-heal (fix c): the created frame carries the commit's own
+    // pair so the creating pane's first attach is born fresh; None when no
+    // claim committed or the coordinator is unwired (frozen-client parity).
+    let owner_trio: Option<(&str, u64, u64)> =
+        match (committed_owner_generation, state.ownership.as_ref()) {
+            (Some(gen), Some(ownership)) => Some(("terminal", ownership.boot_epoch(), gen)),
+            _ => None,
+        };
+
     let created = ServerMessage::TerminalCreated(TerminalCreated {
         created_at: now_ms(),
         request_id: create.request_id,
@@ -5678,6 +5718,9 @@ pub(crate) async fn handle_create(
         // The canonical create-time identity, from the SAME registry every other
         // identity-stamped frame reads (shell creates have no entry -> `None`).
         session_ref: state.identity.session_ref_for(&terminal_id_for_meta),
+        owner_kind: owner_trio.map(|(kind, _, _)| kind.to_string()),
+        owner_epoch: owner_trio.map(|(_, epoch, _)| epoch),
+        owner_generation: owner_trio.map(|(_, _, gen)| gen),
     });
     // Record the settled create (server-wide requestId dedupe) and forward
     // the frame to any cross-connection waiters — AFTER the origin reply's

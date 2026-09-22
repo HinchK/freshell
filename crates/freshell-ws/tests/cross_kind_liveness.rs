@@ -6693,6 +6693,112 @@ async fn a_stale_generation_attach_is_refused_typed() {
     ws_state.registry.kill(&terminal_id);
 }
 
+/// b8ke fence-heal (fixes a + c): the terminal-lane create settle commits
+/// Live{Terminal} and BROADCASTS the authoritative owner frame carrying the
+/// commit's OWN (epoch, generation) pair — captured from the claim ticket
+/// BEFORE the consuming commit (r32 F2 — never a re-observed current
+/// generation) — and the `terminal.created` reply rides the SAME committed
+/// pair so the creating pane's first attach is born fresh. Pre-fix the
+/// settle committed Live with NO broadcast and a pair-less created frame,
+/// so every connected client kept its pre-create observed fence until a
+/// page reload, and the pane's queued attach / later kills and recreates
+/// were refused typed ("moved to a newer runtime; refresh and retry").
+///
+/// Frame capture: the created reply and the broadcast use separate delivery
+/// paths with no ordering guarantee, so every incoming frame is matched
+/// against BOTH targets until both are captured — never `await_frame` one
+/// then the other (it DROPS non-matching frames and would eat the other
+/// one). Broadcasts fan out to every connection (each subscribes to the
+/// bus pre-handshake), so the SAME test socket gets both.
+///
+/// Consistency note (plan-review round 3, finding 1): the end-to-end path
+/// cannot DETERMINISTICALLY discriminate committed-pair vs re-observed
+/// emission — no transition can land between the commit and the
+/// same-handler-turn broadcast, and a captured frame never changes after
+/// capture. That discrimination lives in the helper-level unit test
+/// (`identity_ownership.rs`'s
+/// `a_broadcast_owner_frame_carries_the_committed_pair_not_the_current_generation`),
+/// which builds the divergence INTO the emission.
+#[tokio::test]
+async fn a_terminal_lane_create_settle_broadcasts_the_committed_owner_pair_and_rides_the_created_frame(
+) {
+    let (url, _registry, ws_state) = spawn_server().await;
+    let mut ws = connect(&url).await;
+
+    let sid = uuid::Uuid::new_v4().to_string();
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-fenceheal-settle",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+
+    let mut created: Option<Value> = None;
+    let mut broadcast: Option<Value> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while (created.is_none() || broadcast.is_none()) && tokio::time::Instant::now() < deadline {
+        let msg = match tokio::time::timeout(Duration::from_millis(50), ws.next()).await {
+            Err(_) => continue, // no frame within the tick — re-check the deadline
+            Ok(None) => panic!("stream ended while collecting"),
+            Ok(Some(Err(e))) => panic!("ws error while collecting: {e}"),
+            Ok(Some(Ok(msg))) => msg,
+        };
+        let WsMessage::Text(text) = msg else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(&text).expect("json frame");
+        if value["type"] == "terminal.created" && value["requestId"] == "req-fenceheal-settle" {
+            created = Some(value);
+        } else if value["type"] == "session.runtimeOwner" && value["sessionId"] == json!(sid) {
+            broadcast = Some(value);
+        }
+    }
+    let created = created.expect("the terminal.created reply arrived");
+    let broadcast = broadcast.expect(
+        "the create settle broadcast the committed owner frame \
+         (session.runtimeOwner for the created session id)",
+    );
+    let committed_epoch = ws_state
+        .ownership
+        .as_ref()
+        .expect("ownership wired")
+        .boot_epoch();
+    // (fix c) the created frame carries the commit's own pair
+    assert_eq!(created["ownerKind"], json!("terminal"), "{created}");
+    assert_eq!(created["ownerEpoch"], json!(committed_epoch), "{created}");
+    // (fix a) the broadcast carried the SAME committed pair
+    assert_eq!(broadcast["ownerKind"], json!("terminal"), "{broadcast}");
+    assert_eq!(
+        broadcast["transition"],
+        json!("handoff-committed"),
+        "{broadcast}"
+    );
+    assert_eq!(
+        broadcast["terminalId"], created["terminalId"],
+        "{broadcast}"
+    );
+    assert_eq!(broadcast["epoch"], created["ownerEpoch"], "{broadcast}");
+    assert_eq!(
+        broadcast["generation"], created["ownerGeneration"],
+        "{broadcast}"
+    );
+    assert!(
+        !broadcast["operationId"].as_str().unwrap_or("").is_empty(),
+        "the broadcast names the committing operation: {broadcast}"
+    );
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    ws_state.registry.kill(&terminal_id);
+}
+
 /// b8ke ext r8 F2: a CURRENT attach (fresh observation) succeeds and
 /// restamps — the gate never over-blocks the legitimate path.
 #[tokio::test]
