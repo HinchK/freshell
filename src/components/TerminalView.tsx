@@ -218,8 +218,11 @@ export const INVALID_TERMINAL_LAUNCH_RETRY_DELAY_MS = 500
 // recoveries — bounds exit→recreate→exit crash loops (each recovery is
 // a fresh spawn; without the interval a CLI that dies instantly would
 // auto-respawn unboundedly). A single cross-device kill heals
-// immediately (the first recovery is never spaced); a repeated external
-// kill inside the window merely delays the next heal.
+// immediately (the first recovery is never spaced); a kill inside the
+// window blocks that one attempt WITHOUT scheduling anything — the next
+// heal re-fires on the session's next owner transition, a user action,
+// or a reconnect (Task 7 review M1: the block is not a timer; the end
+// state is the honest exited pane with the user-driven affordance).
 export const VACANT_RECOVERY_MIN_INTERVAL_MS = 10_000
 const MOBILE_KEYBAR_HEIGHT_PX = 40
 const MOBILE_KEY_REPEAT_INITIAL_DELAY_MS = 320

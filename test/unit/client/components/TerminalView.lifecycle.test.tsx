@@ -4100,7 +4100,10 @@ describe('TerminalView lifecycle updates', () => {
 
       // The recovered terminal anchors and FULLY launches (attach.ready
       // clears the launch attempt), then dies immediately, and the
-      // session goes vacant again (the exit-watcher release).
+      // session goes vacant again — the vacant frame here models the
+      // KILL-driven shape (a natural exit releases ownership silently
+      // server-side; the vacant broadcast fires on the kill path's
+      // commit_terminal_stop — Task 7 review N1).
       act(() => {
         messageHandler!({
           type: 'terminal.created',
