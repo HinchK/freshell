@@ -187,6 +187,17 @@ pub struct PacedAttachOptions {
 /// The staged-exit notification hook for a paced subscriber (finding F1).
 pub type PacedExitNotify = Arc<dyn Fn(&str, i64) + Send + Sync>;
 
+/// E2R3 (the atomic exit-transition decision) test-support: the armed
+/// payload of the ONE-SHOT natural-exit staging hook — WHICH
+/// connection's subscriber stages WHICH exit code when the next hook
+/// site fires (see
+/// [`TerminalRegistry::set_paced_exit_stage_hook_for_tests`]).
+#[derive(Debug, Clone, Copy)]
+struct PacedExitStageHook {
+    conn_id: u64,
+    exit_code: i64,
+}
+
 /// The ws pacing coordinator's session description for one paced replay
 /// (responsive-terminal-restore Workstream 1): everything the coordinator
 /// needs to gate continuation credits and drive page reads. Produced by the
@@ -1039,9 +1050,22 @@ pub struct TerminalRegistry {
     /// [`IdentityReadoptPauseHook`]). Never set in production.
     identity_readopt_pause: Arc<std::sync::RwLock<Option<IdentityReadoptPauseHook>>>,
     /// b8ke ext r13 F1: the create POST-CLAIM park seam (see
-    /// [`Self::set_terminal_create_postclaim_pause_for_tests`]). Never set
-    /// in production.
+    /// [`Self::set_terminal_create_postclaim_pause_for_tests`]). Never
+    /// set in production.
     terminal_create_postclaim_pause: Arc<std::sync::RwLock<Option<TerminalCreatePauseHook>>>,
+    /// E2R3 (the atomic exit-transition decision) test-support: the
+    /// ONE-SHOT deterministic natural-exit staging hook. A hook site —
+    /// a staged-exit read on the transition-decision path — fires it
+    /// INSIDE its own terminal-lock hold, immediately AFTER its read
+    /// completes, and the registry then performs the natural-exit
+    /// STAGING for the armed (connection, code): the deterministic
+    /// model of the PTY reader staging its terminal's exit
+    /// CONCURRENTLY with the decision's use of its read (never a
+    /// sleep-based race). `None` (the default, never armed in
+    /// production) keeps every hook site a cheap no-op. Hosted here
+    /// (the `terminal_create_pause` idiom) so every cloned handle
+    /// observes a test-armed hook.
+    paced_exit_stage_hook: Arc<Mutex<Option<PacedExitStageHook>>>,
 }
 
 /// The retained coordinator claim for one sessionRef-owning terminal (kata
@@ -1279,6 +1303,7 @@ impl TerminalRegistry {
             terminal_attach_pause: Arc::new(std::sync::RwLock::new(None)),
             identity_readopt_pause: Arc::new(std::sync::RwLock::new(None)),
             terminal_create_postclaim_pause: Arc::new(std::sync::RwLock::new(None)),
+            paced_exit_stage_hook: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1522,10 +1547,82 @@ impl TerminalRegistry {
                 .get(terminal_id)
                 .map(|handle| Arc::clone(&handle.shared))?
         };
-        let s = shared.lock().expect("terminal lock");
-        s.subscribers
+        let mut s = shared.lock().expect("terminal lock");
+        let staged = s
+            .subscribers
             .get(&conn_id)
-            .and_then(|sub| sub.paced_exit_pending)
+            .and_then(|sub| sub.paced_exit_pending);
+        // E2R3 test-support hook site: the one-shot staging fires AFTER
+        // this read, INSIDE the same lock hold — the deterministic model
+        // of the PTY reader staging its natural exit concurrently with
+        // the caller's use of the state this read just returned (the
+        // pre-fix arm's check-then-act window). Inert in production.
+        self.fire_paced_exit_stage_hook(&mut s, terminal_id);
+        staged
+    }
+
+    /// E2R3 test-support: arm the ONE-SHOT natural-exit staging hook.
+    /// The next staged-exit read at a hook site performs the staging for
+    /// `conn_id` with `exit_code` INSIDE that read's terminal-lock hold,
+    /// immediately AFTER the read observes the pre-staging state —
+    /// deterministically modeling a PTY reader staging a natural exit
+    /// concurrently with the decision path's use of its read (the
+    /// transition-race tests' interleave; never a sleep-based race). The
+    /// hook fires once and clears itself; re-arming replaces a
+    /// not-yet-fired payload.
+    pub fn set_paced_exit_stage_hook_for_tests(&self, conn_id: u64, exit_code: i64) {
+        *self
+            .paced_exit_stage_hook
+            .lock()
+            .expect("paced exit stage hook") = Some(PacedExitStageHook { conn_id, exit_code });
+    }
+
+    /// E2R3 test-support: stage a natural exit for ONE paced subscriber
+    /// from OUTSIDE any terminal lock — the deterministic staging the
+    /// boundary test performs strictly AFTER an atomic transfer decision
+    /// (an exit staged past the decision is the drain's documented
+    /// uncredited tail content). Mirrors `finish_pty_exit`'s
+    /// subscriber-relevant subset: the terminal flips to naturally
+    /// `Exited` (monotone — a later real exit is inert) and the exit code
+    /// stages on the DEFERRED subscriber only. `false` when the terminal
+    /// or subscriber is gone, the subscriber is not deferred, or the
+    /// terminal already exited.
+    pub fn stage_natural_exit_for_test(
+        &self,
+        terminal_id: &str,
+        conn_id: u64,
+        exit_code: i64,
+    ) -> bool {
+        let Some(shared) = self.shared_for(terminal_id) else {
+            return false;
+        };
+        let mut s = shared.lock().expect("terminal lock");
+        stage_natural_exit_locked(&mut s, conn_id, exit_code)
+    }
+
+    /// E2R3 test-support: fire the armed one-shot staging hook at a hook
+    /// site — INSIDE the caller's terminal-lock hold, immediately after
+    /// the site's staged-exit read. Inert unless a test armed the hook;
+    /// the staging is [`stage_natural_exit_locked`] (the real staging
+    /// path's subscriber-relevant subset — callable here because the
+    /// hook site already holds the lock).
+    fn fire_paced_exit_stage_hook(&self, s: &mut TerminalShared, terminal_id: &str) {
+        let Some(hook) = self
+            .paced_exit_stage_hook
+            .lock()
+            .expect("paced exit stage hook")
+            .take()
+        else {
+            return;
+        };
+        if stage_natural_exit_locked(s, hook.conn_id, hook.exit_code) {
+            tracing::info!(
+                terminal_id = %terminal_id,
+                conn_id = hook.conn_id,
+                exit_code = hook.exit_code,
+                "terminal.paced_exit_staged_by_test_hook"
+            );
+        }
     }
 
     /// The EFFECTIVE page budget for one paced attach (round-2 finding
@@ -4929,6 +5026,33 @@ fn complete_at_fixed_boundary(
     }
 }
 
+/// E2R3 test-support: the subscriber-relevant subset of
+/// `finish_pty_exit`'s STAGING, under a terminal lock the caller already
+/// holds (the decision-path hook site) or has just acquired (the public
+/// [`TerminalRegistry::stage_natural_exit_for_test`]). The deterministic
+/// transition-race tests stage at a precise point through this twin
+/// instead of a real PTY death (whose staging moment would be
+/// uncontrolled); the real invariants are exercised by the
+/// `finish_pty_exit` tests. Mirrors the production staging's shape: the
+/// terminal flips to naturally `Exited` (monotone — a later real exit is
+/// inert) and the exit code stages on the DEFERRED subscriber only.
+fn stage_natural_exit_locked(s: &mut TerminalShared, conn_id: u64, exit_code: i64) -> bool {
+    if s.status == TerminalRunStatus::Exited {
+        return false; // monotone, once-only — the terminal is already dead
+    }
+    match s.subscribers.get_mut(&conn_id) {
+        Some(sub) if sub.paced_deferred => {}
+        _ => return false, // gone, or a non-deferred subscriber never stages
+    }
+    s.status = TerminalRunStatus::Exited;
+    s.exit_code = Some(exit_code);
+    s.subscribers
+        .get_mut(&conn_id)
+        .expect("subscriber present")
+        .paced_exit_pending = Some(exit_code);
+    true
+}
+
 /// Round-2 finding F1: deliver a subscriber's STAGED natural exit, if
 /// any, in the same lock hold that just cleared its deferral — the sink
 /// is the connection queue (per-terminal FIFO), so the exit leases
@@ -6639,6 +6763,135 @@ mod tests {
             reg.staged_paced_exit("T", 1),
             Some(7),
             "the staged exit code is the ws layer's sequencing authority"
+        );
+    }
+
+    /// E2R3 (the atomic exit-transition decision) test-support seam: the
+    /// one-shot staging hook fires INSIDE a staged-exit read's
+    /// terminal-lock hold, immediately AFTER the read — the read itself
+    /// returns the PRE-staging state (the deterministic model of the PTY
+    /// reader staging its exit concurrently with the decision's use of
+    /// that read), the staging is durable, and the hook never fires
+    /// twice.
+    #[test]
+    fn paced_exit_stage_hook_stages_inside_the_reads_lock_scope_once() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        for seq in 1..=2 {
+            reg.feed("T", frame(seq, "history\r\n", "S"));
+        }
+        let (sink, _seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("hook-site".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+            PacedAttachOptions::default(),
+        );
+        let _ = out.paced.expect("paced session");
+
+        reg.set_paced_exit_stage_hook_for_tests(1, 9);
+        assert_eq!(
+            reg.staged_paced_exit("T", 1),
+            None,
+            "the firing read observes the PRE-staging state — the hook stages after it"
+        );
+        assert_eq!(
+            reg.staged_paced_exit("T", 1),
+            Some(9),
+            "the hook's staging landed inside the firing read's lock scope (durable)"
+        );
+        assert_eq!(
+            reg.staged_paced_exit("T", 1),
+            Some(9),
+            "the hook is one-shot: later reads never restage"
+        );
+        // The staging mirrors finish_pty_exit's subscriber-relevant
+        // subset: the terminal is naturally Exited (monotone — a later
+        // real exit is inert) and the DEFERRED subscriber holds the code.
+        assert!(
+            reg.terminal_is_dead("T"),
+            "the staged exit marks the terminal dead"
+        );
+        assert!(
+            !reg.finish_pty_exit("T", 77),
+            "the later real exit is inert (monotone, once-only)"
+        );
+        assert_eq!(reg.paced_exit_pending_of("T", 1), Some(9));
+    }
+
+    /// E2R3 test-support: the public test staging mirrors
+    /// `finish_pty_exit`'s subscriber-relevant subset — it stages ONLY
+    /// on a DEFERRED (paced) subscriber, refuses unknown terminals and
+    /// connections without mutating anything, and is monotone.
+    #[test]
+    fn stage_natural_exit_for_test_stages_only_deferred_subscribers_monotonically() {
+        let reg = TerminalRegistry::new();
+        reg.insert_headless("T", "S");
+        let (sink, _seen) = collector();
+        // A LEGACY subscriber never stages (finish_pty_exit retires it
+        // instead); an unknown connection or terminal never stages.
+        let _ = reg.attach(
+            "T",
+            7,
+            sink,
+            Some("legacy".into()),
+            0,
+            false,
+            false,
+            None,
+            None,
+            None,
+            PacedAttachOptions::default(),
+        );
+        assert!(
+            !reg.stage_natural_exit_for_test("T", 7, 4),
+            "a non-deferred subscriber never stages"
+        );
+        assert!(
+            !reg.stage_natural_exit_for_test("T", 8, 4),
+            "an unknown connection never stages"
+        );
+        assert!(
+            !reg.stage_natural_exit_for_test("T-gone", 7, 4),
+            "an unknown terminal is false, not a panic"
+        );
+
+        let (paced_sink, _paced_seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            paced_sink,
+            Some("paced-stage".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+            PacedAttachOptions::default(),
+        );
+        let _ = out.paced.expect("paced session");
+        assert!(reg.stage_natural_exit_for_test("T", 1, 4));
+        assert_eq!(
+            reg.paced_exit_pending_of("T", 1),
+            Some(4),
+            "the deferred subscriber holds the staged code"
+        );
+        assert!(
+            !reg.stage_natural_exit_for_test("T", 1, 5),
+            "the staging is monotone (once-only)"
+        );
+        assert_eq!(
+            reg.paced_exit_pending_of("T", 1),
+            Some(4),
+            "the refused restage changed nothing"
         );
     }
 
