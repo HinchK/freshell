@@ -51,7 +51,7 @@ test.describe('MCP bridge -- Rust QA lever pin (Slice 2)', () => {
   test('standalone MCP stdio client drives an ephemeral Rust server end-to-end', async () => {
     const { path: mcpBinPath, buildMs } = ensureMcpServerBuilt(REPO_ROOT)
     // eslint-disable-next-line no-console
-    console.error(`[mcp-bridge-rust] npm run build:tools completed in ${buildMs}ms (dist/tools/freshell-mcp/server.js)`)
+    console.error(`[mcp-bridge-rust] pnpm run build:tools completed in ${buildMs}ms (dist/tools/freshell-mcp/server.js)`)
 
     const server = new RustServer({ verbose: false })
     const info = await server.start()

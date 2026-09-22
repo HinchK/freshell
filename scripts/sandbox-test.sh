@@ -78,7 +78,7 @@ fi
 # bind-mounted repo (e.g. -v ...:/workspace/target) needs a mount point at
 # ${REPO_ROOT}/target on the host side; in a freshly cloned/worktree'd repo
 # that path doesn't exist yet, so dockerd creates it — root-owned. That stub
-# then breaks host-side `cargo`/`npm` in this worktree with EACCES the next
+# then breaks host-side `cargo`/`pnpm` in this worktree with EACCES the next
 # time a human (not root) tries to write there.
 #
 # Fix: pre-create every such mount point ourselves, as the invoking user,
@@ -106,7 +106,7 @@ docker "${DOCKER_ARGS[@]}" "${IMAGE_TAG}" bash -c "${CMD}" || DOCKER_STATUS=$?
 # than assuming it. If dockerd (or a future volume/mount this script doesn't
 # yet know to pre-create) still left a root-owned entry directly under the
 # repo root, fail loudly with a concrete remediation instead of leaving the
-# next `cargo build`/`npm install` on the host to fail with a bare EACCES.
+# next `cargo build`/`pnpm install` on the host to fail with a bare EACCES.
 ROOT_DROPPINGS="$(find "${REPO_ROOT}" -maxdepth 1 -user root 2>/dev/null || true)"
 if [ -n "${ROOT_DROPPINGS}" ]; then
   echo "[sandbox] ERROR: root-owned entries found directly under ${REPO_ROOT}:" >&2
