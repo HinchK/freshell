@@ -727,6 +727,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     headSeq: number | null
     oldestRetainedSeq: number | null
   } | null>(null)
+  // Honest delivery-gap state (responsive-terminal-restore, round-5
+  // finding 2): a NEGOTIATED queue_overflow / handoff_boundary_reached
+  // gap's visible, accessible notice — in UI CHROME, never in the xterm
+  // surface. During a checkpoint-based delta repair NOTHING may mutate
+  // the surface before the replayed bytes apply (the pre-fix local
+  // notice shifted the cursor/parser state the checkpoint captured and
+  // corrupted the repaired screen), so the notice rides React state —
+  // which the repair attach's generation change (dropQueuedStaleWrites,
+  // a WRITE-queue concern) cannot discard. Set when the delivery-loss
+  // repair initiates; cleared by the next attach (like the retention
+  // notice) and by a retention-gap resolution (the authoritative
+  // honest-loss state then takes over).
+  const [deliveryGapNotice, setDeliveryGapNotice] = useState<{
+    fromSeq: number
+    toSeq: number
+    reason: string
+  } | null>(null)
   // Visible, accessible retry state (WS2): automatic re-attach cycling was
   // stopped by the recovery bound; the surface content below is PRESERVED and
   // an explicit retry re-arms it.
@@ -3572,6 +3589,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     setIsAttaching(true)
     setTruncatedHistoryGap(null)
     setRetentionLossNotice(null)
+    setDeliveryGapNotice(null)
 
     // Startup probes must not leak across attach generations.
     resetStartupProbeParser()
@@ -5010,6 +5028,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               headSeq: gapHeadSeq,
               oldestRetainedSeq: gapOldestRetainedSeq,
             })
+            // The retention-loss notice is the AUTHORITATIVE honest state
+            // here — a delivery-gap repair whose fetch resolved to
+            // unrecoverable retention must not leave its (now-stale)
+            // "refetching" chrome claim on screen alongside it.
+            setDeliveryGapNotice(null)
             recordTerminalPerfAuditEvent('terminal.restore.retention_gap', {
               terminalId: tid,
               attachRequestId: msg.attachRequestId,
@@ -5035,11 +5058,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               repairContentResetPendingRef.current = null
             }
           } else if (deliveryRepairPending) {
-            // Suppressed here — re-emitted UNDER THE REPAIR'S NEW
-            // generation below (round-4 F4): the repair attach's
-            // generation change drops queued stale writes, so this
-            // notice must ride the generation that actually owns the
-            // surface when it renders.
+            // Suppressed here — the negotiated delivery-loss repair owns
+            // the notice (round-5 finding 2): the honest notice rides UI
+            // CHROME below (set after the repair attach fires), never a
+            // local xterm write. The pre-fix immediate write mutated the
+            // surface BETWEEN the checkpoint state and the repair's
+            // replayed bytes — corrupting the repaired screen whenever the
+            // gap straddled an in-flight escape sequence or cursor
+            // position; the legacy non-negotiated lane (the else branch)
+            // keeps its existing immediate-notice behavior.
           } else {
             const reason = msg.reason === 'replay_window_exceeded'
               ? 'reconnect window exceeded'
@@ -5130,19 +5157,28 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
                 ...viewportHydrateReplayOptions(contentRef.current, pacedReplayNegotiated),
               })
             }
-            // THE HONEST NOTICE SURVIVES THE REPAIR (round-4 F4): the
-            // repair attach above minted the NEW generation (dropping the
-            // queued stale writes of the old one), so the delivery-loss
-            // notice is (re-)emitted HERE, under the NEW generation —
-            // the animation-frame flush renders it after the generation
-            // change instead of being discarded by it.
+            // THE HONEST NOTICE RIDES CHROME (round-5 finding 2, the
+            // round-4 F4 fix's successor): during a checkpoint-based
+            // delta repair NOTHING may write to the xterm surface before
+            // the replayed bytes apply — the pre-fix local notice was
+            // enqueued right here, between the surface state the
+            // checkpoint captured and the repair's replayed terminal
+            // instructions, shifting the cursor/parser state the
+            // replayed bytes were addressed to (an in-flight multi-frame
+            // escape sequence made the corruption direct: the notice
+            // bytes were consumed as escape continuation). The notice is
+            // React state — set AFTER the repair attach (which clears
+            // stale notices) — so it is honestly shown through the
+            // generation change, and the repaired surface stays exactly
+            // the uninterrupted reference.
             const noticeReason = msg.reason === 'handoff_boundary_reached'
               ? 'restore boundary reached'
               : 'slow link backlog'
-            writeLocalXtermNotice(
-              term,
-              `\r\n[Output gap ${msg.fromSeq}-${msg.toSeq}: ${noticeReason}]\r\n`,
-            )
+            setDeliveryGapNotice({
+              fromSeq: msg.fromSeq,
+              toSeq: msg.toSeq,
+              reason: noticeReason,
+            })
           }
         }
 
@@ -6960,6 +6996,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           Some earlier terminal output is no longer available on the server. Live output continues.
         </div>
       )}
+      {deliveryGapNotice && (
+        // Honest delivery-loss state (responsive-terminal-restore,
+        // round-5 finding 2): a negotiated queue_overflow /
+        // handoff_boundary_reached gap's accessible CHROME notice. Never a
+        // surface write — during the checkpoint delta repair NOTHING may
+        // mutate the xterm surface before the replayed bytes apply, so the
+        // notice rides React state and the screen below it is repaired to
+        // exactly the uninterrupted reference.
+        <div
+          role="status"
+          aria-live="polite"
+          data-testid="restore-delivery-gap-notice"
+          className={`pointer-events-none absolute inset-x-0 ${retentionLossNotice ? 'top-9' : 'top-0'} z-10 bg-amber-100/90 px-3 py-1 text-xs text-amber-900 dark:bg-amber-900/80 dark:text-amber-100`}
+        >
+          {`Terminal output gap ${deliveryGapNotice.fromSeq}-${deliveryGapNotice.toSeq} (${deliveryGapNotice.reason}). The missing output is being refetched — the screen below is completed as it arrives.`}
+        </div>
+      )}
       {recoveryExhausted && (
         // Bounded automatic recovery (responsive-terminal-restore WS2): the
         // visible, accessible retry state. Automatic re-attach cycling was
@@ -6968,7 +7021,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         <div
           role="alert"
           data-testid="restore-recovery-retry"
-          className={`absolute inset-x-0 ${retentionLossNotice ? 'top-9' : 'top-0'} z-10 flex items-center justify-between gap-2 bg-amber-100/95 px-3 py-1 text-xs text-amber-900 dark:bg-amber-900/85 dark:text-amber-100`}
+          className={`absolute inset-x-0 ${retentionLossNotice && deliveryGapNotice ? 'top-[4.5rem]' : retentionLossNotice || deliveryGapNotice ? 'top-9' : 'top-0'} z-10 flex items-center justify-between gap-2 bg-amber-100/95 px-3 py-1 text-xs text-amber-900 dark:bg-amber-900/85 dark:text-amber-100`}
         >
           <span>Terminal restore is not making progress. What is on screen is unchanged.</span>
           <button
@@ -6983,7 +7036,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       )}
       {truncatedHistoryGap && (
         <div
-          className={`absolute inset-x-0 ${retentionLossNotice ? 'top-9' : 'top-0'} z-10 flex justify-center`}
+          className={`absolute inset-x-0 ${retentionLossNotice && deliveryGapNotice ? 'top-[4.5rem]' : retentionLossNotice || deliveryGapNotice ? 'top-9' : 'top-0'} z-10 flex justify-center`}
         >
           <button
             type="button"

@@ -10517,8 +10517,15 @@ describe('TerminalView lifecycle updates', () => {
       // The pre-gap surface is PRESERVED: the repair never clears the
       // viewport before its content establishes the refilled surface.
       expect(term.clear).not.toHaveBeenCalled()
-      // The honest local notice still renders alongside the repair.
-      expectTerminalWriteContaining(term, 'Output gap 2-5: slow link backlog')
+      // The honest notice still shows alongside the repair — in CHROME
+      // (round-5 finding 2): the surface never receives notice bytes.
+      const notice = screen.getByTestId('restore-delivery-gap-notice')
+      expect(notice.textContent).toContain('output gap 2-5')
+      expect(notice.textContent).toContain('slow link backlog')
+      expect(
+        terminalWriteStrings(term).some((entry) => entry.includes('Output gap')),
+        'the notice is chrome, never surface bytes',
+      ).toBe(false)
 
       // The repair completes: the new generation's ready + frames refill
       // the hole and converge the screen on the SAME connection, with no
@@ -10684,7 +10691,14 @@ describe('TerminalView lifecycle updates', () => {
       // The pre-gap surface is PRESERVED at attach time: the fallback
       // hydrate must not clear the viewport before its content arrives.
       expect(term.clear).not.toHaveBeenCalled()
-      expectTerminalWriteContaining(term, 'Output gap 2-5: slow link backlog')
+      // The honest notice shows in CHROME (round-5 finding 2): no notice
+      // bytes may touch the surface ahead of the replacement content.
+      const notice = screen.getByTestId('restore-delivery-gap-notice')
+      expect(notice.textContent).toContain('output gap 2-5')
+      expect(
+        terminalWriteStrings(term).some((entry) => entry.includes('Output gap')),
+        'the notice is chrome, never surface bytes',
+      ).toBe(false)
 
       // The hydrate's content establishes the new baseline: the surface
       // is replaced exactly when the content arrives — never before. The
@@ -11134,26 +11148,25 @@ describe('TerminalView lifecycle updates', () => {
       expectTerminalWriteContaining(term, 'PRE-GAP-VISIBLE')
     })
 
-    it('the queue-overflow gap notice survives the immediate repair attach under real async scheduling', async () => {
-      // Round-4 F4 (Minor): the delivery-loss gap's honest local notice
-      // must SURVIVE the repair attach that fires in the same message
-      // handler. The repair mints a NEW generation with
-      // dropQueuedStaleWrites — a notice enqueued under the OLD
-      // generation is discarded before the animation-frame flush can
-      // render it (the pre-fix behavior, visible only with REAL flush
-      // timing — a synchronous rAF conceals the race). The notice is
-      // re-emitted under the NEW generation and renders.
+    it('the queue-overflow gap notice rides chrome across the repair attach and never mutates the surface', async () => {
+      // Round-4 F4 + round-5 finding 2 (Major): the delivery-loss gap's
+      // honest notice must SURVIVE the repair attach that fires in the
+      // same message handler — and it must do so WITHOUT writing to the
+      // xterm surface: during a checkpoint-based delta repair NOTHING may
+      // mutate the surface before the replayed bytes apply (the notice's
+      // local bytes would shift the cursor/parser state the checkpoint
+      // captured, corrupting the repaired screen). The notice therefore
+      // rides UI chrome (React state is immune to the repair attach's
+      // generation change, which drops queued stale WRITES, not state).
       wsMocks.capabilities = { pacedTerminalReplayV1: true }
-      const { terminalId, term } = await renderTerminalHarness({
+      const { terminalId, term, getByTestId } = await renderTerminalHarness({
         status: 'running',
         terminalId: 'term-v2-gap-notice-survives-repair',
       })
 
       // A contiguous applied prefix establishes a valid checkpoint, so
-      // the repair is a DELTA resume (the notice is the only queued
-      // write in flight across the generation change).
+      // the repair is a DELTA resume.
       messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'ok' })
-      term.clear.mockClear()
       term.write.mockClear()
       wsMocks.send.mockClear()
       const pendingFrames: FrameRequestCallback[] = []
@@ -11184,15 +11197,249 @@ describe('TerminalView lifecycle updates', () => {
       )
       expect(repairAttaches.length).toBe(1)
 
-      // Nothing has rendered yet (real async): the notice is queued.
+      // Nothing has rendered yet (real async): the surface is untouched.
       expect(
         terminalWriteStrings(term).some((entry) => entry.includes('Output gap 2-5')),
+        'the notice must never be surface bytes',
       ).toBe(false)
 
-      // THE ASSERTION: the notice renders despite the repair attach's
-      // generation change — the honest notice survives the repair.
+      // THE ASSERTION: the notice is honestly shown DESPITE the repair
+      // attach's generation change — in chrome, visible and accessible.
       await flushFrames()
-      expectTerminalWriteContaining(term, 'Output gap 2-5: slow link backlog')
+      const notice = getByTestId('restore-delivery-gap-notice')
+      expect(notice).toHaveAttribute('role', 'status')
+      expect(notice.textContent).toContain('output gap 2-5')
+      expect(notice.textContent).toContain('slow link backlog')
+      // And the surface STILL has no notice bytes — only the stream.
+      expect(
+        terminalWriteStrings(term).some((entry) => entry.includes('Output gap')),
+        'the notice lives in chrome, never in the surface',
+      ).toBe(false)
+    })
+
+    it('a checkpoint delivery-gap repair with an in-flight escape sequence replays the exact uninterrupted byte stream', async () => {
+      // Round-5 finding 2 (Major), the reviewer's required shape: frame 2
+      // ends MID truecolor-SGR escape sequence (the sequence's first half
+      // is held by the client's probe parser, bridged to the completing
+      // bytes of the NEXT frame); the queue_overflow gap folds exactly the
+      // frames that complete it; the checkpoint delta repair replays them
+      // onto the surface. The repaired surface's byte stream must EQUAL
+      // the uninterrupted reference byte stream exactly (a content
+      // comparison against an uninterrupted lane driven through the same
+      // production code) — the pre-fix notice bytes, written to the
+      // surface between the checkpoint state and the replayed bytes,
+      // shifted the cursor the replayed instructions were addressed to and
+      // corrupted the repaired screen.
+      wsMocks.capabilities = { pacedTerminalReplayV1: true }
+
+      // The deterministic fixture: frame 2 is a truecolor SGR's first
+      // half split at the frame boundary (the probe parser holds it until
+      // frame 3 completes it), so the escape is IN FLIGHT exactly at the
+      // checkpoint cursor when the gap lands, and the repair replays both
+      // halves. Both lanes' surfaces must receive the identical byte
+      // stream.
+      const frame1Data = 'ok'
+      const frame2Data = '\x1b[38;2;'
+      const frame3Data = '255;0;0mREPAIRED-TAIL'
+
+      const pendingFrames: FrameRequestCallback[] = []
+      const deferFlushes = () => {
+        requestAnimationFrameSpy!.mockImplementation((cb: FrameRequestCallback) => {
+          pendingFrames.push(cb)
+          return pendingFrames.length
+        })
+      }
+      const flushFrames = async () => {
+        const frames = pendingFrames.splice(0)
+        await act(async () => {
+          for (const cb of frames) cb(0)
+        })
+      }
+
+      // LANE A — the uninterrupted reference: frames 1..3 applied
+      // contiguously, no gap, no repair.
+      const laneA = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-repair-reference-lane',
+      })
+      deferFlushes()
+      messageHandler!({ type: 'terminal.output', terminalId: laneA.terminalId, seqStart: 1, seqEnd: 1, data: frame1Data })
+      messageHandler!({ type: 'terminal.output', terminalId: laneA.terminalId, seqStart: 2, seqEnd: 2, data: frame2Data })
+      await flushFrames()
+      expect(terminalWriteStrings(laneA.term).join('')).toBe(frame1Data)
+      // Align the comparison point: from here on, both lanes' write
+      // mocks observe only the bytes that follow the in-flight escape's
+      // first half.
+      laneA.term.write.mockClear()
+      messageHandler!({ type: 'terminal.output', terminalId: laneA.terminalId, seqStart: 3, seqEnd: 3, data: frame3Data })
+      await flushFrames()
+      const referenceStream = terminalWriteStrings(laneA.term).join('')
+      expect(referenceStream).toBe(frame2Data + frame3Data)
+
+      // LANE B — the gapped repair: frames 1..2 applied live (frame 2
+      // submits nothing — its partial escape is held in flight), the gap
+      // folds 3, the checkpoint repair replays exactly the completing
+      // bytes.
+      const laneB = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-repair-escape-lane',
+      })
+      const termB = laneB.term
+      deferFlushes()
+      messageHandler!({ type: 'terminal.output', terminalId: laneB.terminalId, seqStart: 1, seqEnd: 1, data: frame1Data })
+      messageHandler!({ type: 'terminal.output', terminalId: laneB.terminalId, seqStart: 2, seqEnd: 2, data: frame2Data })
+      // Flush BEFORE the gap: frame 1's write completes and pins the
+      // checkpoint at the cursor where the escape is in flight.
+      await flushFrames()
+      expect(terminalWriteStrings(termB).join('')).toBe(frame1Data)
+      termB.write.mockClear()
+      wsMocks.send.mockClear()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId: laneB.terminalId,
+          fromSeq: 3,
+          toSeq: 3,
+          reason: 'queue_overflow',
+        })
+      })
+      const repair = sentMessages().filter(
+        (msg) => msg?.type === 'terminal.attach' && msg.terminalId === laneB.terminalId,
+      )
+      expect(repair.length).toBe(1)
+      // The repair is the CHECKPOINT DELTA resume (pinned at the applied
+      // cursor — INSIDE the in-flight escape's span — NOT a viewport
+      // rebuild): the server replays the frames that complete the escape.
+      expect(repair[0]).toMatchObject({
+        type: 'terminal.attach',
+        terminalId: laneB.terminalId,
+        intent: 'transport_reconnect',
+        sinceSeq: 1,
+        attachRequestId: expect.any(String),
+      })
+
+      // The repair converges: the retained range replays under the NEW
+      // generation, completing the in-flight escape sequence.
+      const repairArid = repair[0]!.attachRequestId
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId: laneB.terminalId,
+          headSeq: 3,
+          replayFromSeq: 2,
+          replayToSeq: 3,
+          attachRequestId: repairArid,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId: laneB.terminalId,
+          seqStart: 2,
+          seqEnd: 2,
+          data: frame2Data,
+          attachRequestId: repairArid,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId: laneB.terminalId,
+          seqStart: 3,
+          seqEnd: 3,
+          data: frame3Data,
+          attachRequestId: repairArid,
+        })
+      })
+      await flushFrames()
+
+      // THE CONTENT COMPARISON (not notice-presence): the repaired
+      // surface received EXACTLY the uninterrupted reference byte stream —
+      // byte-for-byte, in order, with the escape sequence completed
+      // exactly as the uninterrupted lane parsed it. Any surface-written
+      // notice (the pre-fix behavior) breaks the equality.
+      const repairedStream = terminalWriteStrings(termB).join('')
+      expect(repairedStream).toBe(referenceStream)
+      expect(
+        terminalWriteStrings(termB).some((entry) => entry.includes('Output gap')),
+        'no notice bytes may ever reach the surface mid-repair',
+      ).toBe(false)
+    })
+
+    it('the delivery-gap chrome notice stays visible after the repair converges despite the generation change', async () => {
+      // Round-5 finding 2, the notice-survival requirement in its full
+      // cycle: the honest notice becomes visible (and STAYS visible)
+      // post-repair — the repair attach minted a new generation, but the
+      // chrome notice is React state, so the generation change cannot
+      // discard it, and the converged repair keeps the notice honestly on
+      // screen next to the complete terminal content.
+      wsMocks.capabilities = { pacedTerminalReplayV1: true }
+      const { terminalId, term, getByTestId } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-gap-notice-post-repair',
+      })
+
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'ok' })
+      term.write.mockClear()
+      wsMocks.send.mockClear()
+      const pendingFrames: FrameRequestCallback[] = []
+      requestAnimationFrameSpy!.mockImplementation((cb: FrameRequestCallback) => {
+        pendingFrames.push(cb)
+        return pendingFrames.length
+      })
+      const flushFrames = async () => {
+        const frames = pendingFrames.splice(0)
+        await act(async () => {
+          for (const cb of frames) cb(0)
+        })
+      }
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 2,
+          toSeq: 5,
+          reason: 'queue_overflow',
+        })
+      })
+      const repair = sentMessages().filter(
+        (msg) => msg?.type === 'terminal.attach' && msg.terminalId === terminalId,
+      )
+      expect(repair.length).toBe(1)
+      await flushFrames()
+
+      // The repair CONVERGES: replay the declared range under the new
+      // generation and flush.
+      const repairArid = repair[0]!.attachRequestId
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 5,
+          replayFromSeq: 2,
+          replayToSeq: 5,
+          attachRequestId: repairArid,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 5,
+          data: 'REPAIRED-CONTENT',
+          attachRequestId: repairArid,
+        })
+      })
+      await flushFrames()
+      expectTerminalWriteContaining(term, 'REPAIRED-CONTENT')
+
+      // POST-REPAIR: the notice is still honestly shown (chrome) with the
+      // exact gap range and reason, and the surface carries only stream
+      // bytes.
+      const notice = getByTestId('restore-delivery-gap-notice')
+      expect(notice.textContent).toContain('output gap 2-5')
+      expect(notice.textContent).toContain('slow link backlog')
+      expect(
+        terminalWriteStrings(term).some((entry) => entry.includes('Output gap')),
+        'the converged surface is pure stream content',
+      ).toBe(false)
     })
 
     it('a stale in-flight write completes BEFORE the clear applies — no post-clear mutation', async () => {
@@ -11202,10 +11449,11 @@ describe('TerminalView lifecycle updates', () => {
       // flush must apply the in-flight bytes BEFORE the clear — a
       // synchronous clear ahead of the queue wipes the surface first and
       // the in-flight bytes then mutate the blank surface AFTER the
-      // clear. The in-flight item here is the repair's own honest gap
-      // notice (emitted under the NEW generation by the round-4 F4 fix),
-      // so this fixture also pins the notice's survival ACROSS the repair
-      // attach under real flush timing.
+      // clear. Round-5 finding 2: the in-flight item is now a REAL
+      // stream write (the pre-fix fixture leaned on the notice write the
+      // chrome fix removed) — a live frame delivered under deferred
+      // writes ahead of the delivery-loss gap, so the fixture pins the
+      // same atomicity contract with stream bytes only.
       wsMocks.capabilities = { pacedTerminalReplayV1: true }
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',
@@ -11237,34 +11485,39 @@ describe('TerminalView lifecycle updates', () => {
         })
       }
 
+      // A contiguous live frame goes IN FLIGHT: its write was flushed to
+      // xterm but the completion callback is held by the deferred-write
+      // mock.
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 2, seqEnd: 2, data: 'IN-FLIGHT-LIVE' })
+      await flushFrames()
+      const inFlightWriteOrder = term.write.mock.invocationCallOrder[
+        term.write.mock.calls.findIndex(([data]: [string]) => String(data).includes('IN-FLIGHT-LIVE'))
+      ]
+      expect(inFlightWriteOrder).toBeGreaterThan(0)
+      expect(term.pendingWriteCallbacks.length).toBe(1)
+      expect(term.clear).not.toHaveBeenCalled()
+
       // The gap arms the deferred clear (the no-checkpoint fallback) and
-      // the repair's honest notice enqueues UNDER THE NEW generation —
-      // the pre-fix code enqueued it under the OLD generation (dropped
-      // at the mint) and cleared synchronously ahead of the queue.
+      // the repair attach mints the NEW generation (the delivery-gap
+      // notice rides chrome — no surface write, no queue item).
       act(() => {
         messageHandler!({
           type: 'terminal.output.gap',
           terminalId,
-          fromSeq: 2,
-          toSeq: 3,
+          fromSeq: 3,
+          toSeq: 4,
           reason: 'queue_overflow',
         })
       })
       const repair = repairAttaches()
       expect(repair.length).toBe(1)
-
-      // Flush once: the notice goes IN FLIGHT (its completion callback
-      // is held by the deferred-write mock). Nothing else applies.
-      await flushFrames()
-      const noticeWriteOrder = term.write.mock.invocationCallOrder[
-        term.write.mock.calls.findIndex(([data]: [string]) => String(data).includes('Output gap 2-3'))
-      ]
-      expect(noticeWriteOrder).toBeGreaterThan(0)
-      expect(term.pendingWriteCallbacks.length).toBe(1)
-      expect(term.clear).not.toHaveBeenCalled()
+      expect(
+        terminalWriteStrings(term).some((entry) => entry.includes('Output gap')),
+        'the chrome notice never enqueue a surface write',
+      ).toBe(false)
 
       // The repair's first replacement content ENQUEUES the clear+write
-      // behind the in-flight notice.
+      // behind the in-flight stream write.
       act(() => {
         messageHandler!({
           type: 'terminal.attach.ready',
@@ -11285,17 +11538,17 @@ describe('TerminalView lifecycle updates', () => {
       })
       expect(term.clear).not.toHaveBeenCalled()
 
-      // The in-flight notice completes, THEN the queue applies the
-      // clear+write item: the notice bytes land BEFORE the clear — no
-      // post-clear mutation, and the honest notice survived the repair.
+      // The in-flight stream write completes, THEN the queue applies the
+      // clear+write item: the live bytes land BEFORE the clear — no
+      // post-clear mutation.
       const clearCallsBefore = term.clear.mock.calls.length
       term.releasePendingWrites()
       await flushFrames()
       expect(term.clear.mock.calls.length).toBe(clearCallsBefore + 1)
-      const clearOrder = term.clear.mock.invocationCallOrder[0]
+      const clearOrder = term.clear.mock.invocationCallOrder[clearCallsBefore]
       expect(clearOrder).toBeTruthy()
       expect(
-        noticeWriteOrder,
+        inFlightWriteOrder,
         'the in-flight write completes before the clear applies — no post-clear mutation',
       ).toBeLessThan(clearOrder!)
       expectTerminalWriteContaining(term, 'REPLACEMENT-AFTER-CLEAR')
