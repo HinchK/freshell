@@ -301,6 +301,7 @@ git commit -m "feat(opencode): structured log for shared-daemon discards"
 
 **Files:**
 - Modify: `crates/freshell-opencode/src/serve.rs` (Inner at ~:643-655, `RunningServe` at ~:634-641, `ensure_started` at ~:690-770, `discard_running` at ~:1348, `ServeConfig` at ~:557-603, `shutdown` at ~:1510-1517)
+- Modify: `crates/freshell-opencode/src/lib.rs` (plan-review round 3: the crate uses an explicit `pub use serve::{...}` re-export list — `DaemonSignal` must be added there or Task 4's root-level import cannot compile)
 - Test: `crates/freshell-opencode/src/serve.rs` `#[cfg(test)]` + a new integration file `crates/freshell-opencode/tests/serve_daemon_selfheal.rs` (follows `serve_idle_edge.rs` / `serve_health_bounded.rs` conventions)
 
 **Interfaces:**
@@ -315,7 +316,7 @@ git commit -m "feat(opencode): structured log for shared-daemon discards"
 **Behavior:**
 1. `ensure_started` spawns a daemon exit-watcher task after a successful health check (store its abort handle on `RunningServe` as `_exit_watch`). The watcher polls `process.exited()` every `daemon_watch_interval`; on `Some(exit)` it verifies the running entry is still ITS daemon (compare the captured `ownership_id`), then runs the manager's loss path.
 2. The loss path (shared by watcher-exit and, minus the abort, by `discard_running`): WARN `freshagent.opencode.daemon_crash_detected` (watcher arm; fields `reason="process_exit"`, `base_url`) or the Task-2 discard WARN; take the running entry (killing it in the watcher arm is unnecessary — the process already exited; still call `process.kill()` for the /proc ownership reaper parity); `emit_lost_for_all()`; broadcast `DaemonSignal::Lost{reason}`; schedule a backoff-guarded re-warm. **Exactly-once (LB-07):** the take is the race arbiter — if it yields `None` (the other arm already ran), the whole path is a silent no-op: no log, no Lost, no re-warm.
-3. Re-warm: a spawned task sleeps `min(re_warm_backoff_initial_ms * 2^(attempts-1), re_warm_backoff_max_ms)`, then calls `ensure_started()` (shutdown-flag checked inside; the task also checks it before sleeping). `attempts` is an `AtomicUsize` on `Inner`, incremented per scheduled re-warm, never reset (a crash-looping daemon retries at the max interval forever — self-heals when e.g. disk frees). Log `tracing::info!(outcome=..., attempt=..., "freshagent.opencode.daemon_re_warm")` on success and `tracing::warn!` on failure.
+3. Re-warm: a spawned retry loop sleeps `min(re_warm_backoff_initial_ms * 2^(attempts-1), re_warm_backoff_max_ms)`, then calls `ensure_started()`; a FAILED attempt schedules the next (escalating backoff), a SUCCESSFUL attempt resets `attempts` to 0 and exits the loop. `attempts` is an `AtomicUsize` on `Inner`, incremented per attempt and reset on success — so each new incident starts at the initial delay while a crash-looping daemon still escalates to and retries at the max interval forever (self-heals when e.g. disk frees). Shutdown-flag checked per iteration. Log `tracing::info!(attempt = ..., "freshagent.opencode.daemon_re_warm")` on success and `tracing::warn!(..., error = ...)` on failure.
 4. `discard_running` aborts the watcher FIRST (requested kill — no crash event), then the existing kill+lost, then `Lost` signal + re-warm schedule.
 5. `shutdown`'s inline duplicate (serve.rs:1510-1517) also aborts the watcher; it must NOT schedule a re-warm (shutdown flag blocks it) and need not signal (server is going down) — keep it minimal: abort watcher + existing behavior.
 
@@ -539,7 +540,7 @@ Expected: PASS
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-opencode/src/serve.rs crates/freshell-opencode/tests/serve_daemon_selfheal.rs
+git add crates/freshell-opencode/src/serve.rs crates/freshell-opencode/src/lib.rs crates/freshell-opencode/tests/serve_daemon_selfheal.rs
 git commit -m "feat(opencode): daemon exit watcher, loss signal, and backoff re-warm"
 ```
 
@@ -614,15 +615,36 @@ async fn map_hit_fenced_attach_respawns_the_daemon_and_rebridges() {
     let frame = next_fresh_agent_frame(&rx).await; // the attach tail's snapshot push
     assert_eq!(frame["event"]["type"], "freshAgent.session.snapshot");
 }
+
+// Plan-review round 3: the revival pass must respect the ownership
+// coordinator — a session killed/retired or handed to a terminal owner
+// between the loss and the respawn must NOT be revived.
+#[tokio::test]
+async fn revival_skips_sessions_handed_off_or_removed_after_the_loss() {
+    let (state, rx) = opencode_state_with_bus();
+    state.fresh_agent.set_manager_for_test(fake_manager_healthy());
+    let _kept = materialized_opencode_session(&state, "ses_keeps").await;
+    let _gone = materialized_opencode_session(&state, "ses_gone").await;
+    // The concurrent-handoff shape: while the daemon is down, session B is
+    // retired from the map and its key transitions (Stopping/handoff →
+    // terminal owner):
+    retire_session_from_map(&state, "ses_gone").await;
+    mark_session_transition_or_terminal_owner(&state, "ses_gone").await;
+    drive_daemon_respawn(&state).await; // DaemonSignal::Started arrives
+    assert!(session_serve_bridge_alive(&state, "ses_keeps").await, "healthy fresh-agent sessions revive");
+    assert!(!session_serve_bridge_alive(&state, "ses_gone").await,
+        "removed/transition/terminal-owned sessions must NOT be revived");
+    assert_no_snapshot_push_for(&rx, "ses_gone").await;
+}
 ```
 
 (Drafts: adapt to the actual harness helpers — `opencode_state_with_bus`, session materialization via `handle_send` against the seeded fake http, and the manager's running-entry discard via the fake's own seams or `discard_running`. Lock discipline per LB-01: any test helper that walks the sessions map must clone the `Arc` session handles under a short map lock and drop the map guard before locking a session — the map guard is NEVER held across a per-session lock acquisition, per the documented contract at opencode_ws.rs:100-115.)
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `cargo test -p freshell-freshagent daemon_loss_fans_out` && `cargo test -p freshell-freshagent map_hit_fenced_attach` (two commands — cargo test accepts ONE positional TESTNAME)
+Run: `cargo test -p freshell-freshagent daemon_loss_fans_out` && `cargo test -p freshell-freshagent map_hit_fenced_attach` && `cargo test -p freshell-freshagent revival_skips` (three commands — cargo test accepts ONE positional TESTNAME)
 
-Expected: FAIL — `daemon_loss_fans_out...` fails with no `OPENCODE_DAEMON_LOST` frame (today `SessionSignal::Lost` is a no-op at opencode_ws.rs:6018; no listener exists); `map_hit_fenced_attach...` fails because the attach tail never spawns the daemon (spawns == 0, the LB-05-validated gap).
+Expected: FAIL — `daemon_loss_fans_out...` fails with no `OPENCODE_DAEMON_LOST` frame (today `SessionSignal::Lost` is a no-op at opencode_ws.rs:6018; no listener exists); `map_hit_fenced_attach...` fails because the attach tail never spawns the daemon (spawns == 0, the LB-05-validated gap); `revival_skips...` fails because no revival machinery exists yet.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -700,20 +722,39 @@ fn ensure_daemon_loss_watcher(&self) {
     });
 }
 
-// The revival pass (also called at arming), respecting LB-01's lock order:
+// The revival pass (also called at arming), respecting LB-01's lock order AND
+// the ownership coordinator (plan-review round 3: a revival that checks only
+// real_session_id + bridge state can race a concurrent handoff that kills the
+// session, removes it from the map, and commits a terminal owner — the stale
+// Arc would then spawn a fresh-agent bridge broadcasting beside the terminal
+// owner. The attach path guards exactly this; revival must too.):
 // 1. manager.base_url().await is None → return (daemon absent — nothing to
 //    revive into; the next Started signal or attach drives revival).
-// 2. Snapshot the map: clone (session_id, Arc<Mutex<OpencodeSession>>) pairs
-//    under ONE short map lock, dropping the guard immediately.
-// 3. For each pair (OUTSIDE the map guard): lock the session; if
-//    real_session_id is Some AND the serve-bridge handle is_finished/absent
-//    → spawn_serve_bridge(...) and broadcast snapshot_event(real_id, "idle").
-//    Push the snapshot ONLY to sessions whose bridge was actually restarted.
+// 2. Snapshot the map: clone the (session_id, Arc<Mutex<OpencodeSession>>)
+//    pairs under ONE short map lock, dropping the guard immediately.
+// 3. For each pair (OUTSIDE the map guard), per candidate:
+//    a. RE-LOOKUP the id in the sessions map at revival time — if the key is
+//       gone (killed/handoff removed it), skip. Never act on the retained Arc
+//       alone.
+//    b. Observe the canonical ownership state fresh (the runtime's
+//       canonical_ownership_snapshot): skip on ANY transition
+//       (Handoff/Starting/Stopping/Fenced — something else owns the session
+//       right now) and skip on Live{Terminal} (a terminal owner holds it).
+//       Revive only Live{FreshAgent} (this runtime's own sessions).
+//    c. Arm the SAME adopt-guard machinery handle_attach's restart tail uses
+//       (ownership_lane::arm_adopt_guard, held across the bridge restart) —
+//       factor handle_attach's guard-held restart tail into a shared helper
+//       (e.g. restart_session_bridge_guarded) that BOTH handle_attach and the
+//       revival pass call, so the coordinator's atomicity rides along instead
+//       of being re-implemented.
+//    d. Only then: spawn_serve_bridge(...) and broadcast
+//       snapshot_event(real_id, "idle") — the snapshot push goes ONLY to
+//       sessions whose bridge was actually restarted.
 ```
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `cargo test -p freshell-freshagent daemon_loss_fans_out` && `cargo test -p freshell-freshagent map_hit_fenced_attach`
+Run: `cargo test -p freshell-freshagent daemon_loss_fans_out` && `cargo test -p freshell-freshagent map_hit_fenced_attach` && `cargo test -p freshell-freshagent revival_skips`
 
 Expected: PASS
 
@@ -933,7 +974,10 @@ Expected: PASS
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/components/fresh-agent/FreshAgentView.tsx test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
+git add src/components/fresh-agent/FreshAgentView.tsx src/store/freshAgentSlice.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
+# Plan-review round 3: stage EVERY file the fold/refusal-fence change lands in
+# (freshAgentSlice.ts, the runtimeOwner selector's store module, or wherever
+# the reuse-or-mirror action lives — match the actual touched files).
 git commit -m "fix(fresh-agent): recover freshopencode panes from snapshot 409 via fenced attach and refetch"
 ```
 
@@ -1000,8 +1044,8 @@ git commit -m "test(e2e): freshopencode snapshot-409 recovery runs cloud-legal e
 - Test: itself (local chromium run)
 
 **Interfaces:**
-- Consumes: the `freshopencode-restart-recovery.spec.ts` harness pattern — `installFakeOpencode` (`fixtures/fake-opencode.cjs` on the spawned server's PATH), the `RustServer` + `TestHarness` helpers, the fake's `FAKE_OPENCODE_AUDIT_LOG` JSONL for spawn/event assertions, and a fixture capability to make the fake daemon process DIE on demand (reuse the model spec's daemon restart/death mechanics if present; otherwise add a minimal scripted-exit verb to the fixture — e.g. an env-armed exit or a served `/__kill` endpoint the spec hits).
-- Produces: an e2e proof of the SERVER-side self-heal chain with a real spawned server and a fake daemon process: (1) the pane is materialized and live; (2) the daemon dies an UNREQUESTED death; (3) the pane shows the `OPENCODE_DAEMON_LOST` "Agent error:" banner; (4) the daemon respawns automatically within a bounded wait (audit log shows a second serve spawn); (5) the pane recovers (the idle snapshot push refetches the transcript; the banner is dismissible and no dead-end remains); (6) NO `freshAgent.turn.complete` chime during the window.
+- Consumes: the `freshopencode-restart-recovery.spec.ts` harness pattern — `installFakeOpencode` (`fixtures/fake-opencode.cjs` on the spawned server's PATH), the `RustServer` + `TestHarness` helpers, the fake's `FAKE_OPENCODE_AUDIT_LOG` JSONL for spawn/event assertions, and a fixture capability for an UNREQUESTED daemon death that is a scripted SELF-exit — the fake child exits on its own schedule/trigger (plan-review round 3: the spec must not kill any process — `AGENTS.md`'s destructive-test sandbox rule requires process-kill suites to run in `scripts/sandbox-test.sh`; a fixture child exiting itself is the test-sandbox doc's explicitly host-legal fake-child-lifecycle class, the same precedent as the codex onExit self-heal test spawning `true`. E.g. the fixture env-arms an exit-after-N-secs or polls a marker file and exits when it appears — no foreign PID is ever killed. If during implementation the spec cannot avoid killing something, run the spec via `npm run test:sandbox -- "..."` instead of host Playwright).
+- Produces: an e2e proof of the SERVER-side self-heal chain with a real spawned server and a fake daemon process: (1) the pane is materialized and live; (2) the daemon dies an UNREQUESTED death (self-exit); (3) the pane shows the `OPENCODE_DAEMON_LOST` "Agent error:" banner; (4) the daemon respawns automatically within a bounded wait (audit log shows a second serve spawn); (5) the pane recovers (the idle snapshot push refetches the transcript; the banner is dismissible and no dead-end remains); (6) NO `freshAgent.turn.complete` chime during the window.
 
 - [ ] **Step 1: Write the spec** (verification task; Tasks 3+4 turned the chain green — their Rust unit tests carry the TDD red history for this behavior)
 
@@ -1058,7 +1102,7 @@ No commit (verification only). Record the gate results in the run state; the coo
 
 1. **Spec coverage:** defect 1 → Tasks 1 (compact/config no-kill, FR2 mirror); defect 2 → Task 2 (structured discard log); defect 3 → Tasks 3+4 (exit watcher + loss signal + retrying backoff re-warm + runtime fan-out edge + level-triggered bridge revival — the freshcodex-onExit mirror adapted to shared-daemon topology); defect 4 → Tasks 4a+5+6 (the fenced attach made a real recovery verb by respawning the daemon on map-hits, the client 409 arm driving it once, cloud-legal e2e). E2E coverage: Task 6 (cloud-legal client recovery) + Task 7 (local-lane real-daemon self-heal chain) + Rust unit tests (server lanes). Gates: Task 8 runs fmt/clippy/typecheck/lint + the focused suites on the final HEAD; the coordinated full suite runs at the-usual Stage-5 exit. The "backoff-guarded respawn" and "client-visible status edge" elements of defect 3 are both explicit (Task 3 re-warm config + retry loop; Task 4 `OPENCODE_DAEMON_LOST` edge).
 2. **No silent deferrals:** the deliberate residuals (prompt_async and thin wrappers keep `DiscardOnTimeout::Yes`; frozen 409 text; terminal-owner 409s recover via the session-directory handoff door; REST-only never-viewed panes miss the banner until first WS interaction) are stated in Global Constraints, each with its reason and precedent. The real-daemon e2e is local-lane with an honest CLOUD_SKIP_SPECS entry (cloud PR coverage carried by Task 6).
-3. **File and interface consistency:** all paths/signatures cross-checked against the six exploration reports at base 855dae72a, then corrected against the load-bearing ledger (LB-01 map lock order, LB-02 no-replay → level-triggered revival + arming pass, LB-03 bounded recovery, LB-04 reveal-trigger refetch, LB-05 attach-respawn redesign + fresh-agent-owner scoping, LB-06 Arc process + ownership_id, LB-07 exactly-once take, LB-08 Lagged tolerance, LB-09 attach-count delta, LB-10 state clone, R-1 `captureFreshAgentAttachmentAttempt`, N-3 `ensure_manager` seam), plan-review round 1 (routed `get_config(route)`, retrying re-warm with a fail-then-succeed test, single-filter cargo commands, deferred-rejection + awaited-banner client tests, dual-key dedupe, Tasks 7/8), AND plan-review round 2 (the re-warm retry test now starts healthy → kills the watched daemon → scripts failing re-warms; the recovery fence binds to the 409's `ownerGeneration` via the refusal-fold, suppressed attaches do not consume the one-shot guard; ApiError instances + fake timers in the client tests; the re-warm attempts counter resets on success; no trailing whitespace).
+3. **File and interface consistency:** all paths/signatures cross-checked against the six exploration reports at base 855dae72a, then corrected against the load-bearing ledger (LB-01 map lock order, LB-02 no-replay → level-triggered revival + arming pass, LB-03 bounded recovery, LB-04 reveal-trigger refetch, LB-05 attach-respawn redesign + fresh-agent-owner scoping, LB-06 Arc process + ownership_id, LB-07 exactly-once take, LB-08 Lagged tolerance, LB-09 attach-count delta, LB-10 state clone, R-1 `captureFreshAgentAttachmentAttempt`, N-3 `ensure_manager` seam), plan-review round 1 (routed `get_config(route)`, retrying re-warm with a fail-then-succeed test, single-filter cargo commands, deferred-rejection + awaited-banner client tests, dual-key dedupe, Tasks 7/8), AND plan-review round 2 (the re-warm retry test now starts healthy → kills the watched daemon → scripts failing re-warms; the recovery fence binds to the 409's `ownerGeneration` via the refusal-fold, suppressed attaches do not consume the one-shot guard; ApiError instances + fake timers in the client tests; the re-warm attempts counter resets on success; no trailing whitespace), AND plan-review round 3 (the revival pass re-looks-up each id, observes canonical ownership, skips transitions/terminal owners, and rides the same adopt-guard-protected restart helper as handle_attach; `DaemonSignal` re-exported from the crate root via lib.rs; Task 5's commit stages the store fold files; Task 7's daemon death is a scripted self-exit, never a foreign process kill).
 4. **Executable tests:** each red test names its exact lane failure (killed counter, missing frame, missing spawn, missing attach) and reuses pinned fake/harness idioms (NeverExitsProcess kill counters, config_capture tracing capture, state_with_bus + set_manager_for_test, the 404 ApiError-mock template with delta-based attach counting and an explicit synchronization point). Every cargo invocation uses a single positional TESTNAME filter that matches the named tests.
 5. **Placeholder scan:** drafts reference real helpers; where a fake needs a small extension (ExitingProcess, summarize/config hang scripting, fail-twice-then-healthy scripting, the fake-opencode death verb), the extension is named and its model (existing fakes) is cited — no TBDs.
 6. **Operational completeness:** new structured event names are logged (Task 3/4) and registered in the logging docs if enumerated; AGENTS.md architecture prose updated (Task 4); no migrations; rollback = revert the commits (no persisted-state changes); verification gates explicit (Task 8 + the Stage-5 full suite).
