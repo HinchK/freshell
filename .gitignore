@@ -28,6 +28,9 @@ playwright-report/
 blob-report/
 # Electron build artifacts
 electron-runtime/
+# Transient staging tree from pnpm-deploy-based runtime staging; normally
+# renamed away on completion, but survives a hard kill mid-staging.
+electron-runtime.staging/
 release/
 dist/wizard/
 artifacts/perf/
@@ -44,7 +47,7 @@ sdk.session.snapshot
 **/*.rs.bk
 # Note: Cargo.lock IS committed for the workspace (it will host binaries).
 
-# claude sidecar deps (npm install in the sidecar dir; not vendored in git)
+# claude sidecar deps (installed by the root pnpm workspace; not vendored in git)
 crates/freshell-claude-sidecar/node_modules/
 
 # --- vm-bridge session scratch (SECURITY: mandatory, per 2026-07-10 adversarial
