@@ -268,9 +268,15 @@ cat > "${P6_FIXTURE_PNPM}/package.json" <<'EOF'
   "name": "sandbox-deps-fixture-pnpm",
   "version": "0.0.0",
   "private": true,
-  "packageManager": "pnpm@10.34.5"
+  "packageManager": "pnpm@10.34.5",
+  "dependencies": { "ms": "2.1.3" }
 }
 EOF
+# One tiny real dependency: an empty-deps tree makes the frozen install a
+# no-op ("Already up to date"), and that no-op path rewrites the wanted
+# lockfile through a temp file in the project root — which the read-only
+# bind mount cannot host. The real repo flow links real packages and never
+# writes the root, so the fixture mirrors it with ms@2.1.3.
 # A stale npm lock is planted alongside the pnpm lock (as on this branch
 # while package-lock.json is still carried): packageManager must win.
 echo '{"name":"sandbox-deps-fixture-pnpm","version":"0.0.0","lockfileVersion":3,"packages":{"":{"name":"sandbox-deps-fixture-pnpm","version":"0.0.0"}}}' > "${P6_FIXTURE_PNPM}/package-lock.json"
