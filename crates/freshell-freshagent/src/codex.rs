@@ -9339,6 +9339,22 @@ fn status_rang_gate_holds(set: &Arc<StdMutex<Vec<String>>>, turn_id: Option<&str
     })
 }
 
+/// Release the compact window (the busy bit + the captured ownership id).
+/// The ONLY callers are the two authorities that can PROVE the compact's
+/// turn ended: the id-matched `turn/completed` arm (the compact's own
+/// completion, any status) and the Exited-class lifecycle-loss mint
+/// (FE3R2-1 — the thread died in error with the window's owned turn in
+/// flight, so the window's matching `turn/completed` may never arrive; a
+/// window left armed would mis-block later rollbacks/compacts through the
+/// D2-F1 busy gate forever). Outside an armed window this is a no-op.
+fn release_compact_window(
+    compact_in_flight: &Arc<AtomicBool>,
+    compact_turn_id: &Arc<StdMutex<Option<String>>>,
+) {
+    compact_in_flight.store(false, Ordering::SeqCst);
+    *compact_turn_id.lock().expect("compact_turn_id mutex") = None;
+}
+
 // ── wedged-sidecar quiet deadman ───────────────────────────────────────────
 //
 // A wedged-but-ALIVE codex app-server sidecar (process running, no events, no exit)
@@ -9460,6 +9476,16 @@ fn disarm_codex_quiet(
 /// retirement, so a stale completion that retires no active turn leaves the
 /// still-in-flight turn's window armed.
 ///
+/// FE3R2-1: the Exited-class lifecycle-loss mint in the ThreadStatusChanged
+/// arm is the SECOND window-release authority — a `systemError` status with
+/// the crash latch armed fires REGARDLESS of an armed compact window (inside
+/// the window the tracker holds the COMPACT's own turn id, so the errored
+/// status is the lifecycle loss of the window's owned turn), and such a mint
+/// releases the window too ([`release_compact_window`]): its matching
+/// `turn/completed` may never arrive. The ORDINARY terminal-idle branch keeps
+/// the ep3-r4 F2 suppression inside a window (thread-level idle is the
+/// compact lifecycle's punctuation, never a busy-truth clear).
+///
 /// Task-002 review M1/M2 (user-interrupt marker discipline): the `turn/started`
 /// arm CLEARS the per-session user-interrupt marker — a stale armed marker must
 /// not cross the turn boundary (the full opencode `turn_aborted` dispatch-clear
@@ -9511,13 +9537,19 @@ fn reduce_notification(
             // turn/completed) — it must never clear `active_turn`, which a
             // submission accepted inside the window has already installed for
             // its own newer turn; the id-matched completion arm owns every
-            // retirement inside the window.
+            // retirement inside the window. That F2 suppression binds the
+            // ORDINARY terminal-idle branch ONLY (FE3R2-1): the Exited-class
+            // branch below fires REGARDLESS of the compact window — inside the
+            // window the tracker holds the COMPACT's own turn id (its
+            // turn/started adopted it), so a `systemError` status is the
+            // lifecycle loss of the window's OWNED turn, and the compact gate
+            // must not silence an unwitnessed turn end (the thread died in
+            // error; its `turn/completed` need never arrive, and the provider
+            // contract does not guarantee an immediate `thread/closed`
+            // rescue either).
             if thread_id == subscription.session_id() {
                 let normalized = normalize_codex_thread_status(&status);
-                if normalized != CodexStatus::Running
-                    && normalized != CodexStatus::Starting
-                    && !compact_in_flight.load(Ordering::SeqCst)
-                {
+                if normalized != CodexStatus::Running && normalized != CodexStatus::Starting {
                     if normalized == CodexStatus::Exited && turn_in_flight.load(Ordering::SeqCst) {
                         // DR5-2 (delta round 5): an Exited-class terminal
                         // status (`systemError` — the thread DIED IN ERROR)
@@ -9540,6 +9572,17 @@ fn reduce_notification(
                         // is never voided anywhere else, so nothing that
                         // follows (a non-minting `thread/closed`, a new-turn
                         // install) can reopen the gate.
+                        //
+                        // FE3R2-1: inside an armed compact window the
+                        // tracker id above IS the compact's own turn id —
+                        // the mint just rang the window's OWNED turn end —
+                        // so the mint ALSO releases the window (the same
+                        // authority the id-matched completion arm has):
+                        // the window's matching `turn/completed` may never
+                        // arrive, and a window left armed would mis-block
+                        // later rollbacks/compacts through the D2-F1 busy
+                        // gate forever. Outside a window the release is a
+                        // no-op.
                         mint_synthesized_attention_edge(
                             last_turn_complete_at,
                             subscription.session_id(),
@@ -9568,7 +9611,8 @@ fn reduce_notification(
                             subscription.session_id(),
                             "thread_status_exited",
                         );
-                    } else {
+                        release_compact_window(compact_in_flight, compact_turn_id);
+                    } else if !compact_in_flight.load(Ordering::SeqCst) {
                         // The observed thread end retires the active-turn tracker
                         // ONLY. The in-flight crash latch stays ARMED through the
                         // app-server's documented idle-BEFORE-completed gap: a
@@ -9739,7 +9783,10 @@ fn reduce_notification(
                 // pre-start/post-RPC rollback window stays closed. The sole
                 // exception is the documented ID-less completion after a newer
                 // active turn supersedes an already-captured compact owner.
-                let mut owned_turn_id = compact_turn_id.lock().expect("compact_turn_id mutex");
+                let owned_turn_id = compact_turn_id
+                    .lock()
+                    .expect("compact_turn_id mutex")
+                    .clone();
                 // The accepted app-server shape permits an ID-less completion.
                 // With a newer tracked turn distinct from the compact owner, the
                 // FIFO notification stream makes that completion the compact's:
@@ -9758,10 +9805,8 @@ fn reduce_notification(
                     && (event.turn_id.as_deref() == owned_turn_id.as_deref()
                         || idless_superseded_compact_completion)
                 {
-                    compact_in_flight.store(false, Ordering::SeqCst);
-                    *owned_turn_id = None;
+                    release_compact_window(compact_in_flight, compact_turn_id);
                 }
-                drop(owned_turn_id);
                 // The completion that retired the TRACKED active turn also disarms
                 // (adapter.ts:1030). A stale/differently-keyed completion retired
                 // nothing — disarming there would strand the still-in-flight turn
@@ -18232,6 +18277,304 @@ pub(crate) mod tests {
         assert!(
             !after.matched,
             "a crash after the systemError mint must not add a second edge: {:?}",
+            after.frames
+        );
+    }
+
+    /// The-usual SDD focused FE3R2-1: a compact turn that ends in
+    /// `thread/status/changed{systemError}` — with NO `turn/completed` —
+    /// must still ring the turn's ONE unified edge AND release the compact
+    /// window. The provider contract does NOT guarantee an immediate
+    /// `thread/closed` rescue after the errored status (the
+    /// session-resilience plan: "must not depend on an immediate
+    /// `thread/closed` signal"), and the pre-fix shape was a full silent
+    /// stall: the Exited-class mint sat inside the arm's
+    /// `!compact_in_flight` guard, so the errored status produced ONLY the
+    /// exited snapshot — no mint, no latch retirement, no deadman disarm
+    /// (the re-armed quiet window later flags the dead thread `stuck` and
+    /// rings a LATE edge), and no window clear (the compact's matching
+    /// `turn/completed` never arrives, so the stale armed window keeps
+    /// refusing rollbacks/compacts through the D2-F1 busy gate forever).
+    ///
+    /// The fix: the Exited-class branch fires REGARDLESS of the compact
+    /// window (inside the window the tracker holds the COMPACT's turn id —
+    /// the window's owned turn IS the turn that died in error), and a mint
+    /// inside the window ALSO releases the window with the same authority
+    /// the id-matched completion arm has. Ordinary thread-level idle
+    /// inside the window keeps its ep3-r4 F2 suppression (it is the
+    /// compact lifecycle's punctuation, never a busy-truth clear).
+    #[tokio::test]
+    async fn a_compact_turn_ending_in_system_error_rings_and_releases_the_compact_window() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, mut rx) = state_with_bus();
+        // A short quiet window: a lingering armed deadman (the pre-fix
+        // shape — no disarm at the errored status) must FIRE (stuck + a
+        // late edge) well inside this test's budget, so the first-signal
+        // assertion below can pin that the MINT, not the deadman, is the
+        // ringer.
+        st.set_codex_quiet_window_ms_for_tests(400);
+
+        let child = spawn_sleeper();
+        let pid = child.id().expect("sleeper pid");
+
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-compact-syserr",
+            client,
+            Arc::new(StdMutex::new(None)),
+            notifs,
+            child,
+            "codex-sidecar-test-compact-syserr",
+        )
+        .await;
+
+        // Arm a REAL compact window the way the compact tests do: the
+        // `thread/compact/start` RPC answers, then the compact's own
+        // `turn/started` adopts the tracker + mirrors the in-flight latch
+        // + captures the window's ownership id (the probed 0.147.0 order:
+        // active status first).
+        let compact_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_compact(compact_msg("thread-compact-syserr"))
+                    .await;
+            })
+        };
+        answer_initialize(&peer).await;
+        let (compact_id, method, _p) = peer.expect_request().await;
+        assert_eq!(method, "thread/compact/start");
+        peer.respond(&compact_id, json!({}));
+        compact_driver.await.expect("compact task");
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-compact-syserr", "status": { "type": "active" } }),
+        );
+        peer.emit_notification(
+            "turn/started",
+            json!({ "threadId": "thread-compact-syserr", "turn": { "id": "turn-compact-syserr" } }),
+        );
+
+        // Deterministic sync: the consumer adopted the compact's turn
+        // (tracker + latch + ownership id — one reduce pass) before the
+        // errored status lands.
+        let (active_turn, turn_in_flight, compact_in_flight, compact_turn_id) = {
+            let sessions = st.sessions.lock().await;
+            let session = sessions
+                .get("thread-compact-syserr")
+                .expect("session remains registered");
+            (
+                session.active_turn.clone(),
+                session.turn_in_flight.clone(),
+                session.compact_in_flight.clone(),
+                session.compact_turn_id.clone(),
+            )
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let captured = compact_turn_id
+                .lock()
+                .expect("compact_turn_id mutex")
+                .clone();
+            if captured.is_some() {
+                break;
+            }
+            assert!(
+                !deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .is_zero(),
+                "the compact's turn/started never adopted the window ownership"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            active_turn.lock().expect("active_turn mutex").as_deref(),
+            Some("turn-compact-syserr"),
+            "inside the window the tracker holds the compact's turn id"
+        );
+        assert!(
+            turn_in_flight.load(Ordering::SeqCst),
+            "the compact's turn/started mirrored the in-flight latch"
+        );
+
+        // The compact's turn dies in error: the thread reports its own
+        // death-in-error mid-window and its `turn/completed` never arrives
+        // (an errored thread is not required to send one).
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-compact-syserr", "status": { "type": "systemError" } }),
+        );
+
+        // (a) The unified edge fires AT the errored status — and the FIRST
+        // attention signal must be the MINT's edge, never the deadman's
+        // stuck-then-late-edge pair (the pre-fix shape: the whole arm was
+        // suppressed inside the window, the entry feed re-armed the quiet
+        // window, and the deadman fired stuck FIRST).
+        let first = collect_frames_until(&mut rx, std::time::Duration::from_secs(2), |w| {
+            (w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "stuck")
+                || w["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert!(
+            first.matched,
+            "the errored compact turn rings its unified edge: {:?}",
+            first.frames
+        );
+        let edge_frame = first.frames.last().expect("the first matched signal frame");
+        assert_eq!(
+            edge_frame["event"]["type"],
+            json!("freshAgent.turn.complete"),
+            "the mint at the errored status is the FIRST attention signal — a \
+             stuck-first shape is the deadman firing on the un-disarmed window \
+             (the pre-fix silent stall): {:?}",
+            first.frames
+        );
+        assert_eq!(edge_frame["sessionId"], json!("thread-compact-syserr"));
+        assert!(
+            edge_frame["event"]["at"].is_i64(),
+            "finite numeric `at` on the errored-compact edge: {edge_frame}"
+        );
+
+        // (b) NO stuck flag and NO second edge inside the short deadman
+        // window: the mint disarmed the deadman (a thread that already
+        // reported its own death is not wedged) and retired the crash
+        // latch.
+        let post = collect_frames_until(&mut rx, std::time::Duration::from_millis(1000), |w| {
+            (w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "stuck")
+                || w["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert!(
+            !post.matched,
+            "no stuck flag, no second edge after the errored-compact mint: {:?}",
+            post.frames
+        );
+
+        // (d) The compact window is RELEASED at the mint: the turn it
+        // minted for IS the window's owned turn, and its matching
+        // `turn/completed` may never arrive — a stale armed window would
+        // mis-block later rollbacks/compacts through the D2-F1 busy gate
+        // forever. The mint retired the tracker and the latch too.
+        assert!(
+            active_turn.lock().expect("active_turn mutex").is_none(),
+            "the mint retired the compact's tracked turn"
+        );
+        assert!(
+            !turn_in_flight.load(Ordering::SeqCst),
+            "the mint retired the crash latch"
+        );
+        assert!(
+            !compact_in_flight.load(Ordering::SeqCst),
+            "the errored end released the compact window"
+        );
+        assert!(
+            compact_turn_id
+                .lock()
+                .expect("compact_turn_id mutex")
+                .is_none(),
+            "releasing the window also cleared its ownership id"
+        );
+
+        // The D2-F1 busy gate reopened behaviorally: a rollback is no
+        // longer refused BUSY_TURN by the (now cleared) compact window —
+        // it proceeds to thread/read and answers NOTHING_TO_UNDO on the
+        // empty thread.
+        let (sink, captured) = capturing_sink();
+        let rollback_driver = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_rollback(
+                    undo_msg("thread-compact-syserr", "rb-compact-syserr", None),
+                    sink,
+                )
+                .await;
+            })
+        };
+        let mut saw_read = false;
+        while let Ok((read_id, method, _)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), peer.expect_request()).await
+        {
+            assert_eq!(method, "thread/read");
+            saw_read = true;
+            peer.respond(
+                &read_id,
+                json!({ "thread": { "id": "thread-compact-syserr", "turns": [] } }),
+            );
+        }
+        rollback_driver.await.expect("rollback probe task");
+        assert!(
+            saw_read,
+            "the released window no longer refuses the rollback (D2-F1 gate reopened)"
+        );
+        assert_eq!(
+            captured_frames(&captured)[0]["event"]["code"],
+            json!("NOTHING_TO_UNDO"),
+            "the rollback runs to its empty-history refusal, not a BUSY_TURN: {:?}",
+            captured_frames(&captured)
+        );
+
+        // (e) The compact's LATE matching `turn/completed` (an errored
+        // thread need not send one, but MAY): publishes its snapshot/idle
+        // bookkeeping and adds NO second edge — the mint pushed the
+        // compact's turn id (the tracker's id inside the window) onto the
+        // durable already-rang set.
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-compact-syserr", "turn": { "id": "turn-compact-syserr", "status": "completed" } }),
+        );
+        let completion = collect_frames_until(&mut rx, std::time::Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.session.snapshot" && w["event"]["status"] == "idle"
+        })
+        .await;
+        assert!(
+            completion.matched,
+            "the late matching completion still publishes its idle snapshot: {:?}",
+            completion.frames
+        );
+        assert!(
+            !completion
+                .frames
+                .iter()
+                .any(|w| w["event"]["type"] == "freshAgent.turn.complete"),
+            "the late matching completion carries NO edge before its snapshot: {:?}",
+            completion.frames
+        );
+        let trailing = collect_frames_until(&mut rx, std::time::Duration::from_millis(400), |w| {
+            w["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert!(
+            !trailing.matched,
+            "the late matching completion adds NO second edge (the mint's rang-set \
+             push gates it — one bell per END): {:?}",
+            trailing.frames
+        );
+
+        // (c) A subsequent sidecar death (an unrequested exit) broadcasts
+        // the `exited` frame and rings NOTHING — the mint retired the
+        // crash latch, so the crash arm cannot misattribute a phantom
+        // edge. Safety: a targeted SIGKILL of this test's OWN sleep
+        // fixture child (the `sleep` process spawned above) — never a
+        // broad kill pattern.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        let exited = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |w| {
+            w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "exited"
+        })
+        .await;
+        assert!(
+            exited.matched,
+            "the watcher self-heals within the budget: {:?}",
+            exited.frames
+        );
+        let after = collect_frames_until(&mut rx, std::time::Duration::from_millis(400), |w| {
+            w["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert!(
+            !after.matched,
+            "a crash after the errored-compact mint must not add a second edge: {:?}",
             after.frames
         );
     }
