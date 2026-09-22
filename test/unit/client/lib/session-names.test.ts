@@ -208,6 +208,72 @@ describe('collectSessionNameRefs', () => {
     })
     expect(refs).toEqual([])
   })
+
+  it('never collects out-of-scope provider refs (a gemini pane cannot 400 the whole bootstrap chunk)', async () => {
+    // Round-3 review finding 1: the bootstrap ref collector walked every
+    // terminal/fresh pane's sessionRef with no provider scope check, so an
+    // out-of-scope coding CLI (gemini/kimi/amplifier) produced
+    // {kind:'session',provider:'gemini',...} — a ref the server's wholesale
+    // strict scope gate rejects with 400 for the ENTIRE chunked read, on
+    // every ready/reconnect, defeating the convergence bootstrap. Out-of-scope
+    // panes must simply never be collected.
+    const { parseSessionNameRef } = await import('@/lib/session-names')
+    const refs = collectSessionNameRefs({
+      panes: {
+        layouts: {
+          // A gemini terminal pane that has acquired a durable sessionRef
+          // (resumed/reconciled panes carry one — pane-reconcile promotes
+          // resumeSessionId into a structured sessionRef).
+          'tab-gemini': {
+            type: 'leaf',
+            id: 'pane-g',
+            content: {
+              kind: 'terminal',
+              mode: 'gemini',
+              terminalId: 't-g',
+              createRequestId: 'cr-g',
+              status: 'running',
+              sessionRef: { provider: 'gemini', sessionId: 'gem-1' },
+            },
+          } as never,
+          // A scoped claude pane beside it — its refs must still bootstrap.
+          'tab-claude': {
+            type: 'leaf',
+            id: 'pane-c',
+            content: {
+              kind: 'terminal',
+              mode: 'claude',
+              terminalId: 't-c',
+              createRequestId: 'cr-c',
+              status: 'running',
+              nameRef: pendingRef('h-claude'),
+              sessionRef: { provider: 'claude', sessionId: 's-claude' },
+            },
+          } as never,
+          // An out-of-scope kimi pane whose sessionRef would land in the
+          // same 100-ref chunk after the claude pane.
+          'tab-kimi': {
+            type: 'leaf',
+            id: 'pane-k',
+            content: {
+              kind: 'terminal',
+              mode: 'kimi',
+              terminalId: 't-k',
+              createRequestId: 'cr-k',
+              status: 'running',
+              sessionRef: { provider: 'kimi', sessionId: 'kimi-1' },
+            },
+          } as never,
+        },
+      },
+    })
+    expect(refs).toEqual([pendingRef('h-claude'), sessionRef('s-claude')])
+    // The provider typing itself must be sound: a validated whitelist, not
+    // an unsound cast that lets any string become a NamedProvider.
+    expect(parseSessionNameRef({ kind: 'session', provider: 'gemini', sessionId: 'g' })).toBeUndefined()
+    expect(parseSessionNameRef({ kind: 'session', provider: 'amplifier', sessionId: 'a' })).toBeUndefined()
+    expect(parseSessionNameRef({ kind: 'session', provider: 'claude', sessionId: 'c' })).toEqual(sessionRef('c'))
+  })
 })
 
 describe('uncachedSessionNameRefs', () => {

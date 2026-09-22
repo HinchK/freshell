@@ -7,6 +7,7 @@
 import { api, ApiError, with429Retry } from '@/lib/api'
 import { createLogger } from '@/lib/client-logger'
 import {
+  NamedProviderSchema,
   SessionNameRecordSchema,
   SessionNameUpdateSchema,
   sessionNameRefKey,
@@ -219,7 +220,13 @@ function collectPaneRefs(
   collectPaneRefs(node.children[1], push)
 }
 
-/** Parse an unknown naming-ref-shaped value; undefined for anything else. */
+/** Parse an unknown naming-ref-shaped value; undefined for anything else.
+ * The session variant's provider is validated against the scoped-provider
+ * whitelist (`NamedProviderSchema`: claude/codex/opencode) — never an
+ * unsound cast. This is the collector's single ingestion point, so an
+ * out-of-scope coding CLI's pane (gemini/kimi/amplifier — `SessionLocator`
+ * providers are arbitrary strings) can never produce a ref the server's
+ * strict wholesale-400 scope gate would reject the whole batched read for. */
 export function parseSessionNameRef(value: unknown): SessionNameRef | undefined {
   if (!value || typeof value !== 'object') return undefined
   const ref = value as { kind?: unknown; id?: unknown; provider?: unknown; sessionId?: unknown }
@@ -228,11 +235,12 @@ export function parseSessionNameRef(value: unknown): SessionNameRef | undefined 
   }
   if (
     ref.kind === 'session'
-    && typeof ref.provider === 'string'
     && typeof ref.sessionId === 'string'
     && ref.sessionId.length > 0
   ) {
-    return { kind: 'session', provider: ref.provider as 'claude' | 'codex' | 'opencode', sessionId: ref.sessionId }
+    const provider = NamedProviderSchema.safeParse(ref.provider)
+    if (!provider.success) return undefined
+    return { kind: 'session', provider: provider.data, sessionId: ref.sessionId }
   }
   return undefined
 }
