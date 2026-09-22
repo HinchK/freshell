@@ -424,8 +424,18 @@ for immediacy.)
   `GCLOUD_ROBOT_ACCOUNT` (the selector probes it first and never mints the
   human) or `GCLOUD_IDENT` on PTY-launched agent lanes. A
   `gcloud-robot: well-known install at ... produced no identity` note means
-  a standard install exists but its probe failed — see the selector's stderr
-  guidance.
+  a standard install exists but its probe failed. The lane swallows the
+  selector's own stderr when it runs it (`scripts/lib/gcp-identity.sh`
+  invokes it with `2>/dev/null`), so that one-line note is the only in-lane
+  observable; to see the selector's real guidance, run it manually with the
+  env the lane passes (use the install path from the note):
+
+  ```bash
+  GCLOUD_ROBOT_HOME=<install path from the note> \
+  GCLOUD_ROBOT_PROJECT=misc-puttering-project \
+  GCLOUD_ROBOT_PROBE_PERMISSION=cloudbuild.builds.create \
+  bash "$GCLOUD_ROBOT_HOME/scripts/select-gcloud-identity.sh"
+  ```
 
 ### CI
 
