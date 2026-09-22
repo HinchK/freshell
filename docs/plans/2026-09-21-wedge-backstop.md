@@ -474,9 +474,10 @@ Expected: PASS.
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-protocol/src/server_messages.rs crates/freshell-protocol/src/client_messages.rs shared/ws-protocol.ts port/contract/ws-server-messages.schema.json port/contract/ws-message-inventory.json crates/freshell-protocol/tests/inventory.rs test/unit/port/ws-contract-freeze.test.ts test/unit/client/lib/terminal-stuck-ws.test.ts
+git add crates/freshell-protocol/src/server_messages.rs crates/freshell-protocol/src/client_messages.rs shared/ws-protocol.ts port/contract/ws-server-messages.schema.json port/contract/ws-message-inventory.json port/contract/ws-protocol.schema.json crates/freshell-protocol/tests/inventory.rs test/unit/port/ws-contract-freeze.test.ts test/unit/client/lib/terminal-stuck-ws.test.ts
 git commit -m "feat(protocol): additive terminal.stuck server message + terminal.kill reason (wedge-backstop)"
 ```
+(`ws-protocol.schema.json` is the committed INBOUND bundle the generator rewrites when `TerminalKillSchema` changes — round-2 review Major; staging it is what keeps the freeze test green against the COMMITTED tree, not just the dirty worktree.)
 
 ---
 
@@ -575,11 +576,21 @@ fn pane_close_kill_keeps_the_full_durable_close() {
 }
 ```
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [ ] **Step 2: Run ALL the new tests and verify each group's intended RED**
 
-Run: `cargo test -p freshell-ws --test terminal_stuck_monitor 2>&1 | tail -10`
+Cargo accepts ONE positional test-name filter per invocation, so run each group separately. Every test from Step 1 must execute RED before any production change (round-2 review Major — red-before-green applies to the attach and kill behaviors just as to the monitor frame):
 
-Expected: FAIL — `broadcast_stuck_frame` not found (compile error) is the intended missing-behavior failure.
+Run A (ws frames): `cargo test -p freshell-ws --test terminal_stuck_monitor 2>&1 | tail -10`
+
+Expected: FAIL to COMPILE — `broadcast_stuck_frame` does not exist (the intended missing-symbol failure).
+
+Run B (registry attach emission, in-file suite): `cargo test -p freshell-terminal attaching 2>&1 | tail -10` and `cargo test -p freshell-terminal attach_reconciles 2>&1 | tail -10`
+
+Expected: FAIL on ASSERTIONS — the tests compile (Task 2 landed `TerminalStuck`) but no stuck frame is enqueued on attach yet (the intended missing-behavior failure, not a compile accident).
+
+Run C (kill reason, ws harness): `cargo test -p freshell-ws stuck_recovery 2>&1 | tail -10` and `cargo test -p freshell-ws pane_close_kill 2>&1 | tail -10`
+
+Expected: FAIL on ASSERTIONS — `reason` parses (Task 2 landed the schema) but the handler ignores it (stuck-recovery still writes the close envelope; the pane-close regression pin fails against the un-branched handler only if it asserts the envelope — if it passes vacuously before the branch exists, note that and keep it as the post-branch regression pin; the stuck-recovery test is the behavioral RED).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -673,9 +684,9 @@ if is_agent_mode(&s.mode) && s.status == TerminalRunStatus::Running {
 
 - [ ] **Step 4: Run the focused test**
 
-Run: `cargo test -p freshell-ws --test terminal_stuck_monitor 2>&1 | tail -5` and `cargo test -p freshell-terminal stuck attach 2>&1 | tail -5` (the attach-emission tests live in the registry crate's in-file suite)
+Run (one filter per invocation — cargo takes a single positional filter): `cargo test -p freshell-ws --test terminal_stuck_monitor 2>&1 | tail -5` and `cargo test -p freshell-terminal stuck 2>&1 | tail -5` and `cargo test -p freshell-terminal attaching 2>&1 | tail -5` and `cargo test -p freshell-ws stuck_recovery 2>&1 | tail -5`
 
-Expected: PASS.
+Expected: PASS (all groups green).
 
 - [ ] **Step 5: Refactor while green**
 
@@ -780,6 +791,14 @@ it('invokes the callbacks', () => { /* click both */ })
 //   terminal keeps running.
 // E (advisory guard): restart bails when an opencode durable replacement is
 //   in flight (pendingDurableReplacementRef set) — assert no kill is sent.
+// F (start-fresh behavioral coverage — round-2 review Major): click "Start
+//   fresh conversation" → assert the kill-await runs with reason
+//   'stuck-recovery' (same A1 assertion), then on the success ack assert
+//   exactly ONE resetPaneForReconcileCreate with intent 'fresh'
+//   (pendingReconcile 'fresh', sessionRef cleared per the fresh semantics);
+//   and the kill-failure arm keeps the pane and card (same C shape). This
+//   pins that the second required action cannot silently skip the process
+//   kill or mis-wire the intent.
 ```
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
