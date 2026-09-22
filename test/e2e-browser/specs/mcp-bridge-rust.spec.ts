@@ -484,21 +484,55 @@ process.stdin.resume()
       //    fresh-agent owner (freshclaude resuming S over the fake SDK
       //    sidecar). The endpoint's 200 awaits the handoff's completion —
       //    the coordinator holds Live{FreshAgent} on (claude, S).
-      const handoffResp = await fetch(`${info.baseUrl}/api/sessions/handoff`, {
-        method: 'POST',
-        headers: {
-          'x-auth-token': info.token,
-          'content-type': 'application/json',
-        },
-        body: JSON.stringify({
-          provider: 'claude',
-          sessionId,
-          targetKind: 'fresh-agent',
-          sessionType: 'freshclaude',
-          cwd: projectDir,
-        }),
-      })
-      expect(handoffResp.status).toBe(200)
+      //
+      //    The pane layout clears terminalId as soon as the server observes
+      //    the dead peer, but the terminal lane's ownership stamp release
+      //    races the client's next request: a handoff POST that lands
+      //    inside that window gets the feature's own typed 409 with
+      //    ownerKind "terminal" — the designed coordination signal for
+      //    exactly this transient. Retry the typed terminal-owner refusal
+      //    (bounded) until the release settles; every OTHER 409 shape is a
+      //    real conflict and surfaces immediately.
+      let handoffResp: Response | null = null
+      let lastConflictSummary = 'no response'
+      const handoffDeadline = Date.now() + 15_000
+      for (;;) {
+        const attempt = await fetch(`${info.baseUrl}/api/sessions/handoff`, {
+          method: 'POST',
+          headers: {
+            'x-auth-token': info.token,
+            'content-type': 'application/json',
+          },
+          body: JSON.stringify({
+            provider: 'claude',
+            sessionId,
+            targetKind: 'fresh-agent',
+            sessionType: 'freshclaude',
+            cwd: projectDir,
+          }),
+        })
+        if (attempt.status === 200) {
+          handoffResp = attempt
+          break
+        }
+        const body = (await attempt.json().catch(() => null)) as
+          | (Record<string, unknown> & {
+              ownerKind?: string
+              code?: string
+              error?: { ownerKind?: string; code?: string }
+            })
+          | null
+        lastConflictSummary = JSON.stringify(body).slice(0, 300)
+        const transientTerminalOwner =
+          attempt.status === 409 &&
+          (body?.ownerKind === 'terminal' || body?.error?.ownerKind === 'terminal')
+        if (!transientTerminalOwner || Date.now() > handoffDeadline) {
+          handoffResp = attempt
+          break
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100))
+      }
+      expect(handoffResp.status, `handoff did not settle: ${lastConflictSummary}`).toBe(200)
       const handoffBody = (await handoffResp.json()) as { ok: boolean }
       expect(handoffBody.ok).toBe(true)
 
