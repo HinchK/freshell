@@ -196,9 +196,13 @@ Environment:
 Identity (cloud lanes only — details: docs/development/gcloud-robot.md):
   Cloud subcommands resolve a gcloud identity lazily, in this order:
   --account= > FRESHELL_GCP_ACCOUNT > GCLOUD_IDENT > gcloud-robot probe
-  (needs GCLOUD_ROBOT_HOME, the installed gcloud-robot skill directory)
+  (via GCLOUD_ROBOT_HOME, or the first well-known gcloud-robot skill
+  install: ~/.codex/skills/gcloud-robot, ~/.claude/skills/gcloud-robot,
+  ~/code/skill-gcloud-robot/gcloud-robot)
   > ambient gcloud (one quiet stderr note). GCLOUD_ROBOT_REQUIRE=1 fails
-  closed with guidance instead of the ambient fallback.
+  closed with guidance instead of the ambient fallback. Non-TTY (agent)
+  invocations disable gcloud prompts and preflight the credential, so a
+  dead identity fails in seconds instead of hanging.
 
 Cloud job lifecycle: each cloud run creates its OWN unique job
 (<prefix>-<commit>[-dirty]-<random>), executes it, and deletes it

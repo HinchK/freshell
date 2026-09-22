@@ -31,9 +31,12 @@ The repo is in exactly one of two states at any time:
    committed, but the robot SA/key do not exist yet. Expected behavior: lanes
    run exactly as before under ambient gcloud, with one quiet stderr note
    (`gcloud-robot: no probed identity; using ambient gcloud` / `skill not
-   found ... — using ambient gcloud`). In this state `verify-as-robot.sh`
-   failing at the key/token-mint rung is the CORRECT result, not a
-   regression — do not debug it, provision.
+   found ... — using ambient gcloud`). On machines with a well-known-path
+   install this state resolves the robot via discovery instead: the selector
+   runs, and a second stderr note (`gcloud-robot: well-known install at ...
+   produced no identity`) can appear when the probe fails. In this state
+   `verify-as-robot.sh` failing at the key/token-mint rung is the CORRECT
+   result, not a regression — do not debug it, provision.
 2. **provisioned and verified** — provisioning below completed and the
    verification ladder passed as the robot.
 
@@ -49,7 +52,10 @@ fixed order:
    no probe, no network.
 4. gcloud-robot probe — `$GCLOUD_ROBOT_HOME/scripts/select-gcloud-identity.sh`
    picks the first credentialed account passing the lane's live
-   `testIamPermissions` probe. The robot "just works" wherever its key is
+   `testIamPermissions` probe; when `GCLOUD_ROBOT_HOME` is unset the lanes
+   probe the first well-known skill install (`~/.codex/skills/gcloud-robot`,
+   `~/.claude/skills/gcloud-robot`, `~/code/skill-gcloud-robot/gcloud-robot`)
+   instead. The robot "just works" wherever its key is
    activated; human accounts keep working untouched.
 5. Ambient gcloud (default when nothing above resolves), announced once on
    stderr. Set `GCLOUD_ROBOT_REQUIRE=1` to fail closed with guidance instead
@@ -88,6 +94,13 @@ Deliberately NOT brokered, so do not "fix" their absence:
 - `oauth2.googleapis.com` token refresh — every other Google account on the
   machine refreshes through the same proxy; serving the broker's cached
   token to their refresh POSTs would corrupt client credential state.
+
+The identity preflight mints via `oauth2.googleapis.com`, which the gateway
+deliberately does not broker: on brokered hosts, a lane whose resolved
+identity has a dead LOCAL credential now fails fast at the preflight instead
+of succeeding silently via brokered control-plane hosts. Keep the robot key
+activated (`scripts/bootstrap-robot.sh`) or pin `GCLOUD_IDENT` on such
+machines.
 
 Consequence for operators: gcloud calls on a brokered host from
 garageserver run as the robot regardless of the active account — including
@@ -130,6 +143,10 @@ Facts on disk (garageserver):
   # Prefer the robot when several accounts pass the probe:
   export GCLOUD_ROBOT_ACCOUNT="gcloud-robot@misc-puttering-project.iam.gserviceaccount.com"
   ```
+
+  On machines with a standard install the `GCLOUD_ROBOT_HOME` export is
+  optional — the lanes probe the well-known locations in order when
+  `GCLOUD_ROBOT_HOME` is unset; an explicit export still wins.
 
 ### Provision (once per project, human-run — agents never run these)
 
@@ -392,6 +409,23 @@ for immediacy.)
   robot is not provisioned (or not activated) on this machine. Provision
   (above) or re-login interactively; both work, the point is the robot
   cannot be culled.
+- A dead resolved identity now fails a lane in seconds at the identity
+  preflight with the observable signature `[vitest-cloud]/[e2e-cloud]
+  ERROR: identity preflight failed for <identity> (source: <rung>) - gcloud
+  auth print-access-token could not mint a token.` — the preflight swallows
+  gcloud's own output, so the historical raw signature (`There was a problem
+  refreshing your current auth tokens: Reauthentication failed. cannot
+  prompt during non-interactive execution`) no longer appears on the
+  preflight path; it is what the preflight replaced. A lane under a real TTY
+  with a reauth-required HUMAN credential still blocks interactively on
+  `Reauthentication required.` / `Please enter your password:` (the prompt
+  class that produced the multi-hour incident; discovery moves this blockage
+  EARLIER, inside the resolve, with the selector's output swallowed) — pin
+  `GCLOUD_ROBOT_ACCOUNT` (the selector probes it first and never mints the
+  human) or `GCLOUD_IDENT` on PTY-launched agent lanes. A
+  `gcloud-robot: well-known install at ... produced no identity` note means
+  a standard install exists but its probe failed — see the selector's stderr
+  guidance.
 
 ### CI
 
