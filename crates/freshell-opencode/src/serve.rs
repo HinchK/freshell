@@ -1371,9 +1371,10 @@ impl OpencodeServeManager {
         }
     }
 
-    async fn discard_running(&self, _reason: &str) {
+    async fn discard_running(&self, reason: &str) {
         let taken = self.inner.running.lock().await.take();
         if let Some(running) = taken {
+            tracing::warn!(reason = reason, "freshagent.opencode.daemon_discarded");
             running.process.kill();
         }
         self.emit_lost_for_all();
@@ -1803,7 +1804,8 @@ mod tests {
     /// responses: healthy probes, summarize per `summarize_status` (or a NEVER-resolving
     /// response when `summarize_pending` — the wedged shape from
     /// `tests/serve_health_bounded.rs`), fork per `fork_status`/`fork_body`, `/config`
-    /// per `config_body` (or never-resolving when `config_pending`), everything else a
+    /// per `config_body` (or never-resolving when `config_pending`), `/prompt_async`
+    /// never-resolving when `prompt_pending`, everything else a
     /// benign 200 `{}`. Per-request timeouts land in the index-aligned
     /// [`RecordingHttp::timeouts`] vec (`requests[i]`'s timeout is `timeouts[i]`).
     struct RecordingHttp {
@@ -1816,6 +1818,7 @@ mod tests {
         config_body: Vec<u8>,
         config_pending: bool,
         revert_status: u16,
+        prompt_pending: bool,
     }
 
     impl RecordingHttp {
@@ -1830,6 +1833,7 @@ mod tests {
                 config_body: br#"{"model":null}"#.to_vec(),
                 config_pending: false,
                 revert_status: 200,
+                prompt_pending: false,
             }
         }
 
@@ -1913,6 +1917,14 @@ mod tests {
                 }
                 let body = self.config_body.clone();
                 return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
+            if req.url.contains("/prompt_async") && self.prompt_pending {
+                // A genuine wedge: the response NEVER resolves — only the
+                // caller's per-request bound can settle it.
+                return Box::pin(async {
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                });
             }
             Box::pin(async move { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) })
         }
@@ -2929,6 +2941,61 @@ mod tests {
             events[0].values().all(|v| !v.contains("plugin-x")),
             "no content substring survives into the warning: {:?}",
             events[0]
+        );
+    }
+
+    /// 2026-09-20 incident: the daemon discard that killed the shared serve left
+    /// ZERO log trace (its reason parameter went unused), so the shared-daemon
+    /// death was undiagnosable from the structured JSONL log. The discard must
+    /// be observable: a WARN `freshagent.opencode.daemon_discarded` naming its
+    /// reason. Driven through `prompt_async` — a deliberate
+    /// `DiscardOnTimeout::Yes` lane — so a pending prompt POST times out and
+    /// takes the discard path.
+    #[tokio::test]
+    async fn discard_running_emits_a_structured_warn_with_its_reason() {
+        let killed = Arc::new(AtomicUsize::new(0));
+        let http = Arc::new(RecordingHttp {
+            prompt_pending: true,
+            ..RecordingHttp::new()
+        });
+        let config = ServeConfig {
+            request_timeout: Duration::from_millis(50),
+            ..ServeConfig::default()
+        };
+        let (events, _guard) = config_capture::capture();
+        let mgr = started_recording_manager_counting_kills(http, config, killed.clone()).await;
+
+        let err = mgr
+            .prompt_async(
+                "ses_discard",
+                build_prompt_body("hi", None, None),
+                &None,
+                None,
+            )
+            .await
+            .expect_err("the prompt POST must time out");
+        assert!(
+            matches!(err, ServeError::RequestTimeout { .. }),
+            "got {err:?}"
+        );
+        // The discard itself ran: the Yes-lane timeout took the daemon down.
+        assert_eq!(
+            killed.load(Ordering::SeqCst),
+            1,
+            "the discard must actually kill the running daemon here"
+        );
+        let events = events.lock().expect("capture lock");
+        let discard = events
+            .iter()
+            .find(|fields| {
+                fields.get("message").map(String::as_str)
+                    == Some("freshagent.opencode.daemon_discarded")
+            })
+            .expect("a daemon discard must emit freshagent.opencode.daemon_discarded");
+        assert_eq!(
+            discard.get("reason").map(String::as_str),
+            Some("request_timeout"),
+            "the discard warn carries its reason: {discard:?}"
         );
     }
 
