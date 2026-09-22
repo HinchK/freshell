@@ -102,7 +102,7 @@ export const store = configureStore({
       serializableCheck: {
         ignoredPaths: ['sessions.expandedProjects'],
       },
-    }    ).concat(
+    }).concat(
       paneSelectionMiddleware,
       perfMiddleware,
       tabFallbackIdentityMiddleware,
