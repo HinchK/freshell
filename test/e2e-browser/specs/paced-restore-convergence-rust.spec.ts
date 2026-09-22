@@ -40,15 +40,15 @@
  * assertion is satisfied and the pinned path is the one the incident
  * actually exercised.
  *
- * Scenario 4 mechanism note (the task-5 M-3 carry): there is no WS-level
- * fault-injection seam in helpers/; the honest page-level seam is the
- * harness's own forceDisconnect loop. A converged pane is idle, so the
- * reconnect's keyless delta re-attaches with NO coverage progress, and each
- * flap's reconcile round adds its episode-keyed re-drives (collapsed to one
- * counted attempt per flap by the recovery accounting's M-1 rule). The
- * recovery bound (TERMINAL_RECOVERY_MAX_ATTEMPTS = 3) must stop the
- * automatic cycling once the attempts are spent and surface the visible
- * retry strip instead of looping — then an explicit retry re-arms it.
+  * Scenario 4 mechanism note (the task-5 M-3 carry): there is no WS-level
+  * fault-injection seam in helpers/; the honest page-level seam is the
+  * harness's own forceDisconnect loop. A converged pane is idle, so the
+  * reconnect's keyless delta re-attaches with NO coverage progress; the
+  * flap's reconcile round confirms the unchanged identity and re-drives
+  * nothing (task-009b), so each flap costs one counted keyless attempt.
+  * The recovery bound (TERMINAL_RECOVERY_MAX_ATTEMPTS = 3) must stop the
+  * automatic cycling once the attempts are spent and surface the visible
+  * retry strip instead of looping — then an explicit retry re-arms it.
  *
  * Scenario 5 mechanism note: "any spill produces the honest gap notice" —
  * on the NEGOTIATED browser lane a spill is structurally unreachable
@@ -740,7 +740,7 @@ test.describe('paced-restore convergence (incident-shaped, rust)', () => {
     }
   })
 
-  test('mid-restore client-side disconnect resumes from coverage checkpoints without a refetch', async ({ browser }, testInfo) => {
+  test('mid-restore client-side disconnect resumes from coverage checkpoints with zero superseding refetches (in-flight-writes quarantine excepted)', async ({ browser }, testInfo) => {
     const targetIndex = 1
     const incident = await bootIncident(browser, { activeIndex: targetIndex })
     try {
@@ -792,6 +792,27 @@ test.describe('paced-restore convergence (incident-shaped, rust)', () => {
         (event) => event.event === 'terminal.catchup.full_hydrate_fallback'
           && String((event as Record<string, unknown>).terminalId ?? '') === targetTerminalId,
       )
+      const hydrateAttaches = targetAttaches.filter((m) => m.intent === 'viewport_hydrate')
+      // Zero superseding refetches (task-009b, goal 4): the ONLY tolerated
+      // hydrate is the in-flight-writes quarantine — a write still mutating
+      // the surface at attach time freezes the checkpoint decision
+      // (terminal.catchup.full_hydrate_fallback reason 'in_flight_writes' /
+      // terminal.catchup.surface_quarantined), and the drained repair ALWAYS
+      // rebuilds once more (surface_quarantine_repair, M-2): at most the
+      // quarantined attach plus its repair rebuild. Any hydrate outside that
+      // shape is a supersede regression.
+      const quarantineAdmitted = perfSnapshot.some(
+        (event) => {
+          const record = event as Record<string, unknown>
+          return String(record.terminalId ?? '') === targetTerminalId
+            && (
+              (event.event === 'terminal.catchup.full_hydrate_fallback'
+                && record.reason === 'in_flight_writes')
+              || event.event === 'terminal.catchup.surface_quarantined'
+            )
+        },
+      )
+
       // Diagnostics-first: this evidence lands even when an assertion below
       // fails, so the failure is self-explaining (attach intents + any
       // warm-delta fallback reasons observed on the wire).
@@ -802,24 +823,31 @@ test.describe('paced-restore convergence (incident-shaped, rust)', () => {
         observedLine,
         targetAttaches,
         hydrateFallbackEvents: targetFallbacks,
+        supersedingHydrateAttaches: hydrateAttaches.length,
+        quarantineAdmitted,
       })
       expect(targetAttaches.length, 'a terminal.attach for the target pane after the reconnect').toBeGreaterThan(0)
       const deltaAttaches = targetAttaches.filter(
         (m) => m.intent === 'transport_reconnect' && typeof m.sinceSeq === 'number' && m.sinceSeq > 0,
       )
       expect(deltaAttaches, 'a sinceSeq > 0 transport_reconnect delta attach').not.toEqual([])
-      // Bounded re-drive, never a storm: one reconnect carries the checkpoint
-      // delta plus at most the reconnect's ONE reconcile round re-driving the
-      // pane (the pending-window-open and verdict-fold attaches, each
-      // deliberately keyed as one recovery episode — the recovery accounting
-      // collapses same-key attaches; see terminal-recovery-accounting M-1).
-      // The incident's failure shape was UNBOUNDED repetition; a bounded pair
-      // of paced re-drives that converge is the current contract.
-      const hydrateAttaches = targetAttaches.filter((m) => m.intent === 'viewport_hydrate')
-      expect(
-        hydrateAttaches.length,
-        'no unbounded refetch storm: at most the one reconcile round of re-drives',
-      ).toBeLessThanOrEqual(2)
+      // The checkpoint delta resume is authoritative: the reconnect's
+      // reconcile round (App re-sends pane.reconcile on every ready)
+      // confirms the pane's unchanged identity and must NOT re-drive a full
+      // viewport_hydrate — the pre-fix behavior superseded the delta with up
+      // to two sinceSeq:0 refetches per pane per flap (the pending-window
+      // re-drive and the verdict-fold re-drive).
+      if (!quarantineAdmitted) {
+        expect(
+          hydrateAttaches.length,
+          'zero superseding viewport_hydrate refetches for a healthy-checkpoint flap',
+        ).toBe(0)
+      } else {
+        expect(
+          hydrateAttaches.length,
+          'quarantine-bounded: at most the quarantined attach plus its drained repair rebuild',
+        ).toBeLessThanOrEqual(2)
+      }
 
       // The previously-visible content survives the disconnect — the surface
       // is preserved (no blank-then-refetch wipe).
@@ -956,12 +984,13 @@ test.describe('paced-restore convergence (incident-shaped, rust)', () => {
 
       // Four client-side disconnects in a row on an IDLE pane. Each flap
       // re-attaches with zero coverage progress: the reconnect's keyless
-      // transport_reconnect delta plus the flap's reconcile round
-      // (pending-window-open + verdict-fold re-drives, one counted episode
-      // key per flap). The recovery bound (TERMINAL_RECOVERY_MAX_ATTEMPTS =
-      // 3) must STOP the automatic cycling once the attempts are spent —
-      // visible in the strip, never a loop, never a kill. Four flaps give
-      // margin over where exactly the bound lands.
+      // transport_reconnect delta. The flap's reconcile round CONFIRMS the
+      // pane's unchanged identity and re-drives nothing (task-009b) — one
+      // counted keyless attempt per flap. The recovery bound
+      // (TERMINAL_RECOVERY_MAX_ATTEMPTS = 3) must STOP the automatic cycling
+      // once the attempts are spent — visible in the strip, never a loop,
+      // never a kill. Four flaps give margin over where exactly the bound
+      // lands.
       for (let i = 0; i < 4; i += 1) {
         await harness.forceDisconnect()
         await harness.waitForConnection()

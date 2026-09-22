@@ -3,7 +3,13 @@ import { act, render, cleanup, waitFor, screen, fireEvent, within } from '@testi
 import { configureStore } from '@reduxjs/toolkit'
 import { Provider } from 'react-redux'
 import tabsReducer, { setActiveTab } from '@/store/tabsSlice'
-import panesReducer, { removeLayout, requestPaneRefresh, setPaneCloseError } from '@/store/panesSlice'
+import panesReducer, {
+  removeLayout,
+  requestPaneRefresh,
+  setPaneCloseError,
+  applyReconcileAttach,
+  setReconcilePendingPanes,
+} from '@/store/panesSlice'
 import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/settingsSlice'
 import connectionReducer, { setStatus as setConnectionStatus } from '@/store/connectionSlice'
 import freshAgentReducer, { applyRuntimeOwner } from '@/store/freshAgentSlice'
@@ -5435,9 +5441,17 @@ describe('TerminalView lifecycle updates', () => {
       refreshOnMount?: boolean
       sessionRef?: TerminalPaneContent['sessionRef']
       serverInstanceId?: string
+      /** Pane CONTENT's serverInstanceId (the fold-identity field the
+       * checkpoint identity uses first; distinct from the connection-level
+       * `serverInstanceId` opt). */
+      contentServerInstanceId?: string
       streamId?: string
       waitForMessageHandler?: boolean
       waitForTerminalInstance?: boolean
+      /** Render through the store-connected wrapper (the real
+       * PaneContainer's wiring) so store-only content folds — reconcile
+       * verdicts — re-render the pane and re-fire the lifecycle effect. */
+      fromStore?: boolean
     }) {
       const tabId = 'tab-v2-stream'
       const paneId = 'pane-v2-stream'
@@ -5458,6 +5472,7 @@ describe('TerminalView lifecycle updates', () => {
         ...(terminalId ? { terminalId } : {}),
         ...(opts?.sessionRef ? { sessionRef: opts.sessionRef } : {}),
         ...(opts?.streamId ? { streamId: opts.streamId } : {}),
+        ...(opts?.contentServerInstanceId ? { serverInstanceId: opts.contentServerInstanceId } : {}),
       }
 
       const root: PaneNode = { type: 'leaf', id: paneId, content: paneContent }
@@ -5511,8 +5526,10 @@ describe('TerminalView lifecycle updates', () => {
 
       const view = render(
         <Provider store={store}>
-          <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} hidden={opts?.hidden} />
-        </Provider>
+          {opts?.fromStore
+            ? <TerminalViewFromStore tabId={tabId} paneId={paneId} hidden={opts?.hidden} />
+            : <TerminalView tabId={tabId} paneId={paneId} paneContent={paneContent} hidden={opts?.hidden} />}
+        </Provider>,
       )
 
       if (opts?.waitForMessageHandler !== false) {
@@ -11226,6 +11243,216 @@ describe('TerminalView lifecycle updates', () => {
       // Never a delta resume out of the drained repair — the surface
       // provably moved during the frozen window.
       expect(repairAttach).not.toMatchObject({ intent: 'transport_reconnect' })
+      })
+    })
+
+    // Task-009b (goal 4 — "reconnect resumes from applied progress"): the
+    // reconnect's reconcile round (App re-sends pane.reconcile on EVERY
+    // ready) must never supersede the checkpoint delta resume with a full
+    // viewport_hydrate refetch. The wire blueprint is the e2e trace
+    // `transport_reconnect sinceSeq: 254` followed by a superseding
+    // `viewport_hydrate sinceSeq: 0`.
+    describe('reconcile re-drives stay resume-aware across a healthy-checkpoint flap', () => {
+      // The resume-aware re-drive contract is negotiated-lane
+      // (pacedTerminalReplayV1): production flaps re-attach on a ready,
+      // capability-echoed connection, so the current attach generation is a
+      // paced one. The old-server lane is pinned separately below.
+      beforeEach(() => {
+        wsMocks.capabilities = { pacedTerminalReplayV1: true }
+      })
+
+      function attachMessagesFor(terminalId: string) {
+        return sentMessages().filter((msg) => msg?.type === 'terminal.attach' && msg.terminalId === terminalId)
+      }
+
+      function terminalWrites(term: { write: { mock: { calls: Array<[unknown]> } } }): string {
+        return term.write.mock.calls.map(([data]) => String(data)).join('')
+      }
+
+      async function renderReconcileFlapPane(suffix: string) {
+        const terminalId = `term-9b-${suffix}`
+        const harness = await renderTerminalHarness({
+          status: 'running',
+          terminalId,
+          streamId: `stream-9b-${suffix}`,
+          sessionRef: { provider: 'claude', sessionId: `s-9b-${suffix}` },
+          contentServerInstanceId: 'srv-9b',
+          ackInitialAttach: false,
+          clearSends: false,
+          fromStore: true,
+        })
+        return { ...harness, terminalId, tabId: 'tab-v2-stream', paneId: 'pane-v2-stream' }
+      }
+
+      // Apply frames 1..4 through the real attach pipeline: the coverage
+      // cursor advances and the surface checkpoint saves — the healthy
+      // baseline the flap's delta resume (and any re-drive) consults.
+      async function applyCheckpointBaseline(terminalId: string, term: { write: { mock: { calls: Array<[unknown]> } } }) {
+        act(() => {
+          messageHandler!({
+            type: 'terminal.attach.ready',
+            terminalId,
+            headSeq: 4,
+            replayFromSeq: 1,
+            replayToSeq: 4,
+          })
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 4, data: 'SEED' })
+        })
+        expect(terminalWrites(term)).toBe('SEED')
+      }
+
+      it('a healthy-checkpoint flap never supersedes the checkpoint delta resume with a viewport_hydrate refetch', async () => {
+        const { store, terminalId, term } = await renderReconcileFlapPane('flap')
+        await applyCheckpointBaseline(terminalId, term)
+        term.clear.mockClear()
+        wsMocks.send.mockClear()
+
+        // The transport flap: onReconnect fires the checkpoint delta resume
+        // (transport_reconnect, sinceSeq>0 from the coverage cursor) and the
+        // attach stays IN FLIGHT — no attach.ready — so the pane's deferred
+        // mode is 'attaching' for everything that follows.
+        act(() => { reconnectHandler?.() })
+        const deltaAttach = attachMessagesFor(terminalId).at(-1)
+        expect(deltaAttach).toMatchObject({ intent: 'transport_reconnect', sinceSeq: 4 })
+
+        // The reconnect's ready round, exactly as App sends it: the pending
+        // window opens (setReconcilePendingPanes), then the server's attach
+        // verdict CONFIRMS the pane's exact current identity — same
+        // terminalId, same server instance, same sessionRef, no
+        // corrected/duplicate flags.
+        act(() => {
+          store.dispatch(setReconcilePendingPanes({
+            paneKeys: ['tab-v2-stream:pane-v2-stream'],
+            startedAt: Date.now(),
+          }))
+        })
+        act(() => {
+          store.dispatch(applyReconcileAttach({
+            tabId: 'tab-v2-stream',
+            paneId: 'pane-v2-stream',
+            terminalId,
+            serverInstanceId: 'srv-9b',
+            sessionRef: { provider: 'claude', sessionId: 's-9b-flap' },
+          }))
+        })
+
+        // Goal 4: the checkpoint delta resume stays authoritative. No
+        // superseding viewport_hydrate (sinceSeq 0 full refetch) follows it
+        // — neither from the pending-window re-drive nor from the verdict
+        // fold — and the delta is the flap's only attach.
+        const attaches = attachMessagesFor(terminalId)
+        expect(
+          attaches.filter((m) => m.intent === 'viewport_hydrate'),
+          'no superseding full refetch after the delta resume',
+        ).toEqual([])
+        expect(attaches, 'the delta resume is the flap’s only attach').toHaveLength(1)
+
+        // The delta completes on the SAME surface: content preserved (no
+        // wipe) and the remainder applies with no duplicate writes.
+        act(() => {
+          messageHandler!({
+            type: 'terminal.attach.ready',
+            terminalId,
+            headSeq: 8,
+            replayFromSeq: 5,
+            replayToSeq: 8,
+          })
+          messageHandler!({ type: 'terminal.output', terminalId, seqStart: 5, seqEnd: 8, data: ' TAIL' })
+        })
+        expect(terminalWrites(term)).toBe('SEED TAIL')
+        expect(term.clear).not.toHaveBeenCalled()
+      })
+
+      it('a corrective duplicate verdict re-drives as a checkpoint delta, never a full refetch', async () => {
+        const { store, terminalId } = await renderReconcileFlapPane('dup')
+        const term = terminalInstances[terminalInstances.length - 1]
+        await applyCheckpointBaseline(terminalId, term)
+        wsMocks.send.mockClear()
+
+        act(() => { reconnectHandler?.() })
+        expect(attachMessagesFor(terminalId).at(-1)).toMatchObject({ intent: 'transport_reconnect', sinceSeq: 4 })
+
+        // A corrective verdict (duplicate flag) still bumps the epoch and
+        // re-drives the pane — but the re-drive must RESUME the same
+        // healthy surface instead of refetching it whole.
+        act(() => {
+          store.dispatch(applyReconcileAttach({
+            tabId: 'tab-v2-stream',
+            paneId: 'pane-v2-stream',
+            terminalId,
+            serverInstanceId: 'srv-9b',
+            sessionRef: { provider: 'claude', sessionId: 's-9b-dup' },
+            duplicate: true,
+          }))
+        })
+
+        const reDrive = attachMessagesFor(terminalId).at(-1)
+        expect(reDrive, 'the corrective re-drive resumes from the checkpoint').toMatchObject({ intent: 'keepalive_delta' })
+        expect(
+          attachMessagesFor(terminalId).filter((m) => m.intent === 'viewport_hydrate'),
+          'a same-surface corrective verdict never refetches',
+        ).toEqual([])
+      })
+
+      it('a foreign-identity corrective verdict still re-drives with the honest full hydrate', async () => {
+        const { store, terminalId } = await renderReconcileFlapPane('foreign')
+        const term = terminalInstances[terminalInstances.length - 1]
+        await applyCheckpointBaseline(terminalId, term)
+        wsMocks.send.mockClear()
+
+        act(() => { reconnectHandler?.() })
+        expect(attachMessagesFor(terminalId).at(-1)).toMatchObject({ intent: 'transport_reconnect', sinceSeq: 4 })
+
+        // The verdict corrects the pane onto a DIFFERENT live terminal: the
+        // repair must still re-drive, and this pane holds no checkpoint for
+        // the foreign terminal's surface — the honest full hydrate.
+        act(() => {
+          store.dispatch(applyReconcileAttach({
+            tabId: 'tab-v2-stream',
+            paneId: 'pane-v2-stream',
+            terminalId: 'term-9b-other',
+            serverInstanceId: 'srv-9b',
+          }))
+        })
+
+        const repairAttaches = sentMessages().filter(
+          (m) => m?.type === 'terminal.attach' && m.terminalId === 'term-9b-other',
+        )
+        expect(repairAttaches.at(-1)).toMatchObject({ intent: 'viewport_hydrate', sinceSeq: 0 })
+      })
+
+      it('a non-negotiated (old-server) pane keeps today’s full re-drive chain, bounded at the recovery accounting', async () => {
+        wsMocks.capabilities = {} // no paced replay: byte-identical legacy lane
+        const { store, terminalId, term } = await renderReconcileFlapPane('legacy')
+        await applyCheckpointBaseline(terminalId, term)
+        wsMocks.send.mockClear()
+
+        act(() => { reconnectHandler?.() })
+        expect(attachMessagesFor(terminalId).at(-1)).toMatchObject({ intent: 'transport_reconnect', sinceSeq: 4 })
+
+        act(() => {
+          store.dispatch(setReconcilePendingPanes({
+            paneKeys: ['tab-v2-stream:pane-v2-stream'],
+            startedAt: Date.now(),
+          }))
+        })
+        act(() => {
+          store.dispatch(applyReconcileAttach({
+            tabId: 'tab-v2-stream',
+            paneId: 'pane-v2-stream',
+            terminalId,
+            serverInstanceId: 'srv-9b',
+            sessionRef: { provider: 'claude', sessionId: 's-9b-legacy' },
+          }))
+        })
+
+        // Old-server contract (unchanged by task-009b): the reconcile round
+        // still re-drives the pane — the mode-heuristic viewport_hydrates
+        // today's code sends, one per pending-window transition, bounded by
+        // the recovery accounting — exactly today's wire shape.
+        const hydrates = attachMessagesFor(terminalId).filter((m) => m.intent === 'viewport_hydrate')
+        expect(hydrates).toHaveLength(2)
+        expect(hydrates.every((m) => m.sinceSeq === 0)).toBe(true)
       })
     })
 

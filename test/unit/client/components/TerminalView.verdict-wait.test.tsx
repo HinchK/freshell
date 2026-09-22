@@ -17,8 +17,16 @@ import { paneKeyFor } from '@/lib/pane-reconcile'
 // A hydrated pane that is reconcile-pending must NOT fire its mount-time
 // terminal.create until its verdict folds -- bounded by
 // RECONCILE_VERDICT_WAIT_MS, then falling back to the legacy eager create.
-// The attach branch is NEVER gated. The reconnect re-drive is gated too
-// (V3 caveat: mid-window WS flap).
+// The attach branch is NEVER gated by the pre-verdict wait. The reconnect
+// re-drive is gated too (V3 caveat: mid-window WS flap).
+// task-009b (goal 4): on the NEGOTIATED lane (this suite's ws stub has no
+// capability echo, so it pins the old-server lane), a reconcile round that
+// confirms an unchanged live identity no longer re-attaches an in-motion
+// pane — the reconnect's own attach stays authoritative, and only a
+// CORRECTIVE fold re-drives. The negotiated contract is pinned in
+// TerminalView.lifecycle.test.tsx's task-009b describe; this suite keeps
+// today's non-negotiated re-drive chain byte-identical, including the M-1
+// episode accounting for a no-change fold's closing re-drive.
 //
 // Mounting scaffold copied from TerminalView.session-reserved.test.tsx.
 
@@ -257,6 +265,10 @@ describe('TerminalView pre-verdict create wait (reload-path race, terminal leg)'
   })
 
   it('allows the three deliberate live-terminal attach sources after reconnect', async () => {
+    // This suite's ws stub has no capability echo — the NON-NEGOTIATED lane,
+    // where task-009b keeps today's re-drive chain byte-identical (the
+    // resume-aware zero-supersede gate is negotiated-lane only; the paced
+    // describe in TerminalView.lifecycle.test.tsx pins that contract).
     const { store } = await renderTerminalPane({ terminalId: 'term-1', status: 'running' })
     wsHarness.send.mockClear() // exclude the mount attach from this reconnect episode
 
@@ -281,6 +293,10 @@ describe('TerminalView pre-verdict create wait (reload-path race, terminal leg)'
   })
 
   it('a legitimate reconcile episode does not exhaust the recovery bound (M-1): one reconnect + one episode + one further re-attach never shows the retry strip', async () => {
+    // Non-negotiated lane (see the test above): the episode collapse must
+    // keep charging the round ONE counted attempt whether or not the fold
+    // bumped the epoch (a no-change fold skips the bump but its re-drive is
+    // still the same episode's closing attach).
     const { store } = await renderTerminalPane({ terminalId: 'term-1', status: 'running' })
     wsHarness.send.mockClear() // exclude the mount attach (initial hydration, exempt)
 

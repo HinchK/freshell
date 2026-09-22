@@ -666,7 +666,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // (the pending mark or the verdict fold) — deliberate pane lifecycle,
   // not recovery cycling. The derived per-episode key collapses every
   // attach of ONE reconcile episode into a single counted attempt.
-  const reconcileDriveStateRef = useRef<{ pendingSince: number | undefined; epoch: number } | null>(null)
+  // task-009b: the anchor also records the identity it ran with
+  // (createRequestId + terminalId) so a later re-run can tell a
+  // reconcile-bookkeeping-only re-drive (nothing about the pane changed)
+  // from a fold that must re-attach.
+  const reconcileDriveStateRef = useRef<{
+    pendingSince: number | undefined
+    epoch: number
+    createRequestId: string | undefined
+    terminalId: string | undefined
+  } | null>(null)
   // Branch-5 / reconcile-verdict interaction (design invariant 7): a pane
   // listed in the dead-session adjudication panel is owned by the user's
   // explicit panel decision -- the INVALID_TERMINAL_ID auto-recovery must
@@ -3970,10 +3979,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
 
       // Reconcile-episode key derivation (M-1), BEFORE any early return so
       // the anchor updates on EVERY effect run: an attach fired because the
-      // pending window OPENED, because the verdict FOLDED (pending cleared +
-      // epoch bumped), or because a fold landed without a pending window,
-      // carries the episode's key into the recovery gate. Keyless runs
-      // (mount, transport reconnects, other dep changes) count normally.
+      // pending window OPENED, because the verdict FOLDED (pending cleared —
+      // epoch bumped for corrective folds, unchanged for the task-009b
+      // no-change folds whose re-drive still fires on the non-negotiated
+      // lane), or because a fold landed without a pending window, carries
+      // the episode's key into the recovery gate. Keyless runs (mount,
+      // transport reconnects, other dep changes) count normally.
       const reconcileEpoch = terminalContent?.reconcileEpoch ?? 0
       const previousReconcileDrive = reconcileDriveStateRef.current
       let reconcileAttemptKey: string | undefined
@@ -3985,10 +3996,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         } else if (
           reconcilePendingSince === undefined
           && previousReconcileDrive.pendingSince !== undefined
-          && reconcileEpoch !== previousReconcileDrive.epoch
         ) {
-          // The verdict fold (applyReconcileAttach): pending cleared + epoch
-          // bumped — the SAME episode's closing attach.
+          // The window this run closes (the verdict fold — or its bounded
+          // timeout release) is the SAME episode's closing attach, whether
+          // or not the fold bumped the epoch.
           reconcileAttemptKey = `pending:${previousReconcileDrive.pendingSince}`
         } else if (reconcileEpoch !== previousReconcileDrive.epoch) {
           // A fold without a pending window (the exhaustion reconcile, the
@@ -3997,7 +4008,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           reconcileAttemptKey = `epoch:${reconcileEpoch}`
         }
       }
-      reconcileDriveStateRef.current = { pendingSince: reconcilePendingSince, epoch: reconcileEpoch }
+      reconcileDriveStateRef.current = {
+        pendingSince: reconcilePendingSince,
+        epoch: reconcileEpoch,
+        createRequestId,
+        terminalId: terminalIdRef.current,
+      }
 
       const failLaunch = (message: string, restore: boolean, terminalId?: string) => {
         clearRateLimitRetry()
@@ -6126,7 +6142,56 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           // progressive background hydration.
           registerForBackgroundHydration()
         } else {
-          const intent: AttachIntent = deferredAttachStateRef.current.mode === 'live'
+          // Goal-4 re-drive gate (task-009b): a reconcile-driven re-run whose
+          // pane identity is unchanged — the ready round's pending-window
+          // opening, or a no-change verdict fold closing it
+          // (applyReconcileAttach skips the epoch bump for no-change folds)
+          // — must NOT re-attach a pane whose attach lifecycle is already in
+          // motion. The old mode heuristic re-fired a viewport_hydrate here
+          // on every reconnect flap and superseded the in-flight checkpoint
+          // delta resume with a full refetch. Scoped to the negotiated
+          // (paced-replay) lane AND to a current attach generation that was
+          // itself built post-negotiation (pacedReplayRef is absent for
+          // non-negotiated attaches): a pre-ready MOUNT attach carries the
+          // legacy 128 KiB truncation budget, and the re-drive chain was
+          // load-bearing as the repair that replaced it with the full paced
+          // restore — such a pane must still re-drive. Old servers
+          // (no paced replay) keep today's exact re-drive chain. Corrective
+          // folds (epoch changed), identity changes, and an un-anchored pane
+          // (mode 'none') always re-drive below.
+          const deferredMode = deferredAttachStateRef.current.mode
+          const reconcileNoopRedrive = isPacedReplayNegotiated()
+            && pacedReplayRef.current !== null
+            && previousReconcileDrive !== null
+            && reconcileEpoch === previousReconcileDrive.epoch
+            && reconcilePendingSince !== previousReconcileDrive.pendingSince
+            && createRequestId === previousReconcileDrive.createRequestId
+            && currentTerminalId === previousReconcileDrive.terminalId
+            && (deferredMode === 'live' || deferredMode === 'attaching')
+          if (reconcileNoopRedrive) {
+            if (debugRef.current) {
+              log.debug('[TRACE resumeSessionId] skipping reconcile re-drive: identity unchanged, attach lifecycle in motion', {
+                paneId: paneIdRef.current,
+                terminalId: currentTerminalId,
+                reconcileEpoch,
+                reconcilePendingSince,
+                deferredMode,
+              })
+            }
+            return
+          }
+          // Checkpoint-aware re-drive intent (task-009b): a corrective fold
+          // that lands mid-attach used to pick viewport_hydrate off the
+          // 'attaching' mode alone and refetch the whole retained buffer;
+          // on the negotiated lane, with a healthy checkpoint for THIS
+          // surface, the re-drive resumes instead (attachTerminal's internal
+          // geometry-aware decision still falls back to viewport_hydrate
+          // when the checkpoint is unusable — the same contract as the
+          // hidden branch above). Non-negotiated connections keep the mode
+          // heuristic exactly.
+          const checkpointDecision = getCheckpointDeltaReplayDecision(currentTerminalId)
+          const intent: AttachIntent = deferredMode === 'live'
+            || (isPacedReplayNegotiated() && checkpointDecision.ok)
             ? 'keepalive_delta'
             : 'viewport_hydrate'
           attachTerminal(currentTerminalId, intent, {
