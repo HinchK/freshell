@@ -1000,7 +1000,11 @@ impl SessionNames {
     pub(crate) fn native_work_snapshot(&self) -> Vec<crate::session_name_native::NativeWorkItem> {
         let view = self.core.current_view();
         let document = &view.document;
-        let now = now_ms();
+        // Delta-review round 3, finding 7: the offset-aware decision clock,
+        // exactly like generation_work_snapshot — the real-clock now_ms()
+        // made the due filter ignore the test ClockOffsetMs hook its
+        // clock-controlled sibling tests rely on.
+        let now = effective_now_ms(&self.core.data_dir);
         let mut items = Vec::new();
         for (key, state) in &document.native_write {
             if state.settled || state.cycles_consumed >= MAX_NATIVE_CYCLES {

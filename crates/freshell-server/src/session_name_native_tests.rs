@@ -1352,6 +1352,63 @@ async fn the_selector_orders_due_work_by_earliest_next_due() {
     );
 }
 
+/// Delta-review round 3, finding 7: `native_work_snapshot` must read the
+/// same test-offset-aware decision clock (`effective_now_ms`) as its
+/// sibling `generation_work_snapshot`. The real-clock `now_ms()` made the
+/// due filter ignore the `ClockOffsetMs` hook, so a clock-controlled
+/// native test could never advance virtual time through the snapshot's due
+/// gate (the claim path already uses the effective clock via TxnMeta).
+#[tokio::test]
+async fn native_work_snapshot_reads_the_test_offset_aware_clock() {
+    let dir = temp_data_dir();
+    crate::session_names::set_test_hooks(
+        dir.path(),
+        vec![crate::session_names::TestHook::NativeRetryFloorMs(60)],
+    );
+    let store = open_store(dir.path());
+    let target = armed_pending(&store, "h-clock", "/h/.claude").await;
+
+    // Consume cycle 1 and fold an undelivered failure: the retry becomes due
+    // 60ms after the fold (the effective decision clock stamps the fold).
+    let claim = store
+        .claim_native_cycle(target.clone(), "cycle-1".to_string())
+        .await
+        .unwrap()
+        .expect("cycle 1 claims — an armed series is immediately ready");
+    store
+        .fold_native_outcome(
+            target.clone(),
+            claim.location_revision,
+            claim.series_epoch,
+            NativeOutcomeFold::Undelivered {
+                reason: "connect refusal".to_string(),
+            },
+        )
+        .await
+        .expect("failure folds a record update");
+
+    // Not yet due on the wall clock: the snapshot stays empty.
+    assert!(
+        store.native_work_snapshot().is_empty(),
+        "cycle 2 waits for the retry floor"
+    );
+
+    // Advance virtual time past the floor: the offset-aware due filter must
+    // admit the retry (the real wall clock has NOT moved 60s).
+    crate::session_names::set_test_hooks(
+        dir.path(),
+        vec![
+            crate::session_names::TestHook::NativeRetryFloorMs(60),
+            crate::session_names::TestHook::ClockOffsetMs(60_000),
+        ],
+    );
+    let items = store.native_work_snapshot();
+    assert!(
+        items.iter().any(|item| item.target == target),
+        "the offset-aware clock admits the due native retry"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Task 3 fix round: the writeback contract's behavioral reds and pins.
 // ---------------------------------------------------------------------------
