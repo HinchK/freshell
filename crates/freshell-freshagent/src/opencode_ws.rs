@@ -4503,6 +4503,17 @@ impl FreshOpencodeState {
             return;
         }
 
+        // fresheyes ep2-r2 Major (the transitional-window dead bridge): the
+        // commit landed, so the child is now visible to every future
+        // revival trigger — but the triggers that fired inside the
+        // construction window are already spent. The rescue tail re-checks
+        // the bridge HERE, before the success reply: an operation must
+        // never answer success over a bridge its own window got killed
+        // (daemon loss swept the just-subscribed sender; the one-shot
+        // `Started` revival skipped the unpublished/`Starting` child).
+        self.rescue_transitional_bridge_after_commit(&child.id)
+            .await;
+
         reply_sink(ServerMessage::FreshAgentForked(FreshAgentForked {
             request_id: msg.request_id.clone(),
             parent_session_id: msg.session_id.clone(),
@@ -5997,6 +6008,19 @@ impl FreshOpencodeState {
             }
         }
 
+        // fresheyes ep2-r2 Major (the transitional-window dead bridge): the
+        // resume installed its bridge BEFORE the map publication and the
+        // claim commits above, so a daemon loss inside that window killed
+        // the fresh bridge with every recovery trigger spent (an
+        // unpublished session is invisible to the revival pass; a plain
+        // resume holds no `Live` state for it to rescue either; the
+        // re-warm's already-running fast path emits no second `Started`).
+        // Every failure gate has passed — the rescue tail re-checks the
+        // bridge HERE, before the success return, so the resume never
+        // hands back a session whose bridge died in its own window.
+        self.rescue_transitional_bridge_after_commit(session_id)
+            .await;
+
         Ok(session_arc)
     }
 
@@ -6370,6 +6394,72 @@ impl FreshOpencodeState {
         }
         self.install_serve_bridge(&manager, session, &real_id).await;
         Ok(Some(real_id))
+    }
+
+    /// The POST-COMMIT transitional-bridge rescue tail (fresheyes ep2-r2
+    /// Major — the transitional-window dead bridge): the fork-child and
+    /// resume constructions install the generation-fenced bridge BEFORE the
+    /// session is published in `sessions` and committed `Live`, so a daemon
+    /// loss landing inside that window kills the fresh bridge (the loss
+    /// sweep claims its just-subscribed sender; the fanned `Lost` closes
+    /// its channel) while every recovery trigger misses it — the successor's
+    /// one-shot `Started` revival pass cannot see an unpublished session,
+    /// deliberately skips transitional ownership states, and the re-warm's
+    /// already-running fast path emits no second `Started`. The operation
+    /// would otherwise answer success over a permanently dead bridge.
+    ///
+    /// This tail closes the window from the operation's own side: after the
+    /// `Live` commit (the only state the revival pass rescues), it re-runs
+    /// the SAME fenced [`Self::restart_session_bridge_guarded`] tail the
+    /// revival pass uses — a bridge still alive against the CURRENT daemon
+    /// is the quiet no-op (`Ok(None)`, no push, no restart: the happy path
+    /// is byte-identical), a bridge stamped to the lost generation (or
+    /// exited, or absent) is restarted against the successor and the client
+    /// gets the one recovery snapshot. The position-independent re-check
+    /// covers BOTH window variants — the unpublished leg (a revival pass
+    /// can never see a session before its map publication) and the
+    /// published-`Starting` leg (a pass that sees it must skip it) —
+    /// because it judges the bridge's health at tail time, not where in
+    /// the window the loss landed.
+    ///
+    /// No adopt-guard is armed here BY DESIGN: unlike the revival pass
+    /// (an outside actor adopting arbitrary `Live` sessions), this is the
+    /// operation finishing its OWN registration under the claim it just
+    /// committed — the same exposure every other registration step (the
+    /// bridge install itself) already carries, with no new race class.
+    /// The re-lookup discipline mirrors the revival pass's (3a): a session
+    /// whose map keys are gone was killed/handed off mid-operation and its
+    /// teardown already aborted the bridge — never act on the retained
+    /// claim alone. A respawn failure WARNS and the operation still
+    /// returns success (the session is registered; the next `Started`
+    /// signal or a fenced attach retries — the revival pass's failure
+    /// handling, verbatim).
+    async fn rescue_transitional_bridge_after_commit(&self, durable: &str) {
+        let session_arc = {
+            let map = self.sessions.lock().await;
+            map.get(durable).cloned()
+        };
+        let Some(session_arc) = session_arc else {
+            return;
+        };
+        let restarted = {
+            let mut session = session_arc.lock().await;
+            self.restart_session_bridge_guarded(&mut session).await
+        };
+        match restarted {
+            Ok(Some(real_id)) => {
+                self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %durable, error = %err,
+                    "freshagent.opencode.transitional_bridge_rescue_failed: the \
+                     post-commit bridge rescue's bounded daemon respawn failed — \
+                     the next Started signal or a fenced attach retries"
+                );
+            }
+        }
     }
 }
 
@@ -18863,6 +18953,248 @@ mod tests {
         );
     }
 
+    /// Bounded wait until the session's serve-SSE bridge reaches the wanted
+    /// liveness — the ep2-r2 transitional-window fixture's observable (the
+    /// bridge's death by channel-close and its rescue are both scheduler-side
+    /// events, so the fixture polls instead of racing them).
+    async fn await_bridge_liveness(
+        st: &FreshOpencodeState,
+        id: &str,
+        want_alive: bool,
+        what: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if session_serve_bridge_alive(st, id).await == want_alive {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for the {id} bridge to be {}: {what}",
+                if want_alive { "alive" } else { "dead" }
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// ep2-r2 fresheyes Major (the transitional-window dead bridge): the
+    /// generation-fenced bridge is installed BEFORE the forked child is
+    /// published in `sessions` or committed `Live` (materialization remains
+    /// `Starting`), so a daemon loss that captures the fresh bridge's sender
+    /// inside that window leaves the child with a dead bridge and NO
+    /// recovery trigger: B's one-shot `Started` revival pass either cannot
+    /// see the child (unpublished) or deliberately skips its transitional
+    /// ownership state, and the re-warm's fast path (B already running)
+    /// emits no second `Started`. The operation still answers success — a
+    /// pane with a permanently dead event bridge.
+    ///
+    /// The interleaving, forced deterministically through the REAL paths:
+    /// the child's binding-row write parks the fork between its map
+    /// publication and its `Live` commit (`arm_binding_stall`); while
+    /// parked, daemon A dies through the REAL watcher arm (the take sweeps
+    /// the child's just-subscribed sender — the fanned `Lost` closes the
+    /// bridge's channel and the task exits), B re-warms, and B's one-shot
+    /// `Started` revival pass runs: it rescues the PARENT (`Live`) — and,
+    /// because the pass visits the sorted durable ids ("ses_child" before
+    /// "ses_parent"), the parent's rescue PROVES the pass already visited
+    /// and SKIPPED the `Starting` child. Releasing the park lets the
+    /// commit land, and the operation must not answer success over the
+    /// dead bridge: the post-commit rescue tail restarts it against B and
+    /// pushes the client's recovery snapshot (exactly one; no chime
+    /// anywhere).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transitional_fork_child_survives_a_daemon_loss_in_its_starting_window() {
+        // The selfheal manager shape (flag-controlled daemon death,
+        // test-speed watch/backoff knobs) over a FORK-serving HTTP fake.
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(256);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let exited = Arc::new(AtomicBool::new(false));
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let deps = ServeDeps {
+            spawner: Arc::new(FlagExitSpawner {
+                exited: exited.clone(),
+                spawns: spawns.clone(),
+            }),
+            http: Arc::new(ForkFakeHttp::child_ok()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(20),
+            daemon_watch_interval: Duration::from_millis(10),
+            re_warm_backoff_initial_ms: 5,
+            re_warm_backoff_max_ms: 50,
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager.clone()).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
+        seed_live_fresh_owner(&registry, "ses_parent");
+        // Arm the runtime's daemon-loss watcher (production arms it at the
+        // first WS entry point; the fork lane does not, so arm it here). Its
+        // arming-time level pass bridges the bridgeless parent; drain that
+        // push so the frames below are only the machinery under test.
+        st.ensure_daemon_loss_watcher().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = drain_frames(&mut rx);
+        assert!(
+            session_serve_bridge_alive(&st, "ses_parent").await,
+            "fixture: the arming-time pass bridged the parent"
+        );
+
+        // Park the fork between the child's map publication and its `Live`
+        // commit: the child's binding-row write stalls behind the release.
+        let stall = fake.arm_binding_stall("opencode", "ses_child");
+        let (sink, captured) = capturing_sink();
+
+        // The mid-fork mover: once the fork parks, drive the finding's
+        // exact interleaving through the REAL loss/re-warm/revival paths,
+        // prove the revival pass skipped the transitional child, then
+        // release the park.
+        let mover_state = st.clone();
+        let mover_manager = manager.clone();
+        let mover_exited = exited.clone();
+        let mover = tokio::spawn(async move {
+            stall
+                .entered
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("the fork parks between the child's publication and its Live commit");
+            // Daemon A dies. The loss completes: the take cleared the
+            // running slot (the sweep ran inside the same critical
+            // section)...
+            mover_exited.store(true, Ordering::SeqCst);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while mover_manager.base_url().await.is_some() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "A's loss must take the running entry within the budget"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // ...and the fanned `Lost` + dropped swept senders closed BOTH
+            // bridges' channels: the parent's A-era bridge and the parked
+            // child's (the loss captured the child's just-subscribed
+            // sender — the finding's premise).
+            await_bridge_liveness(
+                &mover_state,
+                "ses_parent",
+                false,
+                "A's loss drains the parent's A-era bridge",
+            )
+            .await;
+            await_bridge_liveness(
+                &mover_state,
+                "ses_child",
+                false,
+                "A's loss drains the parked child's bridge (its sender was swept)",
+            )
+            .await;
+            mover_exited.store(false, Ordering::SeqCst);
+            // B re-warms and its one-shot `Started` revival pass runs: the
+            // PARENT (Live) is rescued. The pass visits "ses_child" FIRST
+            // (sorted ids), so the parent's rescue proves the pass already
+            // visited — and skipped — the transitional child.
+            await_bridge_liveness(
+                &mover_state,
+                "ses_parent",
+                true,
+                "B's Started revival rescues the Live parent",
+            )
+            .await;
+            assert!(
+                !session_serve_bridge_alive(&mover_state, "ses_child").await,
+                "fixture: the Started revival deliberately skipped the Starting \
+                 child — the dead transitional bridge the tail must rescue"
+            );
+            stall.release.send(()).expect("release the parked fork");
+        });
+
+        let mut fork_request = fork_msg("ses_parent", "fork-req-trans", None);
+        (
+            fork_request.observed_epoch,
+            fork_request.observed_generation,
+        ) = fenced_observed(&registry, "ses_parent");
+        st.handle_fork(fork_request, None, sink).await;
+        mover.await.expect("the mover completed the interleaving");
+
+        // The operation SUCCEEDED — the finding's premise: a successful
+        // forked reply over the dead transitional bridge.
+        let captured = captured.lock().expect("captured mutex").clone();
+        assert_eq!(
+            captured.len(),
+            1,
+            "the fork answers exactly one frame: {captured:?}"
+        );
+        assert!(
+            matches!(captured[0], ServerMessage::FreshAgentForked { .. }),
+            "the forked reply landed: {captured:?}"
+        );
+        await_freshagent_live(&registry, "ses_child").await;
+
+        // THE BRIDGE: the pane must not dead-end — the child ends up with a
+        // LIVE bridge bound to the successor daemon (RED on HEAD: the
+        // skipped revival left the dead A-era task in place and nothing
+        // ever restarted it).
+        assert!(
+            session_serve_bridge_alive(&st, "ses_child").await,
+            "the fork must not answer success over a dead bridge — the \
+             transitional child's bridge was killed by the daemon loss and \
+             no revival trigger ever came (ep2-r2)"
+        );
+
+        // THE RECOVERY SNAPSHOT: the client's transcript-refetch push for
+        // the actually-restarted bridge.
+        let revive_frames = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                && f["sessionId"].as_str() == Some("ses_child")
+        })
+        .await;
+        let mut all = revive_frames;
+        all.extend(drain_frames(&mut rx));
+        let pushes = all
+            .iter()
+            .filter(|f| {
+                is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                    && f["sessionId"].as_str() == Some("ses_child")
+            })
+            .count();
+        assert_eq!(
+            pushes, 1,
+            "exactly ONE recovery snapshot for the rescued child: {all:?}"
+        );
+        let edges = all
+            .iter()
+            .filter(|f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.error"
+                    && f["event"]["code"] == "OPENCODE_DAEMON_LOST"
+                    && f["sessionId"].as_str() == Some("ses_child")
+            })
+            .count();
+        assert_eq!(
+            edges, 1,
+            "exactly ONE typed loss edge for the child: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .all(|f| f["event"]["type"] != "freshAgent.turn.complete"),
+            "a daemon loss is never a positive completion — no chime: {all:?}"
+        );
+        assert!(
+            manager.base_url().await.is_some(),
+            "fixture: the successor daemon B serves"
+        );
+        let _ = spawns;
+    }
     /// LB-05 (falsified → redesign): in the incident, the pane's fenced
     /// attach was exercised 3× against the dead shared daemon and recovered
     /// NOTHING, because the attach tail only re-subscribed the bridge —
