@@ -25,7 +25,7 @@ use freshell_protocol::ServerMessage;
 mod delivery;
 #[path = "terminal_interest.rs"]
 mod terminal_interest;
-use delivery::{Delivery, DeliveryQueue, Range};
+use delivery::{Delivery, DeliveryQueue, EvictedOutput, Range};
 use freshell_terminal::output_queue::output_frame_meta;
 use futures_util::{Sink, SinkExt};
 use terminal_interest::InterestState;
@@ -94,11 +94,11 @@ const CONTROL_STREAK_LIMIT: usize = 8;
 
 /// Minimum spacing between `ws.terminal_stream.queue_overflow_spill` events
 /// per connection (responsive-terminal-restore Workstream 3 observability).
-/// Under sustained eviction a lane's gap head is leased on nearly every
-/// arbitration round — hundreds of gap deliveries per second under
-/// incident-scale pressure — so per-delivery events would flood the log;
-/// deliveries inside the window are folded into the next event's
-/// `suppressed` count. Identifiers and measurements only.
+/// Under sustained eviction a single admission can evict many frames —
+/// hundreds of evictions per second under incident-scale pressure — so
+/// per-eviction events would flood the log; evictions inside the window are
+/// folded into the next event's `suppressed` count. Identifiers and
+/// measurements only.
 const SPILL_EVENT_MIN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// One rate-limited spill (queue-overflow eviction) observability event.
@@ -134,17 +134,22 @@ struct Queues {
     /// Rate-limited spill-event bookkeeping (see
     /// [`SPILL_EVENT_MIN_INTERVAL`]): when the last
     /// `ws.terminal_stream.queue_overflow_spill` event was emitted, and how
-    /// many gap deliveries have been folded into the next one since.
+    /// many evictions have been folded into the next one since. Evictions
+    /// are counted at ADMISSION time (task-007 review M2); leasing the
+    /// coalesced gap later is delivery, not a spill occurrence.
     spill_last_logged: Option<std::time::Instant>,
     spill_suppressed: u64,
 }
 
 impl Queues {
-    /// Rate-limited spill-event bookkeeping: returns `Some` when an event
-    /// should be emitted NOW (this gap's interval plus the count of gap
-    /// deliveries suppressed since the previous event), `None` when this
-    /// delivery is folded into a future event. Called under the admission
-    /// lock at gap-lease time — only gaps that actually lease are counted.
+    /// Rate-limited spill-event bookkeeping (task-007 review M2, landed by
+    /// task-010): returns `Some` when an event should be emitted NOW (this
+    /// eviction's range plus the count of evictions suppressed since the
+    /// previous event), `None` when this eviction is folded into a future
+    /// event. Called under the admission lock at EVICTION time — the moment
+    /// the spill happens — so a connection that dies while backlogged (its
+    /// coalesced gap never leased to the socket) still leaves spill evidence
+    /// in the live log.
     fn note_spill(&mut self, terminal_id: &str, range: &Range) -> Option<SpillEvent> {
         let now = std::time::Instant::now();
         let due = self
@@ -168,6 +173,18 @@ impl Queues {
                 .pending_bytes()
                 .saturating_add(self.in_flight_output_bytes),
         })
+    }
+
+    /// Map the delivery queue's admission-time eviction records through the
+    /// per-connection rate limiter (task-007 review M2). Call under the
+    /// admission lock immediately after `push`; emit the returned events only
+    /// AFTER the lock is dropped (never hold the admission lock across a log
+    /// write).
+    fn take_admission_spills(&mut self, evicted: Vec<EvictedOutput>) -> Vec<SpillEvent> {
+        evicted
+            .into_iter()
+            .filter_map(|evicted| self.note_spill(&evicted.terminal_id, &evicted.range))
+            .collect()
     }
 }
 
@@ -374,7 +391,14 @@ impl WriterSender {
         let seq = queues.next_seq;
         queues.next_seq += 1;
         let bytes = json.len();
-        if let Some(meta) = meta {
+        // All three queued shapes below share one admission tail: the push,
+        // the admission-time spill evidence, and the notify/fail mapping.
+        // Spill observability (task-007 review M2, landed by task-010):
+        // evictions surface HERE — the moment they happen — including on the
+        // error path (a dying connection's evictions are exactly the
+        // undercounted spills the review found), and the events are emitted
+        // only after the admission lock is dropped.
+        let pushed = if let Some(meta) = meta {
             let range = Range {
                 stream_id: meta.stream_id,
                 attach_request_id: meta.attach_request_id,
@@ -382,22 +406,14 @@ impl WriterSender {
                 to_seq: meta.seq_end,
             };
             let priority = queues.interest.priority(&meta.terminal_id);
-            if queues
-                .output
-                .push(
-                    &meta.terminal_id,
-                    priority,
-                    Message::Text(json.into()),
-                    bytes,
-                    Some(range),
-                    seq,
-                )
-                .is_err()
-            {
-                drop(queues);
-                self.fail(WriterExit::OutputCapacityExceeded);
-                return false;
-            }
+            queues.output.push(
+                &meta.terminal_id,
+                priority,
+                Message::Text(json.into()),
+                bytes,
+                Some(range),
+                seq,
+            )
         } else if let ServerMessage::TerminalExit(exit) = &msg {
             // Preserve final-output -> exit. It must not use the control lane.
             let priority = queues.interest.priority(&exit.terminal_id);
@@ -405,24 +421,19 @@ impl WriterSender {
             // they can never force an eviction nor close the connection, and
             // they still cost one service unit per frame (count-bounded by
             // the metadata limit).
-            if queues
-                .output
-                .push(
-                    &exit.terminal_id,
-                    priority,
-                    Message::Text(json.into()),
-                    0,
-                    None,
-                    seq,
-                )
-                .is_err()
-            {
-                drop(queues);
-                self.fail(WriterExit::OutputCapacityExceeded);
-                return false;
-            }
+            let pushed = queues.output.push(
+                &exit.terminal_id,
+                priority,
+                Message::Text(json.into()),
+                0,
+                None,
+                seq,
+            );
             // A dead terminal never needs its attach fallback again.
-            queues.interest.detach(&exit.terminal_id);
+            if pushed.is_ok() {
+                queues.interest.detach(&exit.terminal_id);
+            }
+            pushed
         } else {
             // Restore contract (responsive-terminal-restore): a
             // `terminal.output.gap` pushed DIRECTLY by the paced replay core
@@ -437,26 +448,45 @@ impl WriterSender {
                 unreachable!("meta-less output frames are exit or gap only")
             };
             let priority = queues.interest.priority(&gap.terminal_id);
-            if queues
-                .output
-                .push(
-                    &gap.terminal_id,
-                    priority,
-                    Message::Text(json.into()),
-                    0,
-                    None,
-                    seq,
-                )
-                .is_err()
-            {
-                drop(queues);
+            queues.output.push(
+                &gap.terminal_id,
+                priority,
+                Message::Text(json.into()),
+                0,
+                None,
+                seq,
+            )
+        };
+        let evicted = queues.output.take_evictions();
+        let spills = queues.take_admission_spills(evicted);
+        drop(queues);
+        Self::emit_spill_events(spills);
+        match pushed {
+            Ok(()) => {
+                self.shared.ready.notify_one();
+                true
+            }
+            Err(_) => {
                 self.fail(WriterExit::OutputCapacityExceeded);
-                return false;
+                false
             }
         }
-        drop(queues);
-        self.shared.ready.notify_one();
-        true
+    }
+
+    /// Log the rate-limited spill events collected at admission time. Must
+    /// be called with the admission lock NOT held.
+    fn emit_spill_events(spills: Vec<SpillEvent>) {
+        for spill in spills {
+            tracing::warn!(
+                terminal_id = %spill.terminal_id,
+                stream_id = %spill.stream_id,
+                from_seq = spill.from_seq,
+                to_seq = spill.to_seq,
+                suppressed = spill.suppressed,
+                pending_bytes = spill.pending_bytes,
+                "ws.terminal_stream.queue_overflow_spill"
+            );
+        }
     }
 
     pub(super) fn enable_terminal_interest(&self) {
@@ -643,7 +673,6 @@ impl WriterPump {
             let Some(delivery) = queues.output.pop() else {
                 return Ok(None);
             };
-            let mut spill = None;
             let (frame, bytes) = match delivery {
                 Delivery::Frame { payload, bytes } => (payload, bytes),
                 Delivery::Gap { terminal_id, range } => {
@@ -672,9 +701,10 @@ impl WriterPump {
                         }
                         None => None,
                     };
-                    // Spill observability (responsive-terminal-restore W3):
-                    // rate-limited per connection — see SPILL_EVENT_MIN_INTERVAL.
-                    spill = queues.note_spill(&terminal_id, &range);
+                    // Spill observability (task-007 review M2) now fires at
+                    // ADMISSION time, when the eviction happens — see
+                    // `Queues::take_admission_spills`. Leasing the coalesced
+                    // gap here is delivery, not a spill occurrence.
                     let message =
                         ServerMessage::TerminalOutputGap(freshell_protocol::TerminalOutputGap {
                             terminal_id,
@@ -704,19 +734,7 @@ impl WriterPump {
                 output_bytes: bytes,
                 flushed: None,
             };
-            // Never hold the admission lock across a log write.
             drop(queues);
-            if let Some(spill) = spill {
-                tracing::warn!(
-                    terminal_id = %spill.terminal_id,
-                    stream_id = %spill.stream_id,
-                    from_seq = spill.from_seq,
-                    to_seq = spill.to_seq,
-                    suppressed = spill.suppressed,
-                    pending_bytes = spill.pending_bytes,
-                    "ws.terminal_stream.queue_overflow_spill"
-                );
-            }
             return Ok(Some(next));
         }
         if let Some(control) = queues.controls.pop_front() {

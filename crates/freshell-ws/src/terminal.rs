@@ -591,12 +591,24 @@ async fn run_loop(
                 let completed_sends = ws_tx.completed_sends();
                 let sends_since_last_tick = completed_sends.saturating_sub(last_completed_sends);
                 last_completed_sends = completed_sends;
-                if catastrophic.tick(ws_tx.pending_output_bytes(), sends_since_last_tick) {
+                if let Some(fire) =
+                    catastrophic.tick(ws_tx.pending_output_bytes(), sends_since_last_tick)
+                {
+                    // Task-007 review M3 (landed by task-010): the event
+                    // must be diagnosable from the log line alone.
+                    // `sends_in_window` is the per-occurrence evidence —
+                    // completed sends DURING the deciding window for THIS
+                    // close, structurally zero (any send resets the window)
+                    // — while `total_sends` carries the connection's
+                    // lifetime history; the pair distinguishes a
+                    // wedge-after-progress episode (large total, silent
+                    // window) from a never-sent socket (both zero).
                     tracing::warn!(
                         connection_id = conn_id,
                         pending_bytes = ws_tx.pending_output_bytes(),
                         threshold = state.term09.catastrophic_buffered_bytes,
-                        sends = completed_sends,
+                        total_sends = completed_sends,
+                        sends_in_window = fire.sends_in_window,
                         window_ms = state.term09.catastrophic_stall_ms,
                         "ws.terminal_stream.catastrophic_close"
                     );

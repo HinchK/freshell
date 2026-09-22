@@ -35,6 +35,103 @@ async fn flood_test_serial() -> tokio::sync::MutexGuard<'static, ()> {
     FLOOD_TEST_LOCK.lock().await
 }
 
+// ── capturing tracing layer (dev-only test facility, the paced_replay.rs
+// pattern). PROCESS-GLOBAL by deliberate choice: the spawned in-process
+// axum server emits its diagnostics from the connection task, and a
+// thread-local `set_default` capture is UNSOUND for callsites shared with
+// sibling threads — tracing-core caches each callsite's Interest
+// process-wide on first registration, so a subscriber-less sibling thread
+// executing a shared emission site first caches `Interest::never` and the
+// event! macro short-circuits before any dispatch. One global subscriber
+// sees every thread's events; every read below MUST filter by message name
+// because ALL tests in this binary share the vec.
+// ─────────────────────────────────────────────────────────────────────────
+
+use std::sync::Mutex;
+use tracing::field::{Field, Visit};
+use tracing::{Event, Subscriber};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::Layer;
+
+#[derive(Debug, Clone, Default)]
+struct CapturedEvent {
+    message: String,
+    fields: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Default)]
+struct FieldVisitor {
+    message: String,
+    fields: std::collections::BTreeMap<String, String>,
+}
+
+impl Visit for FieldVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        let rendered = format!("{value:?}");
+        if field.name() == "message" {
+            self.message = rendered;
+        } else {
+            self.fields.insert(field.name().to_string(), rendered);
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    fn record_i64(&mut self, field: &Field, value: i64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        self.fields
+            .insert(field.name().to_string(), value.to_string());
+    }
+}
+
+struct CaptureLayer {
+    events: std::sync::Arc<Mutex<Vec<CapturedEvent>>>,
+}
+
+impl<S: Subscriber> Layer<S> for CaptureLayer {
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let mut visitor = FieldVisitor::default();
+        event.record(&mut visitor);
+        self.events
+            .lock()
+            .expect("capture lock")
+            .push(CapturedEvent {
+                message: visitor.message,
+                fields: visitor.fields,
+            });
+    }
+}
+
+/// Process-global capture for this test binary (first caller installs;
+/// `get_or_init` is the synchronization). This binary installs no other
+/// global subscriber; `.expect()` turns any future second installer into an
+/// immediate diagnosable panic instead of a silently-empty capture.
+fn global_capture() -> std::sync::Arc<Mutex<Vec<CapturedEvent>>> {
+    static EVENTS: std::sync::OnceLock<std::sync::Arc<Mutex<Vec<CapturedEvent>>>> =
+        std::sync::OnceLock::new();
+    std::sync::Arc::clone(EVENTS.get_or_init(|| {
+        let events = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let layer = CaptureLayer {
+            events: std::sync::Arc::clone(&events),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("this test binary installs exactly one global subscriber");
+        events
+    }))
+}
+
 fn test_settings_value() -> serde_json::Value {
     serde_json::json!({
         "ai": {},
@@ -654,17 +751,30 @@ async fn incident_backlog_spills_instead_of_disconnecting() {
 /// over-threshold pending bytes can persist — and proves the monitor keys on
 /// SEND PROGRESS, not on the byte count: the old sustained-bytes-only
 /// decision closed exactly this client.
+///
+/// Flake hardening (task-010, task-007 review Minor 1 direction): the
+/// original tuning (8 MiB queue against a ~2 MiB/s drain) needed bash
+/// production to outpace the drain by a FULL 8 MiB before the first
+/// eviction — a margin that disappears under CI load, where PTY production
+/// drops to near the drain rate and the gap-evidence assertion fails with
+/// the queue never overflowing. The queue bound now sits just above the
+/// threshold (the minimal inversion this test exists to inject), the drain
+/// matches the incident test's demonstrated ~1 MiB/s accumulation regime,
+/// and the stall window is widened to 5 s so a loaded runner's scheduling
+/// gaps cannot masquerade as a genuine >2 s send silence. Every assertion
+/// is unchanged; only the reachability margins were re-derived.
 #[tokio::test]
 async fn slow_but_progressing_client_survives_over_threshold_backlog() {
     let _flood_guard = flood_test_serial().await;
-    // Inverted ON PURPOSE (see doc comment): 8 MiB queue > 1 MiB threshold.
-    // The 2 s stall window keeps the test fast; the harness's 30 s ping
+    // Inverted ON PURPOSE (see doc comment): 2 MiB queue > 1 MiB threshold.
+    // The 5 s stall window keeps the decision observable while a loaded
+    // runner cannot fake a >2 s send silence; the harness's 30 s ping
     // interval keeps the per-send write timeout at 60 s, far beyond the
     // window, so only the monitor's decision can close this connection.
     let term09 = Term09Config {
-        queue_max_bytes: 8 * 1024 * 1024,
+        queue_max_bytes: 2 * 1024 * 1024,
         catastrophic_buffered_bytes: 1024 * 1024,
-        catastrophic_stall_ms: 2_000,
+        catastrophic_stall_ms: 5_000,
     };
     let url = spawn_server(term09).await;
 
@@ -676,10 +786,11 @@ async fn slow_but_progressing_client_survives_over_threshold_backlog() {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let marker = "FLOOD-DONE-MARKER";
-    // ~27 MB at ~2 MiB/s drain: the queue stays pinned at its 8 MiB bound —
-    // over the 1 MiB threshold continuously for many multiples of the 2 s
-    // stall window — while every frame the writer leases completes a
-    // successful send.
+    // ~27 MB at ~1 MiB/s drain: the queue pins at its 2 MiB bound — over the
+    // 1 MiB threshold continuously for many multiples of the 5 s stall
+    // window — while every frame the writer leases completes a successful
+    // send. The overflow (and its exact gap) is reachable even when a
+    // loaded runner slows PTY production to the drain rate.
     let flood = flood_command(300_000, marker);
     creator
         .send(WsMessage::Text(
@@ -693,11 +804,14 @@ async fn slow_but_progressing_client_survives_over_threshold_backlog() {
         .await
         .expect("send flood input");
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    // Deadline sized for a ~630 KB/s effective drain under CI load (the
+    // per-frame JSON parsing contends with everything else on the runner):
+    // ~27 MB then needs ~45 s, so 75 s keeps >1.5x headroom.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(75);
     let report = drain_throttled_until_marker(
         &mut victim,
         marker,
-        256 * 1024,
+        128 * 1024,
         Duration::from_millis(125),
         deadline,
     )
@@ -715,7 +829,7 @@ async fn slow_but_progressing_client_survives_over_threshold_backlog() {
     );
     assert!(
         !report.gaps.is_empty(),
-        "the 8 MiB queue must evict (gap) against a ~27 MB flood at this \
+        "the 2 MiB queue must evict (gap) against a ~27 MB flood at this \
          drain rate; the overflow is repaired by the exact gap, not by hanging up"
     );
 }
@@ -728,6 +842,11 @@ async fn slow_but_progressing_client_survives_over_threshold_backlog() {
 #[tokio::test]
 async fn eviction_and_supersede_without_sends_still_close() {
     let _flood_guard = flood_test_serial().await;
+    // Install the process-global capture BEFORE the server spawns: the
+    // catastrophic_close event below is emitted by the connection task the
+    // moment the monitor fires, and an event emitted before the subscriber
+    // exists is lost for good (tracing dispatch is not replayed).
+    let events = global_capture();
     // Same deliberately-inverted injection as the progressing-client test:
     // the queue may hold bytes over the threshold, making the monitor's
     // window observable. The 30 s harness ping interval keeps the per-send
@@ -808,6 +927,66 @@ async fn eviction_and_supersede_without_sends_still_close() {
         "a connection with zero completed sends for the whole stall window — \
          whose queue bytes shrank only via eviction and a superseding attach — \
          must still be closed by the catastrophic monitor"
+    );
+
+    // Task-007 review M3 (landed by task-010): the catastrophic-close event
+    // must be diagnosable from the log line ALONE. `sends_in_window` is the
+    // per-occurrence evidence — completed sends DURING the deciding window
+    // for THIS close, structurally zero (any send resets the window) — while
+    // `total_sends` (the renamed lifetime `sends` counter) carries the
+    // connection's whole history. The stuck client here completed sends
+    // (its attach handshake) BEFORE the window, so the two fields must
+    // disagree: window evidence 0, lifetime total >= 1.
+    let close_events: Vec<_> = events
+        .lock()
+        .expect("capture lock")
+        .iter()
+        .filter(|e| e.message == "ws.terminal_stream.catastrophic_close")
+        .cloned()
+        .collect();
+    assert_eq!(
+        close_events.len(),
+        1,
+        "the monitor's close must emit exactly one catastrophic_close event: {close_events:?}"
+    );
+    let close = &close_events[0];
+    assert_eq!(
+        close.fields.get("sends_in_window").map(String::as_str),
+        Some("0"),
+        "the deciding window for THIS occurrence was send-silent — the \
+         per-occurrence evidence must say so directly: {close:?}"
+    );
+    let total_sends: u64 = close
+        .fields
+        .get("total_sends")
+        .expect("the lifetime counter is carried as total_sends")
+        .parse()
+        .expect("total_sends renders as a plain integer");
+    assert!(
+        total_sends >= 1,
+        "the stuck client completed its attach handshake before the wedge, \
+         so the lifetime counter must be nonzero — the field pair is what \
+         distinguishes wedge-after-progress from never-sent: {close:?}"
+    );
+    assert_eq!(
+        close.fields.get("window_ms").map(String::as_str),
+        Some("2000"),
+        "the injected stall window is reported"
+    );
+    assert_eq!(
+        close.fields.get("threshold").map(String::as_str),
+        Some("1048576"),
+        "the injected threshold is reported"
+    );
+    let pending: usize = close
+        .fields
+        .get("pending_bytes")
+        .expect("pending bytes at fire time")
+        .parse()
+        .expect("pending_bytes renders as a plain integer");
+    assert!(
+        pending > 1024 * 1024,
+        "the monitor only fires over-threshold: {close:?}"
     );
 }
 

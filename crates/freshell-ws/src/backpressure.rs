@@ -198,6 +198,21 @@ impl Term09Config {
     }
 }
 
+/// Fire-time evidence for ONE sustained catastrophic-backpressure
+/// occurrence (task-007 review M3, landed by task-010): what the
+/// `ws.terminal_stream.catastrophic_close` event needs to be diagnosable
+/// from the log line alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatastrophicFire {
+    /// Completed socket sends DURING the deciding window for THIS
+    /// occurrence — a per-occurrence delta, not a lifetime counter.
+    /// Structurally zero (any send resets the window), so a nonzero value
+    /// is accounting drift the log line exposes directly; a lifetime
+    /// total cannot answer this question (a wedge-after-progress episode
+    /// reads large lifetime sends while the window was send-silent).
+    pub sends_in_window: u64,
+}
+
 /// Tracks whether the connection writer's pending output bytes (queued plus
 /// in-flight frame) have been continuously over `catastrophic_buffered_bytes`
 /// WITH ZERO successful socket sends, for the full `stall` duration
@@ -211,6 +226,12 @@ pub struct CatastrophicMonitor {
     threshold_bytes: usize,
     stall: Duration,
     since: Option<Instant>,
+    /// Completed sends accumulated inside the CURRENT sustained window
+    /// (see [`CatastrophicFire::sends_in_window`]): every tick's delta adds
+    /// here while the window stays open, and any window reset (recovery or
+    /// send progress) zeroes it — so at fire time it is exactly the sends
+    /// that happened during the deciding window.
+    window_sends: u64,
 }
 
 impl CatastrophicMonitor {
@@ -219,6 +240,7 @@ impl CatastrophicMonitor {
             threshold_bytes: threshold_bytes.max(1),
             stall: Duration::from_millis(stall_ms.max(1)),
             since: None,
+            window_sends: 0,
         }
     }
 
@@ -232,15 +254,31 @@ impl CatastrophicMonitor {
     /// reductions from eviction or superseded attachments do NOT count as
     /// progress — only completed sends (the caller feeds the connection
     /// writer's completed-send counter; queue-size deltas are invisible
-    /// here). Fires exactly once per sustained episode; the caller closes
-    /// the connection immediately on `true`.
-    pub fn tick(&mut self, pending_bytes: usize, sends_since_last_tick: u64) -> bool {
+    /// here). Fires exactly once per sustained episode (the caller closes
+    /// the connection immediately on `Some`); the returned evidence carries
+    /// the per-occurrence `sends_in_window` delta for the close event.
+    pub fn tick(
+        &mut self,
+        pending_bytes: usize,
+        sends_since_last_tick: u64,
+    ) -> Option<CatastrophicFire> {
         if pending_bytes <= self.threshold_bytes || sends_since_last_tick > 0 {
             self.since = None;
-            return false;
+            self.window_sends = 0;
+            return None;
         }
+        self.window_sends = self.window_sends.saturating_add(sends_since_last_tick);
         let since = *self.since.get_or_insert_with(Instant::now);
-        since.elapsed() >= self.stall
+        if since.elapsed() < self.stall {
+            return None;
+        }
+        // One fire per sustained episode: a caller that (against the
+        // contract) kept ticking would need a full fresh window to fire
+        // again, with fresh per-occurrence evidence.
+        self.since = None;
+        let sends_in_window = self.window_sends;
+        self.window_sends = 0;
+        Some(CatastrophicFire { sends_in_window })
     }
 }
 
@@ -398,7 +436,7 @@ mod tests {
     fn catastrophic_monitor_never_fires_under_threshold() {
         let mut m = CatastrophicMonitor::new(100, 10);
         for _ in 0..5 {
-            assert!(!m.tick(50, 0));
+            assert!(m.tick(50, 0).is_none());
             std::thread::sleep(Duration::from_millis(15));
         }
     }
@@ -406,21 +444,21 @@ mod tests {
     #[test]
     fn catastrophic_monitor_resets_on_recovery_before_stall_elapses() {
         let mut m = CatastrophicMonitor::new(100, 1000);
-        assert!(!m.tick(200, 0)); // starts the clock
-        assert!(!m.tick(50, 0)); // recovers immediately -> resets
+        assert!(m.tick(200, 0).is_none()); // starts the clock
+        assert!(m.tick(50, 0).is_none()); // recovers immediately -> resets
         std::thread::sleep(Duration::from_millis(5));
         // Overflow again: a FRESH clock, so it must not have carried over
         // elapsed time from the first (reset) episode.
-        assert!(!m.tick(200, 0));
+        assert!(m.tick(200, 0).is_none());
     }
 
     #[test]
     fn catastrophic_monitor_fires_after_sustained_overflow() {
         let mut m = CatastrophicMonitor::new(100, 20);
-        assert!(!m.tick(200, 0));
+        assert!(m.tick(200, 0).is_none());
         std::thread::sleep(Duration::from_millis(35));
         assert!(
-            m.tick(200, 0),
+            m.tick(200, 0).is_some(),
             "sustained overflow past the stall duration must fire"
         );
     }
@@ -432,19 +470,19 @@ mod tests {
     #[test]
     fn send_progress_resets_the_stall_window() {
         let mut m = CatastrophicMonitor::new(100, 40);
-        assert!(!m.tick(200, 0)); // starts the clock
+        assert!(m.tick(200, 0).is_none()); // starts the clock
         std::thread::sleep(Duration::from_millis(25));
-        assert!(!m.tick(200, 1)); // a send completed -> resets the window
+        assert!(m.tick(200, 1).is_none()); // a send completed -> resets the window
         std::thread::sleep(Duration::from_millis(30));
         // 55 ms since the FIRST over-threshold tick — past the 40 ms window —
         // but only 30 ms since the progress reset: must NOT fire.
         assert!(
-            !m.tick(200, 0),
+            m.tick(200, 0).is_none(),
             "the window must restart from the last progress, not the first tick"
         );
         // With no further progress it DOES fire after the full window.
         std::thread::sleep(Duration::from_millis(45));
-        assert!(m.tick(200, 0));
+        assert!(m.tick(200, 0).is_some());
     }
 
     /// Eviction and supersede reduce queue bytes WITHOUT a send; those byte
@@ -454,15 +492,59 @@ mod tests {
     #[test]
     fn byte_reductions_without_sends_do_not_reset_the_window() {
         let mut m = CatastrophicMonitor::new(100, 30);
-        assert!(!m.tick(180, 0)); // starts the clock
+        assert!(m.tick(180, 0).is_none()); // starts the clock
         std::thread::sleep(Duration::from_millis(10));
-        assert!(!m.tick(150, 0)); // "eviction" shrank the count; still over, no sends
+        assert!(m.tick(150, 0).is_none()); // "eviction" shrank the count; still over, no sends
         std::thread::sleep(Duration::from_millis(10));
-        assert!(!m.tick(190, 0)); // refilled; still no sends
+        assert!(m.tick(190, 0).is_none()); // refilled; still no sends
         std::thread::sleep(Duration::from_millis(15));
         assert!(
-            m.tick(160, 0),
+            m.tick(160, 0).is_some(),
             "over-threshold bytes with zero sends across the whole window must close"
         );
+    }
+
+    /// Task-007 review M3 (landed by task-010): the fire evidence carries
+    /// `sends_in_window` — completed sends DURING the deciding window for
+    /// THIS occurrence, not the caller's lifetime counter. A
+    /// progress-then-wedge episode must report ZERO window sends even though
+    /// sends happened before the window opened; structurally the field is
+    /// always 0 at fire time (any send resets the window), so a nonzero
+    /// value is accounting drift the log line exposes directly.
+    #[test]
+    fn fire_evidence_reports_sends_inside_the_deciding_window_not_the_lifetime() {
+        let mut m = CatastrophicMonitor::new(100, 30);
+        // Wedge-after-progress: sends complete while over threshold (each
+        // resets the window), then a sustained zero-send window fires.
+        assert!(m.tick(200, 7).is_none(), "send progress resets the window");
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(
+            m.tick(200, 4).is_none(),
+            "more progress, window keeps resetting"
+        );
+        // The next over-threshold zero-send tick OPENS the deciding window;
+        // it cannot fire yet.
+        assert!(m.tick(200, 0).is_none(), "the window opens, not fires");
+        std::thread::sleep(Duration::from_millis(35));
+        let Some(fire) = m.tick(200, 0) else {
+            panic!("the sustained zero-send window must fire");
+        };
+        assert_eq!(
+            fire.sends_in_window, 0,
+            "no sends completed inside the deciding window — the per-occurrence \
+             evidence must say so directly (a lifetime counter would read 11 here)"
+        );
+        // A second sustained episode after the fire starts a FRESH window
+        // with fresh evidence (the monitor reports one occurrence per
+        // sustained episode; the caller closes the connection on fire).
+        assert!(
+            m.tick(200, 0).is_none(),
+            "post-fire ticks open a fresh window"
+        );
+        std::thread::sleep(Duration::from_millis(35));
+        let Some(second) = m.tick(200, 0) else {
+            panic!("the second sustained window must fire too");
+        };
+        assert_eq!(second.sends_in_window, 0);
     }
 }

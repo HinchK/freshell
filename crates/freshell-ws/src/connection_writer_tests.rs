@@ -509,6 +509,123 @@ async fn oversized_indivisible_output_frame_spills_instead_of_accumulating() {
     );
 }
 
+/// Task-007 review M2 (landed by task-010): the rate-limited
+/// `ws.terminal_stream.queue_overflow_spill` event must fire at ADMISSION
+/// time — the moment the eviction happens — not at gap-lease time, so a
+/// connection that spills and then dies while backlogged (its coalesced
+/// gap never surfaces from the stuck queue) still leaves spill evidence in
+/// the live log. The pump is NEVER run until after the emit assertions:
+/// nothing is leased, so a lease-time emit would produce no event at all.
+#[tokio::test]
+async fn spill_observability_fires_at_admission_time_even_if_the_gap_is_never_leased() {
+    let events = crate::invariants::capture::capture();
+    // Cap sized to exactly ONE of THIS terminal's frames (the longer
+    // terminal id makes each serialized frame larger than `output(1)`'s
+    // probe, so `overflow_writer()` would self-evict frame 1).
+    let (sender, pump) = {
+        let probe = serde_json::to_string(&named_output("spill-admission", 1))
+            .unwrap()
+            .len();
+        WriterSender::new(probe, 4096, Duration::from_secs(10))
+    };
+    let spill_events = || {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e.message.contains("queue_overflow_spill")
+                    && e.fields.get("terminal_id").map(String::as_str) == Some("spill-admission")
+            })
+            .count()
+    };
+    // Frame 1 alone fits the cap (probe bytes); frame 2's admission evicts
+    // frame 1; frame 3's admission evicts frame 2.
+    assert!(sender.push_server(named_output("spill-admission", 1)));
+    {
+        let queues = sender.shared.queues.lock().unwrap();
+        assert!(
+            queues.spill_last_logged.is_none(),
+            "no spill bookkeeping before any eviction"
+        );
+    }
+    assert_eq!(spill_events(), 0, "no eviction has happened yet");
+    assert!(sender.push_server(named_output("spill-admission", 2)));
+    // The FIRST eviction emits immediately (rate limiter idle) with the
+    // evicted frame's own range — without any pump lease.
+    {
+        let queues = sender.shared.queues.lock().unwrap();
+        assert!(
+            queues.spill_last_logged.is_some(),
+            "the eviction at admission time must record the spill"
+        );
+    }
+    {
+        let captured: Vec<_> = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e.message.contains("queue_overflow_spill")
+                    && e.fields.get("terminal_id").map(String::as_str) == Some("spill-admission")
+            })
+            .cloned()
+            .collect();
+        assert_eq!(
+            captured.len(),
+            1,
+            "admission-time eviction must emit exactly one spill event with no pump lease: {captured:?}"
+        );
+        assert_eq!(
+            captured[0].fields.get("from_seq").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            captured[0].fields.get("to_seq").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            captured[0].fields.get("suppressed").map(String::as_str),
+            Some("0")
+        );
+    }
+    // A second eviction inside the rate-limit window folds into the
+    // `suppressed` counter (one event per window).
+    assert!(sender.push_server(named_output("spill-admission", 3)));
+    {
+        let queues = sender.shared.queues.lock().unwrap();
+        assert_eq!(
+            queues.spill_suppressed, 1,
+            "the in-window eviction folds into suppressed"
+        );
+    }
+    // NOW lease everything (including the coalesced [1..=2] gap): gap
+    // DELIVERY is not a spill occurrence — no new event, no extra fold.
+    let mut leased_gap = None;
+    while let Some(next) = pump.take_next().unwrap() {
+        let text = leased_text(&next.frame);
+        if text.contains("terminal.output.gap") {
+            leased_gap = Some(serde_json::from_str::<serde_json::Value>(&text).unwrap());
+        }
+        pump.finish_frame(next.output_bytes, next.control_bytes);
+    }
+    let gap = leased_gap.expect("the coalesced gap must lease");
+    assert_eq!(gap["fromSeq"], 1);
+    assert_eq!(gap["toSeq"], 2);
+    {
+        let queues = sender.shared.queues.lock().unwrap();
+        assert_eq!(
+            queues.spill_suppressed, 1,
+            "leasing the gap is not a spill occurrence"
+        );
+    }
+    assert_eq!(
+        spill_events(),
+        1,
+        "delivery of the gap must not emit a second spill event"
+    );
+}
+
 /// Drain-progress liveness (responsive-terminal-restore Workstream 3): the
 /// completed-send counter moves ONLY on successful socket sends. Supersede
 /// and eviction shrink queued bytes without touching it, and a leased frame
