@@ -125,7 +125,18 @@ fn global_capture() -> std::sync::Arc<Mutex<Vec<CapturedEvent>>> {
         let layer = CaptureLayer {
             events: std::sync::Arc::clone(&events),
         };
-        let subscriber = tracing_subscriber::registry().with(layer);
+        // Level-filter the process-global registry to WARN (task-010b
+        // hygiene): an unfiltered registry enables every callsite
+        // process-wide — including any future debug site — a latent perf
+        // and determinism footgun on the flood path. Every event this
+        // binary's assertions read is warn-level
+        // (`ws.terminal_stream.catastrophic_close`, and the sibling
+        // `ws.terminal_stream.queue_overflow_spill`), so the filter
+        // disables nothing the tests read while every sub-WARN callsite
+        // short-circuits before dispatch.
+        let subscriber = tracing_subscriber::registry()
+            .with(layer)
+            .with(tracing_subscriber::filter::LevelFilter::WARN);
         tracing::subscriber::set_global_default(subscriber)
             .expect("this test binary installs exactly one global subscriber");
         events
@@ -504,8 +515,13 @@ async fn slow_client_does_not_block_fast_client_and_is_bounded() {
         .expect("send flood input");
 
     // The FAST client must see the flood complete promptly, regardless of
-    // the slow client never draining anything.
-    let fast_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    // the slow client never draining anything. 60 s wall-clock margin
+    // (task-010b, the task-10 retune precedent): structurally identical to
+    // the fast-client drain that starved past its 20 s deadline when the
+    // full-workspace gate ran on a loaded shared box (1.9 s isolated).
+    // The deadline only bounds failure diagnosis — the marker breaks the
+    // loop the moment the flood completes — never the pass-path wall time.
+    let fast_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let (fast_acc, _fast_gap, fast_closed) =
         drain_until_marker_or_deadline(&mut fast, marker, fast_deadline).await;
     assert!(
@@ -521,8 +537,12 @@ async fn slow_client_does_not_block_fast_client_and_is_bounded() {
     // NOW resume the slow client and observe the TERM-09 policy in effect:
     // either it received a queue-overflow gap, or it was already closed
     // (catastrophic backpressure). Both are acceptable per the acceptance
-    // text ("slow-client gap/recovery or documented close").
-    let slow_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    // text ("slow-client gap/recovery or documented close"). 30 s (3x)
+    // resume margin (task-010b): a stuck-client resume wait structurally
+    // identical to the gap-negotiation test's, whose class starved past
+    // its original bound under full-workspace gate load; the gap-or-close
+    // it waits for already exists server-side.
+    let slow_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let (_slow_acc, slow_gap, slow_closed) =
         drain_until_marker_or_deadline(&mut slow, marker, slow_deadline).await;
     assert!(
@@ -1077,7 +1097,13 @@ async fn queue_overflow_gap_bounds_follow_negotiation() {
 
     // Wait for the flood to COMPLETE on the fast client: by then both stuck
     // clients' queues have overflowed and their queue-overflow gaps exist.
-    let fast_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    // 60 s wall-clock margin (task-010b, the task-10 retune precedent):
+    // this drain measures 1.9 s isolated but starved past its 20 s
+    // deadline when the full-workspace gate ran `cargo test --workspace`
+    // on a loaded shared box. The deadline only bounds failure diagnosis —
+    // the marker breaks the loop the moment the flood completes — never
+    // the pass-path wall time.
+    let fast_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let (fast_acc, _fast_gap, fast_closed) =
         drain_until_marker_or_deadline(&mut fast, marker, fast_deadline).await;
     assert!(
@@ -1086,7 +1112,11 @@ async fn queue_overflow_gap_bounds_follow_negotiation() {
     );
 
     // NOW resume each stuck client and capture its first queue-overflow gap.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    // Same loaded-gate margin as the fast-client drain above (the gaps
+    // already exist server-side once the flood completes; the deadline only
+    // bounds how long we wait to observe them through the resumed
+    // backlog).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     let paced_gap = first_gap_frame(&mut paced, deadline).await;
     assert_eq!(
         paced_gap["reason"], "queue_overflow",

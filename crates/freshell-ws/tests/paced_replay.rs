@@ -121,7 +121,29 @@ fn global_capture() -> Arc<Mutex<Vec<CapturedEvent>>> {
         let layer = CaptureLayer {
             events: Arc::clone(&events),
         };
-        let subscriber = tracing_subscriber::registry().with(layer);
+        // Target/level-filter the process-global registry (task-010b
+        // hygiene): an unfiltered registry enables every callsite
+        // process-wide — a latent perf and determinism footgun. Unlike the
+        // term09 twin (a plain WARN level filter), this binary's
+        // assertions read INFO-level `ws.restore.*` events, emitted by
+        // exactly two modules: `freshell_ws::paced_replay` (paced_start /
+        // paced_complete / paced_expired; paced_gone is warn) and
+        // `freshell_ws::terminal` (the credit verdicts and
+        // restore-unavailable). The filter admits exactly those targets at
+        // INFO plus WARN-or-above everywhere else — nothing the tests read
+        // is disabled.
+        let subscriber = tracing_subscriber::registry().with(layer).with(
+            tracing_subscriber::filter::Targets::new()
+                .with_default(tracing_subscriber::filter::LevelFilter::WARN)
+                .with_target(
+                    "freshell_ws::paced_replay",
+                    tracing_subscriber::filter::LevelFilter::INFO,
+                )
+                .with_target(
+                    "freshell_ws::terminal",
+                    tracing_subscriber::filter::LevelFilter::INFO,
+                ),
+        );
         tracing::subscriber::set_global_default(subscriber)
             .expect("this test binary installs exactly one global subscriber");
         events
