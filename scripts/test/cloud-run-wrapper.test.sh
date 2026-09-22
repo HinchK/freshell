@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Test: e2e-cloud wrapper script and npm script integration.
+# Test: e2e-cloud wrapper script and package.json script integration.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,32 +56,32 @@ if ! echo "$LOCAL_OUTPUT" | grep -q "6 passed"; then
 fi
 echo "PASS: --local runs 6 auth tests"
 
-# Check 5: npm run test:e2e -- --local works
-echo "Testing: npm run test:e2e -- --local"
-NPM_LOCAL_OUTPUT=$(npm run test:e2e -- --local --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line 2>&1) || {
-  echo "FAIL: npm run test:e2e -- --local failed"
+# Check 5: pnpm run test:e2e --local works
+echo "Testing: pnpm run test:e2e --local"
+NPM_LOCAL_OUTPUT=$(pnpm run test:e2e --local --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line 2>&1) || {
+  echo "FAIL: pnpm run test:e2e --local failed"
   echo "$NPM_LOCAL_OUTPUT" | tail -20
   exit 1
 }
-echo "PASS: npm run test:e2e -- --local works"
+echo "PASS: pnpm run test:e2e --local works"
 
-# Check 6: npm run test:e2e:local works
-echo "Testing: npm run test:e2e:local"
-NPM_LOCAL_SCRIPT_OUTPUT=$(npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line 2>&1) || {
-  echo "FAIL: npm run test:e2e:local failed"
+# Check 6: pnpm run test:e2e:local works
+echo "Testing: pnpm run test:e2e:local"
+NPM_LOCAL_SCRIPT_OUTPUT=$(pnpm run test:e2e:local --project=chromium test/e2e-browser/specs/auth.spec.ts --reporter=line 2>&1) || {
+  echo "FAIL: pnpm run test:e2e:local failed"
   echo "$NPM_LOCAL_SCRIPT_OUTPUT" | tail -20
   exit 1
 }
-echo "PASS: npm run test:e2e:local works"
+echo "PASS: pnpm run test:e2e:local works"
 
 # Check 7: existing scripts still work
-echo "Testing: npm run test:e2e:chromium (unchanged)"
-CHROMIUM_OUTPUT=$(npm run test:e2e:chromium -- test/e2e-browser/specs/auth.spec.ts --reporter=line 2>&1) || {
-  echo "FAIL: npm run test:e2e:chromium failed"
+echo "Testing: pnpm run test:e2e:chromium (unchanged)"
+CHROMIUM_OUTPUT=$(pnpm run test:e2e:chromium test/e2e-browser/specs/auth.spec.ts --reporter=line 2>&1) || {
+  echo "FAIL: pnpm run test:e2e:chromium failed"
   echo "$CHROMIUM_OUTPUT" | tail -20
   exit 1
 }
-echo "PASS: npm run test:e2e:chromium still works"
+echo "PASS: pnpm run test:e2e:chromium still works"
 
 # Check 9: default backend (unset env var) runs locally
 echo "Testing: default backend (unset FRESHELL_E2E_BACKEND) runs locally"

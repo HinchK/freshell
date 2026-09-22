@@ -221,12 +221,12 @@ fi
 
 CONFIG_REPORT="$WORK/config-report.json"
 FRESHELL_CLOUD_RETRY_REPORT_PATH="$CONFIG_REPORT" \
-  npx playwright test --config "$ROOT/test/e2e-browser/playwright.cloud.config.ts" --list >/dev/null
+  pnpm exec playwright test --config "$ROOT/test/e2e-browser/playwright.cloud.config.ts" --list >/dev/null
 if [ ! -s "$CONFIG_REPORT" ]; then
   echo "FAIL: cloud Playwright config did not write the retry-evidence JSON report"
   exit 1
 fi
-TRACE_MODE="$(npx tsx --eval "import config from '$ROOT/test/e2e-browser/playwright.cloud.config.ts'; console.log(config.use?.trace)")"
+TRACE_MODE="$(pnpm exec tsx --eval "import config from '$ROOT/test/e2e-browser/playwright.cloud.config.ts'; console.log(config.use?.trace)")"
 if [ "$TRACE_MODE" != "retain-on-first-failure" ]; then
   echo "FAIL: Cloud Playwright config does not retain the trace from the first failed attempt"
   exit 1

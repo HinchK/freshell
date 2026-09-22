@@ -329,7 +329,7 @@ describe('checkout-free Electron runtime acceptance', () => {
 
   it('carries the real Claude SDK, its native platform package, and no lock or link residue outside the checkout', async () => {
     const staged = runtimeRoot()
-    expect(existsSync(staged), 'run npm run prepare:electron-runtime before this lane').toBe(true)
+    expect(existsSync(staged), 'run pnpm run prepare:electron-runtime before this lane').toBe(true)
     const outsideRoot = await mkdtemp(path.join(tmpdir(), 'freshell-electron-runtime-'))
     const runtime = path.join(outsideRoot, 'runtime')
     const emptyCwd = path.join(outsideRoot, 'cwd')
@@ -402,7 +402,7 @@ describe('checkout-free Electron runtime acceptance', () => {
 
   it('serves Rust/client, runs fake Claude, and speaks MCP JSON-RPC outside the checkout', async () => {
     const staged = runtimeRoot()
-    expect(existsSync(staged), 'run npm run prepare:electron-runtime before this lane').toBe(true)
+    expect(existsSync(staged), 'run pnpm run prepare:electron-runtime before this lane').toBe(true)
     const outsideRoot = await mkdtemp(path.join(tmpdir(), 'freshell-electron-runtime-'))
     const runtime = path.join(outsideRoot, 'runtime')
     const emptyCwd = path.join(outsideRoot, 'cwd')

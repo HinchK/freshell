@@ -1,6 +1,6 @@
 name: Demos
 
-# Each demo is an independent pnpm project with its own lock (plan §4.5):
+# Each demo is an independent pnpm project with its own lock (plan §3.3 item 5):
 # prove they still install and build from their own locks, without the parent
 # workspace, whenever their manifests/locks/config change.
 

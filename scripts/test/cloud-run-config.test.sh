@@ -19,7 +19,7 @@ echo "PASS: $CONFIG exists"
 
 # Check 2: Config lists specs (non-empty)
 echo "Running: playwright test --list with cloud config..."
-LIST_OUTPUT=$(npx playwright test --config "$CONFIG" --list 2>&1) || {
+LIST_OUTPUT=$(pnpm exec playwright test --config "$CONFIG" --list 2>&1) || {
   echo "FAIL: --list command failed"
   echo "$LIST_OUTPUT" | tail -20
   exit 1
@@ -58,7 +58,7 @@ fi
 echo "PASS: no globalSetup build step"
 
 # Check 5: Sharding works
-SHARD_OUTPUT=$(npx playwright test --config "$CONFIG" --list --shard=1/2 2>&1) || {
+SHARD_OUTPUT=$(pnpm exec playwright test --config "$CONFIG" --list --shard=1/2 2>&1) || {
   echo "FAIL: --shard=1/2 list failed"
   echo "$SHARD_OUTPUT" | tail -20
   exit 1

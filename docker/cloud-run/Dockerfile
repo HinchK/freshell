@@ -94,7 +94,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Must match the @playwright/test version in package.json.
-RUN npx --yes playwright@1.58.2 install --with-deps chromium
+RUN pnpm dlx playwright@1.58.2 install --with-deps chromium
 
 # The runtime entrypoint drives Vitest and Playwright with `pnpm exec`
 # (plan §7.2.3), so the runtime stage needs the same pinned pnpm.

@@ -51,7 +51,7 @@
  *        }
  *      })
  *      process.stdin.resume()
- *   2. FRESHELL_FAKE_NOOP=1 npx playwright test --config test/e2e-browser/playwright.config.ts \
+ *   2. FRESHELL_FAKE_NOOP=1 pnpm exec playwright test --config test/e2e-browser/playwright.config.ts \
  *   Expected: the approval-allow test fails — the approval card never renders
  *   (timeout waiting for role=alert "Permission request for Bash"), proving
  *   the assertion chain is not vacuous. (Recorded in the Task-8 report; with

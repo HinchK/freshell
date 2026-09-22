@@ -44,7 +44,7 @@ CLOUD_STDOUT=$(mktemp /tmp/cloud-stdout.XXXXXX)
 timeout 10s bash -c "
 FRESHELL_VITEST_BACKEND=cloud \
 FRESHELL_VITEST_CLOUD_SCRIPT='$FAKE_SCRIPT' \
-npx tsx scripts/run-standard-tests.ts --mode desktop
+pnpm exec tsx scripts/run-standard-tests.ts --mode desktop
 " > "$CLOUD_STDOUT" 2>&1 || true
 
 check "fake vitest-cloud.sh was invoked" grep -q 'FAKE_VITEST_CLOUD' "$FAKE_CLOUD_LOG"
@@ -63,7 +63,7 @@ rm -f "$FAKE_CLOUD_LOG"; touch "$FAKE_CLOUD_LOG"
 timeout 10s bash -c "
 FRESHELL_VITEST_BACKEND=local \
 FRESHELL_VITEST_CLOUD_SCRIPT='$FAKE_SCRIPT' \
-npx tsx scripts/run-standard-tests.ts --mode desktop
+pnpm exec tsx scripts/run-standard-tests.ts --mode desktop
 " > /dev/null 2>&1 || true
 
 if grep -q 'FAKE_VITEST_CLOUD' "$FAKE_CLOUD_LOG" 2>/dev/null; then
