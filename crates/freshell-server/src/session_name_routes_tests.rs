@@ -859,6 +859,101 @@ async fn an_unknown_name_intent_is_rejected_loudly_not_silently_defaulted() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// Delta-review round 4, finding 3: a non-integer or beyond-JS-safe
+/// `ifRevision` silently degraded the compare-and-set guard to an
+/// UNGUARDED rename (the helper's `as_u64` + ceiling filter mapped every
+/// malformed value to "no CAS"). Malformed revisions are now rejected
+/// loudly with a 400 — the same discipline the helper's own `nameIntent`
+/// handling (round 3, finding 8) and the canonical serde route already
+/// apply — while a valid integer revision is still honored.
+#[tokio::test]
+async fn a_malformed_if_revision_is_rejected_loudly_not_silently_dropped() {
+    let home = temp_home();
+    let state = names_state(&home);
+    let names = state.names.clone();
+    admit_pending(&names, "handle-cas", NamedProvider::Claude, Some("/w")).await;
+    let bound = bind_verified(&names, "handle-cas", NamedProvider::Claude, "sess-cas-1").await;
+    let target = SessionNameRef::Session {
+        provider: NamedProvider::Claude,
+        session_id: "sess-cas-1".into(),
+    };
+    let uri = "/api/sessions/sess-cas-1?provider=claude";
+
+    // Every malformed shape is a loud 400 — never a silently-unguarded
+    // rename.
+    for bad_revision in [
+        json!("12"),                     // a string, not an integer
+        json!(1.5),                      // a non-integral number
+        json!(-5),                       // negative
+        json!(true),                     // a bare boolean
+        json!(9_007_199_254_740_993u64), // one beyond the JS-safe ceiling
+    ] {
+        let (status, body) = {
+            let sessions = sessions_router(&home, &names);
+            patch(
+                sessions,
+                uri,
+                json!({ "titleOverride": "Must Not Land", "ifRevision": bad_revision }),
+            )
+            .await
+        };
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "ifRevision {bad_revision} is rejected loudly, not silently dropped: {body}"
+        );
+        let survivor = names.get(vec![target.clone()]).await.unwrap()[0].clone();
+        assert_ne!(
+            survivor.record.name, "Must Not Land",
+            "the malformed CAS attempt renamed nothing"
+        );
+    }
+
+    // A VALID integer revision is still honored: matching the current
+    // record revision succeeds...
+    let (status, body) = {
+        let sessions = sessions_router(&home, &names);
+        patch(
+            sessions,
+            uri,
+            json!({
+                "titleOverride": "CAS Name",
+                "ifRevision": bound.record.revision,
+            }),
+        )
+        .await
+    };
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let record = names.get(vec![target]).await.unwrap()[0].clone();
+    assert_eq!(record.record.name, "CAS Name");
+
+    // ...and a mismatched one still yields the conflict, not an overwrite.
+    let (status, body) = {
+        let sessions = sessions_router(&home, &names);
+        patch(
+            sessions,
+            uri,
+            json!({ "titleOverride": "Stale Editor", "ifRevision": 1u64 }),
+        )
+        .await
+    };
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "a stale valid revision still answers the CAS conflict: {body}"
+    );
+    let survivor = names
+        .get(vec![SessionNameRef::Session {
+            provider: NamedProvider::Claude,
+            session_id: "sess-cas-1".into(),
+        }])
+        .await
+        .unwrap()[0]
+        .clone();
+    assert_eq!(survivor.record.name, "CAS Name");
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// A request that OMITS the title field still updates unrelated fields
 /// through the legacy session route (archive), and a scoped title rename
 /// never writes a competing settings override.

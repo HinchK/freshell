@@ -140,6 +140,11 @@ pub(crate) async fn rename_through_authority(
 /// `automatic`, which would quietly strip an intended rename's permanence
 /// behind a typo. The safe direction is preserved either way: rejection
 /// forces the caller to state the intent correctly.
+/// Delta-review round 4, finding 3: a malformed `ifRevision` (a
+/// non-integer, a negative, a boolean, or a number beyond the JS-safe
+/// ceiling) is the SAME loud 400 — it used to be silently dropped, which
+/// degraded the compare-and-set guard to an unguarded rename. Omitted or
+/// `null` stays "no CAS"; a valid integer within the ceiling is honored.
 pub(crate) fn parse_rename_intents(body: &Value) -> Result<(NameIntent, Option<u64>), String> {
     let intent = match body.get("nameIntent") {
         None | Some(Value::Null) => NameIntent::Automatic,
@@ -158,10 +163,25 @@ pub(crate) fn parse_rename_intents(body: &Value) -> Result<(NameIntent, Option<u
             ))
         }
     };
-    let if_revision = body
-        .get("ifRevision")
-        .and_then(Value::as_u64)
-        .filter(|r| *r <= MAX_NAME_REVISION);
+    let if_revision = match body.get("ifRevision") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(number)) => {
+            let revision = number.as_u64().filter(|r| *r <= MAX_NAME_REVISION);
+            match revision {
+                Some(revision) => Some(revision),
+                None => {
+                    return Err(format!(
+                        "ifRevision must be an integer within the JS-safe range (0..={MAX_NAME_REVISION}), got {number}"
+                    ))
+                }
+            }
+        }
+        Some(other) => {
+            return Err(format!(
+                "ifRevision must be an integer within the JS-safe range (0..={MAX_NAME_REVISION}), got {other}"
+            ))
+        }
+    };
     Ok((intent, if_revision))
 }
 
