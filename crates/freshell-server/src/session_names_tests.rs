@@ -1906,8 +1906,14 @@ async fn observe_native_folds_provider_titles_and_own_write_echoes() {
     assert_eq!(equal.record.name, "Native title");
 
     // Invalid titles (an external rename over the accepted-name cap) never
-    // fail the transaction: the observation PROVENANCE is retained and only
-    // the offer is skipped — no rename, no error (Task 3 fix round M7).
+    // fail the transaction: only the offer is skipped — no rename, no error
+    // (Task 3 fix round M7). Delta-review round 3, finding 5: a no-op
+    // observation no longer rewrites the document just to persist its
+    // `last_observation.at` — the durable write folds into the next real
+    // change, so the last COMMITTED provenance (the seeding "Native title"
+    // snapshot, location revision 0) stands and the generation does not
+    // advance.
+    let generation_before = read_raw_document(dir.path()).document_generation;
     let oversize = store
         .observe_native(observe(
             target.clone(),
@@ -1916,21 +1922,104 @@ async fn observe_native_folds_provider_titles_and_own_write_echoes() {
             1,
         ))
         .await
-        .expect("an invalid observation title retains its provenance");
+        .expect("an invalid observation title never fails the transaction");
     assert!(!oversize.changed);
     assert_eq!(oversize.record.name, "Native title");
     let document = read_raw_document(dir.path());
+    assert_eq!(
+        document.document_generation, generation_before,
+        "an observation-only delta must not rewrite the document"
+    );
     let entry = document
         .native_write
         .values()
         .next()
-        .expect("an observation entry exists");
+        .expect("the committed observation entry exists");
     let observation = entry
         .last_observation
         .as_ref()
-        .expect("the invalid observation's provenance is retained");
+        .expect("the last committed observation's provenance is retained");
     assert_eq!(observation.origin, "snapshot");
     assert!(!observation.stale);
+    assert_eq!(
+        observation.location_revision, 0,
+        "the losing no-op observation did not overwrite the committed provenance"
+    );
+}
+
+/// Delta-review round 3, finding 5: every native title observation used to
+/// commit a bookkeeping-only document rewrite (full-document replace +
+/// fsync) merely to persist `last_observation.at` when nothing user-visible
+/// changed — a durable write per OpenCode `session.updated` event during
+/// active conversations. An observation-only delta (equal-rank losing
+/// offer, no series to rearm) must not rewrite the document at all; the
+/// provenance timestamp folds into the next real change instead.
+#[tokio::test]
+async fn observation_only_native_titles_do_not_rewrite_the_document() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = pending("h-obs-only");
+    ensure(
+        &store,
+        "h-obs-only",
+        NamedProvider::Claude,
+        Some("/w/obs-only"),
+    )
+    .await
+    .expect("ensure pending");
+
+    // Seed a committed provider_ai name: this observation's offer WINS, so
+    // its transaction commits and its provenance rides the real write.
+    let folded = store
+        .observe_native(observe(
+            target.clone(),
+            "Native title",
+            NativeNameOrigin::Snapshot,
+            0,
+        ))
+        .await
+        .expect("the seeding observation folds");
+    assert!(folded.changed);
+    assert_eq!(folded.record.name, "Native title");
+    let generation = read_raw_document(dir.path()).document_generation;
+
+    // An equal-rank automatic observation LOSES (equal-rank observations
+    // preserve the accepted value) and there is no series to rearm: the only
+    // thing this observation could move is last_observation.at.
+    let noop = store
+        .observe_native(observe(
+            target.clone(),
+            "A different provider title",
+            NativeNameOrigin::ProviderAi,
+            0,
+        ))
+        .await
+        .expect("the observation-only delta");
+    assert!(!noop.changed);
+    assert_eq!(noop.record.name, "Native title");
+
+    // No document rewrite: the generation did not advance, and the
+    // committed provenance still stands with the winning observation's
+    // location revision (the losing observation wrote nothing durable).
+    let document = read_raw_document(dir.path());
+    assert_eq!(
+        document.document_generation, generation,
+        "an observation-only delta must not advance the document generation"
+    );
+    let entry = document
+        .native_write
+        .values()
+        .next()
+        .expect("the committed observation entry exists");
+    assert_eq!(
+        entry
+            .last_observation
+            .as_ref()
+            .expect("provenance")
+            .location_revision,
+        0,
+        "the seeding observation's provenance still stands"
+    );
 }
 
 #[tokio::test]

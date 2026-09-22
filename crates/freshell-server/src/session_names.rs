@@ -2809,26 +2809,10 @@ fn observe_native_decision(
         .unwrap_or(0);
     let stale = location_revision < verified_revision;
 
-    {
-        let entry = document.native_write.entry(key.clone()).or_default();
-        entry.last_observation = Some(StoredObservation {
-            origin: match origin {
-                NativeNameOrigin::Snapshot => "snapshot".to_string(),
-                NativeNameOrigin::ProviderAi => "provider_ai".to_string(),
-                NativeNameOrigin::OwnWrite => "own_write".to_string(),
-            },
-            location_revision,
-            event_id,
-            at: meta.now_ms,
-            stale,
-        });
-    }
-
     let mut changed = false;
     // An invalid observation title (an external rename over the accepted-name
-    // cap, or control characters) never fails the transaction: the
-    // observation PROVENANCE staged above is retained, and only the offer and
-    // the divergence rearm are skipped for the invalid text.
+    // cap, or control characters) never fails the transaction: only the
+    // offer and the divergence rearm are skipped for the invalid text.
     let valid_title = validate_name(&title).ok();
     match origin {
         // An own-write echo is provenance only: same-name or late echoes never
@@ -2886,16 +2870,35 @@ fn observe_native_decision(
         }
     }
 
+    // Delta-review round 3, finding 5: an observation-only delta (nothing
+    // user-visible moved) must not rewrite the document merely to persist
+    // `last_observation.at` — that was a full-document replace + fsync per
+    // observation during active provider conversations. The provenance
+    // stages only when a real change is committing anyway, so the latest
+    // observation's timestamp rides the next real write instead.
+    if changed || status_changed {
+        let entry = document.native_write.entry(key.clone()).or_default();
+        entry.last_observation = Some(StoredObservation {
+            origin: match origin {
+                NativeNameOrigin::Snapshot => "snapshot".to_string(),
+                NativeNameOrigin::ProviderAi => "provider_ai".to_string(),
+                NativeNameOrigin::OwnWrite => "own_write".to_string(),
+            },
+            location_revision,
+            event_id,
+            at: meta.now_ms,
+            stale,
+        });
+    } else {
+        return Ok(Decision::Read(read_update(document, &key)));
+    }
+
     if changed {
         Ok(commit_decision(document, &key, true))
-    } else if status_changed {
+    } else {
         // A status-only update publishes the unchanged record with its new
         // nativeSync projection; clients fold it by documentGeneration.
         Ok(commit_decision_publishing_status(document, &key))
-    } else {
-        // Provenance bookkeeping is a persisted mutation (a bookkeeping-only
-        // generation) — but it publishes nothing and never renames.
-        Ok(commit_decision(document, &key, false))
     }
 }
 

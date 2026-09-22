@@ -2751,9 +2751,13 @@ async fn a_superseded_cycle_charges_no_read_against_the_successor_series() {
 }
 
 // ---------------------------------------------------------------------------
-// T3-M7: an invalid observation title retains the observation provenance and
-// skips only the offer/rearm — an external >200-scalar rename must not abort
-// the whole transaction.
+// T3-M7: an invalid observation title never fails the transaction and skips
+// only the offer/rearm — an external >200-scalar rename must not abort the
+// whole transaction. Delta-review round 3, finding 5 re-contracted the
+// provenance write: a no-op observation (nothing user-visible moved) no
+// longer pays a durable document rewrite for `last_observation.at` — the
+// timestamp rides the next real change — so this no-op leaves no durable
+// lastObservation behind.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -2765,8 +2769,7 @@ async fn an_invalid_observation_title_retains_provenance_without_offering_or_rea
     // An external rename longer than the accepted-name cap arrives.
     let oversize = "x".repeat(201);
     let folded = observe(&store, target.clone(), &oversize, 1).await;
-    let folded = folded
-        .expect("an invalid observation title is retained as provenance, not a failed transaction");
+    let folded = folded.expect("an invalid observation title is not a failed transaction");
     assert_eq!(
         folded.record.name, "Manual Title",
         "an invalid title never renames"
@@ -2775,12 +2778,15 @@ async fn an_invalid_observation_title_retains_provenance_without_offering_or_rea
         folded.record.source,
         freshell_protocol::session_names::NameSource::Manual
     );
+    // The observation was a no-op (invalid title: no offer, no rearm), so it
+    // wrote nothing durable — no bookkeeping-only generation, and no
+    // lastObservation staged by this event (the next real change persists
+    // the then-current observation instead).
     let doc = document_json(dir.path());
-    let observation = native_entry_of(&doc)["lastObservation"]
-        .as_object()
-        .expect("the observation provenance is retained");
-    assert_eq!(observation["origin"].as_str(), Some("snapshot"));
-    assert_eq!(observation["stale"].as_bool(), Some(false));
+    assert!(
+        native_entry_of(&doc).get("lastObservation").is_none(),
+        "a no-op observation stages no durable provenance"
+    );
 
     // No rearm: the armed series stays untouched by the invalid event.
     let sync = native_sync_of(&store, target.clone())
