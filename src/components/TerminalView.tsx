@@ -104,6 +104,7 @@ import {
   beginRecoveryAttempt,
   createTerminalRecoveryAccounting,
   recordRecoveryProgress,
+  recordRecoveryRestoreSuccess,
   resetRecoveryAccounting,
   type TerminalRecoveryAccounting,
 } from '@/lib/terminal-recovery-accounting'
@@ -1015,6 +1016,22 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // attach attempts vs the coverage cursor; gates automatic re-attach
   // cycling and drives the visible retry state. Never kills or replaces.
   const recoveryAccountingRef = useRef<TerminalRecoveryAccounting>(createTerminalRecoveryAccounting())
+  // Clean-restore success (WS2): per-attach-generation taint tracking for
+  // the recovery-streak reset. `generationGapFreeRef` turns false the
+  // moment the current generation reports any output loss (a gap frame, a
+  // stream-identity mismatch, an invalid-message lost range) — a
+  // completion is only a CLEAN restore (and only a clean reset resets the
+  // progressless streak) when the generation stayed gap-free; broken
+  // cycles (no ready, gaps, failures) still exhaust the bound.
+  // `generationSuppressCleanResetRef` marks a gap-initiated REPAIR
+  // generation: repeated queue_overflow repairs must still exhaust to the
+  // retry strip, so their clean completions do not refund the streak.
+  // `gapRepairPendingRef` is the one-shot pending marker between the gap
+  // arm initiating the repair and the repair attach's install (the next
+  // install consumes it).
+  const generationGapFreeRef = useRef(true)
+  const generationSuppressCleanResetRef = useRef(false)
+  const gapRepairPendingRef = useRef(false)
   const surfaceEpochRef = useRef(0)
   const geometryEpochRef = useRef(1)
   const geometryAuthorityRef = useRef<TerminalGeometryAuthority>('single_client')
@@ -3040,13 +3057,41 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       pendingSinceSeq: 0,
       pendingReason: 'initial_hydrate',
     }
+    // Clean-restore success (WS2): a completion on a generation that
+    // received its attach.ready, stayed gap-free, and was not a
+    // gap-initiated repair is a SUCCESSFUL restore, not stagnation — an
+    // idle converged pane's ordinary empty-delta reconnects must never
+    // strand it on the retry strip. The gap-tainted completion paths
+    // (retention/delivery gaps, stream-identity mismatches) call this with
+    // generationGapFreeRef false, so broken cycles still exhaust the bound.
+    if (
+      currentAttachRef.current
+      && generationGapFreeRef.current
+      && !generationSuppressCleanResetRef.current
+    ) {
+      const terminalId = currentAttachRef.current.terminalId
+      const attachRequestId = currentAttachRef.current.requestId
+      const wasExhausted = recoveryAccountingRef.current.exhausted
+      const attemptsBefore = recoveryAccountingRef.current.attempts
+      if (attemptsBefore > 0 || wasExhausted) {
+        recoveryAccountingRef.current = recordRecoveryRestoreSuccess(recoveryAccountingRef.current)
+        if (wasExhausted) {
+          setRecoveryExhausted(false)
+        }
+        recordTerminalPerfAuditEvent('terminal.restore.recovery_success', {
+          terminalId,
+          attachRequestId,
+          attempts: attemptsBefore,
+        })
+      }
+    }
     const queue = getHydrationQueue()
     if (hiddenRef.current) {
       queue.onHydrationComplete(paneId)
     } else {
       queue.onActiveTabReady(tabId, tabOrderRef.current)
     }
-  }, [paneId, tabId])
+  }, [paneId, tabId, recordTerminalPerfAuditEvent])
 
   const markTerminalOutputRangeLost = useCallback((input: {
     terminalId: string
@@ -3058,6 +3103,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     reason: string
     invalidReason?: string
   }) => {
+    // A known lost range taints the current attach generation: its
+    // completion is not a clean restore (no streak reset).
+    generationGapFreeRef.current = false
     const previousSeqState = seqStateRef.current
     const explicitFromSeq = input.fromSeq
     const explicitToSeq = input.toSeq
@@ -3219,6 +3267,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       ? msg.seqEnd
       : (typeof msg.toSeq === 'number' ? msg.toSeq : undefined)
     if (typeof fromSeq === 'number' && typeof toSeq === 'number') {
+      // A stream-identity-mismatch loss taints the current generation:
+      // its completion is not a clean restore (no streak reset).
+      generationGapFreeRef.current = false
       const previousSeqState = seqStateRef.current
       const gapDecision = onOutputGap(previousSeqState, { fromSeq, toSeq })
       const nextSeqState = gapDecision.state
@@ -3508,6 +3559,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     pacedReplayRef.current = pacedReplayNegotiated
       ? beginPacedReplayConsumption({ terminalId: tid, attachRequestId, sinceSeq })
       : null
+
+    // Re-arm the clean-restore taint tracking for the NEW generation: it
+    // starts gap-free, and consumes the one-shot gap-repair pending marker
+    // (a repair generation's clean completion does not refund the streak —
+    // repeated gaps must still exhaust to the retry strip).
+    generationGapFreeRef.current = true
+    generationSuppressCleanResetRef.current = gapRepairPendingRef.current
+    gapRepairPendingRef.current = false
 
     currentAttachRef.current = {
       requestId: attachRequestId,
@@ -4829,6 +4888,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               : 'slow link backlog'
             writeLocalXtermNotice(term, `\r\n[Output gap ${msg.fromSeq}-${msg.toSeq}: ${reason}]\r\n`)
           }
+          // The generation is gap-tainted from here on: any completion it
+          // reaches is NOT a clean restore (the clean-restore streak reset
+          // must never fire for it).
+          generationGapFreeRef.current = false
           const previousSeqState = seqStateRef.current
           const gapDecision = onOutputGap(previousSeqState, { fromSeq: msg.fromSeq, toSeq: msg.toSeq })
           const nextSeqState = gapDecision.state
@@ -4878,6 +4941,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               fromSeq: msg.fromSeq,
               toSeq: msg.toSeq,
             })
+            // The repair generation must not refund the streak on a clean
+            // completion: repeated gaps still exhaust to the retry strip.
+            gapRepairPendingRef.current = true
             attachTerminal(tid, 'viewport_hydrate', {
               clearViewportFirst: true,
               ...viewportHydrateReplayOptions(contentRef.current, pacedReplayNegotiated),

@@ -11241,6 +11241,98 @@ describe('TerminalView lifecycle updates', () => {
       expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
     })
 
+    it('recovery bounding: a cleanly completed reconnect-restore resets the streak — an idle converged pane never strands', async () => {
+      const { terminalId } = await renderResumablePane('recovery-clean')
+
+      const attachCount = () => attachMessagesFor(terminalId).length
+      // The mount attach is the pane's INITIAL hydration (never counted).
+      expect(attachCount()).toBe(1)
+
+      // Each flap's reconnect attach completes CLEANLY on the converged
+      // pane: ready received, empty window, no gap — the ordinary
+      // shape of an idle pane's reconnect (it delivers no new coverage
+      // bytes, yet it is a SUCCESSFUL restore, not a broken cycle).
+      const ackCleanRestore = () => {
+        const attach = attachMessagesFor(terminalId).at(-1)
+        expect(attach?.attachRequestId).toBeTruthy()
+        act(() => {
+          messageHandler!({
+            type: 'terminal.attach.ready',
+            terminalId,
+            headSeq: 4,
+            replayFromSeq: 5,
+            replayToSeq: 4,
+            attachRequestId: attach!.attachRequestId,
+          })
+        })
+      }
+
+      // FAR past the bound (3): every flap still auto-attaches because each
+      // clean completion resets the progressless streak.
+      for (let flap = 0; flap < 6; flap += 1) {
+        act(() => { reconnectHandler?.() })
+        expect(attachCount(), `flap ${flap} attaches`).toBe(2 + flap)
+        ackCleanRestore()
+      }
+      expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+
+      // And the pane keeps auto-attaching on the next flap after that.
+      act(() => { reconnectHandler?.() })
+      expect(attachCount()).toBe(8)
+      expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+    })
+
+    it('recovery bounding: a gap-tainted generation never resets the streak on completion', async () => {
+      const { terminalId } = await renderResumablePane('recovery-gap-taint')
+
+      const attachCount = () => attachMessagesFor(terminalId).length
+      expect(attachCount()).toBe(1)
+
+      // Flap 1: the reconnect attach's ready arrives, then a retention gap
+      // breaks the generation mid-window — the completion that follows is
+      // NOT a clean success and must not reset the streak.
+      act(() => { reconnectHandler?.() })
+      expect(attachCount()).toBe(2)
+      const gapped = attachMessagesFor(terminalId).at(-1)
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 8,
+          replayFromSeq: 1,
+          replayToSeq: 8,
+          attachRequestId: gapped!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 2,
+          toSeq: 5,
+          reason: 'replay_window_exceeded',
+          attachRequestId: gapped!.attachRequestId,
+        })
+        // The post-gap retained range completes the attach via frames.
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 6,
+          seqEnd: 8,
+          data: 'TAIL',
+          attachRequestId: gapped!.attachRequestId,
+        })
+      })
+
+      // Flaps 2 and 3: the gap-poisoned pane's further progressless
+      // reconnects accumulate to the bound; the 4th is declined.
+      for (let flap = 1; flap <= 2; flap += 1) {
+        act(() => { reconnectHandler?.() })
+        expect(attachCount()).toBe(2 + flap)
+      }
+      act(() => { reconnectHandler?.() })
+      expect(attachCount(), 'the bound still trips for gap-poisoned cycles').toBe(4)
+      expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+    })
+
     it('recovery bounding: the no-progress deadline reaches the retry state through the wired timer path (M-4)', async () => {
       const { terminalId } = await renderResumablePane('deadline')
 

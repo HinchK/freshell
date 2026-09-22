@@ -82,6 +82,30 @@ export function recordRecoveryProgress(
 }
 
 /**
+ * Record a CLEAN, COMPLETED restore: attach.ready received, the attach's
+ * window completed, and no gap quarantined the generation. Restore SUCCESS
+ * is distinct from stagnation — a converged pane's ordinary empty-delta
+ * reconnects deliver no new coverage bytes, yet each one proves the
+ * surface is valid and live; charging them as progressless attempts
+ * strands a healthy pane on the retry strip after N ordinary flaps
+ * (WS2's bound targets broken restore CYCLES — no ready, gaps, failures —
+ * not successful restores). Resets the progressless streak and clears
+ * exhaustion; the coverage record (lastProgressSeq) and the
+ * initial-attach exemption are untouched.
+ */
+export function recordRecoveryRestoreSuccess(
+  state: TerminalRecoveryAccounting,
+): TerminalRecoveryAccounting {
+  return {
+    ...state,
+    attempts: 0,
+    streakStartedAt: null,
+    exhausted: false,
+    lastAttemptKey: null,
+  }
+}
+
+/**
  * Decide whether ONE automatic attach attempt may proceed, folding in any
  * progress-since-last-attempt first. `allowed: false` means the bound was
  * reached: the caller stops automatic re-attach cycling and shows the
