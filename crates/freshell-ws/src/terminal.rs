@@ -402,17 +402,20 @@ async fn run_loop(
     // registry-side deferrals die with the subscribers remove_connection
     // sweeps), a detach cancels one, a re-attach replaces it.
     let mut paced_sessions = crate::paced_replay::PacedSessions::default();
-    // Round-2 finding F1 + E2R1 finding 1: the connection's staged-exit
-    // routing. A natural exit while a paced session's deferral is armed
-    // STAGES the exit registry-side (final output first) and fires the
-    // per-subscriber notify hook; this channel carries the event back to
-    // THIS loop, whose select arm extends the still-CREDITED session's
-    // phase through the terminal's final head — the deferred final
-    // output pages ONLY on continuation credits, and the session's
-    // completing verdict delivers the staged exit (no uncredited dump).
-    // Unbounded mpsc: the sender lives on registry subscribers and fires
-    // at most once per subscriber; the credited session bounds the
-    // staged window itself.
+    // Round-2 finding F1 + E2R1 finding 1 + E2R2 finding: the
+    // connection's staged-exit routing. A natural exit while a paced
+    // session's deferral is armed STAGES the exit registry-side (final
+    // output first) and fires the per-subscriber notify hook; this
+    // channel carries the event back to THIS loop, whose select arm
+    // ARMS the still-CREDITED session's phase extension through the
+    // terminal's frozen final head (the dispatch-side mirror of the
+    // credit path's arm-first query — the registry is the authority
+    // either way, and the arm is monotone + idempotent). The deferred
+    // final output pages ONLY on continuation credits, and terminal.exit
+    // rides the credit that acknowledges the page reaching the armed
+    // exit head (no uncredited dump, no wedge). Unbounded mpsc: the
+    // sender lives on registry subscribers and fires at most once per
+    // subscriber; the credited session bounds the staged window itself.
     let (paced_exit_tx, mut paced_exit_rx) = mpsc::unbounded_channel::<(String, i64)>();
     let paced_exit_notify: Option<freshell_terminal::PacedExitNotify> = paced_terminal_replay_v1
         .then(|| {
@@ -603,66 +606,34 @@ async fn run_loop(
                     _ => {}
                 }
             }
-            // E2R1 finding 1: a natural exit must SEQUENCE behind the
-            // session's normal CREDITED completion — the pacing contract
-            // pinned at the exit boundary. A session still in its
-            // credited phase STAYS ARMED: the credited phase extends
-            // ONCE through the terminal's final head (the head is frozen
-            // by the exit), the deferred final output pages ONLY on the
-            // client's continuation credits, and the session's
-            // completing verdict (the drain's CaughtUp hold) delivers
-            // the staged exit after the last page. A client that
-            // withholds credits receives no further pages and no exit
-            // until it credits; a dead connection ends the wait naturally
-            // (keepalive termination). No uncredited dump, under any
-            // name.
+            // E2R2 finding (the exit-arming race): the notify arm is the
+            // DISPATCH-side mirror of the credit path's arm-first
+            // invariant. A session still in its credited phase — which
+            // always has exactly ONE uncredited page outstanding — gets
+            // its phase extended through the terminal's frozen final head
+            // HERE when the notify wins the dispatch race; the credit
+            // path's arm-first query closes the same race when a credit
+            // runs first (the registry is the authority either way, and
+            // arming is monotone + idempotent, so whichever arm lands
+            // first wins and the other is inert). NOTHING is ever
+            // delivered here and the session never leaves the table
+            // here: the extended phase pages only on continuation
+            // credits, and terminal.exit rides the credit that
+            // acknowledges the page reaching the armed exit head (the
+            // drive sites own that disposition).
             Some((terminal_id, exit_code)) = paced_exit_rx.recv() => {
-                let mut deliver_now = false;
+                let _ = exit_code; // the armed log names the frozen head; the drain logs the code
                 if let Some(session) = paced_sessions.get_mut(&terminal_id) {
-                    if session.exit_head.is_none() {
-                        if let Some(bounds) = state.registry.replay_bounds(&terminal_id) {
-                            session.arm_staged_exit(bounds.head_seq);
-                            tracing::info!(
-                                terminal_id = %terminal_id,
-                                attach_request_id = %session.attach_request_id,
-                                exit_code,
-                                exit_head = bounds.head_seq,
-                                "ws.restore.paced_exit_armed"
-                            );
-                            // The extended phase is ALREADY complete and
-                            // the client owes no credit (nothing
-                            // outstanding): no credit can ever arrive, so
-                            // the exit delivers NOW through the empty
-                            // drain's CaughtUp hold (the reservation is
-                            // released unused — zero uncredited pages).
-                            deliver_now = session.credited == session.page_end
-                                && session.page_end >= session.phase_target();
-                        }
-                        // No bounds: the terminal is gone; the session
-                        // reports Gone on its next credit.
-                    }
-                    // exit_head already set: a credit raced ahead of this
-                    // notify and armed the extension — the armed session
-                    // pages on credits; nothing more to do here.
+                    crate::paced_replay::arm_staged_exit_from_registry(
+                        &state.registry,
+                        conn_id,
+                        session,
+                    );
                 }
                 // A session NOT in the credited table is owned by its
                 // drain task (its completing verdict delivers the staged
                 // exit) or already completed (the exit was delivered at
                 // staging, the non-paced shape) — nothing to do.
-                if deliver_now {
-                    if let Some(session) = paced_sessions.remove(&terminal_id) {
-                        let page_budget = session.page_budget;
-                        crate::paced_replay::spawn_paced_drain(
-                            state.registry.clone(),
-                            conn_id,
-                            ws_tx.clone(),
-                            Arc::clone(&conn_sink),
-                            session,
-                            page_budget,
-                            create_cancel_rx.clone(),
-                        );
-                    }
-                }
             }
             _ = catastrophic_ticker.tick() => {
                 // TERM-09 catastrophic backpressure: this connection's queued
@@ -7328,55 +7299,55 @@ fn handle_replay_credit(
     // recorded on the session at attach) sizes the credited pages — the
     // whole session honors the requested bound, not just the first page.
     let budget = session.page_budget;
-    let mut exit_armed_stays_credited = false;
+    // E2R2 finding (the exit-arming race) — THE INVARIANT, part 1:
+    // arming ALWAYS precedes driving in the credit path. The registry is
+    // the authority for a staged natural exit (the staging happens under
+    // the terminal lock BEFORE the notify fires), so a staged exit is
+    // discovered HERE — before the drive — and the drive below pages
+    // toward the extended phase target. An arm that extends the target
+    // beyond the credited cursor is therefore ALWAYS followed by a drive
+    // that produces the next page: no state may exist where the target
+    // exceeds the credited cursor and no page was just emitted (the
+    // pre-fix drive-then-arm ordering kept such sessions with nothing
+    // outstanding — permanently wedging the final output and
+    // terminal.exit, because nothing outstanding means no credit can
+    // ever come).
+    crate::paced_replay::arm_staged_exit_from_registry(registry, conn_id, session);
     match crate::paced_replay::drive_session(registry, conn_id, conn_sink, session, budget) {
         DriveOutcome::Active => {}
+        // THE INVARIANT, part 2: terminal.exit rides the CREDIT verdict
+        // that acknowledges consumption of the page reaching the armed
+        // exit head — never the drive that emits it. A DrainReady drive
+        // that just emitted that page leaves it UN-CREDITED: removal
+        // waits for the NEXT credit — the acknowledging one (the client
+        // clears its attach state on exit, so an exit delivered here
+        // would also kill that page's parser-applied checkpoint and
+        // consumption credit on the client side). Every other
+        // DrainReady completes now: the session leaves the credited
+        // phase and the spawned drain's CaughtUp hold delivers any
+        // staged exit AFTER everything the client already acknowledged
+        // (an armed session with `credited == page_end` extended
+        // nothing past the acknowledged cursor, or the acknowledging
+        // credit is the one being processed).
+        DriveOutcome::DrainReady if session.uncredited_exit_page() => {}
         DriveOutcome::DrainReady => {
-            // E2R1 finding 1 (race close): a natural exit may have staged
-            // between this credit and the notify's dispatch — the REGISTRY
-            // is the authority (staging happens under the terminal lock,
-            // before the notify fires), so a still-credited session with a
-            // staged exit STAYS ARMED: the credited phase extends once
-            // through the terminal's final head and the deferred final
-            // output pages ONLY on credits. An Accepted credit has already
-            // consumed the outstanding page (credited == page_end), so the
-            // extended phase either leaves pages to produce (stay armed)
-            // or is complete (the empty drain below delivers the staged
-            // exit through its CaughtUp hold — zero uncredited pages).
-            if session.exit_head.is_none()
-                && registry
-                    .staged_paced_exit(&replay_credit.terminal_id, conn_id)
-                    .is_some()
-            {
-                if let Some(bounds) = registry.replay_bounds(&replay_credit.terminal_id) {
-                    session.arm_staged_exit(bounds.head_seq);
-                    if session.page_end < session.phase_target() {
-                        exit_armed_stays_credited = true;
-                    }
-                }
-                // No bounds: the terminal is gone — fall through to the
-                // drain, which reports Gone.
-            }
-            if !exit_armed_stays_credited {
-                // The credited phase covered its target (and any staged
-                // exit is delivered by the drain's completing verdict, or
-                // there is none): the session leaves the credited phase
-                // and moves WHOLE into the spawned drain task — the
-                // connection dispatcher stays free (input, other panes,
-                // controls) while the un-credited drain pages, and
-                // credits that arrive during the drain are inert stale
-                // generations (the drain is un-credited).
-                if let Some(session) = paced_sessions.remove(&replay_credit.terminal_id) {
-                    crate::paced_replay::spawn_paced_drain(
-                        registry.clone(),
-                        conn_id,
-                        writer.clone(),
-                        Arc::clone(conn_sink),
-                        session,
-                        budget,
-                        cancel.clone(),
-                    );
-                }
+            // The credited phase covered its target (and any staged exit
+            // rides the drain's completing verdict, or there is none): the
+            // session leaves the credited phase and moves WHOLE into the
+            // spawned drain task — the connection dispatcher stays free
+            // (input, other panes, controls) while the un-credited drain
+            // pages, and credits that arrive during the drain are inert
+            // stale generations (the drain is un-credited).
+            if let Some(session) = paced_sessions.remove(&replay_credit.terminal_id) {
+                crate::paced_replay::spawn_paced_drain(
+                    registry.clone(),
+                    conn_id,
+                    writer.clone(),
+                    Arc::clone(conn_sink),
+                    session,
+                    budget,
+                    cancel.clone(),
+                );
             }
         }
         DriveOutcome::Gone => {
@@ -11435,10 +11406,7 @@ mod paced_exit_race_tests {
     /// Poll `probe` until it returns `Some` or the deadline passes —
     /// the deterministic observation points (output landed in the ring,
     /// the exit staged, the drain delivered).
-    async fn wait_for<T>(
-        mut probe: impl FnMut() -> Option<T>,
-        what: &str,
-    ) -> T {
+    async fn wait_for<T>(mut probe: impl FnMut() -> Option<T>, what: &str) -> T {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             if let Some(value) = probe() {
@@ -11461,10 +11429,7 @@ mod paced_exit_race_tests {
         for _ in 0..pads {
             script.push_str("read x; printf 'PAD-STEP\\n'; ");
         }
-        script.push_str(&format!(
-            "read x; printf '{}\\n'; exit\n",
-            final_marker
-        ));
+        script.push_str(&format!("read x; printf '{}\\n'; exit\n", final_marker));
         script
     }
 
@@ -11506,10 +11471,9 @@ mod paced_exit_race_tests {
             let terminal_id = format!("T-{name}");
             let exit_registry = registry.clone();
             let exit_terminal_id = terminal_id.clone();
-            let on_exit: freshell_terminal::pty::ExitHook =
-                Box::new(move |exit_code: i64| {
-                    exit_registry.finish_pty_exit(&exit_terminal_id, exit_code);
-                });
+            let on_exit: freshell_terminal::pty::ExitHook = Box::new(move |exit_code: i64| {
+                exit_registry.finish_pty_exit(&exit_terminal_id, exit_code);
+            });
             let spec = freshell_platform::SpawnSpec {
                 program: "/bin/sh".into(),
                 args: vec!["-c".into(), race_script(pads, final_marker)],
@@ -11737,30 +11701,26 @@ mod paced_exit_race_tests {
         harness.start_session(start, head_at_attach);
         // INVARIANT 1: the arm extended the target beyond the credited
         // cursor, so the drive MUST have produced the next page — the
-        // pre-fix keep-with-no-page wedged here (no page, no exit, ever).
-        wait_for(
-            {
-                let collector = Arc::clone(&harness.collector);
-                move || {
-                    outputs(&collector)
-                        .iter()
-                        .any(|data| data.contains("FINAL-WEDGE"))
-                        .then_some(())
-                }
-            },
-            "the deferred final output to page on the extended phase target",
-        )
-        .await;
+        // pre-fix keep-with-no-page wedged here with NOTHING outstanding
+        // (no page, no exit, ever). The session owes exactly one
+        // uncredited page and its first frames are already sunk.
         let session = harness.session();
         assert!(
             session.credited < session.page_end,
-            "the session owes exactly one uncredited page (no wedge state)"
+            "the drive produced the extended phase's next page \
+             (no wedge state: credited {}, page_end {})",
+            session.credited,
+            session.page_end,
+        );
+        assert!(
+            !outputs(&harness.collector).is_empty(),
+            "the extended phase's first page was sunk to the client"
         );
         // INVARIANT 2: the exit waits for the credit that acknowledges
-        // the page reaching the armed exit head.
-        harness.assert_exit_held().await;
-        // Drive the credits until the page reaching the frozen head is
-        // outstanding, then acknowledge it — the exit rides THAT credit.
+        // the page reaching the armed exit head. Credit the pages one by
+        // one until that page is outstanding, hold it uncredited, then
+        // acknowledge it — the exit rides THAT credit.
+        let mut guards = 0;
         loop {
             let session = harness.session();
             assert!(
@@ -11770,14 +11730,15 @@ mod paced_exit_race_tests {
             if session.page_end == exit_head {
                 break;
             }
+            harness.assert_exit_held().await;
             let consumed = session.page_end;
             harness.credit(consumed);
+            guards += 1;
+            assert!(guards < 10_000, "the credit walk must converge");
         }
         harness.assert_exit_held().await;
         harness.credit(exit_head);
-        harness
-            .assert_exit_arrives_and_is_last(exit_code)
-            .await;
+        harness.assert_exit_arrives_and_is_last(exit_code).await;
         assert!(
             outputs(&harness.collector)
                 .iter()
@@ -11789,7 +11750,9 @@ mod paced_exit_race_tests {
             "the session left the credited table on the acknowledging credit"
         );
         assert_eq!(
-            harness.registry.staged_paced_exit(&harness.terminal_id, harness.conn_id),
+            harness
+                .registry
+                .staged_paced_exit(&harness.terminal_id, harness.conn_id),
             None,
             "the subscriber retired with the delivered exit"
         );
@@ -11883,9 +11846,7 @@ mod paced_exit_race_tests {
         harness.assert_exit_held().await;
         // The acknowledging credit: the exit arrives and is the last frame.
         harness.credit(exit_head);
-        harness
-            .assert_exit_arrives_and_is_last(exit_code)
-            .await;
+        harness.assert_exit_arrives_and_is_last(exit_code).await;
         assert!(
             harness.sessions.get_mut(&harness.terminal_id).is_none(),
             "the session left the credited table on the acknowledging credit"
@@ -11900,9 +11861,7 @@ mod paced_exit_race_tests {
             "a post-exit credit grants nothing (no second exit)"
         );
         assert!(
-            !harness
-                .registry
-                .finish_pty_exit(&harness.terminal_id, 99),
+            !harness.registry.finish_pty_exit(&harness.terminal_id, 99),
             "a second exit never restages (monotone, once-only)"
         );
     }

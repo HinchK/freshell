@@ -127,6 +127,24 @@ impl PacedSession {
         });
     }
 
+    /// E2R2 finding (the exit-arming race), invariant 2: after a
+    /// `DrainReady` drive, `true` when the session is armed for a staged
+    /// exit AND its last emitted page — the one that reached the frozen
+    /// [`Self::exit_head`] — is still UN-CREDITED. That page's
+    /// acknowledgment is the ONLY verdict terminal.exit may ride: the
+    /// session must STAY in the credited phase (removal happens on the
+    /// acknowledging credit, and the spawned drain's completing verdict
+    /// delivers the staged exit after it). `false` in every other
+    /// DrainReady state — un-armed (the ordinary completion: the
+    /// uncredited tail drain) or armed with `credited == page_end` (the
+    /// acknowledging credit is the one being processed, or the staged
+    /// exit added no output past the credited cursor — the empty drain's
+    /// CaughtUp hold delivers the exit now, after everything the client
+    /// already acknowledged).
+    pub(crate) fn uncredited_exit_page(&self) -> bool {
+        self.exit_head.is_some() && self.credited < self.page_end
+    }
+
     /// Adopt the registry's attach-time session description (the first page
     /// was produced under the attach lock and is sunk by the caller).
     pub(crate) fn from_desc(desc: PacedSessionDesc) -> Self {
@@ -144,6 +162,56 @@ impl PacedSession {
             pages: u64::from(started),
         }
     }
+}
+
+/// E2R2 finding (the exit-arming race), invariant 1 — ARMING ALWAYS
+/// PRECEDES DRIVING, at every drive site (the credit path, the attach
+/// start, and the notify arm). The REGISTRY is the authority for a
+/// staged natural exit: the staging happens under the terminal lock
+/// BEFORE the connection's notify hook fires, so this query observes it
+/// regardless of the notify's dispatch order — arming here, BEFORE the
+/// drive that follows, is what closes the credit/notify race. Because
+/// the drive runs after the arm, an arm that extends the phase target
+/// beyond the credited cursor is ALWAYS followed by a drive that
+/// produces the next page: no state can exist where the target exceeds
+/// the credited cursor and no page was just emitted (the pre-fix
+/// drive-then-arm ordering kept such sessions with nothing outstanding,
+/// permanently wedging the final output and terminal.exit — nothing
+/// outstanding means no credit can ever come).
+///
+/// Monotone and idempotent: a session already armed (by the notify or an
+/// earlier arm) never moves its `exit_head` backward and never
+/// double-delivers — the terminal's head is frozen by the exit, and
+/// [`PacedSession::arm_staged_exit`] takes the max. Returns `true` when
+/// THIS call armed (observability).
+pub(crate) fn arm_staged_exit_from_registry(
+    registry: &TerminalRegistry,
+    conn_id: u64,
+    session: &mut PacedSession,
+) -> bool {
+    if session.exit_head.is_some() {
+        // Already armed — the notify or an earlier arm won the race; the
+        // frozen head never moves and a second arm is inert.
+        return false;
+    }
+    if registry
+        .staged_paced_exit(&session.terminal_id, conn_id)
+        .is_none()
+    {
+        return false;
+    }
+    let Some(bounds) = registry.replay_bounds(&session.terminal_id) else {
+        // staged_paced_exit was Some, so the terminal exists; defensive.
+        return false;
+    };
+    session.arm_staged_exit(bounds.head_seq);
+    tracing::info!(
+        terminal_id = %session.terminal_id,
+        attach_request_id = %session.attach_request_id,
+        exit_head = bounds.head_seq,
+        "ws.restore.paced_exit_armed"
+    );
+    true
 }
 
 /// The per-connection session table (at most one session per terminal).
@@ -719,6 +787,16 @@ pub(crate) fn start_session(
     );
     if session.page_end >= session.target {
         let budget = session.page_budget;
+        // E2R2 finding (the exit-arming race), invariant 1: ARM FIRST —
+        // a natural exit may have staged between the attach and this
+        // drive, and the registry is the authority (staging happens
+        // under the terminal lock, before the notify's dispatch). The
+        // arm extends the credited phase through the terminal's frozen
+        // final head BEFORE the drive, so the drive below produces the
+        // extended phase's next page: an arm that extends the target
+        // beyond the credited cursor is always followed by a page (no
+        // wedge state).
+        arm_staged_exit_from_registry(registry, conn_id, &mut session);
         match drive_session(registry, conn_id, sink, &mut session, budget) {
             DriveOutcome::Active => {
                 // The replay phase still has window left (the drive cannot
@@ -726,49 +804,32 @@ pub(crate) fn start_session(
                 // the session credited-phase-active).
                 sessions.insert(session);
             }
+            DriveOutcome::DrainReady if session.uncredited_exit_page() => {
+                // E2R2 finding, invariant 2: the drive just EMITTED the page
+                // reaching the armed exit head and the client has not
+                // credited it — the session stays in the credited phase;
+                // removal and the exit ride the credit that acknowledges
+                // that page, never the drive that emitted it.
+                sessions.insert(session);
+            }
             DriveOutcome::DrainReady => {
-                // E2R1 finding 1 (the attach-time race close): a natural
-                // exit may have staged between the attach and this drive —
-                // the REGISTRY is the authority (staging happens under the
-                // terminal lock, before the notify's dispatch), so a
-                // still-credited session with a staged exit STAYS ARMED:
-                // the credited phase extends once through the terminal's
-                // final head and the deferred final output pages ONLY on
-                // credits. Only a session with NO staged exit hands off to
-                // the uncredited tail drain.
-                let mut stays_armed = false;
-                if session.exit_head.is_none()
-                    && registry
-                        .staged_paced_exit(&session.terminal_id, conn_id)
-                        .is_some()
-                {
-                    if let Some(bounds) = registry.replay_bounds(&session.terminal_id) {
-                        session.arm_staged_exit(bounds.head_seq);
-                        // The extended phase is complete AND the client
-                        // owes no credit (an empty first page): the exit
-                        // delivers now through the empty drain's CaughtUp
-                        // hold — no credit can ever arrive. Otherwise the
-                        // session stays armed; the exit waits for the
-                        // credited completion.
-                        stays_armed = session.page_end < session.phase_target()
-                            || session.credited < session.page_end;
-                    }
-                    // No bounds: the terminal is gone — fall through to
-                    // the drain, which reports Gone.
-                }
-                if stays_armed {
-                    sessions.insert(session);
-                } else {
-                    spawn_paced_drain(
-                        registry.clone(),
-                        conn_id,
-                        writer,
-                        Arc::clone(sink),
-                        session,
-                        budget,
-                        cancel,
-                    );
-                }
+                // The credited phase covered its target and everything
+                // emitted is acknowledged: the session leaves the credited
+                // phase. With a staged exit armed and `credited ==
+                // page_end` (the empty-first-page arm that extended
+                // nothing, or an exit that added no output), the spawned
+                // drain's CaughtUp hold delivers the staged exit now,
+                // after everything the client already acknowledged — zero
+                // uncredited pages.
+                spawn_paced_drain(
+                    registry.clone(),
+                    conn_id,
+                    writer,
+                    Arc::clone(sink),
+                    session,
+                    budget,
+                    cancel,
+                );
             }
             DriveOutcome::Gone => {}
         }

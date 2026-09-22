@@ -4228,7 +4228,10 @@ async fn natural_exit_exit_page_read_uncredited_holds_the_exit_for_its_credit() 
         .map(|f| f["seqEnd"].as_i64().unwrap_or(0))
         .max()
         .expect("first page frames");
-    assert!(credited < head, "the session is mid-restore when the shell exits");
+    assert!(
+        credited < head,
+        "the session is mid-restore when the shell exits"
+    );
 
     // The shell produces one FINAL marker line and exits naturally while
     // the first page is uncredited (octal escapes keep the echoed command
@@ -4253,7 +4256,10 @@ async fn natural_exit_exit_page_read_uncredited_holds_the_exit_for_its_credit() 
     let marker_page_end = loop {
         let (acc, page_end, gaps) =
             read_credited_page(&mut paced, Duration::from_millis(400)).await;
-        assert!(gaps.is_empty(), "no retention loss in this fixture: {gaps:?}");
+        assert!(
+            gaps.is_empty(),
+            "no retention loss in this fixture: {gaps:?}"
+        );
         pages += 1;
         assert!(pages < 500, "the page walk must converge");
         if acc.contains(marker) {
@@ -4343,7 +4349,10 @@ async fn natural_exit_retention_gap_then_held_final_page_delivers_exit_on_its_cr
         .map(|f| f["seqEnd"].as_i64().unwrap_or(0))
         .max()
         .expect("first page frames");
-    assert!(credited < head, "the session is mid-restore when the ring churns");
+    assert!(
+        credited < head,
+        "the session is mid-restore when the ring churns"
+    );
 
     // Evict the credited window's middle while the client withholds.
     let mut evictor = connect(&url).await;
@@ -4353,7 +4362,10 @@ async fn natural_exit_retention_gap_then_held_final_page_delivers_exit_on_its_cr
     send_input(&mut evictor, &terminal_id, &flood_command(400, marker2)).await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let (evictor_acc, _) = drain_until_marker(&mut evictor, marker2, deadline).await;
-    assert!(evictor_acc.contains(marker2), "the evicting flood completes");
+    assert!(
+        evictor_acc.contains(marker2),
+        "the evicting flood completes"
+    );
     drop(evictor);
 
     // The exit stages behind the still-armed deferral; the withhold holds.
@@ -4385,13 +4397,18 @@ async fn natural_exit_retention_gap_then_held_final_page_delivers_exit_on_its_cr
                 Some("terminal.output.gap"),
                 "the overrun reports as the negotiated gap: {gap}"
             );
-            assert_eq!(gap["reason"], "replay_window_exceeded", "the gap names retention loss: {gap}");
+            assert_eq!(
+                gap["reason"], "replay_window_exceeded",
+                "the gap names retention loss: {gap}"
+            );
             assert_eq!(
                 gap["fromSeq"].as_i64(),
                 Some(credited + 1),
                 "the lost interval starts at the credited cursor+1: {gap}"
             );
-            let gap_oldest = gap["oldestRetainedSeq"].as_i64().expect("oldestRetainedSeq");
+            let gap_oldest = gap["oldestRetainedSeq"]
+                .as_i64()
+                .expect("oldestRetainedSeq");
             assert_eq!(
                 gap["toSeq"].as_i64(),
                 Some(gap_oldest - 1),
@@ -4403,14 +4420,20 @@ async fn natural_exit_retention_gap_then_held_final_page_delivers_exit_on_its_cr
         pages += 1;
         assert!(pages < 500, "the page walk must converge");
         let start_ok = acc.is_empty() || gap_seen.is_some();
-        assert!(start_ok, "frames without a gap would be a silent forward jump");
+        assert!(
+            start_ok,
+            "frames without a gap would be a silent forward jump"
+        );
         if acc.contains(marker) {
             break page_end;
         }
         credit(&mut paced, &terminal_id, "attach-exit-gaph", page_end).await;
         cursor = cursor.max(page_end);
     };
-    assert!(gap_seen.is_some(), "the retention gap reported before the continuation");
+    assert!(
+        gap_seen.is_some(),
+        "the retention gap reported before the continuation"
+    );
     assert!(
         cursor < marker_page_end,
         "the marker page is UN-CREDITED at the hold (cursor {cursor})"
@@ -4426,7 +4449,13 @@ async fn natural_exit_retention_gap_then_held_final_page_delivers_exit_on_its_cr
     .await;
 
     // The acknowledging credit: the exit arrives and is the last frame.
-    credit(&mut paced, &terminal_id, "attach-exit-gaph", marker_page_end).await;
+    credit(
+        &mut paced,
+        &terminal_id,
+        "attach-exit-gaph",
+        marker_page_end,
+    )
+    .await;
     let exit = next_json_or_timeout(&mut paced, Duration::from_secs(5))
         .await
         .expect("the exit rides the credit acknowledging the final page");
