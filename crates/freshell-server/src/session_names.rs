@@ -3187,12 +3187,19 @@ fn hydrate_indexed_decision(
     }
     // The free fallbacks: a provider-authored title, then the first-message
     // extraction, then the directory basename (the ensure_pending fallback).
+    // Round-2 carried finding F2 (adjudicated): a provider title that FAILS
+    // accepted-name validation (over the 200-scalar cap, or control
+    // characters) is an unusable rung, not a failed hydration — the ladder
+    // falls through exactly like an absent title. An abort would leave the
+    // session with NO canonical record while the ~5s sweep re-failed and
+    // re-logged it every pass.
     let (name, source) = if let Some(title) = provider_title
         .as_deref()
         .map(str::trim)
         .filter(|t| !t.is_empty())
+        .filter(|t| validate_name(t).is_ok())
     {
-        (validate_name(title)?, NameSource::ProviderAi)
+        (title.to_string(), NameSource::ProviderAi)
     } else if let Some(message) = first_user_message
         .as_deref()
         .and_then(first_message_fallback)

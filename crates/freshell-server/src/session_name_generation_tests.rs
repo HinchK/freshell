@@ -1719,6 +1719,82 @@ async fn hydration_installs_free_fallbacks_and_never_schedules_paid_titles() {
     );
 }
 
+/// Round-2 carried finding F2 (adjudicated): a provider title that fails
+/// accepted-name validation (over the 200-scalar cap, or control
+/// characters) must not ABORT hydration for that session — the ladder
+/// falls through to the first-message extraction, then the directory
+/// basename, exactly like an absent title. An abort left the session with
+/// NO canonical record while the ~5s sweep re-failed and re-logged it
+/// every pass.
+#[tokio::test]
+async fn an_invalid_provider_title_falls_through_the_fallback_ladder() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+
+    // Oversize title + a real first message: the first-message rung serves.
+    let oversize = session(NamedProvider::Opencode, "ses_oversize");
+    store
+        .hydrate_indexed(
+            IndexedNameInput {
+                provider: NamedProvider::Opencode,
+                session_id: "ses_oversize".to_string(),
+                cwd: Some("/w/oversize".to_string()),
+                first_user_message: Some("The message that names the session".to_string()),
+                provider_title: Some("x".repeat(201)),
+            },
+            true,
+        )
+        .await
+        .expect("an oversize provider title falls through, never aborts");
+    let record = get_one(&store, oversize.clone())
+        .await
+        .expect("the record exists");
+    assert_eq!(record.record.source, NameSource::FirstMessage);
+    assert_eq!(record.record.name, "The message that names the session");
+
+    // Control characters + no usable first message: the directory rung
+    // serves (the directory fallback validates the basename away).
+    let control = session(NamedProvider::Claude, "ses_control");
+    store
+        .hydrate_indexed(
+            IndexedNameInput {
+                provider: NamedProvider::Claude,
+                session_id: "ses_control".to_string(),
+                cwd: Some("/w/controlproj".to_string()),
+                first_user_message: None,
+                provider_title: Some("bad\u{0007}title".to_string()),
+            },
+            true,
+        )
+        .await
+        .expect("a control-character provider title falls through");
+    let record = get_one(&store, control.clone())
+        .await
+        .expect("the record exists");
+    assert_eq!(record.record.source, NameSource::Directory);
+    assert_eq!(record.record.name, "controlproj");
+
+    // A VALID provider title still wins the ladder (the fall-through must
+    // not over-apply).
+    let valid = session(NamedProvider::Opencode, "ses_valid");
+    store
+        .hydrate_indexed(
+            IndexedNameInput {
+                provider: NamedProvider::Opencode,
+                session_id: "ses_valid".to_string(),
+                cwd: Some("/w/valid".to_string()),
+                first_user_message: Some("A message that would lose".to_string()),
+                provider_title: Some("A perfectly fine title".to_string()),
+            },
+            true,
+        )
+        .await
+        .expect("hydrate");
+    let record = get_one(&store, valid.clone()).await.expect("record");
+    assert_eq!(record.record.source, NameSource::ProviderAi);
+    assert_eq!(record.record.name, "A perfectly fine title");
+}
+
 /// The explicit-open hook: binding a pending handle (an explicit
 /// create/open/resume lane) arms an unattempted absorbed series — history
 /// stays unpurchased until the user actually opens the session.
