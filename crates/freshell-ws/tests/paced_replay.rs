@@ -490,11 +490,34 @@ async fn attach_without_arid(ws: &mut WsClient, terminal_id: &str) {
 
 /// Send one continuation credit.
 async fn credit(ws: &mut WsClient, terminal_id: &str, arid: &str, consumed_seq: i64) {
+    credit_with_stream(
+        ws,
+        terminal_id,
+        &known_stream(terminal_id),
+        arid,
+        consumed_seq,
+    )
+    .await;
+}
+
+/// Send `terminal.replay.credit` with an EXPLICIT stream id — the honest
+/// client shape (the stream comes from the terminal's `attach.ready`),
+/// used by tests that credit without having observed a ready for the
+/// terminal (round-2 finding F4 made stream identity part of the
+/// continuation contract, so the old fixture value
+/// "ignored-by-server" is now correctly rejected as a stream mismatch).
+async fn credit_with_stream(
+    ws: &mut WsClient,
+    terminal_id: &str,
+    stream_id: &str,
+    arid: &str,
+    consumed_seq: i64,
+) {
     ws.send(WsMessage::Text(
         serde_json::json!({
             "type": "terminal.replay.credit",
             "terminalId": terminal_id,
-            "streamId": "ignored-by-server",
+            "streamId": stream_id,
             "attachRequestId": arid,
             "consumedSeq": consumed_seq,
         })
@@ -502,6 +525,43 @@ async fn credit(ws: &mut WsClient, terminal_id: &str, arid: &str, consumed_seq: 
     ))
     .await
     .expect("send terminal.replay.credit");
+}
+
+/// The stream ids observed in `terminal.attach.ready` frames, keyed by
+/// terminal id (terminal ids are unique per test, so the map is race-free
+/// across parallel tests in this binary). `credit()` sends the terminal's
+/// REAL stream id from here — see [`credit_with_stream`]. Poison-tolerant:
+/// the map is a test fixture, and one test's panic must not cascade
+/// through every other test's lock acquisition.
+fn note_ready_stream(ready: &serde_json::Value) {
+    let terminal_id = ready["terminalId"].as_str().expect("ready.terminalId");
+    let stream_id = ready["streamId"].as_str().expect("ready.streamId");
+    test_ready_streams()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(terminal_id.to_string(), stream_id.to_string());
+}
+
+fn known_stream(terminal_id: &str) -> String {
+    test_ready_streams()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(terminal_id)
+        .cloned()
+        .unwrap_or_else(|| {
+            panic!(
+                "no attach.ready observed for {terminal_id}: read the ready via a helper \
+                 (paced_attach_first_page / attach_burst_collecting_gaps) or use \
+                 credit_with_stream"
+            )
+        })
+}
+
+fn test_ready_streams() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static STREAMS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, String>>,
+    > = std::sync::OnceLock::new();
+    STREAMS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// A flood whose completion is detectable by a marker that only the EXECUTED
@@ -619,6 +679,7 @@ async fn paced_attach_first_page(
         }
     }
     let ready = ready.expect("attach.ready never arrived");
+    note_ready_stream(&ready);
     (ready, outputs)
 }
 
@@ -653,6 +714,7 @@ async fn legacy_attach_inline_replay(
         }
     }
     let ready = ready.expect("attach.ready never arrived");
+    note_ready_stream(&ready);
     (ready, outputs)
 }
 
@@ -697,6 +759,7 @@ async fn attach_burst_collecting_gaps(
         }
     }
     let ready = ready.expect("attach.ready never arrived");
+    note_ready_stream(&ready);
     (ready, outputs, gaps)
 }
 
@@ -1555,7 +1618,10 @@ async fn read_and_route_by_pane(
         return true; // not ours (handshake stragglers): keep reading
     };
     match value.get("type").and_then(|v| v.as_str()) {
-        Some("terminal.attach.ready") => readies[pane] = Some(value),
+        Some("terminal.attach.ready") => {
+            note_ready_stream(&value);
+            readies[pane] = Some(value);
+        }
         Some("terminal.output") => delivered[pane].push((
             value["seqStart"].as_i64().unwrap_or(0),
             value["seqEnd"].as_i64().unwrap_or(0),
