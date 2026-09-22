@@ -142,6 +142,14 @@ struct CodexConsumerRuntime {
     /// that can no longer match the live tracker — see
     /// [`reduce_notification`]'s TurnCompleted arm.
     retired_turn_id: Arc<StdMutex<Option<String>>>,
+    /// The session's already-rang slot (one shared `Arc` with
+    /// [`CodexSession::status_rang_turn_id`], DR5-2 delta round 5): the
+    /// turn id whose end a LIFECYCLE-LOSS notification already rang (a
+    /// `thread_closed` or an Exited-class `thread/status/changed` with the
+    /// turn in flight) — the double-ring guard that suppresses a later
+    /// matching `turn/completed`'s edge while still publishing its
+    /// snapshot/idle bookkeeping.
+    status_rang_turn_id: Arc<StdMutex<Option<String>>>,
     /// The session's shared monotonic turn-complete clock (one shared `Arc`
     /// with [`CodexSession::last_turn_complete_at`]): adopted by the consumer's
     /// [`CodexSubscription`] so ordinary and synthesized edges share ONE
@@ -453,6 +461,23 @@ struct CodexSession {
     /// `active_turn` (never held together), and never lock `quiet_deadman`
     /// while holding it.
     retired_turn_id: Arc<StdMutex<Option<String>>>,
+    /// The-usual SDD delta round 5 DR5-2: the per-session ALREADY-RANG slot.
+    /// A lifecycle-loss notification that ends an in-flight turn —
+    /// `thread_closed` (the thread is gone: provider lifecycle-loss, the
+    /// crash class per the session-resilience plan) or an Exited-class
+    /// terminal `thread/status/changed` (`systemError` — the thread DIED
+    /// IN ERROR) — mints the unified attention edge for the turn's
+    /// unwitnessed end and records the turn id here, so the turn's own
+    /// LATE `turn/completed` (an errored thread need not send one, but
+    /// MAY) publishes its snapshot/idle bookkeeping WITHOUT ringing a
+    /// second edge (one bell per event). Cleared when the matching
+    /// completion folds, at every new-turn install, and at every
+    /// latch-retire/teardown site (the retired slot's own discipline), so
+    /// a stale stamp can never suppress a NEWER turn's edge. Lock tier:
+    /// joins the `retired_turn_id` tier — sequenced with (never nested
+    /// inside) `active_turn`, and never held together with
+    /// `quiet_deadman`.
+    status_rang_turn_id: Arc<StdMutex<Option<String>>>,
     /// The session's ONE monotonic turn-complete clock, shared by the
     /// notification consumer's [`CodexSubscription`] (ordinary edges) and the
     /// synthesized attention edges minted OUTSIDE the consumer (the crash
@@ -2337,20 +2362,24 @@ impl FreshCodexState {
         // The retired-turn slot starts empty (filled by a tracker retirement
         // that leaves the latch armed — the idle-BEFORE-completed gap).
         let retired_turn_id: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        // DR5-2: the already-rang stamp starts empty (filled by a
+        // lifecycle-loss mint — thread_closed / systemError with a turn in
+        // flight).
+        let status_rang_turn_id: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let last_turn_complete_at: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
 
         // ORDERING FIX (wireshape-oracle flake, ~1-in-3): the app-server can already have
         // pushed a `ThreadStarted` notification onto `notifs` (the fake app-server
         // broadcasts it synchronously right after the `thread/start` RPC response,
         // `fake-app-server.mjs:506-511`) BEFORE this task reaches the
-        // `broadcast(FreshAgentCreated)` below. Spawning the consumer gates its FIRST
+        // `broadcast(FreshAgentCreated)` below. Spawning the consumer gates its first
         // `notifs.recv()` on `created_tx` firing -- which happens only after `created` is
         // broadcast -- so the consumer can never race the created broadcast, matching
         // legacy's structural guarantee (its per-session lifecycle listener is attached
         // only AFTER `freshAgent.created` is sent, `ws-handler.ts:3378` then `:3387`, so it
         // cannot possibly observe an event that fired before it existed). The unbounded
         // `notifs` channel buffers whatever arrives in the meantime -- nothing is lost,
-        // only its delivery to the consumer is deferred.
+        // only its delivery to the consumer (and thus any resulting broadcast) is deferred.
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
         let event_emission_gate = Arc::new(TokioMutex::new(()));
@@ -2364,6 +2393,7 @@ impl FreshCodexState {
                 quiet_deadman: quiet_deadman.clone(),
                 turn_in_flight: turn_in_flight.clone(),
                 retired_turn_id: retired_turn_id.clone(),
+                status_rang_turn_id: status_rang_turn_id.clone(),
                 last_turn_complete_at: last_turn_complete_at.clone(),
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
@@ -2391,6 +2421,7 @@ impl FreshCodexState {
             quiet_deadman.clone(),
             turn_in_flight.clone(),
             retired_turn_id.clone(),
+            status_rang_turn_id.clone(),
             last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
@@ -2421,6 +2452,7 @@ impl FreshCodexState {
                 quiet_deadman,
                 turn_in_flight,
                 retired_turn_id,
+                status_rang_turn_id,
                 last_turn_complete_at,
                 // D8 (focused-ep1-r3 — the parking invariant): park the creating
                 // connection's provenance ON the session so downstream readers
@@ -2852,7 +2884,9 @@ impl FreshCodexState {
                     s.active_turn.clone(),
                     s.turn_in_flight.clone(),
                     // FR1-1: the install-site void of the retired-turn slot.
+                    // DR5-2: the install-site void of the already-rang stamp.
                     s.retired_turn_id.clone(),
+                    s.status_rang_turn_id.clone(),
                     s.turn_lock.clone(),
                     s.event_emission_gate.clone(),
                     s.quiet_deadman.clone(),
@@ -2865,6 +2899,7 @@ impl FreshCodexState {
             active_turn,
             turn_in_flight,
             retired_turn_id,
+            status_rang_turn_id,
             turn_lock,
             event_emission_gate,
             quiet_deadman,
@@ -2991,6 +3026,14 @@ impl FreshCodexState {
                 // against the reducer. The slot guard is sequenced with (never
                 // nested inside) the tracker guard.
                 *retired_turn_id.lock().expect("retired_turn_id mutex") = None;
+                // DR5-2 (delta round 5): the install also VOIDS the
+                // already-rang stamp — a lifecycle-loss mint's turn ended
+                // before THIS turn began; a stale stamp must never gate the
+                // new turn's own completion. Same gate serialization, same
+                // tier discipline.
+                *status_rang_turn_id
+                    .lock()
+                    .expect("status_rang_turn_id mutex") = None;
                 // A turn is now in flight: refresh the quiet window off the
                 // response (the sidecar has provably accepted the turn; the
                 // deadline resets from this lane-visible proof).
@@ -3279,13 +3322,21 @@ impl FreshCodexState {
                     s.user_interrupt_pending.clone(),
                     // FR1-1: the retire helper clears the retired-turn slot
                     // with the tracker + latch (a user-initiated interrupt
-                    // leaves no idle→completed gap to bridge).
+                    // leaves no idle→completed gap to bridge). DR5-2: the
+                    // already-rang stamp clears with the same retirement.
                     s.retired_turn_id.clone(),
+                    s.status_rang_turn_id.clone(),
                 )
             })
         };
-        let Some((client, active_turn, turn_in_flight, user_interrupt_pending, retired_turn_id)) =
-            looked_up
+        let Some((
+            client,
+            active_turn,
+            turn_in_flight,
+            user_interrupt_pending,
+            retired_turn_id,
+            status_rang_turn_id,
+        )) = looked_up
         else {
             self.send_error(&None, "SESSION_NOT_FOUND", "codex session not found");
             return;
@@ -3314,7 +3365,12 @@ impl FreshCodexState {
                 // The user-initiated interrupt ends the turn SILENTLY: retire the
                 // in-flight latch too, so a later idle crash cannot ring for a turn
                 // that already ended at the user's own hand.
-                retire_observed_turn_end(&active_turn, &turn_in_flight, &retired_turn_id);
+                retire_observed_turn_end(
+                    &active_turn,
+                    &turn_in_flight,
+                    &retired_turn_id,
+                    &status_rang_turn_id,
+                );
             }
             Err(err) => {
                 // The interrupt never landed — disarm so a later NON-user
@@ -5880,6 +5936,9 @@ impl FreshCodexState {
         // FR1-1: the retired-turn slot starts empty for the fresh incarnation
         // (the crashed incarnation's slot — if any — died with its crash arm).
         let retired_turn_id: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        // DR5-2: the already-rang stamp starts empty for the fresh incarnation
+        // (the crashed incarnation's stamp died with its crash arm too).
+        let status_rang_turn_id: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let last_turn_complete_at: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
@@ -5894,6 +5953,7 @@ impl FreshCodexState {
                 quiet_deadman: quiet_deadman.clone(),
                 turn_in_flight: turn_in_flight.clone(),
                 retired_turn_id: retired_turn_id.clone(),
+                status_rang_turn_id: status_rang_turn_id.clone(),
                 last_turn_complete_at: last_turn_complete_at.clone(),
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
@@ -5915,6 +5975,7 @@ impl FreshCodexState {
             quiet_deadman.clone(),
             turn_in_flight.clone(),
             retired_turn_id.clone(),
+            status_rang_turn_id.clone(),
             last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
@@ -5957,6 +6018,7 @@ impl FreshCodexState {
                     quiet_deadman,
                     turn_in_flight,
                     retired_turn_id,
+                    status_rang_turn_id,
                     last_turn_complete_at,
                     // D8 (focused-ep1-r3): CARRY the crashed session's parked
                     // provenance onto the rebuilt record (the same logical
@@ -6182,6 +6244,8 @@ impl FreshCodexState {
         let turn_in_flight: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         // FR1-1: the retired-turn slot starts empty for the fresh incarnation.
         let retired_turn_id: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        // DR5-2: the already-rang stamp starts empty for the fresh incarnation.
+        let status_rang_turn_id: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let last_turn_complete_at: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
@@ -6196,6 +6260,7 @@ impl FreshCodexState {
                 quiet_deadman: quiet_deadman.clone(),
                 turn_in_flight: turn_in_flight.clone(),
                 retired_turn_id: retired_turn_id.clone(),
+                status_rang_turn_id: status_rang_turn_id.clone(),
                 last_turn_complete_at: last_turn_complete_at.clone(),
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
@@ -6217,6 +6282,7 @@ impl FreshCodexState {
             quiet_deadman.clone(),
             turn_in_flight.clone(),
             retired_turn_id.clone(),
+            status_rang_turn_id.clone(),
             last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
@@ -6250,6 +6316,7 @@ impl FreshCodexState {
                     quiet_deadman,
                     turn_in_flight,
                     retired_turn_id,
+                    status_rang_turn_id,
                     last_turn_complete_at,
                     // D8 (focused-ep1-r3): the parked provenance rides the
                     // OLD→NEW re-key (carried from the crashed session).
@@ -6559,6 +6626,7 @@ impl FreshCodexState {
             quiet_deadman,
             turn_in_flight,
             retired_turn_id,
+            status_rang_turn_id,
             last_turn_complete_at,
             compact_in_flight,
             compact_turn_id,
@@ -6583,7 +6651,7 @@ impl FreshCodexState {
             // monotonic `at` timeline per session.
             let mut subscription = CodexSubscription::new(thread_id.clone())
                 .with_user_interrupt_pending(user_interrupt_pending)
-                .with_last_turn_complete_at(last_turn_complete_at);
+                .with_last_turn_complete_at(last_turn_complete_at.clone());
             while let Some(notification) = notifs.recv().await {
                 // `turn/started` has no wire output, but establishes state that later
                 // notifications depend on (notably the compact turn's ownership id).
@@ -6603,6 +6671,9 @@ impl FreshCodexState {
                         &compact_in_flight,
                         &compact_turn_id,
                         &retired_turn_id,
+                        &status_rang_turn_id,
+                        &last_turn_complete_at,
+                        &broadcast_tx,
                     );
                     debug_assert!(events.is_empty(), "turn/started must not emit wire frames");
                     continue;
@@ -6635,6 +6706,9 @@ impl FreshCodexState {
                     &compact_in_flight,
                     &compact_turn_id,
                     &retired_turn_id,
+                    &status_rang_turn_id,
+                    &last_turn_complete_at,
+                    &broadcast_tx,
                 );
                 for event in events {
                     // DIAG-01: the positive turn-complete chime only -- session_id
@@ -6655,8 +6729,8 @@ impl FreshCodexState {
     /// Brief sessions-map lookup of a session's quiet-deadman + turn-state handles
     /// (the map lock is never held across an await): the active-turn tracker, the
     /// deadman, the turn-in-flight latch (the lane's in-flight authority), the
-    /// shared turn-complete clock, and the retired-turn slot — every caller gets
-    /// the SAME incarnation's set.
+    /// shared turn-complete clock, the retired-turn slot, and the already-rang
+    /// stamp — every caller gets the SAME incarnation's set.
     async fn quiet_handles(
         &self,
         thread_id: &str,
@@ -6665,6 +6739,7 @@ impl FreshCodexState {
         Arc<StdMutex<QuietDeadman>>,
         Arc<AtomicBool>,
         Arc<StdMutex<Option<i64>>>,
+        Arc<StdMutex<Option<String>>>,
         Arc<StdMutex<Option<String>>>,
     )> {
         let guard = self.sessions.lock().await;
@@ -6675,6 +6750,7 @@ impl FreshCodexState {
                 s.turn_in_flight.clone(),
                 s.last_turn_complete_at.clone(),
                 s.retired_turn_id.clone(),
+                s.status_rang_turn_id.clone(),
             )
         })
     }
@@ -6716,8 +6792,14 @@ impl FreshCodexState {
     async fn watch_codex_quiet_deadline(self, thread_id: String, generation: u64) {
         // Snapshot the per-session handles + the armed deadline WITHOUT holding the
         // sessions lock across the sleep (it is never held across an await).
-        let Some((_active_turn, quiet, turn_in_flight, last_turn_complete_at, _retired_turn_id)) =
-            self.quiet_handles(&thread_id).await
+        let Some((
+            _active_turn,
+            quiet,
+            turn_in_flight,
+            last_turn_complete_at,
+            _retired_turn_id,
+            _status_rang_turn_id,
+        )) = self.quiet_handles(&thread_id).await
         else {
             return;
         };
@@ -6832,8 +6914,14 @@ impl FreshCodexState {
         // A later snapshot poll must NEVER reset an armed window (arm-if-absent only);
         // RPC traffic otherwise never feeds the deadman.
         let handles = self.quiet_handles(thread_id).await;
-        if let Some((active_turn, quiet, turn_in_flight, _last_turn_complete_at, retired_turn_id)) =
-            &handles
+        if let Some((
+            active_turn,
+            quiet,
+            turn_in_flight,
+            _last_turn_complete_at,
+            retired_turn_id,
+            status_rang_turn_id,
+        )) = &handles
         {
             let thread = raw.get("thread").cloned().unwrap_or_else(|| json!({}));
             let fresh_running =
@@ -6869,6 +6957,13 @@ impl FreshCodexState {
                         // THIS turn's latch). Sequenced with (never nested
                         // inside) the tracker guard.
                         *retired_turn_id.lock().expect("retired_turn_id mutex") = None;
+                        // DR5-2 (delta round 5): the seed VOIDS the
+                        // already-rang stamp with the same install
+                        // discipline — a lifecycle-loss mint's turn ended
+                        // before THIS observed turn began.
+                        *status_rang_turn_id
+                            .lock()
+                            .expect("status_rang_turn_id mutex") = None;
                     }
                 }
                 if turn_in_flight.load(Ordering::SeqCst) {
@@ -6878,7 +6973,7 @@ impl FreshCodexState {
         }
         // The snapshot overlay mirrors the wire contract: `stuck` while the deadman
         // has flagged the session and the fresh read still shows it running.
-        let stuck = handles.as_ref().is_some_and(|(_, quiet, _, _, _)| {
+        let stuck = handles.as_ref().is_some_and(|(_, quiet, _, _, _, _)| {
             quiet
                 .lock()
                 .expect("quiet deadman lock")
@@ -7758,6 +7853,8 @@ impl FreshCodexState {
         let turn_in_flight: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         // FR1-1: the retired-turn slot starts empty for the fresh registration.
         let retired_turn_id: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        // DR5-2: the already-rang stamp starts empty for the fresh registration.
+        let status_rang_turn_id: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let last_turn_complete_at: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
@@ -7772,6 +7869,7 @@ impl FreshCodexState {
                 quiet_deadman: quiet_deadman.clone(),
                 turn_in_flight: turn_in_flight.clone(),
                 retired_turn_id: retired_turn_id.clone(),
+                status_rang_turn_id: status_rang_turn_id.clone(),
                 last_turn_complete_at: last_turn_complete_at.clone(),
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
@@ -7793,6 +7891,7 @@ impl FreshCodexState {
             quiet_deadman.clone(),
             turn_in_flight.clone(),
             retired_turn_id.clone(),
+            status_rang_turn_id.clone(),
             last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
@@ -7822,6 +7921,7 @@ impl FreshCodexState {
                 quiet_deadman,
                 turn_in_flight,
                 retired_turn_id,
+                status_rang_turn_id,
                 last_turn_complete_at,
                 provenance,
             },
@@ -7868,6 +7968,9 @@ impl FreshCodexState {
         // FR1-1: the retired-turn slot starts empty (the real consumer paths
         // fill it from the notification stream).
         let retired_turn_id: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        // DR5-2: the already-rang stamp starts empty (the real consumer
+        // paths fill it from a lifecycle-loss mint).
+        let status_rang_turn_id: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let last_turn_complete_at: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         // b8ke focused round-2 R2-1: the condemned-prior identity (pid + tag).
         let sidecar_pid = child.id();
@@ -7883,6 +7986,7 @@ impl FreshCodexState {
             quiet_deadman.clone(),
             turn_in_flight.clone(),
             retired_turn_id.clone(),
+            status_rang_turn_id.clone(),
             last_turn_complete_at.clone(),
             Arc::clone(&self.condemned_priors),
             self.ownership_watch(),
@@ -7913,6 +8017,7 @@ impl FreshCodexState {
                 quiet_deadman,
                 turn_in_flight,
                 retired_turn_id,
+                status_rang_turn_id,
                 last_turn_complete_at,
                 provenance: None,
             },
@@ -8902,6 +9007,11 @@ pub(crate) fn spawn_exit_watcher(
     // idle→completed bridge dies with the latch: a respawned incarnation's
     // fresh notifications must never consult a pre-teardown slot.
     retired_turn_id: Arc<StdMutex<Option<String>>>,
+    // DR5-2 (delta round 5): the session's already-rang stamp — both
+    // terminal arms end the turn, so the stamp a lifecycle-loss mint may
+    // have left dies with the latch too: a respawned incarnation's fresh
+    // notifications must never consult a pre-teardown stamp.
+    status_rang_turn_id: Arc<StdMutex<Option<String>>>,
     last_turn_complete_at: Arc<StdMutex<Option<i64>>>,
     condemned_priors: Arc<
         StdMutex<HashMap<String, crate::session_lease::CondemnedRuntimeIdentity>>,
@@ -8946,6 +9056,12 @@ pub(crate) fn spawn_exit_watcher(
                 // teardown IS the turn's terminal classification — there is
                 // no idle→completed gap left to bridge).
                 *retired_turn_id.lock().expect("retired_turn_id mutex") = None;
+                // DR5-2: the already-rang stamp dies with the same
+                // teardown (a requested teardown is SILENT — no later
+                // completion of the torn-down turn may be double-gated
+                // either, but a respawned incarnation's fresh turns must
+                // never consult this stamp).
+                *status_rang_turn_id.lock().expect("status_rang_turn_id mutex") = None;
                 let _ = child.start_kill();
                 let wait_result = child.wait().await;
                 let confirmed = if cfg!(target_os = "linux") {
@@ -9134,6 +9250,11 @@ pub(crate) fn spawn_exit_watcher(
                 // it, so a respawned incarnation's fresh notifications can
                 // never consult a pre-crash slot.
                 *retired_turn_id.lock().expect("retired_turn_id mutex") = None;
+                // DR5-2 (delta round 5): the already-rang stamp dies with
+                // the crash too — the crash arm's own mint below is this
+                // turn's ONE bell, and a respawned incarnation's fresh
+                // turns must never consult a pre-crash stamp.
+                *status_rang_turn_id.lock().expect("status_rang_turn_id mutex") = None;
                 if turn_was_in_flight {
                     mint_synthesized_attention_edge(
                         &last_turn_complete_at,
@@ -9158,14 +9279,22 @@ pub(crate) fn spawn_exit_watcher(
 /// FR1-1: the retired-turn slot dies with the latch it bridges for (a
 /// thread-closed / user-interrupted turn end leaves no idle→completed gap to
 /// bridge), so a stale slot can never outlive the observed turn end.
+/// DR5-2: the already-rang stamp dies with the same retirement — the callers
+/// that mint a lifecycle-loss edge re-stamp AFTER this helper returns (the
+/// stamp they set describes the turn this retirement ends).
 fn retire_observed_turn_end(
     active_turn: &Arc<StdMutex<Option<String>>>,
     turn_in_flight: &Arc<AtomicBool>,
     retired_turn_id: &Arc<StdMutex<Option<String>>>,
+    status_rang_turn_id: &Arc<StdMutex<Option<String>>>,
 ) {
     *active_turn.lock().expect("active_turn mutex") = None;
     // FR1-1: sequenced with (never nested inside) the tracker guard.
     *retired_turn_id.lock().expect("retired_turn_id mutex") = None;
+    // DR5-2: same tier, same discipline.
+    *status_rang_turn_id
+        .lock()
+        .expect("status_rang_turn_id mutex") = None;
     turn_in_flight.store(false, Ordering::SeqCst);
 }
 
@@ -9176,12 +9305,18 @@ fn retire_observed_turn_end(
 /// FR1-1: also clears the retired-turn slot — every latch retirement ends
 /// the slot's reason to exist, so the slot never outlives the turn it
 /// bridges for.
+/// DR5-2: also clears the already-rang stamp — every latch retirement ends
+/// the turn the stamp could still be guarding.
 fn clear_turn_in_flight(
     turn_in_flight: &Arc<AtomicBool>,
     retired_turn_id: &Arc<StdMutex<Option<String>>>,
+    status_rang_turn_id: &Arc<StdMutex<Option<String>>>,
 ) {
     turn_in_flight.store(false, Ordering::SeqCst);
     *retired_turn_id.lock().expect("retired_turn_id mutex") = None;
+    *status_rang_turn_id
+        .lock()
+        .expect("status_rang_turn_id mutex") = None;
 }
 
 // ── wedged-sidecar quiet deadman ───────────────────────────────────────────
@@ -9322,6 +9457,9 @@ fn reduce_notification(
     compact_in_flight: &Arc<AtomicBool>,
     compact_turn_id: &Arc<StdMutex<Option<String>>>,
     retired_turn_id: &Arc<StdMutex<Option<String>>>,
+    status_rang_turn_id: &Arc<StdMutex<Option<String>>>,
+    last_turn_complete_at: &Arc<StdMutex<Option<i64>>>,
+    broadcast_tx: &tokio::sync::broadcast::Sender<String>,
 ) -> Vec<CodexAdapterEvent> {
     // Lane-visible activity: resolves a flagged stuck state first, then resets the
     // armed window (or disarms once no turn is in flight).
@@ -9360,33 +9498,89 @@ fn reduce_notification(
                     && normalized != CodexStatus::Starting
                     && !compact_in_flight.load(Ordering::SeqCst)
                 {
-                    // The observed thread end retires the active-turn tracker
-                    // ONLY. The in-flight crash latch stays ARMED through the
-                    // app-server's documented idle-BEFORE-completed gap: a
-                    // sidecar death inside that gap must still synthesize the
-                    // attention edge for the turn whose `turn/completed` never
-                    // arrives. The id-matched `turn/completed` retired arm
-                    // ([`clear_turn_in_flight`]) owns the latch's retirement;
-                    // the crash arm and the quiet deadman read the latch.
-                    //
-                    // FR1-1: the completion that follows can no longer match
-                    // the now-EMPTY live tracker, so RECORD the just-retired
-                    // id in the retired-turn slot — the slot is the only way
-                    // that completion can still retire the latch this
-                    // retirement deliberately left armed. An already-empty
-                    // tracker retires nothing and leaves the slot alone. The
-                    // slot guard is SEQUENCED with (never nested inside) the
-                    // `active_turn` guard, and dropped before the
-                    // `quiet_deadman` lock below (the file-wide order is
-                    // `quiet_deadman` outer / `active_turn`-tier inner).
-                    let retired_tracker_id = active_turn.lock().expect("active_turn mutex").take();
-                    if let Some(id) = retired_tracker_id {
-                        *retired_turn_id.lock().expect("retired_turn_id mutex") = Some(id);
+                    if normalized == CodexStatus::Exited && turn_in_flight.load(Ordering::SeqCst) {
+                        // DR5-2 (delta round 5): an Exited-class terminal
+                        // status (`systemError` — the thread DIED IN ERROR)
+                        // with the crash latch ARMED is provider
+                        // lifecycle-loss mid-turn (the crash class, per the
+                        // session-resilience plan): the turn in flight ended
+                        // UNWITNESSED and its `turn/completed` need never
+                        // arrive (an errored thread is not required to send
+                        // one). Mint the unified edge NOW on the session's
+                        // ONE shared clock, retire tracker + latch + retired
+                        // slot, disarm the deadman (no stuck flag for a
+                        // thread that already reported its own death), and
+                        // STAMP the already-rang slot with the turn id this
+                        // retirement ends (the tracker's id when it held
+                        // one, else the retired slot's gap id) so a LATE
+                        // matching `turn/completed` publishes its snapshot
+                        // WITHOUT a second edge (one bell per event). The
+                        // stamp is written AFTER the retirement helpers —
+                        // they void the stamp (every install/latch-retire
+                        // site does); this arm is the one site that SETS it.
+                        mint_synthesized_attention_edge(
+                            last_turn_complete_at,
+                            subscription.session_id(),
+                            broadcast_tx,
+                            "system_error_status",
+                        );
+                        let rang_turn_id = active_turn
+                            .lock()
+                            .expect("active_turn mutex")
+                            .take()
+                            .or_else(|| {
+                                retired_turn_id
+                                    .lock()
+                                    .expect("retired_turn_id mutex")
+                                    .take()
+                            });
+                        // Sequenced with (never nested inside) the tracker
+                        // guard; never held together with `quiet_deadman`.
+                        *retired_turn_id.lock().expect("retired_turn_id mutex") = None;
+                        *status_rang_turn_id
+                            .lock()
+                            .expect("status_rang_turn_id mutex") = None;
+                        turn_in_flight.store(false, Ordering::SeqCst);
+                        if let Some(id) = rang_turn_id {
+                            *status_rang_turn_id
+                                .lock()
+                                .expect("status_rang_turn_id mutex") = Some(id);
+                        }
+                        disarm_codex_quiet(
+                            quiet_deadman,
+                            subscription.session_id(),
+                            "thread_status_exited",
+                        );
+                    } else {
+                        // The observed thread end retires the active-turn tracker
+                        // ONLY. The in-flight crash latch stays ARMED through the
+                        // app-server's documented idle-BEFORE-completed gap: a
+                        // sidecar death inside that gap must still synthesize the
+                        // attention edge for the turn whose `turn/completed` never
+                        // arrives. The id-matched `turn/completed` retired arm
+                        // ([`clear_turn_in_flight`]) owns the latch's retirement;
+                        // the crash arm and the quiet deadman read the latch.
+                        //
+                        // FR1-1: the completion that follows can no longer match
+                        // the now-EMPTY live tracker, so RECORD the just-retired
+                        // id in the retired-turn slot — the slot is the only way
+                        // that completion can still retire the latch this
+                        // retirement deliberately left armed. An already-empty
+                        // tracker retires nothing and leaves the slot alone. The
+                        // slot guard is SEQUENCED with (never nested inside) the
+                        // `active_turn` guard, and dropped before the
+                        // `quiet_deadman` lock below (the file-wide order is
+                        // `quiet_deadman` outer / `active_turn`-tier inner).
+                        let retired_tracker_id =
+                            active_turn.lock().expect("active_turn mutex").take();
+                        if let Some(id) = retired_tracker_id {
+                            *retired_turn_id.lock().expect("retired_turn_id mutex") = Some(id);
+                        }
+                        // The terminal status also disarms (adapter.ts:1015): the entry
+                        // feed re-armed the window while the turn was still tracked, and
+                        // a stale deadline would block a later snapshot-observed arm.
+                        disarm_codex_quiet(quiet_deadman, subscription.session_id(), "activity");
                     }
-                    // The terminal status also disarms (adapter.ts:1015): the entry
-                    // feed re-armed the window while the turn was still tracked, and
-                    // a stale deadline would block a later snapshot-observed arm.
-                    disarm_codex_quiet(quiet_deadman, subscription.session_id(), "activity");
                 }
             }
             subscription
@@ -9563,8 +9757,10 @@ fn reduce_notification(
                     // active turn's completion retires the in-flight latch (the
                     // crash/deadman authority) and the retired-turn slot (the
                     // helper owns both mirrors — a stale slot must never
-                    // outlive the latch it bridges for).
-                    clear_turn_in_flight(turn_in_flight, retired_turn_id);
+                    // outlive the latch it bridges for). DR5-2: the already-
+                    // rang stamp clears with the same retirement — the
+                    // completing turn's own edge is its ONE bell.
+                    clear_turn_in_flight(turn_in_flight, retired_turn_id, status_rang_turn_id);
                     disarm_codex_quiet(quiet_deadman, subscription.session_id(), "turn_complete");
                 } else if retired_slot_match || idless_retired_slot_match {
                     // RETIRED-SLOT match = LATCH-ONLY retirement (FR1-1 id-
@@ -9578,8 +9774,12 @@ fn reduce_notification(
                     // retiring the crash latch the idle retirement
                     // deliberately left armed — without it the deadman later
                     // flags a completed turn `stuck` and a later sidecar
-                    // crash rings for it too.
-                    clear_turn_in_flight(turn_in_flight, retired_turn_id);
+                    // crash rings for it too. DR5-2: the already-rang stamp
+                    // clears here too — in the stamp's own scenarios the
+                    // mint arms already emptied the retired slot, so this
+                    // leg is unreachable with a live stamp; the void keeps
+                    // the discipline total anyway.
+                    clear_turn_in_flight(turn_in_flight, retired_turn_id, status_rang_turn_id);
                     disarm_codex_quiet(quiet_deadman, subscription.session_id(), "turn_complete");
                 }
 
@@ -9603,6 +9803,34 @@ fn reduce_notification(
                         status: CodexStatus::Running,
                         revision: None,
                     }];
+                }
+                // DR5-2 (delta round 5): the ALREADY-RANG double-ring guard. A
+                // lifecycle-loss mint (thread_closed / systemError status with
+                // the turn in flight) already rang this turn's ONE edge and
+                // stamped its id; the turn's own LATE `turn/completed` still
+                // publishes its snapshot/idle bookkeeping (the client re-fetches
+                // the committed transcript) but MUST NOT emit a second edge.
+                // Match ⇒ consume the stamp (one bell per event; a NEWER
+                // turn's completion is never gated — the install sites void
+                // the stamp). Sequenced with (never nested inside) the
+                // tracker guard; never held with `quiet_deadman`.
+                let rang_match = event.turn_id.is_some() && {
+                    let mut stamp = status_rang_turn_id
+                        .lock()
+                        .expect("status_rang_turn_id mutex");
+                    let matched = stamp
+                        .as_deref()
+                        .is_some_and(|id| event.turn_id.as_deref() == Some(id));
+                    if matched {
+                        *stamp = None;
+                    }
+                    matched
+                };
+                if rang_match {
+                    return completion_events
+                        .into_iter()
+                        .filter(|e| !matches!(e, CodexAdapterEvent::TurnComplete { .. }))
+                        .collect();
                 }
                 return completion_events;
             }
@@ -9642,6 +9870,14 @@ fn reduce_notification(
                         // crash latch. Sequenced with (never nested inside)
                         // the tracker guard above.
                         *retired_turn_id.lock().expect("retired_turn_id mutex") = None;
+                        // DR5-2 (delta round 5): the adoption also VOIDED
+                        // the already-rang stamp — a lifecycle-loss mint's
+                        // turn ended before THIS turn began, and a stale
+                        // stamp must never gate a completion of the new
+                        // turn. Same tier discipline.
+                        *status_rang_turn_id
+                            .lock()
+                            .expect("status_rang_turn_id mutex") = None;
                     } else {
                         drop(active);
                     }
@@ -9669,11 +9905,54 @@ fn reduce_notification(
         }
         CodexNotification::ThreadClosed { thread_id } => {
             if thread_id == subscription.session_id() {
+                // DR5-2 (delta round 5): provider lifecycle-loss — the thread
+                // is GONE with a turn in flight (the crash class, per the
+                // session-resilience plan). The thread's own
+                // `turn/completed` will never arrive; a later child exit
+                // cannot recover the bell (this retirement takes the latch
+                // down). Mint the unified edge for the turn's unwitnessed
+                // end NOW, on the session's ONE shared clock — then the
+                // retirement below proceeds and STAMPS the already-rang
+                // slot with the turn id this retirement ends (the tracker's
+                // id when it held one, else the retired slot's gap id), so a
+                // LATE `turn/completed` for that turn publishes its
+                // snapshot WITHOUT a second edge. The stamp is written
+                // AFTER `retire_observed_turn_end` — the helper voids the
+                // stamp (every install/latch-retire site does); this arm is
+                // the one site that SETS it.
+                if turn_in_flight.load(Ordering::SeqCst) {
+                    mint_synthesized_attention_edge(
+                        last_turn_complete_at,
+                        subscription.session_id(),
+                        broadcast_tx,
+                        "thread_closed",
+                    );
+                }
+                let rang_turn_id = active_turn
+                    .lock()
+                    .expect("active_turn mutex")
+                    .take()
+                    .or_else(|| {
+                        retired_turn_id
+                            .lock()
+                            .expect("retired_turn_id mutex")
+                            .take()
+                    });
                 // The thread is gone: the observed end retires the in-flight
                 // state, and disarms so no stale deadline outlives it (same
                 // stale-arm hole as the completion path).
-                retire_observed_turn_end(active_turn, turn_in_flight, retired_turn_id);
+                retire_observed_turn_end(
+                    active_turn,
+                    turn_in_flight,
+                    retired_turn_id,
+                    status_rang_turn_id,
+                );
                 disarm_codex_quiet(quiet_deadman, subscription.session_id(), "thread_closed");
+                if let Some(id) = rang_turn_id {
+                    *status_rang_turn_id
+                        .lock()
+                        .expect("status_rang_turn_id mutex") = Some(id);
+                }
             }
             subscription
                 .on_thread_closed(&thread_id)
@@ -10632,6 +10911,8 @@ pub(crate) mod tests {
         ));
         // FR1-1: the retired-turn slot (starts empty like production).
         let retired_turn_id: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        // DR5-2: the already-rang stamp (starts empty like production).
+        let status_rang_turn_id: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let last_turn_complete_at: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         let sidecar_pid = child.id();
         let sidecar_ownership_id = ownership_id.to_string();
@@ -10646,6 +10927,7 @@ pub(crate) mod tests {
             quiet_deadman.clone(),
             turn_in_flight.clone(),
             retired_turn_id.clone(),
+            status_rang_turn_id.clone(),
             last_turn_complete_at.clone(),
             Arc::clone(&state.condemned_priors),
             None,
@@ -10676,6 +10958,7 @@ pub(crate) mod tests {
                 quiet_deadman,
                 turn_in_flight,
                 retired_turn_id,
+                status_rang_turn_id,
                 last_turn_complete_at,
                 provenance: None,
             },
@@ -10716,6 +10999,8 @@ pub(crate) mod tests {
         ));
         // FR1-1: the retired-turn slot (starts empty like production).
         let retired_turn_id: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
+        // DR5-2: the already-rang stamp (starts empty like production).
+        let status_rang_turn_id: Arc<StdMutex<Option<String>>> = Arc::new(StdMutex::new(None));
         let last_turn_complete_at: Arc<StdMutex<Option<i64>>> = Arc::new(StdMutex::new(None));
         let compact_in_flight = Arc::new(AtomicBool::new(false));
         let compact_turn_id = Arc::new(StdMutex::new(None));
@@ -10729,6 +11014,7 @@ pub(crate) mod tests {
                 quiet_deadman: quiet_deadman.clone(),
                 turn_in_flight: turn_in_flight.clone(),
                 retired_turn_id: retired_turn_id.clone(),
+                status_rang_turn_id: status_rang_turn_id.clone(),
                 last_turn_complete_at: last_turn_complete_at.clone(),
                 compact_in_flight: compact_in_flight.clone(),
                 compact_turn_id: compact_turn_id.clone(),
@@ -10750,6 +11036,7 @@ pub(crate) mod tests {
             quiet_deadman.clone(),
             turn_in_flight.clone(),
             retired_turn_id.clone(),
+            status_rang_turn_id.clone(),
             last_turn_complete_at.clone(),
             Arc::clone(&state.condemned_priors),
             None,
@@ -10780,6 +11067,7 @@ pub(crate) mod tests {
                 quiet_deadman,
                 turn_in_flight,
                 retired_turn_id,
+                status_rang_turn_id,
                 last_turn_complete_at,
                 provenance: None,
             },
@@ -12018,6 +12306,7 @@ pub(crate) mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(StdMutex::new(None)),
             Arc::new(StdMutex::new(None)),
+            Arc::new(StdMutex::new(None)),
             Arc::new(StdMutex::new(HashMap::new())),
             None,
         );
@@ -12386,6 +12675,7 @@ pub(crate) mod tests {
                 quiet_deadman: QuietDeadman::new_shared(),
                 turn_in_flight: Arc::new(AtomicBool::new(false)),
                 retired_turn_id: Arc::new(StdMutex::new(None)),
+                status_rang_turn_id: Arc::new(StdMutex::new(None)),
                 last_turn_complete_at: Arc::new(StdMutex::new(None)),
                 provenance: None,
             },
@@ -17683,6 +17973,256 @@ pub(crate) mod tests {
         assert!(
             !after.matched,
             "a crash after the ID-less completion must not ring for the already-completed turn: {:?}",
+            after.frames
+        );
+    }
+
+    /// The-usual SDD delta round 5 DR5-2(a): a `thread/closed` with a turn
+    /// IN FLIGHT is provider lifecycle-loss mid-turn — the crash class (the
+    /// session-resilience plan names provider lifecycle-loss a spontaneous
+    /// worker failure). The thread's own `turn/completed` will never arrive
+    /// and a later child exit cannot recover the bell (the pre-fix arm
+    /// retired the latch FIRST, so a later sidecar death read no turn in
+    /// flight). The unified attention edge MUST fire at the close — exactly
+    /// once — and both later observers (a sidecar kill, the turn's own late
+    /// completion) add NOTHING.
+    #[tokio::test]
+    async fn thread_closed_with_a_turn_in_flight_rings_the_unified_edge_exactly_once() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, mut rx) = state_with_bus();
+
+        let child = spawn_sleeper();
+        let pid = child.id().expect("sleeper pid");
+
+        // Mid-turn: the fixture seeds the tracker AND mirrors the in-flight
+        // latch (the production invariant), so the turn is in flight at the
+        // close.
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-close-in-flight",
+            client,
+            Arc::new(StdMutex::new(Some("turn-1".to_string()))),
+            notifs,
+            child,
+            "codex-sidecar-test-close-in-flight",
+        )
+        .await;
+
+        // The thread closes with the turn in flight.
+        peer.emit_notification(
+            "thread/closed",
+            json!({ "threadId": "thread-close-in-flight" }),
+        );
+
+        // The unified edge fires AT THE CLOSE (crash-class lifecycle loss).
+        let edge = collect_frames_until(&mut rx, std::time::Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert!(
+            edge.matched,
+            "a thread closing with a turn in flight rings the unified attention edge: {:?}",
+            edge.frames
+        );
+        let edge_frame = edge.frames.last().expect("the matched edge frame");
+        assert_eq!(edge_frame["sessionId"], json!("thread-close-in-flight"));
+        assert!(
+            edge_frame["event"]["at"].is_i64(),
+            "finite numeric `at` on the thread-close edge: {edge_frame}"
+        );
+        // The close's own terminal `exited` frame lands after the mint (the
+        // arm mints for the in-flight turn before the subscription publishes
+        // its terminal status).
+        let exited = collect_frames_until(&mut rx, std::time::Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "exited"
+        })
+        .await;
+        assert!(
+            exited.matched,
+            "the thread-close exited frame publishes after the edge: {:?}",
+            exited.frames
+        );
+
+        // The turn's LATE `turn/completed` (an errored thread need not send
+        // one, but MAY): publishes its snapshot/idle bookkeeping and adds NO
+        // second edge (the already-rang stamp gates it — one bell per
+        // event).
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-close-in-flight", "turnId": "turn-1", "status": "failed" }),
+        );
+        let completion = collect_frames_until(&mut rx, std::time::Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.session.snapshot" && w["event"]["status"] == "idle"
+        })
+        .await;
+        assert!(
+            completion.matched,
+            "the late matching completion still publishes its idle snapshot: {:?}",
+            completion.frames
+        );
+        assert!(
+            !completion
+                .frames
+                .iter()
+                .any(|w| w["event"]["type"] == "freshAgent.turn.complete"),
+            "the late matching completion adds NO second edge (already-rang gate): {:?}",
+            completion.frames
+        );
+
+        // A subsequent sidecar death (an unrequested exit) broadcasts the
+        // `exited` frame and rings NOTHING extra — the latch retired at the
+        // close, so the crash arm cannot misattribute a phantom edge.
+        // Safety: a targeted SIGKILL of this test's own fixture child (the
+        // `sleep` process spawned above) — never a broad kill pattern.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        let exited = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |w| {
+            w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "exited"
+        })
+        .await;
+        assert!(
+            exited.matched,
+            "the watcher self-heals within the budget: {:?}",
+            exited.frames
+        );
+        let after = collect_frames_until(&mut rx, std::time::Duration::from_millis(400), |w| {
+            w["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert!(
+            !after.matched,
+            "a sidecar death after the close must not add a second edge: {:?}",
+            after.frames
+        );
+    }
+
+    /// The-usual SDD delta round 5 DR5-2(b): a terminal
+    /// `thread/status/changed{systemError}` normalizes to the Exited class;
+    /// with the crash latch ARMED the thread DIED IN ERROR with the turn in
+    /// flight — the turn's errored end MUST ring at the status (its
+    /// `turn/completed` need never arrive). No stuck flag may follow (the
+    /// arm disarms the deadman), a later MATCHING `turn/completed`
+    /// publishes its snapshot without a second edge, and a subsequent
+    /// crash rings nothing extra.
+    #[tokio::test]
+    async fn system_error_status_with_a_turn_in_flight_rings_once_and_gates_the_matching_completion(
+    ) {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, mut rx) = state_with_bus();
+        // A tiny quiet window so a lingering armed deadman would FIRE (a
+        // stuck flag + a second edge) well inside this test's budget.
+        st.set_codex_quiet_window_ms_for_tests(150);
+
+        let child = spawn_sleeper();
+        let pid = child.id().expect("sleeper pid");
+
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-syserror-in-flight",
+            client,
+            Arc::new(StdMutex::new(Some("turn-1".to_string()))),
+            notifs,
+            child,
+            "codex-sidecar-test-syserror-in-flight",
+        )
+        .await;
+
+        // The thread reports its own death-in-error while the turn runs.
+        peer.emit_notification(
+            "thread/status/changed",
+            json!({ "threadId": "thread-syserror-in-flight", "status": { "type": "systemError" } }),
+        );
+
+        // The unified edge fires AT THE STATUS (the turn's errored end).
+        let edge = collect_frames_until(&mut rx, std::time::Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert!(
+            edge.matched,
+            "a systemError terminal status with the latch armed rings the turn's errored end: {:?}",
+            edge.frames
+        );
+        let edge_frame = edge.frames.last().expect("the matched edge frame");
+        assert_eq!(edge_frame["sessionId"], json!("thread-syserror-in-flight"));
+        // The status's own exited-class snapshot lands after the mint.
+        let status_snapshot =
+            collect_frames_until(&mut rx, std::time::Duration::from_secs(2), |w| {
+                w["event"]["type"] == "freshAgent.session.snapshot"
+                    && w["event"]["status"] == "exited"
+            })
+            .await;
+        assert!(
+            status_snapshot.matched,
+            "the systemError status publishes its exited-class snapshot after the edge: {:?}",
+            status_snapshot.frames
+        );
+
+        // NO stuck flag and NO second edge may follow (the arm disarms the
+        // deadman — a thread that already reported its own death is not
+        // wedged).
+        let post = collect_frames_until(&mut rx, std::time::Duration::from_millis(500), |w| {
+            (w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "stuck")
+                || w["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert!(
+            !post.matched,
+            "no stuck flag, no second edge after the systemError mint: {:?}",
+            post.frames
+        );
+
+        // The turn's LATE matching `turn/completed`: publishes its
+        // snapshot/idle bookkeeping, NO second edge (already-rang gate).
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-syserror-in-flight", "turnId": "turn-1", "status": "failed" }),
+        );
+        let completion = collect_frames_until(&mut rx, std::time::Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.session.snapshot" && w["event"]["status"] == "idle"
+        })
+        .await;
+        assert!(
+            completion.matched,
+            "the late matching completion still publishes its idle snapshot: {:?}",
+            completion.frames
+        );
+        assert!(
+            !completion
+                .frames
+                .iter()
+                .any(|w| w["event"]["type"] == "freshAgent.turn.complete"),
+            "the late matching completion adds NO second edge (already-rang gate): {:?}",
+            completion.frames
+        );
+
+        // A subsequent sidecar death rings nothing extra (the latch retired
+        // at the status — the pre-fix generic terminal path left it armed,
+        // and a much-later sidecar death would have misattributed a phantom
+        // edge to the turn). Safety: a targeted SIGKILL of this test's own
+        // fixture child — never a broad kill pattern.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        let exited = collect_frames_until(&mut rx, std::time::Duration::from_secs(5), |w| {
+            w["event"]["type"] == "freshAgent.status" && w["event"]["status"] == "exited"
+        })
+        .await;
+        assert!(
+            exited.matched,
+            "the watcher self-heals within the budget: {:?}",
+            exited.frames
+        );
+        let after = collect_frames_until(&mut rx, std::time::Duration::from_millis(400), |w| {
+            w["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert!(
+            !after.matched,
+            "a crash after the systemError mint must not add a second edge: {:?}",
             after.frames
         );
     }
