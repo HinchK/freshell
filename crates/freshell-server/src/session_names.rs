@@ -908,6 +908,75 @@ impl SessionNames {
         }))
     }
 
+    /// Delta-review round 3, finding 2 — the adopted-view pre-check for the
+    /// sweep's hydration feed, in the [`needs_generation_input`] pattern (a
+    /// lock-free read of the current in-memory view). TRUE means the strict
+    /// hydrate transaction is still needed; FALSE means the view PROVES it
+    /// would be a no-op Read, so the sweep skips transacting.
+    ///
+    /// View-accuracy argument (why skipping cannot miss a foreign process's
+    /// change): the strict hydrate decision's ONLY work is the
+    /// record-absent branch — a record present in the re-read document makes
+    /// it return Read unchanged, before `absorb` is even consulted (the
+    /// absorb lives in the insert branch only). A record present in the
+    /// adopted view is therefore present in every LATER on-disk generation:
+    /// records for durable session keys are never removed (the single
+    /// `records.remove` is the pending→durable bind retiring the PENDING
+    /// key), every persisted mutation increments documentGeneration, and a
+    /// foreign document lacking the record would need a lower or
+    /// content-rewritten equal generation — both fenced as loud Persistence
+    /// errors by the strict path. So the only effect of a stale view is
+    /// transacting unnecessarily (the safe direction); a settled session
+    /// stays settled across foreign commits. A first-boot fsync per
+    /// genuinely-new record remains — that is real durable work, paid once
+    /// per session ever, not once per pass.
+    pub(crate) fn hydrate_indexed_pending(&self, input: &IndexedNameInput) -> bool {
+        let target = SessionNameRef::Session {
+            provider: input.provider,
+            session_id: input.session_id.clone(),
+        };
+        let key = name_ref_key(&target);
+        self.core.current_view().document.record_at(&key).is_none()
+    }
+
+    /// Delta-review round 3, finding 2 — the adopted-view pre-check for the
+    /// sweep's activity feed: TRUE means the strict activity transaction
+    /// would still change something (or the target has no record, so the
+    /// transaction must surface its NotFound exactly as before); FALSE
+    /// means the view PROVES a no-op Read. Runs the SAME
+    /// [`plan_activity`] policy the transaction applies, so the pre-check
+    /// and the apply can never drift.
+    ///
+    /// Cross-process staleness: the plan is monotone-safe in both
+    /// directions. A record's source rank never decreases (offers only
+    /// raise; manual wins; migration only raises), so a foreign commit can
+    /// never make a plan-noop into plan-pending through the offer arm. The
+    /// arming arm becomes pending only when the series' input fingerprint
+    /// differs from the fed message — a foreign process moving the
+    /// fingerprint away means ITS transaction armed the series with a newer
+    /// message (work exists and will run; the input changed, not lost), and
+    /// the next pass after any adopted-view refresh (the unconditional 2s
+    /// tick, bootstrap reads, or any local transaction's adoption) re-arms
+    /// this process's feed if the index message moved. A genuinely new
+    /// record is always "pending" here, so a foreign process's hydration is
+    /// never skipped over.
+    pub(crate) fn activity_pending(&self, input: &NameActivity) -> bool {
+        let view = self.core.current_view();
+        let Ok((key, _record)) = required_record(&view.document, &input.target) else {
+            return true;
+        };
+        if !freshell_freshagent::naming::is_unified_agent_mode(Some(&input.mode), None) {
+            return false;
+        }
+        !plan_activity(
+            &view.document,
+            &key,
+            input.reason,
+            input.first_user_message.as_deref(),
+        )
+        .is_noop()
+    }
+
     /// Task 3: the store's CURRENT verified location revision for `target`
     /// (0 when none exists) — the stamp live provider lanes fold their
     /// observations with, so an old-location observation can never masquerade
@@ -1323,6 +1392,7 @@ where
     F: FnOnce(&mut StoredDocument, &TxnMeta) -> Result<Decision<T>, NameError>,
 {
     let _guard = acquire_document_lock(&core.lock_path)?;
+    count_store_transaction_for_test(&core.data_dir);
     test_hold_once(&core.data_dir);
 
     let raw = std::fs::read(&core.doc_path);
@@ -1833,6 +1903,49 @@ fn take_native_retry_floor(data_dir: &Path) -> Option<i64> {
         let _ = data_dir;
         None
     }
+}
+
+/// Test-only store-transaction counter (delta-review round 3, finding 2):
+/// every strict cross-process transaction — lock acquisition through
+/// [`run_txn_sync`] — increments the data-dir-keyed tally. The sweep
+/// pre-check tests prove a settled scoped session transacts ZERO times on a
+/// later pass by reading this counter, in the same data-dir-keyed style as
+/// the test hooks (parallel tests never cross-contaminate). A no-op body in
+/// non-test builds, exactly like the failure-injection seams above.
+fn count_store_transaction_for_test(data_dir: &Path) {
+    #[cfg(test)]
+    {
+        test_transaction_tallies()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(data_dir.to_path_buf())
+            .or_insert_with(|| std::sync::atomic::AtomicU64::new(0))
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    #[cfg(not(test))]
+    {
+        let _ = data_dir;
+    }
+}
+
+/// The current test tally of store transactions against `data_dir`.
+#[cfg(test)]
+pub(crate) fn test_store_transaction_count(data_dir: &Path) -> u64 {
+    test_transaction_tallies()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(data_dir)
+        .map(|count| count.load(std::sync::atomic::Ordering::SeqCst))
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+fn test_transaction_tallies(
+) -> &'static std::sync::Mutex<std::collections::BTreeMap<PathBuf, std::sync::atomic::AtomicU64>> {
+    static TALLIES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<PathBuf, std::sync::atomic::AtomicU64>>,
+    > = std::sync::OnceLock::new();
+    TALLIES.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
 }
 
 // ---------------------------------------------------------------------------
@@ -2481,6 +2594,113 @@ fn bind_pending_decision(
     Ok(commit_decision(document, &target_key, true))
 }
 
+/// The pure pre-evaluation of one activity against a document snapshot:
+/// exactly what the strict activity transaction would change, without
+/// mutating. Shared by [`activity_decision`] (the transaction's apply path)
+/// and the sweep's adopted-view pre-check ([`SessionNames::activity_pending`]),
+/// so the apply and the skip can never drift apart.
+struct ActivityPlan {
+    /// The first-message fallback that would raise the record's rank.
+    offer_fallback: Option<String>,
+    /// The (fingerprint, excerpt) that would (re)arm the generation series.
+    arm: Option<(String, String)>,
+}
+
+impl ActivityPlan {
+    fn is_noop(&self) -> bool {
+        self.offer_fallback.is_none() && self.arm.is_none()
+    }
+}
+
+/// Evaluate the activity acceptance/arming conditions (delta-review round 3,
+/// finding 2, extracted verbatim from the former inline decision so the
+/// pre-check and the transaction share ONE policy). Callers apply the
+/// unified-mode scope admission BEFORE planning:
+/// - the first-message fallback offer runs only for accepted/index user
+///   messages, only when the extraction is a valid name, and only when it
+///   would RAISE rank (an automatic offer never overwrites an equal rank);
+/// - arming is skipped for protected sources, duplicate delivery (same input
+///   fingerprint) and exhausted series; Opened/Resumed arm only an
+///   unattempted series, except the boot-absorbed Idle series an explicit
+///   open may still arm.
+fn plan_activity(
+    document: &StoredDocument,
+    key: &str,
+    reason: NameActivityReason,
+    first_user_message: Option<&str>,
+) -> ActivityPlan {
+    let Some(record) = document.record_at(key) else {
+        return ActivityPlan {
+            offer_fallback: None,
+            arm: None,
+        };
+    };
+    let mut plan = ActivityPlan {
+        offer_fallback: None,
+        arm: None,
+    };
+    if matches!(
+        reason,
+        NameActivityReason::AcceptedUserMessage | NameActivityReason::IndexUserMessage
+    ) {
+        if let Some(message) = first_user_message {
+            if let Some(fallback) = first_message_fallback(message) {
+                if validate_name(&fallback).is_ok()
+                    && source_rank(NameSource::FirstMessage) > source_rank(record.source)
+                {
+                    plan.offer_fallback = Some(fallback);
+                }
+            }
+        }
+    }
+    if !source_is_protected(record.source) {
+        if let Some(message) = first_user_message.map(str::trim).filter(|m| !m.is_empty()) {
+            let unattempted_only = match reason {
+                NameActivityReason::AcceptedUserMessage | NameActivityReason::IndexUserMessage => {
+                    true
+                }
+                NameActivityReason::Opened | NameActivityReason::Resumed => document
+                    .generation
+                    .get(key)
+                    .is_none_or(|series| series.consumed == 0),
+            };
+            if unattempted_only {
+                let fingerprint = fingerprint_message(message);
+                let needs_arm = match document.generation.get(key) {
+                    None => true,
+                    Some(series) => {
+                        if series.input_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+                            true
+                        } else {
+                            // "Explicit open/resume may arm an unattempted
+                            // series": the boot snapshot's absorbed series
+                            // (Idle, consumed == 0) rests until the user
+                            // actually opens the session — the same message
+                            // then arms it. An attempted series (Eligible
+                            // retry, InFlight, Exhausted) never resets.
+                            reason == NameActivityReason::Opened
+                                && series.status == GenerationStatus::Idle
+                                && series.consumed == 0
+                        }
+                    }
+                };
+                if needs_arm {
+                    // An exhausted series never re-arms (the apply path's
+                    // own guard, mirrored so the pre-check is view-accurate).
+                    let exhausted = document
+                        .generation
+                        .get(key)
+                        .is_some_and(|series| series.status == GenerationStatus::Exhausted);
+                    if !exhausted {
+                        plan.arm = Some((fingerprint, excerpt_of(message)));
+                    }
+                }
+            }
+        }
+    }
+    plan
+}
+
 fn activity_decision(
     document: &mut StoredDocument,
     meta: &TxnMeta,
@@ -2503,96 +2723,44 @@ fn activity_decision(
         return Ok(Decision::Read(read_update(document, &key)));
     }
 
-    let mut changed = false;
-    // Accepted input upgrades the fallback without waiting for generation.
-    if matches!(
-        reason,
-        NameActivityReason::AcceptedUserMessage | NameActivityReason::IndexUserMessage
-    ) {
-        if let Some(message) = first_user_message.as_deref() {
-            if let Some(fallback) = first_message_fallback(message) {
-                if validate_name(&fallback).is_ok() {
-                    changed = offer_mut(
-                        document,
-                        &key,
-                        fallback,
-                        NameSource::FirstMessage,
-                        meta.now_ms,
-                    )?;
-                }
-            }
-        }
+    let plan = plan_activity(document, &key, reason, first_user_message.as_deref());
+    if plan.is_noop() {
+        return Ok(Decision::Read(read_update(document, &key)));
     }
 
-    // Eligibility arming: protected names never arm; an exhausted series
-    // never re-arms; duplicate delivery (same input fingerprint) is a no-op.
-    // Opened/Resumed arm only an UNATTEMPTED series (consumed == 0) — an
-    // explicit open never resets an attempted series' schedule.
-    let current_source = document
-        .record_at(&key)
-        .map(|record| record.source)
-        .expect("record exists");
+    let mut changed = false;
+    if let Some(fallback) = plan.offer_fallback {
+        changed = offer_mut(
+            document,
+            &key,
+            fallback,
+            NameSource::FirstMessage,
+            meta.now_ms,
+        )?;
+    }
+
     let mut armed_or_updated = false;
-    if !source_is_protected(current_source) {
-        if let Some(message) = first_user_message
-            .as_deref()
-            .map(str::trim)
-            .filter(|m| !m.is_empty())
-        {
-            let unattempted_only = match reason {
-                NameActivityReason::AcceptedUserMessage | NameActivityReason::IndexUserMessage => {
-                    true
-                }
-                NameActivityReason::Opened | NameActivityReason::Resumed => document
-                    .generation
-                    .get(&key)
-                    .is_none_or(|series| series.consumed == 0),
-            };
-            if unattempted_only {
-                let fingerprint = fingerprint_message(message);
-                let needs_arm = match document.generation.get(&key) {
-                    None => true,
-                    Some(series) => {
-                        if series.input_fingerprint.as_deref() != Some(fingerprint.as_str()) {
-                            true
-                        } else {
-                            // "Explicit open/resume may arm an unattempted
-                            // series": the boot snapshot's absorbed series
-                            // (Idle, consumed == 0) rests until the user
-                            // actually opens the session — the same message
-                            // then arms it. An attempted series (Eligible
-                            // retry, InFlight, Exhausted) never resets.
-                            reason == NameActivityReason::Opened
-                                && series.status == GenerationStatus::Idle
-                                && series.consumed == 0
-                        }
-                    }
-                };
-                if needs_arm {
-                    let series =
-                        document
-                            .generation
-                            .entry(key.clone())
-                            .or_insert_with(|| GenerationState {
-                                status: GenerationStatus::Eligible,
-                                series_id: Uuid::new_v4().to_string(),
-                                input_fingerprint: None,
-                                excerpt: None,
-                                attempt_ids: Vec::new(),
-                                attempt_starts: Vec::new(),
-                                consumed: 0,
-                                next_due: None,
-                                exhausted_at: None,
-                            });
-                    if series.status != GenerationStatus::Exhausted {
-                        series.status = GenerationStatus::Eligible;
-                        series.input_fingerprint = Some(fingerprint);
-                        series.excerpt = Some(excerpt_of(message));
-                        series.next_due = None;
-                        armed_or_updated = true;
-                    }
-                }
-            }
+    if let Some((fingerprint, excerpt)) = plan.arm {
+        let series = document
+            .generation
+            .entry(key.clone())
+            .or_insert_with(|| GenerationState {
+                status: GenerationStatus::Eligible,
+                series_id: Uuid::new_v4().to_string(),
+                input_fingerprint: None,
+                excerpt: None,
+                attempt_ids: Vec::new(),
+                attempt_starts: Vec::new(),
+                consumed: 0,
+                next_due: None,
+                exhausted_at: None,
+            });
+        if series.status != GenerationStatus::Exhausted {
+            series.status = GenerationStatus::Eligible;
+            series.input_fingerprint = Some(fingerprint);
+            series.excerpt = Some(excerpt);
+            series.next_due = None;
+            armed_or_updated = true;
         }
     }
 

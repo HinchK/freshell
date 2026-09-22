@@ -414,16 +414,29 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
         let hydrating = !state
             .index_hydrated
             .swap(true, std::sync::atomic::Ordering::SeqCst);
+        // Delta-review round 3, finding 2 — the per-pass settled memo:
+        // sessions this pass already PROVED settled on the adopted view
+        // (both store pre-checks answered no-op) never re-evaluate, so a
+        // repeated row in one pass costs nothing. Cleared every pass — a
+        // later pass re-proves against the (refreshed) view, so foreign
+        // changes always resurface through the existing refresh discipline.
+        let mut settled_this_pass: HashSet<String> = HashSet::new();
         for s in sessions {
             let Some(provider) =
                 freshell_freshagent::naming::named_provider_for(Some(&s.provider), None)
             else {
                 continue;
             };
-            if kilroy_only.contains(&sweep_session_key(&s.provider, &s.session_id)) {
+            let session_key = sweep_session_key(&s.provider, &s.session_id);
+            if kilroy_only.contains(&session_key) {
                 // A kilroy-only session keeps kilroy's existing UI and
                 // generation behavior: no naming-authority record, no
                 // generator arming — the legacy ladder below serves it.
+                continue;
+            }
+            if settled_this_pass.contains(&session_key) {
+                // Proven settled earlier in THIS pass: no transaction, no
+                // targeted lookup, no re-evaluation.
                 continue;
             }
             let target = freshell_protocol::SessionNameRef::Session {
@@ -475,38 +488,60 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
                 first_user_message: first_user_message.clone(),
                 provider_title,
             };
-            if let Err(error) = names
-                .hydrate_indexed(input, hydrating && !explicitly_open)
-                .await
-            {
-                freshell_freshagent::naming::log_name_error("hydrate_indexed", &target, &error);
+            // Delta-review round 3, finding 2 — the adopted-view pre-checks:
+            // a settled session (hydrated record, absorbed/duplicate message,
+            // no pending work) must not pay a strict cross-process store
+            // transaction per pass. `hydrate_indexed_pending`/
+            // `activity_pending` prove the no-op from the in-memory view
+            // (the same plan the transaction applies); a stale view can only
+            // make the pre-check transact unnecessarily, never skip real
+            // work — the store's own doc comments carry the full argument.
+            let mut transacted = false;
+            if names.hydrate_indexed_pending(&input) {
+                transacted = true;
+                if let Err(error) = names
+                    .hydrate_indexed(input.clone(), hydrating && !explicitly_open)
+                    .await
+                {
+                    freshell_freshagent::naming::log_name_error("hydrate_indexed", &target, &error);
+                }
             }
-            if first_user_message.is_some() {
-                // The boot pass arms only explicitly open sessions; every
-                // later pass feeds the newly observed message (the store's
-                // fingerprint absorbs duplicates, and an explicitly open
-                // session's Opened edge arms its absorbed unattempted
-                // series — the plan's "explicit open/resume may arm an
-                // unattempted series if a first user message exists").
-                if !hydrating || explicitly_open {
-                    if let Err(error) = names
-                        .activity(freshell_freshagent::naming::NameActivity {
-                            target: target.clone(),
-                            mode: s.provider.clone(),
-                            event_id: format!("{}:{}", s.provider, s.session_id),
-                            reason: if explicitly_open {
-                                freshell_freshagent::naming::NameActivityReason::Opened
-                            } else {
-                                freshell_freshagent::naming::NameActivityReason::IndexUserMessage
-                            },
-                            first_user_message,
-                            cwd: s.cwd.clone(),
-                        })
-                        .await
-                    {
+            // The boot pass arms only explicitly open sessions; every later
+            // pass feeds the newly observed message (the store's
+            // fingerprint absorbs duplicates, and an explicitly open
+            // session's Opened edge arms its absorbed unattempted
+            // series — the plan's "explicit open/resume may arm an
+            // unattempted series if a first user message exists").
+            let mut activity = None;
+            if first_user_message.is_some() && (!hydrating || explicitly_open) {
+                activity = Some(freshell_freshagent::naming::NameActivity {
+                    target: target.clone(),
+                    mode: s.provider.clone(),
+                    event_id: format!("{}:{}", s.provider, s.session_id),
+                    reason: if explicitly_open {
+                        freshell_freshagent::naming::NameActivityReason::Opened
+                    } else {
+                        freshell_freshagent::naming::NameActivityReason::IndexUserMessage
+                    },
+                    first_user_message,
+                    cwd: s.cwd.clone(),
+                });
+            }
+            if let Some(activity) = activity {
+                // Re-checked AFTER the hydrate above: a boot-pass hydration
+                // that just created/absorbed makes this a provable no-op on
+                // the now-current view (no duplicate arming transaction).
+                if names.activity_pending(&activity) {
+                    transacted = true;
+                    if let Err(error) = names.activity(activity).await {
                         freshell_freshagent::naming::log_name_error("activity", &target, &error);
                     }
                 }
+            }
+            if !transacted {
+                // Proven settled on the adopted view: memo so a repeated row
+                // later in THIS pass never re-evaluates.
+                settled_this_pass.insert(session_key);
             }
         }
     }
@@ -1685,6 +1720,122 @@ mod tests {
             .await
             .expect("the new session hydrated");
         assert_eq!(record.record.name, "A brand new post-boot session");
+    }
+
+    /// Delta-review round 3, finding 2: a SETTLED scoped session costs ZERO
+    /// store transactions on a later sweep pass. Steady state used to pay
+    /// hydrate_indexed + activity — each a strict cross-process transaction
+    /// locking/reading/digesting/parsing the whole session-names document —
+    /// for every scoped session on EVERY ~5s pass (O(H^2) per pass, forever).
+    /// The adopted-view pre-checks prove the no-op without transacting; the
+    /// convergence control proves a genuinely new session still reaches the
+    /// store (the pre-check only skips what the strict transaction would
+    /// have no-op'd — view staleness in the other direction just transacts).
+    #[tokio::test]
+    async fn settled_scoped_sessions_transact_zero_on_later_sweep_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = crate::session_names::SessionNames::open(dir.path().to_path_buf()).unwrap();
+        let (state, _rx) = sweep_state_with(dir.path(), None, Some(names.clone()), None);
+
+        // Boot pass: the scoped session hydrates (record + absorbed message).
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "claude",
+                "s-settled",
+                "/x/proj",
+                Some("Fix the flux capacitor"),
+            )],
+        )
+        .await;
+        assert!(
+            naming_record(&names, scoped_session_ref("claude", "s-settled"))
+                .await
+                .is_some(),
+            "the boot pass installed the record"
+        );
+
+        // Second pass (settled, message re-fed): ZERO transactions.
+        let before = crate::session_names::test_store_transaction_count(dir.path());
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "claude",
+                "s-settled",
+                "/x/proj",
+                Some("Fix the flux capacitor"),
+            )],
+        )
+        .await;
+        let after = crate::session_names::test_store_transaction_count(dir.path());
+        assert_eq!(
+            before, after,
+            "a settled scoped session (absorbed message, unopened) must not transact on a later pass"
+        );
+
+        // The explicitly-open variant settles too: the boot-pass Opened edge
+        // armed its series, and re-feeding the SAME message with Opened on an
+        // armed (Eligible, attempted-count 0 but non-Idle) series is a no-op.
+        spawn_headless_terminal_for_test(&state.registry, "term-open");
+        state.identity.upsert(
+            "term-open",
+            Some("claude"),
+            Some("s-open"),
+            Some("/x/open"),
+            1,
+        );
+        run_auto_title_pass(
+            &state,
+            &[session("claude", "s-open", "/x/open", Some("Open me up"))],
+        )
+        .await;
+        assert!(
+            names
+                .generation_work_snapshot()
+                .iter()
+                .any(|item| item.target == scoped_session_ref("claude", "s-open")),
+            "the open session's message armed generation"
+        );
+        let before_open = crate::session_names::test_store_transaction_count(dir.path());
+        run_auto_title_pass(
+            &state,
+            &[session("claude", "s-open", "/x/open", Some("Open me up"))],
+        )
+        .await;
+        let after_open = crate::session_names::test_store_transaction_count(dir.path());
+        assert_eq!(
+            before_open, after_open,
+            "a settled explicitly-open scoped session must not transact on a later pass"
+        );
+
+        // Convergence control: alongside the settled sessions, a genuinely
+        // NEW scoped session still reaches the store (a missing record is
+        // always pending work — the pre-check never over-skips).
+        let before_new = crate::session_names::test_store_transaction_count(dir.path());
+        run_auto_title_pass(
+            &state,
+            &[
+                session(
+                    "claude",
+                    "s-settled",
+                    "/x/proj",
+                    Some("Fix the flux capacitor"),
+                ),
+                session("claude", "s-fresh", "/x/fresh", Some("A brand new session")),
+            ],
+        )
+        .await;
+        let after_new = crate::session_names::test_store_transaction_count(dir.path());
+        assert!(
+            after_new > before_new,
+            "a new scoped session still transacts (hydrate + arm)"
+        );
+        assert!(
+            naming_record(&names, scoped_session_ref("claude", "s-fresh"))
+                .await
+                .is_some(),
+            "the new session's record installed"
+        );
     }
 
     /// An already-named opencode session carries no first message in the
