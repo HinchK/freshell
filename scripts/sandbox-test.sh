@@ -54,6 +54,12 @@ DOCKER_ARGS=(
   -v freshell-sandbox-cargo-git:/usr/local/cargo/git
   -v freshell-sandbox-cargo-target:/workspace/target
   -v freshell-sandbox-node-modules:/workspace/node_modules
+  # pnpm workspace members with their own dependencies get their own
+  # sandbox-owned node_modules (the entrypoint chowns and, on fingerprint
+  # changes, purges these only as mounted volumes). On legacy npm-era
+  # branches these stay mounted-but-unused and harmless.
+  -v freshell-sandbox-sidecar-node-modules:/workspace/crates/freshell-claude-sidecar/node_modules
+  -v freshell-sandbox-mcp-node-modules:/workspace/packages/freshell-mcp-runtime/node_modules
   -v freshell-sandbox-playwright-cache:/home/sandbox/.cache/ms-playwright
 )
 

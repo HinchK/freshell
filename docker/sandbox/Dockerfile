@@ -52,6 +52,13 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 # VOLUME entries are needed for it.
 RUN npm install -g pnpm@10.34.5
 
+# pnpm's default store-path resolution probes the project root's
+# writability (it touches a temp file next to the root manifest); on the
+# read-only bind-mounted repo that EACCES would fail any in-container pnpm
+# invocation. Pin the store explicitly for ad-hoc commands — the
+# entrypoint's install passes the same path on its command line.
+ENV npm_config_store_dir=/home/sandbox/.local/share/pnpm/store
+
 # Non-root user matching the invoking operator's UID/GID (passed as build
 # args by scripts/sandbox-build.sh) so files written through the bind-mounted
 # repo keep sane host-side ownership instead of ending up root-owned.

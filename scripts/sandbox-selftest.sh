@@ -242,12 +242,15 @@ echo
 echo "--- Proof 6: dependency prep (manager selection + fingerprint transitions) ---"
 # docker/sandbox/entrypoint.sh replaces the one-shot `.sandbox-npm-ci-done`
 # marker with a fingerprinted, dual-manager dependency prep. These cases
-# drive it through the real image entrypoint against hermetic fixture trees
-# (host temp dirs bind-mounted at /workspace — they never touch this repo's
-# working tree, its named volumes, or any host path outside mktemp -d):
+# drive it through the real image entrypoint against hermetic fixture
+# trees: host temp dirs bind-mounted at /workspace plus throwaway named
+# volumes at /workspace/node_modules — the same mount topology
+# scripts/sandbox-test.sh gives the real repo, so the purge path is
+# exercised against a real volume mount. Nothing here touches this repo's
+# working tree or its persistent named volumes:
 #   6a: pnpm-era tree (packageManager pin, both lock styles present) with a
 #       planted stale npm marker + stale npm node_modules → pnpm prep runs,
-#       purges the stale tree, and writes the new state file.
+#       purges the stale volume, and writes the new state file.
 #   6b: an unchanged fingerprint on a second container start skips the
 #       install and leaves the state file untouched.
 #   6c: a changed fingerprint input (package.json bytes) forces a
@@ -257,6 +260,8 @@ echo "--- Proof 6: dependency prep (manager selection + fingerprint transitions)
 #       the old one-shot marker never satisfies the new state.
 P6_FIXTURE_PNPM="$(mktemp -d)"
 P6_FIXTURE_NPM="$(mktemp -d)"
+P6_VOL_PNPM="freshell-selftest-deps-pnpm-$$"
+P6_VOL_NPM="freshell-selftest-deps-npm-$$"
 
 cat > "${P6_FIXTURE_PNPM}/package.json" <<'EOF'
 {
@@ -269,9 +274,6 @@ EOF
 # A stale npm lock is planted alongside the pnpm lock (as on this branch
 # while package-lock.json is still carried): packageManager must win.
 echo '{"name":"sandbox-deps-fixture-pnpm","version":"0.0.0","lockfileVersion":3,"packages":{"":{"name":"sandbox-deps-fixture-pnpm","version":"0.0.0"}}}' > "${P6_FIXTURE_PNPM}/package-lock.json"
-mkdir -p "${P6_FIXTURE_PNPM}/node_modules/.bin"
-: > "${P6_FIXTURE_PNPM}/node_modules/.sandbox-npm-ci-done"
-echo stale > "${P6_FIXTURE_PNPM}/node_modules/stale-npm-junk.js"
 
 cat > "${P6_FIXTURE_NPM}/package.json" <<'EOF'
 {
@@ -280,17 +282,14 @@ cat > "${P6_FIXTURE_NPM}/package.json" <<'EOF'
   "private": true
 }
 EOF
-mkdir -p "${P6_FIXTURE_NPM}/node_modules"
-: > "${P6_FIXTURE_NPM}/node_modules/.sandbox-npm-ci-done"
-echo stale > "${P6_FIXTURE_NPM}/node_modules/stale-npm-junk.js"
 
 # Generate each fixture's lock with the image's own pinned manager (empty
 # dependency sets: no network resolution). Lock-only generation keeps the
-# case runs below exercising the entrypoint's real frozen-install path. The
-# generators run as the container's root user: under this host's rootless
-# docker mapping, bind-mounted files keep the invoking user's ownership, so
-# root-created locks come back out as the invoking user's own files —
-# readable and chmod-able host-side for the assertions below.
+# case runs below exercising the entrypoint's real frozen-install path.
+# The generators run as the container's root user: under this host's
+# rootless docker mapping, bind-mounted files keep the invoking user's
+# ownership, so root-created locks come back out as the invoking user's
+# own files — readable and chmod-able host-side for the steps below.
 P6_GEN_STATUS=0
 docker run --rm --network "${NETWORK_NAME}" --entrypoint bash \
   -v "${P6_FIXTURE_PNPM}:/fixture" "${IMAGE_TAG}" \
@@ -303,10 +302,29 @@ docker run --rm --network "${NETWORK_NAME}" --entrypoint bash \
 
 # The entrypoint's gosu drop means the container reads the fixture as the
 # "sandbox" user, while bind-mounted host files appear inside the container
-# as root-owned — they must be world-readable for the install to work, and
-# world-traversable for the host-side state readback. chmod after creation
-# so the invoking shell's umask cannot break the proof.
+# as root-owned — they must be world-readable for the install to work.
+# chmod after creation so the invoking shell's umask cannot break the proof.
 chmod -R a+rX "${P6_FIXTURE_PNPM}" "${P6_FIXTURE_NPM}"
+
+# Plant the stale npm-era node_modules (one-shot marker + junk) INTO each
+# throwaway volume, exactly as a legacy npm-era container would have left
+# it. Runs as the container's root with the volume mounted at its wrapper
+# path over the bind-mounted fixture.
+for _fx in "${P6_FIXTURE_PNPM}" "${P6_FIXTURE_NPM}"; do
+  if [ "${_fx}" = "${P6_FIXTURE_NPM}" ]; then
+    _vol="${P6_VOL_NPM}"
+  else
+    _vol="${P6_VOL_PNPM}"
+  fi
+  docker run --rm --entrypoint bash \
+    -v "${_fx}:/workspace" -v "${_vol}:/workspace/node_modules" \
+    "${IMAGE_TAG}" -c '
+      mkdir -p /workspace/node_modules/.bin
+      : > /workspace/node_modules/.sandbox-npm-ci-done
+      echo stale > /workspace/node_modules/stale-npm-junk.js
+    ' >/dev/null 2>&1 || P6_GEN_STATUS=$?
+done
+unset _fx _vol
 
 P6_FIXTURES_OK=true
 if [ "${P6_GEN_STATUS}" -ne 0 ] \
@@ -316,18 +334,22 @@ if [ "${P6_GEN_STATUS}" -ne 0 ] \
   P6_FIXTURES_OK=false
 fi
 
+# Every case command reports from INSIDE the container: the state file
+# lives in the volume, which the host cannot read through the fixture dir.
+P6_CASE_SCRIPT='
+  cat node_modules/.sandbox-deps-state 2>/dev/null || echo "STATE-MISSING"
+  test -e node_modules/stale-npm-junk.js && echo "junk:present" || echo "junk:purged"
+  test -e node_modules/.sandbox-npm-ci-done && echo "old-marker:present" || echo "old-marker:purged"
+'
+
 if [ "${P6_FIXTURES_OK}" = true ]; then
-  # -- 6a: pnpm tree + stale npm marker/tree → pnpm prep, purge, new state --
+  # -- 6a: pnpm tree + stale npm marker/volume → pnpm prep, purge, state --
   P6A_STATUS=0
   P6A_OUT="$(docker run --rm --network "${NETWORK_NAME}" \
-    -v "${P6_FIXTURE_PNPM}:/workspace" \
-    "${IMAGE_TAG}" bash -c '
-      cat node_modules/.sandbox-deps-state 2>/dev/null || echo "STATE-MISSING"
-      test -e node_modules/stale-npm-junk.js && echo "junk:present" || echo "junk:purged"
-      test -e node_modules/.sandbox-npm-ci-done && echo "old-marker:present" || echo "old-marker:purged"
-    ' 2>&1)" || P6A_STATUS=$?
+    -v "${P6_FIXTURE_PNPM}:/workspace" -v "${P6_VOL_PNPM}:/workspace/node_modules" \
+    "${IMAGE_TAG}" bash -c "${P6_CASE_SCRIPT}" 2>&1)" || P6A_STATUS=$?
   echo "${P6A_OUT}"
-  P6A_FP="$(grep '^fingerprint=' "${P6_FIXTURE_PNPM}/node_modules/.sandbox-deps-state" 2>/dev/null | cut -d= -f2 || true)"
+  P6A_FP="$(grep '^fingerprint=' <<<"${P6A_OUT}" | cut -d= -f2 || true)"
   if [ "${P6A_STATUS}" -eq 0 ] \
     && echo "${P6A_OUT}" | grep -q "deps: installing via pnpm install --frozen-lockfile" \
     && echo "${P6A_OUT}" | grep -q "manager=pnpm" \
@@ -335,27 +357,26 @@ if [ "${P6_FIXTURES_OK}" = true ]; then
     && echo "${P6A_OUT}" | grep -q "junk:purged" \
     && echo "${P6A_OUT}" | grep -q "old-marker:purged" \
     && ! echo "${P6A_OUT}" | grep -q "STATE-MISSING"; then
-    pass "6a: pnpm-era tree with stale npm marker/node_modules triggered the pnpm prep; stale tree purged; state written (fingerprint ${P6A_FP:0:12}...)"
+    pass "6a: pnpm-era tree with stale npm marker/node_modules triggered the pnpm prep; stale volume purged; state written (fingerprint ${P6A_FP:0:12}...)"
   else
     fail "6a: pnpm transition: exit=${P6A_STATUS} state_fingerprint=${P6A_FP:-none} output=[${P6A_OUT}]"
   fi
   echo
 
   # -- 6b: unchanged fingerprint on a second start → skip, state untouched --
-  P6B_STATE_BEFORE="$(cat "${P6_FIXTURE_PNPM}/node_modules/.sandbox-deps-state" 2>/dev/null || true)"
   P6B_STATUS=0
   P6B_OUT="$(docker run --rm --network "${NETWORK_NAME}" \
-    -v "${P6_FIXTURE_PNPM}:/workspace" \
+    -v "${P6_FIXTURE_PNPM}:/workspace" -v "${P6_VOL_PNPM}:/workspace/node_modules" \
     "${IMAGE_TAG}" bash -c 'cat node_modules/.sandbox-deps-state' 2>&1)" || P6B_STATUS=$?
   echo "${P6B_OUT}"
-  P6B_STATE_AFTER="$(cat "${P6_FIXTURE_PNPM}/node_modules/.sandbox-deps-state" 2>/dev/null || true)"
+  P6B_FP="$(grep '^fingerprint=' <<<"${P6B_OUT}" | cut -d= -f2 || true)"
   if [ "${P6B_STATUS}" -eq 0 ] \
     && echo "${P6B_OUT}" | grep -q "deps: reusing" \
     && ! echo "${P6B_OUT}" | grep -q "deps: installing" \
-    && [ -n "${P6B_STATE_BEFORE}" ] && [ "${P6B_STATE_BEFORE}" = "${P6B_STATE_AFTER}" ]; then
-    pass "6b: unchanged fingerprint skipped the install and left the state file untouched"
+    && [ -n "${P6B_FP}" ] && [ "${P6B_FP}" = "${P6A_FP}" ]; then
+    pass "6b: unchanged fingerprint skipped the install and left the recorded state untouched"
   else
-    fail "6b: reuse path: exit=${P6B_STATUS} state_before=[${P6B_STATE_BEFORE}] state_after=[${P6B_STATE_AFTER}] output=[${P6B_OUT}]"
+    fail "6b: reuse path: exit=${P6B_STATUS} fingerprint_before=${P6A_FP:-none} fingerprint_after=${P6B_FP:-none} output=[${P6B_OUT}]"
   fi
   echo
 
@@ -366,10 +387,10 @@ if [ "${P6_FIXTURES_OK}" = true ]; then
   printf '\n' >> "${P6_FIXTURE_PNPM}/package.json"
   P6C_STATUS=0
   P6C_OUT="$(docker run --rm --network "${NETWORK_NAME}" \
-    -v "${P6_FIXTURE_PNPM}:/workspace" \
+    -v "${P6_FIXTURE_PNPM}:/workspace" -v "${P6_VOL_PNPM}:/workspace/node_modules" \
     "${IMAGE_TAG}" bash -c 'cat node_modules/.sandbox-deps-state' 2>&1)" || P6C_STATUS=$?
   echo "${P6C_OUT}"
-  P6C_FP="$(grep '^fingerprint=' "${P6_FIXTURE_PNPM}/node_modules/.sandbox-deps-state" 2>/dev/null | cut -d= -f2 || true)"
+  P6C_FP="$(grep '^fingerprint=' <<<"${P6C_OUT}" | cut -d= -f2 || true)"
   if [ "${P6C_STATUS}" -eq 0 ] \
     && echo "${P6C_OUT}" | grep -q "deps: installing via pnpm install --frozen-lockfile" \
     && [ "${#P6C_FP}" -eq 64 ] \
@@ -383,12 +404,8 @@ if [ "${P6_FIXTURES_OK}" = true ]; then
   # -- 6d: legacy npm tree + old marker → npm ci runs anyway, state written --
   P6D_STATUS=0
   P6D_OUT="$(docker run --rm --network "${NETWORK_NAME}" \
-    -v "${P6_FIXTURE_NPM}:/workspace" \
-    "${IMAGE_TAG}" bash -c '
-      cat node_modules/.sandbox-deps-state 2>/dev/null || echo "STATE-MISSING"
-      test -e node_modules/stale-npm-junk.js && echo "junk:present" || echo "junk:purged"
-      test -e node_modules/.sandbox-npm-ci-done && echo "old-marker:present" || echo "old-marker:purged"
-    ' 2>&1)" || P6D_STATUS=$?
+    -v "${P6_FIXTURE_NPM}:/workspace" -v "${P6_VOL_NPM}:/workspace/node_modules" \
+    "${IMAGE_TAG}" bash -c "${P6_CASE_SCRIPT}" 2>&1)" || P6D_STATUS=$?
   echo "${P6D_OUT}"
   if [ "${P6D_STATUS}" -eq 0 ] \
     && echo "${P6D_OUT}" | grep -q "deps: installing via npm ci --no-audit --no-fund" \
@@ -403,18 +420,9 @@ if [ "${P6_FIXTURES_OK}" = true ]; then
   echo
 fi
 
-# The case runs leave each fixture's node_modules owned by the container's
-# "sandbox" user (host uid 100999 under this host's rootless docker mapping)
-# — the invoking user cannot delete those entries directly. Empty them via
-# a root-in-container cleanup pass (root inside the container's user
-# namespace can remove them, and the bind mount propagates the deletions)
-# so the host-side rm -rf below always succeeds.
-docker run --rm --entrypoint bash \
-  -v "${P6_FIXTURE_PNPM}:/f" "${IMAGE_TAG}" \
-  -c 'rm -rf /f/node_modules' >/dev/null 2>&1 || true
-docker run --rm --entrypoint bash \
-  -v "${P6_FIXTURE_NPM}:/f" "${IMAGE_TAG}" \
-  -c 'rm -rf /f/node_modules' >/dev/null 2>&1 || true
+# Throwaway volumes first (they shadow the fixtures' node_modules), then the
+# fixture dirs themselves (all host-owned once the volumes are gone).
+docker volume rm "${P6_VOL_PNPM}" "${P6_VOL_NPM}" >/dev/null 2>&1 || true
 rm -rf "${P6_FIXTURE_PNPM}" "${P6_FIXTURE_NPM}" 2>/dev/null || true
 
 # ---- final host health check ----
