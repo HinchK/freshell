@@ -997,16 +997,37 @@ impl OpencodeServeManager {
     /// and the whole path is a silent no-op: no log, no Lost, no re-warm. The
     /// arm selects the pre-take gate and the structured WARN (a requested kill
     /// never raises the crash event; a watcher's WARN names the dead daemon).
+    ///
+    /// **Sweep fencing (ep2-r1 fresheyes Major):** the session-emitter sweep
+    /// is part of the SAME `running` critical section as the take, BEFORE the
+    /// lock releases. A successor daemon cannot cold-start while this lock is
+    /// held (`ensure_started` needs it), so every sender claimed by the sweep
+    /// was necessarily registered against the daemon being lost (or against
+    /// no daemon at all — an in-flight `once_idle` whose request was going to
+    /// fail anyway); any registration that happens after the release belongs
+    /// to a SUCCESSOR and is never swept by this loss. Pre-fix, the sweep ran
+    /// after the lock release (kill/reap → `emit_lost_for_all`), so a fenced
+    /// attach that cold-started daemon B in that window had B's fresh bridge
+    /// sender wiped by A's late cleanup — B's bridge then drained its closed
+    /// channel and exited with no recovery trigger left (B's `Started` pass
+    /// had already seen a live B-stamped bridge, the `Lost` pass never
+    /// revives, and A's re-warm takes B's fast path silently) — the exact
+    /// dead-ended pane this recovery exists to heal.
     async fn lose_daemon(&self, arm: LossArm<'_>) {
-        let taken = {
+        let (taken, lost_senders) = {
             let mut running = self.inner.running.lock().await;
             match arm {
                 LossArm::Watcher {
                     base_url: _,
                     ownership_id,
                 } => match running.as_ref() {
-                    // Still OUR daemon: take it (the loss is ours to handle).
-                    Some(r) if r.ownership_id == ownership_id => running.take(),
+                    // Still OUR daemon: take it (the loss is ours to handle)
+                    // and sweep the shared session-emitter map while no
+                    // successor can be starting.
+                    Some(r) if r.ownership_id == ownership_id => {
+                        let senders = self.take_session_emitters();
+                        (running.take(), senders)
+                    }
                     // Stale watcher — a newer daemon owns the entry: no-op.
                     _ => return,
                 },
@@ -1024,7 +1045,8 @@ impl OpencodeServeManager {
                         if let Some(watch) = &r._exit_watch {
                             watch.abort();
                         }
-                        running.take()
+                        let senders = self.take_session_emitters();
+                        (running.take(), senders)
                     }
                     // Stale timeout — the request's daemon is already gone
                     // and a replacement owns the entry: no-op (no kill, no
@@ -1058,7 +1080,14 @@ impl OpencodeServeManager {
         // exited); the discard arm's kill is the requested kill. Either way
         // kill() reaps the /proc-scoped ownership tree.
         running.process.kill();
-        self.emit_lost_for_all();
+        // The sweep already ran INSIDE the take critical section, so
+        // `lost_senders` is exactly the set of THIS daemon's emitters it
+        // claimed: the Lost edge goes only to the sessions the lost daemon
+        // served, and a successor's post-release registration is not in it
+        // and stays live.
+        for sender in lost_senders {
+            let _ = sender.send(SessionSignal::Lost);
+        }
         let _ = self
             .inner
             .daemon_signals
@@ -1667,20 +1696,35 @@ impl OpencodeServeManager {
         dispatch_event_on(&self.inner, event);
     }
 
+    /// Collect every registered session-emitter sender and CLEAR the shared
+    /// map — the sweep half of [`Self::emit_lost_for_all`], split out so the
+    /// daemon-loss path can run it INSIDE the `running` critical section
+    /// that removes the dead daemon (see [`Self::lose_daemon`]): while that
+    /// lock is held no successor daemon can cold-start (`ensure_started`
+    /// needs it), so every sender claimed here belongs to the daemon being
+    /// lost, and anything registered later (a successor's bridge) is never
+    /// swept by this loss.
+    fn take_session_emitters(&self) -> Vec<broadcast::Sender<SessionSignal>> {
+        let mut map = self
+            .inner
+            .session_emitters
+            .lock()
+            .expect("session emitters mutex");
+        let senders = map.values().cloned().collect();
+        map.clear();
+        senders
+    }
+
     /// Signal every subscriber that the sidecar was lost (`emitLostForAllSessions`,
-    /// `serve-manager.ts:126-132`). Exposed for the sidecar-loss liveness path/tests.
+    /// `serve-manager.ts:126-132`). Exposed for the sidecar-loss liveness path/tests
+    /// and the shutdown teardown. The daemon-LOSS path does NOT use this method:
+    /// it sweeps via [`Self::take_session_emitters`] inside its own `running`
+    /// critical section (see [`Self::lose_daemon`]) so a successor daemon's
+    /// fresh senders can never be wiped by a predecessor's late cleanup; this
+    /// whole-map form is correct only where no successor remains to protect
+    /// (final shutdown, liveness tests).
     pub fn emit_lost_for_all(&self) {
-        let emitters: Vec<broadcast::Sender<SessionSignal>> = {
-            let mut map = self
-                .inner
-                .session_emitters
-                .lock()
-                .expect("session emitters mutex");
-            let senders = map.values().cloned().collect();
-            map.clear();
-            senders
-        };
-        for sender in emitters {
+        for sender in self.take_session_emitters() {
             let _ = sender.send(SessionSignal::Lost);
         }
     }

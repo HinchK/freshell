@@ -16,7 +16,12 @@
 //!     respawn — the runtime self-heal (Task 4) observes BOTH loss classes;
 //!   * the stale-timeout gate: a Yes-lane timeout may only discard the daemon
 //!     the wedged request was ACTUALLY dispatched against — never its
-//!     replacement.
+//!     replacement;
+//!   * the successor-sweep fence (ep2-r1 fresheyes Major): a loss cleanup
+//!     still running past its running-entry take must never claim session
+//!     emitters registered by the replacement daemon that cold-started in
+//!     the overlap — A's late cleanup wiped B's fresh sender, and B's bridge
+//!     dead-ended with no recovery trigger left.
 //!
 //! The crash-detected WARN (`freshagent.opencode.daemon_crash_detected`) is
 //! pinned unit-side in `serve.rs` (the `config_capture` idiom), where the
@@ -26,12 +31,15 @@ use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use freshell_opencode::events::parse_serve_event;
 use freshell_opencode::serve::{
     build_prompt_body, DaemonSignal, Endpoint, EventSink, EventSource, EventStreamHandle,
     OpencodeServeManager, PortAllocator, ProcessSpawner, ServeConfig, ServeDeps, ServeError,
     ServeHttp, ServeHttpError, ServeHttpRequest, ServeHttpResponse, ServeProcess, SessionSignal,
     SpawnRequest,
 };
+use serde_json::json;
+use tokio::sync::broadcast::error::TryRecvError;
 
 // ── injected fakes ───────────────────────────────────────────────────────────────
 
@@ -226,6 +234,74 @@ impl ProcessSpawner for NeverExitsSpawner {
         Ok(Box::new(NeverExitsProcess {
             killed: self.killed.clone(),
         }))
+    }
+}
+
+/// A serve whose `kill()` PARKS until the test drops the release sender: the
+/// loss cleanup stops between the running-entry take (the lock is already
+/// released) and its session-emitter sweep — the exact production window in
+/// which a successor daemon's cold start + bridge registration can overlap
+/// the still-pending cleanup. `kill_entered` counts the park so the test can
+/// wait for the cleanup to reach it.
+struct LatchedKillProcess {
+    exited: Arc<AtomicBool>,
+    kill_entered: Arc<AtomicUsize>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+impl ServeProcess for LatchedKillProcess {
+    fn exited(&self) -> Option<i32> {
+        self.exited.load(Ordering::SeqCst).then_some(0)
+    }
+    fn take_fatal_startup_error(&self) -> Option<String> {
+        None
+    }
+    fn kill(&self) {
+        self.kill_entered.fetch_add(1, Ordering::SeqCst);
+        // Park the cleanup; the test releases the latch by dropping its
+        // sender, which ends this recv with an error. Only kill() ever
+        // touches the receiver, so parking under the mutex is safe.
+        // block_in_place: recv() is a BLOCKING sync wait, and a tokio
+        // worker must never block directly — the worker servicing the
+        // runtime's timer driver would starve every sleep/timeout on the
+        // runtime (observed: the whole test freezes). block_in_place
+        // hands the worker's runtime duties off first. Requires the
+        // multi_thread flavor this test runs under.
+        tokio::task::block_in_place(|| {
+            let _ = self.release.lock().expect("latch mutex").recv();
+        });
+    }
+}
+
+/// Generation 1 is the latched daemon A (the test holds the release sender);
+/// every later generation is a [`NeverExitsProcess`] — the replacement B,
+/// which this spawner's test never loses.
+struct LatchedKillSpawner {
+    exited: Arc<AtomicBool>,
+    kill_entered: Arc<AtomicUsize>,
+    spawns: Arc<AtomicUsize>,
+    /// The gen-1 latch receiver, handed to the first spawned process.
+    release: std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+impl ProcessSpawner for LatchedKillSpawner {
+    fn spawn(&self, _req: SpawnRequest) -> Result<Box<dyn ServeProcess>, String> {
+        let n = self.spawns.fetch_add(1, Ordering::SeqCst) + 1;
+        if n == 1 {
+            let release = self
+                .release
+                .lock()
+                .expect("latch mutex")
+                .take()
+                .expect("the gen-1 latch receiver is present");
+            Ok(Box::new(LatchedKillProcess {
+                exited: self.exited.clone(),
+                kill_entered: self.kill_entered.clone(),
+                release: std::sync::Mutex::new(release),
+            }))
+        } else {
+            Ok(Box::new(NeverExitsProcess {
+                killed: Arc::new(AtomicUsize::new(0)),
+            }))
+        }
     }
 }
 
@@ -639,4 +715,158 @@ async fn stale_request_timeout_never_discards_the_replacement_daemon() {
         Some("http://127.0.0.1:2".to_string()),
         "B is still the running daemon after the settle window"
     );
+}
+
+// ── ep2-r1 fresheyes Major: A's late emitter cleanup vs. B's fresh sender ────────
+
+/// A daemon-loss cleanup must NEVER remove session emitters registered by a
+/// SUCCESSOR daemon (ep2-r1 fresheyes Major — A's late emitter cleanup wipes
+/// B's fresh sender). The review's interleaving, forced deterministically:
+/// daemon A is lost and its cleanup is HELD at the kill/reap step — the take
+/// already happened and the `running` lock is free; while held, the
+/// fenced-attach-shaped recovery cold-starts the replacement daemon B
+/// (`ensure_started`, which broadcasts B's `Started` — it comes and goes
+/// BEFORE A's `Lost`, exactly as in the finding) and registers a B-era
+/// session sender in the SHARED emitter map (the bridge subscribe,
+/// `spawn_serve_bridge`'s `manager.subscribe(&real_id)`). Releasing A's
+/// cleanup must send `Lost` ONLY to A's pre-existing subscribers; B's fresh
+/// sender must survive untouched and still work — a dispatch through the
+/// shared map must reach its subscriber (the bridge stays live and
+/// functional; no revival pass is needed). Pre-fix, A's late
+/// `emit_lost_for_all` swept the WHOLE shared map — claiming B's fresh
+/// sender, so B's bridge drained its closed channel and exited with no
+/// recovery trigger left (the dead-ended pane this self-heal exists to
+/// prevent).
+///
+/// Multi-thread runtime: the parked `kill()` blocks inside
+/// `block_in_place`, which requires the multi_thread flavor, and the test's
+/// own cold-start/registration work needs the remaining workers.
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_loss_cleanup_never_sweeps_a_successor_daemons_emitters() {
+    let exited = Arc::new(AtomicBool::new(false));
+    let kill_entered = Arc::new(AtomicUsize::new(0));
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let deps = ServeDeps {
+        spawner: Arc::new(LatchedKillSpawner {
+            exited: exited.clone(),
+            kill_entered: kill_entered.clone(),
+            spawns: spawns.clone(),
+            release: std::sync::Mutex::new(Some(release_rx)),
+        }),
+        http: Arc::new(HealthyHttp {
+            prompt_pending: false,
+        }),
+        ports: Arc::new(CountingAllocator {
+            next: AtomicU16::new(0),
+        }),
+        events: Arc::new(NoopEventSource),
+    };
+    // Huge backoff: A's own scheduled re-warm must stay parked for the whole
+    // test window — the successor start under proof is the overlapped
+    // fenced-attach-shaped `ensure_started` below, and the manager's re-warm
+    // must not race it for the cold-start slot.
+    let manager = started_manager(deps, selfheal_config(10, 60_000, 120_000)).await;
+    let mut signals = manager.subscribe_daemon_signals();
+    // A-era registration: the subscriber that was already live when A died.
+    let mut rx_a = manager.subscribe("ses_a");
+
+    // Daemon A dies; the watcher's loss path takes A out of the running slot
+    // and parks at the kill/reap step.
+    exited.store(true, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while kill_entered.load(Ordering::SeqCst) < 1 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("the loss cleanup must reach its kill/reap step within the budget");
+    assert!(
+        manager.base_url().await.is_none(),
+        "fixture: A is already taken out of the running slot while its cleanup is parked"
+    );
+
+    // The overlapped fenced-attach shape: with A's cleanup still parked, the
+    // recovery cold-starts the replacement daemon B (a NEW generation — its
+    // `Started` broadcasts now, BEFORE A's `Lost`, the finding's ordering).
+    let b_base = manager
+        .ensure_started()
+        .await
+        .expect("the replacement daemon B cold-starts while A's cleanup is parked");
+    assert_eq!(
+        b_base, "http://127.0.0.1:2",
+        "B is a cold start on the next allocator port, not the fast path"
+    );
+    // ... and its bridge registers the successor's session sender in the
+    // SHARED emitter map.
+    let mut rx_b = manager.subscribe("ses_b");
+
+    // Release A's parked cleanup: kill/reap A, sweep the session emitters,
+    // and signal the loss.
+    drop(release_tx);
+
+    let first = tokio::time::timeout(Duration::from_secs(2), signals.recv())
+        .await
+        .expect("a daemon signal within budget")
+        .expect("channel alive");
+    assert!(
+        matches!(first, DaemonSignal::Started),
+        "B's cold start mid-cleanup must broadcast Started first, got {first:?}"
+    );
+    let second = tokio::time::timeout(Duration::from_secs(2), signals.recv())
+        .await
+        .expect("a daemon signal within budget")
+        .expect("channel alive");
+    assert!(
+        matches!(
+            second,
+            DaemonSignal::Lost {
+                reason: "process_exit"
+            }
+        ),
+        "A's released cleanup signals its loss, got {second:?}"
+    );
+
+    // A's Lost went to A's pre-existing subscriber — and cleared A's own
+    // emitter (its channel closes once the swept senders drop).
+    assert!(
+        matches!(rx_a.try_recv(), Ok(SessionSignal::Lost)),
+        "A's pre-existing subscriber must see the Lost edge"
+    );
+    assert!(
+        matches!(rx_a.try_recv(), Err(TryRecvError::Closed)),
+        "A's own emitter must be cleared from the shared map"
+    );
+
+    // THE invariant: B's sender was registered by a SUCCESSOR — A's cleanup
+    // must never claim it. No Lost edge may arrive on it ...
+    match rx_b.try_recv() {
+        Err(TryRecvError::Empty) => {}
+        other => panic!(
+            "A's loss cleanup must never touch the successor daemon's fresh \
+             sender — a post-take registration was swept (ep2-r1): got {other:?}"
+        ),
+    }
+    // ... and it must still WORK: a dispatch through the shared map still
+    // reaches the B-era subscriber (the bridge stays live and functional).
+    manager.dispatch_event(
+        parse_serve_event(&json!({
+            "type": "session.idle",
+            "properties": { "sessionID": "ses_b" }
+        }))
+        .expect("parseable serve event"),
+    );
+    let got = tokio::time::timeout(Duration::from_secs(2), rx_b.recv())
+        .await
+        .expect("the dispatch must arrive on the successor's emitter within the budget");
+    assert!(
+        matches!(got, Ok(SessionSignal::Event(_))),
+        "the successor daemon's emitter must still deliver events, got {got:?}"
+    );
+    // Stability: no further daemon edges in the window (the huge backoff
+    // keeps the scheduled re-warm parked).
+    match signals.try_recv() {
+        Err(TryRecvError::Empty) => {}
+        other => panic!("no further daemon edges expected, got {other:?}"),
+    }
 }
