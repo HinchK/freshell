@@ -2056,6 +2056,11 @@ async fn main() -> ExitCode {
             // short-circuit.
             ai_key: ai_key.clone(),
             gemini: gemini.clone(),
+            // Delta-review round 4, finding 1: the same SESSION-06 metadata
+            // store the sweep and the directory read — the kilroy-lane
+            // seam's per-session `sessionType` discriminator for this
+            // route's title decisions.
+            metadata: session_metadata_store.clone(),
             index: sessions_state_index,
             // Unified agent names (Task 4): the scoped generate-title
             // compatibility path wakes the shared worker through this.

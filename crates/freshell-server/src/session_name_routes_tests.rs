@@ -68,12 +68,29 @@ fn names_state(home: &std::path::Path) -> SessionNamesState {
 }
 
 /// The session rename surface with the SAME naming authority wired the way
-/// `main.rs` wires it (the identity registry carries the sink).
+/// `main.rs` wires it (the identity registry carries the sink), and — since
+/// delta-review round 4, finding 1 — the SAME SESSION-06 metadata store every
+/// server surface reads, so the shared kilroy-lane seam can discriminate a
+/// kilroy-only claude session (legacy override ladder) from a scoped one
+/// (naming authority) the way production does. Tests that need a kilroy
+/// session tag the store and build through [`sessions_router_state`].
 fn sessions_router(home: &std::path::Path, names: &Arc<SessionNames>) -> Router {
+    let metadata = crate::session_metadata::SessionMetadataStore::new(home.join(".freshell"));
+    crate::sessions::router(sessions_router_state(home, names, metadata))
+}
+
+/// The metadata-taking variant of [`sessions_router`] — the kilroy-lane
+/// tests tag the store (the SPA's own `POST /api/session-metadata` write)
+/// BEFORE the router is built over it.
+fn sessions_router_state(
+    home: &std::path::Path,
+    names: &Arc<SessionNames>,
+    metadata: crate::session_metadata::SessionMetadataStore,
+) -> crate::sessions::SessionsState {
     let (tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
     let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
     identity.set_session_naming(names.clone());
-    crate::sessions::router(crate::sessions::SessionsState {
+    crate::sessions::SessionsState {
         auth_token: Arc::new("tok".to_string()),
         settings: crate::settings_store::SettingsStore::load(
             Some(home),
@@ -86,9 +103,10 @@ fn sessions_router(home: &std::path::Path, names: &Arc<SessionNames>) -> Router 
         sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         ai_key: crate::ai_title::AiKeyCell::init(None, None),
         gemini: Arc::new(FakeGemini(Err("unused".into()))),
+        metadata,
         index: None,
         generation_wake: None,
-    })
+    }
 }
 
 /// The pane/tab rename surface: a fresh-agent state with the authority wired
@@ -632,6 +650,130 @@ async fn scoped_reset_is_refused_on_every_surface() {
         .unwrap()[0]
         .clone();
     assert_eq!(survivor.record.name, "Protected");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Delta-review round 4, finding 1 (the routes' kilroy blind spot): a
+/// KILROY-ONLY session — the metadata store types it `kilroy`; its
+/// provider string is `claude` — keeps the LEGACY session-override path.
+/// Its user rename writes the settings override (never the scoped path's
+/// 404 NAME_NOT_FOUND from the authority the sweep never gave it a record
+/// in), and its still-offered reset clears the override (never the scoped
+/// path's 400 NAME_RESET_UNSUPPORTED).
+#[tokio::test]
+async fn a_kilroy_only_session_rename_keeps_the_legacy_override_path() {
+    let home = temp_home();
+    let names = SessionNames::open(home.join(".freshell")).expect("store opens");
+    // The SPA's own sessionType tag — the ONLY thing that says this
+    // provider-`claude` session is kilroy.
+    let metadata = crate::session_metadata::SessionMetadataStore::new(home.join(".freshell"));
+    metadata
+        .set("claude", "s-kilroy-rename", "kilroy", Some("explicit"))
+        .await
+        .unwrap();
+    let st = sessions_router_state(&home, &names, metadata);
+    let sessions = crate::sessions::router(st.clone());
+
+    // Rename: 200 + the legacy override row — the kilroy UI's own path.
+    let (status, body) = patch(
+        sessions,
+        "/api/sessions/s-kilroy-rename?provider=claude",
+        json!({ "titleOverride": "Kilroy Renamed", "nameIntent": "user" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["titleOverride"], json!("Kilroy Renamed"));
+    assert_eq!(body["titleSource"], json!("user"));
+    let row = st
+        .settings
+        .session_overrides()
+        .get("claude:s-kilroy-rename")
+        .cloned()
+        .expect("the legacy override row carries the kilroy rename");
+    assert_eq!(row["titleOverride"], json!("Kilroy Renamed"));
+    assert_eq!(row["titleSource"], json!("user"));
+    // The naming authority NEVER acquired a record — never a competing
+    // kilroy record (the sweep's own guarantee, kept intact by this route).
+    assert!(
+        names
+            .get(vec![SessionNameRef::Session {
+                provider: NamedProvider::Claude,
+                session_id: "s-kilroy-rename".into(),
+            }])
+            .await
+            .unwrap()
+            .is_empty(),
+        "a kilroy-only session never enters the naming authority through a rename"
+    );
+
+    // Reset: the still-offered kilroy control clears the override.
+    let (status, body) = patch(
+        crate::sessions::router(st.clone()),
+        "/api/sessions/s-kilroy-rename?provider=claude",
+        json!({ "titleOverride": null }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let row = st
+        .settings
+        .session_overrides()
+        .get("claude:s-kilroy-rename")
+        .cloned()
+        .unwrap_or_default();
+    assert!(row.get("titleOverride").is_none(), "cleared row: {row}");
+    assert!(row.get("titleSource").is_none(), "cleared row: {row}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The singular-name half of the same seam: a durable session the metadata
+/// ALSO types kilroy, but whose canonical record exists through the claude
+/// mode (the create-lane admission + verified bind — the dual-mode
+/// scenario), is NOT kilroy-only. The rename routes through the naming
+/// authority — ONE singular saved name everywhere, never a competing
+/// settings title — exactly like every scoped surface.
+#[tokio::test]
+async fn a_dual_mode_kilroy_typed_session_renames_through_the_authority() {
+    let home = temp_home();
+    let names = SessionNames::open(home.join(".freshell")).expect("store opens");
+    admit_pending(&names, "handle-dual", NamedProvider::Claude, Some("/w")).await;
+    bind_verified(&names, "handle-dual", NamedProvider::Claude, "s-dual-mode").await;
+    let metadata = crate::session_metadata::SessionMetadataStore::new(home.join(".freshell"));
+    metadata
+        .set("claude", "s-dual-mode", "kilroy", Some("explicit"))
+        .await
+        .unwrap();
+    let st = sessions_router_state(&home, &names, metadata);
+    let (status, body) = patch(
+        crate::sessions::router(st.clone()),
+        "/api/sessions/s-dual-mode?provider=claude",
+        json!({ "titleOverride": "One Singular Name", "nameIntent": "user" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // The ONE canonical record carries the rename...
+    assert_eq!(
+        body["sessionName"]["record"]["name"],
+        json!("One Singular Name"),
+        "the session route answers the accepted naming update: {body}"
+    );
+    let record = names
+        .get(vec![SessionNameRef::Session {
+            provider: NamedProvider::Claude,
+            session_id: "s-dual-mode".into(),
+        }])
+        .await
+        .unwrap()[0]
+        .clone();
+    assert_eq!(record.record.name, "One Singular Name");
+    assert_eq!(record.record.source, NameSource::Manual);
+    // ...and the settings ladder never acquired a competing scoped title.
+    assert!(
+        st.settings
+            .session_overrides()
+            .get("claude:s-dual-mode")
+            .is_none(),
+        "the dual-mode session's one name lives in the authority alone"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 

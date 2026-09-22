@@ -17,6 +17,7 @@ fn state(dir: &std::path::Path) -> super::SessionsState {
         // overwrite these fields (the no-key path never touches gemini).
         ai_key: crate::ai_title::AiKeyCell::init(None, None),
         gemini: std::sync::Arc::new(FakeGemini(Err("unused in default test state".into()))),
+        metadata: crate::session_metadata::SessionMetadataStore::new(dir.join(".freshell")),
         index: None,
         generation_wake: None,
     }
@@ -693,6 +694,7 @@ async fn patch_override_is_visible_through_session_directory_overlay() {
         sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         ai_key: crate::ai_title::AiKeyCell::init(None, None),
         gemini: std::sync::Arc::new(FakeGemini(Err("unused in default test state".into()))),
+        metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
         index: None,
         generation_wake: None,
     });
@@ -1001,6 +1003,7 @@ async fn deleted_session_disappears_from_session_directory_overlay() {
         sessions_revision: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         ai_key: crate::ai_title::AiKeyCell::init(None, None),
         gemini: std::sync::Arc::new(FakeGemini(Err("unused in default test state".into()))),
+        metadata: crate::session_metadata::SessionMetadataStore::new(home.join(".freshell")),
         index: None,
         generation_wake: None,
     });
@@ -1159,6 +1162,54 @@ async fn generate_title_uses_gemini_when_key_present_and_broadcasts_sessions_cha
     assert_eq!(row["titleSource"], "ai");
     let frames: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert!(frames.iter().any(|f| f.contains("sessions.changed")));
+}
+
+/// Delta-review round 4, finding 1: a KILROY-ONLY session's generate-title
+/// keeps kilroy's RETAINED server-side AI titling — the Gemini answer
+/// persists through the settings ladder and broadcasts `sessions.changed`,
+/// never the scoped compatibility arm (which could only answer
+/// `{title:null}` — the sweep guarantees a kilroy-only session never has a
+/// naming record to read a name from).
+#[tokio::test]
+async fn kilroy_generate_title_keeps_the_retained_server_side_ai_titling() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut st = state(dir.path());
+    st.ai_key = crate::ai_title::AiKeyCell::init(Some("k".into()), None);
+    st.gemini = std::sync::Arc::new(FakeGemini(Ok("Kilroy AI Title".into())));
+    st.metadata
+        .set("claude", "s-kilroy-gen", "kilroy", Some("explicit"))
+        .await
+        .unwrap();
+    // The naming authority is wired (the way production wires it) so the
+    // test also proves it was never given a record.
+    let names = crate::session_names::SessionNames::open(dir.path().join(".freshell")).unwrap();
+    st.identity.set_session_naming(names.clone());
+    let mut rx = st.broadcast_tx.subscribe();
+    let body =
+        body_json(post_generate_title(&st, "claude:s-kilroy-gen", "a kilroy prompt").await).await;
+    assert_eq!(body["title"], serde_json::json!("Kilroy AI Title"));
+    assert_eq!(body["source"], "ai");
+    let row = st
+        .settings
+        .session_overrides()
+        .get("claude:s-kilroy-gen")
+        .cloned()
+        .expect("the retained ladder persisted the AI title");
+    assert_eq!(row["titleOverride"], "Kilroy AI Title");
+    assert_eq!(row["titleSource"], "ai");
+    let frames: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert!(frames.iter().any(|f| f.contains("sessions.changed")));
+    assert!(
+        names
+            .get(vec![freshell_protocol::SessionNameRef::Session {
+                provider: freshell_protocol::session_names::NamedProvider::Claude,
+                session_id: "s-kilroy-gen".into(),
+            }])
+            .await
+            .unwrap()
+            .is_empty(),
+        "the retained AI titling never enters the naming authority"
+    );
 }
 
 #[tokio::test]

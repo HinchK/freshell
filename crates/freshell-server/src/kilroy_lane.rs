@@ -205,6 +205,30 @@ pub(crate) async fn kilroy_only_keys(
     lanes
 }
 
+/// The single-session form of [`kilroy_only_keys`] — ONE predicate, one
+/// candidate, so the routes can never drift from the batch surfaces.
+pub(crate) async fn is_kilroy_only_session(
+    metadata_entries: &HashMap<String, Value>,
+    naming: Option<&Arc<dyn SessionNaming>>,
+    identity: &TerminalIdentityRegistry,
+    registry: Option<&freshell_terminal::TerminalRegistry>,
+    provider: &str,
+    session_id: &str,
+    cwd: Option<&str>,
+) -> bool {
+    if freshell_freshagent::naming::named_provider_for(Some(provider), None).is_none() {
+        return false;
+    }
+    let candidates = [KilroyLaneCandidate {
+        provider: provider.to_string(),
+        session_id: session_id.to_string(),
+        cwd: cwd.map(str::to_string),
+    }];
+    kilroy_only_keys(metadata_entries, naming, identity, registry, &candidates)
+        .await
+        .contains(&kilroy_lane_key(provider, session_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

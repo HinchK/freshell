@@ -72,6 +72,14 @@ pub struct SessionsState {
     /// Trait-injected Gemini transport (same seam as
     /// `AutoTitleSweepState.gemini`) so tests fake the wire -- no live calls.
     pub gemini: Arc<dyn crate::ai_title::GeminiTransport>,
+    /// Delta-review round 4, finding 1: the SESSION-06 metadata store —
+    /// the per-session `sessionType` tags the shared kilroy-lane seam
+    /// (`crate::kilroy_lane`) reads to decide whether a provider-claude
+    /// title request belongs to a KILROY-ONLY session (which keeps this
+    /// route's legacy override ladder) or to a scoped coding-agent session
+    /// (which renames through the naming authority). The same store the
+    /// sweep and the directory read; `get_all()` is a cached read.
+    pub metadata: crate::session_metadata::SessionMetadataStore,
     /// The shared session index, consulted ONLY for the provider-generated
     /// short-circuit (`sessions-router.ts:186-192`). `None` when no provider
     /// home resolves (the same `Option` main.rs threads everywhere else).
@@ -168,17 +176,43 @@ async fn patch_session(
         if let Some(named) =
             freshell_freshagent::naming::named_provider_for(Some(&scoped_provider), None)
         {
-            return scoped_session_rename(
-                &state,
-                &key,
-                freshell_protocol::SessionNameRef::Session {
-                    provider: named,
-                    session_id: scoped_session_id,
-                },
-                clean_string(body.get("titleOverride")),
-                &body,
+            // Delta-review round 4, finding 1: the shared kilroy-lane seam.
+            // Kilroy sessions are provider `claude` — the provider string
+            // alone must never route them into the naming authority. A
+            // KILROY-ONLY session (metadata-typed kilroy, no canonical
+            // record, no live scoped terminal) keeps this route's LEGACY
+            // override path below: its rename writes the settings override
+            // (and cascades a live terminal retitle), and its still-offered
+            // reset clears the override — never the scoped path's 404
+            // NAME_NOT_FOUND / 400 NAME_RESET_UNSUPPORTED. A DUAL-MODE
+            // session (a canonical record through the claude mode, or a live
+            // scoped terminal) is NOT kilroy-only, so the authority keeps
+            // owning its ONE singular name and the rename routes scoped —
+            // the Global Constraint's never-a-competing-kilroy-record rule.
+            let kilroy_only = crate::kilroy_lane::is_kilroy_only_session(
+                &state.metadata.get_all().await,
+                state.identity.naming().as_ref(),
+                &state.identity,
+                Some(&state.registry),
+                &scoped_provider,
+                &scoped_session_id,
+                None,
             )
             .await;
+            if !kilroy_only {
+                return scoped_session_rename(
+                    &state,
+                    &key,
+                    freshell_protocol::SessionNameRef::Session {
+                        provider: named,
+                        session_id: scoped_session_id,
+                    },
+                    clean_string(body.get("titleOverride")),
+                    &body,
+                )
+                .await;
+            }
+            // Kilroy-only: fall through to the legacy ladder below.
         }
     }
 
@@ -594,6 +628,15 @@ async fn generate_title(
     // worker's ALREADY-eligible unattempted work, and can never reset or
     // re-arm the durable series, never writes the settings ladder, and
     // never calls Gemini itself.
+    //
+    // Delta-review round 4, finding 1: the shared kilroy-lane seam runs
+    // FIRST — a KILROY-ONLY session (metadata-typed kilroy, no canonical
+    // record, no live scoped terminal) keeps kilroy's RETAINED server-side
+    // AI titling below (the provider-generated short-circuit, the
+    // first-message heuristic, Gemini through the settings ladder), instead
+    // of being routed into the scoped compatibility arm that can only
+    // answer `{title:null}` for it. A dual-mode session (canonical record /
+    // live scoped terminal) stays scoped like every other surface.
     let (scoped_provider, scoped_session_id) = match raw_id.split_once(':') {
         Some((prefix, rest)) => (prefix.to_string(), rest.to_string()),
         None => (provider_of(&q), raw_id.clone()),
@@ -601,7 +644,20 @@ async fn generate_title(
     if let Some(named) =
         freshell_freshagent::naming::named_provider_for(Some(&scoped_provider), None)
     {
-        return scoped_generate_title(&state, named, scoped_session_id).await;
+        let kilroy_only = crate::kilroy_lane::is_kilroy_only_session(
+            &state.metadata.get_all().await,
+            state.identity.naming().as_ref(),
+            &state.identity,
+            Some(&state.registry),
+            &scoped_provider,
+            &scoped_session_id,
+            None,
+        )
+        .await;
+        if !kilroy_only {
+            return scoped_generate_title(&state, named, scoped_session_id).await;
+        }
+        // Kilroy-only: fall through to the retained legacy AI-titling ladder.
     }
 
     // (1) provider-generated short-circuit (`sessions-router.ts:186-192`): a
