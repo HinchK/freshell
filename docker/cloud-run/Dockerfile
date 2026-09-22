@@ -93,12 +93,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# The runtime entrypoint drives Vitest and Playwright with `pnpm exec`
+# (plan §7.2.3), and the browser bootstrap below runs `pnpm dlx`, so the
+# pinned pnpm must be installed before either can run. npm appears only as
+# the pinned pnpm bootstrap (plan §7.2.2).
+RUN npm install -g pnpm@10.34.5
+
 # Must match the @playwright/test version in package.json.
 RUN pnpm dlx playwright@1.58.2 install --with-deps chromium
-
-# The runtime entrypoint drives Vitest and Playwright with `pnpm exec`
-# (plan §7.2.3), so the runtime stage needs the same pinned pnpm.
-RUN npm install -g pnpm@10.34.5
 
 WORKDIR /app
 COPY --from=rust-builder /build/target/release/freshell-server /app/target/release/freshell-server
