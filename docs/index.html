@@ -459,6 +459,11 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
 /* kata b8ke: the "opened as CLI elsewhere" divergence card (amber alert + attach action) */
 .fresh-divergence { margin: 12px 12px 0; border: 1px solid hsl(38 92% 50% / .5); border-radius: 6px; background: hsl(38 92% 50% / .1); padding: 8px 12px; font-size: 13px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .fresh-divergence-action { border: 1px solid hsl(var(--border) / .7); border-radius: 6px; background: transparent; color: hsl(var(--foreground)); font: inherit; font-size: 12px; padding: 4px 10px; white-space: nowrap; cursor: pointer; }
+/* Wedge-backstop: the terminal-mode "Agent appears stuck" card (amber alert +
+   restart/start-fresh actions), mirroring the divergence card's structure */
+.terminal-stuck-card { margin: 8px 12px 0; border: 1px solid hsl(38 92% 50% / .5); border-radius: 6px; background: hsl(38 92% 50% / .1); padding: 8px 12px; font-size: 13px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.terminal-stuck-card-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.terminal-stuck-action { border: 1px solid hsl(var(--border) / .7); border-radius: 6px; background: transparent; color: hsl(var(--foreground)); font: inherit; font-size: 12px; padding: 4px 10px; white-space: nowrap; cursor: pointer; }
 .fresh-transcript { min-height: 0; flex: 1; overflow-x: hidden; overflow-y: auto; padding: 14px 12px; }
 .fresh-transcript { position: relative; }
 .fresh-minimap { position: absolute; top: 0; right: 8px; bottom: 48px; width: 12px; }
@@ -830,6 +835,11 @@ body { background: hsl(var(--background)); color: hsl(var(--foreground)); transi
       <div class="tab-panel" id="panel-claude">
         <div class="pane">
           <div class="pane-header active"><i data-lucide="terminal" class="icon"></i><span class="pane-header-title">Terminal — Claude Code</span><span class="pane-header-meta">~/code/freshell</span><div class="pane-btns"><span class="pane-btn"><i data-lucide="maximize-2" class="icon-xs"></i></span><span class="pane-btn"><i data-lucide="x" class="icon-xs"></i></span></div></div>
+          <!-- Wedge-backstop mock: the terminal-mode agent pane flagged stuck —
+               no meaningful output for a bounded window while the TUI keeps
+               repainting. Restart kills the wedged process and resumes the
+               session; Start fresh begins a new conversation. -->
+          <div class="terminal-stuck-card" role="alert" aria-label="Agent appears stuck"><span>Agent appears stuck — no agent output for a while.</span><div class="terminal-stuck-card-actions"><button type="button" class="terminal-stuck-action" aria-label="Restart the claude agent and resume this conversation">Restart agent</button><button type="button" class="terminal-stuck-action" aria-label="Start a fresh conversation">Start fresh conversation</button></div></div>
           <div class="terminal" id="term-claude"></div>
         </div>
       </div>

@@ -5846,7 +5846,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
 
   // ── Wedge-backstop (terminal-mode deadman): the stuck card's actions ──
   // Both actions kill the wedged terminal through the CORRELATED close-ack
-  // helper and only then re-drive the pane. Two load-bearing details:
+  // helper and only then re-drive the pane. Three load-bearing details:
   // (1) reason:'stuck-recovery' on the kill — a bare terminal.kill is the
   //     DURABLE pane-close primitive (close envelope + identity retirement +
   //     recovery suppression); the stuck restart must kill the process
