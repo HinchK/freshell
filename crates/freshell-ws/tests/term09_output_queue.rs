@@ -925,15 +925,24 @@ async fn eviction_and_supersede_without_sends_still_close() {
     tokio::time::sleep(Duration::from_millis(4_000)).await;
 
     // NOW resume reading: the connection should already be terminated (the
-    // catastrophic monitor fired while we were silent). The closure deadline
-    // (20 s from flood start) sits far below the 60 s write timeout and the
-    // 60 s keepalive termination, so observing a close here proves the
-    // monitor's decision — not the send timeout's.
-    let deadline = started + Duration::from_secs(20);
+    // catastrophic monitor fired while we were silent). Attribution does
+    // NOT come from observing a Close frame: this socket is deliberately
+    // backpressured to saturation, so the monitor's 4008 CloseFrame cannot
+    // be delivered — the teardown surfaces as a bare stream end or error.
+    // The decision is proven server-side by the capture assert below
+    // (exactly one ws.terminal_stream.catastrophic_close event); a write-
+    // timeout or keepalive close would produce none. The observation budget
+    // below must stay under the 60 s write timeout (the next-closest closer,
+    // which cannot fire before ~60 s from the wedged send) so a termination
+    // observed in this window is the monitor's. The budget is a starvation
+    // fail-safe for a single-event wait on a quiet connection: it can only
+    // fail if the close never arrives (a dead monitor) — never merely
+    // because the box is slow.
+    let deadline = started + Duration::from_secs(60);
     let mut closed = false;
     while tokio::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(remaining, stuck.next()).await {
+        match tokio::time::timeout(remaining.max(Duration::from_millis(1)), stuck.next()).await {
             Ok(Some(Ok(WsMessage::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => {
                 closed = true;
                 break;
