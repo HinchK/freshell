@@ -6754,6 +6754,139 @@ async fn a_stale_generation_attach_is_refused_typed() {
             .contains("stale observed generation"),
         "the typed refusal names the stale generation: {refused}"
     );
+    // b8ke fence-heal: the refusal carries the coordinator's CURRENT pair so
+    // the client can refresh its fence (fix b server contract).
+    let current = ownership.observe("claude", &sid);
+    assert_eq!(
+        refused["ownerEpoch"],
+        json!(current.epoch),
+        "the refusal carries the current epoch: {refused}"
+    );
+    assert_eq!(
+        refused["ownerGeneration"],
+        json!(current.generation),
+        "the refusal carries the current generation: {refused}"
+    );
+    // fix (b) wire-level self-heal: the immediate re-attach with the pair the
+    // refusal just taught us must SUCCEED — the deterministic protocol-level
+    // proof that "the next attempt uses the fresh pair" heals the wedge.
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.attach",
+            "terminalId": terminal_id,
+            "intent": "viewport_hydrate",
+            "cols": 80,
+            "rows": 24,
+            "observedEpoch": refused["ownerEpoch"],
+            "observedGeneration": refused["ownerGeneration"],
+        }),
+    )
+    .await;
+    let attach_ready = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.attach.ready"
+    })
+    .await;
+    assert_eq!(
+        attach_ready["type"], "terminal.attach.ready",
+        "the re-attach with the refusal-taught pair must heal the wedge"
+    );
+    ws_state.registry.kill(&terminal_id);
+}
+
+/// b8ke fence-heal (fix b server contract): a create refused on a stale
+/// observed pair carries the coordinator's CURRENT (epoch, generation) —
+/// the pair the client folds into its runtimeOwners fence so its next
+/// attempt is born fresh instead of looping on the same stale pair.
+#[tokio::test]
+async fn a_stale_generation_create_refusal_carries_the_current_pair() {
+    let (url, _registry, ws_state) = spawn_server().await;
+    let mut ws = connect(&url).await;
+
+    // Seed the session Live exactly as the attach refusal test does: one
+    // terminal-lane create whose settle commits Live{Terminal}.
+    let sid = uuid::Uuid::new_v4().to_string();
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-fenceheal-create-seed",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-fenceheal-create-seed"
+    })
+    .await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let ownership = ws_state.ownership.as_ref().expect("coordinator wired");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !matches!(
+        ownership.observe("claude", &sid).state,
+        freshell_ownership::OwnershipState::Live { .. }
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never committed Live"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // THE STALE CREATE: observed generation is one behind the committed
+    // Live pair — the typed refusal must carry the CURRENT pair.
+    let current = ownership.observe("claude", &sid);
+    assert!(
+        current.generation >= 1,
+        "the committed Live pair must have a generation to be stale against"
+    );
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-fenceheal-create-stale",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+            "observedEpoch": current.epoch,
+            "observedGeneration": current.generation - 1,
+        }),
+    )
+    .await;
+    let refused = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "error"
+            && v["code"] == "SESSION_RESERVED"
+            && v["requestId"] == "req-fenceheal-create-stale"
+    })
+    .await;
+    assert_eq!(
+        refused["code"], "SESSION_RESERVED",
+        "the stale create is the typed refusal: {refused}"
+    );
+    assert_eq!(
+        refused["ownerEpoch"],
+        json!(current.epoch),
+        "the refusal carries the current epoch: {refused}"
+    );
+    assert_eq!(
+        refused["ownerGeneration"],
+        json!(current.generation),
+        "the refusal carries the current generation: {refused}"
+    );
+    // Nothing spawned: the incumbent Live owner stands untouched.
+    let after = ownership.observe("claude", &sid);
+    assert!(
+        matches!(after.state, freshell_ownership::OwnershipState::Live { .. }),
+        "the stale create must not disturb the incumbent owner: {:?}",
+        after.state
+    );
     ws_state.registry.kill(&terminal_id);
 }
 

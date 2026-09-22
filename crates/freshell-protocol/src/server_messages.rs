@@ -416,6 +416,24 @@ pub struct TerminalKilled {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// kata b8ke fence-heal (Task 4): stale-claim refusals only — the
+    /// incumbent owner's kind ("terminal" | "fresh-agent"). Additive and
+    /// omitted everywhere else, so every non-stale kill answer stays
+    /// byte-identical on the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_kind: Option<String>,
+    /// kata b8ke fence-heal (Task 4): the coordinator's generation at
+    /// refusal time — with `owner_epoch`, lets the client refresh its
+    /// observed fence from the refusal itself (the killed ack is the ONLY
+    /// frame the client's correlated kill await resolves). Additive and
+    /// omitted everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_generation: Option<u64>,
+    /// kata b8ke fence-heal (Task 4): the emitting server's boot epoch for
+    /// the owner fields (a fence pair from a different epoch is always
+    /// stale). Additive and omitted everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_epoch: Option<u64>,
 }
 
 /// The correlated `pane.closed` answer (delta-r7-round-3, focused-episode-7
