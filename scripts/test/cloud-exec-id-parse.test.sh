@@ -66,6 +66,10 @@ if [[ "$*" == *"executions describe"* ]]; then
 fi
 if [[ "$*" == *"executions list"* ]]; then echo "test-exec-123"; exit 0; fi
 if [[ "$*" == *"logs read"* ]]; then echo "Test Files  1 passed (1)"; exit 0; fi
+if [[ "$*" == *"logging read"* ]]; then
+  printf '[{"jsonPayload":{"event":"e2e_playwright_task_complete","execution":"test-exec-123","taskIndex":0,"taskCount":1,"recoveredRetryCount":0}}]\n'
+  exit 0
+fi
 if [[ "$*" == *"artifacts docker images describe"* ]] || [[ "$*" == *"artifacts repositories describe"* ]] || [[ "$*" == *"builds submit"* ]]; then exit 0; fi
 if [[ "$*" == *"auth print-access-token"* ]]; then echo "fake-token"; exit 0; fi
 if [[ "$*" == *"info"* ]]; then echo "/usr/lib/google-cloud-sdk"; exit 0; fi
