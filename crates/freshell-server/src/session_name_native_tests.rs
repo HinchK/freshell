@@ -1165,6 +1165,7 @@ async fn the_selector_prefers_manual_projection_then_the_stable_key() {
             desired_name: "x".to_string(),
             desired_source: source,
             cycles_consumed: 0,
+            next_due: None,
         };
     let a_freshell = items(
         freshell_protocol::session_names::NameSource::FreshellAi,
@@ -1250,6 +1251,104 @@ async fn the_selector_prefers_manual_projection_then_the_stable_key() {
         picked.unwrap().target,
         re_decided.target,
         "a fresh armed revision is probed promptly despite the old series' window"
+    );
+}
+
+/// Delta-review round 3, finding 4: among DUE items the selection order is
+/// "manual first, then earliest nextDue, then the stable reference key" —
+/// the plan's stated policy and the worker doc's own contract. The old code
+/// ordered by the reference key (then cycles consumed) and never even
+/// carried `next_due`, so a persistently early-keyed series was served
+/// ahead of an earlier-due one.
+#[tokio::test]
+async fn the_selector_orders_due_work_by_earliest_next_due() {
+    let items =
+        |source: freshell_protocol::session_names::NameSource, key: &str| super::NativeWorkItem {
+            target: pending(key),
+            location: claude_location("/h/.claude", key),
+            location_revision: 1,
+            desired_revision: 1,
+            desired_name: "x".to_string(),
+            desired_source: source,
+            cycles_consumed: 0,
+            next_due: None,
+        };
+    let mut backoff = std::collections::HashMap::new();
+
+    // An earlier-due series with a LATER reference key must be served before
+    // a later-due series with an earlier key.
+    let late_due_early_key = super::NativeWorkItem {
+        next_due: Some(500_000),
+        ..items(
+            freshell_protocol::session_names::NameSource::FreshellAi,
+            "a-early-key",
+        )
+    };
+    let early_due_late_key = super::NativeWorkItem {
+        next_due: Some(100_000),
+        ..items(
+            freshell_protocol::session_names::NameSource::FreshellAi,
+            "z-late-key",
+        )
+    };
+    let picked = super::select_next(
+        &[late_due_early_key.clone(), early_due_late_key.clone()],
+        &mut backoff,
+    );
+    assert_eq!(
+        picked.unwrap().target,
+        early_due_late_key.target,
+        "earliest nextDue wins among due items, regardless of the reference key"
+    );
+
+    // Equal nextDue falls back to the stable reference key.
+    let equal_due_later_key = super::NativeWorkItem {
+        next_due: Some(100_000),
+        ..items(
+            freshell_protocol::session_names::NameSource::FreshellAi,
+            "zz-equal-due",
+        )
+    };
+    let picked = super::select_next(
+        &[early_due_late_key.clone(), equal_due_later_key.clone()],
+        &mut backoff,
+    );
+    assert_eq!(
+        picked.unwrap().target,
+        early_due_late_key.target,
+        "equal nextDue falls back to the stable reference key"
+    );
+
+    // An unarmed (None) next_due is immediately ready — the select_generation
+    // convention: it sorts as due-from-zero, i.e. at least as overdue as any
+    // explicit due.
+    let unarmed = items(
+        freshell_protocol::session_names::NameSource::FreshellAi,
+        "m-unarmed",
+    );
+    let picked = super::select_next(&[early_due_late_key.clone(), unarmed.clone()], &mut backoff);
+    assert_eq!(
+        picked.unwrap().target,
+        unarmed.target,
+        "a None (immediately ready) next_due sorts before an explicit later due"
+    );
+
+    // Manual-first still wins over an earlier due automatic series.
+    let manual_late_due = super::NativeWorkItem {
+        next_due: Some(900_000),
+        ..items(
+            freshell_protocol::session_names::NameSource::Manual,
+            "y-manual",
+        )
+    };
+    let picked = super::select_next(
+        &[early_due_late_key.clone(), manual_late_due.clone()],
+        &mut backoff,
+    );
+    assert_eq!(
+        picked.unwrap().target,
+        manual_late_due.target,
+        "ready manual projection is served first, regardless of due order"
     );
 }
 

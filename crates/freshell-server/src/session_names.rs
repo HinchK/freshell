@@ -1049,6 +1049,7 @@ impl SessionNames {
                     .unwrap_or_else(|| record.name.clone()),
                 desired_source: state.desired_source.unwrap_or(record.source),
                 cycles_consumed: state.cycles_consumed,
+                next_due: state.next_due,
             });
         }
         items

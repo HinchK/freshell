@@ -2163,6 +2163,7 @@ fn the_selector_orders_generation_by_due_then_key_and_alternates_classes() {
         desired_name: "x".to_string(),
         desired_source: NameSource::Manual,
         cycles_consumed: 0,
+        next_due: None,
     };
     let mut backoff = std::collections::HashMap::new();
     let picked = crate::session_name_native::select_work(

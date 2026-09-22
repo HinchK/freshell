@@ -213,6 +213,11 @@ pub struct NativeWorkItem {
     pub desired_name: String,
     pub desired_source: NameSource,
     pub cycles_consumed: u32,
+    /// Delta-review round 3, finding 4: the series' next-due time, carried so
+    /// the selector orders due work "then earliest nextDue/reference key" as
+    /// the plan and the worker's own doc comment state. `None` is an unarmed
+    /// immediately-ready series (the select_generation convention).
+    pub next_due: Option<i64>,
 }
 
 /// The charged attempt returned by [`SessionNames::claim_native_cycle`].
@@ -664,11 +669,17 @@ async fn recover_interrupted_starts(names: &Arc<SessionNames>) {
     }
 }
 
-/// The selection order: manual-name projection first, then earliest due
-/// (equal-due falls back to the stable name-reference key). A series whose
-/// capability probe was refused is skipped until its bounded re-probe
-/// window expires (expired backoff entries are pruned as part of every
-/// selection), so a paused head can never starve the armed series behind it.
+/// The selection order: manual-name projection first, then earliest
+/// nextDue (an unarmed `None` due is immediately ready, the
+/// [`select_generation`] convention), equal-due falling back to the stable
+/// name-reference key — the plan's "then earliest nextDue/reference key".
+/// Delta-review round 3, finding 4: the former key-first (then
+/// cycles-consumed) ordering deviated from this stated policy and let a
+/// persistently early-keyed series be served ahead of an earlier-due one.
+/// A series whose capability probe was refused is skipped until its bounded
+/// re-probe window expires (expired backoff entries are pruned as part of
+/// every selection), so a paused head can never starve the armed series
+/// behind it.
 fn select_next(
     items: &[NativeWorkItem],
     probe_backoff: &mut HashMap<(String, NameRevision), tokio::time::Instant>,
@@ -693,11 +704,11 @@ fn select_next(
                 _ => std::cmp::Ordering::Equal,
             };
             manual
+                .then_with(|| a.next_due.unwrap_or(0).cmp(&b.next_due.unwrap_or(0)))
                 .then_with(|| {
                     freshell_freshagent::naming::name_ref_debug_key(&a.target)
                         .cmp(&freshell_freshagent::naming::name_ref_debug_key(&b.target))
                 })
-                .then_with(|| a.cycles_consumed.cmp(&b.cycles_consumed))
         })
         .cloned()
 }
