@@ -9,14 +9,9 @@ import {
 } from '@/store/turnCompletionSlice'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { useNotificationSound } from '@/hooks/useNotificationSound'
+import { isWindowFocused } from '@/lib/window-focus'
 
 const EMPTY_PENDING_EVENTS: TurnCompleteEvent[] = []
-
-function isWindowFocused(): boolean {
-  if (typeof document === 'undefined') return true
-  const hasFocus = typeof document.hasFocus === 'function' ? document.hasFocus() : true
-  return hasFocus && !document.hidden
-}
 
 export function useTurnCompletionNotifications() {
   const dispatch = useAppDispatch()
@@ -46,10 +41,15 @@ export function useTurnCompletionNotifications() {
   useEffect(() => {
     if (pendingEvents.length === 0) return
 
-    const windowFocused = isWindowFocused()
-    // A turn ending the user was watching: the window is focused AND the
-    // event's tab is the active tab.
-    const isWatched = (event: TurnCompleteEvent) => windowFocused && activeTabId === event.tabId
+    // DR5-3 (delta round 5): the watched classification was stamped at
+    // EVENT-RECEIPT time (turnCompletionReceiptMiddleware read the CURRENT
+    // focus + active-tab + visibility at the dispatch that queued the
+    // event) — consume the stamped bit. Recomputing HERE would classify the
+    // ending by the drain-time witness state instead: a focus or active-tab
+    // change between receipt and this passive effect's run would re-classify
+    // an ending that already happened (an unwitnessed ending silenced, or a
+    // watched ending rung).
+    const isWatched = (event: TurnCompleteEvent) => event.watched
     const markAttention = (event: TurnCompleteEvent) => {
       dispatch(markTabAttention({ tabId: event.tabId }))
       dispatch(markPaneAttention({ paneId: event.paneId }))
@@ -94,7 +94,7 @@ export function useTurnCompletionNotifications() {
     if (terminalShouldPlay) {
       play()
     }
-  }, [activeTabId, dispatch, pendingEvents, play])
+  }, [dispatch, pendingEvents, play])
 
   // 'click' mode: clear attention only when the user *switches* to a tab that has attention.
   // If a completion arrives on the already-active tab, the indicator persists until the user

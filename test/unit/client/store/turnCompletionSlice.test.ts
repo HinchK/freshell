@@ -378,6 +378,9 @@ describe('turnCompletionSlice', () => {
         at: 1_000,
         seq: 1,
         source: 'terminal',
+        // DR5-3: the receipt-time witness bit (no receipt middleware in
+        // this test's store — the un-stamped default: unwitnessed).
+        watched: false,
       }])
       expect(store.getState().turnCompletion.lastIdleAtByTerminalId?.['term-1']).toBe(1_000)
     })

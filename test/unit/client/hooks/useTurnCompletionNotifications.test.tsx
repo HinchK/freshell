@@ -11,6 +11,7 @@ import turnCompletionReducer, {
   clearTabAttention,
   clearPaneAttention,
 } from '@/store/turnCompletionSlice'
+import { turnCompletionReceiptMiddleware } from '@/store/turnCompletionReceipt'
 import { paneSelectionMiddleware } from '@/lib/pane-focus-ownership'
 import { handleUiCommand } from '@/lib/ui-commands'
 import { useTurnCompletionNotifications } from '@/hooks/useTurnCompletionNotifications'
@@ -63,8 +64,10 @@ function createStore(activeTabId = 'tab-1', attentionDismiss: AttentionDismiss =
     },
     // The app store clears watched-completion marks on tab (re)activation via
     // this middleware — the watched-clear cases dispatch selection actions the
-    // same way the app does.
-    middleware: (getDefault) => getDefault().concat(paneSelectionMiddleware as never),
+    // same way the app does. DR5-3: the receipt-time watched stamp rides the
+    // same middleware chain the app store uses.
+    middleware: (getDefault) =>
+      getDefault().concat(paneSelectionMiddleware as never, turnCompletionReceiptMiddleware as never),
     preloadedState: {
       tabs: {
         tabs,
@@ -146,6 +149,106 @@ describe('useTurnCompletionNotifications', () => {
   })
 
   describe('fresh-agent partition (recordTurnComplete)', () => {
+    // ── DR5-3 (delta round 5): the receipt-time witness stamp ──────────────
+    //
+    // The watched classification must follow the witness state at
+    // EVENT-RECEIPT (the dispatch that queues the event), never the state at
+    // the passive effect's drain: a focus or active-tab change between the
+    // two must never re-classify an ending that already happened.
+
+    it('a watched ending stays watched when focus/active-tab change before the drain (DR5-3)', async () => {
+      const store = createStore('tab-1')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      // RECEIPT: window focused + tab-1 active → watched=true stamped at
+      // dispatch time.
+      store.dispatch(recordTurnComplete({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 'term-1', at: 100 }))
+
+      // The witness state changes BEFORE the effect drains: the window
+      // blurs and the user switches to another tab.
+      act(() => {
+        hasFocus = false
+        store.dispatch(setActiveTab('tab-2'))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+      })
+
+      // The treatment follows the RECEIPT-time witness state: the watched
+      // mark (tab strip only), no attention flags, no sound.
+      expect(store.getState().turnCompletion.watchedCompletionByTab['tab-1']).toBe(true)
+      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBeUndefined()
+      expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBeUndefined()
+      expect(playSound).not.toHaveBeenCalled()
+    })
+
+    it('an unwitnessed ending stays unwitnessed when focus returns before the drain (DR5-3)', async () => {
+      // The inverse misclassification: receipt while UNFOCUSED (watched=
+      // false), focus returns before the drain — the ending was NOT
+      // witnessed and must still ring.
+      hasFocus = false
+      const store = createStore('tab-2')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      // RECEIPT: window unfocused → watched=false, even though tab-2 is
+      // active.
+      store.dispatch(recordTurnComplete({ tabId: 'tab-2', paneId: 'pane-2', terminalId: 'term-2', at: 100 }))
+
+      // The witness state changes BEFORE the drain: the window regains
+      // focus.
+      act(() => {
+        hasFocus = true
+        window.dispatchEvent(new Event('focus'))
+      })
+
+      await waitFor(() => {
+        expect(playSound).toHaveBeenCalledTimes(1)
+      })
+      expect(store.getState().turnCompletion.attentionByTab['tab-2']).toBe(true)
+      expect(store.getState().turnCompletion.watchedCompletionByTab['tab-2']).toBeUndefined()
+    })
+
+    it('a terminal watched ending suppresses only the sound by the receipt-time stamp (DR5-3)', async () => {
+      const store = createStore('tab-1')
+
+      render(
+        <Provider store={store}>
+          <TestComponent />
+        </Provider>
+      )
+
+      // RECEIPT: focused + tab-1 active → the terminal idle edge is
+      // watched at receipt.
+      store.dispatch(recordTerminalIdle({ tabId: 'tab-1', paneId: 'pane-1', terminalId: 't-1', at: 1_000, reason: 'grace' }))
+
+      // The witness state changes BEFORE the drain.
+      act(() => {
+        hasFocus = false
+        store.dispatch(setActiveTab('tab-2'))
+      })
+
+      await waitFor(() => {
+        expect(store.getState().turnCompletion.pendingEvents).toHaveLength(0)
+      })
+
+      // Terminal partition, receipt-time-stamped: attention marks always;
+      // the sound is suppressed by the RECEIPT-time watched bit.
+      expect(store.getState().turnCompletion.attentionByTab['tab-1']).toBe(true)
+      expect(store.getState().turnCompletion.attentionByPane['pane-1']).toBe(true)
+      expect(playSound).not.toHaveBeenCalled()
+    })
+
     it('background completion: marks tab+pane attention and rings once', async () => {
       const store = createStore('tab-1')
 

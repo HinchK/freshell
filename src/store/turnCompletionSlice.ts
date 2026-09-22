@@ -5,6 +5,19 @@ type TurnCompletePayload = {
   paneId: string
   terminalId: string
   at: number
+  /**
+   * DR5-3 (delta round 5): the RECEIPT-time witness bit — stamped
+   * synchronously at the dispatch that queues the event by
+   * `turnCompletionReceiptMiddleware` (window focused + this tab active at
+   * receipt), so the notification hook consumes the classification the
+   * user's attention ACTUALLY had when the ending happened. A focus or
+   * active-tab change between receipt and the hook's passive-effect drain
+   * must never re-classify an ending that already happened. Optional on the
+   * wire shape: absent means no receipt middleware stamped it (a bare store
+   * without the middleware) and the event queues as UNWITNESSED — the
+   * fail-loud direction for a notification system.
+   */
+  watched?: boolean
 }
 
 /** Who recorded a pending event — partitions the notification hook. */
@@ -13,6 +26,8 @@ export type TurnCompletionEventSource = 'freshAgent' | 'terminal'
 export type TurnCompleteEvent = TurnCompletePayload & {
   seq: number
   source: TurnCompletionEventSource
+  /** The receipt-time witness bit (required on the queued event — see `TurnCompletePayload.watched`). */
+  watched: boolean
 }
 
 export type TerminalIdlePayload = {
@@ -21,6 +36,8 @@ export type TerminalIdlePayload = {
   terminalId: string
   at: number
   reason: 'grace' | 'queue-empty'
+  /** The receipt-time witness bit (see `TurnCompletePayload.watched`). */
+  watched?: boolean
 }
 
 export interface TurnCompletionState {
@@ -76,6 +93,7 @@ const turnCompletionSlice = createSlice({
         ...action.payload,
         seq: state.seq,
         source: 'freshAgent',
+        watched: action.payload.watched ?? false,
       })
     },
     // Truly-idle edge (terminal.idle) for terminal CLI panes: the ONLY event that
@@ -96,6 +114,7 @@ const turnCompletionSlice = createSlice({
         at,
         seq: state.seq,
         source: 'terminal',
+        watched: action.payload.watched ?? false,
       })
     },
     // Cleared on a real server restart (not a plain reconnect). The new process has no
