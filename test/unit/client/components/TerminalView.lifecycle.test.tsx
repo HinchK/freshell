@@ -10781,6 +10781,191 @@ describe('TerminalView lifecycle updates', () => {
       expect(repairAttaches().length).toBe(1)
     })
 
+    it('a fully filtered first repair frame does not consume the deferred clear — the next writing frame clears-then-writes', async () => {
+      // Round-3 fix: the deferred viewport clear must consume ONLY when
+      // replacement content ACTUALLY renders — after sequence acceptance
+      // AND when the frame's write path will write bytes to xterm. A first
+      // frame consisting ENTIRELY of an OSC52 clipboard sequence is
+      // accepted by sequence validation but fully consumed by the OSC52
+      // pre-parser: no byte reaches xterm, so it must NOT consume the
+      // clear. The pre-gap surface survives, the clear stays armed, and
+      // the NEXT frame that will write bytes clears-then-writes.
+      wsMocks.capabilities = { pacedTerminalReplayV1: true }
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-gap-repair-filtered-first',
+        ackInitialAttach: false,
+      })
+
+      const repairAttaches = () => sentMessages().filter(
+        (msg) => msg?.type === 'terminal.attach' && msg.terminalId === terminalId,
+      )
+
+      // A usable pre-gap surface: real content on screen, no streamId —
+      // no valid checkpoint exists for the repair decision.
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'PRE-GAP-VISIBLE' })
+      term.clear.mockClear()
+      wsMocks.send.mockClear()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 2,
+          toSeq: 5,
+          reason: 'queue_overflow',
+        })
+      })
+
+      const repair = repairAttaches()
+      expect(repair.length).toBe(1)
+      expect(repair[0]).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      })
+      expect(term.clear).not.toHaveBeenCalled()
+
+      // The hydrate answers: a replay window, then a first frame that is
+      // ENTIRELY an OSC52 sequence (fully filtered — no xterm write).
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 8,
+          replayFromSeq: 1,
+          replayToSeq: 8,
+          attachRequestId: repair[0]!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 8,
+          data: '\x1b]52;c;RklMVEVSLU9OTFk=\x07',
+          attachRequestId: repair[0]!.attachRequestId,
+        })
+      })
+
+      // The filtered frame rendered NOTHING: the clear must NOT have been
+      // consumed, and the pre-gap surface is still the last thing written.
+      expect(term.clear).not.toHaveBeenCalled()
+      expect(
+        terminalWriteStrings(term).some((entry) => entry.includes('52;c;')),
+        'the OSC52-only frame wrote no bytes to xterm',
+      ).toBe(false)
+      expectTerminalWriteContaining(term, 'PRE-GAP-VISIBLE')
+
+      // The clear is STILL ARMED: the next frame that will actually write
+      // bytes consumes it — clear-then-write, exactly once, at that frame.
+      const clearCallsBefore = term.clear.mock.calls.length
+      expect(clearCallsBefore).toBe(0)
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 9,
+          seqEnd: 12,
+          data: 'REBUILT-LATE',
+          attachRequestId: repair[0]!.attachRequestId,
+        })
+      })
+      expect(term.clear).toHaveBeenCalledTimes(1)
+      expectTerminalWriteContaining(term, 'REBUILT-LATE')
+      const writes = term.write.mock.calls.map(([data]: [string]) => String(data)).join('')
+      expect(
+        writes.indexOf('REBUILT-LATE'),
+        'the replacement content renders after the clear',
+      ).toBeGreaterThan(writes.lastIndexOf('PRE-GAP-VISIBLE'))
+      expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+    })
+
+    it('a rejected duplicate first repair frame does not consume the deferred clear', async () => {
+      // Round-3 fix: a frame the sequence validator REJECTS (duplicate /
+      // overlap) must not consume the deferred clear either — the surface
+      // is preserved until a frame that actually renders replaces it.
+      wsMocks.capabilities = { pacedTerminalReplayV1: true }
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-gap-repair-dup-first',
+        ackInitialAttach: false,
+      })
+
+      const repairAttaches = () => sentMessages().filter(
+        (msg) => msg?.type === 'terminal.attach' && msg.terminalId === terminalId,
+      )
+
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'PRE-GAP-VISIBLE' })
+      term.clear.mockClear()
+      wsMocks.send.mockClear()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 2,
+          toSeq: 5,
+          reason: 'queue_overflow',
+        })
+      })
+
+      const repair = repairAttaches()
+      expect(repair.length).toBe(1)
+      expect(repair[0]).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+      })
+
+      // The hydrate answers with an EMPTY replay window already covered
+      // up to head 8 (the ready folds the high-water cursor), so a first
+      // frame re-covering 1..8 is a REJECTED duplicate/overlap.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 8,
+          replayFromSeq: 0,
+          replayToSeq: 0,
+          attachRequestId: repair[0]!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 8,
+          data: 'STALE-DUPLICATE',
+          attachRequestId: repair[0]!.attachRequestId,
+        })
+      })
+
+      // The duplicate was rejected: nothing rendered, nothing consumed.
+      expect(term.clear).not.toHaveBeenCalled()
+      expect(
+        terminalWriteStrings(term).some((entry) => entry.includes('STALE-DUPLICATE')),
+        'the rejected duplicate never reaches xterm',
+      ).toBe(false)
+      expectTerminalWriteContaining(term, 'PRE-GAP-VISIBLE')
+
+      // The clear is still armed: the next accepted writing frame
+      // clears-then-writes.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 9,
+          seqEnd: 10,
+          data: 'REBUILT-LATE',
+          attachRequestId: repair[0]!.attachRequestId,
+        })
+      })
+      expect(term.clear).toHaveBeenCalledTimes(1)
+      expectTerminalWriteContaining(term, 'REBUILT-LATE')
+      expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+    })
+
     it('repeated negotiated queue_overflow gaps exhaust to the visible retry strip', async () => {
       wsMocks.capabilities = { pacedTerminalReplayV1: true }
       const { terminalId } = await renderTerminalHarness({

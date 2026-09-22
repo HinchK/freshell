@@ -1266,19 +1266,24 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // Deferred content reset (responsive-terminal-restore WS3, delivery-loss
   // repair fallback): when a hydrate attach deferred its viewport clear
   // (`deferViewportClearUntilContent`), the pre-gap surface stays visible
-  // until that generation's first content frame ACTUALLY arrives — the
-  // new baseline is established by attach content, never before. Two
-  // paths retire the pending clear WITHOUT wiping: the repair dying
-  // without content (nothing is cleared and the pre-gap surface
-  // survives), and — the round-2 disarm — a `replay_window_exceeded`
-  // gap in this generation (the server declared the prefix
-  // unreconstructible, so the pre-gap screen is the best available
-  // surface and the existing honest-loss UX proceeds; see the gap arm).
-  // Same direct-clear discipline as the attach-time clear (both run
-  // before the triggering frame is queued, and queued stale-generation
-  // writes were already dropped by the generation swap).
-  const consumeRepairContentReset = useCallback((terminalId: string, attachRequestId?: unknown) => {
-    if (repairContentResetPendingRef.current !== attachRequestId) return
+  // until that generation's first RENDERING frame — replacement content
+  // the sequence validator ACCEPTED and whose write path will write bytes
+  // to xterm — actually establishes the new baseline (round-3 fix: the
+  // clear consumes at the render moment, never on mere envelope arrival —
+  // a rejected duplicate/overlap or a fully filtered frame such as the
+  // OSC52-only case renders nothing and must leave the clear armed).
+  // The consumption runs inside `handleTerminalOutput` immediately before
+  // the triggering frame's write is enqueued, so the surface is always
+  // cleared-then-written; if the enqueue fails (no surface), the caller
+  // re-arms the pending clear because nothing rendered. Two paths retire
+  // the pending clear WITHOUT wiping: the repair dying without content
+  // (nothing is cleared and the pre-gap surface survives), and — the
+  // round-2 disarm — a `replay_window_exceeded` gap in this generation
+  // (the server declared the prefix unreconstructible, so the pre-gap
+  // screen is the best available surface and the existing honest-loss UX
+  // proceeds; see the gap arm).
+  const consumeRepairContentReset = useCallback((terminalId: string, attachRequestId?: unknown): boolean => {
+    if (repairContentResetPendingRef.current !== attachRequestId) return false
     repairContentResetPendingRef.current = null
     try {
       termRef.current?.clear()
@@ -1286,6 +1291,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       // disposed
     }
     clearTerminalCursor(terminalId)
+    return true
   }, [])
 
   // ── Paced terminal replay consumption (responsive-terminal-restore
@@ -2400,6 +2406,20 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     }
 
     const submittedBytesEqualInput = cleaned === raw
+    // THE RENDER MOMENT (responsive-terminal-restore WS3, round-3 fix): a
+    // deferred repair clear consumes ONLY here — the sequence validator
+    // already accepted this frame (the caller runs the acceptance before
+    // submitting), and `cleaned` non-empty proves the frame's write path
+    // WILL write bytes to xterm. The clear runs immediately before the
+    // write is enqueued, so the surface is cleared-then-written; a
+    // rejected or fully filtered frame (cleaned === '') never reaches
+    // this point and leaves the clear armed for the next writing frame.
+    // Rejected/filtered frames of a LATER generation than the armed one
+    // no-op the ref check inside, exactly like before.
+    let consumedDeferredClear = false
+    if (cleaned && tid) {
+      consumedDeferredClear = consumeRepairContentReset(tid, writeOptions?.generation)
+    }
     const submittedWrite = cleaned
       ? enqueueTerminalWrite(
           cleaned,
@@ -2407,6 +2427,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           writeOptions,
         )
       : false
+    if (consumedDeferredClear && !submittedWrite) {
+      // Nothing will render (no surface / disposed write): the clear was
+      // consumed for content that never renders — re-arm it. Nothing else
+      // can touch the ref inside this synchronous block, so the re-arm is
+      // exact.
+      repairContentResetPendingRef.current = writeOptions?.generation ?? null
+    }
 
     for (const event of osc.events) {
       handleOsc52Event(event, outputSource, mode)
@@ -2416,7 +2443,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       submittedBytesEqualInput: submittedWrite && submittedBytesEqualInput,
       preParserConsumedAllBytes: cleaned === '',
     }
-  }, [dispatch, enqueueTerminalWrite, handleOsc52Event, sendInput, tabId])
+  }, [consumeRepairContentReset, dispatch, enqueueTerminalWrite, handleOsc52Event, sendInput, tabId])
 
   const findNext = useCallback((value: string = searchQuery) => {
     const terminalId = terminalIdRef.current
@@ -4779,9 +4806,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           }
           if (!outputSource) return
 
-          // A deferred-clear repair hydrate replaces the surface exactly
-          // when its first content arrives (never before).
-          consumeRepairContentReset(tid, msg.attachRequestId)
+          // Deferred-clear repair hydrate (round-3 fix): the clear now
+          // consumes at the RENDER moment inside `submitAcceptedOutput`'s
+          // write path — never here on envelope arrival. A rejected
+          // duplicate/overlap or a fully filtered frame must not consume
+          // it; the next writing frame clears-then-writes.
           const previousSeqState = seqStateRef.current
           const batchDecision = onOutputBatchSegments(previousSeqState, batchSegments)
           if (!batchDecision.accept) {
@@ -4895,9 +4924,11 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             }
             return
           }
-          // A deferred-clear repair hydrate replaces the surface exactly
-          // when its first content arrives (never before).
-          consumeRepairContentReset(tid, msg.attachRequestId)
+          // Deferred-clear repair hydrate (round-3 fix): the clear now
+          // consumes at the RENDER moment inside `submitAcceptedOutput`'s
+          // write path — never here on envelope arrival. A rejected
+          // duplicate/overlap or a fully filtered frame must not consume
+          // it; the next writing frame clears-then-writes.
           const previousSeqState = seqStateRef.current
           const frameDecision = onOutputFrame(previousSeqState, {
             seqStart: msg.seqStart,
