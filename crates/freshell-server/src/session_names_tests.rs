@@ -1354,6 +1354,108 @@ async fn same_text_user_promotion() {
     assert!(promoted.record.renamed_at.is_some());
 }
 
+/// Delta-review round 3, finding 3: repeating the EXACT same explicit
+/// rename on an already-manual record is an equal unchanged request — the
+/// plan's native policy says "a newly accepted name decision ... including a
+/// deliberate user rename, can create a new bounded series; equal unchanged
+/// requests cannot." The repeat must not allocate a revision nor re-arm a
+/// fresh three-cycle/six-read native series (the consumed cycle and desired
+/// revision survive), while a DIFFERENT rename still gets its own series.
+#[tokio::test]
+async fn identical_manual_rename_creates_no_new_revision_or_series() {
+    let dir = temp_data_dir();
+    let store = open_store(dir.path());
+    let target = pending("h-identical");
+
+    let ensured = ensure(
+        &store,
+        "h-identical",
+        NamedProvider::Claude,
+        Some("/w/idem"),
+    )
+    .await
+    .expect("ensure pending");
+    let _ = ensured;
+
+    let first = rename_user(&store, target.clone(), "Same name")
+        .await
+        .expect("first manual rename");
+    assert!(first.changed);
+    let first_revision = first.record.revision;
+    let first_renamed_at = first.record.renamed_at;
+
+    // Give the armed native series a verified route and consume one cycle so
+    // a re-armed FRESH series is distinguishable from the surviving one.
+    store
+        .record_acquisition(
+            target.clone(),
+            claude_acquisition("/w/homes/identical", NativePersistence::Verified),
+        )
+        .await
+        .expect("verified route");
+    store
+        .claim_native_cycle(target.clone(), "cycle-1".to_string())
+        .await
+        .expect("claim transaction")
+        .expect("the first rename armed a native series");
+
+    // The identical repeated explicit rename: an equal unchanged request.
+    let repeat = rename_user(&store, target.clone(), "Same name")
+        .await
+        .expect("repeated identical rename");
+    assert!(
+        !repeat.changed,
+        "an equal unchanged manual request is not a new name decision"
+    );
+    assert_eq!(repeat.record.name, "Same name");
+    assert_eq!(repeat.record.source, NameSource::Manual);
+    assert_eq!(
+        repeat.record.revision, first_revision,
+        "no revision is allocated for an equal unchanged request"
+    );
+    assert_eq!(
+        repeat.record.manual_revision, first.record.manual_revision,
+        "the original manual revision stands"
+    );
+    assert_eq!(
+        repeat.record.renamed_at, first_renamed_at,
+        "the original explicit-rename time stands"
+    );
+
+    // The native series was NOT re-armed: the consumed cycle and the desired
+    // revision survive (a fresh series would reset both to zero/rev2).
+    let document = read_raw_document(dir.path());
+    let entry = document
+        .native_write
+        .values()
+        .next()
+        .expect("the native series entry");
+    assert_eq!(
+        entry.cycles_consumed, 1,
+        "the consumed cycle survives — no fresh series was armed"
+    );
+    assert_eq!(entry.desired_revision, Some(first_revision));
+
+    // A DIFFERENT explicit rename is a real new decision: fresh revision and
+    // its own bounded series (the idempotence must not over-apply).
+    let second = rename_user(&store, target.clone(), "A different name")
+        .await
+        .expect("a different manual rename");
+    assert!(second.changed);
+    assert!(second.record.revision > first_revision);
+    let document = read_raw_document(dir.path());
+    let entry = document
+        .native_write
+        .values()
+        .next()
+        .expect("the native series entry");
+    assert_eq!(
+        entry.cycles_consumed, 0,
+        "a real new decision arms a fresh series"
+    );
+    assert_eq!(entry.desired_revision, Some(second.record.revision));
+}
+
 #[tokio::test]
 async fn cross_provider_opaque_ids_do_not_collide() {
     let dir = temp_data_dir();

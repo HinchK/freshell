@@ -2140,6 +2140,16 @@ fn offer_mut(
         return Err(NameError::NotFound(format!("no naming record for {key}")));
     };
     if source == NameSource::Manual {
+        // Delta-review round 3, finding 3: an equal unchanged manual request
+        // is NOT a new name decision — repeating the exact same explicit
+        // rename on an already-manual record must allocate no revision and
+        // re-arm no fresh bounded native series ("equal unchanged requests
+        // cannot", the plan's native policy). The response still carries the
+        // unchanged winner. A same-text rename that RAISES rank to manual
+        // (any lower source) remains a real decision and proceeds.
+        if record.source == NameSource::Manual && record.name == name {
+            return Ok(false);
+        }
         let revision = document.allocate_revision()?;
         document.records.insert(
             key.to_string(),
