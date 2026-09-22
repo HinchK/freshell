@@ -62,6 +62,8 @@ Freshell sessions claimed by terminal-lane panes (plain CLI TUI panes, e.g. code
 
 Protocol round-trip (extend the existing serialization tests; find the TerminalCreated round-trip test or add one beside the `session_runtime_owner` round-trips at server_messages.rs:1716-1800):
 
+**(0) r32 F2 discrimination unit test (plan-review round 3, finding 1)** — mirror the repo's own committed-pair test `broadcast_vacant_frame_carries_the_committed_pair_not_the_current_generation` (codex_association.rs:1082) for `broadcast_owner_frame`: wire ownership via the `wire_ownership`/`race_state` fixture, observe a missing key (generation 0), advance or seed the record so `ownership.observe(provider, sid).generation` DIFFERS from a caller-supplied pair, call `broadcast_owner_frame(&state, provider, sid, tid, "op-f2", SUPPLIED_GENERATION, "handoff-committed")`, and assert the frame carries `SUPPLIED_GENERATION` (and the supplied epoch) — never the re-observed value. Run: `cargo test -p freshell-ws --lib a_broadcast_owner_frame_carries_the_committed_pair`.
+
 ```rust
 #[test]
 fn terminal_created_round_trips_the_additive_owner_pair_and_omits_it_when_none() {
@@ -118,17 +120,15 @@ async fn a_terminal_lane_create_settle_broadcasts_the_committed_owner_pair_and_r
     assert_eq!(broadcast["epoch"], created["ownerEpoch"]);
     assert_eq!(broadcast["generation"], created["ownerGeneration"]);
     assert!(!broadcast["operationId"].as_str().unwrap_or("").is_empty());
-    // (r32 F2 discriminator, plan-review round 2 finding 1) advance the
-    // coordinator AFTER the capture (begin_handoff + fail, exactly as :6649-6661):
-    // a lazy/re-observing frame would track the NEW current generation; the
-    // committed-pair frame is FROZEN at emission and must not move.
-    let frozen_generation = broadcast["generation"].clone();
-    /* begin_handoff + fail to advance the generation, as :6649-6661 */
-    assert_eq!(broadcast["generation"], frozen_generation); // unchanged by later transitions
-    assert_ne!(
-        ws_state.ownership.as_ref().unwrap().observe(&PROVIDER, &SESSION_ID).generation,
-        frozen_generation, // the coordinator DID move on — the frame did not
-    );
+    // (consistency only — plan-review round 3, finding 1) the end-to-end path
+    // cannot DETERMINISTICALLY discriminate committed-pair vs re-observed
+    // emission: no transition can land between the commit and the same-handler-
+    // turn broadcast, and a captured frame never changes after capture. The
+    // r32 F2 discrimination lives in the helper-level unit test above
+    // (mirroring the repo's own F2 test at codex_association.rs:1082), which
+    // builds the divergence INTO the emission: call broadcast_owner_frame with
+    // a caller-supplied pair while the coordinator's observed generation
+    // DIFFERS, and assert the frame carries the SUPPLIED pair.
 }
 ```
 
@@ -784,7 +784,9 @@ export type RefusalFencePair = { ownerEpoch?: number; ownerGeneration?: number }
  * target (the same state-taking resolveCanonicalPaneSession the fence
  * reads use), so aliased/rekeyed sessions fold onto the record the next
  * claim actually reads. Merge-only by construction (the reducer
- * preserves ownerKind/transition). Returns true when a fold dispatched.
+ * preserves ownerKind/transition). Returns true when a fold was DISPATCHED —
+ * the reducer may itself no-op when no record exists (plan-review round 3,
+ * finding 3: the return reports the dispatch decision, not the state change).
  */
 export function foldRefusalFencePair(
   dispatch: (action: ReturnType<typeof applyRuntimeOwnerFenceRefresh>) => void,
@@ -1070,3 +1072,11 @@ Applied after the second independent plan review (report: `fresheyes-plan/usual-
 - Finding 8 (Major): Test B redesigned — post-fix a CONNECTED client cannot be deterministically stale-fenced (every terminal-lane commit broadcasts; that is the fix working), so Test B proves the user-visible guarantee (cross-device kill+reopen never wedges a connected page, no reload), and the refusal→retry-success contract is pinned deterministically at the wire level by the Task 4 cross_kind extension (stale attach refused WITH the pair; immediate re-attach with the returned pair SUCCEEDS) plus Task 6's unit tests.
 - Finding 9 (Major): Task 7 Step 2's red block is fully executable — real spec paths in the `cp`, `cd` into the scratch, `npm ci` + `npm run build:client`, the harness builds the pre-fix server itself, and the scratch is removed afterwards.
 - Finding 10 (Minor): the stale LB-A2 "optional live red" disposition is marked SUPERSEDED by the mandatory-red remediation.
+
+## Plan-review dispositions (Fresh Eyes round 3 — the loop's final round)
+
+Round 3 FAILED (report: `fresheyes-plan/usual-fresheyes-20260922T045937Z-3570275.md`); the plan loop ends at its 3-round cap non-converged. Dispositions:
+
+- Finding 1 (Major): SUBSTANTIATED — the capture-then-bump discriminator was vacuous (a captured serialized frame never changes; the repo's own F2 tests build the divergence into EMISSION). REMEDIATED: the r32 F2 discrimination moved to a helper-level unit test (Task 1 Step 1 (0)) mirroring codex_association.rs:1082 — call `broadcast_owner_frame` with a caller-supplied pair while `observe()` differs, assert the frame carries the supplied pair; the integration test keeps consistency assertions only, with the limitation documented in-line.
+- Finding 2 (Major): OUT-OF-SCOPE — post-fix, a connected browser cannot be DETERMINISTICALLY stale-fenced by any normal operation: every terminal-lane commit now broadcasts (Task 1-3), the created frame folds before the first attach (Task 5), the reconnect ready-replay resets-then-folds before the reconnect attach, and per-request captures are abandoned to reconcile by the fast path (Task 6 (h)). Every deterministic staging of a browser-level typed refusal would require timing races or a new production test seam; the refusal→next-attempt contract is covered by the wire-level integration test (Task 4: stale attach refused WITH the pair → immediate re-attach with the returned pair SUCCEEDS, real server + real socket + real coordinator), the client unit tests of every fold path (Task 6), and the live base_ref red (Task 7 Step 2) which demonstrates the browser-level refusal behavior the fix eliminates. The e2e suite proves the user-visible guarantees the User Request names: a connected page never wedges and never needs the reload (Tests A and B).
+- Finding 3 (Minor): CLEARED — the helper's return contract now documents "dispatch attempted, not state changed".
