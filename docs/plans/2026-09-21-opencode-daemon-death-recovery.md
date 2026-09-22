@@ -50,6 +50,10 @@ Fix the freshopencode shared-daemon death incident class in the Freshell repo (R
 
 - `prompt_async` (the send-turn POST) and the thin `json_request` wrappers (`get_session`, `list_messages`, `get_session_status_map`, `abort`, `fork`, `revert`, `unrevert`) KEEP `DiscardOnTimeout::Yes`. Rationale: they are the deliberate wedged-daemon recycler for writes (FR2 kept Yes for writes on purpose), and the incident class was compact-specific (an LLM-scale budget routinely exceeded by a healthy-but-busy daemon). A wedged-alive daemon is also caught by the new exit-watcher only if it exits; a hung-but-alive daemon remains the send-lane's recycle responsibility. Revisit only with a dedicated wedged-detection design.
 - The frozen 409 message text stays (even when the Live owner's daemon is dead, the text says "still running on the server" — clients' muscle memory depends on it). The new `OPENCODE_DAEMON_LOST` runtime edge is what tells the user the truth.
+- **Terminal-owner 409s are a different scenario from the incident** (log-validated in the load-bearing stage: the incident-time key was `Live{FreshAgent, gen 1}` — the pane's own stale claim; the later-observed `ownerKind:"terminal", ownerGeneration:2` body was the post-salvage handoff state, minted ~2h17m after the daemon died). For a genuine terminal owner the fenced attach is refused by design, and the existing recovery doors are the session-directory handoff (the door the user actually used to salvage the session) or the owning terminal's exit. The client 409 recovery (Task 5) is scoped to `ownerKind:"fresh-agent"` — the stale-own-claim class the incident actually was.
+- **The validated core gap for the incident state** (LB-05, falsified): a map-hit fenced attach re-subscribes the serve bridge but never respawns the daemon — `spawn_serve_bridge` never calls `ensure_started`, and `ensure_manager` returns the discarded manager. The attach was exercised 3× in the incident and recovered nothing. Task 4 therefore adds `ensure_started` to the attach tail's bridge-restart arm (mirroring what `resume_durable_session` already does for map-misses), turning the fenced attach into a real recovery verb for the map-hit daemon-dead state.
+- After Task 1, a timed-out compact leaves the summarize turn running daemon-side until its own ~600 s budget expires or an interrupt arrives; the pane's busy state settles via the existing await-idle/turn-settle machinery.
+- Runtime watcher arming (Task 4): armed from the WS materializing handlers (handle_send/handle_attach/handle_compact) plus an immediate level pass at arming (revive dead bridges if the daemon is already running). Residual: a REST-only, never-viewed pane misses the `OPENCODE_DAEMON_LOST` banner until its first WS interaction — accepted, because the pane renders nothing until viewed, and revival is level-triggered.
 - E2E daemon-death/respawn coverage against a real spawned daemon is the cloud-skipped provider-lifecycle class (see `CLOUD_SKIP_SPECS`: `freshopencode-restart-recovery` et al.). This run adds cloud-legal e2e for the client recovery lane (Task 6) and covers the server lanes with the Rust unit tests (the same coverage strategy the freshcodex self-heal uses).
 
 ---
@@ -300,13 +304,14 @@ git commit -m "feat(opencode): structured log for shared-daemon discards"
 - Consumes: `ServeProcess::exited()` (serve.rs:404-411), `emit_lost_for_all` (serve.rs:1332), Task 2's log site.
 - Produces (used by Task 4 and later tests):
   - `pub enum DaemonSignal { Lost { reason: &'static str }, Started }` (crate-root re-export)
-  - `OpencodeServeManager::subscribe_daemon_signals(&self) -> tokio::sync::broadcast::Receiver<DaemonSignal>` (capacity 16)
+  - `OpencodeServeManager::subscribe_daemon_signals(&self) -> tokio::sync::broadcast::Receiver<DaemonSignal>` (capacity 16; NOTE: tokio broadcast does NOT replay history to late subscribers — late `subscribe()` starts at the tail, so Task 4's watcher design is level-triggered, not event-history-dependent)
   - `ServeConfig` gains: `daemon_watch_interval: Duration` (default 1000 ms), `re_warm_backoff_initial_ms: u64` (default 2000), `re_warm_backoff_max_ms: u64` (default 60_000).
-  - Semantics: `Started` is broadcast on every successful cold start (not on fast-path returns of an already-running daemon); `Lost{reason}` on discard (`"request_timeout"` today) and on unrequested process exit (`"process_exit"`).
+  - `RunningServe` gains an additive `ownership_id: String` field (currently only a local in `ensure_started`), and `process` becomes `Arc<dyn ServeProcess>` (LB-06: the watcher needs a handle that outlives the entry; share the Arc, never move the Box).
+  - Semantics: `Started` is broadcast on every successful cold start (not on fast-path returns of an already-running daemon); `Lost{reason}` on discard (`"request_timeout"` today) and on unrequested process exit (`"process_exit"`). The shared loss path is exactly-once (LB-07): only the arm whose running-entry take yields `Some` logs/signals/schedules; a `None` take is a silent no-op (the watcher-vs-discard race resolves via the take).
 
 **Behavior:**
 1. `ensure_started` spawns a daemon exit-watcher task after a successful health check (store its abort handle on `RunningServe` as `_exit_watch`). The watcher polls `process.exited()` every `daemon_watch_interval`; on `Some(exit)` it verifies the running entry is still ITS daemon (compare the captured `ownership_id`), then runs the manager's loss path.
-2. The loss path (shared by watcher-exit and, minus the abort, by `discard_running`): WARN `freshagent.opencode.daemon_crash_detected` (watcher arm; fields `reason="process_exit"`, `base_url`) or the Task-2 discard WARN; take the running entry (killing it in the watcher arm is unnecessary — the process already exited; still call `process.kill()` for the /proc ownership reaper parity); `emit_lost_for_all()`; broadcast `DaemonSignal::Lost{reason}`; schedule a backoff-guarded re-warm.
+2. The loss path (shared by watcher-exit and, minus the abort, by `discard_running`): WARN `freshagent.opencode.daemon_crash_detected` (watcher arm; fields `reason="process_exit"`, `base_url`) or the Task-2 discard WARN; take the running entry (killing it in the watcher arm is unnecessary — the process already exited; still call `process.kill()` for the /proc ownership reaper parity); `emit_lost_for_all()`; broadcast `DaemonSignal::Lost{reason}`; schedule a backoff-guarded re-warm. **Exactly-once (LB-07):** the take is the race arbiter — if it yields `None` (the other arm already ran), the whole path is a silent no-op: no log, no Lost, no re-warm.
 3. Re-warm: a spawned task sleeps `min(re_warm_backoff_initial_ms * 2^(attempts-1), re_warm_backoff_max_ms)`, then calls `ensure_started()` (shutdown-flag checked inside; the task also checks it before sleeping). `attempts` is an `AtomicUsize` on `Inner`, incremented per scheduled re-warm, never reset (a crash-looping daemon retries at the max interval forever — self-heals when e.g. disk frees). Log `tracing::info!(outcome=..., attempt=..., "freshagent.opencode.daemon_re_warm")` on success and `tracing::warn!` on failure.
 4. `discard_running` aborts the watcher FIRST (requested kill — no crash event), then the existing kill+lost, then `Lost` signal + re-warm schedule.
 5. `shutdown`'s inline duplicate (serve.rs:1510-1517) also aborts the watcher; it must NOT schedule a re-warm (shutdown flag blocks it) and need not signal (server is going down) — keep it minimal: abort watcher + existing behavior.
@@ -380,7 +385,7 @@ Expected: FAIL — `subscribe_daemon_signals` does not exist (compile error is t
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-In serve.rs (sketch — the implementer adapts to the actual Inner/ensure_started structure):
+In serve.rs (sketch — the implementer adapts to the actual Inner/ensure_started structure; LB-06/LB-07 corrections applied: the watcher holds an `Arc` clone of the process + the ownership id, never a moved Box):
 
 ```rust
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -390,20 +395,24 @@ pub enum DaemonSignal { Lost { reason: &'static str }, Started }
 //   daemon_signals: tokio::sync::broadcast::Sender<DaemonSignal>,  (capacity 16, on construction)
 //   re_warm_attempts: std::sync::atomic::AtomicUsize,
 // RunningServe gains:
+//   ownership_id: String,
+//   process: Arc<dyn ServeProcess>,        // was Box<dyn ServeProcess> — LB-06
 //   _exit_watch: Option<tokio::task::AbortHandle>,
 
 // ensure_started, after storing RunningServe (the cold-start success path):
-let watch = self.spawn_exit_watch(base_url.clone(), process_handle_for_watch, ownership_id.clone());
+let watch = self.spawn_exit_watch(base_url.clone(), Arc::clone(&process), ownership_id.clone());
 running._exit_watch = watch;
 let _ = self.inner.daemon_signals.send(DaemonSignal::Started);
 
-fn spawn_exit_watch(self: &Arc<Inner>, base_url: String, process: Box<dyn ServeProcess>, ownership_id: String) -> Option<AbortHandle> {
-    let manager = self.manager_clone(); // however the crate threads weak self (mirror make_dispatch_sink's weak-Inner pattern, serve.rs:836-843)
+// The watcher polls the SHARED process Arc (the running entry keeps its own
+// Arc; nothing is moved out of RunningServe):
+fn spawn_exit_watch(&self, base_url: String, process: Arc<dyn ServeProcess>, ownership_id: String) -> Option<AbortHandle> {
+    let manager = self.clone(); // OpencodeServeManager is Arc-backed-cheap
     let interval = ...config.daemon_watch_interval...;
     let handle = tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
-            if let Some(_code) = process.exited() {
+            if process.exited().is_some() {
                 manager.handle_unrequested_exit(&base_url, &ownership_id).await;
                 return;
             }
@@ -412,13 +421,28 @@ fn spawn_exit_watch(self: &Arc<Inner>, base_url: String, process: Box<dyn ServeP
     Some(handle.abort_handle())
 }
 
-// handle_unrequested_exit: guard stale watchers (compare ownership_id against
-// the current running entry), WARN freshagent.opencode.daemon_crash_detected,
-// take the entry (kill for reaper parity), emit_lost_for_all, send
-// DaemonSignal::Lost{reason:"process_exit"}, schedule_re_warm().
+// Staleness-gated loss path. The take is the exactly-once arbiter (LB-07):
+// a None take means the other arm already handled this loss — silent no-op.
+async fn handle_unrequested_exit(&self, base_url: &str, ownership_id: &str) {
+    let taken = {
+        let mut running = self.inner.running.lock().await;
+        match running.as_ref() {
+            Some(r) if r.ownership_id == ownership_id => running.take(), // ours, still current
+            _ => return, // stale watcher (a newer daemon owns the entry) — no-op
+        }
+    };
+    let Some(running) = taken else { return };
+    tracing::warn!(reason = "process_exit", base_url = %base_url, "freshagent.opencode.daemon_crash_detected");
+    running.process.kill(); // reaper parity only — the process already exited
+    self.emit_lost_for_all();
+    let _ = self.inner.daemon_signals.send(DaemonSignal::Lost { reason: "process_exit" });
+    self.schedule_re_warm();
+}
 
-// discard_running: abort the watcher (running._exit_watch), Task-2 WARN, kill,
-// emit_lost_for_all, send Lost{reason}, schedule_re_warm().
+// discard_running: abort the watcher (running._exit_watch) FIRST, Task-2 WARN,
+// kill, emit_lost_for_all, send Lost{reason}, schedule_re_warm(). Same
+// exactly-once discipline: the take yields None only if the watcher lost the
+// race, in which case the abort already ran and the watcher returned.
 
 fn schedule_re_warm(&self) {
     if self.inner.shutdown.load(Ordering::SeqCst) { return; }
@@ -477,18 +501,22 @@ git commit -m "feat(opencode): daemon exit watcher, loss signal, and backoff re-
 - Test: `crates/freshell-freshagent/src/opencode_ws.rs` `#[cfg(test)] mod tests` (mirror the codex self-heal test at codex.rs:15846)
 
 **Interfaces:**
-- Consumes: Task 3's `subscribe_daemon_signals()` / `DaemonSignal`; `event_frame`/`emit_fresh_agent_error` (opencode_ws.rs:6068/686), `spawn_serve_bridge` (opencode_ws.rs:5971), `FreshAgentState.broadcast_tx` (lib.rs:1917), `set_manager_for_test` (lib.rs:2837).
-- Produces: a per-materialized-session typed edge on daemon loss: `freshAgent.event{provider:"opencode", sessionType:"freshopencode", event:{type:"freshAgent.error", code:"OPENCODE_DAEMON_LOST", message:"The opencode serve daemon was lost unexpectedly - it is restarting automatically."}}` — folds client-side through the EXISTING generic `sessionError` path (fresh-agent-ws.ts:514-520), showing the dismissible "Agent error:" banner and clearing busy. After a successful respawn: dead serve bridges restart and each materialized session gets `freshAgent.session.snapshot{status:"idle"}` (which the client treats as snapshot-invalidating → transcript refetch). No chime: the recovery must never emit `freshAgent.turn.complete`.
+- Consumes: Task 3's `subscribe_daemon_signals()` / `DaemonSignal`; `event_frame`/`emit_fresh_agent_error` (opencode_ws.rs:6068/686), `spawn_serve_bridge` (opencode_ws.rs:5971), `FreshAgentState.broadcast_tx` (lib.rs:1917), `set_manager_for_test` (lib.rs:2837), `ensure_manager` (lib.rs:2803 — the real seam; there is no `peek_or_ensure_manager`).
+- Produces: 
+  - A per-materialized-session typed edge on daemon loss: `freshAgent.event{provider:"opencode", sessionType:"freshopencode", event:{type:"freshAgent.error", code:"OPENCODE_DAEMON_LOST", message:"The opencode serve daemon was lost unexpectedly - it is restarting automatically."}}` — folds client-side through the EXISTING generic `sessionError` path (fresh-agent-ws.ts:514-520), showing the dismissible "Agent error:" banner and clearing busy.
+  - Level-triggered bridge revival: on arming, and again on every `DaemonSignal::Started`, restart bridges that are dead/absent for materialized sessions and push `freshAgent.session.snapshot{status:"idle"}` ONLY to sessions whose bridge was actually restarted (which the client treats as snapshot-invalidating → transcript refetch). No `saw_loss` heuristic — tokio broadcast does not replay history, so revival must not depend on having seen the `Lost` edge (LB-02).
+  - **The fenced attach becomes a real recovery verb (LB-05 redesign):** `handle_attach`'s dead-bridge restart arm (opencode_ws.rs:5460-5473) gains `manager.ensure_started().await` before `spawn_serve_bridge` — a map-hit fenced attach against a daemon-absent manager now respawns the shared daemon and re-bridges, exactly as `resume_durable_session` already does for map-misses. No chime: the recovery must never emit `freshAgent.turn.complete`.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [ ] **Step 1: Write the failing behavioral tests**
 
-In `opencode_ws.rs` tests (draft; mirror `onexit_self_heal_emits_exited_status_with_no_chime_and_keeps_session_mapped` at codex.rs:15846-15896 and the `state_with_bus` harness at codex.rs:9983-9991 — the opencode tests already have the bus pattern + `set_manager_for_test`):
+In `opencode_ws.rs` tests (drafts; mirror `onexit_self_heal_emits_exited_status_with_no_chime_and_keeps_session_mapped` at codex.rs:15846-15896 and the `state_with_bus` harness at codex.rs:9983-9991 — the opencode tests already have the bus pattern + `set_manager_for_test`):
 
 ```rust
 // 2026-09-20 incident: the shared daemon died and NOTHING told the panes —
 // no status edge, no respawn, no bridge revival; panes dead-ended on the
 // snapshot 409. The runtime self-heal must make daemon loss observable and
-// recoverable per session.
+// recoverable per session. (LB-02: revival is level-triggered — it runs on
+// arming and on Started, never dependent on having observed Lost.)
 #[tokio::test]
 async fn daemon_loss_fans_out_a_typed_edge_then_revives_bridges_after_respawn() {
     let exiting = Arc::new(AtomicBool::new(false));
@@ -504,61 +532,123 @@ async fn daemon_loss_fans_out_a_typed_edge_then_revives_bridges_after_respawn() 
     // NO chime ever accompanies a daemon loss:
     assert_no_turn_complete(&rx).await;
     exiting.store(false, Ordering::SeqCst); // the re-warm's respawn now succeeds
-    let frame = next_fresh_agent_frame(&rx).await;
+    let frame = next_fresh_agent_frame(&rx).await; // DaemonSignal::Started → level-triggered revival
     assert_eq!(frame["event"]["type"], "freshAgent.session.snapshot");
     assert_eq!(frame["event"]["status"], "idle");
     assert!(session_serve_bridge_alive(&state, "ses_recover").await, "bridge restarted after respawn");
 }
+
+// LB-05 (falsified → redesign): in the incident, the pane's fenced attach was
+// exercised 3× against the dead shared daemon and recovered NOTHING, because
+// the attach tail only re-subscribed the bridge — nothing respawns the
+// daemon for a map-hit. The attach tail must ensure the daemon exists.
+#[tokio::test]
+async fn map_hit_fenced_attach_respawns_the_daemon_and_rebridges() {
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let (state, rx) = opencode_state_with_bus();
+    state.fresh_agent.set_manager_for_test(fake_manager_with( // health 200; daemon DISCARDED before the attach
+        FakeSpawner::counting(spawns.clone())));
+    let session = materialized_opencode_session(&state, "ses_attach_recover").await;
+    discard_manager_running_entry(&state).await; // the shared daemon is dead; the session row persists
+    let fence = observed_fence_for(&state, "ses_attach_recover").await; // the runtime-owner pair
+    state.handle_attach(attach_msg("ses_attach_recover", fence)).await;
+    assert!(spawns.load(Ordering::SeqCst) >= 1, "a map-hit attach against a daemon-absent manager must respawn the daemon");
+    assert!(session_serve_bridge_alive(&state, "ses_attach_recover").await, "the bridge must be restarted");
+    let frame = next_fresh_agent_frame(&rx).await; // the attach tail's snapshot push
+    assert_eq!(frame["event"]["type"], "freshAgent.session.snapshot");
+}
 ```
+
+(Drafts: adapt to the actual harness helpers — `opencode_state_with_bus`, session materialization via `handle_send` against the seeded fake http, and the manager's running-entry discard via the fake's own seams or `discard_running`. Lock discipline per LB-01: any test helper that walks the sessions map must clone the `Arc` session handles under a short map lock and drop the map guard before locking a session — the map guard is NEVER held across a per-session lock acquisition, per the documented contract at opencode_ws.rs:100-115.)
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `cargo test -p freshell-freshagent daemon_loss_fans_out`
+Run: `cargo test -p freshell-freshagent daemon_loss_fans_out map_hit_fenced_attach`
 
-Expected: FAIL — no `OPENCODE_DAEMON_LOST` frame is broadcast (today `SessionSignal::Lost` is a no-op at opencode_ws.rs:6018; no listener exists).
+Expected: FAIL — `daemon_loss_fans_out...` fails with no `OPENCODE_DAEMON_LOST` frame (today `SessionSignal::Lost` is a no-op at opencode_ws.rs:6018; no listener exists); `map_hit_fenced_attach...` fails because the attach tail never spawns the daemon (spawns == 0, the LB-05-validated gap).
 
 - [ ] **Step 3: Add the minimal production implementation**
 
-In `opencode_ws.rs` (sketch):
+Two server-side changes (LB-01/LB-02/LB-08/LB-10/N-3 corrections applied):
+
+**(a) The attach tail's bridge-restart arm (opencode_ws.rs:5460-5473) ensures the daemon exists before re-bridging — the LB-05 redesign that turns the fenced attach into a real recovery verb:**
 
 ```rust
-// FreshOpencodeState gains: daemon_loss_watcher: Arc<OnceCell<()>> (or AtomicBool)
-// and this idempotent starter, called at the top of handle_send, handle_attach,
-// and handle_compact:
+// LB-05 (falsified → redesign): in the incident the fenced attach was
+// exercised 3× against the dead daemon and recovered nothing — the tail only
+// re-subscribed the bridge. A map-hit attach must respawn the shared daemon
+// (mirroring resume_durable_session's map-miss behavior). ensure_started is
+// single-flighted, so concurrent attach/send/compact callers cannot spawn a
+// second daemon.
+let manager = self.fresh_agent.ensure_manager().await;
+if let Err(err) = manager.ensure_started().await {
+    // Bounded health failure: answer the attach with the typed error path
+    // (the existing emit_fresh_agent_error machinery) instead of a silent
+    // half-attached state.
+    ...
+}
+// ...existing dead-bridge restart + spawn_serve_bridge tail...
+```
+
+**(b) The daemon-loss watcher on `FreshOpencodeState` (idempotent; armed from handle_send/handle_attach/handle_compact; LB-10: the task holds a full state clone so `spawn_serve_bridge(&self, ...)` is callable directly):**
+
+```rust
+// FreshOpencodeState gains: daemon_loss_watcher: Arc<OnceCell<()>>.
 fn ensure_daemon_loss_watcher(&self) {
-    if self.daemon_loss_watcher.set(()).is_err() { return; } // already running
-    let Ok(manager) = ... self.fresh_agent.peek_or_ensure_manager() ... else { reset the guard and return; };
-    let sessions = Arc::clone(&self.sessions);
-    let broadcast_tx = Arc::clone(&self.fresh_agent.broadcast_tx);
+    if self.daemon_loss_watcher.set(()).is_err() { return; } // already armed
+    let manager = self.fresh_agent.ensure_manager().await; // lib.rs:2803 (N-3: the real seam)
+    let state = self.clone();
     let mut signals = manager.subscribe_daemon_signals();
     tokio::spawn(async move {
+        // Arming-time level pass (LB-02: broadcast does NOT replay history —
+        // if the daemon already re-warmed before we subscribed, revive now).
+        state.revive_dead_bridges_if_daemon_running().await;
         loop {
-            let Ok(signal) = signals.recv().await else { return };
-            match signal {
-                DaemonSignal::Lost { reason } => {
+            match signals.recv().await {
+                Ok(DaemonSignal::Lost { reason }) => {
                     tracing::warn!(reason = reason, "freshagent.opencode.daemon_loss_observed");
-                    let materialized: Vec<String> = sessions.lock().await.values()
-                        .filter_map(|s| s.lock().await.real_session_id.clone()).collect();
+                    // LB-01: NEVER hold the sessions-map guard across a
+                    // per-session lock (contract at opencode_ws.rs:100-115 —
+                    // the reverse edge deadlocked production). Clone the
+                    // (id, Arc<session>) pairs under ONE short map lock,
+                    // drop the guard, then read each session outside it.
+                    let materialized: Vec<String> = {
+                        let map = state.sessions.lock().await;
+                        let handles: Vec<Arc<TokioMutex<OpencodeSession>>> = map.values().cloned().collect();
+                        drop(map);
+                        handles.into_iter().filter_map(|s| s.lock().await.real_session_id.clone()).collect()
+                    };
                     for id in materialized {
-                        let _ = broadcast_tx.send(event_frame_json(&id, json!({
+                        let _ = state.fresh_agent.broadcast_tx.send(event_frame_json(&id, json!({
                             "type": "freshAgent.error", "sessionId": id,
                             "code": "OPENCODE_DAEMON_LOST",
                             "message": "The opencode serve daemon was lost unexpectedly - it is restarting automatically.",
                         })));
                     }
                 }
-                DaemonSignal::Started => {
-                    // Restart dead bridges for materialized sessions and push
-                    // an idle snapshot edge (client refetches the transcript).
-                    ...for each materialized session: if bridge handle is_finished/absent -> spawn_serve_bridge(...); send snapshot_event(id, "idle")...
+                Ok(DaemonSignal::Started) => {
+                    // Level-triggered revival (LB-02): revive whatever is
+                    // dead; push the idle snapshot ONLY to sessions whose
+                    // bridge was actually restarted. No `saw_loss` heuristic.
+                    state.revive_dead_bridges_if_daemon_running().await;
                 }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue, // LB-08: never disarm on Lagged
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
             }
         }
     });
 }
-```
 
-(Adapt to the actual locking model of `sessions` (a `TokioMutex<HashMap<String, Arc<TokioMutex<OpencodeSession>>>>`) and the real `spawn_serve_bridge` signature — it is an async method on `FreshOpencodeState`; if it cannot be called from a free task, factor the bridge-restart body (the same logic as handle_attach's restart arm at opencode_ws.rs:5460-5473) into a standalone async helper both call. Track "Started after Lost" via a local `saw_loss` bool so normal cold starts emit nothing.)
+// The revival pass (also called at arming), respecting LB-01's lock order:
+// 1. manager.base_url().await is None → return (daemon absent — nothing to
+//    revive into; the next Started signal or attach drives revival).
+// 2. Snapshot the map: clone (session_id, Arc<Mutex<OpencodeSession>>) pairs
+//    under ONE short map lock, dropping the guard immediately.
+// 3. For each pair (OUTSIDE the map guard): lock the session; if
+//    real_session_id is Some AND the serve-bridge handle is_finished/absent
+//    → spawn_serve_bridge(...) and broadcast snapshot_event(real_id, "idle").
+//    Push the snapshot ONLY to sessions whose bridge was actually restarted.
+```
 
 - [ ] **Step 4: Run the focused test**
 
@@ -594,32 +684,38 @@ git commit -m "feat(freshopencode): daemon-loss self-heal edge, respawn revival,
 - Test: `test/unit/client/components/fresh-agent/FreshAgentView.test.tsx` (beside the 404 test at ~:1887-1930)
 
 **Interfaces:**
-- Consumes: `ApiError.details` (the full 409 body: `code`, `ownerKind`, `ownerGeneration`), `captureAttachmentAttempt` (FreshAgentView.tsx:403-412), `sendFencedFreshAgentAttach` (:1262-1275), `requestSnapshotRefresh` / `requestRevealRefresh`, `selectPaneOwnerFence`.
-- Produces: on a 409 `RESTORE_UNAVAILABLE` snapshot error for a freshopencode pane: ONE generation-fenced `freshAgent.attach` (via a fresh attachment decision — bump `attachDecisionSerialRef`, capture, send) followed by a snapshot refetch. Bounded: once per pane identity (`createRequestId` + `snapshotThreadId`); a second 409 falls through to the existing error surfaces (loadError banner / reveal error), no loop. The pane identity is NOT reset (unlike the 404 lost-thread path).
+- Consumes: `ApiError.details` (the full 409 body: `code`, `ownerKind`, `ownerGeneration`), `captureFreshAgentAttachmentAttempt` (the real wrapper at FreshAgentView.tsx — R-1: the pane-refresh reaction pattern at :1718-1761 is the exact reuse: bump `attachDecisionSerialRef`, capture, `sendFencedFreshAgentAttach(attempt)`), `sendFencedFreshAgentAttach` (:1262-1275), `requestSnapshotRefresh` / `requestRevealRefresh`, `selectPaneOwnerFence`.
+- Produces: on a 409 `RESTORE_UNAVAILABLE` snapshot error for a freshopencode pane whose refusal names a `fresh-agent` owner (the incident class — the pane's own stale claim; LB-05 scoped terminal owners out to the session-directory handoff door): ONE generation-fenced `freshAgent.attach` followed by a snapshot refetch. Bounded (LB-03): the ENTIRE recovery — attach + refetch — runs once per pane identity (`createRequestId` + `snapshotThreadId`); a second 409 falls through to the existing error surfaces (loadError banner / reveal error), never re-triggering fetches. When the 409 arrived on the reveal lane with `snapshotDirty` set, the recovery drives the reveal-refresh path (`requestRevealRefresh(true)`) so the success-path reveal-dirty clear can run and the "Refreshing conversation" overlay lifts (LB-04). The pane identity is NOT reset (unlike the 404 lost-thread path).
 
 - [ ] **Step 1: Write the failing behavioral test**
 
 In FreshAgentView.test.tsx (draft — template is the 404 test at :1887-1930; reuse its harness: `apiMock.getFreshAgentThreadSnapshot.mockRejectedValueOnce`, `StoreBackedFreshAgentView`, `sentFreshAgentMessages`):
 
 ```ts
-// 2026-09-20 incident: the daemon died, the reveal GET answered the typed
-// 409 RESTORE_UNAVAILABLE, and the pane dead-ended on a dismiss-only banner
-// forever ("Session ... is still running on the server."). The documented
-// recovery is the generation-fenced attach + refetch — drive it once.
+// 2026-09-20 incident (log-validated): the daemon died, the reveal GET
+// answered the typed 409 RESTORE_UNAVAILABLE for the pane's OWN stale
+// Live{FreshAgent, gen 1} claim, and the pane dead-ended on a dismiss-only
+// banner forever. The documented recovery is the generation-fenced attach +
+// refetch — drive it once.
+// LB-09: the mount attach already sends ONE freshAgent.attach on mount, so a
+// bare length assertion is vacuous — snapshot the sent-frame log after the
+// mount settles and assert the POST-409 delta.
 it('recovers a freshopencode pane from a snapshot 409 with one fenced attach and a refetch', async () => {
   apiMock.getFreshAgentThreadSnapshot
     .mockRejectedValueOnce({
       status: 409,
       message: 'Session ses_live is still running on the server.',
-      details: { code: 'RESTORE_UNAVAILABLE', ownerKind: 'terminal', ownerGeneration: 2 },
+      details: { code: 'RESTORE_UNAVAILABLE', ownerKind: 'fresh-agent', ownerGeneration: 1 },
     })
     .mockResolvedValue(freshopencodeSnapshot({ sessionId: 'ses_live', status: 'idle' })) // the refetch succeeds
   renderFreshAgentPane({ provider: 'opencode', sessionId: 'ses_live', status: 'connected' })
+  await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+  const attachCountBeforeRecovery = sentFreshAgentMessages('freshAgent.attach').length // the mount attach
   await waitFor(() => {
-    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1)
+    expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(attachCountBeforeRecovery + 1) // the RECOVERY attach (LB-09)
   })
   await waitFor(() => {
-    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2) // the refetch
+    expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2) // exactly one recovery refetch
   })
   // The pane kept its identity (the 409 is NOT the 404 lost-thread reset):
   expect(getFreshAgentPaneContent(store).sessionId).toBe('ses_live')
@@ -627,14 +723,18 @@ it('recovers a freshopencode pane from a snapshot 409 with one fenced attach and
   await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument())
 })
 
-it('does not loop attach attempts on repeated 409s', async () => {
+it('does not loop recovery fetches on repeated 409s', async () => {
   apiMock.getFreshAgentThreadSnapshot.mockRejectedValue({
     status: 409, message: 'Session ses_live is still running on the server.',
-    details: { code: 'RESTORE_UNAVAILABLE', ownerKind: 'terminal', ownerGeneration: 2 },
+    details: { code: 'RESTORE_UNAVAILABLE', ownerKind: 'fresh-agent', ownerGeneration: 1 },
   })
   renderFreshAgentPane({ provider: 'opencode', sessionId: 'ses_live', status: 'connected' })
   await waitFor(() => expect(screen.findByText(/still running on the server/i)).toBeTruthy())
-  expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1) // once, not per fetch
+  const baseline = sentFreshAgentMessages('freshAgent.attach').length
+  // Let any would-be refetch loop run (fake timers or a short flush):
+  await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+  expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(baseline) // one recovery total, not per fetch (LB-03)
+  expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeLessThanOrEqual(3) // mount + recovery only — no loop
 })
 ```
 
@@ -656,39 +756,58 @@ function isRestoreUnavailableSnapshotError(error: unknown): boolean {
   const code = details && typeof details === 'object' && 'code' in details
     ? (details as { code?: unknown }).code
     : undefined
-  return status === 409 && code === 'RESTORE_UNAVAILABLE'
+  const ownerKind = details && typeof details === 'object' && 'ownerKind' in details
+    ? (details as { ownerKind?: unknown }).ownerKind
+    : undefined
+  // LB-05 scoping: fresh-agent owners are the pane's own stale-claim class
+  // (the incident state) — the fenced attach proceeds for them. Terminal
+  // owners are a different scenario (a genuinely terminal-owned session);
+  // their recovery door is the session-directory handoff, so the client does
+  // not attempt the (refused) attach for them.
+  return status === 409 && code === 'RESTORE_UNAVAILABLE' && ownerKind === 'fresh-agent'
 }
 ```
 
-In `handleSnapshotError`, after the opencode lost-404 arm and BEFORE the reveal arm — provider-gated to `opencode`:
+In `handleSnapshotError`, after the opencode lost-404 arm and BEFORE the reveal arm — provider-gated to `opencode` (LB-03: the ENTIRE recovery — attach + refetch — sits inside the once-per-identity guard; a second 409 falls through to the honest error surfaces below, never looping):
 
 ```ts
 // 2026-09-20 incident: with the daemon dead, daemon-absent snapshot GETs
 // answer the typed 409 RESTORE_UNAVAILABLE for as long as the session key
 // stays Live. The documented recovery is the generation-fenced attach
 // (b8ke Task-5: cold resume flows only through the explicit lifecycle
-// commands) — drive it ONCE per pane identity, then refetch. Repeated 409s
-// fall through to the honest error surfaces below; never reset the pane.
+// commands) — drive it ONCE per pane identity, then refetch via the
+// reveal-refresh path when reveal-dirty (LB-04) so the overlay can clear.
+// Repeated 409s fall through to the honest error surfaces below; never
+// reset the pane.
 if (paneContent.provider === 'opencode' && isRestoreUnavailableSnapshotError(error)) {
   const fresh = paneContentRef.current
   const recoveryKey = `${fresh.createRequestId}:${sessionId}`
   if (restoreUnavailableRecoveryRef.current !== recoveryKey) {
     restoreUnavailableRecoveryRef.current = recoveryKey
     attachDecisionSerialRef.current += 1
-    const attempt = captureAttachmentAttempt('restore-unavailable-recovery')
+    const attempt = captureFreshAgentAttachmentAttempt(fresh) // R-1: the real wrapper's call shape
     sendFencedFreshAgentAttach(attempt)
+    // LB-04: a reveal-lane 409 with snapshotDirty set must refetch through
+    // the reveal path ('reveal' trigger), or the success-path reveal-dirty
+    // clear never runs and the pane hides behind the "Refreshing
+    // conversation" overlay forever. Otherwise refetch via 'manual'.
+    if (trigger === 'reveal' && snapshotDirtyRef.current) {
+      revealRefreshStartedAtRef.current = null
+      setSnapshotRevealError(null)
+      requestRevealRefresh(true)
+    } else {
+      setLoadError(null)
+      requestSnapshotRefresh('manual')
+    }
+    return // recovery fired for this error — the honest error surfaces below are for SUBSEQUENT 409s only
   }
-  if (trigger === 'reveal' && snapshotDirtyRef.current) {
-    revealRefreshStartedAtRef.current = null
-    setSnapshotRevealError(null) // recovery in flight; don't dead-end the reveal lane
-  }
-  setLoadError(null)
-  requestSnapshotRefresh('manual') // refetch once the attach lands
-  return
+  // Recovery already attempted for this identity: do NOT clear errors and do
+  // NOT refetch again — fall through to the reveal error arm / setLoadError
+  // below so the user sees the honest state.
 }
 ```
 
-(Adapt: `captureAttachmentAttempt`'s real signature at :403-412; the ref `restoreUnavailableRecoveryRef = useRef<string | null>(null)` beside the other reveal refs ~:800-804. The `trigger === 'reveal'` branch must still let the reveal-dirty state clear on the NEXT successful fetch — verify against the reveal-refresh state machine at :2601-2624; if clearing `snapshotRevealError` alone is insufficient, keep the reveal arm's bookkeeping and skip its error assignment while recovery is in flight.)
+(Adapt: the ref `restoreUnavailableRecoveryRef = useRef<string | null>(null)` beside the other reveal refs ~:800-804; `captureFreshAgentAttachmentAttempt`'s real signature follows the pane-refresh reaction lane at :1735-1739. Verify the reveal-refresh request helper's exact name/behavior (`requestRevealRefresh(true)` forces a reveal-tagged refresh) against the state machine at :2601-2624 and the arming sites ~:1233.)
 
 - [ ] **Step 4: Run the focused test**
 
@@ -733,16 +852,19 @@ Draft structure (follow the model-picker spec's routing/suppression mechanics ex
 
 ```ts
 test('freshopencode pane recovers from a snapshot 409 via fenced attach', async ({ page }) => {
-  // 1. Suppress the opencode sidecar (model-picker pattern).
+  // 1. Suppress the opencode sidecar (model-picker pattern:
+  //    setSuppressAllFreshAgentNetworkEffects(true) routes freshAgent.* WS
+  //    frames to the harness spy — getSentWsMessages() captures them).
   // 2. Route /api/fresh-agent/threads/freshopencode/opencode/:id:
   //    first call -> fulfill(409, { status:'error', code:'RESTORE_UNAVAILABLE',
   //      message:'Session <id> is still running on the server.',
-  //      ownerKind:'terminal', ownerGeneration:2 })
+  //      ownerKind:'fresh-agent', ownerGeneration:1 })   // the incident class (LB-05)
   //    subsequent -> fulfill(200, <a minimal valid FreshAgentSnapshot>)
   // 3. Seed a freshopencode pane with a durable ses_* session (harness).
-  // 4. Assert: a freshAgent.attach frame is sent (harness ws capture),
-  //    the transcript renders from the 200 snapshot, and no dismiss-only
-  //    dead-end alert remains.
+  // 4. Assert: a POST-409 recovery freshAgent.attach frame is sent (R-2: the
+  //    mount attach also appears in the spy log — count the delta after the
+  //    409 lands, not the total), the transcript renders from the 200
+  //    snapshot, and no dismiss-only dead-end alert remains.
 })
 ```
 
@@ -767,13 +889,13 @@ git commit -m "test(e2e): freshopencode snapshot-409 recovery runs cloud-legal e
 
 ---
 
-## Plan self-review (completed before commit)
+## Plan self-review (re-run after the Stage-2 load-bearing corrections)
 
-1. **Spec coverage:** defect 1 → Tasks 1 (compact/config no-kill, FR2 mirror); defect 2 → Task 2 (structured discard log); defect 3 → Tasks 3+4 (exit watcher + loss signal + backoff re-warm + runtime fan-out edge + bridge revival — the freshcodex-onExit mirror adapted to shared-daemon topology); defect 4 → Tasks 5+6 (client fenced-attach recovery + refetch, cloud-legal e2e). The "backoff-guarded respawn" and "client-visible status edge" elements of defect 3 are both explicit (Task 3 re-warm config; Task 4 `OPENCODE_DAEMON_LOST` edge).
-2. **No silent deferrals:** the deliberate residuals (prompt_async and thin wrappers keep `DiscardOnTimeout::Yes`; frozen 409 text; cloud-skipped real-daemon-lifecycle e2e class) are stated in Global Constraints, each with its reason and precedent.
-3. **File and interface consistency:** all paths/signatures cross-checked against the six exploration reports (`serve-lane-mechanics.md`, `runtime-compact-events.md`, `codex-selfheal-precedent.md`, `client-409-recovery.md`, `server-snapshot-409.md`, `testing-conventions.md`) at base 855dae72a.
-4. **Executable tests:** each red test names its exact lane failure (killed counter, missing frame, missing attach) and reuses pinned fake/harness idioms (NeverExitsProcess kill counters, config_capture tracing capture, state_with_bus + set_manager_for_test, the 404 ApiError-mock template).
+1. **Spec coverage:** defect 1 → Tasks 1 (compact/config no-kill, FR2 mirror); defect 2 → Task 2 (structured discard log); defect 3 → Tasks 3+4 (exit watcher + loss signal + backoff re-warm + runtime fan-out edge + level-triggered bridge revival — the freshcodex-onExit mirror adapted to shared-daemon topology); defect 4 → Tasks 4a+5+6 (the fenced attach made a real recovery verb by respawning the daemon on map-hits, the client 409 arm driving it once, cloud-legal e2e). The "backoff-guarded respawn" and "client-visible status edge" elements of defect 3 are both explicit (Task 3 re-warm config; Task 4 `OPENCODE_DAEMON_LOST` edge).
+2. **No silent deferrals:** the deliberate residuals (prompt_async and thin wrappers keep `DiscardOnTimeout::Yes`; frozen 409 text; terminal-owner 409s recover via the session-directory handoff door; cloud-skipped real-daemon-lifecycle e2e class; REST-only never-viewed panes miss the banner until first WS interaction) are stated in Global Constraints, each with its reason and precedent.
+3. **File and interface consistency:** all paths/signatures cross-checked against the six exploration reports at base 855dae72a, then corrected against the load-bearing ledger: LB-01 (map lock order), LB-02 (no broadcast replay → level-triggered revival + arming pass), LB-03 (bounded recovery), LB-04 (reveal-trigger refetch), LB-05 (falsified: attach must respawn the daemon — Task 4a added; recovery scoped to fresh-agent owners), LB-06 (Arc process + ownership_id), LB-07 (exactly-once take), LB-08 (Lagged tolerance), LB-09 (attach-count delta), LB-10 (state clone), R-1 (`captureFreshAgentAttachmentAttempt`), N-3 (`ensure_manager` seam).
+4. **Executable tests:** each red test names its exact lane failure (killed counter, missing frame, missing spawn, missing attach) and reuses pinned fake/harness idioms (NeverExitsProcess kill counters, config_capture tracing capture, state_with_bus + set_manager_for_test, the 404 ApiError-mock template with delta-based attach counting).
 5. **Placeholder scan:** drafts reference real helpers; where a fake needs a small extension (ExitingProcess, summarize/config hang scripting), the extension is named and its model (existing fakes) is cited — no TBDs.
 6. **Operational completeness:** new structured event names are logged (Task 3/4) and registered in the logging docs if enumerated; AGENTS.md architecture prose updated (Task 4); no migrations; rollback = revert the commits (no persisted-state changes).
 
-UNRESOLVED COVERAGE GAP: none known. The one soft spot — whether `captureAttachmentAttempt`'s real signature supports the Task-5 recovery arm without a wrapper — is a load-bearing assumption carried to Stage 2 for validation before execution.
+UNRESOLVED COVERAGE GAP: none. The original soft spot was resolved in Stage 2 (R-1: `captureFreshAgentAttachmentAttempt` supports the mid-flight re-decision), and the one falsified assumption (LB-05) reshaped Tasks 4+5 — the fenced attach now respawns the daemon (map-hit), and the client recovery is scoped to the fresh-agent-owner class the incident actually was.
