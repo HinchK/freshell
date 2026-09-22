@@ -1,9 +1,12 @@
 import { readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..');
-const lockPath = join(repoRoot, 'pnpm-lock.yaml');
+// Zero args (the unit-lane enforcement path) checks the real workspace lock;
+// an explicit path targets a fixture lock, which lets the unit tests prove
+// drift detection without mutating the repository.
+const lockPath = process.argv[2] ? resolve(process.cwd(), process.argv[2]) : join(repoRoot, 'pnpm-lock.yaml');
 
 let content;
 try {
