@@ -328,9 +328,24 @@ struct OpencodeSession {
     /// mirrors `adapter.ts`'s `sendQueue` only loosely (this crate does not yet
     /// serialize overlapping sends); the new drive's task simply overwrites the
     /// finished/hijacked handle. A send arriving while a COMPACT is in flight is
-    /// REFUSED instead ([`FreshOpencodeState::handle_send`], D2-F1): overwriting the
-    /// compact's handle would orphan its still-running drive.
+    /// QUEUED instead ([`OpencodeSession::pending_sends`], via
+    /// [`FreshOpencodeState::handle_send`]): overwriting the compact's handle
+    /// would orphan its still-running drive.
     turn_task: Option<TurnTask>,
+    /// send-during-compact queue: a `freshAgent.send` arriving while the
+    /// session's `turn_task` is an in-flight COMPACT — or while older
+    /// entries are still queued — is parked here (FIFO, under this same
+    /// session mutex) instead of being refused. The retired Node adapter
+    /// chained both onto `state.sendQueue` (adapter.ts:825-829); the D2-F1
+    /// refusal this replaces dropped the user's typed message (the
+    /// composer stays interactive, so the busy-status race makes the seam
+    /// reachable by design). The entry is the complete wire message: the
+    /// drain (compact settle tail / send settle tail / handle_interrupt /
+    /// the push-armed drain / the kill-enumeration decrement sites)
+    /// re-enters the send path with it. `freshAgent.kill` and the handoff
+    /// prior-stop drop the queue (WARN per entry); the drain re-checks the
+    /// killed/close_pending gates before every re-drive.
+    pending_sends: std::collections::VecDeque<FreshAgentSend>,
     /// PR-3: set by `handle_interrupt` (BEFORE aborting) so a racing in-flight turn's
     /// completion gating suppresses `freshAgent.turn.complete` (`state.turnAborted`,
     /// adapter.ts:521,334-335). Reset to `false` at the top of every `handle_send`.
@@ -425,6 +440,7 @@ impl OpencodeSession {
             model,
             effort,
             turn_task: None,
+            pending_sends: std::collections::VecDeque::new(),
             turn_aborted: Arc::new(AtomicBool::new(false)),
             daemon_turn_accepted: Arc::new(AtomicBool::new(false)),
             turn_errored: Arc::new(AtomicBool::new(false)),
@@ -839,6 +855,29 @@ impl FreshOpencodeState {
             terminal_id: None,
             live_terminal_id: None,
         }));
+    }
+
+    /// Broadcast the send path's `freshAgent.send.accepted` (ws-handler.ts:3487-3495)
+    /// — the ONE construction shared by the normal send path and the
+    /// send-during-compact queue arm (the queue fires it immediately so the
+    /// client's requestId correlation resolves; the parked entry's real drive
+    /// happens at drain time and must never double-fire the frame).
+    fn broadcast_send_accepted(
+        &self,
+        session_id: &str,
+        request_id: &Option<String>,
+        cwd: &Option<String>,
+    ) {
+        self.broadcast(&ServerMessage::FreshAgentSendAccepted(
+            FreshAgentSendAccepted {
+                provider: PROVIDER.to_string(),
+                request_id: request_id.clone().unwrap_or_default(),
+                session_id: session_id.to_string(),
+                session_type: SESSION_TYPE.to_string(),
+                cwd: cwd.clone(),
+                submitted_turn_id: None,
+            },
+        ));
     }
 
     // ── freshAgent.create (WS) ──────────────────────────────────────────────
@@ -1418,13 +1457,15 @@ impl FreshOpencodeState {
     /// then `freshAgent.send.accepted`, then runs the turn against the real opencode
     /// serve session in a detached task (PR-3 bridges its completion signal onto the bus).
     ///
-    /// BUSY REFUSAL (delta-review round 2, D2-F1): a send arriving while a COMPACT is
-    /// in flight (the session's `turn_task` kind — the composer stays interactive, so
-    /// this race is reachable) is refused with the nested
-    /// `freshAgent.error{INTERNAL_ERROR}` BEFORE any side effect; overwriting the
-    /// compact's registered handle would orphan its drive. A send arriving while a
-    /// SEND is in flight keeps the pre-existing loose-overwrite behavior (the
-    /// divergence documented on [`OpencodeSession::turn_task`]).
+    /// BUSY QUEUE (the send-during-compact seam): a send arriving while a COMPACT
+    /// is in flight (the session's `turn_task` kind — the composer stays
+    /// interactive, so this race is reachable) is QUEUED FIFO on
+    /// [`OpencodeSession::pending_sends`] with an immediate
+    /// `freshAgent.send.accepted` (the original requestId) and a structured WARN
+    /// as the only queue-time side effects — overwriting the compact's registered
+    /// handle would orphan its drive. A send arriving while a SEND is in flight
+    /// keeps the pre-existing loose-overwrite behavior (the divergence
+    /// documented on [`OpencodeSession::turn_task`]).
     pub async fn handle_send(&self, msg: FreshAgentSend) {
         let request_id = msg.request_id.clone();
         let session_id = msg.session_id.clone();
@@ -1467,31 +1508,6 @@ impl FreshOpencodeState {
             return;
         }
 
-        // D2-F1 (delta-review round 2): a send arriving while a COMPACT is in flight
-        // is REFUSED — the nested `freshAgent.error{INTERNAL_ERROR}` — BEFORE any side
-        // effect (flag reset, busy snapshot, materialization, prompt POST). Registering
-        // this send's drive would overwrite the compact's `turn_task` handle while the
-        // compact keeps running: kill/interrupt would silently stop reaching it, and
-        // the shared idle edge would settle both operations (a false/duplicate
-        // completion). A send arriving while a SEND is in flight keeps the PRE-EXISTING
-        // behavior: the new task overwrites the old registration (the documented
-        // divergence — this crate does not serialize overlapping sends).
-        if session
-            .turn_task
-            .as_ref()
-            .is_some_and(|t| t.kind == TurnTaskKind::Compact && !t.is_finished())
-        {
-            drop(session);
-            self.emit_fresh_agent_error(
-                &session_id,
-                "INTERNAL_ERROR",
-                &format!(
-                    "send while a compact is in progress is not supported (opencode session {session_id})"
-                ),
-            );
-            return;
-        }
-
         // b8ke ext r31 F1: the request's observed fence is parsed BEFORE
         // ANY side effect (the turn-flag resets, the redo destroy, the
         // busy broadcast, the materialization) — the pair is ONE fence
@@ -1519,6 +1535,45 @@ impl FreshOpencodeState {
                     return;
                 }
             };
+
+        // send-during-compact queue: a send arriving while a COMPACT is in
+        // flight — including the compact's settling tail (the tail is
+        // still the compact's FIFO turn; Task 3's settling-flag gate
+        // decides when a drain may act) — or while older entries are still
+        // queued (a fresh send must never jump ahead of a pending one:
+        // the client fires one send the moment the compact's idle
+        // broadcast clears its flush gate) is QUEUED (FIFO) instead of
+        // refused. Queue-time side effects are ONLY the client
+        // contract's immediate `freshAgent.send.accepted` (the exact
+        // shape the normal path broadcasts, request_id preserved,
+        // submitted_turn_id: None) and the structured WARN: every other
+        // side effect happens at DRAIN time with `already_accepted =
+        // true` so the frame never double-fires. The push and the
+        // compact's `turn_task` registration (:3935) share this session
+        // mutex, so the in-flight observation is exact.
+        if session
+            .turn_task
+            .as_ref()
+            .is_some_and(|t| t.kind == TurnTaskKind::Compact && !t.is_finished())
+            || !session.pending_sends.is_empty()
+        {
+            let real_id = session
+                .real_session_id
+                .clone()
+                .unwrap_or_else(|| session.placeholder_id.clone());
+            self.broadcast_send_accepted(&real_id, &msg.request_id, &session.cwd);
+            session.pending_sends.push_back(msg.clone());
+            tracing::warn!(target: "freshell_freshagent::opencode",
+                session_id = %session_id,
+                request_id = ?msg.request_id,
+                queued_depth = session.pending_sends.len(),
+                "fresh_agent_send_queued_behind_compact");
+            // Task 3 appends the push-armed detached drain here
+            // (`Self::drain_detached`) — the self-healing sliver closer.
+            // In THIS task the parked entry simply waits for the drain
+            // machinery the next task adds.
+            return;
+        }
 
         // materializeOrSend:334-335 -- a fresh turn starts un-aborted and un-errored;
         // `handle_interrupt` flips `turn_aborted` while we are parked on idle, and
@@ -1956,16 +2011,7 @@ impl FreshOpencodeState {
         // mirroring the codex slice's ack timing. The turn itself runs in a detached
         // task below so `freshAgent.kill` can target it independently of this handler's
         // own (already-detached, per terminal.rs dispatch) task.
-        self.broadcast(&ServerMessage::FreshAgentSendAccepted(
-            FreshAgentSendAccepted {
-                provider: PROVIDER.to_string(),
-                request_id: request_id.unwrap_or_default(),
-                session_id: acked_session_id,
-                session_type: SESSION_TYPE.to_string(),
-                cwd: route.clone(),
-                submitted_turn_id: None,
-            },
-        ));
+        self.broadcast_send_accepted(&acked_session_id, &request_id, &route);
 
         let fresh_agent = self.fresh_agent.clone();
         let turn_aborted = session.turn_aborted.clone();
@@ -12997,6 +13043,16 @@ mod tests {
             .insert(id.to_string(), Arc::new(TokioMutex::new(session)));
     }
 
+    /// The recorded-body needle probe: `RecordedRequest.body` is an
+    /// `Option<Value>` with NO Display, so assert on the serialized JSON
+    /// body as a whole (`None` serializes to `null` — the same parse
+    /// idiom the fake itself uses at its `body_value`).
+    fn r_body_contains(r: &RecordedRequest, needle: &str) -> bool {
+        serde_json::to_string(&r.body)
+            .unwrap_or_default()
+            .contains(needle)
+    }
+
     /// Drain every buffered bus frame in arrival order (full parsed payloads).
     fn drain_frames(rx: &mut tokio::sync::broadcast::Receiver<String>) -> Vec<Value> {
         let mut out = Vec::new();
@@ -15389,98 +15445,134 @@ mod tests {
         );
     }
 
-    /// D2-F1 (delta-review round 2): the composer stays interactive while a session
-    /// is busy, so a send CAN arrive mid-compact. The send must be REFUSED — a nested
-    /// `freshAgent.event{freshAgent.error{INTERNAL_ERROR}}` naming the compact — rather
-    /// than overwriting the compact's registered `turn_task`: such an overwrite would
-    /// disconnect kill/interrupt from the still-running compact drive and let ONE idle
-    /// edge settle both operations (a false/duplicate completion). The refused send
-    /// takes NO other action (no prompt POST, no send.accepted, no busy snapshot), the
-    /// compact's task stays registered, and a later kill still aborts it.
+    /// The composer stays interactive while a session is busy, so a send CAN
+    /// arrive mid-compact. The send is QUEUED (FIFO, on the session's
+    /// `pending_sends`) instead of refused — the user's typed message is never
+    /// lost — with the client contract's immediate `freshAgent.send.accepted`
+    /// (the original requestId) and a structured WARN as the ONLY queue-time
+    /// side effects: no prompt POST fires while the compact is parked, the
+    /// compact's driving task stays the session's registered `turn_task`
+    /// (never stolen), and a later kill still aborts it without a fabricated
+    /// `freshAgent.turn.complete` (the kill also drops the queued entry).
     #[tokio::test]
-    async fn send_during_an_in_flight_compact_is_refused_and_leaves_the_compact_owned() {
-        let gate = Arc::new(tokio::sync::Notify::new());
+    async fn send_during_an_in_flight_compact_is_queued_accepted_and_leaves_the_compact_owned() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
         let (st, http, mut rx) = compact_state_gated(
             r#"{"model":null}"#,
             SummarizeOutcome::OkAnswered,
-            Some(gate.clone()),
+            Some(summarize_gate.clone()),
             None,
         )
         .await;
-        insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
-        let session_arc = st.sessions.lock().await.get("ses_1").cloned().unwrap();
-
-        // The handler spawns + registers the compact drive, then returns.
+        insert_compact_session(&st, "ses_q1", Some("prov/model")).await;
+        // The compact drive: parked summarize = deterministic in-flight window.
         tokio::time::timeout(
             Duration::from_secs(2),
-            st.handle_compact(compact_msg("ses_1")),
+            st.handle_compact(compact_msg("ses_q1")),
         )
         .await
-        .expect("handle_compact returns after registering the driving task");
-        await_summarize_posted(&http).await; // the compact is deterministically in flight
+        .expect("handle_compact returns after registering the detached drive");
+        await_summarize_posted(&http).await;
 
-        // The mid-compact send is refused inline (never waits on upstream, never
-        // spawns a drive): a clean inline-return assertion pins that ordering.
+        // WARN capture: the crate's real facility (user precedent :6807-6851).
+        let (events, _guard) = info_capture::capture();
+
+        // THE SEND — arrives while the compact drive is in flight.
         tokio::time::timeout(
             Duration::from_secs(2),
-            st.handle_send(send_msg("ses_1", "mid-compact")),
+            st.handle_send(send_msg("ses_q1", "queued text")),
         )
         .await
-        .expect("the mid-compact send is refused inline, never upstream-blocking");
+        .expect("handle_send queues inline (no refusal path)");
 
-        let frames = drain_frames(&mut rx);
-        let refusal = frames
-            .iter()
-            .find(|f| is_event(f, "freshAgent.error", None))
-            .expect("the refused send answers a LOUD nested freshAgent.error");
-        assert_eq!(refusal["event"]["code"], "INTERNAL_ERROR", "{refusal}");
+        // (1) The client contract: immediate `freshAgent.send.accepted` with the
+        // original requestId (send_msg mints request_id = Some("req-queued text")).
+        // frames_until stops at the FIRST predicate match — one call pins the
+        // single expected acceptance.
+        let frames = frames_until(&mut rx, |f| {
+            f["type"] == "freshAgent.send.accepted" && f["requestId"] == "req-queued text"
+        })
+        .await;
         assert!(
-            refusal["event"]["message"]
-                .as_str()
-                .unwrap_or("")
-                .contains("compact"),
-            "the message names the in-flight compact: {refusal}"
+            !frames.is_empty(),
+            "accepted carries the send's original requestId"
         );
+
+        // (2) NO refusal: the D2-F1 nested INTERNAL_ERROR broadcast is gone.
         assert!(
-            !frames
+            !drain_frames(&mut rx)
                 .iter()
-                .any(|f| f["type"] == "freshAgent.send.accepted"),
-            "a refused send never broadcasts send.accepted: {frames:?}"
+                .any(|f| is_event(f, "freshAgent.error", None)
+                    && f["event"]["code"] == "INTERNAL_ERROR"),
+            "the refusal must not fire — the send is queued"
         );
+
+        // (3) NO prompt POST left the building while the compact is parked.
         assert!(
             !http
                 .recorded()
                 .iter()
-                .any(|r| r.url.contains("/prompt_async")),
-            "a refused send never reaches the prompt POST"
+                .any(|r| r.url.contains("prompt_async") && r_body_contains(&r, "queued text")),
+            "the queued send must NOT POST while the compact is in flight"
         );
 
-        // The compact's driving task is STILL the registered turn task (never stolen).
-        let still_live = {
+        // (4) The compact's turn_task is untouched (the original test's
+        // ownership invariant, kept) and the send is parked FIFO.
+        {
+            let session_arc = st
+                .sessions
+                .lock()
+                .await
+                .get("ses_q1")
+                .cloned()
+                .expect("session present");
             let session = session_arc.lock().await;
-            session
-                .turn_task
-                .as_ref()
-                .map(|t| !t.is_finished())
-                .unwrap_or(false)
-        };
-        assert!(
-            still_live,
-            "the refused send must not overwrite the compact's registered task"
-        );
+            assert!(
+                session
+                    .turn_task
+                    .as_ref()
+                    .is_some_and(|t| t.kind == TurnTaskKind::Compact && !t.is_finished()),
+                "the compact still owns the session's turn_task"
+            );
+            assert_eq!(
+                session.pending_sends.len(),
+                1,
+                "the send is parked in the FIFO queue"
+            );
+        }
 
-        // The ownership invariant holds end-to-end: a kill mid-compact aborts the
-        // registered drive — no false completion after the gate releases.
+        // (5) The structured WARN named the queueing (message + field).
+        {
+            let captured = events.lock().unwrap();
+            assert!(
+                captured
+                    .iter()
+                    .any(|e| e.message.contains("fresh_agent_send_queued_behind_compact")),
+                "queueing is observable in the structured log"
+            );
+        }
+
+        // (6) The kill tail of the replaced test stays: a kill mid-compact
+        // aborts the compact with no fabricated freshAgent.turn.complete and
+        // lands freshAgent.killed (kill also drops the queue — Task 4 adds the
+        // dropped-entry WARN).
+        let session_arc = st
+            .sessions
+            .lock()
+            .await
+            .get("ses_q1")
+            .cloned()
+            .expect("session present before the kill");
         st.handle_kill(FreshAgentKill {
             observed_epoch: None,
             observed_generation: None,
             provider: AgentProvider::Opencode,
-            session_id: "ses_1".to_string(),
+            session_id: "ses_q1".to_string(),
             session_type: SessionType::Freshopencode,
             cwd: None,
         })
         .await;
-        gate.notify_waiters();
+        summarize_gate.notify_waiters();
         tokio::time::sleep(Duration::from_millis(50)).await; // settle window
 
         let frames = drain_frames(&mut rx);
