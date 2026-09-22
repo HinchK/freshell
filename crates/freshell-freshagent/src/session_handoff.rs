@@ -1633,6 +1633,79 @@ impl SessionHandoffRunner {
                             "ownership.handoff.done",
                             TransitionLevel::Info,
                         );
+                        // fresheyes ep2-r4 Major (daemon loss in the
+                        // handoff pre-commit window): the under-ticket
+                        // continuation (`start_target` →
+                        // `opencode_resume_for_handoff`) installs its
+                        // generation-fenced bridge and runs its own
+                        // transitional rescue BEFORE this runner's single
+                        // `Live` commit — and between the two, this
+                        // runner can still await
+                        // `current_flavor()`/`stage()` while the
+                        // coordinator key remains `Handoff`. A daemon
+                        // loss in that interval kills the fresh bridge
+                        // with every recovery trigger spent: the
+                        // successor's `Started` revival pass deliberately
+                        // skips the transitional owner (the
+                        // foreign-transition rule), this commit emits no
+                        // new daemon signal, and the finished rescue is
+                        // never rerun — the handoff would answer plain
+                        // success over an A-generation dead bridge. The
+                        // ESTABLISHED post-commit rescue pattern (the
+                        // fork/resume tails) closes the window from the
+                        // commit's own side: re-run the SAME
+                        // ownership-coordinator-gated guarded-restart
+                        // seam for the freshopencode target.
+                        // `own_lifecycle_window = false`: this commit IS
+                        // the window's end, so the seam observes the
+                        // runner's own `Live{FreshAgent}` and arms the
+                        // adopt guard across the restart (the revival
+                        // pass's exact discipline). A bridge alive
+                        // against the CURRENT daemon is the quiet no-op;
+                        // a dead/lost-generation bridge is restarted
+                        // against the successor and the client gets its
+                        // one recovery snapshot; a REFUSAL — the session
+                        // was killed or re-transitioned between the
+                        // commit and this tail, the mover's teardown
+                        // owning the cleanup — surfaces the typed
+                        // ownership-changed failure, never success over
+                        // the retired session. A bounded respawn failure
+                        // stays WARN-only (the seam's ep2-r2 contract).
+                        if req.target_kind == RuntimeOwnerKind::FreshAgent
+                            && req.session_type.as_deref() == Some("freshopencode")
+                            && matches!(
+                                self.fresh_opencode
+                                    .rescue_transitional_bridge_after_commit(
+                                        &req.session_id,
+                                        false,
+                                    )
+                                    .await,
+                                crate::opencode_ws::TransitionalBridgeRescue::Refused
+                            )
+                        {
+                            tracing::warn!(target: "freshell_freshagent::opencode",
+                                operation_id = %operation_id,
+                                provider = %req.provider, session_id = %req.session_id,
+                                generation,
+                                "freshagent.opencode.handoff_bridge_recheck_refused: the \
+                                 freshopencode target committed but the session was retired \
+                                 or re-transitioned before the handoff answered — the \
+                                 mover's teardown owns the cleanup; the handoff surfaces \
+                                 the typed ownership-changed failure (ep2-r4)"
+                            );
+                            let current = self
+                                .ownership
+                                .observe(&req.provider, &req.session_id)
+                                .generation;
+                            return typed_failure(
+                                "STALE_GENERATION",
+                                "ownership changed during handoff; the freshopencode target \
+                                 committed but the session was retired or re-transitioned \
+                                 before the handoff could answer — refresh and retry",
+                                true,
+                                current,
+                            );
+                        }
                         json!({
                             "ok": true,
                             "operationId": operation_id,

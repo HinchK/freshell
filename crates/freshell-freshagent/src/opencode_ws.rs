@@ -6546,7 +6546,19 @@ impl FreshOpencodeState {
     /// under-ticket handoff continuation resumes inside the RUNNER's own
     /// held claim (the coordinator key is mid-transition by design and
     /// the runner — not this lane — performs the one `commit_live`), so
-    /// the killed check and the map re-lookup remain its gates.
+    /// the killed check and the map re-lookup remain its gates. Every
+    /// caller whose lifecycle window has ALREADY committed passes
+    /// `false` — the observation then sees the caller's own
+    /// `Live{FreshAgent}` and arms the adopt guard across the restart
+    /// (the revival pass's exact discipline): the lane's own-commit
+    /// tails (fork/resume) and, since ep2-r4, the handoff runner's
+    /// post-commit re-check for its freshopencode targets — the
+    /// runner's commit is the ONE `Live` commit an under-ticket
+    /// continuation ever gets, so the runner re-runs this seam after it
+    /// (a daemon loss in the runner's awaited flavor-write window kills
+    /// the just-rescued bridge with every other recovery trigger spent:
+    /// the successor's `Started` revival pass skips the transitional
+    /// owner, and the commit itself emits no new daemon signal).
     ///
     /// A [`TransitionalBridgeRescue::Refused`] never installs and never
     /// pushes: the mover's teardown owns the cleanup (the kill/handoff
@@ -6558,7 +6570,7 @@ impl FreshOpencodeState {
     /// still succeeds (the session is registered and visible to the next
     /// `Started` revival pass and fenced attaches — the revival pass's
     /// failure handling, verbatim).
-    async fn rescue_transitional_bridge_after_commit(
+    pub(crate) async fn rescue_transitional_bridge_after_commit(
         &self,
         durable: &str,
         own_lifecycle_window: bool,
@@ -6682,10 +6694,11 @@ impl FreshOpencodeState {
 }
 
 /// The post-commit rescue's outcome (ep2-r3): the operation tail (the
-/// fork's reply, the resume's return) consumes this to decide between its
-/// success path and its typed ownership-changed refusal. See
+/// fork's reply, the resume's return, the handoff runner's post-commit
+/// re-check) consumes this to decide between its success path and its
+/// typed ownership-changed refusal. See
 /// [`FreshOpencodeState::rescue_transitional_bridge_after_commit`].
-enum TransitionalBridgeRescue {
+pub(crate) enum TransitionalBridgeRescue {
     /// The bridge was (re)started against the successor daemon and the
     /// client got its one recovery snapshot (pushed by the rescue itself —
     /// only actually-restarted bridges are ever pushed).
@@ -19715,6 +19728,542 @@ mod tests {
         );
         let _ = (exited, spawns);
     }
+
+    // ── fresheyes ep2-r4: the handoff runner's post-commit bridge re-check ──
+
+    /// The ep2-r4 flavor-writer latch: the runner's OWN awaited flavor steps
+    /// are the deterministic interleaving points (existing injection seams —
+    /// no `cfg(test)` production gates). `stage` parks the runner INSIDE the
+    /// Handoff window (before the `Live` commit — the pre-commit
+    /// daemon-loss test's hold); the staged handle's `commit` parks the
+    /// runner AFTER the commit (the post-commit kill test's hold). An
+    /// unwired latch is a plain immediate `Ok` — the happy-path writer.
+    #[derive(Default)]
+    struct ParkingFlavorWriter {
+        stage_entered: StdMutex<Option<std::sync::mpsc::Sender<()>>>,
+        stage_release: StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        commit_entered: StdMutex<Option<std::sync::mpsc::Sender<()>>>,
+        commit_release: StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    /// The staged flavor handle [`ParkingFlavorWriter`] hands the runner:
+    /// `commit()` fires `entered` and parks on `release` when armed.
+    struct ParkingStagedFlavor {
+        entered: Option<std::sync::mpsc::Sender<()>>,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    impl crate::session_handoff::StagedFlavor for ParkingStagedFlavor {
+        fn commit(
+            self: Box<Self>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        {
+            let Self { entered, release } = *self;
+            Box::pin(async move {
+                if let Some(entered) = entered {
+                    let _ = entered.send(());
+                }
+                if let Some(release) = release {
+                    let _ = release.await;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    impl crate::session_handoff::FlavorWrite for ParkingFlavorWriter {
+        fn stage(
+            &self,
+            _provider: &str,
+            _session_id: &str,
+            _flavor: &str,
+        ) -> crate::session_handoff::StagedFlavorFuture {
+            let stage_entered = self.stage_entered.lock().expect("writer latch").take();
+            let stage_release = self.stage_release.lock().expect("writer latch").take();
+            let commit_entered = self.commit_entered.lock().expect("writer latch").take();
+            let commit_release = self.commit_release.lock().expect("writer latch").take();
+            Box::pin(async move {
+                if let Some(entered) = stage_entered {
+                    let _ = entered.send(());
+                }
+                if let Some(release) = stage_release {
+                    let _ = release.await;
+                }
+                Ok(Some(Box::new(ParkingStagedFlavor {
+                    entered: commit_entered,
+                    release: commit_release,
+                })
+                    as Box<dyn crate::session_handoff::StagedFlavor>))
+            })
+        }
+    }
+
+    /// The ep2-r4 fixture: the selfheal manager shape (flag-controlled
+    /// daemon death, test-speed watch/backoff knobs) wired into a FULL
+    /// [`crate::session_handoff::SessionHandoffRunner`] — the finding lives
+    /// in the RUNNER's commit path (`start_target`'s under-ticket
+    /// continuation → the awaited flavor write → the single `Live`
+    /// commit), so the tests drive the real runner over the real
+    /// shared-serve machinery. The runner holds clones of the same states
+    /// the lane uses (the broadcast bus, the coordinator, the shared
+    /// manager).
+    async fn handoff_selfheal_rig(
+        backoff_initial_ms: u64,
+        backoff_max_ms: u64,
+        writer: crate::session_handoff::FlavorWriter,
+    ) -> (
+        FreshOpencodeState,
+        Arc<crate::session_handoff::SessionHandoffRunner>,
+        Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        tokio::sync::broadcast::Receiver<String>,
+        Arc<AtomicBool>,
+        OpencodeServeManager,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(256);
+        let broadcast_tx = Arc::new(tx);
+        let auth_token = Arc::new("handoff-ep2r4-tok".to_string());
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let terminal_registry =
+            freshell_terminal::TerminalRegistry::new().with_ownership(Arc::clone(&registry));
+        let fresh_agent = FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx))
+            .with_ownership(Arc::clone(&registry))
+            .with_terminal_registry(terminal_registry.clone());
+        let exited = Arc::new(AtomicBool::new(false));
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let deps = ServeDeps {
+            spawner: Arc::new(FlagExitSpawner {
+                exited: exited.clone(),
+                spawns: spawns.clone(),
+            }),
+            http: Arc::new(FakeHttp {
+                next_session: AtomicUsize::new(0),
+            }),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(20),
+            daemon_watch_interval: Duration::from_millis(10),
+            re_warm_backoff_initial_ms: backoff_initial_ms,
+            re_warm_backoff_max_ms: backoff_max_ms,
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager.clone()).await;
+        let mut st = FreshOpencodeState::new(fresh_agent.clone());
+        st.set_ownership(Arc::clone(&registry));
+        // Production arms the daemon-loss watcher at the first opencode WS
+        // entry point; the handoff lane does not, so arm it here (the fork
+        // fixture's precedent) — the typed loss edge and the `Started`
+        // revival pass are the real machinery the finding is about.
+        st.ensure_daemon_loss_watcher().await;
+        let mut fresh_claude = crate::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+        fresh_claude.set_ownership(Arc::clone(&registry));
+        let mut fresh_codex = crate::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            json!({ "freshAgent": { "enabled": true } }),
+        );
+        fresh_codex.set_ownership(Arc::clone(&registry));
+        let runner = crate::session_handoff::SessionHandoffRunner::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            Arc::clone(&registry),
+            terminal_registry,
+            fresh_codex,
+            fresh_claude,
+            st.clone(),
+            fresh_agent.clone(),
+            // A FreshAgent-target handoff never consults the CLI specs
+            // (validate_handoff_target's terminal arm only).
+            Arc::new(Vec::new()),
+        )
+        .with_flavor_writer(Some(writer));
+        (st, Arc::new(runner), registry, rx, exited, manager)
+    }
+
+    /// A `switch` handoff moving `durable` to the freshopencode lane (the
+    /// finding's target arm — the under-ticket continuation).
+    fn freshopencode_handoff_request(durable: &str) -> crate::session_handoff::HandoffRequest {
+        crate::session_handoff::HandoffRequest {
+            action: crate::session_handoff::HandoffAction::Switch,
+            provider: "opencode".to_string(),
+            session_id: durable.to_string(),
+            target_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            session_type: Some("freshopencode".to_string()),
+            mode: None,
+            cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
+            tab_id: None,
+            pane_id: None,
+            observed_epoch: None,
+            observed_generation: None,
+            device_id: Some("test-device-ep2r4".to_string()),
+        }
+    }
+
+    /// fresheyes ep2-r4 Major (daemon loss in the handoff pre-commit
+    /// window): the under-ticket continuation installs its
+    /// generation-fenced bridge and runs its transitional rescue BEFORE the
+    /// runner's single `Live` commit; between the two the runner still
+    /// awaits the staged flavor write while the coordinator key remains
+    /// `Handoff`. A daemon loss there kills the fresh bridge with every
+    /// recovery trigger spent — the successor's one-shot `Started` revival
+    /// pass correctly skips the transitional owner, the `Live` commit emits
+    /// no new daemon signal, and the finished rescue is never rerun — so
+    /// the handoff answered plain success over an A-generation dead bridge.
+    ///
+    /// The interleaving, forced deterministically through the REAL paths:
+    /// the runner parks inside the flavor `stage` (its own awaited step
+    /// inside the Handoff window); while parked, daemon A dies and B
+    /// re-warms through the REAL loss/re-warm machinery (the fixture
+    /// proves B serves while the bridge stays dead — the revival pass
+    /// skipped the Handoff owner); releasing the park lets the commit
+    /// land, and the handoff must NOT leave a dead A-generation bridge:
+    /// the commit's re-check recovers it against B (a B-stamped live
+    /// bridge + exactly one idle snapshot push) or surfaces the typed
+    /// loss — never plain success over a dead bridge.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handoff_commit_recovers_daemon_loss_in_the_pre_commit_window() {
+        let writer = Arc::new(ParkingFlavorWriter::default());
+        let (stage_entered_tx, stage_entered) = std::sync::mpsc::channel::<()>();
+        let (stage_release_tx, stage_release_rx) = tokio::sync::oneshot::channel::<()>();
+        writer
+            .stage_entered
+            .lock()
+            .expect("writer latch")
+            .replace(stage_entered_tx);
+        writer
+            .stage_release
+            .lock()
+            .expect("writer latch")
+            .replace(stage_release_rx);
+        let (st, runner, registry, mut rx, exited, manager) = handoff_selfheal_rig(
+            5,
+            50,
+            writer.clone() as crate::session_handoff::FlavorWriter,
+        )
+        .await;
+
+        // The prior: a committed TERMINAL owner (the terminal→freshopencode
+        // shape; the handoff's prior stop is the idempotent AlreadyGone
+        // against the nonexistent terminal row).
+        let durable = "ses_ep2r4_loss";
+        commit_terminal_owner(&registry, durable).await;
+
+        // The mover drives the finding's interleaving while the runner is
+        // parked inside the Handoff window.
+        let mover_state = st.clone();
+        let mover_manager = manager.clone();
+        let mover_exited = exited.clone();
+        let mover = tokio::spawn(async move {
+            stage_entered
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("the runner parks in the awaited flavor stage (inside the Handoff window)");
+            // The under-ticket rescue has COMPLETED (start_target returned
+            // before the runner reached the flavor write) — the loss below
+            // lands in the finding's exact window.
+            mover_exited.store(true, Ordering::SeqCst); // daemon A dies
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while mover_manager.base_url().await.is_some() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "A's loss must take the running entry within the budget"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // ...the take's sweep closed the target session's A-era bridge
+            // channel — the just-installed bridge is dead.
+            await_bridge_liveness(
+                &mover_state,
+                durable,
+                false,
+                "A's loss kills the target's just-installed bridge",
+            )
+            .await;
+            mover_exited.store(false, Ordering::SeqCst); // B re-warms
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while mover_manager.base_url().await.is_none() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "B's re-warm must respawn the daemon within the budget"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // B's one-shot `Started` revival pass has run — and correctly
+            // SKIPPED the transitional (Handoff) owner: the bridge stays
+            // dead while B serves, with no recovery trigger left (the
+            // finding's unrecovered state, observed by the fixture before
+            // the commit proceeds).
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !session_serve_bridge_alive(&mover_state, durable).await,
+                "fixture: the Started revival pass skipped the Handoff owner — \
+                 the dead A-era bridge with no recovery trigger (ep2-r4)"
+            );
+            stage_release_tx.send(()).expect("release the parked stage");
+        });
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(20),
+            runner
+                .spawn_handoff(freshopencode_handoff_request(durable))
+                .completion,
+        )
+        .await
+        .expect("the handoff completes within the budget")
+        .expect("the runner task lives to answer");
+        mover.await.expect("the mover completed the interleaving");
+
+        // The operation's answer: SUCCESS (the recovery leg — the happy
+        // contract, not the typed-loss leg).
+        assert_eq!(
+            resp["ok"],
+            json!(true),
+            "the handoff answers success: {resp:?}"
+        );
+        await_freshagent_live(&registry, durable).await;
+
+        // THE BRIDGE: the handoff must not leave a dead A-generation
+        // bridge. RED on HEAD: plain success over the dead bridge.
+        assert!(
+            session_serve_bridge_alive(&st, durable).await,
+            "the handoff must not answer success over a dead A-generation \
+             bridge — the pre-commit loss left every recovery trigger spent \
+             and the commit's re-check is the only one left (ep2-r4)"
+        );
+        // The recovered bridge is stamped to the CURRENT (successor) daemon
+        // generation — not the dead A era.
+        {
+            let session_arc = st
+                .sessions
+                .lock()
+                .await
+                .get(durable)
+                .cloned()
+                .expect("the handoff target session is registered");
+            let session = session_arc.lock().await;
+            assert_eq!(
+                session.serve_bridge_daemon,
+                manager.ownership_id().await,
+                "the recovered bridge is stamped to the successor daemon B"
+            );
+        }
+
+        // The frames: the commit's re-check pushed EXACTLY ONE recovery
+        // snapshot for the actually-restarted bridge (the revival pass
+        // pushed none — it skipped the Handoff owner), exactly ONE typed
+        // loss edge reached the materialized session, and NO chime
+        // anywhere (a daemon loss is never a positive completion).
+        let mut all = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                && f["sessionId"].as_str() == Some(durable)
+        })
+        .await;
+        all.extend(drain_frames(&mut rx));
+        let pushes = all
+            .iter()
+            .filter(|f| {
+                is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                    && f["sessionId"].as_str() == Some(durable)
+            })
+            .count();
+        assert_eq!(
+            pushes, 1,
+            "exactly ONE recovery snapshot for the restarted bridge: {all:?}"
+        );
+        let edges = all
+            .iter()
+            .filter(|f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.error"
+                    && f["event"]["code"] == "OPENCODE_DAEMON_LOST"
+                    && f["sessionId"].as_str() == Some(durable)
+            })
+            .count();
+        assert_eq!(
+            edges, 1,
+            "exactly ONE typed loss edge for the target session: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .all(|f| f["event"]["type"] != "freshAgent.turn.complete"),
+            "a daemon loss is never a positive completion — no chime: {all:?}"
+        );
+        assert!(
+            manager.base_url().await.is_some(),
+            "fixture: the successor daemon B serves"
+        );
+    }
+
+    /// The ep2-r4 REFUSAL leg (the ep2-r3 discipline applied to the
+    /// runner's commit): a kill completing between the runner's `Live`
+    /// commit and its answer must surface the typed ownership-changed
+    /// failure — never plain success over the retired session. The
+    /// deterministic hold is the runner's own awaited STAGED FLAVOR
+    /// COMMIT (post-commit, pre-answer): the mover completes a REAL
+    /// `freshAgent.kill` while the runner is parked there; the commit's
+    /// re-check then refuses (the kill's teardown owns the cleanup — no
+    /// bridge install, no snapshot push, no re-own). RED on HEAD: the
+    /// runner answered ok:true with nothing re-checking after the commit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_between_the_handoff_commit_and_its_answer_fails_the_handoff_typed() {
+        let writer = Arc::new(ParkingFlavorWriter::default());
+        let (commit_entered_tx, commit_entered) = std::sync::mpsc::channel::<()>();
+        let (commit_release_tx, commit_release_rx) = tokio::sync::oneshot::channel::<()>();
+        writer
+            .commit_entered
+            .lock()
+            .expect("writer latch")
+            .replace(commit_entered_tx);
+        writer
+            .commit_release
+            .lock()
+            .expect("writer latch")
+            .replace(commit_release_rx);
+        // The daemon never dies here (the KILL is the mover) — a far re-warm
+        // budget keeps the background machinery out of the window.
+        let (st, runner, registry, mut rx, exited, manager) = handoff_selfheal_rig(
+            60_000,
+            120_000,
+            writer.clone() as crate::session_handoff::FlavorWriter,
+        )
+        .await;
+
+        let durable = "ses_ep2r4_refused";
+        commit_terminal_owner(&registry, durable).await;
+
+        let mover_state = st.clone();
+        let mover_registry = registry.clone();
+        let mover = tokio::spawn(async move {
+            commit_entered
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("the runner parks in the staged flavor commit (after the Live commit)");
+            // Fixture honesty: the handoff's Live{FreshAgent} commit has
+            // landed (the parked staged commit is strictly post-commit).
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if matches!(
+                    mover_registry.observe("opencode", durable).state,
+                    freshell_ownership::OwnershipState::Live { owner, .. }
+                        if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                ) {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the handoff's Live{{FreshAgent}} commit never landed"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // The concurrent kill, driven through the REAL path to
+            // completion — the mover's teardown owns the cleanup.
+            mover_state
+                .handle_kill(FreshAgentKill {
+                    provider: AgentProvider::Opencode,
+                    session_id: durable.to_string(),
+                    session_type: SessionType::Freshopencode,
+                    cwd: None,
+                    observed_epoch: None,
+                    observed_generation: None,
+                })
+                .await;
+            assert!(
+                !mover_state.has_live_session(durable).await,
+                "fixture: the kill removed every map key for the target session"
+            );
+            assert!(
+                !matches!(
+                    mover_registry.observe("opencode", durable).state,
+                    freshell_ownership::OwnershipState::Live { owner, .. }
+                        if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                ),
+                "fixture: the coordinator no longer holds the session Live{{FreshAgent}}"
+            );
+            commit_release_tx
+                .send(())
+                .expect("release the staged commit");
+        });
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(20),
+            runner
+                .spawn_handoff(freshopencode_handoff_request(durable))
+                .completion,
+        )
+        .await
+        .expect("the handoff completes within the budget")
+        .expect("the runner task lives to answer");
+        mover.await.expect("the mover completed the interleaving");
+
+        // THE outcome: the typed ownership-changed failure — never plain
+        // success over the retired session (RED on HEAD: ok:true).
+        assert_ne!(
+            resp["ok"],
+            json!(true),
+            "the handoff must not answer success over a session a concurrent \
+             kill retired between the commit and the answer (ep2-r4): {resp:?}"
+        );
+        assert_eq!(
+            resp["error"]["code"],
+            json!("STALE_GENERATION"),
+            "the refusal is the typed ownership-changed failure: {resp:?}"
+        );
+        assert_eq!(
+            resp["error"]["retryable"],
+            json!(true),
+            "the refusal is the canonical retryable race outcome: {resp:?}"
+        );
+
+        // NO resurrection: the refusal never installs a bridge and never
+        // pushes a snapshot — the kill's teardown owns the cleanup.
+        assert!(
+            !st.has_live_session(durable).await,
+            "the refusal never resurrected the retired session"
+        );
+        manager.dispatch_event(
+            freshell_opencode::events::parse_serve_event(&json!({
+                "type": "session.idle",
+                "properties": { "sessionID": durable }
+            }))
+            .expect("parseable serve event"),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let all = drain_frames(&mut rx);
+        assert!(
+            all.iter().all(
+                |f| !(is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                    && f["sessionId"].as_str() == Some(durable))
+            ),
+            "no recovery-snapshot push for the retired session: {all:?}"
+        );
+        assert!(
+            !all.iter().any(
+                |f| f["type"] == "freshAgent.event" && f["sessionId"].as_str() == Some(durable)
+            ),
+            "no resurrected bridge frame for the killed session: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .all(|f| f["event"]["type"] != "freshAgent.turn.complete"),
+            "no chime anywhere: {all:?}"
+        );
+        // The kill's coordinator commit stands — nothing re-owns the
+        // retired session.
+        assert!(
+            !matches!(
+                registry.observe("opencode", durable).state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            ),
+            "the kill's coordinator commit stands — the re-check never re-owns the session"
+        );
+        let _ = (exited, manager);
+    }
+
     /// LB-05 (falsified → redesign): in the incident, the pane's fenced
     /// attach was exercised 3× against the dead shared daemon and recovered
     /// NOTHING, because the attach tail only re-subscribed the bridge —
