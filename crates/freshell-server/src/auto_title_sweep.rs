@@ -232,18 +232,22 @@ fn sweep_session_key(provider: &str, session_id: &str) -> String {
     format!("{provider}:{session_id}")
 }
 
-/// Unified agent names (Task 4, review I3): the pass's KILROY-ONLY
-/// sessions — listing rows whose known metadata type is `kilroy` (kilroy
-/// shares the Claude runtime, so its transcripts list under provider
-/// `claude`) and whose live terminal matches hold NO scoped mode. A
-/// kilroy-only session never enters the naming authority or the
-/// generator merely because its provider is claude — it KEEPS the legacy
-/// ladder (the Global Constraint: kilroy retains its existing UI and
-/// generation behavior). The singular-record exception: a live terminal
-/// in a SUPPORTED mode (a resumed claude/codex/opencode CLI pane, a
-/// fresh scoped pane) means the identical durable session is also open
-/// through a supported mode, so its one canonical record stays with the
-/// authority — never a competing kilroy record.
+/// Unified agent names (Task 4, review I3; generalized by delta-review
+/// round 4, finding 1): the pass's KILROY-ONLY sessions, answered by the
+/// ONE shared seam ([`crate::kilroy_lane`]) every server surface consults —
+/// a session is kilroy-only iff the metadata store types it `kilroy` AND
+/// the naming authority holds no canonical record for it AND no live
+/// terminal runs it in a scoped mode. Kilroy shares the Claude runtime, so
+/// its transcripts list under provider `claude`; a kilroy-only session
+/// never enters the naming authority or the generator merely because its
+/// provider is claude — it KEEPS the legacy ladder (the Global Constraint:
+/// kilroy retains its existing UI and generation behavior). The
+/// singular-record component is the Global Constraint's other half: a
+/// durable session opened BOTH as kilroy and through a supported mode has
+/// ONE canonical name — the supported-mode record owns it (never a
+/// competing kilroy record), so a kilroy-typed row that already holds a
+/// canonical record stays in the authority lane and the legacy ladder
+/// never writes it a competing settings title.
 async fn kilroy_only_session_keys(
     state: &AutoTitleSweepState,
     sessions: &[SweepSession],
@@ -254,41 +258,32 @@ async fn kilroy_only_session_keys(
     if !has_scoped {
         return HashSet::new();
     }
-    // Batch-read the store's session types once per pass (cheap Arc/Mutex
-    // JSON — cached after the first load, shared with the POST route).
-    let types = state.metadata.get_all().await;
-    let mut keys = HashSet::new();
-    for s in sessions {
-        if freshell_freshagent::naming::named_provider_for(Some(&s.provider), None).is_none() {
-            continue;
-        }
-        let key = sweep_session_key(&s.provider, &s.session_id);
-        let kilroy_typed = types
-            .get(&key)
-            .and_then(|entry| entry.get("sessionType"))
-            .and_then(serde_json::Value::as_str)
-            == Some("kilroy");
-        if !kilroy_typed {
-            continue;
-        }
-        let live_scoped_terminal = state
-            .identity
-            .find_all_by_session(&s.provider, &s.session_id, s.cwd.as_deref())
-            .iter()
-            .any(|identity| {
-                state
-                    .registry
-                    .mode_of(&identity.terminal_id)
-                    .map(|mode| {
-                        freshell_freshagent::naming::is_unified_agent_mode(Some(&mode), None)
-                    })
-                    .unwrap_or(false)
-            });
-        if !live_scoped_terminal {
-            keys.insert(key);
-        }
-    }
-    keys
+    // One metadata read per pass (cheap Arc/Mutex JSON — cached after the
+    // first load, shared with the POST route), then the shared predicate.
+    let entries = state.metadata.get_all().await;
+    let candidates: Vec<crate::kilroy_lane::KilroyLaneCandidate> = sessions
+        .iter()
+        .filter(|s| {
+            freshell_freshagent::naming::named_provider_for(Some(&s.provider), None).is_some()
+        })
+        .map(|s| crate::kilroy_lane::KilroyLaneCandidate {
+            provider: s.provider.clone(),
+            session_id: s.session_id.clone(),
+            cwd: s.cwd.clone(),
+        })
+        .collect();
+    let naming = state
+        .names
+        .clone()
+        .map(|names| names as Arc<dyn SessionNaming>);
+    crate::kilroy_lane::kilroy_only_keys(
+        &entries,
+        naming.as_ref(),
+        &state.identity,
+        Some(&state.registry),
+        &candidates,
+    )
+    .await
 }
 
 /// Task 18: the sweep-time terminal-metadata refresh — Node's
@@ -2182,6 +2177,71 @@ mod tests {
                 .get("claude:s-kilroy")
                 .is_none(),
             "the singular scoped record keeps the ladder excluded"
+        );
+    }
+
+    /// Delta-review round 4, finding 1 (the seam's singular-record
+    /// component): a kilroy-typed row whose session ALREADY holds a
+    /// canonical record — with NO live scoped terminal — stays in the
+    /// naming-authority lane. The supported-mode record owns the session's
+    /// ONE singular name, so the legacy ladder never writes it a competing
+    /// settings title, and observed activity feeds the authority (arms
+    /// generation) exactly like any scoped row.
+    #[tokio::test]
+    async fn a_kilroy_typed_row_with_a_canonical_record_stays_in_the_authority_lane() {
+        let (_dir, names, state) = kilroy_sweep_state(true).await;
+        // The canonical record through the claude mode (the index-adopted
+        // hydration path) — the only live terminal is the non-scoped one
+        // `kilroy_sweep_state` registers, so the live-scoped-terminal
+        // component cannot be what keeps this row scoped.
+        names
+            .hydrate_indexed(
+                crate::session_name_generation::IndexedNameInput {
+                    provider: freshell_protocol::session_names::NamedProvider::Claude,
+                    session_id: "s-kilroy".to_string(),
+                    cwd: Some("/x/proj".to_string()),
+                    first_user_message: Some("Canonical first".to_string()),
+                    provider_title: None,
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        state
+            .index_hydrated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "claude",
+                "s-kilroy",
+                "/x/proj",
+                Some("A later scoped message"),
+            )],
+        )
+        .await;
+        // The legacy ladder never acquired a competing settings title.
+        assert!(
+            state
+                .settings
+                .session_overrides()
+                .get("claude:s-kilroy")
+                .is_none(),
+            "a record-holding kilroy-typed session keeps the ladder excluded"
+        );
+        // The authority keeps the session: the record survives with its
+        // name, and the later observed message fed the authority (armed
+        // generation) instead of the legacy ladder.
+        let record = naming_record(&names, scoped_session_ref("claude", "s-kilroy"))
+            .await
+            .expect("the canonical record keeps owning the session");
+        assert_eq!(record.record.name, "Canonical first");
+        assert!(
+            names
+                .generation_work_snapshot()
+                .iter()
+                .any(|item| item.target == scoped_session_ref("claude", "s-kilroy")),
+            "activity feeds the naming authority for a record-holding kilroy-typed row"
         );
     }
 }

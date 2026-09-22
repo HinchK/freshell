@@ -32,6 +32,7 @@ mod fresh_agent_extras;
 mod host_stats;
 mod identity_sink;
 mod instance_id;
+mod kilroy_lane;
 mod legacy_local_seed;
 mod logging;
 mod machines;
