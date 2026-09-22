@@ -14,12 +14,16 @@
 //! otherwise): a credit whose `attachRequestId` does not match the ACTIVE
 //! session is a stale generation (superseded or completed — ignored); a
 //! `consumedSeq` outside `(credited, page_end]` is out of window (ignored —
-//! no double-grant, no phantom grant past the last-sent page). A valid
-//! credit produces exactly ONE further replay page, so at most ONE
-//! unacknowledged page per (connection, terminal) exists at any time. Gap
-//! rounds continue within the same credit until a frame-carrying page is
-//! produced — an accepted credit always makes byte progress, never a
-//! zero-progress demand for more credit.
+//! no double-grant, no phantom grant past the last-sent page). The grant is
+//! STRICTLY page-end: an in-window value below the page end is a partial
+//! consumption report (observed as `partial_consumption`, grants nothing —
+//! the prior batch is not yet fully consumed); only `consumedSeq == page_end`
+//! produces exactly ONE further replay page, so at most ONE unacknowledged
+//! page per (connection, terminal) exists at any time and per-pane
+//! unacknowledged replay stays bounded by one page budget. Gap rounds
+//! continue within the same credit until a frame-carrying page is produced
+//! — an accepted credit always makes byte progress, never a zero-progress
+//! demand for more credit.
 //!
 //! When the cursor reaches the target, the accumulated live range
 //! `(target, head]` drains as ordinary delivery (pages, not credit-gated)
@@ -104,6 +108,10 @@ impl PacedSessions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CreditVerdict {
     Accepted,
+    /// In-window but below the last-sent page's end: honest consumption
+    /// progress the server records as an observation, but the prior batch
+    /// is not fully consumed, so it grants nothing.
+    PartialConsumption,
     StaleGeneration,
     BeyondWindow,
     NonNegotiated,
@@ -113,6 +121,7 @@ impl CreditVerdict {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Accepted => "accepted",
+            Self::PartialConsumption => "partial_consumption",
             Self::StaleGeneration => "stale_generation",
             Self::BeyondWindow => "beyond_window",
             Self::NonNegotiated => "non_negotiated",
@@ -122,6 +131,14 @@ impl CreditVerdict {
 
 /// Validate one credit against the session and, when valid, advance the
 /// credited cursor (the grant). Pure — the drive loop does the producing.
+///
+/// The grant is STRICTLY page-end: only a `consumed_seq` equal to the
+/// last-sent page's end produces the next page (the plan's credit rule —
+/// "Credit is granted only after the prior batch is consumed in order").
+/// An in-window value below the page end is a partial-consumption report:
+/// observed (`partial_consumption`), inert — at most ONE unacknowledged
+/// page per (connection, terminal) exists at any time, so per-pane
+/// unacknowledged replay stays bounded by one page budget.
 pub(crate) fn validate_credit(
     session: &mut PacedSession,
     credit: &TerminalReplayCredit,
@@ -131,6 +148,9 @@ pub(crate) fn validate_credit(
     }
     if credit.consumed_seq <= session.credited || credit.consumed_seq > session.page_end {
         return CreditVerdict::BeyondWindow;
+    }
+    if credit.consumed_seq < session.page_end {
+        return CreditVerdict::PartialConsumption;
     }
     session.credited = credit.consumed_seq;
     CreditVerdict::Accepted
@@ -420,24 +440,40 @@ mod tests {
     }
 
     #[test]
-    fn partial_consumption_within_the_page_window_grants_once() {
+    fn partial_page_credit_grants_nothing_until_the_page_end() {
         let mut session = session_fixture();
-        // consumedSeq inside (credited, page_end] — valid; production
-        // continues from the last-sent end, so no frame is ever re-sent.
+        // A mid-page consumption report is honest progress, but the prior
+        // batch is not fully consumed: the plan's credit rule ("Credit is
+        // granted only after the prior batch is consumed in order") means
+        // it must NOT produce the next page — at most ONE unacknowledged
+        // page may exist per (connection, terminal).
         assert_eq!(
             validate_credit(&mut session, &credit("arid-1", 30)),
-            CreditVerdict::Accepted
+            CreditVerdict::PartialConsumption
         );
-        assert_eq!(session.credited, 30);
         assert_eq!(
-            validate_credit(&mut session, &credit("arid-1", 30)),
-            CreditVerdict::BeyondWindow,
-            "the same value cannot grant twice"
+            session.credited, 10,
+            "a partial credit advances nothing"
         );
+        assert_eq!(session.page_end, 50, "a partial credit grants no page");
+        // Repeated partial reports (coalesced client ticks) stay inert.
+        assert_eq!(
+            validate_credit(&mut session, &credit("arid-1", 40)),
+            CreditVerdict::PartialConsumption
+        );
+        assert_eq!(session.credited, 10);
+        // The page-end value is the grant.
         assert_eq!(
             validate_credit(&mut session, &credit("arid-1", 50)),
             CreditVerdict::Accepted
         );
+        assert_eq!(session.credited, 50);
+        // The same value cannot grant twice (the double-grant guard).
+        assert_eq!(
+            validate_credit(&mut session, &credit("arid-1", 50)),
+            CreditVerdict::BeyondWindow
+        );
+        assert_eq!(session.credited, 50);
     }
 
     #[test]

@@ -798,6 +798,82 @@ async fn negotiated_attach_gets_first_page_only_and_credit_gates_the_rest() {
     assert_eq!(next["source"], "replay");
 }
 
+/// A PARTIAL-PAGE credit (a consumedSeq inside the outstanding page, below
+/// its end) grants NOTHING on the wire: the server observes it as
+/// `partial_consumption` and produces no page — only the page-end value
+/// produces the next page (the one-unacknowledged-page bound).
+#[tokio::test]
+async fn partial_page_credit_on_the_wire_grants_nothing_until_the_page_end() {
+    let events = global_capture();
+    let ring = 512 * 1024;
+    let url = spawn_server(ring).await;
+    let mut driver = connect(&url).await;
+    hello(&mut driver, false).await;
+    let terminal_id = create_shell_terminal(&mut driver, "create-partial-credit").await;
+    flood_until_complete(&url, &mut driver, &terminal_id, 700).await;
+
+    let mut paced = connect(&url).await;
+    hello(&mut paced, true).await;
+    let (ready, page1) = paced_attach_first_page(&mut paced, &terminal_id, "attach-partial").await;
+    let head = ready["headSeq"].as_i64().expect("headSeq");
+    let last_seq = page1
+        .iter()
+        .map(|f| f["seqEnd"].as_i64().unwrap_or(0))
+        .max()
+        .expect("the first page covers something");
+    assert!(last_seq < head, "the session starts mid-replay");
+
+    // Two partial consumption reports inside the outstanding page: observed,
+    // inert — no page may arrive for either.
+    credit(&mut paced, &terminal_id, "attach-partial", last_seq - 2).await;
+    let after_partial1 = next_json_or_timeout(&mut paced, Duration::from_millis(1200)).await;
+    assert!(
+        after_partial1
+            .as_ref()
+            .map(|v| v.get("type").and_then(|t| t.as_str()) != Some("terminal.output"))
+            .unwrap_or(true),
+        "a partial-page credit must produce no page, got {after_partial1:?}"
+    );
+    credit(&mut paced, &terminal_id, "attach-partial", last_seq - 1).await;
+    let after_partial2 = next_json_or_timeout(&mut paced, Duration::from_millis(1200)).await;
+    assert!(
+        after_partial2
+            .as_ref()
+            .map(|v| v.get("type").and_then(|t| t.as_str()) != Some("terminal.output"))
+            .unwrap_or(true),
+        "repeated partial credits must stay inert, got {after_partial2:?}"
+    );
+    let partial_event = wait_for_restore_event(
+        &events,
+        &terminal_id,
+        "ws.restore.credit",
+        "status",
+        "partial_consumption",
+    )
+    .await
+    .expect("the partial credit is observed as partial_consumption");
+
+    // The page-end value grants: the next page arrives.
+    credit(&mut paced, &terminal_id, "attach-partial", last_seq).await;
+    let next = next_json(&mut paced).await;
+    assert_eq!(
+        next["type"], "terminal.output",
+        "the page-end credit produces the next page: {next}"
+    );
+    assert_eq!(next["attachRequestId"], "attach-partial");
+    assert!(
+        next["seqEnd"].as_i64().unwrap_or(0) > last_seq,
+        "pages ascend after the grant"
+    );
+    assert_eq!(
+        partial_event
+            .fields
+            .get("terminal_id")
+            .map(String::as_str),
+        Some(terminal_id.as_str())
+    );
+}
+
 /// Live output produced DURING the paced replay is delivered strictly after
 /// the pages covering it, in seq order, with no loss or duplication — the
 /// hard "no overtaking" invariant, end to end.
