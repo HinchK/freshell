@@ -737,7 +737,7 @@ git commit -m "feat(ws): spawn_stuck_monitor broadcasts terminal.stuck transitio
   - `terminalLifecycleSlice` state: `stuckAtByPaneId: Record<string, { at: number; terminalId: string }>` (LB-8: store the flagged terminalId WITH the entry — terminalId churn happens exactly on kill/respawn/replacement, which is when a prior flag is stale); reducers `recordTerminalStuck({paneId, terminalId, at})`, `clearTerminalStuck({paneId})`, and `clearTerminalStuckIfOtherTerminal({paneId, terminalId})` (delete the entry only when `stuck.terminalId !== payload.terminalId`); `recordTerminalExit`, `clearTerminalLifecycle`, and `foldTerminalReplacement` also delete/clear the pane's stuck entry (one-line belts; `foldTerminalReplacement` keys the clear on `newTerminalId`).
   - `applyTerminalStuck` thunk: parse with `TerminalStuckSchema`, resolve pane via `selectTabPaneByTerminalId`, dispatch record/clear. NEVER dispatches `turnCompletion/*`.
   - `TerminalStuckCard` presentational component: props `{ mode: string; onRestart: () => void; onStartFresh: () => void }`.
-  - `TerminalView`: `restartStuckAgentPane()` (kill-await → `resetPaneForReconcileCreate({tabId, paneId, intent: 'respawn', sessionRef})`) and `startFreshFromStuckPane()` (kill-await → intent `'fresh'`), plus the render gate: `mode !== 'shell' && terminalContent.status === 'running' && stuckAtByPaneId[paneId] !== undefined`.
+  - `TerminalView`: `restartStuckAgentPane()` (kill-await → `resetPaneForReconcileCreate({tabId, paneId, intent: 'respawn', sessionRef})`) and `startFreshFromStuckPane()` (kill-await with the DEFAULT durable-close kill — NO `reason` on the wire, so the abandoned session's identity is retired like any pane close — then, after the ack, a pane-identity REMINT via `updateContent`: fresh-nanoid `createRequestId`, live handles + session identity cleared, status `'creating'`; NOT `resetPaneForReconcileCreate`, because the durable close journaled the old `createRequestId` and a preserved identity would inherit the closed state), plus the render gate: `mode !== 'shell' && terminalContent.status === 'running' && stuckAtByPaneId[paneId] !== undefined`.
   - Clear-on-adoption call site (LB-8): in `TerminalView`'s `terminal.created` fold (4625-4777), immediately after the `updateContent({...})` dispatch ending at 4697: `dispatch(clearTerminalStuckIfOtherTerminal({ paneId: paneIdRef.current, terminalId: newId }))` — the flagged row is gone server-side (kill_internal removes it; a detached row has no subscriber to see the exit), so no `stuck:false` can ever arrive for it; a genuinely wedged replacement re-flags via the next sweep broadcast or the attach-time emission (self-healing, never flag-swallowing).
 
 - [ ] **Step 1: Write the failing tests**
@@ -802,14 +802,18 @@ it('invokes the callbacks', () => { /* click both */ })
 //   terminal keeps running.
 // E (advisory guard): restart bails when an opencode durable replacement is
 //   in flight (pendingDurableReplacementRef set) — assert no kill is sent.
-// F (start-fresh behavioral coverage — round-2 review Major): click "Start
-//   fresh conversation" → assert the kill-await runs with reason
-//   'stuck-recovery' (same A1 assertion), then on the success ack assert
-//   exactly ONE resetPaneForReconcileCreate with intent 'fresh'
-//   (pendingReconcile 'fresh', sessionRef cleared per the fresh semantics);
-//   and the kill-failure arm keeps the pane and card (same C shape). This
-//   pins that the second required action cannot silently skip the process
-//   kill or mis-wire the intent.
+// F (start-fresh behavioral coverage — round-2 review Major; close
+//   semantics corrected by the round-3 delta review): click "Start
+//   fresh conversation" → assert the kill-await runs with the DEFAULT
+//   durable-close kill (NO reason on the wire — unlike A1's
+//   'stuck-recovery'), then on the success ack assert exactly ONE
+//   pane-identity REMINT: a fresh createRequestId with the session
+//   identity cleared and status 'creating' (and NO
+//   resetPaneForReconcileCreate — the durable close journaled the old
+//   createRequestId, so a preserved identity would inherit the retired
+//   one); and the kill-failure arm keeps the pane and card (same C
+//   shape). This pins that the second required action cannot silently
+//   skip the process kill or re-use the retired identity.
 ```
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
@@ -865,10 +869,15 @@ const restartStuckAgentPane = useCallback(async () => {
   dispatch(clearTerminalLifecycle({ paneId }))
   dispatch(resetPaneForReconcileCreate({ tabId, paneId, intent: 'respawn', sessionRef: terminalContent.sessionRef }))
 }, [/* deps */])
-// startFreshFromStuckPane: same kill-await (reason:'stuck-recovery' — even a
-// fresh conversation must not corrupt the durable session's close state),
-// then intent 'fresh' (mirrors startFreshConversation, TerminalView.tsx:5917-5926).
-// The await-first order is load-bearing: the reconcile reset must not fire
+// startFreshFromStuckPane: kill-await with the DEFAULT durable-close kill
+// (NO reason on the wire — the user is abandoning the conversation, so its
+// identity is retired like any pane close), then, after the ack, the
+// pane-identity REMINT: fresh-nanoid createRequestId, live handles + session
+// identity cleared, status 'creating' (the terminal lane's
+// clearTerminalContentForRecreate semantics, NOT resetPaneForReconcileCreate
+// — the durable close journaled the old createRequestId, and a preserved
+// identity would inherit the closed state and be omitted from recovery).
+// The await-first order is load-bearing: the reset/remint must not fire
 // before the correlated terminal.killed resolves (pinned by matrix A/B in the
 // test step).
 ```
@@ -901,6 +910,8 @@ Expected: PASS. Then `npm run typecheck:client 2>&1 | tail -3` — Expected: PAS
 git add src/components/TerminalStuckCard.tsx src/components/TerminalView.tsx src/store/terminalLifecycleSlice.ts src/store/turnCompletionThunks.ts src/App.tsx src/lib/kill-ack.ts test/unit/client
 git commit -m "feat(client): Agent-appears-stuck card for terminal-mode agent panes with kill+restart actions"
 ```
+
+**Round-3 delta-review amendment:** the review loop corrected Task 4's start-fresh close semantics after the sketches were written. Start-fresh sends the DEFAULT durable-close kill (no `reason` field — the abandoned session is retired + tombstoned, mirroring the freshcodex `startNewConversation` twin), awaits the correlated `terminal.killed` ack, then REMINTS the pane identity (fresh-nanoid `createRequestId`, session identity cleared, status `'creating'`) instead of `resetPaneForReconcileCreate({intent:'fresh'})` — the durable close journaled the old `createRequestId`, so a preserved identity would inherit the closed state and recovery would omit the new conversation. The Produces entry, the handler sketch's comment, and matrix arm F above state the corrected contract; the other code blocks remain pre-implementation history per this plan's rules.
 
 ---
 
