@@ -176,6 +176,15 @@ pub struct FreshOpencodeState {
     /// Never compiled into production builds. See [`Self::arm_rescue_stall`].
     #[cfg(test)]
     rescue_stall: Arc<StdMutex<Option<RescueStallGate>>>,
+    /// ep2-r5 test seam (`cfg(test)`-only): when armed for a durable id, the
+    /// post-commit rescue tail parks BEFORE its map re-lookup — the window
+    /// where a same-key kill+replace can complete while the rescue is in
+    /// flight, so the re-lookup then observes whichever session (the
+    /// original or a replacement) the mover left under the key. Never
+    /// compiled into production builds. See
+    /// [`Self::arm_rescue_lookup_stall`].
+    #[cfg(test)]
+    rescue_lookup_stall: Arc<StdMutex<Option<RescueStallGate>>>,
 }
 
 /// The armed rescue-stall gate's state (ep2-r3 test seam, `cfg(test)`-only).
@@ -609,6 +618,8 @@ impl FreshOpencodeState {
             daemon_loss_watcher: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
             rescue_stall: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            rescue_lookup_stall: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -697,6 +708,45 @@ impl FreshOpencodeState {
         }
     }
 
+    /// Arm the `cfg(test)`-only PRE-LOOKUP rescue stall (ep2-r5): the
+    /// post-commit rescue tail for `durable` fires `entered` BEFORE its
+    /// map re-lookup, then parks until the test sends on `release` — the
+    /// deterministic interleaving point for "a kill and a same-key
+    /// replacement resume complete while the rescue is in flight" (the
+    /// re-lookup below then finds whichever session the mover left under
+    /// the key). One-shot per arming.
+    #[cfg(test)]
+    fn arm_rescue_lookup_stall(&self, durable: &str) -> RescueStallHandles {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self
+            .rescue_lookup_stall
+            .lock()
+            .expect("rescue lookup stall mutex") = Some(RescueStallGate {
+            key: durable.to_string(),
+            entered_tx,
+            release_rx: StdMutex::new(Some(release_rx)),
+        });
+        RescueStallHandles {
+            entered,
+            release: release_tx,
+        }
+    }
+
+    /// Take the armed pre-lookup rescue stall for `durable`, if it matches
+    /// (one-shot; `cfg(test)`-only, ep2-r5).
+    #[cfg(test)]
+    fn take_rescue_lookup_stall(&self, durable: &str) -> Option<RescueStallGate> {
+        let mut guard = self
+            .rescue_lookup_stall
+            .lock()
+            .expect("rescue lookup stall mutex");
+        match guard.as_ref() {
+            Some(g) if g.key == durable => guard.take(),
+            _ => None,
+        }
+    }
+
     /// kata b8ke Task 3: begin this lane's coordinator claim. See
     /// [`crate::ownership_lane::begin_lane_claim`].
     fn begin_lane_claim_at(
@@ -743,6 +793,28 @@ impl FreshOpencodeState {
             // (OpenCode invariant).
             None,
         )
+    }
+
+    /// The post-commit rescue's committed fence (fresheyes ep2-r5): the
+    /// `(epoch, generation)` pair the lane's own claim committed `Live`
+    /// under — the registry's boot epoch and the ticket's generation
+    /// (the exact generation `commit_live` lands at, so a still-own
+    /// coordinator observation reports the SAME pair back). `None` when
+    /// the coordinator is unwired or the caller holds no ticket (the
+    /// under-ticket handoff continuation — the runner's single `Live`
+    /// commit is still ahead — or the unwired lane, where no
+    /// coordinator observation exists to fence against).
+    fn committed_lane_fence(
+        ownership: &Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
+        ticket: Option<&freshell_ownership::OperationTicket>,
+    ) -> Option<freshell_ownership::ObservedFence> {
+        match (ownership.as_ref(), ticket) {
+            (Some(registry), Some(ticket)) => Some(freshell_ownership::ObservedFence {
+                epoch: registry.boot_epoch(),
+                generation: ticket.generation(),
+            }),
+            _ => None,
+        }
     }
 
     /// The initiator label for a coordinator transition event: the
@@ -2607,7 +2679,7 @@ impl FreshOpencodeState {
         cwd: Option<&str>,
         operation_id: &str,
         generation: u64,
-    ) -> Result<freshell_ownership::OwnerIdentity, (String, String)> {
+    ) -> Result<(freshell_ownership::OwnerIdentity, OpencodeSessionHandle), (String, String)> {
         match self
             .resume_durable_session(
                 session_id,
@@ -2618,15 +2690,22 @@ impl FreshOpencodeState {
             )
             .await
         {
-            Ok(_session) => Ok(freshell_ownership::OwnerIdentity {
-                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
-                terminal_id: None,
-                live_session_key: Some(session_id.to_string()),
-                // OpenCode invariant: the shared serve daemon is not the
-                // per-session writer — never a kill target, never the pid.
-                pid: None,
-                ownership_id: None,
-            }),
+            // ep2-r5: the under-ticket resume hands its committed session
+            // INSTANCE out with the identity — the runner's post-commit
+            // rescue re-check verifies this exact `Arc` against the map
+            // (a same-key replacement can never satisfy it).
+            Ok(session_arc) => Ok((
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some(session_id.to_string()),
+                    // OpenCode invariant: the shared serve daemon is not the
+                    // per-session writer — never a kill target, never the pid.
+                    pid: None,
+                    ownership_id: None,
+                },
+                OpencodeSessionHandle::new(session_arc),
+            )),
             Err(ResumeOpencodeError::NotFound) => Err((
                 "opencode session not known to the shared serve".to_string(),
                 session_id.to_string(),
@@ -4447,10 +4526,14 @@ impl FreshOpencodeState {
         child_session.real_session_id = Some(child.id.clone());
         self.install_serve_bridge(&manager, &mut child_session, &child.id)
             .await;
+        // ep2-r5: bind the child's session INSTANCE — the fork's rescue
+        // verifies this exact `Arc` against the map (a same-key
+        // replacement for the child can never satisfy it).
+        let child_session_arc = Arc::new(TokioMutex::new(child_session));
         self.sessions
             .lock()
             .await
-            .insert(child.id.clone(), Arc::new(TokioMutex::new(child_session)));
+            .insert(child.id.clone(), child_session_arc.clone());
 
         // P1.13: binding row for the child (the materialization record pattern,
         // `_pattern :600-626`) — AWAITED BEFORE the forked reply
@@ -4580,9 +4663,18 @@ impl FreshOpencodeState {
         // answers the stale-commit ownership-changed error frame instead:
         // never a successful forked reply over a retired child, and never
         // a resurrected bridge for it either.
+        // ep2-r5: the refusal set now includes a same-key REPLACEMENT for
+        // the child — the rescue is bound to the fork's committed instance
+        // and the child's committed (epoch, generation) fence, so it can
+        // only ever verify the fork's own child.
         if matches!(
-            self.rescue_transitional_bridge_after_commit(&child.id, false)
-                .await,
+            self.rescue_transitional_bridge_after_commit(
+                &child.id,
+                false,
+                &OpencodeSessionHandle::new(child_session_arc),
+                Self::committed_lane_fence(&self.fresh_agent.ownership, own_ticket.as_ref()),
+            )
+            .await,
             TransitionalBridgeRescue::Refused
         ) {
             reply_sink(event_frame(
@@ -6111,9 +6203,20 @@ impl FreshOpencodeState {
         // coordinator observation is skipped for exactly that leg (the
         // runner performs the one `commit_live`); the killed check and the
         // map re-lookup remain its gates.
+        // ep2-r5: the refusal set now includes a same-key REPLACEMENT —
+        // the rescue is bound to THIS resume's committed instance (the
+        // `session_arc` it returns below, so a replacement under the key
+        // can never be adopted and the retired `Arc` can never be handed
+        // back) and, for the own-commit leg, the resume's committed
+        // (epoch, generation) fence.
         if matches!(
-            self.rescue_transitional_bridge_after_commit(session_id, handoff.is_some())
-                .await,
+            self.rescue_transitional_bridge_after_commit(
+                session_id,
+                handoff.is_some(),
+                &OpencodeSessionHandle::new(Arc::clone(&session_arc)),
+                Self::committed_lane_fence(&self.fresh_agent.ownership, own_ticket.as_ref()),
+            )
+            .await,
             TransitionalBridgeRescue::Refused
         ) {
             return Err(ResumeOpencodeError::Manager(
@@ -6560,6 +6663,33 @@ impl FreshOpencodeState {
     /// the successor's `Started` revival pass skips the transitional
     /// owner, and the commit itself emits no new daemon signal).
     ///
+    /// **ep2-r5 hardening — the rescue is bound to the identity the
+    /// CALLER committed, never to whichever session currently occupies
+    /// the durable id**: every caller passes its committed session
+    /// instance ([`OpencodeSessionHandle`]) and its committed ownership
+    /// fence (the `(epoch, generation)` pair observed at ITS commit).
+    /// The by-id map re-lookup must return the SAME instance
+    /// (`Arc::ptr_eq` against the caller's handle) — a same-key
+    /// REPLACEMENT (the original killed/removed and another resume's
+    /// brand-new session object under the same durable id, moved in
+    /// during the awaited post-commit work) is a different instance and
+    /// REFUSES, never gets adopted — and, when the coordinator gates
+    /// the call, the canonical observation must still hold the CALLER's
+    /// OWN committed `(epoch, generation)` era: a replacement's
+    /// same-kind `Live{FreshAgent}` at a NEWER generation refuses too
+    /// (the kind-only expected-owner check alone accepted it — the
+    /// finding's exact hole). On either mismatch the outcome is
+    /// [`TransitionalBridgeRescue::Refused`]: the operation surfaces its
+    /// typed ownership-changed error, never answers success carrying its
+    /// obsolete generation, and never restarts a bridge on the retired
+    /// instance (the resume caller would otherwise hand back its
+    /// removed-and-killed `Arc`). The under-ticket pre-commit leg
+    /// (`own_lifecycle_window = true`) passes no fence — the runner's
+    /// `Live` commit is still ahead — so the instance binding, the
+    /// killed check, and the map re-lookup remain its gates; the
+    /// post-commit callers (the fork/resume tails, the handoff runner's
+    /// re-check) always carry the committed fence.
+    ///
     /// A [`TransitionalBridgeRescue::Refused`] never installs and never
     /// pushes: the mover's teardown owns the cleanup (the kill/handoff
     /// paths remove every key, set the killed flag, and abort the bridge
@@ -6574,7 +6704,28 @@ impl FreshOpencodeState {
         &self,
         durable: &str,
         own_lifecycle_window: bool,
+        committed: &OpencodeSessionHandle,
+        committed_fence: Option<freshell_ownership::ObservedFence>,
     ) -> TransitionalBridgeRescue {
+        // ep2-r5 test seam (`cfg(test)`-only): park BEFORE the map
+        // re-lookup — the window where a test can complete a same-key
+        // kill+replace while the rescue is in flight, so the re-lookup
+        // below then observes whichever session the mover left under the
+        // key. See [`Self::arm_rescue_lookup_stall`].
+        #[cfg(test)]
+        if let Some(gate) = self.take_rescue_lookup_stall(durable) {
+            let _ = gate.entered_tx.send(());
+            // Take the release receiver OUT of its Mutex before awaiting —
+            // the std guard is not Send and must not live across the await.
+            let release = gate
+                .release_rx
+                .lock()
+                .expect("rescue lookup stall latch mutex")
+                .take();
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+        }
         // (a) The fresh map re-lookup — the retained-claim-alone rule (the
         // revival pass's (3a)): a session whose map keys are gone was
         // killed/handed off mid-operation and its teardown already aborted
@@ -6586,6 +6737,19 @@ impl FreshOpencodeState {
         let Some(session_arc) = session_arc else {
             return TransitionalBridgeRescue::Refused;
         };
+        // (a′) The committed-INSTANCE binding (ep2-r5): the re-lookup must
+        // return the SAME session instance the caller committed —
+        // `Arc::ptr_eq` against the caller's handle. A replacement resume
+        // under the same durable id is a brand-new object: adopting it
+        // would answer the operation's success over ITS OWN retired
+        // session while the replacement lives under the key (and the
+        // resume caller would hand back its removed-and-killed `Arc` for a
+        // later bridge restart). Refuse — the mover's teardown owns the
+        // original's cleanup and the replacement's own lifecycle owns the
+        // key now.
+        if !committed.ptr_eq(&session_arc) {
+            return TransitionalBridgeRescue::Refused;
+        }
         // ep2-r3 test seam (`cfg(test)`-only): park the rescue in the exact
         // window the fresheyes finding names — the session `Arc` is CLONED
         // and the session lock is not yet taken — so a test can complete a
@@ -6620,6 +6784,30 @@ impl FreshOpencodeState {
                 freshell_ownership::OwnershipState::Live { owner, .. }
                     if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent =>
                 {
+                    // (b′) The committed-FENCE binding (ep2-r5): the
+                    // coordinator must still hold the CALLER's OWN era —
+                    // the observed `(epoch, generation)` must EQUAL the
+                    // pair the caller committed, not merely be a
+                    // same-kind Live. A replacement resume committed at a
+                    // strictly newer per-key generation (generations are
+                    // monotonic and never reset), so the equality refuses
+                    // exactly the shape the kind-only check accepted
+                    // before.
+                    let Some(committed_fence) = committed_fence else {
+                        // A post-commit rescue over a WIRED coordinator
+                        // with no committed fence has no era to verify —
+                        // fail closed, never restart into an unverified
+                        // ownership window. Unreachable for the real
+                        // callers (a wired registry grants every
+                        // own-commit caller a ticket; the handoff runner
+                        // always carries its committed pair).
+                        return TransitionalBridgeRescue::Refused;
+                    };
+                    if snap.epoch != committed_fence.epoch
+                        || snap.generation != committed_fence.generation
+                    {
+                        return TransitionalBridgeRescue::Refused;
+                    }
                     let expected = freshell_ownership::OwnerIdentity {
                         kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
                         terminal_id: None,
@@ -6713,13 +6901,45 @@ pub(crate) enum TransitionalBridgeRescue {
     RespawnFailed,
     /// The session was retired or transitioned between the commit and the
     /// tail — its map keys are gone (a kill/handoff removed them), its
-    /// `killed` flag is set under the session lock, or the canonical
-    /// ownership no longer says `Live{FreshAgent}` (and is not this
-    /// operation's own lifecycle window): NEVER resurrect. The mover's
-    /// teardown owns the cleanup; the operation must surface its typed
-    /// ownership-changed error instead of answering success over the
-    /// retired session.
+    /// `killed` flag is set under the session lock, the map key now holds
+    /// a DIFFERENT session instance than the caller committed (a same-key
+    /// replacement), or the canonical ownership no longer holds the
+    /// caller's committed `(epoch, generation)` era (and is not this
+    /// operation's own lifecycle window): NEVER resurrect, never adopt
+    /// the replacement, never answer success carrying an obsolete
+    /// generation. The mover's teardown owns the cleanup; the operation
+    /// must surface its typed ownership-changed error instead of
+    /// answering success over the retired session.
     Refused,
+}
+
+/// An opaque handle to ONE live freshopencode session instance (fresheyes
+/// ep2-r5): identity is the `Arc` pointer itself, so a same-key
+/// REPLACEMENT — another resume's brand-new session object under the
+/// SAME durable id — can never masquerade as the instance a caller
+/// committed. The handoff runner carries this out of its under-ticket
+/// resume (the Ok payload of
+/// [`FreshOpencodeState::opencode_resume_for_handoff`] → `start_target`)
+/// and hands it back to
+/// [`FreshOpencodeState::rescue_transitional_bridge_after_commit`],
+/// which verifies it with `Arc::ptr_eq` against the sessions map's
+/// current entry. The wrapped [`OpencodeSession`] stays private to this
+/// module; the runner only ever passes the handle through.
+#[derive(Clone)]
+pub(crate) struct OpencodeSessionHandle(Arc<TokioMutex<OpencodeSession>>);
+
+impl OpencodeSessionHandle {
+    /// Wrap the session instance a caller is committing (or has just
+    /// committed) under its durable id.
+    fn new(instance: Arc<TokioMutex<OpencodeSession>>) -> Self {
+        Self(instance)
+    }
+
+    /// The committed-instance binding (ep2-r5): true iff `current` IS the
+    /// session instance this handle was minted from.
+    fn ptr_eq(&self, current: &Arc<TokioMutex<OpencodeSession>>) -> bool {
+        Arc::ptr_eq(&self.0, current)
+    }
 }
 
 /// ISO-8601 / RFC-3339 millis-Z timestamp (matches `new Date().toISOString()`) for error
@@ -11092,11 +11312,26 @@ mod tests {
             },
         );
 
-        let owner = st
+        let (owner, committed_instance) = st
             .opencode_resume_for_handoff("ses_r27_oc", None, "handoff-op-r27", 9)
             .await
             .expect("the under-ticket target resume succeeds");
         assert_eq!(owner.kind, freshell_ownership::RuntimeOwnerKind::FreshAgent);
+        // ep2-r5: the under-ticket resume carries its committed session
+        // INSTANCE out with the identity — the exact `Arc` registered
+        // under the durable id (the runner's post-commit rescue re-check
+        // binds to it).
+        let registered = st
+            .sessions
+            .lock()
+            .await
+            .get("ses_r27_oc")
+            .cloned()
+            .expect("the under-ticket resume registered the target session");
+        assert!(
+            committed_instance.ptr_eq(&registered),
+            "the carried handle IS the registered session instance (ep2-r5)"
+        );
 
         let bindings = fake.bindings.lock().unwrap();
         let last = bindings
@@ -20260,6 +20495,377 @@ mod tests {
                     if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
             ),
             "the kill's coordinator commit stands — the re-check never re-owns the session"
+        );
+        let _ = (exited, manager);
+    }
+
+    // ── fresheyes ep2-r5: the rescue is bound to the committed session
+    // instance and ownership fence, never to a same-key replacement ──
+
+    /// fresheyes ep2-r5 Major (the rescue adopts a same-key replacement
+    /// for the committed session): the post-commit rescue verified
+    /// whichever session currently occupies the durable id — not the
+    /// session INSTANCE and ownership GENERATION the caller committed. A
+    /// kill that removes the committed session followed by another
+    /// freshopencode resume under the SAME durable id leaves a brand-new
+    /// session object under the key, committed Live at a NEWER
+    /// generation; the rescue's by-id lookup obtained the replacement
+    /// `Arc`, the kind-only ownership check accepted the replacement's
+    /// era, and the rescue answered Healthy — after which the resume
+    /// handed back its own removed-and-killed `Arc` for the attach
+    /// caller to restart a bridge on.
+    ///
+    /// The interleaving, forced deterministically through the
+    /// `cfg(test)` PRE-LOOKUP rescue stall: the original resume's
+    /// post-commit rescue fires `entered` BEFORE its map re-lookup and
+    /// parks; while held, a REAL `freshAgent.kill` of the committed
+    /// session COMPLETES and a REAL replacement resume installs a
+    /// brand-new instance under the same key (asserted: a strictly newer
+    /// Live generation); only then is the rescue released — its
+    /// re-lookup now finds the REPLACEMENT. The resume must REFUSE —
+    /// the typed ownership-changed error, never `Ok` over the retired
+    /// instance — and the refusal must leave the replacement untouched
+    /// (its registration, bridge, and era stand; the mover's own
+    /// lifecycle owns the key now). Pre-fix, the rescue adopted the
+    /// same-kind replacement and the resume answered `Ok` with the
+    /// retired `Arc`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replacement_resume_under_the_killed_key_fails_the_original_resume_typed() {
+        // The selfheal fixture answers the cold resumes' GET /session/:id;
+        // the daemon never dies (the KILL+REPLACE is the mover). The
+        // coordinator IS wired — the committed-fence leg is half the
+        // finding, and the committed-instance leg must hold either way.
+        let (mut st, _rx, exited, spawns, _manager) = selfheal_state(60_000, 120_000).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        let durable = "ses_ep2r5_resume";
+        // Park the ORIGINAL resume's post-commit rescue BEFORE its map
+        // re-lookup — the exact window the finding names (the mover
+        // completes while the rescue is in flight).
+        let stall = st.arm_rescue_lookup_stall(durable);
+        let st2 = st.clone();
+        let original = tokio::spawn(async move {
+            st2.resume_durable_session(durable, None, None, None, None)
+                .await
+        });
+
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the rescue parks before its map re-lookup");
+
+        // Fixture honesty: the parked rescue is strictly POST-COMMIT —
+        // the original resume's own Live commit has landed; record its
+        // era (the committed fence the rescue must still find).
+        let committed_generation = match registry.observe("opencode", durable) {
+            freshell_ownership::OwnershipSnapshot {
+                generation,
+                state: freshell_ownership::OwnershipState::Live { owner, .. },
+                ..
+            } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent => generation,
+            snap => panic!("the original resume committed Live: {snap:?}"),
+        };
+
+        // The mover, part 1: a REAL kill of the committed session, driven
+        // through the REAL path to completion (the durable close, every
+        // map key, the killed flag, the bridge abort, Stopping→Vacant).
+        st.handle_kill(FreshAgentKill {
+            provider: AgentProvider::Opencode,
+            session_id: durable.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+            observed_epoch: None,
+            observed_generation: None,
+        })
+        .await;
+        assert!(
+            !st.has_live_session(durable).await,
+            "fixture: the kill removed the committed session's map key"
+        );
+        assert!(
+            !matches!(
+                registry.observe("opencode", durable).state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            ),
+            "fixture: the kill vacated the coordinator key"
+        );
+
+        // The mover, part 2: a REAL replacement resume installs a
+        // BRAND-NEW instance under the SAME durable id and commits it
+        // Live at a strictly newer generation — the finding's same-key
+        // replacement.
+        let replacement = match st
+            .resume_durable_session(durable, None, None, None, None)
+            .await
+        {
+            Ok(arc) => arc,
+            Err(ResumeOpencodeError::Manager(err)) => panic!(
+                "fixture: the replacement resume commits a fresh instance under the vacated key: {err:?}"
+            ),
+            Err(ResumeOpencodeError::NotFound) => {
+                panic!("fixture: the replacement resume found no serve row")
+            }
+            Err(ResumeOpencodeError::Reserved) => {
+                panic!("fixture: the replacement resume hit a reserved key")
+            }
+        };
+        assert!(
+            st.has_live_session(durable).await,
+            "fixture: the replacement session is registered"
+        );
+        let replacement_generation = match registry.observe("opencode", durable) {
+            freshell_ownership::OwnershipSnapshot {
+                generation,
+                state: freshell_ownership::OwnershipState::Live { owner, .. },
+                ..
+            } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent => generation,
+            snap => panic!("the replacement resume committed Live: {snap:?}"),
+        };
+        assert!(
+            replacement_generation > committed_generation,
+            "the replacement's era is a strictly newer generation than the committed fence"
+        );
+        // The retired-vs-replacement identity is the RESCUE's job, not the
+        // fixture's; the replacement's own Arc is only fixture honesty.
+        let _ = replacement;
+
+        // Release the parked rescue: its re-lookup now finds the
+        // REPLACEMENT under the key. Only the committed-instance binding
+        // and the committed-fence check can refuse it.
+        stall.release.send(()).expect("release the parked rescue");
+        let out = original.await.expect("the original resume settles");
+
+        // THE outcome: the typed ownership-changed refusal — never Ok
+        // over the retired original instance (pre-fix: the rescue
+        // adopted the same-kind replacement, answered Healthy, and the
+        // resume returned its own removed-and-killed `Arc`).
+        match out {
+            Err(ResumeOpencodeError::Manager(freshell_opencode::ServeError::Transport(msg))) => {
+                assert!(
+                    msg.contains("ownership changed during resume"),
+                    "the typed refusal names the ownership change: {msg}"
+                );
+            }
+            Err(ResumeOpencodeError::Manager(err)) => {
+                panic!("the refusal must be the ownership-changed Transport error, got {err:?}")
+            }
+            Err(_) => {
+                panic!("the refusal must be a Manager error (NotFound/Reserved are wrong here)")
+            }
+            Ok(_) => panic!(
+                "the resume returned success over a session a concurrent kill retired and \
+                 a same-key replacement superseded (ep2-r5)"
+            ),
+        }
+
+        // The refusal never touched the replacement: its registration,
+        // live bridge, and committed era stand — the mover's lifecycle
+        // owns the key now, and the retired original's rescue installed
+        // nothing for it (the refusal returns before any restart; the
+        // kill's teardown owns the original's cleanup).
+        assert!(
+            st.has_live_session(durable).await,
+            "the replacement's registration stands"
+        );
+        assert!(
+            session_serve_bridge_alive(&st, durable).await,
+            "the replacement's bridge stands — the refusal never uninstalled it"
+        );
+        assert_eq!(
+            registry.observe("opencode", durable).generation,
+            replacement_generation,
+            "the refusal never re-owned or moved the replacement's era"
+        );
+        let _ = (exited, spawns, fake);
+    }
+
+    /// The ep2-r5 interleave on the HANDOFF runner's post-commit re-check
+    /// (the ep2-r4 tail's caller leg): the runner committed its
+    /// freshopencode target and parks in its own awaited STAGED FLAVOR
+    /// COMMIT (the ep2-r4 latch, strictly post-commit); while held, a
+    /// REAL kill retires the committed target and a REAL replacement
+    /// resume installs a brand-new instance under the SAME durable id
+    /// (Live at a strictly newer generation). The re-check's by-id
+    /// lookup then finds the replacement — the runner must surface the
+    /// typed ownership-changed failure, never answer success carrying
+    /// its obsolete generation, and never touch the replacement (the
+    /// mover's lifecycle owns the key). Pre-fix, the rescue adopted the
+    /// same-kind replacement and the handoff answered ok:true.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replacement_resume_under_the_killed_key_fails_the_handoff_typed() {
+        let writer = Arc::new(ParkingFlavorWriter::default());
+        let (commit_entered_tx, commit_entered) = std::sync::mpsc::channel::<()>();
+        let (commit_release_tx, commit_release_rx) = tokio::sync::oneshot::channel::<()>();
+        writer
+            .commit_entered
+            .lock()
+            .expect("writer latch")
+            .replace(commit_entered_tx);
+        writer
+            .commit_release
+            .lock()
+            .expect("writer latch")
+            .replace(commit_release_rx);
+        // The daemon never dies here (the KILL+REPLACE is the mover) — a
+        // far re-warm budget keeps the background machinery out of the
+        // window.
+        let (st, runner, registry, _rx, exited, manager) = handoff_selfheal_rig(
+            60_000,
+            120_000,
+            writer.clone() as crate::session_handoff::FlavorWriter,
+        )
+        .await;
+
+        let durable = "ses_ep2r5_handoff";
+        commit_terminal_owner(&registry, durable).await;
+
+        let mover_state = st.clone();
+        let mover_registry = registry.clone();
+        let mover = tokio::spawn(async move {
+            commit_entered
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("the runner parks in the staged flavor commit (after the Live commit)");
+            // Fixture honesty: the handoff's Live{FreshAgent} commit has
+            // landed (the parked staged commit is strictly
+            // post-commit); record the committed era.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let committed_generation = loop {
+                match mover_registry.observe("opencode", durable) {
+                    freshell_ownership::OwnershipSnapshot {
+                        generation,
+                        state: freshell_ownership::OwnershipState::Live { owner, .. },
+                        ..
+                    } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent => {
+                        break generation
+                    }
+                    _ => {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "the handoff's Live{{FreshAgent}} commit never landed"
+                        );
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            };
+            // The mover, part 1: a REAL kill of the committed target, to
+            // completion — the mover's teardown owns the cleanup.
+            mover_state
+                .handle_kill(FreshAgentKill {
+                    provider: AgentProvider::Opencode,
+                    session_id: durable.to_string(),
+                    session_type: SessionType::Freshopencode,
+                    cwd: None,
+                    observed_epoch: None,
+                    observed_generation: None,
+                })
+                .await;
+            assert!(
+                !mover_state.has_live_session(durable).await,
+                "fixture: the kill removed every map key for the committed target"
+            );
+            assert!(
+                !matches!(
+                    mover_registry.observe("opencode", durable).state,
+                    freshell_ownership::OwnershipState::Live { owner, .. }
+                        if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                ),
+                "fixture: the kill vacated the coordinator key"
+            );
+            // The mover, part 2: a REAL replacement resume installs a
+            // BRAND-NEW instance under the SAME durable id, committed
+            // Live at a strictly newer generation.
+            let replacement = match mover_state
+                .resume_durable_session(durable, None, None, None, None)
+                .await
+            {
+                Ok(arc) => arc,
+                Err(ResumeOpencodeError::Manager(err)) => panic!(
+                    "fixture: the replacement resume commits a fresh instance under the vacated key: {err:?}"
+                ),
+                Err(ResumeOpencodeError::NotFound) => {
+                    panic!("fixture: the replacement resume found no serve row")
+                }
+                Err(ResumeOpencodeError::Reserved) => {
+                    panic!("fixture: the replacement resume hit a reserved key")
+                }
+            };
+            let replacement_generation = match mover_registry.observe("opencode", durable) {
+                freshell_ownership::OwnershipSnapshot {
+                    generation,
+                    state: freshell_ownership::OwnershipState::Live { owner, .. },
+                    ..
+                } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent => generation,
+                snap => panic!("the replacement resume committed Live: {snap:?}"),
+            };
+            assert!(
+                replacement_generation > committed_generation,
+                "the replacement's era is a strictly newer generation than the handoff's commit"
+            );
+            let _ = replacement;
+            commit_release_tx
+                .send(())
+                .expect("release the staged commit");
+            (committed_generation, replacement_generation)
+        });
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(20),
+            runner
+                .spawn_handoff(freshopencode_handoff_request(durable))
+                .completion,
+        )
+        .await
+        .expect("the handoff completes within the budget")
+        .expect("the runner task lives to answer");
+        let (committed_generation, replacement_generation) =
+            mover.await.expect("the mover completed the interleaving");
+        assert!(
+            replacement_generation > committed_generation,
+            "fixture: the replacement superseded the handoff's committed era"
+        );
+
+        // THE outcome: the typed ownership-changed failure — never plain
+        // success carrying the runner's obsolete generation (pre-fix:
+        // the rescue adopted the same-key replacement and the handoff
+        // answered ok:true).
+        assert_ne!(
+            resp["ok"],
+            json!(true),
+            "the handoff must not answer success over a target a concurrent kill retired \
+             and a same-key replacement superseded (ep2-r5): {resp:?}"
+        );
+        assert_eq!(
+            resp["error"]["code"],
+            json!("STALE_GENERATION"),
+            "the refusal is the typed ownership-changed failure: {resp:?}"
+        );
+        assert_eq!(
+            resp["error"]["retryable"],
+            json!(true),
+            "the refusal is the canonical retryable race outcome: {resp:?}"
+        );
+
+        // The refusal never touched the replacement: its registration,
+        // live bridge, and committed era stand — the mover's lifecycle
+        // owns the key now, and the retired target's re-check installed
+        // nothing (the refusal returns before any restart; the kill's
+        // teardown owns the original's cleanup).
+        assert!(
+            st.has_live_session(durable).await,
+            "the replacement's registration stands"
+        );
+        assert!(
+            session_serve_bridge_alive(&st, durable).await,
+            "the replacement's bridge stands — the refusal never uninstalled it"
+        );
+        assert_eq!(
+            registry.observe("opencode", durable).generation,
+            replacement_generation,
+            "the refusal never re-owned or moved the replacement's era"
         );
         let _ = (exited, manager);
     }
