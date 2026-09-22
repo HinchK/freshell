@@ -26,7 +26,7 @@ Freshell sessions claimed by terminal-lane panes (plain CLI TUI panes, e.g. code
 
 **Goal:** A session claimed by any terminal-lane pane (codex/claude/etc. CLI TUI) stays attachable, closable, and reopenable by every connected client without a page reload: every terminal-lane commit-to-Live broadcasts its committed owner pair, the create response carries that pair so the creating pane's first attach is born fresh, and any typed stale-fence refusal teaches the client the current pair.
 
-**Architecture:** Four server layers change. (1) Protocol: `TerminalCreated` and `TerminalKilled` gain additive skip-None owner fields (frozen-client parity — omitted fields keep legacy frames byte-identical). (2) freshell-ws: the two `handle_create` commit sites (create settle ~terminal.rs:5632, attach claim ~:3905), the auto-resume respawn settle (auto_resume.rs:1175), and the REST rung (freshell-freshagent/terminal_tabs.rs:884) each broadcast `session.runtimeOwner` (ownerKind `terminal`, transition `handoff-committed`, the claim ticket's own committed pair — r32 F2) right after a successful commit; the create paths also thread that pair into the `terminal.created` frame. (3) freshell-ws refusal arms: the create stale arms and the kill stale-refusal arms populate `ownerEpoch`/`ownerGeneration` (the attach arms already do). (4) Client: the `terminal.created` handler folds the committed pair into `runtimeOwners` before the queued attach fires (fix c); a new merge-only reducer action `applyRuntimeOwnerFenceRefresh` folds refusal pairs into the existing record (preserving ownerKind/transition — fix b), wired into the TerminalView create-scoped error branch, a new attach-scoped branch, the kill-ack failure result, and the fresh-agent-ws `createFailed` fold. The existing broadcast fold (`applyRuntimeOwner`) already consumes the new server frames unchanged.
+**Architecture:** Four server layers change. (1) Protocol: `TerminalCreated` and `TerminalKilled` gain additive skip-None owner fields (frozen-client parity — omitted fields keep legacy frames byte-identical). (2) freshell-ws: the two `handle_create` commit sites (create settle ~terminal.rs:5632, attach claim ~:3905), the auto-resume respawn settle (auto_resume.rs:1175), and the REST rung (freshell-freshagent/terminal_tabs.rs:884) each broadcast `session.runtimeOwner` (ownerKind `terminal`, transition `handoff-committed`, the claim ticket's own committed pair — r32 F2) right after a successful commit; the create paths also thread that pair into the `terminal.created` frame. (3) freshell-ws refusal arms: the create stale arms and the kill stale-refusal arms populate `ownerEpoch`/`ownerGeneration` (the attach arms already do). (4) Client: the `terminal.created` handler folds the committed pair into `runtimeOwners` before the queued attach fires (fix c); a new merge-only reducer action `applyRuntimeOwnerFenceRefresh` folds refusal pairs into the existing record (preserving ownerKind/transition — fix b), wired into the TerminalView create-scoped error branch, a new pane-terminal-scoped error branch (typed refusals matched by `terminalId` — covering attach refusals AND fire-and-forget kill refusals, which arrive as no-requestId error frames), and the TabBar close-tab kill await result; the fold helper canonicalizes the key internally. Fresh-agent refusal lanes are out of scope: `freshAgent.create.failed` carries no session identity (LB-F5) and fresh-agent fences already advance via that lane's r29 commit broadcasts. The existing broadcast fold (`applyRuntimeOwner`) already consumes the new server frames unchanged.
 
 **Tech Stack:** Rust workspace (freshell-protocol, freshell-ownership, freshell-ws, freshell-freshagent; tokio broadcast bus; serde camelCase), React 18 + Redux Toolkit client (freshAgentSlice, selectors/runtimeOwner.ts), shared/ws-protocol.ts TS wire types, Vitest + Testing Library, Playwright e2e, cargo test.
 
@@ -38,7 +38,7 @@ Freshell sessions claimed by terminal-lane panes (plain CLI TUI panes, e.g. code
 - Transition value for all new terminal-lane commit broadcasts: `"handoff-committed"` (the r29 F1 precedent already uses it for ordinary fresh-agent creates; the client TS whitelist at shared/ws-protocol.ts:1690 needs no change).
 - Refusal folds are merge-only: the client updates only (epoch, generation, updatedAt) of an EXISTING runtimeOwners record, preserving ownerKind/transition/terminalId/aliasOf; when no record exists the fold is a no-op (a refusal corrects a fence the client believed it had; records repopulate via broadcasts/created-fold/ready replay). Same monotonic gate as `applyRuntimeOwner` (same-epoch older generation drops; different epoch wins).
 - The r35 automatic re-drive contract stays intact (test at TerminalView.lifecycle.test.tsx:3602): automatic re-drives of the same request keep the captured per-request pair; the refusal fold updates the store observed by the NEXT decision (user Retry/reconcileEpoch bump re-captures fresh, a new attach re-selects at send time).
-- TypeScript imports: the touched client files use explicit `.js` extensions on relative imports (see src/lib/fresh-agent-ws.ts:5-37); new imports follow file-local convention.
+- TypeScript imports: `src/` uses extensionless `@/`/`@shared/` alias imports under Bundler resolution (see src/lib/fresh-agent-ws.ts:5-37); the NodeNext `.js`-extension rule applies to relative imports in NodeNext-run code (tools/, scripts/, electron/, test helpers). New client modules use extensionless alias imports.
 - Test coordination: the focused commands below (narrowed cargo selectors, `npm run test:vitest -- run <file>`) are delegated — NOT coordinator-gated. The full-suite gate at the end of execution runs `npm test` from this worktree (coordinated; set `FRESHELL_TEST_SUMMARY`; foreign holders are waited on, never killed). E2E runs local (FRESHELL_E2E_BACKEND unset in non-interactive shells → local default).
 - Process safety: never restart the self-hosted production server on port 3001; this worktree's builds/tests are safe (the production-server prebuild guard exempts linked worktrees, scripts/prebuild-guard.ts:144-147); no broad kill patterns ever.
 - No docs/index.html update (not a user-facing UI change).
@@ -96,18 +96,20 @@ Integration (cross_kind_liveness.rs — new test; mirror the create portion of `
 ```rust
 #[tokio::test]
 async fn a_terminal_lane_create_settle_broadcasts_the_committed_owner_pair_and_rides_the_created_frame() {
-    let h = spawn_server().await; // same harness as a_stale_generation_attach_is_refused_typed
-    let mut ws = connect(&h.base_url).await;
-    // ...handshake + terminal.create with sessionRef exactly as at :6620-6646...
-    let created = /* the terminal.created frame captured per the file's await_frame helpers */;
-    let ownership = h.ws_state.ownership.as_ref().expect("ownership wired");
-    let current = ownership.observe(&PROVIDER, &SESSION_ID);
+    // Harness: model EXACTLY on a_stale_generation_attach_is_refused_typed (:6605-6696) —
+    // destructure spawn_server()'s (url, registry, ws_state) tuple as that test
+    // does, handshake + terminal.create with a sessionRef via the same helpers
+    // (:6620-6646), capture frames with the file's await_frame idiom and the
+    // session.runtimeOwner matcher helpers (:3274/:3279). Broadcasts fan out to
+    // every connection (each subscribes to the bus pre-handshake), so the SAME
+    // test connection receives the new frame.
+    let current = ws_state.ownership.as_ref().expect("ownership wired").observe(&PROVIDER, &SESSION_ID);
     // (fix c) the created frame carries the commit's own pair
     assert_eq!(created["ownerKind"], "terminal");
     assert_eq!(created["ownerEpoch"], json!(current.epoch));
     assert_eq!(created["ownerGeneration"], json!(current.generation));
     // (fix a) the broadcast fanned out to this same socket with the committed pair
-    let frame = await_owner_transition(&h, &SESSION_ID, "handoff-committed").await;
+    // (await the session.runtimeOwner frame for SESSION_ID with transition "handoff-committed")
     assert_eq!(frame["ownerKind"], "terminal");
     assert_eq!(frame["terminalId"], created["terminalId"]);
     assert_eq!(frame["epoch"], json!(current.epoch));
@@ -142,6 +144,8 @@ Expected: FAIL because `TerminalCreated` has no owner fields (compile error in t
 ```
 
 Add `owner_kind: None, owner_epoch: None, owner_generation: None` to every other `TerminalCreated` literal (the compiler enumerates them).
+
+(a1) `broadcast_owner_frame` (identity_ownership.rs:799) is currently a bare private `fn` — make it `pub(crate)` (mirroring its `pub(crate)` siblings `broadcast_vacant_frame` and `broadcast_owner_frame_if_authoritative`) so the terminal.rs and auto_resume.rs call sites compile. Never route these call sites through the `_if_authoritative` variant (it re-observes the generation; the r32 F2 constraint forbids it).
 
 (b) terminal.rs create settle (~5618) — capture the pair before the consuming commit, broadcast after the success log, thread the pair to the created literal (~5669):
 
@@ -416,7 +420,7 @@ terminal_tabs.rs REST rung (~3138 Ok arm): the crate cannot call freshell-ws's h
                     }
 ```
 
-(Capture `owner_operation_id`/`owner_generation` from `claim.ticket` before `claim.commit(...)`; obtain `boot_epoch` from the same ownership registry handle the claim's commit path uses — if `RestOwnershipClaim` does not already carry it, add a `boot_epoch: u64` field captured at claim-mint time, which keeps the frame construction self-contained and honest.)
+(Capture `owner_operation_id`/`owner_generation` from `claim.ticket` before `claim.commit(...)`; `epoch` is `state.ownership.as_ref().expect("coordinator wired").boot_epoch()` — `FreshAgentState.ownership` is `pub(crate) Option<Arc<RuntimeOwnershipRegistry>>` (freshagent lib.rs:2091), `boot_epoch()` is pub (ownership lib.rs:1137), and the claim mint implies the coordinator is wired (terminal_tabs.rs:1690).)
 
 - [ ] **Step 4: Run the focused tests**
 
@@ -545,10 +549,14 @@ Sibling of `'sends a viewport attach after terminal.created without issuing a se
 
 ```ts
 it('folds the created frame owner pair so the queued attach is born fresh over a stale record', async () => {
-  const { messageHandler, sentMessages } = await setupTypedPane({
-    seed: {
-      // a STALE pre-create record for the pane's sessionRef: gen 3
-      ...runtimeOwnerFrame({ provider: 'codex', sessionId: TYPED_SESSION_ID, generation: 3 }),
+  // describe-scoped messageHandler capture (wsMocks.onMessage) + file-scoped sentMessages()
+  const { store } = await setupTypedPane({
+    // seed the STALE pre-create record via the seed CALLBACK (the proven
+    // idiom from the r35 test at :3604-3608):
+    seed: (seededStore) => {
+      act(() => seededStore.dispatch(applyRuntimeOwner(
+        runtimeOwnerFrame({ provider: 'codex', sessionId: TYPED_SESSION_ID, generation: 3 }),
+      )))
     },
   })
   messageHandler!({
@@ -570,7 +578,7 @@ it('folds the created frame owner pair so the queued attach is born fresh over a
 })
 ```
 
-(adapt to the harness's actual setup API — `setupTypedPane` returns the store + messageHandler + sentMessages per :3443-3502.)
+(`setupTypedPane({ content?, tabMetadata?, seed? })` returns `{ store, tabId, paneId }`; `messageHandler` is captured at describe scope and `sentMessages()` is file-scoped — mirror the neighboring tests' usage.)
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -652,15 +660,14 @@ git commit -m "feat(client): fold terminal.created owner pair before the queued 
 - Modify: `src/store/freshAgentTypes.ts` (no type change expected — the action payload is inline; extend only if the pattern requires)
 - Create: `src/lib/owner-fence-heal.ts` (the shared fold helper)
 - Modify: `shared/ws-protocol.ts` (`TerminalKilledMessage` — additive trio, mirroring Task 4's wire)
-- Modify: `src/components/TerminalView.tsx` (create-scoped error branch ~:5135-5159; NEW attach-scoped branch; kill failure paths)
-- Modify: `src/lib/kill-ack.ts` (propagate the pair off refusal results ~:116-159)
-- Modify: `src/components/TabBar.tsx` (close-tab kill fold ~:411-433)
-- Modify: `src/lib/fresh-agent-ws.ts` (`createFailed` fold ~:208-228)
-- Test: `test/unit/client/store/freshAgentSlice.runtime-owner.test.ts`, `test/unit/client/lib/fresh-agent-ws.test.ts`, `test/unit/client/lib/kill-ack.test.ts`, `test/unit/client/lib/terminal-kill.test.ts`, `test/unit/client/components/TerminalView.lifecycle.test.tsx`, `test/unit/client/components/panes/PaneContainer.test.tsx`
+- Modify: `src/components/TerminalView.tsx` (create-scoped error branch ~:5135-5159; NEW pane-terminal-scoped branch covering attach refusals AND fire-and-forget kill refusals, matched by `terminalId`)
+- Modify: `src/lib/kill-ack.ts` (propagate the pair off the correlated `TerminalKilled` ack onto the await failure result ~:116-159)
+- Modify: `src/components/TabBar.tsx` (close-tab kill caller-level fold ~:411-433)
+- Test: `test/unit/client/store/freshAgentSlice.runtime-owner.test.ts`, `test/unit/client/lib/owner-fence-heal.test.ts` (new), `test/unit/client/lib/kill-ack.test.ts`, `test/unit/client/lib/terminal-kill.test.ts`, `test/unit/client/components/TerminalView.lifecycle.test.tsx`
 
 **Interfaces:**
 - Consumes: Task 4's refusal pairs (create arms, kill acks) and the already-present attach-refusal pair; `resolveCanonicalPaneSession` (src/store/selectors/runtimeOwner.ts:143-148) for pane→(provider, sessionId) resolution; the r35 per-request capture (`requestFenceRef`) left untouched.
-- Produces: `applyRuntimeOwnerFenceRefresh({ provider, sessionId, epoch, generation })` (merge-only, monotonic gate); `foldRefusalFencePair(dispatch, identity, frame)` in `src/lib/owner-fence-heal.ts` returning whether a fold happened. Task 7's e2e proves the wedge is gone end-to-end.
+- Produces: `applyRuntimeOwnerFenceRefresh({ provider, sessionId, epoch, generation })` (merge-only, monotonic gate); `foldRefusalFencePair(dispatch, state, paneLike, pair)` in `src/lib/owner-fence-heal.ts` — canonicalizes the fold key internally via the state-taking `resolveCanonicalPaneSession(state, paneLike)` so it always matches the canonical key the next claim's fence read resolves; returns whether a fold happened. Task 7's e2e proves the wedge is gone end-to-end.
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
@@ -669,35 +676,40 @@ git commit -m "feat(client): fold terminal.created owner pair before the queued 
 ```ts
 describe('applyRuntimeOwnerFenceRefresh (b8ke fence-heal)', () => {
   it('merges the fresh pair into an existing record, preserving ownerKind/transition', () => {
-    const state = reducerWith(baseFrame({ provider: 'codex', sessionId: 's1', generation: 3, ownerKind: 'terminal', transition: 'handoff-committed' }))
-    const next = reducer(state, applyRuntimeOwnerFenceRefresh({ provider: 'codex', sessionId: 's1', epoch: baseFrame().epoch, generation: 6 }))
+    // reducerWith takes DISPATCHED actions (the file's runner at :20-22):
+    const next = reducerWith(
+      applyRuntimeOwner(baseFrame({ provider: 'codex', sessionId: 's1', generation: 3, ownerKind: 'terminal', transition: 'handoff-committed' })),
+      applyRuntimeOwnerFenceRefresh({ provider: 'codex', sessionId: 's1', epoch: baseFrame().epoch, generation: 6 }),
+    )
     const rec = next.runtimeOwners['codex:s1']
     expect(rec.generation).toBe(6)
     expect(rec.ownerKind).toBe('terminal')
     expect(rec.transition).toBe('handoff-committed')
   })
   it('is a no-op when no record exists', () => {
-    const next = reducer(reducerWith(undefined), applyRuntimeOwnerFenceRefresh({ provider: 'codex', sessionId: 'missing', epoch: 1, generation: 5 }))
+    const next = reducerWith(
+      applyRuntimeOwnerFenceRefresh({ provider: 'codex', sessionId: 'missing', epoch: 1, generation: 5 }),
+    )
     expect(next.runtimeOwners['codex:missing']).toBeUndefined()
   })
   it('drops a same-epoch older generation and honors a new epoch', () => {
-    // existing gen 6, refresh gen 5 same epoch -> unchanged;
-    // refresh (epoch+1, gen 1) -> applied (epoch change wins)
+    // seed gen 6 via applyRuntimeOwner, refresh gen 5 same epoch -> unchanged;
+    // then refresh (epoch+1, gen 1) -> applied (epoch change wins)
   })
 })
 ```
 
-(b) Dispatch-path test (fresh-agent-ws.test.ts, `runtime-owner folds` describe :901+): a `freshAgent.create.failed` frame carrying `ownerEpoch`/`ownerGeneration` (+ provider/sessionId) folds the pair into a seeded stale runtimeOwners record.
+(b) Helper test (new `test/unit/client/lib/owner-fence-heal.test.ts`): the fold helper canonicalizes the key — seed an `aliasOf` chain via `applyRuntimeOwner` frames (mirroring the r7 alias/rekey seeding idiom, fresh-agent-ws.test.ts:1041/:1069) so the pane's raw sessionRef aliases a canonical id; assert a refusal pair handed with the pane-like target folds onto the CANONICAL key while the raw key stays untouched (the LB-A3 pin), plus the no-record no-op and the missing-pair guard.
 
 (c) TerminalView.lifecycle.test.tsx siblings of the r35 test (:3602-3655):
 - create-scoped: inject the SESSION_RESERVED refusal WITH the trio; assert the automatic re-drive still carries the ORIGINAL pair (r35 intact — that test's frame has no trio, so it stays green unchanged) AND the store record now holds the refusal pair; then a user Retry-launch (reconcileEpoch bump) re-captures the FRESH pair.
-- attach-scoped (NEW branch): inject `error { code: 'SESSION_RESERVED', terminalId: <pane terminalId>, ownerEpoch, ownerGeneration, message: '...stale observed generation...' }` (no requestId); assert the store fold and that the next `terminal.attach` send carries the fresh pair.
+- attach-scoped (NEW pane-terminal-scoped branch): inject `error { code: 'SESSION_RESERVED', terminalId: <pane terminalId>, ownerEpoch, ownerGeneration, message: '...stale observed generation...' }` (no requestId); assert the store fold, then fire the ws reconnect handler (the harness's `reconnectHandler?.()` idiom, proven at :6246-6255 — the reconnect path TerminalView.tsx:5504-5581 falls through unconditionally to `attachTerminal` for visible panes with a terminalId) and assert the re-attach send carries the fresh pair (the send-time fence read at :3177 picks up the fold). The identical frame shape covers TerminalView's fire-and-forget kill refusals — no separate kill wiring exists or is needed.
 
-(d) kill-ack.test.ts: a `TerminalKilled { success: false, ownerEpoch, ownerGeneration }` ack and an error-frame failure both surface the pair on the await result; terminal-kill/PaneContainer tests: after a refused close-kill carrying the pair, the next close attempt sends the fresh pair (seed the store record, assert the second `freshAgent.kill`/`terminal.kill` frame).
+(d) kill-ack.test.ts: a `TerminalKilled { success: false, request_id-correlated, ownerKind, ownerEpoch, ownerGeneration }` ack surfaces the trio on the await failure result — the ack is the ONLY frame the correlated await resolves from (the server's Error-arm refusals send `request_id: None` and never correlate). terminal-kill/TabBar tests: after a refused close-tab kill carrying the pair, the caller folds it and the next close attempt sends the fresh pair (seed the store record via `applyRuntimeOwner`, assert the second `terminal.kill` frame's observed pair).
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
-Run: `npm run test:vitest -- run test/unit/client/store/freshAgentSlice.runtime-owner.test.ts test/unit/client/lib/kill-ack.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/lib/terminal-kill.test.ts`
+Run: `npm run test:vitest -- run test/unit/client/store/freshAgentSlice.runtime-owner.test.ts test/unit/client/lib/owner-fence-heal.test.ts test/unit/client/lib/kill-ack.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/lib/terminal-kill.test.ts`
 
 Expected: FAIL — `applyRuntimeOwnerFenceRefresh` does not exist; kill-ack results carry no pair; the attach-scoped refusal is silently dropped (the wedge).
 
@@ -729,23 +741,31 @@ Expected: FAIL — `applyRuntimeOwnerFenceRefresh` does not exist; kill-ack resu
 (b) `src/lib/owner-fence-heal.ts` (new):
 
 ```ts
-import { applyRuntimeOwnerFenceRefresh } from '@/store/freshAgentSlice.js'
+import { applyRuntimeOwnerFenceRefresh } from '@/store/freshAgentSlice'
+import { resolveCanonicalPaneSession } from '@/store/selectors/runtimeOwner'
 
 export type RefusalFencePair = { ownerEpoch?: number; ownerGeneration?: number }
-export type SessionIdentity = { provider: string; sessionId: string } | undefined
 
-/** Fold a typed refusal's current pair into the pane's runtimeOwners record.
- * Returns true when a fold was dispatched. Merge-only by construction. */
+/**
+ * Fold a typed refusal's CURRENT (epoch, generation) into the pane's
+ * runtimeOwners record. The fold key is CANONICALIZED from the pane-like
+ * target (the same state-taking resolveCanonicalPaneSession the fence
+ * reads use), so aliased/rekeyed sessions fold onto the record the next
+ * claim actually reads. Merge-only by construction (the reducer
+ * preserves ownerKind/transition). Returns true when a fold dispatched.
+ */
 export function foldRefusalFencePair(
   dispatch: (action: ReturnType<typeof applyRuntimeOwnerFenceRefresh>) => void,
-  identity: SessionIdentity,
+  state: Parameters<typeof resolveCanonicalPaneSession>[0],
+  paneLike: Parameters<typeof resolveCanonicalPaneSession>[1],
   pair: RefusalFencePair,
 ): boolean {
-  if (!identity) return false
   if (typeof pair.ownerEpoch !== 'number' || typeof pair.ownerGeneration !== 'number') return false
+  const canonical = resolveCanonicalPaneSession(state, paneLike)
+  if (!canonical) return false
   dispatch(applyRuntimeOwnerFenceRefresh({
-    provider: identity.provider,
-    sessionId: identity.sessionId,
+    provider: canonical.provider,
+    sessionId: canonical.sessionId,
     epoch: pair.ownerEpoch,
     generation: pair.ownerGeneration,
   }))
@@ -757,40 +777,31 @@ export function foldRefusalFencePair(
 - In the create-scoped typed branch (~5135-5159), after the existing launch-failure fold:
 
 ```ts
-        foldRefusalFencePair(
-          dispatch,
-          resolveCanonicalPaneSession(appStore.getState(), contentRef.current ?? {}),
-          msg,
-        )
+        foldRefusalFencePair(dispatch, appStore.getState(), contentRef.current ?? {}, msg)
 ```
 
-- New attach-scoped branch (ahead of the catch-all, keyed on the pane's own terminal, no requestId):
+- New pane-terminal-scoped branch (ahead of the catch-all, keyed on the pane's own terminal, no requestId). It covers BOTH refused attaches AND TerminalView's fire-and-forget kill refusals (identical frame shape — no requestId, terminalId set; the kills await nothing, LB-F10):
 
 ```ts
-      // b8ke fence-heal (fix b): the attach-scoped typed refusal (no
+      // b8ke fence-heal (fix b): the pane-terminal-scoped typed refusal (no
       // requestId, terminalId set) previously matched NO branch — the pane
-      // silently never attached (the wedge). Fold the current pair so the
-      // next attach (send-time fence read) is fresh.
+      // silently never attached and refused kills went unfelt (the wedge).
+      // Fold the current pair so the next attach/kill claim — each re-reads
+      // the fence at send time — is fresh.
       } else if (!msg.requestId && msg.terminalId && msg.terminalId === terminalIdRef.current) {
-        foldRefusalFencePair(
-          dispatch,
-          resolveCanonicalPaneSession(appStore.getState(), contentRef.current ?? {}),
-          msg,
-        )
+        foldRefusalFencePair(dispatch, appStore.getState(), contentRef.current ?? {}, msg)
       }
 ```
 
-- TerminalView's own kill failure paths: fold from the await result's pair with the same identity helper.
+(d) kill-ack.ts: lift `ownerEpoch`/`ownerGeneration` off the correlated `TerminalKilled{success:false}` ack onto the failure result (`{ ok: false, ownerEpoch?, ownerGeneration? }`) — the ack is the only frame the correlated await resolves from (the server's Error-arm refusals send `request_id: None` and never correlate; their trio stays belt-wire with no client consumer claim, LB-F6). Add the trio to `TerminalKilledMessage` in shared/ws-protocol.ts (additive optional, mirroring Task 4's Rust trio). The fold wires at the CALLER level (TabBar), which holds the sessionRef identity — kill-ack itself holds only the terminalId.
 
-(d) kill-ack.ts: lift `ownerEpoch`/`ownerGeneration` off the `TerminalKilled{success:false}` ack and the correlated error frame onto the failure result (`{ ok: false, ownerEpoch?, ownerGeneration? }`); add the trio to `TerminalKilledMessage` in shared/ws-protocol.ts (additive optional, mirroring Task 4's Rust trio).
+(e) TabBar.tsx close-tab kill (~:411-433): on a failure result carrying the pair, `foldRefusalFencePair` with the bare `{ sessionRef: t.sessionRef }` target — the exact production-proven pane-like shape TabBar already passes to `resolveTerminalKillFence` at :421. PaneContainer's fresh-agent close-kill stays OUT OF SCOPE (freshAgent.killed refusals carry no pair; that lane's fences advance via its r29 commit broadcasts — LB-F7).
 
-(e) TabBar.tsx close-tab kill (~:411-433) and PaneContainer's kill consumers: on a failure result carrying the pair, `foldRefusalFencePair` with the target's sessionRef identity.
-
-(f) fresh-agent-ws.ts `createFailed` (~:208-228): after the existing `pendingCreateFailures` fold, dispatch `applyRuntimeOwnerFenceRefresh` keyed by the frame's own provider/sessionId when the trio is present.
+(f) REMOVED by load-bearing finding LB-F5: `freshAgent.create.failed` carries no provider/sessionId, so a transport-level fold cannot be keyed; the fresh-agent create-refusal fold is out of scope. The trio still lands in `pendingCreateFailures` (request-scoped recovery UI, unchanged), and that lane's fences advance via its r29 commit broadcasts.
 
 - [ ] **Step 4: Run the focused tests**
 
-Run: `npm run test:vitest -- run test/unit/client/store/freshAgentSlice.runtime-owner.test.ts test/unit/client/lib/kill-ack.test.ts test/unit/client/lib/terminal-kill.test.ts test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx`
+Run: `npm run test:vitest -- run test/unit/client/store/freshAgentSlice.runtime-owner.test.ts test/unit/client/lib/owner-fence-heal.test.ts test/unit/client/lib/kill-ack.test.ts test/unit/client/lib/terminal-kill.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx`
 
 Expected: PASS
 
@@ -802,14 +813,14 @@ All refusal paths now route through `foldRefusalFencePair`; collapse any duplica
 
 Impacted: the full typed-refusal/fence surface — TerminalView lifecycle suite, PaneContainer, TabBar, BackgroundSessions, fresh-agent suites, ws-client tests, selectors tests. This is effectively the client fence surface; run:
 
-Run: `npm run test:vitest -- run test/unit/client/store test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/lib/kill-ack.test.ts test/unit/client/lib/terminal-kill.test.ts test/unit/client/lib/session-handoff.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/components/TabBar.test.tsx`
+Run: `npm run test:vitest -- run test/unit/client/store test/unit/client/lib/owner-fence-heal.test.ts test/unit/client/lib/fresh-agent-ws.test.ts test/unit/client/lib/kill-ack.test.ts test/unit/client/lib/terminal-kill.test.ts test/unit/client/lib/session-handoff.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/panes/PaneContainer.test.tsx test/unit/client/components/TabBar.test.tsx`
 
 Expected: PASS (this broad-but-still-narrowed lane is delegated, not coordinator-gated)
 
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/store/freshAgentSlice.ts src/lib/owner-fence-heal.ts src/components/TerminalView.tsx src/lib/kill-ack.ts src/components/TabBar.tsx src/lib/fresh-agent-ws.ts shared/ws-protocol.ts test/unit/client
+git add src/store/freshAgentSlice.ts src/lib/owner-fence-heal.ts src/components/TerminalView.tsx src/lib/kill-ack.ts src/components/TabBar.tsx shared/ws-protocol.ts test/unit/client
 git commit -m "feat(client): typed stale refusals refresh the runtimeOwners fence (merge-only, create/attach/kill scopes)"
 ```
 
@@ -832,28 +843,35 @@ New sibling test in restore-contract-wall-rust.spec.ts (model the resume-create 
 ```ts
 test('codex terminal: close and reopen a resumed session without a page reload converges', async ({ page }) => {
   const wall = await bootWall(/* same fixtures as the :797 test */)
-  // 1. open the seeded session from the sidebar (terminal-lane resume create)
-  await page.getByRole('button', { name: /* seeded session row label */ }).click()
-  await expect(page.getByTestId('terminal-0')).toContainText(/* resumed marker */, { timeout: 30_000 })
-  // 2. close the tab (kill path), then reopen THE SAME session from the
-  //    sidebar — NO page reload in between.
-  await page.getByRole('button', { name: /* close tab */ }).click()
-  await page.getByRole('button', { name: /* seeded session row label */ }).click()
-  // 3. the reopened pane attaches and round-trips input (pre-fix: the
-  //    stale-fence wedge loops typed refusals and never attaches)
-  await expect(page.getByTestId('terminal-0')).toContainText(/* resumed marker */, { timeout: 30_000 })
+  // 1. open the seeded session from the sidebar (terminal-lane resume create) —
+  //    sidebar-session-list + getByText, exactly the :797 test's idiom
+  await page.locator('[data-testid="sidebar-session-list"]').getByText(/* seeded session label */).click()
+  const firstTerminalId = await harness.firstTerminalId() /* per the spec's helpers */
+  await harness.pollTerminalBuffer(firstTerminalId, /* resumed marker */, 30_000)
+  // 2. close the tab via the closeTab idiom (reconnect-revive-rust.spec.ts:186:
+  //    [data-context="tab"][data-tab-id=...] + getByRole('button', {name: /close/i})),
+  //    then reopen THE SAME session from the sidebar — NO page reload in between
+  await closeTab(page, /* first tab id */)
+  await page.locator('[data-testid="sidebar-session-list"]').getByText(/* seeded session label */).click()
+  // 3. the reopened pane attaches (buffer repaint for the NEW terminalId) and
+  //    round-trips input via canonical-mode line-discipline echo (the fake CLI
+  //    never touches termios — the idiom reconnect-revive-rust.spec.ts:613-624
+  //    proves). Pre-fix: the stale-fence wedge loops typed refusals and the
+  //    reopened pane never attaches.
+  const secondTerminalId = await harness.firstTerminalId()
+  expect(secondTerminalId).not.toBe(firstTerminalId)
+  await harness.pollTerminalBuffer(secondTerminalId, /* resumed marker */, 30_000)
+  await page.locator('.xterm').click()
   await page.keyboard.type('echo fence-heal-e2e\n')
-  await expect(page.getByTestId('terminal-0')).toContainText('fence-heal-e2e', { timeout: 30_000 })
+  await harness.pollTerminalBuffer(secondTerminalId, 'fence-heal-e2e', 30_000)
 })
 ```
 
-(adapt selectors to the spec's existing helpers — mirror the :797 test's selector idioms exactly; the fake CLI echoes stdin per fixtures/fake-codex-cli.mjs.)
+(adapt every helper (`firstTerminalId`, `pollTerminalBuffer`, `closeTab`) to the spec's existing utilities — mirror the :797 test and reconnect-revive-rust.spec.ts:528-624 exactly; the input round-trip rides the PTY's canonical-mode line-discipline echo, which those fixtures prove without any termios handling.)
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
-Run: `scripts/e2e-cloud.sh run --local --project=chromium test/e2e-browser/specs/restore-contract-wall-rust.spec.ts --grep="without a page reload"`
-
-Expected: FAIL on the reopen step (the pane never attaches) when run against a pre-fix server build — run this step only if the server binary predates Tasks 1-6; after Tasks 1-6 the Rust server binary for the e2e is rebuilt by the harness (`cargo build --release -p freshell-server`, helpers/rust-server.ts), so execute this step BEFORE Task 1's changes are reverted — i.e., in practice: if the full branch is already built, instead demonstrate the red by checking out `base_ref` server behavior is already known (the incident), and treat the post-fix green as the regression proof. Record honestly in the task report which path was taken.
+The red half of this task's TDD discipline is the RECORDED PRE-FIX REPRO at `.worktrees/.the-usual-logs/ownership-fence-fix/reports/incident-evidence.md` — the production wedge captured from the rotated server log (the terminal-lane create committed generation 6 with NO `session.runtimeOwner` broadcast and NO created-frame trio; the browser's queued attach was refused typed 0.3s later at observed generation 5; the user's close was refused `StaleClaim` four minutes later; only a page reload resynced the fence via the ready replay). The base_ref code path is identical to the pre-fix derivation, so the new test's reopen step failing at base_ref is established by that evidence plus the code; a live base_ref e2e run is OPTIONAL (pay it only if a reviewer demands a live red). Record in the task report which evidence path was used.
 
 - [ ] **Step 3: Add any production implementation this test demands**
 
@@ -867,7 +885,7 @@ Expected: PASS (the whole spec, including pre-existing tests)
 
 - [ ] **Step 5: Refactor while green**
 
-Keep the new test minimal and aligned with the spec's helper idioms; no fixture changes unless the fake CLI needs an echo affordance it lacks (check fixtures/fake-codex-cli.mjs first).
+Keep the new test minimal and aligned with the spec's helper idioms; no fixture changes — the fake CLIs never touch termios, so the canonical-mode line-discipline echo the input round-trip rides is already proven by the existing spec family.
 
 - [ ] **Step 6: Run impacted-test verification (affected e2e specs on the configured backend)**
 
@@ -904,3 +922,21 @@ Pass criterion: green excluding ledger-recorded pre-existing failures (the basel
 - Frozen-client parity: all wire additions are Option + skip-None; legacy arms unchanged; `transition: "handoff-committed"` reuse avoids the client whitelist change.
 - No silent deferrals: the merge-only no-record no-op is a documented residual (records repopulate via broadcast/created/ready replay), not a stub; the fresh-agent kill-refusal frame pair (freshAgent.killed) is OUT OF SCOPE per the User Request's terminal-lane framing — recorded as an out-of-scope suggestion.
 - Operational: no migrations; no production restart (server binary changes deploy only with explicit approval); no docs/index.html change (not user-facing UI); the worktree stays clean of untracked litter for cloud-run parity.
+
+## Load-bearing amendments (stage 2 ledger dispositions)
+
+Applied after the load-bearing stage. Evidence: `load-bearing-finder.md` (finder, two rounds), `load-bearing-strategist.md`, `load-bearing-validator-lba1-lba3.md`, `incident-evidence.md` — all under `.worktrees/.the-usual-logs/ownership-fence-fix/reports/`.
+
+- LB-F1 (falsified): `broadcast_owner_frame` is a bare private fn — Task 1 Step 3 (a1) makes it `pub(crate)`; the `_if_authoritative` variant stays forbidden (r32 F2).
+- LB-F2 (falsified): Task 1/2 integration tests are modeled on the tuple harness exactly as `a_stale_generation_attach_is_refused_typed` (:6605) and `bound_elsewhere_attach_commits_ownership_for_the_unclaimed_holder` (:2875) destructure it; broadcasts reach the test's own connection (every connection subscribes to the bus pre-handshake).
+- LB-F3/LB-F4 (falsified): Task 5/6 test drafts rewritten to the real harness APIs (`setupTypedPane` seed callback + describe-scoped messageHandler; `reducerWith` dispatched actions).
+- LB-F5 (falsified → scope drop): the fresh-agent `createFailed` fold is removed — `freshAgent.create.failed` carries no provider/sessionId and `pendingCreates` lack sessionId too; that lane's fences advance via its r29 commit broadcasts.
+- LB-F6 (falsified): kill-ack pair extraction rides only the requestId-correlated `TerminalKilled` ack; the server Error-arm trio stays belt-wire.
+- LB-F7 (falsified → scope drop): the PaneContainer fresh-agent close-kill leg is removed (freshAgent.killed refusals carry no pair; out of scope with the fresh-agent refusal lanes).
+- LB-F8 (falsified): Task 7's test body uses the proven reconnect-revive idiom (line-discipline echo + terminal-buffer polls; no `terminal-0` testid, no fake-CLI stdin echo).
+- LB-F9 (falsified): import convention corrected — extensionless `@/` alias imports in `src/`; the `.js` rule applies to relative imports in NodeNext-run code.
+- LB-F10 (falsified): TerminalView kill folds removed — fire-and-forget kill refusals share the pane-terminal-scoped branch's frame shape (no requestId, terminalId set).
+- LB-A1 (verified): the next attach after a folded refusal is driven by the ws reconnect handler (TerminalView.tsx:5504-5581 — unconditional for visible panes with a terminalId); hidden panes ride the hydration pump. Automatic heal rides transport reconnects — within the accepted no-retry-subsystem residual; the unit test drives `reconnectHandler?.()`.
+- LB-A2 (satisfied): Task 7's red is the recorded production repro (`incident-evidence.md`) plus the base_ref code derivation; a live base_ref e2e run is optional.
+- LB-A3 (verified): `foldRefusalFencePair` canonicalizes internally via the state-taking `resolveCanonicalPaneSession`; TabBar passes its production-proven bare `{ sessionRef }` shape; the alias-chain unit case pins the key.
+- LB-V1 (verified): Task 3's REST-rung frame epoch is `state.ownership.as_ref().expect("coordinator wired").boot_epoch()` (`FreshAgentState.ownership` pub(crate) at freshagent lib.rs:2091; the claim mint implies wired).
