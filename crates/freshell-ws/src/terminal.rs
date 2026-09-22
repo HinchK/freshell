@@ -11359,6 +11359,27 @@ mod host_stats_dispatch_tests {
 ///    never double-delivers.
 /// 4. Retention loss mid-wait reports the exact bounds-carrying gap;
 ///    the exit still rides the acknowledging credit.
+///
+/// THE INVARIANT under test (E2R3, the third sharpening — the phase
+/// transition is ATOMIC with respect to exit staging):
+/// 5. The session's phase-transition decision — extend the credited
+///    phase with a staged exit vs transfer to the uncredited tail
+///    drain vs arm at session start — reads the staged-exit state and
+///    commits the disposition under ONE registry lock hold. No
+///    check-then-act window may remain in which a concurrently staged
+///    exit can change which transition was correct: an exit staged
+///    before the decision's hold is absorbed by the SAME handling (the
+///    phase extends; the exit rides the acknowledging credit of the
+///    page reaching the frozen head), and an exit staged strictly after
+///    the atomic transfer decision is the drain's documented
+///    uncredited tail content.
+///
+/// The E2R3 races are modeled deterministically (never sleep-based):
+/// the registry's ONE-SHOT staging hook fires the natural-exit staging
+/// INSIDE a staged-exit read's own lock hold, immediately after that
+/// read — the PTY reader's concurrent staging at a precise point of
+/// the decision path. The quiet script never exits for these tests: a
+/// real exit would stage at its own uncontrolled moment.
 #[cfg(test)]
 mod paced_exit_race_tests {
     use super::*;
@@ -11433,6 +11454,28 @@ mod paced_exit_race_tests {
         script
     }
 
+    /// The QUIET twin (E2R3): identical output behavior, but the script
+    /// NEVER exits and echo is OFF — the concurrent-staging
+    /// transition-race tests stage the natural exit themselves via the
+    /// registry's deterministic in-lock hook, at a precise point
+    /// inside the decision path, and they COUNT FRAMES (budget 0: one
+    /// frame per page, so the credit whose drive reaches the attach
+    /// target is nameable in advance). A real script exit would stage
+    /// at its own uncontrolled moment, and a live PTY's input echo
+    /// coalesces with the step's output nondeterministically (sometimes
+    /// one frame, sometimes two) — `stty -echo` plus the ECHO-OFF
+    /// banner (the harness's [`RaceHarness::wait_ready`] gate) makes
+    /// every post-banner step produce EXACTLY its printf frame.
+    fn quiet_race_script(pads: usize, final_marker: &str) -> String {
+        let mut script = String::from("stty -echo; printf 'ECHO-OFF\\n'; ");
+        for _ in 0..pads {
+            script.push_str("read x; printf 'PAD-STEP\\n'; ");
+        }
+        script.push_str(&format!("read x; printf '{}\\n'; ", final_marker));
+        script.push_str("while :; do read x; done");
+        script
+    }
+
     struct RaceHarness {
         registry: freshell_terminal::TerminalRegistry,
         terminal_id: String,
@@ -11463,11 +11506,24 @@ mod paced_exit_race_tests {
         /// admission gate grants a reservation whenever the queue is empty,
         /// so the spawned drain completes its CaughtUp hold in-process.
         fn new(name: &str, pads: usize, final_marker: &str) -> Self {
-            let registry = freshell_terminal::TerminalRegistry::new();
             // Small pages: every drive emits at most a couple of frames,
             // so the credit-by-credit walk crosses the target boundary in
             // observable steps.
-            registry.set_paced_page_max_bytes(240);
+            Self::new_with_script(name, race_script(pads, final_marker), 240)
+        }
+
+        /// The QUIET twin (E2R3): the script never exits and the page
+        /// budget is 0 — ONE frame per page, the registry's own
+        /// deterministic-cursor idiom — so the concurrent-staging tests
+        /// can name the EXACT credit whose drive reaches the attach
+        /// target (the racing credit) without probing page boundaries.
+        fn new_quiet(name: &str, pads: usize, final_marker: &str) -> Self {
+            Self::new_with_script(name, quiet_race_script(pads, final_marker), 0)
+        }
+
+        fn new_with_script(name: &str, script: String, page_budget: i64) -> Self {
+            let registry = freshell_terminal::TerminalRegistry::new();
+            registry.set_paced_page_max_bytes(page_budget);
             let terminal_id = format!("T-{name}");
             let exit_registry = registry.clone();
             let exit_terminal_id = terminal_id.clone();
@@ -11476,7 +11532,7 @@ mod paced_exit_race_tests {
             });
             let spec = freshell_platform::SpawnSpec {
                 program: "/bin/sh".into(),
-                args: vec!["-c".into(), race_script(pads, final_marker)],
+                args: vec!["-c".into(), script],
                 env_overrides: BTreeMap::new(),
                 cwd: None,
                 cols: 120,
@@ -11533,6 +11589,29 @@ mod paced_exit_race_tests {
                 freshell_terminal::PacedAttachOptions::default(),
             );
             outcome.paced.expect("the paced attach path")
+        }
+
+        /// Wait for the quiet script's ECHO-OFF banner: the `stty -echo`
+        /// before it has taken effect by then, so every later input line
+        /// produces EXACTLY its printf frame — no echo frames, no
+        /// echo/output coalescing. The banner itself is the ring's
+        /// deterministic frame 1, which the frame-counting tests fold
+        /// into their seeded windows.
+        async fn wait_ready(&self) {
+            let registry = self.registry.clone();
+            let terminal_id = self.terminal_id.clone();
+            wait_for(
+                move || {
+                    registry
+                        .directory()
+                        .iter()
+                        .find(|entry| entry.terminal_id == terminal_id)
+                        .map(|entry| entry.snapshot.clone())
+                        .filter(|snapshot| snapshot.contains("ECHO-OFF"))
+                },
+                "the quiet script's ECHO-OFF banner",
+            )
+            .await;
         }
 
         fn start_session(&mut self, start: freshell_terminal::PacedAttachStart, since: i64) {
@@ -11667,7 +11746,7 @@ mod paced_exit_race_tests {
         }
     }
 
-    /// (a) THE WEDGE, at the attach boundary — the same drive-before-arm
+    /// E2R3, (a) THE CONCURRENT-STAGING RACE at the credit path: the
     /// ordering the finding pins at the credit handler, in the one state
     /// where it strands the stream: the client's first page was EMPTY (its
     /// cursor already sat at the attach head: `credited == page_end ==
@@ -11863,6 +11942,346 @@ mod paced_exit_race_tests {
         assert!(
             !harness.registry.finish_pty_exit(&harness.terminal_id, 99),
             "a second exit never restages (monotone, once-only)"
+        );
+    }
+
+    /// E2R3, (a) THE CONCURRENT-STAGING RACE at the credit path: the
+    /// natural exit stages INSIDE the credit handling's window — the
+    /// registry's one-shot hook fires the staging inside the arm read's
+    /// own lock scope, immediately after the read observes the
+    /// pre-staging state (the deterministic model of the PTY reader
+    /// staging concurrently with the decision's use of its read; never
+    /// a sleep-based race). The racing credit is the one whose drive
+    /// reaches the attach target — with budget 0 (one frame per page)
+    /// and one pad step (2 frames: echo + output) the walk is exactly
+    /// countable, so the racing credit is named, not probed.
+    ///
+    /// PRE-FIX (RED): the arm's read went stale (check-then-act) — the
+    /// handler sees `exit_head == None`, `uncredited_exit_page()` is
+    /// false, and the session transfers to the uncredited drain; the
+    /// drain dumps the remaining suffix and delivers terminal.exit
+    /// WITHOUT the credit that would have acknowledged the page
+    /// reaching the frozen head.
+    ///
+    /// POST-FIX (GREEN): the phase-transition decision is ATOMIC — the
+    /// disposition re-reads the staged-exit state under ONE registry
+    /// lock hold after the drive, so the concurrently staged exit is
+    /// absorbed by the SAME handling: the credited phase extends
+    /// through the frozen head, the final output pages only on
+    /// continuation credits, and terminal.exit rides the credit that
+    /// acknowledges the page reaching the armed exit head.
+    #[tokio::test]
+    async fn credit_path_exit_staged_inside_the_window_extends_the_credited_phase() {
+        let mut harness = RaceHarness::new_quiet("creditrace", 1, "FINAL-CREDRACE");
+        harness.wait_ready().await;
+        assert_eq!(
+            harness.head(),
+            1,
+            "the ECHO-OFF banner is the ring's frame 1"
+        );
+        // Seed the replay window: one pad step = exactly ONE frame
+        // (echo off), so the attach target is frame 2 and the first
+        // page (one frame per page) leaves frame 2 for the racing
+        // credit's drive.
+        harness.step("pad", "PAD-STEP").await;
+        let target = harness.head();
+        assert_eq!(target, 2, "one pad step adds exactly one frame (echo off)");
+        let start = harness.attach_paced(0);
+        assert_eq!(
+            start.session.page_end, 1,
+            "budget 0: the first page is exactly frame 1"
+        );
+        harness.start_session(start, 0);
+        // The "final output": one more frame past the attach target —
+        // the exit will freeze THIS head.
+        harness.step("go", "FINAL-CREDRACE").await;
+        let exit_head = harness.head();
+        assert_eq!(
+            exit_head, 3,
+            "the final-marker step adds exactly one frame past the target"
+        );
+        let exit_code = 0;
+        // THE RACING CREDIT: acknowledges frame 1 — its drive produces
+        // the page reaching the attach target, and the exit stages
+        // INSIDE this credit's arm→decision window (the hook fires
+        // inside the arm read's lock scope, right after the read).
+        harness
+            .registry
+            .set_paced_exit_stage_hook_for_tests(harness.conn_id, exit_code);
+        harness.credit(1);
+        let Some(session) = harness.try_session() else {
+            // THE CONCURRENT-STAGING VIOLATION (RED pre-fix): the credit
+            // whose drive reached the target transferred the session to
+            // the uncredited drain even though the natural exit staged
+            // INSIDE the credit's window — the drain then dumped the
+            // remaining suffix and delivered terminal.exit without the
+            // credit acknowledging the page reaching the frozen head.
+            let collector = Arc::clone(&harness.collector);
+            wait_for(
+                move || (exit_count(&collector) > 0).then_some(()),
+                "the premature exit (the violation under test)",
+            )
+            .await;
+            panic!(
+                "the phase transition was decided from a stale staged-exit \
+                 read: the session transferred to the uncredited drain while \
+                 the natural exit staged concurrently with the credit's arm \
+                 — the transition decision must be atomic with respect to \
+                 exit staging"
+            );
+        };
+        // GREEN: the atomic disposition absorbed the concurrently staged
+        // exit — the credited phase EXTENDED through the frozen head.
+        assert_eq!(
+            session.exit_head,
+            Some(exit_head),
+            "the disposition armed the staged exit's frozen head"
+        );
+        assert!(
+            session.credited < session.page_end,
+            "the racing credit's page (reaching the original target) is the \
+             one outstanding uncredited page"
+        );
+        // Pages flow ONLY on continuation credits; the exit rides the
+        // credit acknowledging the page reaching the armed exit head.
+        let mut guards = 0;
+        loop {
+            let session = harness.session();
+            assert!(
+                session.page_end <= exit_head,
+                "pages never overshoot the frozen head"
+            );
+            if session.page_end == exit_head {
+                break;
+            }
+            harness.assert_exit_held().await;
+            let consumed = session.page_end;
+            harness.credit(consumed);
+            guards += 1;
+            assert!(guards < 10_000, "the credit walk must converge");
+        }
+        harness.assert_exit_held().await;
+        harness.credit(exit_head);
+        harness.assert_exit_arrives_and_is_last(exit_code).await;
+        assert!(
+            outputs(&harness.collector)
+                .iter()
+                .any(|data| data.contains("FINAL-CREDRACE")),
+            "the deferred final output was delivered before the exit"
+        );
+        assert!(
+            harness.sessions.get_mut(&harness.terminal_id).is_none(),
+            "the session left the credited table on the acknowledging credit"
+        );
+        assert_eq!(
+            harness
+                .registry
+                .staged_paced_exit(&harness.terminal_id, harness.conn_id),
+            None,
+            "the subscriber retired with the delivered exit"
+        );
+    }
+
+    /// E2R3, (b) THE SAME INTERLEAVE at start_session: the exit stages
+    /// during the attach/start window — the hook fires inside the
+    /// start's arm read's lock scope, immediately after it. The EMPTY
+    /// first page (the client's cursor already sat at the attach head)
+    /// is the start state whose disposition the window poisons.
+    ///
+    /// PRE-FIX (RED): the start's arm read goes stale — start_session
+    /// transfers the session to the uncredited drain with everything
+    /// acknowledged, and the drain dumps the final suffix +
+    /// terminal.exit with no credit at all.
+    ///
+    /// POST-FIX (GREEN): the session STARTS with the exit armed, pages
+    /// flow on continuation credits, and the exit rides the final
+    /// acknowledging credit.
+    #[tokio::test]
+    async fn start_session_exit_staged_during_attach_arms_before_any_transfer() {
+        let mut harness = RaceHarness::new_quiet("startrace", 0, "FINAL-STARTRACE");
+        harness.wait_ready().await;
+        // The client attaches fully caught up: since == head == 1 (the
+        // ECHO-OFF banner frame) — the first page is EMPTY (nothing
+        // outstanding at start).
+        let head_at_attach = harness.head();
+        assert_eq!(
+            head_at_attach, 1,
+            "the ECHO-OFF banner is the ring's frame 1"
+        );
+        let start = harness.attach_paced(head_at_attach);
+        assert_eq!(
+            start.session.page_end, start.session.effective_since,
+            "the empty first page leaves nothing outstanding"
+        );
+        // The exit stages with final output past the attach head while
+        // the start path is the in-flight decision (the hook fires
+        // inside the start arm read's lock scope, right after it).
+        harness.step("go", "FINAL-STARTRACE").await;
+        let exit_head = harness.head();
+        assert_eq!(
+            exit_head, 2,
+            "the final-marker step adds exactly one frame past the head"
+        );
+        let exit_code = 0;
+        harness
+            .registry
+            .set_paced_exit_stage_hook_for_tests(harness.conn_id, exit_code);
+        harness.start_session(start, head_at_attach);
+        let Some(session) = harness.try_session() else {
+            // THE CONCURRENT-STAGING VIOLATION (RED pre-fix): the start
+            // transferred the session to the uncredited drain even though
+            // the natural exit staged during the attach/start window.
+            let collector = Arc::clone(&harness.collector);
+            wait_for(
+                move || (exit_count(&collector) > 0).then_some(()),
+                "the premature exit (the violation under test)",
+            )
+            .await;
+            panic!(
+                "start_session decided the phase transition from a stale \
+                 staged-exit read: the session transferred to the uncredited \
+                 drain while the natural exit staged during the attach \
+                 window — the transition decision must be atomic with \
+                 respect to exit staging"
+            );
+        };
+        // GREEN: the session STARTS with the exit armed and the
+        // extended phase's first page outstanding (no wedge state).
+        assert_eq!(
+            session.exit_head,
+            Some(exit_head),
+            "the start armed the staged exit's frozen head"
+        );
+        assert!(
+            session.credited < session.page_end,
+            "the start's wedge-guard drive produced the extended phase's \
+             first page"
+        );
+        assert!(
+            !outputs(&harness.collector).is_empty(),
+            "the extended phase's first page was sunk to the client"
+        );
+        // Pages flow on credits; the exit rides the final acknowledging
+        // credit.
+        let mut guards = 0;
+        loop {
+            let session = harness.session();
+            assert!(
+                session.page_end <= exit_head,
+                "pages never overshoot the frozen head"
+            );
+            if session.page_end == exit_head {
+                break;
+            }
+            harness.assert_exit_held().await;
+            let consumed = session.page_end;
+            harness.credit(consumed);
+            guards += 1;
+            assert!(guards < 10_000, "the credit walk must converge");
+        }
+        harness.assert_exit_held().await;
+        harness.credit(exit_head);
+        harness.assert_exit_arrives_and_is_last(exit_code).await;
+        assert!(
+            outputs(&harness.collector)
+                .iter()
+                .any(|data| data.contains("FINAL-STARTRACE")),
+            "the deferred final output was delivered before the exit"
+        );
+        assert!(
+            harness.sessions.get_mut(&harness.terminal_id).is_none(),
+            "the session left the credited table on the acknowledging credit"
+        );
+    }
+
+    /// E2R3, (c) THE ATOMICITY BOUNDARY — the legitimately
+    /// post-transfer exit: staged STRICTLY AFTER the atomic transfer
+    /// decision (the disposition that confirmed, under its one lock
+    /// hold, that no exit was staged), it is the uncredited drain's
+    /// documented tail content. The drain delivers the remaining tail
+    /// pages and then the staged exit at its completing verdict —
+    /// WITHOUT any credit after the transfer. That is exactly the
+    /// documented tail semantics, not a loss and not a re-entry into
+    /// the credited phase: the atomicity scope ends at the transfer
+    /// decision's lock hold.
+    ///
+    /// The staging lands in the synchronous window after the
+    /// transferring credit and before the spawned drain task's first
+    /// poll (the current-thread runtime has not yielded), so the
+    /// "strictly after the atomic transfer" ordering is deterministic.
+    #[tokio::test]
+    async fn post_transfer_staged_exit_is_the_drains_documented_tail_content() {
+        let mut harness = RaceHarness::new_quiet("boundary", 1, "FINAL-BOUNDARY");
+        harness.wait_ready().await;
+        assert_eq!(
+            harness.head(),
+            1,
+            "the ECHO-OFF banner is the ring's frame 1"
+        );
+        harness.step("pad", "PAD-STEP").await;
+        assert_eq!(
+            harness.head(),
+            2,
+            "one pad step adds exactly one frame (echo off)"
+        );
+        let start = harness.attach_paced(0);
+        assert_eq!(
+            start.session.page_end, 1,
+            "budget 0: the first page is exactly frame 1"
+        );
+        harness.start_session(start, 0);
+        // The tail the drain will page: one frame past the attach
+        // target, ingested BEFORE the transferring credit (the drain's
+        // fixed target captures it at its start).
+        harness.step("go", "FINAL-BOUNDARY").await;
+        let head_at_transfer = harness.head();
+        assert_eq!(
+            head_at_transfer, 3,
+            "the final-marker step adds exactly one frame past the target"
+        );
+        // The transferring credit: its drive reaches the attach target
+        // with NO exit staged — the disposition atomically confirms
+        // that under its lock hold and transfers. No hook is armed:
+        // nothing stages concurrently here.
+        harness.credit(1);
+        assert!(
+            harness.try_session().is_none(),
+            "the credited phase completed and the session moved to the drain"
+        );
+        // STRICTLY POST-TRANSFER staging: from outside any decision,
+        // after the atomic transfer and before the drain's first poll.
+        assert!(
+            harness
+                .registry
+                .stage_natural_exit_for_test(&harness.terminal_id, harness.conn_id, 0),
+            "the post-transfer staging lands on the live deferred subscriber"
+        );
+        // The drain delivers the tail pages and THEN the staged exit at
+        // its completing verdict — no credit is ever sent after the
+        // transfer (the documented uncredited tail semantics).
+        harness.assert_exit_arrives_and_is_last(0).await;
+        assert!(
+            outputs(&harness.collector)
+                .iter()
+                .any(|data| data.contains("FINAL-BOUNDARY")),
+            "the tail frames were delivered before the exit"
+        );
+        // A post-exit credit is inert: the session left the credited
+        // table at the transfer and the subscriber retired with the
+        // exit.
+        let before = exit_count(&harness.collector);
+        harness.credit(head_at_transfer);
+        assert_eq!(
+            exit_count(&harness.collector),
+            before,
+            "a post-exit credit grants nothing (stale generation)"
+        );
+        assert_eq!(
+            harness
+                .registry
+                .staged_paced_exit(&harness.terminal_id, harness.conn_id),
+            None,
+            "the subscriber retired with the delivered exit"
         );
     }
 }
