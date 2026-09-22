@@ -62,7 +62,7 @@ pub use mode_tracker::ModeTracker;
 pub use pty::{build_child_env, build_child_env_from_process, MessageSink, PtyTerminal};
 pub use registry::{
     compute_scrollback_max_bytes, ActivityEvent, ActivityObserver, AttachOutcome, ClaimState,
-    FrameSink, InputOutcome, PacedAttachStart, PacedPage, PacedSessionDesc, PacedTailPage,
-    ReplayBounds, TerminalRegistry, DEFAULT_PACED_PAGE_MAX_BYTES,
+    FrameSink, InputOutcome, PacedAttachStart, PacedPage, PacedSessionDesc, PacedTailCompletion,
+    PacedTailPage, ReplayBounds, TerminalRegistry, DEFAULT_PACED_PAGE_MAX_BYTES,
 };
 pub use replay_ring::{ReplayDeque, ReplayFrame, ReplayRing};

@@ -12,12 +12,16 @@
 //! Core contract under test: a negotiated attach gets `attach.ready` bounds
 //! plus ONE bounded first page; further replay pages flow only on valid
 //! `terminal.replay.credit` (stale generations, out-of-window values, and
-//! credits from non-negotiated connections are ignored); live output
-//! produced during the replay is delivered strictly AFTER the pages covering
-//! it, in seq order; retention expiry mid-replay reports the exact lost
-//! interval with the task-2 bounds fields and continues from the new
-//! baseline; a re-attach supersedes the old session; a disconnect
-//! mid-replay leaves the terminal running and re-attachable.
+//! credits from non-negotiated connections are ignored); the grant is
+//! strictly page-end (a partial consumption report is observed, grants
+//! nothing); live output produced during the replay is delivered strictly
+//! AFTER the pages covering it, in seq order; the tail drain completes
+//! against a continuously-producing terminal (fixed tail target + the
+//! one-shot live handoff — never a chase of the moving head); retention
+//! expiry mid-replay reports the exact lost interval with the task-2
+//! bounds fields and continues from the new baseline; a re-attach
+//! supersedes the old session; a disconnect mid-replay leaves the
+//! terminal running and re-attachable.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -866,10 +870,180 @@ async fn partial_page_credit_on_the_wire_grants_nothing_until_the_page_end() {
         "pages ascend after the grant"
     );
     assert_eq!(
-        partial_event
-            .fields
-            .get("terminal_id")
-            .map(String::as_str),
+        partial_event.fields.get("terminal_id").map(String::as_str),
+        Some(terminal_id.as_str())
+    );
+}
+
+/// A CONTINUOUSLY-PRODUCING terminal's paced session must COMPLETE (the
+/// fixed-completion requirement): the tail drain never chases the moving
+/// head — it pages to the tail-start head and hands the staged remainder
+/// to the live path — so `ws.restore.paced_complete` fires while
+/// production is still running, and the connection keeps processing
+/// input afterwards. The old moving-head drain chased forever, wedging
+/// the connection's dispatch task inline.
+#[tokio::test]
+async fn paced_session_completes_while_the_terminal_keeps_producing() {
+    let events = global_capture();
+    let ring = 512 * 1024;
+    let url = spawn_server(ring).await;
+    let mut driver = connect(&url).await;
+    hello(&mut driver, false).await;
+    let terminal_id = create_shell_terminal(&mut driver, "create-producing").await;
+
+    // The sustained producer: `yes` with no head — production never pauses.
+    // A primer attach precedes the input (the suite's proven driver
+    // pattern: the attach applies the PTY's geometry and the shell then
+    // executes the buffered line). The primer then observes the flood
+    // demonstrably flowing before detaching, so the paced attach happens
+    // against a terminal that is KNOWN to be mid-production.
+    let mut primer = connect(&url).await;
+    hello(&mut primer, false).await;
+    attach(&mut primer, &terminal_id, "attach-producing-primer").await;
+    send_input(
+        &mut driver,
+        &terminal_id,
+        "yes 'STREAMDATA-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX'\n",
+    )
+    .await;
+    let primer_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut flood_observed = false;
+    while tokio::time::Instant::now() < primer_deadline {
+        let Some(value) = next_json_or_timeout(&mut primer, Duration::from_secs(2)).await else {
+            continue;
+        };
+        if value.get("type").and_then(|v| v.as_str()) == Some("terminal.output") {
+            let data = value.get("data").and_then(|d| d.as_str()).unwrap_or("");
+            // Flood OUTPUT rows, never the kernel's echo of the typed
+            // command line itself (`yes 'STREAMDATA-…'`).
+            if data.contains("STREAMDATA") && !data.contains("yes '") {
+                flood_observed = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        flood_observed,
+        "the sustained producer must be flowing before the paced attach"
+    );
+    primer
+        .send(WsMessage::Text(
+            serde_json::json!({ "type": "terminal.detach", "terminalId": terminal_id }).to_string(),
+        ))
+        .await
+        .expect("primer detaches");
+
+    let mut paced = connect(&url).await;
+    hello(&mut paced, true).await;
+    let (ready, page1) =
+        paced_attach_first_page(&mut paced, &terminal_id, "attach-producing").await;
+    let attach_head = ready["headSeq"].as_i64().expect("headSeq");
+    let mut credited = page1
+        .iter()
+        .map(|f| f["seqEnd"].as_i64().unwrap_or(0))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        credited > 0,
+        "the producer staged content before the attach"
+    );
+
+    // Drive the session with page-end credits (frame-end credits include
+    // every page's end). Retention expiry rounds arrive as negotiated
+    // gaps; the session continues within the same credit.
+    credit(&mut paced, &terminal_id, "attach-producing", credited).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut produced_past_target = false;
+    let mut completed = false;
+    while tokio::time::Instant::now() < deadline {
+        let Some(value) = next_json_or_timeout(&mut paced, Duration::from_secs(5)).await else {
+            break;
+        };
+        match value.get("type").and_then(|v| v.as_str()) {
+            Some("terminal.output") => {
+                let end = value["seqEnd"].as_i64().unwrap_or(0);
+                produced_past_target |= end > attach_head;
+                if end > credited {
+                    credited = end;
+                    credit(&mut paced, &terminal_id, "attach-producing", end).await;
+                }
+            }
+            Some("terminal.output.gap") => {
+                // The negotiated retention gap: continuation is within the
+                // already-granted credit; keep consuming frames.
+            }
+            _ => {}
+        }
+        if !completed {
+            completed = wait_for_restore_event_of_terminal(
+                &events,
+                &terminal_id,
+                "ws.restore.paced_complete",
+            )
+            .await
+            .is_some();
+        }
+        // The handoff's in-flight frames flow after the completion event:
+        // drain them (they carry seqs past the attach target) before
+        // asserting.
+        if completed && produced_past_target {
+            break;
+        }
+    }
+
+    // THE completion: the session closed while `yes` is still running.
+    let complete =
+        wait_for_restore_event_of_terminal(&events, &terminal_id, "ws.restore.paced_complete")
+            .await
+            .expect("the paced session completes against a continuously-producing terminal");
+    assert_eq!(
+        complete.fields.get("attach_request_id").map(String::as_str),
+        Some("attach-producing")
+    );
+    let last_seq = complete
+        .fields
+        .get("last_seq")
+        .and_then(|v| v.parse::<i64>().ok())
+        .expect("last_seq recorded");
+    assert!(
+        last_seq > attach_head,
+        "production continued past the attach-time head (attach {attach_head}, completed {last_seq}) — the session completed WITHOUT waiting for production to pause"
+    );
+    assert!(
+        produced_past_target,
+        "the fixture's producer demonstrably outran the attach target"
+    );
+
+    // The connection is not wedged: stop the flood, then a fresh echo
+    // command round-trips through the same socket.
+    send_input(&mut driver, &terminal_id, "\u{3}").await;
+    let echo_marker = "PRODUCING-ECHO-MARKER";
+    send_input(
+        &mut driver,
+        &terminal_id,
+        &format!("echo '{echo_marker}'\n"),
+    )
+    .await;
+    let drain_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let (acc, _) = drain_until_marker(&mut paced, echo_marker, drain_deadline).await;
+    assert!(
+        acc.contains(echo_marker),
+        "the connection still delivers output after the producing-terminal session completed"
+    );
+
+    // The session is gone: a further credit is a stale generation.
+    credit(&mut paced, &terminal_id, "attach-producing", last_seq).await;
+    let stale = wait_for_restore_event(
+        &events,
+        &terminal_id,
+        "ws.restore.credit",
+        "status",
+        "stale_generation",
+    )
+    .await
+    .expect("post-completion credits are stale generations");
+    assert_eq!(
+        stale.fields.get("terminal_id").map(String::as_str),
         Some(terminal_id.as_str())
     );
 }

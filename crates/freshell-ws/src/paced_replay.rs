@@ -26,16 +26,23 @@
 //! demand for more credit.
 //!
 //! When the cursor reaches the target, the accumulated live range
-//! `(target, head]` drains as ordinary delivery (pages, not credit-gated)
-//! and the registry clears the deferral ATOMICALLY when the ring is
-//! drained — live output can never overtake an un-sent page.
+//! `(target, head-at-tail-start]` drains as ordinary delivery (pages,
+//! not credit-gated) toward a FIXED tail target — the head captured when
+//! the tail phase starts — so ongoing production can never move the
+//! completion condition indefinitely. The registry then completes the
+//! session atomically: either the ring is drained (the deferral clears
+//! under the same lock hold) or the staged remainder is handed off to
+//! the live path in one lock hold — newer frames flow through direct
+//! fan-out, never through a chase.
 
 use std::collections::HashMap;
 
 use freshell_protocol::{
     ServerMessage, TerminalOutputGap, TerminalOutputGapReason, TerminalReplayCredit,
 };
-use freshell_terminal::{FrameSink, PacedPage, PacedSessionDesc, PacedTailPage, TerminalRegistry};
+use freshell_terminal::{
+    FrameSink, PacedPage, PacedSessionDesc, PacedTailCompletion, PacedTailPage, TerminalRegistry,
+};
 
 /// One active paced replay session for a (connection, terminal). Owned by
 /// the connection's dispatch loop; a re-attach replaces it, a detach or
@@ -197,8 +204,12 @@ pub(crate) enum DriveOutcome {
 /// tail when the cursor reached the target). Exactly one replay page per
 /// credit; `Expired` rounds emit the negotiated retention gap and continue
 /// within the same credit until a frame-carrying page exists. The tail
-/// drains without credit and completes the session when the registry's
-/// atomic clear fires (`CaughtUp`).
+/// drains without credit toward the FIXED head captured at tail-start
+/// (never the moving current head — a producing terminal cannot postpone
+/// completion indefinitely, and the drain's per-connection work stays
+/// bounded), then completes atomically: a drained ring clears the
+/// deferral, and a staged remainder is handed off under the same lock
+/// hold so live frames can neither jump the pages nor be lost.
 pub(crate) fn drive_session(
     registry: &TerminalRegistry,
     conn_id: u64,
@@ -265,17 +276,41 @@ pub(crate) fn drive_session(
             }
         }
     }
-    // Tail phase: ordinary delivery of the accumulated live range; the
-    // registry clears the deferral atomically when the ring is drained.
-    loop {
-        match registry.next_paced_tail_page(&session.terminal_id, conn_id, session.page_end, budget)
-        {
+    // Tail phase: ordinary, budget-bounded delivery of the accumulated
+    // live range toward the FIXED tail target (the head at tail-start).
+    let tail_target = match registry.replay_bounds(&session.terminal_id) {
+        Some(bounds) => bounds.head_seq,
+        None => {
+            tracing::warn!(
+                terminal_id = %session.terminal_id,
+                attach_request_id = %session.attach_request_id,
+                "ws.restore.paced_gone"
+            );
+            return DriveOutcome::Gone;
+        }
+    };
+    while session.page_end < tail_target {
+        match registry.next_paced_tail_page(
+            &session.terminal_id,
+            conn_id,
+            session.page_end,
+            tail_target,
+            budget,
+        ) {
             PacedTailPage::Frames {
-                messages, end_seq, ..
+                messages,
+                end_seq,
+                serialized_bytes,
             } => {
                 for message in messages {
                     sink(message);
                 }
+                tracing::debug!(
+                    terminal_id = %session.terminal_id,
+                    end_seq,
+                    serialized_bytes,
+                    "ws.restore.paced_tail_page"
+                );
                 session.page_end = end_seq;
                 session.pages += 1;
             }
@@ -303,6 +338,9 @@ pub(crate) fn drive_session(
                 session.page_end = resume_from;
             }
             PacedTailPage::CaughtUp => {
+                // The ring drained at or below the cursor (a quiet or
+                // slower terminal): the registry's atomic clear already
+                // fired inside the page read.
                 tracing::info!(
                     terminal_id = %session.terminal_id,
                     attach_request_id = %session.attach_request_id,
@@ -312,6 +350,7 @@ pub(crate) fn drive_session(
                 );
                 return DriveOutcome::Completed;
             }
+            PacedTailPage::AtBoundary => break, // fixed target covered -> complete
             PacedTailPage::Gone => {
                 tracing::warn!(
                     terminal_id = %session.terminal_id,
@@ -322,6 +361,40 @@ pub(crate) fn drive_session(
             }
         }
     }
+    // The atomic completion: a drained ring clears the deferral; a staged
+    // remainder is delivered and cleared under one registry lock hold.
+    match registry.complete_paced_tail(&session.terminal_id, conn_id, session.page_end) {
+        PacedTailCompletion::CaughtUp => {}
+        PacedTailCompletion::Handoff {
+            end_seq,
+            serialized_bytes,
+        } => {
+            tracing::debug!(
+                terminal_id = %session.terminal_id,
+                end_seq,
+                serialized_bytes,
+                "ws.restore.paced_tail_handoff"
+            );
+            session.page_end = end_seq;
+            session.pages += 1;
+        }
+        PacedTailCompletion::Gone => {
+            tracing::warn!(
+                terminal_id = %session.terminal_id,
+                attach_request_id = %session.attach_request_id,
+                "ws.restore.paced_gone"
+            );
+            return DriveOutcome::Gone;
+        }
+    }
+    tracing::info!(
+        terminal_id = %session.terminal_id,
+        attach_request_id = %session.attach_request_id,
+        last_seq = session.page_end,
+        pages = session.pages,
+        "ws.restore.paced_complete"
+    );
+    DriveOutcome::Completed
 }
 
 /// Begin one negotiated session after a paced attach: sink the first page
@@ -451,10 +524,7 @@ mod tests {
             validate_credit(&mut session, &credit("arid-1", 30)),
             CreditVerdict::PartialConsumption
         );
-        assert_eq!(
-            session.credited, 10,
-            "a partial credit advances nothing"
-        );
+        assert_eq!(session.credited, 10, "a partial credit advances nothing");
         assert_eq!(session.page_end, 50, "a partial credit grants no page");
         // Repeated partial reports (coalesced client ticks) stay inert.
         assert_eq!(
