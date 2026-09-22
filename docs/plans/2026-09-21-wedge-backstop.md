@@ -33,6 +33,7 @@ Freshell detects wedged terminal-mode agent panes — running agent-mode termina
 - TypeScript uses NodeNext/ESM: relative imports include `.js` extensions. Path aliases `@/` → `src/`, `@test/` → `test/`.
 - A11y: the stuck card uses `role="alert"`, semantic `<button>`s, and non-empty accessible names (mirrors the freshcodex card, `FreshAgentView.tsx:3513-3538`).
 - Broad/coordinated runs: set `FRESHELL_TEST_SUMMARY` to a human-meaningful reason; focused cargo/vitest selectors are fine to run directly (they are delegated, not coordinated). Use `npm run test:vitest -- run <path>` for Vitest; raw `npx vitest` is not a repo workflow.
+- **Exit-status discipline (round-3 review):** every verification command in this plan that pipes (`cargo test … | tail`) must run under `set -o pipefail` — otherwise `tail`'s exit 0 masks the runner's failure and a red gate reads green. Every "Expected: PASS" below means the COMMAND's exit status, observed under pipefail.
 - Do not modify `NoiseScanner`, `RECENT_FINGERPRINTS`, or the strip set (`idle_noise.rs`); do not modify `enforce_idle_kills`' eligibility rules (registry.rs:1215-1279). Additive-only changes to the reaper area.
 - Wire-contract changes go through the frozen-route pattern: extend `ServerMessage` + `SERVER_MESSAGE_TYPES`, run `npm run contract:generate`, keep `test/unit/port/ws-contract-freeze.test.ts` green (the `terminal.idle` precedent, server_messages.rs:520-531, `SESSION` docs).
 - Before running e2e: `FRESHELL_E2E_BACKEND` must be set or the user must be asked (cloud ~2-3 min, ~$0.03/run vs local ~28 min). Record the answer; do not silently pick a paid lane.
@@ -57,119 +58,11 @@ Freshell detects wedged terminal-mode agent panes — running agent-mode termina
   - `pub struct StuckTransition { pub terminal_id: String, pub mode: String, pub stuck: bool, pub at: i64 }`
   - `pub fn enforce_stuck_detection(&self) -> Vec<StuckTransition>`
 
-- [ ] **Step 1: Write the failing behavioral tests**
+- [ ] **Step 1: Write the failing behavioral tests — staged additions in this exact order**
 
-In `registry.rs`'s test module (mirroring the `enforce_idle_kills_*` suite at 5320-5700; reuse the same row-construction pattern as `enforce_idle_kills_spares_agent_mode_terminals_past_threshold` at 5414-5445 for agent-mode rows and `enforce_idle_kills_never_kills_an_attached_terminal` at 5365-5381 for attached rows):
+Cargo compiles the whole crate test target before name filters (the plan's own finding), so the additions are STAGED within this one step and each stage is run before the next:
 
-```rust
-const STUCK_TEST_WINDOW_MS: i64 = 100;
-
-fn stuck_test_registry(mode: &str) -> TerminalRegistry {
-    let reg = // mirror the agent-mode row construction from the 5414 test,
-              // insert_headless with mode set the same way that test does
-    reg.set_stuck_window_ms(STUCK_TEST_WINDOW_MS);
-    reg
-}
-
-#[test]
-fn stuck_detection_flags_attached_agent_pane_with_only_repaint_noise() {
-    let reg = stuck_test_registry("opencode");
-    // Attach a subscriber FIRST — the deliberate divergence from the idle
-    // reaper: attached panes are the primary target class (the reaper
-    // exempts them by design, registry.rs:1232).
-    attach_test_subscriber(&reg, "T"); // mirror the 5365 test's attach helper
-    // Warm the fingerprint ring, then backdate BOTH clocks past the window.
-    reg.feed("T", frame(1, "\r\x1b[2K⠋ (1s • esc to interrupt)", "S"));
-    reg.backdate_last_activity("T", now-ish minus window+1); // mirror 5383 test
-    // Repaint-only output keeps last_activity_at fresh; the meaningful
-    // clock stays stale.
-    for (i, glyph) in ["⠙","⠹","⠸","⠼"].iter().enumerate() {
-        reg.feed("T", frame(2 + i as i64, &format!("\r\x1b[2K{glyph} ({}s • esc to interrupt)", i+2), "S"));
-    }
-    let transitions = reg.enforce_stuck_detection();
-    assert_eq!(transitions.len(), 1);
-    assert!(transitions[0].stuck);
-    assert_eq!(transitions[0].terminal_id, "T");
-    assert_eq!(transitions[0].mode, "opencode");
-    // Idempotent: a second sweep emits no transition.
-    assert!(reg.enforce_stuck_detection().is_empty());
-}
-
-#[test]
-fn stuck_detection_clears_on_meaningful_output() {
-    let reg = stuck_test_registry("opencode");
-    reg.backdate_last_activity("T", /* window+1 ago */);
-    let t = reg.enforce_stuck_detection();
-    assert_eq!(t.len(), 1);
-    assert!(t[0].stuck);
-    // Genuinely-new content refreshes the meaningful clock (ingest path).
-    reg.feed("T", frame(9, "meaningful new text line\n", "S"));
-    let cleared = reg.enforce_stuck_detection();
-    assert_eq!(cleared.len(), 1);
-    assert!(!cleared[0].stuck);
-}
-
-#[test]
-fn stuck_detection_clears_on_user_input() {
-    // Input bumps BOTH clocks (registry.rs:1818-1820) and returns
-    // `InputOutcome` (NOT a Result — do not unwrap).
-    let reg = stuck_test_registry("opencode");
-    reg.backdate_last_activity("T", /* window+1 ago */);
-    reg.enforce_stuck_detection();
-    let _ = reg.input("T", b"x"); // InputOutcome — assert the row-clock variant if desired
-    let cleared = reg.enforce_stuck_detection();
-    assert_eq!(cleared.len(), 1);
-    assert!(!cleared[0].stuck);
-}
-
-#[test]
-fn stuck_detection_ignores_shell_mode_and_exited_rows_and_under_window() {
-    // shell-mode row past the window with fresh activity → no transition.
-    // agent-mode row under the window → no transition.
-    // agent-mode row with status != Running → no transition (mirror how
-    // the 5320 suite forces an Exited row; e.g. finish_pty_exit or the
-    // headless exit helper used by the exit-path tests).
-}
-
-#[test]
-fn stuck_detection_ignores_prompt_idle_rows_where_both_clocks_are_stale() {
-    // The round-1 review pin: a pane sitting quietly at a prompt emits
-    // NOTHING — both clocks age together, so there is no repaint loop and
-    // the pane must NOT be flagged (flagging it would alter a non-wedged
-    // pane). Backdate BOTH clocks equally past the window; do NOT feed.
-    let reg = stuck_test_registry("opencode");
-    reg.backdate_last_activity("T", /* window+1 ago, both clocks */);
-    assert!(reg.enforce_stuck_detection().is_empty());
-}
-
-#[test]
-fn stuck_detection_clears_when_output_freezes_entirely() {
-    // A flagged pane whose repaint stream stops (activity goes stale) is no
-    // longer provably a repaint loop: clear the flag with a transition.
-    let reg = stuck_test_registry("opencode");
-    reg.backdate_last_activity("T", /* window+1 ago */);
-    // repaint feeds keep activity fresh → flagged
-    reg.feed("T", frame(1, "\r\x1b[2K⠋ repaint", "S"));
-    let t = reg.enforce_stuck_detection();
-    assert_eq!(t.len(), 1);
-    assert!(t[0].stuck);
-    // now backdate both clocks far past the freshness bound, feed nothing
-    reg.backdate_last_activity("T", /* window+1 ago again */);
-    let cleared = reg.enforce_stuck_detection();
-    assert_eq!(cleared.len(), 1);
-    assert!(!cleared[0].stuck);
-}
-
-#[test]
-fn stuck_detection_disabled_when_window_zero_or_negative() {
-    let reg = stuck_test_registry("opencode");
-    reg.set_stuck_window_ms(0);
-    reg.backdate_last_activity("T", /* far past */);
-    reg.feed("T", frame(1, "\r\x1b[2K⠋", "S")); // activity fresh
-    assert!(reg.enforce_stuck_detection().is_empty());
-}
-```
-
+**Stage (a): add ONLY the `idle_noise.rs` fixture test (alone).** Run it immediately (Run A, below) BEFORE adding any registry test. This is the round-3 review's sequencing fix: Step 1 and Step 2 must agree on the order.
 In `idle_noise.rs` tests — the real-opencode-TUI fixture pin (data from the 2026-09-20 real capture analyzed in `plan-frame-evidence.md`: an 8-cell gradient bar of `⬝` U+2B1D / `■` U+25A0 cycling through exactly 14 distinct compositions per 52-frame sweep, colors varying per frame but riding CSI sequences, plus a braille spinner cell):
 
 ```rust
@@ -214,15 +107,133 @@ fn opencode_tui_gradient_bar_spinner_cycle_is_noise_after_first_sweep() {
 }
 ```
 
-- [ ] **Step 2: Run the tests and verify the intended failure**
+**Stage (b): after Run A passes, add the registry stuck tests.** Run them (Run B, below) and observe the intended RED before writing any production code.
 
-Cargo compiles the whole crate test target before applying name filters, so run the two additions SEPARATELY in this order:
+In `registry.rs`'s test module (mirroring the `enforce_idle_kills_*` suite at 5320-5700; reuse the same row-construction pattern as `enforce_idle_kills_spares_agent_mode_terminals_past_threshold` at 5414-5445 for agent-mode rows and `enforce_idle_kills_never_kills_an_attached_terminal` at 5365-5381 for attached rows):
 
-Run A (fixture pin only — add the `opencode_tui` test FIRST, alone): `cargo test -p freshell-terminal opencode_tui 2>&1 | tail -20`
+```rust
+const STUCK_TEST_WINDOW_MS: i64 = 100;
+
+fn stuck_test_registry(mode: &str) -> TerminalRegistry {
+    let reg = // mirror the agent-mode row construction from the 5414 test,
+              // insert_headless with mode set the same way that test does
+    reg.set_stuck_window_ms(STUCK_TEST_WINDOW_MS);
+    reg
+}
+
+/// The shared flag-setup: warm the fingerprint ring with one meaningful
+/// first-occurrence frame, backdate BOTH clocks past the window, then feed
+/// ring-repeat repaint variants (noise → activity fresh, meaningful stale).
+/// This is the ONLY way a row reaches the flagged state — both the flag
+/// test and the clear tests must start from here (round-3 review Major:
+/// backdating alone can never flag, because the predicate also requires
+/// activity freshness).
+fn flag_stuck_row(reg: &TerminalRegistry) {
+    reg.feed("T", frame(1, "\r\x1b[2K⠋ (1s • esc to interrupt)", "S"));
+    reg.backdate_last_activity("T", /* now - (window+1) */);
+    for (i, glyph) in ["⠙","⠹","⠸","⠼"].iter().enumerate() {
+        reg.feed("T", frame(2 + i as i64, &format!("\r\x1b[2K{glyph} ({}s • esc to interrupt)", i+2), "S"));
+    }
+    let transitions = reg.enforce_stuck_detection();
+    assert_eq!(transitions.len(), 1);
+    assert!(transitions[0].stuck);
+    assert_eq!(transitions[0].terminal_id, "T");
+    assert_eq!(transitions[0].mode, "opencode");
+    // Idempotent: a second sweep emits no transition.
+    assert!(reg.enforce_stuck_detection().is_empty());
+}
+
+#[test]
+fn stuck_detection_flags_attached_agent_pane_with_only_repaint_noise() {
+    let reg = stuck_test_registry("opencode");
+    // Attach a subscriber FIRST — the deliberate divergence from the idle
+    // reaper: attached panes are the primary target class (the reaper
+    // exempts them by design, registry.rs:1232). The flag transition and
+    // its shape are asserted by the helper — an ATTACHED row flagging is
+    // the whole point of this test.
+    attach_test_subscriber(&reg, "T"); // mirror the 5365 test's attach helper
+    flag_stuck_row(&reg);
+}
+
+#[test]
+fn stuck_detection_clears_on_meaningful_output() {
+    let reg = stuck_test_registry("opencode");
+    flag_stuck_row(&reg);
+    // Genuinely-new content refreshes the meaningful clock (ingest path).
+    reg.feed("T", frame(9, "meaningful new text line\n", "S"));
+    let cleared = reg.enforce_stuck_detection();
+    assert_eq!(cleared.len(), 1);
+    assert!(!cleared[0].stuck);
+}
+
+#[test]
+fn stuck_detection_clears_on_user_input() {
+    // Input bumps BOTH clocks (registry.rs:1818-1820) and returns
+    // `InputOutcome` (NOT a Result — do not unwrap).
+    let reg = stuck_test_registry("opencode");
+    flag_stuck_row(&reg);
+    let _ = reg.input("T", b"x"); // InputOutcome — assert the row-clock variant if desired
+    let cleared = reg.enforce_stuck_detection();
+    assert_eq!(cleared.len(), 1);
+    assert!(!cleared[0].stuck);
+}
+
+#[test]
+fn stuck_detection_ignores_shell_mode_and_exited_rows_and_under_window() {
+    // shell-mode row past the window with fresh activity → no transition.
+    // agent-mode row under the window → no transition.
+    // agent-mode row with status != Running → no transition (mirror how
+    // the 5320 suite forces an Exited row; e.g. finish_pty_exit or the
+    // headless exit helper used by the exit-path tests).
+}
+
+#[test]
+fn stuck_detection_ignores_prompt_idle_rows_where_both_clocks_are_stale() {
+    // The round-1 review pin: a pane sitting quietly at a prompt emits
+    // NOTHING — both clocks age together, so there is no repaint loop and
+    // the pane must NOT be flagged (flagging it would alter a non-wedged
+    // pane). Backdate BOTH clocks equally past the window; do NOT feed.
+    let reg = stuck_test_registry("opencode");
+    reg.backdate_last_activity("T", /* window+1 ago, both clocks */);
+    assert!(reg.enforce_stuck_detection().is_empty());
+}
+
+#[test]
+fn stuck_detection_clears_when_output_freezes_entirely() {
+    // A flagged pane whose repaint stream stops (activity goes stale) is no
+    // longer provably a repaint loop: clear the flag with a transition.
+    let reg = stuck_test_registry("opencode");
+    flag_stuck_row(&reg);
+    // now backdate BOTH clocks far past the freshness bound, feed nothing
+    // (the ring-warm discipline lives in the helper — a bare "⠋ repaint"
+    // feed here would carry the significant word "repaint" and refresh the
+    // MEANINGFUL clock, breaking the test)
+    reg.backdate_last_activity("T", /* window+1 ago again */);
+    let cleared = reg.enforce_stuck_detection();
+    assert_eq!(cleared.len(), 1);
+    assert!(!cleared[0].stuck);
+}
+
+#[test]
+fn stuck_detection_disabled_when_window_zero_or_negative() {
+    let reg = stuck_test_registry("opencode");
+    reg.set_stuck_window_ms(0);
+    reg.backdate_last_activity("T", /* far past */);
+    reg.feed("T", frame(1, "\r\x1b[2K⠋", "S")); // activity fresh
+    assert!(reg.enforce_stuck_detection().is_empty());
+}
+```
+
+
+- [ ] **Step 2: Run the staged tests and verify each stage's intended result**
+
+Each staged addition from Step 1 is run immediately after being added, under `set -o pipefail` (see Global Constraints):
+
+Run A (after Stage (a)): `cargo test -p freshell-terminal opencode_tui 2>&1 | tail -20`
 
 Expected: PASS — the fixture pins EXISTING scanner behavior (a characterization pin in the family of the codex-shimmer tests, idle_noise.rs:337-366); if it FAILS, the fixture mis-models the strip set and the fixture is wrong, not the scanner.
 
-Run B (then add the `stuck_detection_*` tests and run): `cargo test -p freshell-terminal stuck_detection 2>&1 | tail -20`
+Run B (after Stage (b)): `cargo test -p freshell-terminal stuck_detection 2>&1 | tail -20`
 
 Expected: FAIL to COMPILE — `enforce_stuck_detection`, `StuckTransition`, `set_stuck_window_ms` do not exist (the intended missing-behavior failure).
 
@@ -968,7 +979,7 @@ Share the shim-emitter snippet between the three tests via one helper in the spe
 
 - Add the stuck-card mock to `docs/index.html` (search for the exit-banner/dead-pane mock area and mirror its structure).
 - README: only add a sentence if the README already enumerates pane status UX features; do not create new doc files.
-- Full-suite gate (coordinated, once, after all tasks): `FRESHELL_TEST_SUMMARY='the-usual wedge-backstop full-suite gate' npm test`
+- Full-suite gate (coordinated, once, after all tasks — per the usual-executing-plans gate procedure): `FRESHELL_TEST_SUMMARY='the-usual wedge-backstop full-suite gate' npm run check` (typecheck + the coordinated full suite). NOTE (round-3 review): `npm test` alone covers neither the typecheck nor the Playwright e2e lane — the gate must include `npm run check` AND the affected e2e spec run from Task 5 (`npm run test:e2e -- terminal-stuck-rust.spec.ts`), all under `set -o pipefail`.
 
 Expected: PASS green excluding baseline-ledger pre-existing failures (none recorded).
 
