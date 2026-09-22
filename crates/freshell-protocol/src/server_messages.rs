@@ -168,7 +168,8 @@ pub enum ServerMessage {
     TerminalStatus(TerminalStatus),
     #[serde(rename = "terminal.stream.changed")]
     TerminalStreamChanged(TerminalStreamChanged),
-    // Extension surface (wedge-backstop run, not in the frozen T0 inventory):
+    // Wedge-backstop addition; joined the frozen inventory
+    // (SERVER_MESSAGE_TYPES + regenerated contract) in this change:
     // the terminal-mode stuck edge — `{ terminalId, at, stuck }`, emitted ONCE
     // per stuck/unstuck transition by the stuck monitor, and once to a
     // freshly attaching subscriber while the row is flagged. The

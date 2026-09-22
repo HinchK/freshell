@@ -62,6 +62,7 @@ pub use mode_tracker::ModeTracker;
 pub use pty::{build_child_env, build_child_env_from_process, MessageSink, PtyTerminal};
 pub use registry::{
     compute_scrollback_max_bytes, ActivityEvent, ActivityObserver, AttachOutcome, FrameSink,
-    InputOutcome, TerminalRegistry,
+    InputOutcome, StuckTransition, TerminalRegistry, DEFAULT_STUCK_WINDOW_MS,
+    STUCK_ACTIVITY_FRESH_MS,
 };
 pub use replay_ring::{ReplayDeque, ReplayFrame, ReplayRing};

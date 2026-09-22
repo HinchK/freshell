@@ -1143,6 +1143,20 @@ async fn main() -> ExitCode {
         std::time::Duration::from_secs(30)
     };
     freshell_ws::spawn_idle_monitor(registry.clone(), idle_sweep_interval);
+    // Wedge-backstop Task 3: the wedged-agent-pane backstop monitor — the
+    // terminal-mode analogue of the freshcodex quiet deadman. Same cadence
+    // expression as the idle monitor above (30s production / 250ms under
+    // the test clock); the window override is seeded from
+    // `FRESHELL_TERMINAL_STUCK_WINDOW_MS` (parseable integer AS-IS; 0 or
+    // negative disables the sweep; unparseable keeps the 2h default).
+    // Surface-only: nothing is killed here — flagged panes render the
+    // "Agent appears stuck" card and the USER picks the action.
+    registry.set_stuck_window_ms(freshell_ws::stuck_window_ms_from_env());
+    freshell_ws::spawn_stuck_monitor(
+        registry.clone(),
+        Arc::clone(&broadcast_tx),
+        idle_sweep_interval,
+    );
     // e2e knob (kata znhn item 2): sub-second flap cycles would trip the
     // registry generation cap (3 per 30s liveness window) before the hub's
     // circuit breaker can ever fire. Production default unchanged.

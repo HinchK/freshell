@@ -7700,6 +7700,14 @@ async fn handle_kill(
     // close flows await it before dropping the pane; the legacy error frames
     // (`INTERNAL_ERROR` / `INVALID_TERMINAL_ID`) remain for requestId-less
     // kills (older clients). (DETACH stays non-retiring, unchanged.)
+    //
+    // Wedge-backstop Task 3 exception: a kill whose `reason` is
+    // `"stuck-recovery"` (the "Agent appears stuck" card's restart /
+    // start-fresh action) is a PROCESS-ONLY kill — it skips the durable
+    // close (and the identity retirement/tombstone consult inside it) so
+    // the pane's session stays resumable for the follow-up restore:create
+    // respawn; see the stuck_recovery branch below. Everything else about
+    // the kill is unchanged.
     let sref = state.identity.session_ref_for(&kill.terminal_id);
 
     // kata b8ke Task 4 (round-3 carried finding F3 — the binding requirement):
@@ -7882,84 +7890,110 @@ async fn handle_kill(
     // past this point: a granted stop never strands `Stopping` (Task 4
     // review F1).
 
-    let create_request_id = state
-        .registry
-        .probe_create_request_id(&kill.terminal_id)
-        .or_else(|| kill.create_request_id.clone());
-    let ledger = std::sync::Arc::clone(&state.pane_ledger);
-    let tid = kill.terminal_id.clone();
-    let now = now_ms();
-    // Delta-r6-r4 (focused-episode-6 round 3, Finding 3): the close's error
-    // is CLASSED, never flattened — `Clean` means nothing is durable (leave
-    // the terminal running, answer failure); `Persisted` means the journal
-    // record stands despite the reported error, so the kill PROCEEDS (the
-    // live terminal ends, consistent with the durable close) while the
-    // answer still reports failure visibly.
-    let close_outcome = spawn_blocking_in_span(move || {
-        ledger.close_pane(&crate::pane_ledger::PaneCloseWrite {
-            terminal_id: tid.clone(),
-            create_request_id,
-            resolved: sref.into_iter().collect(),
-            now_ms: now,
+    // Wedge-backstop Task 3 (round-1 review Major): the reason
+    // discriminator. `Some("stuck-recovery")` ⇒ a PROCESS-ONLY kill — the
+    // durable close block below (the `close_pane` envelope write AND the
+    // session-identity retirement/tombstone consult it performs, which is
+    // what makes recovery suppress this session as deliberately closed)
+    // is skipped entirely, mirroring the idle reaper's server-initiated
+    // kill (no close envelope; reaped rows converge to respawn, not
+    // suppression — pane_reconcile). The pane's durable session must
+    // survive so the `restore:create` respawn the client dispatches next
+    // can resume it. Any other reason value (or absent) keeps today's
+    // full pane-close semantics byte-for-byte.
+    let stuck_recovery = kill.reason.as_deref() == Some("stuck-recovery");
+    let mut persisted_despite_error = false;
+    if stuck_recovery {
+        tracing::info!(
+            terminal_id = %kill.terminal_id,
+            "terminal_kill_stuck_recovery: process-only kill; session left resumable"
+        );
+    } else {
+        let create_request_id = state
+            .registry
+            .probe_create_request_id(&kill.terminal_id)
+            .or_else(|| kill.create_request_id.clone());
+        let ledger = std::sync::Arc::clone(&state.pane_ledger);
+        let tid = kill.terminal_id.clone();
+        let now = now_ms();
+        // Delta-r6-r4 (focused-episode-6 round 3, Finding 3): the close's
+        // error is CLASSED, never flattened — `Clean` means nothing is
+        // durable (leave the terminal running, answer failure);
+        // `Persisted` means the journal record stands despite the reported
+        // error, so the kill PROCEEDS (the live terminal ends, consistent
+        // with the durable close) while the answer still reports failure
+        // visibly.
+        let close_outcome = spawn_blocking_in_span(move || {
+            ledger.close_pane(&crate::pane_ledger::PaneCloseWrite {
+                terminal_id: tid.clone(),
+                create_request_id,
+                resolved: sref.into_iter().collect(),
+                now_ms: now,
+            })
         })
-    })
-    .await
-    .unwrap_or_else(|err| {
-        tracing::warn!(terminal_id = %kill.terminal_id, error = %err, "pane_ledger_close_join_failed_on_kill");
-        Err(crate::pane_ledger::CloseEnvelopeError::Clean(
-            std::io::Error::other(format!("close task join failed: {err}")),
-        ))
-    });
-    let persisted_despite_error = match &close_outcome {
-        Ok(()) => false,
-        Err(err) => {
-            if err.is_persisted() {
-                tracing::error!(terminal_id = %kill.terminal_id, error = %err,
-                    "pane_ledger_close_persisted_despite_error_on_kill: the close is durable; \
-                     the terminal ends consistently and the answer reports the failure");
-                true
-            } else {
-                tracing::warn!(terminal_id = %kill.terminal_id, error = %err, "pane_ledger_close_pane_failed_on_kill");
-                false
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(terminal_id = %kill.terminal_id, error = %err, "pane_ledger_close_join_failed_on_kill");
+            Err(crate::pane_ledger::CloseEnvelopeError::Clean(
+                std::io::Error::other(format!("close task join failed: {err}")),
+            ))
+        });
+        persisted_despite_error = match &close_outcome {
+            Ok(()) => false,
+            Err(err) => {
+                if err.is_persisted() {
+                    tracing::error!(terminal_id = %kill.terminal_id, error = %err,
+                        "pane_ledger_close_persisted_despite_error_on_kill: the close is durable; \
+                         the terminal ends consistently and the answer reports the failure");
+                    true
+                } else {
+                    tracing::warn!(terminal_id = %kill.terminal_id, error = %err, "pane_ledger_close_pane_failed_on_kill");
+                    false
+                }
             }
-        }
-    };
-    if close_outcome_is_clean_failure(&close_outcome) {
-        // Task 4 review F1: the clean failure leaves the terminal RUNNING
-        // (the close contract) — the granted stop must roll back to Live
-        // HERE, or the key wedges `Stopping` forever (every later kill is
-        // typed-refused `NotLive{Stopping}`, every create Blocked, and
-        // nothing recovers it: the watchdog sweeps `Starting` only, the
-        // fenced exit-watcher release matches `Live` only).
-        abort_terminal_stop(state, &mut stop_commit);
-        const CLOSE_FAILURE_COPY: &str =
-            "the terminal close could not be recorded durably; the terminal was left running";
-        if let Some(request_id) = &kill.request_id {
-            let msg = ServerMessage::TerminalKilled(freshell_protocol::TerminalKilled {
-                request_id: request_id.clone(),
-                terminal_id: kill.terminal_id,
-                success: false,
-                error: Some(CLOSE_FAILURE_COPY.to_string()),
+        };
+        if close_outcome_is_clean_failure(&close_outcome) {
+            // Task 4 review F1: the clean failure leaves the terminal RUNNING
+            // (the close contract) — the granted stop must roll back to Live
+            // HERE, or the key wedges `Stopping` forever (every later kill is
+            // typed-refused `NotLive{Stopping}`, every create Blocked, and
+            // nothing recovers it: the watchdog sweeps `Starting` only, the
+            // fenced exit-watcher release matches `Live` only).
+            abort_terminal_stop(state, &mut stop_commit);
+            const CLOSE_FAILURE_COPY: &str =
+                "the terminal close could not be recorded durably; the terminal was left running";
+            if let Some(request_id) = &kill.request_id {
+                let msg = ServerMessage::TerminalKilled(freshell_protocol::TerminalKilled {
+                    request_id: request_id.clone(),
+                    terminal_id: kill.terminal_id,
+                    success: false,
+                    error: Some(CLOSE_FAILURE_COPY.to_string()),
+                });
+                return send(ws_tx, &msg).await;
+            }
+            let msg = ServerMessage::Error(ErrorMsg {
+                owner_kind: None,
+                owner_generation: None,
+                owner_epoch: None,
+                code: ErrorCode::InternalError,
+                message: CLOSE_FAILURE_COPY.to_string(),
+                timestamp: crate::now_iso(),
+                actual_session_ref: None,
+                expected_session_ref: None,
+                request_id: None,
+                retry_after_ms: None,
+                terminal_id: Some(kill.terminal_id),
+                terminal_exit_code: None,
+                live_terminal_id: None,
             });
             return send(ws_tx, &msg).await;
         }
-        let msg = ServerMessage::Error(ErrorMsg {
-            owner_kind: None,
-            owner_generation: None,
-            owner_epoch: None,
-            code: ErrorCode::InternalError,
-            message: CLOSE_FAILURE_COPY.to_string(),
-            timestamp: crate::now_iso(),
-            actual_session_ref: None,
-            expected_session_ref: None,
-            request_id: None,
-            retry_after_ms: None,
-            terminal_id: Some(kill.terminal_id),
-            terminal_exit_code: None,
-            live_terminal_id: None,
-        });
-        return send(ws_tx, &msg).await;
     }
+    // Stuck-recovery arrives here with NO durable close attempted: there is
+    // no close outcome to class, so the answer below reports plain success
+    // (persisted_despite_error stays false) and the kill core runs
+    // unchanged — the session identity, binding row, and recovery verdict
+    // all still stand for the respawn.
     // The durable close stands (cleanly, or persisted-despite-error). The
     // correlated answer reports success regardless of whether a reaper beat
     // the process kill (a missing registry row means the terminal is already

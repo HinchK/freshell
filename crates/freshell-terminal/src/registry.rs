@@ -51,7 +51,7 @@ use freshell_platform::SpawnSpec;
 use freshell_protocol::{
     GeometryAuthority, InventoryTerminal, OutputSource, ServerMessage, SessionLocator,
     TerminalAttachIntent, TerminalAttachReady, TerminalExit, TerminalModesSync, TerminalOutput,
-    TerminalRunStatus,
+    TerminalRunStatus, TerminalStuck,
 };
 
 use crate::barrier_scanner::{BarrierReason, BarrierScanner, ScannerState};
@@ -1865,6 +1865,28 @@ impl TerminalRegistry {
                     sink(ServerMessage::TerminalOutput(out));
                 }
             }
+        }
+
+        // Wedge-backstop Task 3 (LB-12): state the row's CURRENT stuck truth
+        // to the NEW subscriber's sink only (never the broadcast bus), for
+        // agent-mode Running rows, in BOTH directions — stuck:true while
+        // flagged, stuck:false when healthy. A client that missed a
+        // transition broadcast (offline during the flag or the clear)
+        // reconciles its card on re-attach; repeated keepalive re-attach
+        // re-sends the frame, which is harmless (the client fold is a
+        // keyed set/clear — idempotent). Ordered after the replay and
+        // before the already-Exited block by construction (the same
+        // per-terminal lock is held for the whole handoff), preserving
+        // ready < modes.sync < replay < live. Exited rows are excluded by
+        // the gate: the synthetic exit below answers them, never a stuck
+        // card.
+        if Self::is_agent_mode(&s.mode) && s.status == TerminalRunStatus::Running {
+            let stuck_truth = ServerMessage::TerminalStuck(TerminalStuck {
+                terminal_id: terminal_id.to_string(),
+                at: s.stuck_since.unwrap_or_else(now_ms),
+                stuck: s.stuck_since.is_some(),
+            });
+            sink(stuck_truth);
         }
 
         // DEFECT 5b ("blank pane" on an instant-exit CLI failure): a terminal
@@ -6061,6 +6083,140 @@ mod tests {
         assert!(reg.enforce_stuck_detection().is_empty());
         reg.set_stuck_window_ms(-1);
         assert!(reg.enforce_stuck_detection().is_empty());
+    }
+
+    // Wedge-backstop Task 3: the attach-time stuck-truth emission. A NEW
+    // subscriber attaching to an agent-mode Running row learns the row's
+    // CURRENT stuck state in BOTH directions (stuck:true when flagged,
+    // stuck:false when healthy) — the reconnect reconciliation frame. A
+    // client that missed a broadcast (offline during the flag, or during
+    // the clear) reconciles on re-attach; repeated keepalive re-attach
+    // re-sends the frame harmlessly (the client fold is idempotent).
+
+    /// The `terminal.stuck` frames a collector sink received, in delivery
+    /// order (the `modes_syncs` pattern).
+    fn stuck_frames(
+        seen: &Arc<StdMutex<Vec<ServerMessage>>>,
+    ) -> Vec<freshell_protocol::TerminalStuck> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|m| match m {
+                ServerMessage::TerminalStuck(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn attaching_to_an_agent_row_enqueues_the_current_stuck_truth_both_directions() {
+        // Flagged row: the wedge shape (Task 1's helper is the ONLY way a
+        // row reaches the flagged state), then a fresh subscriber attaches.
+        let reg = stuck_test_registry("opencode");
+        flag_stuck_row(&reg);
+        let (sink, seen) = collector();
+        let outcome = reg.attach("T", 1, sink, Some("att-1".into()), 0, false, None, None);
+        assert!(outcome.found);
+        let msgs = seen.lock().unwrap().clone();
+        let ready_pos = msgs
+            .iter()
+            .position(|m| matches!(m, ServerMessage::TerminalAttachReady(_)))
+            .expect("attach.ready emitted");
+        let last_replay_pos = msgs
+            .iter()
+            .rposition(|m| matches!(m, ServerMessage::TerminalOutput(_)))
+            .expect("the flagged row's scrollback replays");
+        let stuck = stuck_frames(&seen);
+        assert_eq!(stuck.len(), 1, "exactly one stuck frame per attach");
+        assert!(stuck[0].stuck, "a flagged row's truth is stuck:true");
+        assert_eq!(stuck[0].terminal_id, "T");
+        let stuck_pos = msgs
+            .iter()
+            .position(|m| matches!(m, ServerMessage::TerminalStuck(_)))
+            .expect("stuck frame emitted");
+        assert!(
+            ready_pos < last_replay_pos && last_replay_pos < stuck_pos,
+            "ready < replay < stuck-truth (the emission follows the replay, \
+             inside the attach handoff): ready={ready_pos} \
+             last_replay={last_replay_pos} stuck={stuck_pos}"
+        );
+
+        // Healthy row (fresh meaningful clock): the reconnect
+        // reconciliation frame carries stuck:false, so a client that
+        // missed the stuck:false broadcast drops its stale card.
+        let reg = stuck_test_registry("opencode");
+        reg.feed("T", frame(1, "meaningful boot text\r\n", "S"));
+        let (sink, seen) = collector();
+        let outcome = reg.attach("T", 1, sink, Some("att-2".into()), 0, false, None, None);
+        assert!(outcome.found);
+        let stuck = stuck_frames(&seen);
+        assert_eq!(
+            stuck.len(),
+            1,
+            "a healthy agent row still states its truth on attach"
+        );
+        assert!(!stuck[0].stuck, "the healthy row's truth is stuck:false");
+        assert_eq!(stuck[0].terminal_id, "T");
+
+        // The gate: shell-mode rows and non-Running rows state NOTHING (a
+        // shell pane has no stuck semantics; an exited pane is answered by
+        // the synthetic exit, never a stuck card).
+        let reg = stuck_test_registry("opencode");
+        reg.register_headless(HeadlessTerminal {
+            terminal_id: "T-shell".to_string(),
+            stream_id: "S-shell".to_string(),
+            mode: "shell".to_string(),
+            resume_session_id: None,
+            create_request_id: None,
+            created_at: Some(now_ms()),
+        });
+        let (sink, seen) = collector();
+        let _ = reg.attach("T-shell", 1, sink, None, 0, false, None, None);
+        assert!(
+            stuck_frames(&seen).is_empty(),
+            "shell-mode rows emit no stuck truth on attach"
+        );
+
+        reg.feed("T", frame(1, "\r\x1b[2K⠋", "S"));
+        assert!(reg.finish_pty_exit("T", 3));
+        let (sink, seen) = collector();
+        let _ = reg.attach("T", 2, sink, None, 0, false, None, None);
+        assert!(
+            stuck_frames(&seen).is_empty(),
+            "exited rows emit no stuck truth on attach (the synthetic exit answers)"
+        );
+    }
+
+    #[test]
+    fn attach_reconciles_a_late_clear_for_a_reconnecting_client() {
+        // Flag the row, attach (sink A sees stuck:true), then user input
+        // clears the flag (next sweep), then a FRESH sink B attaches: it
+        // must see stuck:false — a client that missed the stuck:false
+        // broadcast reconciles its stale card on re-attach.
+        let reg = stuck_test_registry("opencode");
+        flag_stuck_row(&reg);
+        let (sink_a, seen_a) = collector();
+        let _ = reg.attach("T", 1, sink_a, Some("att-a".into()), 0, false, None, None);
+        let stuck_a = stuck_frames(&seen_a);
+        assert_eq!(stuck_a.len(), 1);
+        assert!(stuck_a[0].stuck, "precondition: sink A saw the flag");
+
+        // User input bumps BOTH clocks (the Task 1 clear path), then the
+        // sweep emits the true→false transition.
+        assert!(reg.input("T", b"x").found);
+        let cleared = reg.enforce_stuck_detection();
+        assert_eq!(cleared.len(), 1);
+        assert!(!cleared[0].stuck);
+
+        // The reconnect: a NEW subscriber (fresh conn id) learns stuck:false.
+        let (sink_b, seen_b) = collector();
+        let _ = reg.attach("T", 2, sink_b, Some("att-b".into()), 0, false, None, None);
+        let stuck_b = stuck_frames(&seen_b);
+        assert_eq!(stuck_b.len(), 1);
+        assert!(
+            !stuck_b[0].stuck,
+            "the reconnecting client reconciles the missed clear: stuck:false"
+        );
     }
 
     // `compute_scrollback_max_bytes` (TERM-13, `settings.terminal.scrollback`):
