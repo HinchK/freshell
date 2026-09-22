@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import freshAgentReducer, {
+  applyRefusalFence,
   applyRuntimeOwner,
   resetRuntimeOwners,
   type RuntimeOwnerRecord,
@@ -105,5 +106,28 @@ describe('freshAgentSlice runtimeOwners fold', () => {
     const record: RuntimeOwnerRecord = state.runtimeOwners['codex:sid-1']
     expect(record.previousKind).toBe('fresh-agent')
     expect(record.updatedAt).toBeGreaterThanOrEqual(before)
+  })
+
+  it('the refusal fence fold never regresses the recorded generation (advance-only, like the broadcast fold)', () => {
+    // 2026-09-20 incident recovery (Task 5 review M1): a NEWER runtimeOwner
+    // broadcast (gen 3) can fold between the server minting the 409 refusal
+    // (gen 2) and the client processing it — the refusal must not roll the
+    // record back, or the recovery attach would carry a stale fence the
+    // wired server refuses with FENCE_REQUIRED.
+    const seeded = reducerWith(applyRuntimeOwner(baseFrame({
+      provider: 'opencode',
+      sessionId: 'ses-fence',
+      epoch: 1,
+      generation: 3,
+      ownerKind: 'fresh-agent',
+    })))
+    const refusalFold = (ownerGeneration: number) => freshAgentReducer(seeded, applyRefusalFence({
+      provider: 'opencode',
+      sessionId: 'ses-fence',
+      ownerKind: 'fresh-agent',
+      ownerGeneration,
+    }))
+    expect(refusalFold(2).runtimeOwners['opencode:ses-fence'].generation).toBe(3)
+    expect(refusalFold(4).runtimeOwners['opencode:ses-fence'].generation).toBe(4)
   })
 })
