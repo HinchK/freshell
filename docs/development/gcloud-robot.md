@@ -99,8 +99,8 @@ The identity preflight mints via `oauth2.googleapis.com`, which the gateway
 deliberately does not broker: on brokered hosts, a lane whose resolved
 identity has a dead LOCAL credential now fails fast at the preflight instead
 of succeeding silently via brokered control-plane hosts. Keep the robot key
-activated (`scripts/bootstrap-robot.sh`) or pin `GCLOUD_IDENT` on such
-machines.
+activated (`$GCLOUD_ROBOT_HOME/scripts/bootstrap-robot.sh`) or pin
+`GCLOUD_IDENT` on such machines.
 
 Consequence for operators: gcloud calls on a brokered host from
 garageserver run as the robot regardless of the active account — including
