@@ -260,21 +260,46 @@ pub enum PacedTailPage {
 }
 
 /// Result of [`TerminalRegistry::complete_paced_tail`] — the terminal
-/// phase's one-shot completion: either the ring was already drained (the
-/// same atomic clear as [`PacedTailPage::CaughtUp`]), or the staged
-/// remainder was delivered and the deferral cleared in one lock hold (the
-/// live handoff). Both arms end the paced session.
+/// phase's PAGED completion: the staged remainder drains through the SAME
+/// budget-bounded paging as the replay (one page per call; the caller
+/// loops), and the deferral clears only at completion — either the drained
+/// clear (nothing staged) or the final page that covers everything staged
+/// (the atomic live handoff). Both completing arms end the paced session.
 #[derive(Debug, Clone, PartialEq)]
 #[must_use]
 pub enum PacedTailCompletion {
     /// Nothing was staged beyond the cursor: the deferral cleared, the
     /// session is complete.
     CaughtUp,
-    /// The staged remainder `(from_seq, head]` was delivered through the
-    /// subscriber's sink and the deferral cleared ATOMICALLY under the
-    /// same lock hold — frames appended after the clear fan out directly,
-    /// so the handoff can neither lose nor duplicate a frame.
+    /// One budget-bounded page of the staged remainder was delivered
+    /// through the subscriber's sink. The deferral STAYS armed (frames
+    /// keep staging, never interleaving with the pages); the caller
+    /// advances its cursor and calls again.
     Handoff { end_seq: i64, serialized_bytes: u64 },
+    /// The FINAL page covered everything staged (its end reached the head
+    /// read under this lock hold) and was delivered through the
+    /// subscriber's sink with the deferral cleared in the SAME hold — the
+    /// atomic live handoff: everything ≤ the read head is delivered by
+    /// the pages + this page, everything appended after the hold fans out
+    /// directly, so the handoff can neither lose nor duplicate a frame.
+    Completed { end_seq: i64, serialized_bytes: u64 },
+    /// The fixed target is covered and nothing ≤ it remains selectable,
+    /// but the terminal kept producing (frames are staged beyond the
+    /// target). The deferral stays armed; the caller re-captures the
+    /// target (the current head) and continues the paged completion.
+    AtTarget,
+    /// Retention evicted part of the range the completion still owes —
+    /// the same exact-interval report as [`PacedPage::Expired`]: the
+    /// caller must emit the bounds-carrying retention gap and continue
+    /// the handoff from the resumed front. A retention advance must
+    /// NEVER become a silent forward jump.
+    Expired {
+        lost_from: i64,
+        lost_to: i64,
+        resume_from: i64,
+        head_seq: i64,
+        oldest_retained_seq: i64,
+    },
     /// The terminal or subscriber is gone — cancel the session.
     Gone,
 }
@@ -303,11 +328,11 @@ struct Subscriber {
     /// and the session's pages deliver the range in seq order. Armed by the
     /// paced attach, cleared ATOMICALLY under the per-terminal lock either
     /// by the tail read that finds the ring drained
-    /// (`next_paced_tail_page`) or by the one-shot completion
-    /// (`complete_paced_tail` — a drained clear, or the live handoff that
-    /// delivers the staged remainder under the same lock hold), so the
-    /// flag-clear boundary can neither lose nor duplicate a frame:
-    /// everything appended before the clear is paged or handed off,
+    /// (`next_paced_tail_page`) or by the paged completion
+    /// (`complete_paced_tail` — the drained clear, or the final page that
+    /// covers everything staged, sunk and cleared under the same lock
+    /// hold), so the flag-clear boundary can neither lose nor duplicate a
+    /// frame: everything appended before the clear is paged or handed off,
     /// everything appended after it is fanned out directly.
     paced_deferred: bool,
     /// TERM-07 seam: the attach's `maxReplayBytes` request, threaded through
@@ -2462,22 +2487,40 @@ impl TerminalRegistry {
         }
     }
 
-    /// The paced tail's one-shot COMPLETION (responsive-terminal-restore
-    /// W1): either the ring is drained past `from_seq` — the same atomic
-    /// deferral clear as [`Self::next_paced_tail_page`]'s `CaughtUp` —
-    /// or the staged remainder `(from_seq, head]` is delivered through
-    /// the subscriber's sink and the deferral cleared UNDER THE SAME LOCK
-    /// HOLD (the live handoff). The lock hold is the atomicity boundary:
-    /// ingest cannot interleave, so every frame at or below the read
-    /// boundary is delivered (pages + handoff) exactly once, in seq
-    /// order, and every frame appended after the clear fans out directly
-    /// — the handoff can neither lose nor duplicate a frame. Sinking
-    /// under the terminal lock follows [`Self::ingest`]'s own discipline
-    /// (live fan-out and the paced attach's ready/gap prelude both sink
-    /// under this lock), and the handoff is ONE bounded batch: its bytes
-    /// are bounded by the ring's retention and the connection writer's
-    /// own admission limits (spill with exact gaps), never by a chase
-    /// against a moving head.
+    /// The paced tail's PAGED completion (responsive-terminal-restore
+    /// W1): the staged remainder `(from_seq, min(head, to_seq_inclusive)]`
+    /// drains through the SAME budget-bounded paging as the replay — ONE
+    /// page per call, the lock held only per page (never across pages, so
+    /// PTY ingestion interleaves and no full-suffix clone is ever built
+    /// under a single hold). The caller loops until a completing verdict:
+    ///
+    /// - `CaughtUp` — the ring was drained past `from_seq`: the same
+    ///   atomic deferral clear as [`Self::next_paced_tail_page`].
+    /// - `Completed` — this call's page covered everything staged up to
+    ///   the head read under this hold: the page is sunk and the
+    ///   deferral cleared in the SAME hold (the atomic live handoff).
+    ///   The lock hold is the atomicity boundary: ingest cannot
+    ///   interleave, so every frame ≤ the read head is delivered (pages +
+    ///   this page) exactly once, in seq order, and every frame appended
+    ///   after the hold fans out directly — the handoff can neither lose
+    ///   nor duplicate a frame.
+    /// - `Handoff` — one budget-bounded page delivered; the deferral
+    ///   STAYS armed (ordering with live frames is preserved by the
+    ///   deferral itself: ingest stages without fanning out, so live
+    ///   output can never overtake an un-sent page); advance the cursor
+    ///   and call again.
+    /// - `AtTarget` — the FIXED target is covered but frames remain
+    ///   staged beyond it: re-capture the target (the current head) and
+    ///   continue, so the completion never chases a moving head within
+    ///   one bounded round.
+    /// - `Expired` — retention advanced past `from_seq`: the exact
+    ///   bounds-carrying interval for the omitted range; the caller emits
+    ///   the retention gap and continues from the resumed front — never
+    ///   a silent forward jump to the ring front.
+    ///
+    /// Sink backpressure bounds the loop against the connection queue
+    /// (the sink is the writer queue's admission-controlled push): each
+    /// iteration delivers at most one page budget of bytes.
     ///
     /// Callers must NOT hold the calling connection's writer admission
     /// lock (same lock-order rule as [`Self::replay_bounds`]).
@@ -2486,6 +2529,8 @@ impl TerminalRegistry {
         terminal_id: &str,
         conn_id: u64,
         from_seq: i64,
+        to_seq_inclusive: i64,
+        max_serialized_bytes: i64,
     ) -> PacedTailCompletion {
         let Some(shared) = self.shared_for(terminal_id) else {
             return PacedTailCompletion::Gone;
@@ -2506,33 +2551,54 @@ impl TerminalRegistry {
                 .paced_deferred = false;
             return PacedTailCompletion::CaughtUp;
         }
-        let build = paced_page_build(
+        let oldest = s.oldest_retained_seq();
+        if from_seq + 1 < oldest {
+            // Retention advanced past the fixed tail boundary mid-handoff:
+            // report the EXACT lost interval (never silently start at the
+            // ring front) and let the caller resume from the new front.
+            return PacedTailCompletion::Expired {
+                lost_from: from_seq + 1,
+                lost_to: oldest - 1,
+                resume_from: oldest - 1,
+                head_seq,
+                oldest_retained_seq: oldest,
+            };
+        }
+        let page_target = head_seq.min(to_seq_inclusive);
+        let Some(build) = paced_page_build(
             &s,
             conn_id,
             from_seq,
-            head_seq,
-            i64::MAX,
+            page_target,
+            max_serialized_bytes,
             OutputSource::Live,
-        );
-        // THE ATOMIC LIVE HANDOFF: clear BEFORE sinking, under this lock
-        // hold — ingest is blocked on the lock, so no frame can be fanned
-        // out between the clear and the handoff delivery; everything ≤
-        // head_at_clear is delivered by the pages + this batch, everything
-        // appended later fans out at its own ingest.
-        s.subscribers
-            .get_mut(&conn_id)
-            .expect("subscriber checked above")
-            .paced_deferred = false;
-        let Some(build) = build else {
-            // Nothing staged beyond `from_seq` (the ring holds no frame the
-            // walk could select): the clear above already completed the
-            // handoff with an empty batch.
-            return PacedTailCompletion::CaughtUp;
+        ) else {
+            // Nothing selectable up to the fixed target (the target is
+            // covered; the terminal kept producing beyond it): the
+            // deferral stays armed and the caller re-captures the target.
+            return PacedTailCompletion::AtTarget;
         };
         let sink = Arc::clone(&s.subscribers.get(&conn_id).expect("checked above").sink);
         for message in build.messages {
             sink(message);
         }
+        if build.end_seq >= head_seq {
+            // THE ATOMIC LIVE HANDOFF: this page covered everything staged
+            // — clear the deferral in the same lock hold. Ingest is blocked
+            // on the lock, so no frame can be fanned out between this
+            // page's delivery and the clear; everything ≤ head_at_clear is
+            // delivered by the pages + this page, everything appended
+            // later fans out at its own ingest.
+            s.subscribers
+                .get_mut(&conn_id)
+                .expect("subscriber checked above")
+                .paced_deferred = false;
+            return PacedTailCompletion::Completed {
+                end_seq: build.end_seq,
+                serialized_bytes: build.serialized_bytes,
+            };
+        }
+        // More remains staged: the deferral stays armed, the caller pages on.
         PacedTailCompletion::Handoff {
             end_seq: build.end_seq,
             serialized_bytes: build.serialized_bytes,
@@ -5859,9 +5925,22 @@ mod tests {
                 PacedTailPage::Gone => panic!("terminal vanished mid-tail"),
             }
         }
-        match reg.complete_paced_tail("T", 1, tail_cursor) {
-            PacedTailCompletion::CaughtUp => {}
-            other => panic!("a quiet terminal completes drained, got {other:?}"),
+        let mut completion_target = reg.replay_bounds("T").expect("bounds").head_seq;
+        loop {
+            match reg.complete_paced_tail("T", 1, tail_cursor, completion_target, 1024) {
+                PacedTailCompletion::CaughtUp => break,
+                PacedTailCompletion::Completed { end_seq, .. } => {
+                    tail_cursor = tail_cursor.max(end_seq);
+                    break;
+                }
+                PacedTailCompletion::Handoff { end_seq, .. } => {
+                    tail_cursor = end_seq;
+                    if end_seq >= completion_target {
+                        completion_target = reg.replay_bounds("T").expect("bounds").head_seq;
+                    }
+                }
+                other => panic!("a quiet terminal completes drained, got {other:?}"),
+            }
         }
         assert_eq!(tail_cursor, 12, "the tail drains to the current head");
         let tail: String = {
@@ -5972,42 +6051,50 @@ mod tests {
             }
         }
 
-        // The one-shot completion: the producer staged frames during the
-        // drain, so the handoff delivers them and clears the deferral.
+        // The PAGED completion: the producer staged frames during the
+        // drain, so the handoff pages them within the budget and clears
+        // the deferral at the final page. (This fixture stages one frame
+        // per tail page read, so the staged remainder may fit a single
+        // final page — the multi-page paging shape is pinned by
+        // `paced_tail_handoff_pages_the_staged_remainder_within_the_page_budget`.)
         let head_before_completion = produced as i64;
-        match reg.complete_paced_tail("T", 1, cursor) {
-            PacedTailCompletion::Handoff { end_seq, .. } => {
-                assert!(end_seq >= head_before_completion);
-                cursor = end_seq;
+        let mut completion_target = reg.replay_bounds("T").expect("bounds").head_seq;
+        loop {
+            match reg.complete_paced_tail("T", 1, cursor, completion_target, 1024) {
+                PacedTailCompletion::CaughtUp => {
+                    panic!("the producer staged {head_before_completion} — the handoff must deliver it")
+                }
+                PacedTailCompletion::Completed { end_seq, .. } => {
+                    assert!(
+                        end_seq >= head_before_completion,
+                        "the paged handoff delivers everything staged before completion"
+                    );
+                    cursor = end_seq;
+                    break;
+                }
+                PacedTailCompletion::Handoff { end_seq, .. } => {
+                    cursor = end_seq;
+                    if end_seq >= completion_target {
+                        completion_target = reg.replay_bounds("T").expect("bounds").head_seq;
+                    }
+                }
+                PacedTailCompletion::AtTarget => {
+                    completion_target = reg.replay_bounds("T").expect("bounds").head_seq;
+                }
+                PacedTailCompletion::Expired { .. } => {
+                    panic!("no retention loss in this fixture")
+                }
+                PacedTailCompletion::Gone => panic!("terminal vanished at completion"),
             }
-            PacedTailCompletion::CaughtUp => {
-                panic!("the producer staged {head_before_completion} — the handoff must deliver it")
-            }
-            PacedTailCompletion::Gone => panic!("terminal vanished at completion"),
         }
 
         // Everything up to the completion boundary was delivered exactly
         // once, in order, with no hole and no duplicate — the pages and the
-        // handoff partition the range.
-        let mut seqs: Vec<i64> = delivered.iter().map(|(s, _)| *s).collect();
-        seqs.sort_unstable();
-        seqs.dedup();
-        assert_eq!(
-            seqs.last(),
-            Some(&tail_target),
-            "the paged drain covers exactly up to the fixed tail target"
-        );
-        for expected in 1..=tail_target {
-            assert!(
-                seqs.contains(&expected),
-                "no seq hole: {expected} missing from the drained tail"
-            );
-        }
-        assert_eq!(
-            seqs.len(),
-            tail_target as usize,
-            "every paged seq is delivered exactly once"
-        );
+        // paged handoff partition the range. The delivered stream is
+        // CONTIGUOUS across the handoff: the tail pages, the handoff
+        // pages, and the direct post-clear delivery together tile
+        // 1..=cursor with no gap (this fixture has no retention loss, so
+        // an interrupted stream would be corruption).
         let handed_off: Vec<i64> = seen
             .lock()
             .unwrap()
@@ -6022,6 +6109,27 @@ mod tests {
             (tail_target + 1..=cursor).collect::<Vec<i64>>(),
             "the handoff delivers exactly the staged remainder, in seq order"
         );
+        let mut seqs: Vec<i64> = delivered.iter().map(|(s, _)| *s).collect();
+        seqs.extend(handed_off);
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(
+            seqs.last(),
+            Some(&cursor),
+            "the paged drain + handoff cover everything up to the completion cursor"
+        );
+        for expected in 1..=cursor {
+            assert!(
+                seqs.contains(&expected),
+                "the delivered stream must be contiguous across the handoff: \
+                 {expected} missing"
+            );
+        }
+        assert_eq!(
+            seqs.len(),
+            cursor as usize,
+            "every seq is delivered exactly once across pages + handoff"
+        );
 
         // Post-completion output flows through DIRECT fan-out (the
         // deferral cleared): a new frame reaches the subscriber with no
@@ -6033,6 +6141,324 @@ mod tests {
                 .iter()
                 .any(|m| matches!(m, ServerMessage::TerminalOutput(o)
                     if o.seq_end == cursor + 1)),
+            "post-clear output fans out directly to the subscriber"
+        );
+    }
+
+    /// The tail handoff must PAGE the staged remainder through the SAME
+    /// budget-bounded paging as the replay (responsive-terminal-restore:
+    /// at most ONE unacknowledged page per (connection, terminal) — an
+    /// `i64::MAX` full-suffix batch cloned under one lock hold defeats the
+    /// page budget, blocks PTY ingestion, and monopolizes the dispatch
+    /// path). A staged tail larger than one page budget must arrive as
+    /// MULTIPLE handoff pages, each within the paced page budget.
+    #[test]
+    fn paced_tail_handoff_pages_the_staged_remainder_within_the_page_budget() {
+        let reg = TerminalRegistry::new();
+        reg.set_paced_page_max_bytes(1024);
+        reg.insert_headless("T", "S");
+        for seq in 1..=4 {
+            reg.feed("T", frame(seq, &format!("data-{seq:03}\r\n"), "S"));
+        }
+        let (sink, seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("paced".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+        );
+        let start = out.paced.expect("paced session");
+
+        // Drive the replay to the attach-time target (4).
+        let mut cursor = start.session.page_end;
+        let mut delivered = page_seq_data(&start.first_page);
+        while cursor < 4 {
+            match reg.next_replay_page("T", 1, cursor, 4, 1024) {
+                PacedPage::Frames {
+                    messages, end_seq, ..
+                } => {
+                    delivered.extend(page_seq_data(&messages));
+                    cursor = end_seq;
+                }
+                other => panic!("unexpected replay read: {other:?}"),
+            }
+        }
+
+        // A staged tail far larger than one page budget (each frame ~120
+        // serialized bytes → ~8 frames per 1024-byte page).
+        for seq in 5..=40 {
+            reg.feed("T", frame(seq, &format!("staged-{seq:03}\r\n"), "S"));
+        }
+        let mut completion_target = reg.replay_bounds("T").expect("bounds").head_seq;
+        assert_eq!(completion_target, 40);
+
+        // The completion drives the staged remainder through
+        // budget-bounded pages: more than one handoff page for this staged
+        // tail, each within the page budget, ending in EXACTLY ONE
+        // completing verdict that cleared the deferral.
+        let mut pages = 0usize;
+        let mut completions = 0usize;
+        let mut final_page_over_budget = false;
+        loop {
+            match reg.complete_paced_tail("T", 1, cursor, completion_target, 1024) {
+                PacedTailCompletion::Handoff {
+                    end_seq,
+                    serialized_bytes,
+                } => {
+                    assert!(
+                        serialized_bytes as usize <= 1024,
+                        "each handoff page must stay within the paced page budget \
+                         (got {serialized_bytes} bytes for the page ending at seq {end_seq})"
+                    );
+                    assert!(end_seq > cursor);
+                    cursor = end_seq;
+                    pages += 1;
+                    if end_seq >= completion_target {
+                        // Fixed target covered: this quiet fixture is drained.
+                        completion_target = reg.replay_bounds("T").expect("bounds").head_seq;
+                    }
+                }
+                PacedTailCompletion::Completed {
+                    end_seq,
+                    serialized_bytes,
+                } => {
+                    // The final page may honestly exceed the budget only as
+                    // the explicit atomic oversize result (a single frame
+                    // larger than the budget); this fixture's frames are
+                    // tiny, so it must fit too.
+                    if serialized_bytes as usize > 1024 {
+                        final_page_over_budget = true;
+                    }
+                    assert_eq!(end_seq, 40, "the final page covers the whole staged tail");
+                    cursor = end_seq;
+                    completions += 1;
+                    break;
+                }
+                PacedTailCompletion::CaughtUp => {
+                    panic!("a staged remainder exists — the handoff must deliver it")
+                }
+                PacedTailCompletion::AtTarget => {
+                    completion_target = reg.replay_bounds("T").expect("bounds").head_seq;
+                }
+                PacedTailCompletion::Expired { .. } => panic!("no retention loss in this fixture"),
+                PacedTailCompletion::Gone => panic!("terminal vanished at completion"),
+            }
+        }
+        assert!(
+            pages > 1,
+            "a staged tail larger than one page budget must produce multiple \
+             handoff pages, got {pages}"
+        );
+        assert_eq!(completions, 1, "the handoff completes exactly once");
+        assert!(
+            !final_page_over_budget,
+            "the final page fits the budget in this fixture"
+        );
+        assert_eq!(cursor, 40, "the handoff drained everything staged");
+
+        // Everything staged was delivered through the sink, contiguously,
+        // exactly once (the pages + handoff partition the range).
+        let handed_off: Vec<i64> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|m| match m {
+                ServerMessage::TerminalOutput(o) => Some(o.seq_end),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            handed_off,
+            (5..=cursor).collect::<Vec<_>>(),
+            "the handoff delivers exactly the staged remainder, in seq order"
+        );
+        let mut all: Vec<i64> = delivered.iter().map(|(s, _)| *s).collect();
+        all.extend(handed_off);
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(
+            all,
+            (1..=cursor).collect::<Vec<_>>(),
+            "the delivered stream is contiguous across the handoff"
+        );
+    }
+
+    /// A retention advance past the drain cursor must NEVER become a silent
+    /// forward jump in the handoff (responsive-terminal-restore: retention
+    /// loss mid-restore is an exact bounds-carrying gap, never a silent
+    /// truncation). The completion must emit the retention gap for the
+    /// omitted interval BEFORE any delivered frame, with bounds matching
+    /// the actual eviction.
+    #[test]
+    fn paced_tail_completion_reports_retention_loss_instead_of_a_silent_forward_jump() {
+        let reg = TerminalRegistry::new();
+        // Tiny CHAR ring so feeding evicts the front deterministically.
+        reg.set_scrollback_max_bytes(60);
+        reg.insert_headless("T", "S");
+        reg.set_paced_page_max_bytes(0); // per-frame pages: deterministic cursor control
+        for seq in 1..=3 {
+            reg.feed("T", frame(seq, "chunk123\r\n", "S")); // 10 chars each
+        }
+        let (sink, seen) = collector();
+        let out = reg.attach(
+            "T",
+            1,
+            sink,
+            Some("paced".into()),
+            0,
+            false,
+            true,
+            None,
+            None,
+            None,
+        );
+        let start = out.paced.expect("paced session");
+
+        // Drive the replay to the attach-time target (3).
+        let mut cursor = start.session.page_end;
+        let mut delivered = page_seq_data(&start.first_page);
+        while cursor < 3 {
+            match reg.next_replay_page("T", 1, cursor, 3, 0) {
+                PacedPage::Frames {
+                    messages, end_seq, ..
+                } => {
+                    delivered.extend(page_seq_data(&messages));
+                    cursor = end_seq;
+                }
+                other => panic!("unexpected replay read: {other:?}"),
+            }
+        }
+        assert_eq!(cursor, 3);
+
+        // Evict frames 4.. well past the drain cursor: 10 more chunks (100
+        // chars) push the front far past seq 3.
+        for seq in 4..=13 {
+            reg.feed("T", frame(seq, "chunk123\r\n", "S"));
+        }
+        let bounds = reg.replay_bounds("T").expect("bounds");
+        assert!(
+            bounds.oldest_retained_seq > 4,
+            "the fixture evicted the frames the handoff needs next"
+        );
+
+        // The handoff must declare the retention loss for the omitted
+        // interval with the EXACT bounds — never silently start at the
+        // ring front: a forward jump from seq 3 with no gap frame is
+        // silent corruption. The caller (the ws drive loop) sinks the
+        // bounds-carrying gap and resumes from the ring front; the same
+        // continuation is driven here.
+        let head_at_expiry = bounds.head_seq;
+        let gap_lo = cursor + 1;
+        let seen_len_at_expiry = seen.lock().unwrap().len();
+        match reg.complete_paced_tail("T", 1, cursor, head_at_expiry, 0) {
+            PacedTailCompletion::Expired {
+                lost_from,
+                lost_to,
+                resume_from,
+                head_seq,
+                oldest_retained_seq,
+            } => {
+                assert_eq!(
+                    lost_from,
+                    cursor + 1,
+                    "the lost interval starts at cursor+1"
+                );
+                assert_eq!(
+                    lost_to,
+                    bounds.oldest_retained_seq - 1,
+                    "the lost interval ends just before the new ring front"
+                );
+                assert_eq!(resume_from, bounds.oldest_retained_seq - 1);
+                assert_eq!(head_seq, bounds.head_seq);
+                assert_eq!(oldest_retained_seq, bounds.oldest_retained_seq);
+                cursor = resume_from;
+            }
+            other => panic!(
+                "a retention advance past the tail boundary must report the exact \
+                 gap, never a silent forward jump, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            seen_len_at_expiry,
+            "the Expired verdict delivers NOTHING itself — the caller emits the gap"
+        );
+
+        // The caller's continuation: sink the exact gap (as the ws drive
+        // loop does), then resume the paged handoff from the ring front.
+        // The delivered stream is contiguous except for EXACTLY the
+        // asserted gap: 1..=3 delivered, 4..=oldest-1 declared lost,
+        // oldest..=head delivered in order.
+        let mut completion_target = reg.replay_bounds("T").expect("bounds").head_seq;
+        loop {
+            match reg.complete_paced_tail("T", 1, cursor, completion_target, 0) {
+                PacedTailCompletion::Handoff { end_seq, .. } => {
+                    cursor = end_seq;
+                    if end_seq >= completion_target {
+                        completion_target = reg.replay_bounds("T").expect("bounds").head_seq;
+                    }
+                }
+                PacedTailCompletion::Completed { end_seq, .. } => {
+                    cursor = end_seq;
+                    break;
+                }
+                PacedTailCompletion::CaughtUp => break,
+                PacedTailCompletion::AtTarget => {
+                    completion_target = reg.replay_bounds("T").expect("bounds").head_seq;
+                }
+                PacedTailCompletion::Expired { .. } => {
+                    panic!("the eviction is fully declared — no second loss expected")
+                }
+                PacedTailCompletion::Gone => panic!("terminal vanished mid-handoff"),
+            }
+        }
+        assert_eq!(
+            cursor, bounds.head_seq,
+            "the resumed handoff drains to the head"
+        );
+        let handed_off: Vec<i64> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|m| match m {
+                ServerMessage::TerminalOutput(o) => Some(o.seq_end),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            handed_off,
+            (bounds.oldest_retained_seq..=bounds.head_seq).collect::<Vec<_>>(),
+            "the resumed handoff delivers exactly the retained remainder, in seq order"
+        );
+        // Contiguity modulo exactly the asserted gap: the delivered seqs
+        // plus the declared-lost interval tile 1..=head with no hole and
+        // no overlap.
+        let mut delivered_seqs: Vec<i64> = delivered.iter().map(|(s, _)| *s).collect();
+        delivered_seqs.extend(handed_off);
+        delivered_seqs.sort_unstable();
+        delivered_seqs.dedup();
+        let mut expected: Vec<i64> = (1..=bounds.head_seq).collect();
+        expected.retain(|seq| !(gap_lo..=bounds.oldest_retained_seq - 1).contains(seq));
+        assert_eq!(
+            delivered_seqs, expected,
+            "the delivered stream is contiguous except exactly the asserted gap"
+        );
+
+        // Post-clear output flows through DIRECT fan-out (the deferral
+        // cleared at the completing verdict).
+        reg.feed("T", frame(bounds.head_seq + 1, "after-clear\r\n", "S"));
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|m| matches!(m, ServerMessage::TerminalOutput(o)
+                    if o.seq_end == bounds.head_seq + 1)),
             "post-clear output fans out directly to the subscriber"
         );
     }
@@ -6186,9 +6612,25 @@ mod tests {
                 other => panic!("unexpected tail read: {other:?}"),
             }
         }
-        match reg.complete_paced_tail("T", 1, tail_cursor) {
-            PacedTailCompletion::CaughtUp => {}
-            other => panic!("a quiet terminal completes drained, got {other:?}"),
+        let mut completion_target = reg.replay_bounds("T").expect("bounds").head_seq;
+        loop {
+            match reg.complete_paced_tail("T", 1, tail_cursor, completion_target, 0) {
+                PacedTailCompletion::CaughtUp => break,
+                PacedTailCompletion::Completed { end_seq, .. } => {
+                    tail_cursor = tail_cursor.max(end_seq);
+                    break;
+                }
+                PacedTailCompletion::Handoff { end_seq, .. } => {
+                    tail_cursor = end_seq;
+                    if end_seq >= completion_target {
+                        completion_target = reg.replay_bounds("T").expect("bounds").head_seq;
+                    }
+                }
+                PacedTailCompletion::AtTarget => {
+                    completion_target = reg.replay_bounds("T").expect("bounds").head_seq;
+                }
+                other => panic!("a quiet terminal completes drained, got {other:?}"),
+            }
         }
         assert_eq!(tail_cursor, bounds.head_seq);
         let drained_seqs: Vec<i64> = drained.iter().map(|(s, _)| *s).collect();
@@ -6251,7 +6693,9 @@ mod tests {
 
         // Drain: replay pages to the target, then tail pages toward the
         // FIXED tail target (the head at tail-start — the feeder races it),
-        // then the one-shot completion (drained clear or live handoff).
+        // then the PAGED completion (drained clear or paged handoff; the
+        // feeder's staged frames are delivered through the subscriber's
+        // sink, recorded in `seen` alongside the direct deliveries below).
         let mut collected = page_seq_data(&start.first_page);
         let mut cursor = start.session.page_end;
         while cursor < start.session.target {
@@ -6278,13 +6722,25 @@ mod tests {
                 other => panic!("unexpected tail read: {other:?}"),
             }
         }
-        match reg.complete_paced_tail("T", 1, cursor) {
-            PacedTailCompletion::CaughtUp => {}
-            // The feeder staged frames during the drain: the handoff
-            // delivers them through the subscriber's sink (recorded in
-            // `seen` alongside the direct deliveries below).
-            PacedTailCompletion::Handoff { .. } => {}
-            PacedTailCompletion::Gone => panic!("terminal vanished at completion"),
+        let mut completion_target = reg.replay_bounds("T").expect("bounds").head_seq;
+        loop {
+            match reg.complete_paced_tail("T", 1, cursor, completion_target, 0) {
+                PacedTailCompletion::CaughtUp => break,
+                PacedTailCompletion::Completed { .. } => break,
+                PacedTailCompletion::Handoff { end_seq, .. } => {
+                    cursor = end_seq;
+                    if end_seq >= completion_target {
+                        completion_target = reg.replay_bounds("T").expect("bounds").head_seq;
+                    }
+                }
+                PacedTailCompletion::AtTarget => {
+                    completion_target = reg.replay_bounds("T").expect("bounds").head_seq;
+                }
+                PacedTailCompletion::Expired { .. } => {
+                    panic!("no retention loss in this fixture (feeder max 41 frames)")
+                }
+                PacedTailCompletion::Gone => panic!("terminal vanished at completion"),
+            }
         }
         feeder.join().expect("feeder joins");
 

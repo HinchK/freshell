@@ -29,11 +29,15 @@
 //! `(target, head-at-tail-start]` drains as ordinary delivery (pages,
 //! not credit-gated) toward a FIXED tail target — the head captured when
 //! the tail phase starts — so ongoing production can never move the
-//! completion condition indefinitely. The registry then completes the
-//! session atomically: either the ring is drained (the deferral clears
-//! under the same lock hold) or the staged remainder is handed off to
-//! the live path in one lock hold — newer frames flow through direct
-//! fan-out, never through a chase.
+//! completion condition indefinitely. The completion then drains the
+//! staged remainder through the SAME budget-bounded paging (one page per
+//! drive step, the deferral cleared only at the completing verdict — the
+//! drained clear, or the final page that covers everything staged, sunk
+//! and cleared under one registry lock hold), looping toward fixed
+//! targets re-captured per round so live output can neither jump the
+//! pages nor be lost; a retention advance past the drain cursor reports
+//! the exact bounds-carrying gap and resumes from the ring front — never
+//! a silent forward jump.
 
 use std::collections::HashMap;
 
@@ -207,9 +211,12 @@ pub(crate) enum DriveOutcome {
 /// drains without credit toward the FIXED head captured at tail-start
 /// (never the moving current head — a producing terminal cannot postpone
 /// completion indefinitely, and the drain's per-connection work stays
-/// bounded), then completes atomically: a drained ring clears the
-/// deferral, and a staged remainder is handed off under the same lock
-/// hold so live frames can neither jump the pages nor be lost.
+/// bounded), then completes through budget-bounded pages: the staged
+/// remainder pages at the same page budget (never a full-suffix batch),
+/// the deferral clears only at the completing verdict, and a retention
+/// advance past the drain cursor reports the exact bounds-carrying gap
+/// and resumes from the ring front so live frames can neither jump the
+/// pages nor be lost.
 pub(crate) fn drive_session(
     registry: &TerminalRegistry,
     conn_id: u64,
@@ -361,30 +368,114 @@ pub(crate) fn drive_session(
             }
         }
     }
-    // The atomic completion: a drained ring clears the deferral; a staged
-    // remainder is delivered and cleared under one registry lock hold.
-    match registry.complete_paced_tail(&session.terminal_id, conn_id, session.page_end) {
-        PacedTailCompletion::CaughtUp => {}
-        PacedTailCompletion::Handoff {
-            end_seq,
-            serialized_bytes,
-        } => {
-            tracing::debug!(
-                terminal_id = %session.terminal_id,
-                end_seq,
-                serialized_bytes,
-                "ws.restore.paced_tail_handoff"
-            );
-            session.page_end = end_seq;
-            session.pages += 1;
-        }
-        PacedTailCompletion::Gone => {
+    // The PAGED completion: the staged remainder drains through the SAME
+    // budget-bounded paging as the replay — one page per call, the
+    // deferral cleared only at completion (the drained clear, or the final
+    // page that covers everything staged, sunk and cleared in one lock
+    // hold). The completion loops toward a FIXED target (the head
+    // captured at completion start), re-capturing only when a target is
+    // covered — it never chases a moving head within a round, and sink
+    // backpressure (the writer queue's admission-controlled push) bounds
+    // the loop against the connection queue. A retention advance past
+    // the drain cursor reports the exact bounds-carrying gap and resumes
+    // from the ring front — never a silent forward jump.
+    let mut completion_target = match registry.replay_bounds(&session.terminal_id) {
+        Some(bounds) => bounds.head_seq,
+        None => {
             tracing::warn!(
                 terminal_id = %session.terminal_id,
                 attach_request_id = %session.attach_request_id,
                 "ws.restore.paced_gone"
             );
             return DriveOutcome::Gone;
+        }
+    };
+    loop {
+        match registry.complete_paced_tail(
+            &session.terminal_id,
+            conn_id,
+            session.page_end,
+            completion_target,
+            budget,
+        ) {
+            PacedTailCompletion::CaughtUp => break,
+            PacedTailCompletion::Completed { end_seq, .. } => {
+                session.page_end = end_seq;
+                session.pages += 1;
+                break;
+            }
+            PacedTailCompletion::Handoff {
+                end_seq,
+                serialized_bytes,
+            } => {
+                tracing::debug!(
+                    terminal_id = %session.terminal_id,
+                    end_seq,
+                    serialized_bytes,
+                    "ws.restore.paced_tail_handoff"
+                );
+                session.page_end = end_seq;
+                session.pages += 1;
+                if end_seq >= completion_target {
+                    // Fixed target covered: re-capture for the next bounded
+                    // round (the terminal kept producing beyond it).
+                    completion_target = match registry.replay_bounds(&session.terminal_id) {
+                        Some(bounds) => bounds.head_seq,
+                        None => {
+                            tracing::warn!(
+                                terminal_id = %session.terminal_id,
+                                attach_request_id = %session.attach_request_id,
+                                "ws.restore.paced_gone"
+                            );
+                            return DriveOutcome::Gone;
+                        }
+                    };
+                }
+            }
+            PacedTailCompletion::AtTarget => {
+                completion_target = match registry.replay_bounds(&session.terminal_id) {
+                    Some(bounds) => bounds.head_seq,
+                    None => {
+                        tracing::warn!(
+                            terminal_id = %session.terminal_id,
+                            attach_request_id = %session.attach_request_id,
+                            "ws.restore.paced_gone"
+                        );
+                        return DriveOutcome::Gone;
+                    }
+                };
+            }
+            PacedTailCompletion::Expired {
+                lost_from,
+                lost_to,
+                resume_from,
+                head_seq,
+                oldest_retained_seq,
+            } => {
+                sink(retention_gap(
+                    session,
+                    lost_from,
+                    lost_to,
+                    head_seq,
+                    oldest_retained_seq,
+                ));
+                tracing::info!(
+                    terminal_id = %session.terminal_id,
+                    lost_from,
+                    lost_to,
+                    resume_from,
+                    "ws.restore.paced_expired"
+                );
+                session.page_end = resume_from;
+            }
+            PacedTailCompletion::Gone => {
+                tracing::warn!(
+                    terminal_id = %session.terminal_id,
+                    attach_request_id = %session.attach_request_id,
+                    "ws.restore.paced_gone"
+                );
+                return DriveOutcome::Gone;
+            }
         }
     }
     tracing::info!(
