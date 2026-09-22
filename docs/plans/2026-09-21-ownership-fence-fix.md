@@ -99,22 +99,36 @@ async fn a_terminal_lane_create_settle_broadcasts_the_committed_owner_pair_and_r
     // Harness: model EXACTLY on a_stale_generation_attach_is_refused_typed (:6605-6696) —
     // destructure spawn_server()'s (url, registry, ws_state) tuple as that test
     // does, handshake + terminal.create with a sessionRef via the same helpers
-    // (:6620-6646), capture frames with the file's await_frame idiom and the
-    // session.runtimeOwner matcher helpers (:3274/:3279). Broadcasts fan out to
-    // every connection (each subscribes to the bus pre-handshake), so the SAME
-    // test connection receives the new frame.
-    let current = ws_state.ownership.as_ref().expect("ownership wired").observe(&PROVIDER, &SESSION_ID);
+    // (:6620-6646). CAPTURE, don't filter: the created reply and the broadcast
+    // use separate delivery paths with no ordering guarantee, so drain frames
+    // into a buffer with the bounded-poll collector idiom (codex_association.rs:1400-1410)
+    // until BOTH the `terminal.created` frame for the requestId AND the
+    // `session.runtimeOwner` frame for the session id are captured — never
+    // await_frame one then the other (await_frame DROPS non-matching frames and
+    // would eat the other one). Broadcasts fan out to every connection (each
+    // subscribes to the bus pre-handshake), so the SAME test socket gets both.
+    let (created, broadcast) = /* the collected pair */;
+    let committed_epoch = ws_state.ownership.as_ref().expect("ownership wired").boot_epoch();
     // (fix c) the created frame carries the commit's own pair
     assert_eq!(created["ownerKind"], "terminal");
-    assert_eq!(created["ownerEpoch"], json!(current.epoch));
-    assert_eq!(created["ownerGeneration"], json!(current.generation));
-    // (fix a) the broadcast fanned out to this same socket with the committed pair
-    // (await the session.runtimeOwner frame for SESSION_ID with transition "handoff-committed")
-    assert_eq!(frame["ownerKind"], "terminal");
-    assert_eq!(frame["terminalId"], created["terminalId"]);
-    assert_eq!(frame["epoch"], json!(current.epoch));
-    assert_eq!(frame["generation"], json!(current.generation));
-    assert!(!frame["operationId"].as_str().unwrap_or("").is_empty());
+    assert_eq!(created["ownerEpoch"], json!(committed_epoch));
+    // (fix a) the broadcast carried the SAME committed pair
+    assert_eq!(broadcast["ownerKind"], "terminal");
+    assert_eq!(broadcast["terminalId"], created["terminalId"]);
+    assert_eq!(broadcast["epoch"], created["ownerEpoch"]);
+    assert_eq!(broadcast["generation"], created["ownerGeneration"]);
+    assert!(!broadcast["operationId"].as_str().unwrap_or("").is_empty());
+    // (r32 F2 discriminator, plan-review round 2 finding 1) advance the
+    // coordinator AFTER the capture (begin_handoff + fail, exactly as :6649-6661):
+    // a lazy/re-observing frame would track the NEW current generation; the
+    // committed-pair frame is FROZEN at emission and must not move.
+    let frozen_generation = broadcast["generation"].clone();
+    /* begin_handoff + fail to advance the generation, as :6649-6661 */
+    assert_eq!(broadcast["generation"], frozen_generation); // unchanged by later transitions
+    assert_ne!(
+        ws_state.ownership.as_ref().unwrap().observe(&PROVIDER, &SESSION_ID).generation,
+        frozen_generation, // the coordinator DID move on — the frame did not
+    );
 }
 ```
 
@@ -226,9 +240,11 @@ Expected: PASS
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-protocol/src/server_messages.rs crates/freshell-ws/src/terminal.rs crates/freshell-ws/tests/cross_kind_liveness.rs
+git add crates/freshell-protocol/src/server_messages.rs crates/freshell-protocol/tests/roundtrip.rs crates/freshell-ws/src/identity_ownership.rs crates/freshell-ws/src/terminal.rs crates/freshell-ws/src/create_dedupe.rs crates/freshell-ws/tests/cross_kind_liveness.rs
 git commit -m "feat(ws): terminal-lane create settle broadcasts its committed owner pair and rides it on terminal.created"
 ```
+
+(plus any other file whose `TerminalCreated` literal the compiler flags for the new fields — the two named literal sites — `crates/freshell-protocol/tests/roundtrip.rs` and `crates/freshell-ws/src/create_dedupe.rs` — are the known ones; every compile-touched file joins this commit so the commit builds independently and the worktree stays clean.)
 
 ---
 
@@ -259,7 +275,7 @@ Extend `bound_elsewhere_attach_commits_ownership_for_the_unclaimed_holder` (~:28
     assert_eq!(created["ownerGeneration"], json!(current.generation));
 ```
 
-(adapt `created`/`current`/`attached_terminal_id` to the test's existing bindings; `current` from `h.ws_state.ownership` observe, as in Task 1).
+(adapt `created`/`current`/`attached_terminal_id` to the test's existing bindings — it uses the same tuple harness and collectors as Task 1: destructure `spawn_server()` as the test does, capture BOTH the created reply and the `session.runtimeOwner` broadcast with the collect-don't-discard pattern (the created reply and the broadcast have no ordering guarantee; `await_frame` drops non-matching frames), and assert the committed pair consistency as in Task 1.)
 
 - [ ] **Step 2: Run the test and verify the intended failure**
 
@@ -463,13 +479,24 @@ git commit -m "feat(ws,freshagent): auto-resume and REST-rung terminal commits b
 
 - [ ] **Step 1: Write the failing behavioral tests**
 
-(a) Extend `a_stale_generation_attach_is_refused_typed` (~:6682-6695) — pin what already holds:
+(a) Extend `a_stale_generation_attach_is_refused_typed` (~:6682-6695) — pin what already holds, then prove the wire-level self-heal contract end-to-end:
 
 ```rust
     // b8ke fence-heal: the refusal carries the coordinator's CURRENT pair so
     // the client can refresh its fence (fix b server contract).
     assert_eq!(refused["ownerEpoch"], json!(current.epoch));
     assert_eq!(refused["ownerGeneration"], json!(current.generation));
+    // fix (b) wire-level self-heal: the immediate re-attach with the pair the
+    // refusal just taught us must SUCCEED — the deterministic protocol-level
+    // proof that "the next attempt uses the fresh pair" heals the wedge.
+    send_json(&mut ws, json!({
+        "type": "terminal.attach",
+        "terminalId": /* the test's terminal id */,
+        "intent": "viewport_hydrate", "cols": 80, "rows": 24,
+        "observedEpoch": refused["ownerEpoch"], "observedGeneration": refused["ownerGeneration"],
+    })).await;
+    let attach_ready = /* await terminal.attach.ready */;
+    assert_eq!(attach_ready["type"], "terminal.attach.ready");
 ```
 
 (b) New test in the same file — a create refused with a stale observed generation carries the current pair (model: send `terminal.create` with `sessionRef` + an `observedGeneration` behind `current.generation` — seed the session Live first exactly as :6634-6646 does, then create with the stale pair):
@@ -714,9 +741,9 @@ describe('applyRuntimeOwnerFenceRefresh (b8ke fence-heal)', () => {
 
 - [ ] **Step 2: Run the tests and verify the intended failure**
 
-Run: `npm run test:vitest -- run test/unit/client/store/freshAgentSlice.runtime-owner.test.ts test/unit/client/lib/owner-fence-heal.test.ts test/unit/client/lib/kill-ack.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/BackgroundSessions.test.tsx test/unit/client/lib/terminal-kill.test.ts`
+Run: `npm run test:vitest -- run test/unit/client/store/freshAgentSlice.runtime-owner.test.ts test/unit/client/lib/owner-fence-heal.test.ts test/unit/client/lib/kill-ack.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/BackgroundSessions.test.tsx test/unit/client/components/TabBar.test.tsx test/unit/client/lib/terminal-kill.test.ts`
 
-Expected: FAIL — `applyRuntimeOwnerFenceRefresh` does not exist; kill-ack results carry no pair; the pane-terminal-scoped refusal is silently dropped (the wedge); the background-session kill refusal folds nowhere; the stale create keeps re-driving the stale pair.
+Expected: FAIL — `applyRuntimeOwnerFenceRefresh` does not exist; kill-ack results carry no pair; the pane-terminal-scoped refusal is silently dropped (the wedge); the background-session kill refusal folds nowhere; the stale create keeps re-driving the stale pair; the TabBar close-kill retry sends the stale pair.
 
 - [ ] **Step 3: Add the minimal production implementation**
 
@@ -824,7 +851,7 @@ export function foldRefusalFencePair(
 
 - [ ] **Step 4: Run the focused tests**
 
-Run: `npm run test:vitest -- run test/unit/client/store/freshAgentSlice.runtime-owner.test.ts test/unit/client/lib/owner-fence-heal.test.ts test/unit/client/lib/kill-ack.test.ts test/unit/client/lib/terminal-kill.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/BackgroundSessions.test.tsx`
+Run: `npm run test:vitest -- run test/unit/client/store/freshAgentSlice.runtime-owner.test.ts test/unit/client/lib/owner-fence-heal.test.ts test/unit/client/lib/kill-ack.test.ts test/unit/client/lib/terminal-kill.test.ts test/unit/client/components/TerminalView.lifecycle.test.tsx test/unit/client/components/BackgroundSessions.test.tsx test/unit/client/components/TabBar.test.tsx`
 
 Expected: PASS
 
@@ -843,7 +870,7 @@ Expected: PASS (this broad-but-still-narrowed lane is delegated, not coordinator
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add src/store/freshAgentSlice.ts src/lib/owner-fence-heal.ts src/components/TerminalView.tsx src/lib/kill-ack.ts src/components/TabBar.tsx shared/ws-protocol.ts test/unit/client
+git add src/store/freshAgentSlice.ts src/lib/owner-fence-heal.ts src/components/TerminalView.tsx src/lib/kill-ack.ts src/components/TabBar.tsx src/components/BackgroundSessions.tsx shared/ws-protocol.ts test/unit/client
 git commit -m "feat(client): typed stale refusals refresh the runtimeOwners fence (merge-only, create/attach/kill scopes)"
 ```
 
@@ -865,8 +892,12 @@ git commit -m "feat(client): typed stale refusals refresh the runtimeOwners fenc
 Test A — single-page incident core (restore-contract-wall-rust.spec.ts, sibling of :797; mirror its bootWall/fixtures/sidebar idioms exactly):
 
 ```ts
-test('codex terminal: resume-create attaches without a reload, and a kill→reopen cycle converges', async ({ page }) => {
-  const wall = await bootWall(/* same fixtures as the :797 test */)
+test('codex terminal: resume-create attaches without a reload, and a kill→reopen cycle converges', async ({ browser }) => {
+  // bootWall takes the BROWSER fixture and returns its own context/page —
+  // mirror the :797 test's exact call shape and use wall.page (plan-review
+  // round 2, finding 6).
+  const wall = await bootWall(browser, /* same fixtures as the :797 test */)
+  const page = wall.page
   // 1. open the seeded session from the sidebar (terminal-lane resume create) —
   //    pre-fix: the create commits a new generation with no broadcast and no
   //    created-frame trio, so the pane never attaches (the incident).
@@ -874,9 +905,10 @@ test('codex terminal: resume-create attaches without a reload, and a kill→reop
   const firstTerminalId = /* per the spec's pane-layout helpers */
   await pollTerminalBuffer(firstTerminalId, /* resumed marker */, 30_000)
   // 2. KILL the terminal via the real kill affordance: shift-click the tab's
-  //    close button (plain close is DETACH-ONLY — reconnect-revive:181-193).
-  await page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`).click({ modifiers: ['Shift'] })
-  await page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`).getByRole('button', { name: /close/i }).click()
+  //    CLOSE button (plain close is DETACH-ONLY, and TabBar decides kill vs
+  //    detach from e.shiftKey on the CLOSE-BUTTON event — the modifier must
+  //    be on THIS click, reconnect-revive:181-193; plan-review round 2, finding 7).
+  await page.locator(`[data-context="tab"][data-tab-id="${tabId}"]`).getByRole('button', { name: /close/i }).click({ modifiers: ['Shift'] })
   //    the session row returns to not-running once the kill commits
   await expect(sessionRow).toHaveAttribute('data-is-running', 'false', { timeout: 15_000 })
   // 3. reopen THE SAME session from the sidebar — a NEW resume-create that
@@ -892,19 +924,29 @@ test('codex terminal: resume-create attaches without a reload, and a kill→reop
 })
 ```
 
-Test B — cross-device stale-refusal self-heal (handoff-two-device-rust.spec.ts, using its two-BrowserContext machinery; fix (b)'s e2e):
+Test B — cross-device convergence of a CONNECTED page (handoff-two-device-rust.spec.ts, using its two-BrowserContext machinery; plan-review round 2, finding 8 redesigned the scenario):
 
 ```ts
-test('a typed stale-fence kill refusal self-heals on the next attempt without a reload', async ({ browser }) => {
-  // context A opens the seeded session (resume-create; fence fresh at gen N)
-  // context B clicks the SAME session row — the adoption commits gen N+1
-  //   (the attach-claim site's new broadcast, Task 2) behind A's back
-  // A shift-click KILLS its tab with its now-stale observed pair → refused
-  //   typed (StaleClaim; the TerminalKilled ack carries the current pair,
-  //   Task 4) → the tab STAYS OPEN (the close did not complete)
-  // A retries the shift-click close → the folded fresh pair → the kill
-  //   succeeds and the tab closes — no reload anywhere. Pre-fix: the retry
-  //   loops the same stale pair (the incident's "close failed" symptom).
+test('cross-device kill+reopen does not wedge a connected page (no reload)', async ({ browser }) => {
+  // Context A opens the seeded session (resume-create) and stays connected.
+  // Context B — the spec's second BrowserContext machinery — shift-click-kills
+  //   the SAME session's tab from ITS page and reopens it from its own
+  //   sidebar, committing new ownership generations behind A's back.
+  // Post-fix: A folds B's session.runtimeOwner commit broadcasts in real
+  //   time, so A's session row converges (data-is-running / the new
+  //   data-running-terminal-id), and A can open the session and echo input
+  //   with NO page reload.
+  // Pre-fix (base_ref red): the commits are silent; A's fence goes stale; A's
+  //   open attempt wedges behind the typed refusals (the incident's shape).
+  //
+  // NOTE on scope: post-fix a CONNECTED client cannot be deterministically
+  // stale-fenced by normal operations — every terminal-lane commit now
+  // broadcasts, which is the fix working. The refusal→retry-success
+  // contract itself is pinned deterministically at the wire level by the
+  // Task 4 cross_kind extension (stale attach refused WITH the current pair;
+  // immediate re-attach with the returned pair SUCCEEDS) and at unit level by
+  // Task 6; this e2e proves the user-visible guarantee the User Request
+  // names: a connected page never wedges and never needs the reload.
 })
 ```
 
@@ -912,15 +954,24 @@ test('a typed stale-fence kill refusal self-heals on the next attempt without a 
 
 - [ ] **Step 2: Run the tests and verify the intended failure — LIVE RED at base_ref**
 
-The red phase is MANDATORY and must be run against PRE-FIX server code (plan-review round 1, finding 5): from the MAIN checkout, create a throwaway scratch worktree at base_ref, copy ONLY the two amended spec files into it, run the two new tests there, and record the failure:
+The red phase is MANDATORY and must be run against PRE-FIX server code (plan-review round 1, finding 5; commands made executable per round 2, finding 9). The new specs are written and committed in Step 1; this step creates a throwaway scratch worktree at base_ref, copies the two amended spec files into it, sets the scratch up (deps + client build; the e2e harness builds `target/release/freshell-server` itself from the scratch — the pre-fix code), runs the two new tests there, records the failing output, and removes the scratch:
 
 ```bash
 git -C /home/dan/code/freshell worktree add --detach /home/dan/code/freshell/.worktrees/.red-base-855dae72 855dae72a83404c930a56d8c6810dab5746720fa
-cp <the two amended spec files> /home/dan/code/freshell/.worktrees/.red-base-855dae72/test/e2e-browser/specs/
-scripts/e2e-cloud.sh run --local --project=chromium test/e2e-browser/specs/restore-contract-wall-rust.spec.ts test/e2e-browser/specs/handoff-two-device-rust.spec.ts --grep="without a reload|self-heals"
-# from the scratch worktree; expected: BOTH new tests FAIL (Test A wedges on
-# the attach / Test B's retry loops the stale close), and the failure output
-# lands in the task report as the recorded red.
+cp /home/dan/code/freshell/.worktrees/ownership-fence-fix/test/e2e-browser/specs/restore-contract-wall-rust.spec.ts \
+   /home/dan/code/freshell/.worktrees/ownership-fence-fix/test/e2e-browser/specs/handoff-two-device-rust.spec.ts \
+   /home/dan/code/freshell/.worktrees/.red-base-855dae72/test/e2e-browser/specs/
+cd /home/dan/code/freshell/.worktrees/.red-base-855dae72
+npm ci --no-audit --no-fund
+npm run build:client
+bash scripts/e2e-cloud.sh run --local --project=chromium \
+  test/e2e-browser/specs/restore-contract-wall-rust.spec.ts \
+  test/e2e-browser/specs/handoff-two-device-rust.spec.ts \
+  --grep="without a reload|cross-device"
+# Expected: BOTH new tests FAIL at base_ref — Test A: the resume-created pane
+# never attaches / the reopened pane wedges behind the stale fence; Test B:
+# context A's page wedges behind the silent cross-device commits. Capture the
+# failing output in the task report as the recorded red.
 git -C /home/dan/code/freshell worktree remove --force /home/dan/code/freshell/.worktrees/.red-base-855dae72
 ```
 
@@ -991,7 +1042,7 @@ Applied after the load-bearing stage. Evidence: `load-bearing-finder.md` (finder
 - LB-F9 (falsified): import convention corrected — extensionless `@/` alias imports in `src/`; the `.js` rule applies to relative imports in NodeNext-run code.
 - LB-F10 (falsified): TerminalView kill folds removed — fire-and-forget kill refusals share the pane-terminal-scoped branch's frame shape (no requestId, terminalId set).
 - LB-A1 (verified): the next attach after a folded refusal is driven by the ws reconnect handler (TerminalView.tsx:5504-5581 — unconditional for visible panes with a terminalId); hidden panes ride the hydration pump. Automatic heal rides transport reconnects — within the accepted no-retry-subsystem residual; the unit test drives `reconnectHandler?.()`.
-- LB-A2 (satisfied): Task 7's red is the recorded production repro (`incident-evidence.md`) plus the base_ref code derivation; a live base_ref e2e run is optional.
+- LB-A2 (satisfied; SUPERSEDED by plan-review round 1 finding 5 and round 2 finding 9): the recorded evidence was sufficient for the load-bearing gate, but the TDD constraint requires more — Task 7 Step 2 now runs a MANDATORY live base_ref red via a fully-specified scratch-worktree command block; `incident-evidence.md` is supporting context only, not the red.
 - LB-A3 (verified): `foldRefusalFencePair` canonicalizes internally via the state-taking `resolveCanonicalPaneSession`; TabBar passes its production-proven bare `{ sessionRef }` shape; the alias-chain unit case pins the key.
 - LB-V1 (verified): Task 3's REST-rung frame epoch is `state.ownership.as_ref().expect("coordinator wired").boot_epoch()` (`FreshAgentState.ownership` pub(crate) at freshagent lib.rs:2091; the claim mint implies wired).
 
@@ -1004,3 +1055,18 @@ Applied after the first independent plan review (report: `fresheyes-plan/usual-f
 - Finding 3 (Major): fix (b) had no e2e coverage — Task 7 gains Test B (handoff-two-device spec, two BrowserContexts): a cross-device adoption bumps the fence behind page A; A's kill is refused typed once; A's RETRY succeeds with the folded fresh pair, no reload.
 - Finding 4 (Major): the automatic create re-drive kept resending the SAME stale pair within the 30s window (the incident's own 60x loop) — Task 6 Step 3(h) adds the fast bail-to-reconcile for pair-bearing stale refusals (fold + immediate `resolveReserveExhaustionViaReconcile()` instead of the bounded re-drive), keyed on the byte-frozen stale message prefix `"Session ownership moved on (stale observed generation)"` (the server's stale arms freeze this text; the in-flight-lifecycle refusals keep a different frozen message and keep the bounded re-drive). Legacy pair-less refusals (including the r35-pinned frame) keep the existing bounded re-drive, so the r35 pin stays green unchanged.
 - Finding 5 (Major): the e2e red is now MANDATORY and LIVE — Task 7 Step 2 builds a throwaway scratch worktree at base_ref, copies the two amended specs in, runs the new tests against pre-fix server code, records the failing output, and removes the scratch. `incident-evidence.md` remains supporting context, not the red.
+
+## Plan-review amendments (Fresh Eyes round 2, FAILED → remediated)
+
+Applied after the second independent plan review (report: `fresheyes-plan/usual-fresheyes-20260922T043143Z-3329881.md`).
+
+- Finding 1 (Major): the server integration tests now carry an r32 F2 DISCRIMINATOR — capture the broadcast + created frames first (collect-don't-discard), advance the coordinator afterwards, and assert the captured frame's pair is frozen while `observe()` moved on; a re-observing implementation fails this.
+- Finding 2 (Major): Task 1's commit stages every compile-touched file — `identity_ownership.rs` (the pub(crate) change) and the known `TerminalCreated` literal sites (`crates/freshell-protocol/tests/roundtrip.rs`, `crates/freshell-ws/src/create_dedupe.rs`) plus any the compiler flags — so the commit builds independently and the worktree stays clean.
+- Finding 3 (Major): Task 1/2 tests capture BOTH frames with the bounded-poll collector idiom before asserting — never `await_frame` one then the other (await_frame drops non-matching frames; the reply and broadcast have no ordering guarantee).
+- Finding 4 (Major): Task 6's red/green commands now include `test/unit/client/components/TabBar.test.tsx` (new TabBar test + production change).
+- Finding 5 (Major): Task 6's commit stages `src/components/BackgroundSessions.tsx`.
+- Finding 6 (Major): Test A uses `bootWall(browser, ...)` and `wall.page` per the harness's real API.
+- Finding 7 (Major): the Shift modifier moved to the CLOSE-BUTTON click (TabBar decides kill vs detach from `e.shiftKey` on that event); the tab-selection click is plain.
+- Finding 8 (Major): Test B redesigned — post-fix a CONNECTED client cannot be deterministically stale-fenced (every terminal-lane commit broadcasts; that is the fix working), so Test B proves the user-visible guarantee (cross-device kill+reopen never wedges a connected page, no reload), and the refusal→retry-success contract is pinned deterministically at the wire level by the Task 4 cross_kind extension (stale attach refused WITH the pair; immediate re-attach with the returned pair SUCCEEDS) plus Task 6's unit tests.
+- Finding 9 (Major): Task 7 Step 2's red block is fully executable — real spec paths in the `cp`, `cd` into the scratch, `npm ci` + `npm run build:client`, the harness builds the pre-fix server itself, and the scratch is removed afterwards.
+- Finding 10 (Minor): the stale LB-A2 "optional live red" disposition is marked SUPERSEDED by the mandatory-red remediation.
