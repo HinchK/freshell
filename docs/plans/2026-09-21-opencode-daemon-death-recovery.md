@@ -70,7 +70,7 @@ Fix the freshopencode shared-daemon death incident class in the Freshell repo (R
 
 **Behavior:** `compact` becomes the FR2 shape for writes: resolve the base once (`require_base()` — spawn-on-demand is preserved), then POST `/session/{id}/summarize` through `json_request_over_base` with `DiscardOnTimeout::No` and the dedicated `compact_timeout`. `get_config` (a read, and the compact drive's pre-flight model-pair resolution at opencode_ws.rs:3675-3696) gets the same treatment — a slow GET must never kill the shared daemon (the FR2 doc rule for reads; today it violates it). All other lanes keep their current discard policy (see residuals).
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [x] **Step 1: Write the failing behavioral test**
 
 Add to the `#[cfg(test)] mod tests` module in serve.rs, reusing the existing fakes (`started_recording_manager_with_config`, `NeverExitsProcess` with its `killed: Arc<AtomicUsize>` counter, and a recording HTTP fake scripted so health answers 200 and `/summarize` never resolves — the wedged shape from `tests/serve_health_bounded.rs:78` (`std::future::pending()`), exposed through a per-URL scripting seam like `RecordingHttp` at serve.rs:1781-1871):
 
@@ -131,13 +131,13 @@ async fn get_config_timeout_does_not_kill_the_shared_daemon() {
 
 (Draft: adapt the fake construction to the actual `RecordingHttp`/`started_recording_manager*` signatures — the fakes already record per-request timeouts at serve.rs:1808-1817; extend their URL scripting to include a never-resolving `/summarize` and `/config` arm if not already scriptable. The two assertions that matter are `killed == 0` and `base_url().is_some()` after `Err(RequestTimeout)`.)
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run: `cargo test -p freshell-opencode does_not_kill`
 
 Expected: FAIL — `compact_timeout_does_not_kill_the_shared_daemon` fails with `killed: 1` (the discard-on-timeout arm killed the process) and/or `base_url()` is `None`; `get_config_timeout_does_not_kill_the_shared_daemon` fails the same way. (Single positional filter: cargo test accepts ONE TESTNAME — `does_not_kill` matches both new tests.)
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 In `crates/freshell-opencode/src/serve.rs`:
 
@@ -182,17 +182,17 @@ self.json_request_over_base(
 Ok(())
 ```
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `cargo test -p freshell-opencode does_not_kill`
 
 Expected: PASS
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 None needed beyond the above (the change is already the FR2 mirror; `json_request_maybe_witnessed` remains for the lanes that intentionally keep `Yes`).
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Impacted set: all `freshell-opencode` tests (compact family, config, timeout plumbing) plus the `freshell-freshagent` compact-drive tests (the redo-destroy family pins `never_dispatched` classification and the `compact_failed` WARN — unchanged by this fix, but they exercise the compact lane end-to-end).
 
@@ -200,7 +200,7 @@ Run: `cargo test -p freshell-opencode && cargo test -p freshell-freshagent compa
 
 Expected: PASS (a pre-existing-failure comparison against the baseline ledger is not needed; baseline is green).
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add crates/freshell-opencode/src/serve.rs
@@ -219,7 +219,7 @@ git commit -m "fix(opencode): compact and config timeouts never kill the shared 
 - Consumes: the `config_capture` thread-local tracing capture idiom (serve.rs:2451-2502, the DIAG-01 pattern), `prompt_async` (serve.rs:1091 — a lane that intentionally keeps `DiscardOnTimeout::Yes`).
 - Produces: `discard_running(reason: &str)` logs `tracing::warn!(reason = ..., "freshagent.opencode.daemon_discarded")` before the kill. Task 3 builds on this exact site.
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [x] **Step 1: Write the failing behavioral test**
 
 ```rust
 // 2026-09-20 incident: the daemon discard that killed the shared serve left
@@ -248,13 +248,13 @@ async fn discard_running_emits_a_structured_warn_with_its_reason() {
 
 (Draft: adapt to the actual `config_capture` helper API and `prompt_async` minimal-args shape used by `run_turn_arms_the_accepted_witness_at_the_dispatch_boundary` at serve.rs:1982. If `config_capture` needs the event on the test's own thread, note `#[tokio::test]` runs current-thread — `discard_running` executes inline on it, so the capture sees it.)
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run: `cargo test -p freshell-opencode discard_running_emits`
 
 Expected: FAIL — no `freshagent.opencode.daemon_discarded` event is captured (discard_running is tracing-silent today).
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 ```rust
 async fn discard_running(&self, reason: &str) {
@@ -270,17 +270,17 @@ async fn discard_running(&self, reason: &str) {
 }
 ```
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `cargo test -p freshell-opencode discard_running_emits`
 
 Expected: PASS
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 None (single-site change; keep the underscore removal as the whole diff).
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Impacted set: the whole `freshell-opencode` unit suite (tracing capture tests assert event sets; adding an event could affect any test asserting exact event streams — none do outside `config_capture`).
 
@@ -288,7 +288,7 @@ Run: `cargo test -p freshell-opencode`
 
 Expected: PASS
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add crates/freshell-opencode/src/serve.rs
@@ -320,7 +320,7 @@ git commit -m "feat(opencode): structured log for shared-daemon discards"
 4. `discard_running` aborts the watcher FIRST (requested kill — no crash event), then the existing kill+lost, then `Lost` signal + re-warm schedule.
 5. `shutdown`'s inline duplicate (serve.rs:1510-1517) also aborts the watcher; it must NOT schedule a re-warm (shutdown flag blocks it) and need not signal (server is going down) — keep it minimal: abort watcher + existing behavior.
 
-- [ ] **Step 1: Write the failing behavioral tests**
+- [x] **Step 1: Write the failing behavioral tests**
 
 New integration file `crates/freshell-opencode/tests/serve_daemon_selfheal.rs` (drafts; adapt fakes from `serve_health_bounded.rs:41-127` — add an `ExitingProcess` fake whose `exited()` flips to `Some(0)` after the test sets a shared flag, plus a kill counter):
 
@@ -414,13 +414,13 @@ async fn discard_running_signals_daemon_loss_and_schedules_re_warm() {
 }
 ```
 
-- [ ] **Step 2: Run the tests and verify the intended failure**
+- [x] **Step 2: Run the tests and verify the intended failure**
 
 Run: `cargo test -p freshell-opencode --test serve_daemon_selfheal`
 
 Expected: FAIL — `subscribe_daemon_signals` does not exist (compile error is the intended missing behavior; write the enum + stub method returning a channel that never signals if needed to make it a runtime red instead — prefer the compile-first red, then a minimal stub for a runtime red on the watcher semantics).
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 In serve.rs (sketch — the implementer adapts to the actual Inner/ensure_started structure; LB-06/LB-07 corrections applied: the watcher holds an `Arc` clone of the process + the ownership id, never a moved Box):
 
@@ -519,17 +519,17 @@ pub fn subscribe_daemon_signals(&self) -> tokio::sync::broadcast::Receiver<Daemo
 }
 ```
 
-- [ ] **Step 4: Run the focused tests**
+- [x] **Step 4: Run the focused tests**
 
 Run: `cargo test -p freshell-opencode --test serve_daemon_selfheal && cargo test -p freshell-opencode`
 
 Expected: PASS (including all pre-existing tests — especially `rejects_on_sidecar_lost`, `settles_within_deadline_when_health_never_resolves` (its kill path now aborts the watcher too), and the FR2 trio).
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Fold the shared loss path (take-entry + lost + signal + schedule) into one private helper used by both the watcher arm and `discard_running` (the only difference: the WARN text/reason and the pre-abort).
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Impacted set: all of `freshell-opencode` (manager core), plus `freshell-freshagent opencode_ws::tests` (the runtime drives the manager — its fakes seed via `set_manager_for_test`; new fields/behavior must not break the 119 existing tests) and `freshell-freshagent lib::tests` (FR2 pins).
 
@@ -537,7 +537,7 @@ Run: `cargo test -p freshell-opencode && cargo test -p freshell-freshagent openc
 
 Expected: PASS
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add crates/freshell-opencode/src/serve.rs crates/freshell-opencode/src/lib.rs crates/freshell-opencode/tests/serve_daemon_selfheal.rs
@@ -561,7 +561,7 @@ git commit -m "feat(opencode): daemon exit watcher, loss signal, and backoff re-
   - Level-triggered bridge revival: on arming, and again on every `DaemonSignal::Started`, restart bridges that are dead/absent for materialized sessions and push `freshAgent.session.snapshot{status:"idle"}` ONLY to sessions whose bridge was actually restarted (which the client treats as snapshot-invalidating → transcript refetch). No `saw_loss` heuristic — tokio broadcast does not replay history, so revival must not depend on having seen the `Lost` edge (LB-02).
   - **The fenced attach becomes a real recovery verb (LB-05 redesign):** `handle_attach`'s dead-bridge restart arm (opencode_ws.rs:5460-5473) gains `manager.ensure_started().await` before `spawn_serve_bridge` — a map-hit fenced attach against a daemon-absent manager now respawns the shared daemon and re-bridges, exactly as `resume_durable_session` already does for map-misses. No chime: the recovery must never emit `freshAgent.turn.complete`.
 
-- [ ] **Step 1: Write the failing behavioral tests**
+- [x] **Step 1: Write the failing behavioral tests**
 
 In `opencode_ws.rs` tests (drafts; mirror `onexit_self_heal_emits_exited_status_with_no_chime_and_keeps_session_mapped` at codex.rs:15846-15896 and the `state_with_bus` harness at codex.rs:9983-9991 — the opencode tests already have the bus pattern + `set_manager_for_test`):
 
@@ -640,13 +640,13 @@ async fn revival_skips_sessions_handed_off_or_removed_after_the_loss() {
 
 (Drafts: adapt to the actual harness helpers — `opencode_state_with_bus`, session materialization via `handle_send` against the seeded fake http, and the manager's running-entry discard via the fake's own seams or `discard_running`. Lock discipline per LB-01: any test helper that walks the sessions map must clone the `Arc` session handles under a short map lock and drop the map guard before locking a session — the map guard is NEVER held across a per-session lock acquisition, per the documented contract at opencode_ws.rs:100-115.)
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run: `cargo test -p freshell-freshagent daemon_loss_fans_out` && `cargo test -p freshell-freshagent map_hit_fenced_attach` && `cargo test -p freshell-freshagent revival_skips` (three commands — cargo test accepts ONE positional TESTNAME)
 
 Expected: FAIL — `daemon_loss_fans_out...` fails with no `OPENCODE_DAEMON_LOST` frame (today `SessionSignal::Lost` is a no-op at opencode_ws.rs:6018; no listener exists); `map_hit_fenced_attach...` fails because the attach tail never spawns the daemon (spawns == 0, the LB-05-validated gap); `revival_skips...` fails because no revival machinery exists yet.
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 Two server-side changes (LB-01/LB-02/LB-08/LB-10/N-3 corrections applied):
 
@@ -752,17 +752,17 @@ fn ensure_daemon_loss_watcher(&self) {
 //       sessions whose bridge was actually restarted.
 ```
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `cargo test -p freshell-freshagent daemon_loss_fans_out` && `cargo test -p freshell-freshagent map_hit_fenced_attach` && `cargo test -p freshell-freshagent revival_skips`
 
 Expected: PASS
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 Ensure the fan-out + bridge-revival helper is shared (not duplicated) with `handle_attach`'s restart arm; keep AGENTS.md's "Agent Status Indicators" paragraph truthful — update the freshopencode sentence to document the daemon-loss self-heal (edge shape, no chime, backoff respawn, bridge revival, and the fix-4 client recovery pointer).
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Impacted set: all `opencode_ws::tests` (119 tests) plus the lib.rs snapshot pins (`get_opencode_snapshot_*` — crate-root `mod tests` tests are named `tests::...`, so the filter is the test-name substring, not `lib::tests`).
 
@@ -770,7 +770,7 @@ Run: `cargo test -p freshell-freshagent`
 
 Expected: PASS
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add crates/freshell-freshagent/src/opencode_ws.rs crates/freshell-freshagent/src/lib.rs AGENTS.md crates/freshell-server/src/logging.rs
@@ -790,7 +790,7 @@ git commit -m "feat(freshopencode): daemon-loss self-heal edge, respawn revival,
 - Consumes: `ApiError.details` (the full 409 body: `code`, `ownerKind`, `ownerGeneration`), `captureFreshAgentAttachmentAttempt` (the real wrapper at FreshAgentView.tsx — R-1: the pane-refresh reaction pattern at :1718-1761 is the exact reuse: bump `attachDecisionSerialRef`, capture, `sendFencedFreshAgentAttach(attempt)`), `sendFencedFreshAgentAttach` (:1262-1275), `requestSnapshotRefresh` / `requestRevealRefresh`, `selectPaneOwnerFence`.
 - Produces: on a 409 `RESTORE_UNAVAILABLE` snapshot error for a freshopencode pane whose refusal names a `fresh-agent` owner (the incident class — the pane's own stale claim; LB-05 scoped terminal owners out to the session-directory handoff door): ONE generation-fenced `freshAgent.attach` whose `observedGeneration` is refreshed from the 409's own `ownerGeneration` (plan-review round 2: the fence binds to the refusal, not the possibly-stale owner record — an unfenced or stale attach is refused `FENCE_REQUIRED` and preserves the dead-end), followed by a snapshot refetch. Bounded (LB-03): the ENTIRE recovery — attach + refetch — runs once per pane identity (`createRequestId` + `snapshotThreadId`); a suppressed attach (`sendFencedFreshAgentAttach` returning false) does NOT consume the one-shot guard and does NOT refetch; a second 409 falls through to the existing error surfaces (loadError banner / reveal error), never re-triggering fetches. When the 409 arrived on the reveal lane with `snapshotDirty` set, the recovery drives the reveal-refresh path (`requestRevealRefresh(true)`) so the success-path reveal-dirty clear can run and the "Refreshing conversation" overlay lifts (LB-04). The pane identity is NOT reset (unlike the 404 lost-thread path).
 
-- [ ] **Step 1: Write the failing behavioral test**
+- [x] **Step 1: Write the failing behavioral test**
 
 In FreshAgentView.test.tsx (draft — template is the 404 test at :1887-1930; reuse its harness: `apiMock.getFreshAgentThreadSnapshot.mockRejectedValueOnce`, `StoreBackedFreshAgentView`, `sentFreshAgentMessages`):
 
@@ -863,13 +863,13 @@ it('does not loop recovery fetches on repeated 409s', async () => {
 })
 ```
 
-- [ ] **Step 2: Run the test and verify the intended failure**
+- [x] **Step 2: Run the test and verify the intended failure**
 
 Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx -t '409'`
 
 Expected: FAIL — no attach is sent; the pane shows the dismiss-only alert banner (the current dead-end).
 
-- [ ] **Step 3: Add the minimal production implementation**
+- [x] **Step 3: Add the minimal production implementation**
 
 In FreshAgentView.tsx (sketch):
 
@@ -953,17 +953,17 @@ if (paneContent.provider === 'opencode' && isRestoreUnavailableSnapshotError(err
 
 (Adapt: the ref `restoreUnavailableRecoveryRef = useRef<string | null>(null)` beside the other reveal refs ~:800-804; `captureFreshAgentAttachmentAttempt`'s real signature follows the pane-refresh reaction lane at :1735-1739; `refreshObservedFenceFromRefusal` is the reuse-or-add-mirror of the WS refusal fold at fresh-agent-ws.ts:224 — if the exact action differs in the slice, reuse it; the TEST pins the observable contract: the recovery attach carries `observedGeneration === <the 409's ownerGeneration>`. Verify the reveal-refresh request helper's exact name/behavior (`requestRevealRefresh(true)` forces a reveal-tagged refresh) against the state machine at :2601-2624 and the arming sites ~:1233.)
 
-- [ ] **Step 4: Run the focused test**
+- [x] **Step 4: Run the focused test**
 
 Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/FreshAgentView.test.tsx -t '409'`
 
 Expected: PASS
 
-- [ ] **Step 5: Refactor while green**
+- [x] **Step 5: Refactor while green**
 
 If the 409 arm and the 404 arm now share reset-vs-recover structure, extract only what is genuinely shared (they intentionally differ: reset vs recover) — otherwise leave as-is.
 
-- [ ] **Step 6: Run impacted-test verification**
+- [x] **Step 6: Run impacted-test verification**
 
 Impacted set: the full FreshAgentView suite (the snapshot error paths, reveal lanes, attach lanes, and scheduler tests all touch `handleSnapshotError`) plus the fresh-agent-ws fold tests.
 
@@ -971,7 +971,7 @@ Run: `npm run test:vitest -- run test/unit/client/components/fresh-agent/ test/u
 
 Expected: PASS
 
-- [ ] **Step 7: Commit the task**
+- [x] **Step 7: Commit the task**
 
 ```bash
 git add src/components/fresh-agent/FreshAgentView.tsx src/store/freshAgentSlice.ts test/unit/client/components/fresh-agent/FreshAgentView.test.tsx
@@ -993,7 +993,7 @@ git commit -m "fix(fresh-agent): recover freshopencode panes from snapshot 409 v
 - Consumes: the model-picker "sidecar suppressed + routed fetch" pattern (the explicitly-cloud-legal pattern cited at playwright.cloud.config.ts:36-38; follow `test/e2e-browser/specs/freshopencode-model-picker.spec.ts`), the `TestHarness` (`test/e2e-browser/helpers/test-harness.js`), `RustServer` helper.
 - Produces: an e2e proof of the Task-5 user story: a freshopencode pane whose snapshot fetch first 409s (`RESTORE_UNAVAILABLE` + `ownerKind`/`ownerGeneration` body) then 200s, recovers by sending `freshAgent.attach` and rendering the transcript — with no dismiss-only dead-end.
 
-- [ ] **Step 1: Write the failing-passing spec (verification task; Task 5 already turned the behavior green)**
+- [x] **Step 1: Write the failing-passing spec (verification task; Task 5 already turned the behavior green)**
 
 Draft structure (follow the model-picker spec's routing/suppression mechanics exactly):
 
@@ -1015,19 +1015,19 @@ test('freshopencode pane recovers from a snapshot 409 via fenced attach', async 
 })
 ```
 
-- [ ] **Step 2: Run it locally**
+- [x] **Step 2: Run it locally**
 
 Run: `npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/freshopencode-snapshot-409-recovery.spec.ts`
 
 Expected: PASS. (Sanity-check the red history: `git stash` the Task-5 commit is NOT needed — Task 5's unit red already proves the pre-fix dead-end; record that linkage in the commit message.)
 
-- [ ] **Step 3: Verify cloud inclusion**
+- [x] **Step 3: Verify cloud inclusion**
 
 Run: `FRESHELL_E2E_BACKEND=cloud npm run test:e2e` in the coordinated lane (or the narrow cloud invocation the repo sanctions for one spec) and confirm the spec is selected — it must not appear in `CLOUD_SKIP_SPECS`, `LOCAL_ONLY_SPECS`, or match any `CLOUD_SKIP_TITLES` pattern.
 
 Expected: the spec runs (and passes) on the cloud backend; per AGENTS.md, "a spec sitting in CLOUD_SKIP_SPECS is not coverage".
 
-- [ ] **Step 4: Commit the task**
+- [x] **Step 4: Commit the task**
 
 ```bash
 git add test/e2e-browser/specs/freshopencode-snapshot-409-recovery.spec.ts
@@ -1047,21 +1047,21 @@ git commit -m "test(e2e): freshopencode snapshot-409 recovery runs cloud-legal e
 - Consumes: the `freshopencode-restart-recovery.spec.ts` harness pattern — `installFakeOpencode` (`fixtures/fake-opencode.cjs` on the spawned server's PATH), the `RustServer` + `TestHarness` helpers, the fake's `FAKE_OPENCODE_AUDIT_LOG` JSONL for spawn/event assertions, and a fixture capability for an UNREQUESTED daemon death that is a scripted SELF-exit — the fake child exits on its own schedule/trigger (plan-review round 3: the spec must not kill any process — `AGENTS.md`'s destructive-test sandbox rule requires process-kill suites to run in `scripts/sandbox-test.sh`; a fixture child exiting itself is the test-sandbox doc's explicitly host-legal fake-child-lifecycle class, the same precedent as the codex onExit self-heal test spawning `true`. E.g. the fixture env-arms an exit-after-N-secs or polls a marker file and exits when it appears — no foreign PID is ever killed. If during implementation the spec cannot avoid killing something, run the spec via `npm run test:sandbox -- "..."` instead of host Playwright).
 - Produces: an e2e proof of the SERVER-side self-heal chain with a real spawned server and a fake daemon process: (1) the pane is materialized and live; (2) the daemon dies an UNREQUESTED death (self-exit); (3) the pane shows the `OPENCODE_DAEMON_LOST` "Agent error:" banner; (4) the daemon respawns automatically within a bounded wait (audit log shows a second serve spawn); (5) the pane recovers (the idle snapshot push refetches the transcript; the banner is dismissible and no dead-end remains); (6) NO `freshAgent.turn.complete` chime during the window.
 
-- [ ] **Step 1: Write the spec** (verification task; Tasks 3+4 turned the chain green — their Rust unit tests carry the TDD red history for this behavior)
+- [x] **Step 1: Write the spec** (verification task; Tasks 3+4 turned the chain green — their Rust unit tests carry the TDD red history for this behavior)
 
 Follow the restart-recovery spec's structure (fake CLI on PATH, harness-seeded freshopencode pane with a durable `ses_*` id, deterministic waits on harness state — never wall-clock-sensitive provider-boot timing).
 
-- [ ] **Step 2: Run it locally**
+- [x] **Step 2: Run it locally**
 
 Run: `npm run test:e2e:local -- --project=chromium test/e2e-browser/specs/freshopencode-daemon-death-selfheal.spec.ts`
 
 Expected: PASS
 
-- [ ] **Step 3: Register the cloud-skip honestly**
+- [x] **Step 3: Register the cloud-skip honestly**
 
 Add the filename to `CLOUD_SKIP_SPECS` (the spec is the same provider-lifecycle class as its model — 2-CPU/2-worker cloud contention cannot guarantee daemon-death timing). Cloud-backend PR coverage is carried by Task 6's cloud-legal spec; this spec is the local-lane end-to-end proof.
 
-- [ ] **Step 4: Commit the task**
+- [x] **Step 4: Commit the task**
 
 ```bash
 git add test/e2e-browser/specs/freshopencode-daemon-death-selfheal.spec.ts test/e2e-browser/playwright.cloud.config.ts
@@ -1074,25 +1074,25 @@ git commit -m "test(e2e): real-daemon death self-heal recovery runs end to end (
 
 **Files:** none (verification only — the plan declares these gates, so the plan must run them; the-usual's Stage-5 exit additionally runs the coordinated full suite once at the final HEAD after the review loop closes)
 
-- [ ] **Step 1: Rust formatting and lints**
+- [x] **Step 1: Rust formatting and lints**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings`
 
 Expected: PASS (clean)
 
-- [ ] **Step 2: Client typecheck and lints**
+- [x] **Step 2: Client typecheck and lints**
 
 Run: `npm run typecheck && npm run lint`
 
 Expected: PASS (clean; eslint includes the jsx-a11y rules)
 
-- [ ] **Step 3: Focused suite confirmation**
+- [x] **Step 3: Focused suite confirmation**
 
 Run: `cargo test -p freshell-opencode && cargo test -p freshell-freshagent && npm run test:vitest -- run test/unit/client/components/fresh-agent/ test/unit/client/lib/fresh-agent-ws.test.ts`
 
 Expected: PASS (all tasks' focused suites green together on the final HEAD)
 
-- [ ] **Step 4: Record**
+- [x] **Step 4: Record**
 
 No commit (verification only). Record the gate results in the run state; the coordinated full-suite gate at final HEAD runs per the-usual Stage 5 after the delta review loop ends.
 
