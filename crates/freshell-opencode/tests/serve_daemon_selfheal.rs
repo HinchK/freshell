@@ -13,7 +13,10 @@
 //!     (no spawn storm);
 //!   * the requested-discard arm: a Yes-lane timeout discard also signals
 //!     `DaemonSignal::Lost` (its reason) and schedules the same backoff-guarded
-//!     respawn — the runtime self-heal (Task 4) observes BOTH loss classes.
+//!     respawn — the runtime self-heal (Task 4) observes BOTH loss classes;
+//!   * the stale-timeout gate: a Yes-lane timeout may only discard the daemon
+//!     the wedged request was ACTUALLY dispatched against — never its
+//!     replacement.
 //!
 //! The crash-detected WARN (`freshagent.opencode.daemon_crash_detected`) is
 //! pinned unit-side in `serve.rs` (the `config_capture` idiom), where the
@@ -492,5 +495,148 @@ async fn discard_running_signals_daemon_loss_and_schedules_re_warm() {
     assert!(
         manager.base_url().await.is_some(),
         "the re-warmed daemon serves again"
+    );
+}
+
+/// Delta-r1 review Finding 1 (the stale-timeout discard race): a Yes-lane
+/// timeout may only discard the daemon the timed-out request was ACTUALLY
+/// dispatched against — never its replacement. Two staggered wedged prompt
+/// POSTs both capture daemon A's base (port 1); R1's timeout legitimately
+/// discards A and the re-warm installs the replacement B (port 2); R2 —
+/// still wedged against the dead A — then times out and must NO-OP: B
+/// survives (no kill, no second `Lost`, no third spawn), the same silence
+/// as a `None` take. Pre-fix, R2's timeout took+killed whichever entry was
+/// CURRENT — the innocent replacement — defeating stable self-healing.
+#[tokio::test]
+async fn stale_request_timeout_never_discards_the_replacement_daemon() {
+    let spawns = Arc::new(AtomicUsize::new(0));
+    let killed = Arc::new(AtomicUsize::new(0));
+    let deps = ServeDeps {
+        spawner: Arc::new(NeverExitsSpawner {
+            killed: killed.clone(),
+            spawns: spawns.clone(),
+        }),
+        http: Arc::new(HealthyHttp {
+            prompt_pending: true,
+        }),
+        ports: Arc::new(CountingAllocator {
+            next: AtomicU16::new(0),
+        }),
+        events: Arc::new(NoopEventSource),
+    };
+    let config = ServeConfig {
+        request_timeout: Duration::from_millis(100),
+        daemon_watch_interval: Duration::from_millis(5),
+        re_warm_backoff_initial_ms: 10,
+        re_warm_backoff_max_ms: 50,
+        ..ServeConfig::default()
+    };
+    let manager = started_manager(deps, config).await;
+    let mut signals = manager.subscribe_daemon_signals();
+
+    // R1 dispatches against daemon A (port 1) and wedges.
+    let r1_manager = manager.clone();
+    let r1 = tokio::spawn(async move {
+        r1_manager
+            .prompt_async("ses_r1", build_prompt_body("r1", None, None), &None, None)
+            .await
+    });
+    // Stagger: R2 still dispatches against A (well inside R1's timeout).
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let r2_manager = manager.clone();
+    let r2 = tokio::spawn(async move {
+        r2_manager
+            .prompt_async("ses_r2", build_prompt_body("r2", None, None), &None, None)
+            .await
+    });
+
+    // R1's timeout: A is discarded — the legitimate same-identity discard.
+    let r1_err = r1
+        .await
+        .expect("r1 settles")
+        .expect_err("the r1 prompt POST must time out");
+    assert!(
+        matches!(r1_err, ServeError::RequestTimeout { .. }),
+        "got {r1_err:?}"
+    );
+    let lost = tokio::time::timeout(Duration::from_secs(2), signals.recv())
+        .await
+        .expect("loss signal within budget")
+        .expect("channel alive");
+    assert!(
+        matches!(
+            lost,
+            DaemonSignal::Lost {
+                reason: "request_timeout"
+            }
+        ),
+        "the same-identity discard must signal its loss, got {lost:?}"
+    );
+    assert_eq!(
+        killed.load(Ordering::SeqCst),
+        1,
+        "the discard killed exactly the wedged daemon A"
+    );
+    // The re-warm installs the replacement daemon B (port 2).
+    let started = tokio::time::timeout(Duration::from_secs(2), signals.recv())
+        .await
+        .expect("re-warm within budget")
+        .expect("channel alive");
+    assert!(
+        matches!(started, DaemonSignal::Started),
+        "the re-warm must install the replacement, got {started:?}"
+    );
+    assert_eq!(
+        manager.base_url().await,
+        Some("http://127.0.0.1:2".to_string()),
+        "the replacement daemon B owns the running entry"
+    );
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        2,
+        "exactly A and B have spawned so far"
+    );
+
+    // R2 — still wedged against the dead A — now times out.
+    let r2_err = r2
+        .await
+        .expect("r2 settles")
+        .expect_err("the r2 prompt POST must time out");
+    match r2_err {
+        ServeError::RequestTimeout { url, .. } => assert!(
+            url.contains("127.0.0.1:1"),
+            "R2 was dispatched against daemon A: {url}"
+        ),
+        other => panic!("expected a RequestTimeout, got {other:?}"),
+    }
+
+    // THE assertion: the stale timeout must not touch B — no kill, no second
+    // Lost, no third spawn — the silence of a `None` take.
+    assert_eq!(
+        killed.load(Ordering::SeqCst),
+        1,
+        "the stale timeout must NOT kill the replacement daemon B"
+    );
+    assert_eq!(
+        manager.base_url().await,
+        Some("http://127.0.0.1:2".to_string()),
+        "the replacement daemon B must survive the stale timeout"
+    );
+    match signals.try_recv() {
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+        other => panic!("the stale timeout must not signal a second loss, got {other:?}"),
+    }
+    // A sneaky deferred re-warm would have spawned by now (the ladder's
+    // first rung is 10-20 ms with these knobs).
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    assert_eq!(
+        spawns.load(Ordering::SeqCst),
+        2,
+        "the stale timeout must not schedule another re-warm"
+    );
+    assert_eq!(
+        manager.base_url().await,
+        Some("http://127.0.0.1:2".to_string()),
+        "B is still the running daemon after the settle window"
     );
 }

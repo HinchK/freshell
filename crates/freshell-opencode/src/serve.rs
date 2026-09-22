@@ -683,10 +683,18 @@ enum LossArm<'a> {
         base_url: &'a str,
         ownership_id: &'a str,
     },
-    /// A requested discard (kill). The watcher is aborted first (a requested
-    /// kill never raises the crash event); `reason` names the discard cause
-    /// and rides both the WARN and the `Lost` signal.
-    Discard { reason: &'static str },
+    /// A requested discard (kill). `dispatched_base` is the base URL the
+    /// timed-out request was actually sent to — the discard takes+kills
+    /// ONLY the daemon at that base; a STALE timeout (its daemon already
+    /// lost, a replacement owns the entry) no-ops with the same silence as
+    /// a `None` take, never killing the innocent replacement. The watcher
+    /// is aborted first (a requested kill never raises the crash event);
+    /// `reason` names the discard cause and rides both the WARN and the
+    /// `Lost` signal.
+    Discard {
+        reason: &'static str,
+        dispatched_base: &'a str,
+    },
 }
 
 struct RunningServe {
@@ -986,19 +994,31 @@ impl OpencodeServeManager {
                     // Stale watcher — a newer daemon owns the entry: no-op.
                     _ => return,
                 },
-                LossArm::Discard { reason: _ } => {
-                    // Abort the watcher FIRST (inside the lock, before the
-                    // take and the WARN/kill sequence) — the requested kill
-                    // must never raise the crash event. After the take the
-                    // watcher can never win its own take; if it already won,
-                    // our take below is the silent no-op.
-                    if let Some(r) = running.as_ref() {
+                LossArm::Discard {
+                    reason: _,
+                    dispatched_base,
+                } => match running.as_ref() {
+                    // The wedged request's OWN daemon: abort the watcher
+                    // FIRST (inside the lock, before the take and the
+                    // WARN/kill sequence) — the requested kill must never
+                    // raise the crash event. After the take the watcher can
+                    // never win its own take; if it already won, our take
+                    // below is the silent no-op.
+                    Some(r) if r.base_url == dispatched_base => {
                         if let Some(watch) = &r._exit_watch {
                             watch.abort();
                         }
+                        running.take()
                     }
-                    running.take()
-                }
+                    // Stale timeout — the request's daemon is already gone
+                    // and a replacement owns the entry: no-op (no kill, no
+                    // log, no Lost, no re-warm), the same silence as a
+                    // `None` take. The gate is the base URL captured at
+                    // dispatch — the exact address the wedged request was
+                    // sent to — so a mismatch means the entry is a
+                    // different (re-warmed) daemon the request never used.
+                    _ => return,
+                },
             }
         };
         let Some(running) = taken else {
@@ -1013,7 +1033,7 @@ impl OpencodeServeManager {
                 );
                 "process_exit"
             }
-            LossArm::Discard { reason } => {
+            LossArm::Discard { reason, .. } => {
                 tracing::warn!(reason = reason, "freshagent.opencode.daemon_discarded");
                 reason
             }
@@ -1108,8 +1128,9 @@ impl OpencodeServeManager {
     }
 
     /// One JSON request/response through the transport, bounded by the config's
-    /// `request_timeout`. On a timeout the running sidecar is discarded
-    /// (`discardRunning('request_timeout')`, `serve-manager.ts:320-324`).
+    /// `request_timeout`. On a timeout the sidecar the request was dispatched
+    /// against is discarded (`discardRunning('request_timeout')`,
+    /// `serve-manager.ts:320-324`) — never a re-warmed replacement.
     /// `not_found_value` mirrors `json`'s 404 handling.
     async fn json_request(
         &self,
@@ -1184,7 +1205,11 @@ impl OpencodeServeManager {
         {
             Err(_) => {
                 if discard_on_timeout == DiscardOnTimeout::Yes {
-                    self.discard_running("request_timeout").await;
+                    // Gate on the daemon THIS request was dispatched against:
+                    // a stale timeout (its daemon already discarded, a
+                    // re-warmed replacement installed) must never kill the
+                    // replacement — the discard no-ops on a base mismatch.
+                    self.discard_running("request_timeout", &base).await;
                 }
                 return Err(ServeError::RequestTimeout {
                     method: method_str,
@@ -1644,13 +1669,19 @@ impl OpencodeServeManager {
         }
     }
 
-    /// The requested-loss arm: discard the running daemon (a Yes-lane request
-    /// timeout, a shutdown-adjacent lane, …), WARN the Task-2 structured
-    /// event, then run the shared exactly-once loss path (Lost signal +
-    /// backoff re-warm). `reason` is `&'static` because it rides the
-    /// [`DaemonSignal::Lost`] broadcast to daemon-signal subscribers.
-    async fn discard_running(&self, reason: &'static str) {
-        self.lose_daemon(LossArm::Discard { reason }).await;
+    /// The requested-loss arm: discard the running daemon the timed-out
+    /// request at `dispatched_base` was sent to (a Yes-lane request
+    /// timeout, …), WARN the Task-2 structured event, then run the shared
+    /// exactly-once loss path (Lost signal + backoff re-warm). A STALE
+    /// timeout — one whose daemon was already replaced — no-ops silently.
+    /// `reason` is `&'static` because it rides the [`DaemonSignal::Lost`]
+    /// broadcast to daemon-signal subscribers.
+    async fn discard_running(&self, reason: &'static str, dispatched_base: &str) {
+        self.lose_daemon(LossArm::Discard {
+            reason,
+            dispatched_base,
+        })
+        .await;
     }
 
     // ── the IDLE edge (once_idle / await_idle, serve-manager.ts:440-520) ─────────
