@@ -289,9 +289,11 @@ cat > "${P6_FIXTURE_NPM}/package.json" <<'EOF'
 }
 EOF
 
-# Generate each fixture's lock with the image's own pinned manager (empty
-# dependency sets: no network resolution). Lock-only generation keeps the
-# case runs below exercising the entrypoint's real frozen-install path.
+# Generate each fixture's lock with the image's own pinned manager. The
+# pnpm fixture carries a real dependency (ms@2.1.3), so lock generation
+# resolves from the registry; the npm fixture's lock stays dependency-free.
+# Lock-only generation keeps the case runs below exercising the entrypoint's
+# real frozen-install path.
 # The generators run as the container's root user: under this host's
 # rootless docker mapping, bind-mounted files keep the invoking user's
 # ownership, so root-created locks come back out as the invoking user's
