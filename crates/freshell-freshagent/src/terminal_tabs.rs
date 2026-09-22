@@ -3130,6 +3130,12 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
             });
         } else {
             let claim_locator = claim.locator.clone();
+            // b8ke fence-heal (plan Task 3), r32 F2: capture the claim
+            // ticket's OWN pair BEFORE the consuming commit — the broadcast
+            // below carries THIS pair, never a re-observed current
+            // generation.
+            let owner_operation_id = claim.ticket.operation_id().to_string();
+            let owner_generation = claim.ticket.generation();
             match claim.commit(&registry, &terminal_id) {
                 Ok(()) => {
                     tracing::info!(
@@ -3137,6 +3143,37 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                         terminal_id = %terminal_id,
                         "session_ref.ownership_committed (REST rung)"
                     );
+                    // b8ke fence-heal (plan Task 3): the REST rung's
+                    // commit-to-Live broadcasts its own committed pair
+                    // (r29 F1 invariant / r32 F2 pair), mirroring
+                    // broadcast_owner_frame's terminal-Live shape — this
+                    // crate cannot call the freshell-ws helper, so the same
+                    // frame is constructed in-crate exactly as the
+                    // fresh-agent lane's emission (lib.rs) does. The claim
+                    // mint implies the coordinator is wired.
+                    let frame = freshell_protocol::ServerMessage::SessionRuntimeOwner(
+                        freshell_protocol::SessionRuntimeOwner {
+                            provider: claim_locator.provider.clone(),
+                            session_id: claim_locator.session_id.clone(),
+                            epoch: state
+                                .ownership
+                                .as_ref()
+                                .expect("coordinator wired")
+                                .boot_epoch(),
+                            generation: owner_generation,
+                            owner_kind: "terminal".into(),
+                            previous_kind: None,
+                            terminal_id: Some(terminal_id.clone()),
+                            operation_id: owner_operation_id,
+                            transition: "handoff-committed".into(),
+                            reason: None,
+                            fenced: None,
+                            alias_of: None,
+                        },
+                    );
+                    if let Ok(frame) = serde_json::to_string(&frame) {
+                        let _ = state.broadcast_tx.send(frame);
+                    }
                 }
                 Err(outcome) => {
                     tracing::error!(target: "invariant",
@@ -8269,6 +8306,77 @@ if (args.includes('app-server')) {{
             ),
             freshell_ownership::BeginOutcome::OwnedByOtherKind { .. }
         ));
+    }
+
+    /// b8ke fence-heal (plan Task 3): the REST rung's commit-to-Live
+    /// BROADCASTS its own committed (epoch, generation) pair (the r29 F1
+    /// "every ownership transition broadcasts" invariant; r32 F2: the pair
+    /// captured from the claim ticket BEFORE the consuming commit) — the
+    /// same terminal-Live frame shape freshell-ws's `broadcast_owner_frame`
+    /// emits, constructed in-crate because this crate cannot call the
+    /// freshell-ws helper. Pre-Task-3 the REST settle committed Live with
+    /// NO broadcast, so clients never learned the REST-created terminal's
+    /// fence until an unrelated transition or a reload supplied one.
+    #[tokio::test]
+    async fn a_rest_rung_commit_broadcasts_its_committed_owner_pair() {
+        let _ = isolate_amplifier_home();
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let registry =
+            freshell_terminal::TerminalRegistry::new().with_ownership(Arc::clone(&ownership));
+        let sid = format!("rest-rung-bcast-{}", Uuid::new_v4());
+        // The broadcast receiver subscribed BEFORE the create (the shared
+        // bus every connected client folds owner frames from).
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let state = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
+            .with_terminal_registry(registry.clone())
+            .with_cli_commands(Arc::new(vec![recording_cli_spec(
+                "claude",
+                &unique_argv_file("rest-rung-bcast"),
+            )]))
+            .with_ownership(Arc::clone(&ownership));
+        let tmp = std::env::temp_dir();
+        let (status, body) = post(
+            app(state),
+            "/api/tabs",
+            json!({
+                "mode": "claude",
+                "cwd": tmp.to_string_lossy(),
+                "sessionRef": { "provider": "claude", "sessionId": sid },
+            }),
+            true,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the REST create must succeed: {body}"
+        );
+        let terminal_id = body["data"]["terminalId"]
+            .as_str()
+            .expect("terminalId")
+            .to_string();
+
+        // The committed pair the frame must carry: the Live record the
+        // settle committed carries the ticket's own generation.
+        let committed_generation = ownership.observe("claude", &sid).generation;
+
+        // THE CONTRACT: the commit's own pair rode the bus — same drain
+        // discipline as the fresh-agent lane's r29 F1 precedent
+        // (`a_normal_create_broadcasts_the_committed_owner_record`).
+        let mut owner_frame = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).expect("bus json");
+            if frame["type"] == "session.runtimeOwner" && frame["sessionId"] == json!(sid) {
+                owner_frame = Some(frame);
+            }
+        }
+        let frame = owner_frame.expect("the REST rung's commit broadcast its committed owner pair");
+        assert_eq!(frame["ownerKind"], json!("terminal"));
+        assert_eq!(frame["transition"], json!("handoff-committed"));
+        assert_eq!(frame["generation"], json!(committed_generation));
+        assert_eq!(frame["epoch"], json!(ownership.boot_epoch()));
+        assert_eq!(frame["terminalId"], json!(terminal_id));
+        registry.kill(&terminal_id);
     }
 
     /// b8ke d4 F4: the dropped-ticket diagnostics capture for the REST
