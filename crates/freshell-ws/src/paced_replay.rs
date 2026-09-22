@@ -142,6 +142,12 @@ pub(crate) enum CreditVerdict {
     /// is not fully consumed, so it grants nothing.
     PartialConsumption,
     StaleGeneration,
+    /// The credit carries the current attach generation but the WRONG
+    /// stream id (round-2 finding F4): stream identity is part of the
+    /// continuation contract, so this is not the session's credit. A
+    /// distinct verdict from the stale generation — the generation is
+    /// current; the STREAM is foreign.
+    StreamMismatch,
     BeyondWindow,
     NonNegotiated,
 }
@@ -152,6 +158,7 @@ impl CreditVerdict {
             Self::Accepted => "accepted",
             Self::PartialConsumption => "partial_consumption",
             Self::StaleGeneration => "stale_generation",
+            Self::StreamMismatch => "stream_mismatch",
             Self::BeyondWindow => "beyond_window",
             Self::NonNegotiated => "non_negotiated",
         }
@@ -174,6 +181,13 @@ pub(crate) fn validate_credit(
 ) -> CreditVerdict {
     if session.attach_request_id != credit.attach_request_id {
         return CreditVerdict::StaleGeneration;
+    }
+    // Round-2 finding F4: stream identity is a required part of the
+    // continuation contract — a credit whose stream id does not match the
+    // session's stream belongs to a different stream's story, not this
+    // session, and must never page for it (no grant, wire shape unchanged).
+    if session.stream_id != credit.stream_id {
+        return CreditVerdict::StreamMismatch;
     }
     if credit.consumed_seq <= session.credited || credit.consumed_seq > session.page_end {
         return CreditVerdict::BeyondWindow;
@@ -677,9 +691,13 @@ mod tests {
     }
 
     fn credit(arid: &str, consumed_seq: i64) -> TerminalReplayCredit {
+        credit_with_stream("S", arid, consumed_seq)
+    }
+
+    fn credit_with_stream(stream_id: &str, arid: &str, consumed_seq: i64) -> TerminalReplayCredit {
         TerminalReplayCredit {
             terminal_id: "T".into(),
-            stream_id: "S".into(),
+            stream_id: stream_id.into(),
             attach_request_id: arid.into(),
             consumed_seq,
         }
@@ -705,6 +723,31 @@ mod tests {
             CreditVerdict::StaleGeneration
         );
         assert_eq!(session.credited, 10, "a stale credit grants nothing");
+    }
+
+    #[test]
+    fn wrong_stream_credit_with_the_current_generation_grants_nothing() {
+        // Round-2 finding F4: the continuation contract keys on stream
+        // identity as well as the attach generation — a credit carrying the
+        // CURRENT attachRequestId but the WRONG stream id is not this
+        // session's credit and must grant nothing (the stale-generation
+        // guard is otherwise incomplete: the arid matches, so without this
+        // check the credit would page for a session it does not belong to).
+        let mut session = session_fixture();
+        assert_eq!(
+            validate_credit(
+                &mut session,
+                &credit_with_stream("OTHER-STREAM", "arid-1", 50)
+            ),
+            CreditVerdict::StreamMismatch
+        );
+        assert_eq!(session.credited, 10, "a wrong-stream credit grants nothing");
+        // The matching-stream credit still grants after the ignored one.
+        assert_eq!(
+            validate_credit(&mut session, &credit("arid-1", 50)),
+            CreditVerdict::Accepted
+        );
+        assert_eq!(session.credited, 50);
     }
 
     #[test]
