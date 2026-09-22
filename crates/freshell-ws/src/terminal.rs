@@ -1778,7 +1778,7 @@ async fn handle_client_text(
             } else {
                 handle_replay_credit(
                     &replay_credit,
-                    state,
+                    &state.registry,
                     conn_id,
                     conn_sink,
                     paced_sessions,
@@ -7295,7 +7295,7 @@ fn handle_attach(
 /// `ws.restore.credit`, never a client-visible error).
 fn handle_replay_credit(
     replay_credit: &freshell_protocol::TerminalReplayCredit,
-    state: &WsState,
+    registry: &freshell_terminal::TerminalRegistry,
     conn_id: u64,
     conn_sink: &FrameSink,
     paced_sessions: &mut crate::paced_replay::PacedSessions,
@@ -7329,7 +7329,7 @@ fn handle_replay_credit(
     // whole session honors the requested bound, not just the first page.
     let budget = session.page_budget;
     let mut exit_armed_stays_credited = false;
-    match crate::paced_replay::drive_session(&state.registry, conn_id, conn_sink, session, budget) {
+    match crate::paced_replay::drive_session(registry, conn_id, conn_sink, session, budget) {
         DriveOutcome::Active => {}
         DriveOutcome::DrainReady => {
             // E2R1 finding 1 (race close): a natural exit may have staged
@@ -7344,12 +7344,11 @@ fn handle_replay_credit(
             // or is complete (the empty drain below delivers the staged
             // exit through its CaughtUp hold — zero uncredited pages).
             if session.exit_head.is_none()
-                && state
-                    .registry
+                && registry
                     .staged_paced_exit(&replay_credit.terminal_id, conn_id)
                     .is_some()
             {
-                if let Some(bounds) = state.registry.replay_bounds(&replay_credit.terminal_id) {
+                if let Some(bounds) = registry.replay_bounds(&replay_credit.terminal_id) {
                     session.arm_staged_exit(bounds.head_seq);
                     if session.page_end < session.phase_target() {
                         exit_armed_stays_credited = true;
@@ -7369,7 +7368,7 @@ fn handle_replay_credit(
                 // generations (the drain is un-credited).
                 if let Some(session) = paced_sessions.remove(&replay_credit.terminal_id) {
                     crate::paced_replay::spawn_paced_drain(
-                        state.registry.clone(),
+                        registry.clone(),
                         conn_id,
                         writer.clone(),
                         Arc::clone(conn_sink),
