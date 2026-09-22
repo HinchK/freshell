@@ -4855,6 +4855,34 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             setIsAttaching(false)
             markAttachComplete()
           }
+          // Delivery-loss repair (responsive-terminal-restore WS3→WS2,
+          // negotiated lane only): a queue_overflow gap on the STILL-OPEN
+          // connection means this connection missed sequenced output — the
+          // shared restore contract requires repair from retained output,
+          // never silent advancement and never a stranded screen. One
+          // bounded repair attach per gap (a full viewport-hydrate rebuild:
+          // the surface already rendered the frames after the hole, so a
+          // delta resume would duplicate them), through the recovery
+          // accounting — repeated gaps exhaust to the visible retry strip.
+          // Old servers never emit this negotiated gap shape; their
+          // local-notice behavior (pinned above) is unchanged.
+          if (
+            pacedReplayNegotiated
+            && msg.reason === 'queue_overflow'
+            && gapDecision.requiresSurfaceQuarantine
+          ) {
+            recordTerminalPerfAuditEvent('terminal.restore.queue_overflow_repair', {
+              terminalId: tid,
+              attachRequestId: msg.attachRequestId,
+              activeAttachRequestId: currentAttachRef.current?.requestId,
+              fromSeq: msg.fromSeq,
+              toSeq: msg.toSeq,
+            })
+            attachTerminal(tid, 'viewport_hydrate', {
+              clearViewportFirst: true,
+              ...viewportHydrateReplayOptions(contentRef.current, pacedReplayNegotiated),
+            })
+          }
         }
 
         if (msg.type === 'terminal.stream.changed' && msg.terminalId === tid) {

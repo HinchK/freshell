@@ -10375,6 +10375,108 @@ describe('TerminalView lifecycle updates', () => {
       }))
     })
 
+    it('a negotiated queue_overflow gap initiates the bounded repair attach on the still-open connection', async () => {
+      // The negotiated lane (pacedTerminalReplayV1): the spill gap is
+      // repairable delivery loss — the shared restore contract requires
+      // "repair from retained output", initiated on the SAME connection
+      // (no transport flap). The old-server lane (no capability) keeps
+      // its local-notice-only behavior — pinned by the test above.
+      wsMocks.capabilities = { pacedTerminalReplayV1: true }
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-gap-repair',
+      })
+
+      const repairAttaches = () => sentMessages().filter(
+        (msg) => msg?.type === 'terminal.attach' && msg.terminalId === terminalId,
+      )
+
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'ok' })
+      term.write.mockClear()
+      wsMocks.send.mockClear()
+      expect(repairAttaches()).toEqual([])
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 2,
+          toSeq: 5,
+          reason: 'queue_overflow',
+        })
+      })
+
+      // No reconnect handler is invoked anywhere in this test: the repair
+      // attach must be emitted by the gap arm itself, on the open socket.
+      expect(reconnectHandler).not.toBeNull()
+      const repair = repairAttaches()
+      expect(repair.length).toBe(1)
+      expect(repair[0]).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      })
+      // The honest local notice still renders alongside the repair.
+      expectTerminalWriteContaining(term, 'Output gap 2-5: slow link backlog')
+
+      // The repair completes: the new generation's ready + frames converge
+      // the screen on the SAME connection.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 8,
+          replayFromSeq: 1,
+          replayToSeq: 8,
+          attachRequestId: repair[0]!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 1,
+          seqEnd: 8,
+          data: 'REPAIRED',
+          attachRequestId: repair[0]!.attachRequestId,
+        })
+      })
+      expectTerminalWriteContaining(term, 'REPAIRED')
+      expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+    })
+
+    it('repeated negotiated queue_overflow gaps exhaust to the visible retry strip', async () => {
+      wsMocks.capabilities = { pacedTerminalReplayV1: true }
+      const { terminalId } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-gap-repair-exhaust',
+      })
+
+      const repairAttachCount = () => sentMessages().filter(
+        (msg) => msg?.type === 'terminal.attach' && msg.terminalId === terminalId,
+      ).length
+
+      wsMocks.send.mockClear()
+      for (let round = 1; round <= 4; round += 1) {
+        act(() => {
+          messageHandler!({
+            type: 'terminal.output.gap',
+            terminalId,
+            fromSeq: round * 10 + 1,
+            toSeq: round * 10 + 5,
+            reason: 'queue_overflow',
+          })
+        })
+      }
+
+      // The recovery bound (TERMINAL_RECOVERY_MAX_ATTEMPTS = 3): exactly
+      // three gap-initiated repair attaches went out, the fourth gap is
+      // declined, and the visible retry state shows.
+      expect(repairAttachCount()).toBe(3)
+      const retryStrip = screen.getByTestId('restore-recovery-retry')
+      expect(retryStrip).toHaveAttribute('role', 'alert')
+    })
+
     it('queues local gap notices behind a pending replay write', async () => {
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',
