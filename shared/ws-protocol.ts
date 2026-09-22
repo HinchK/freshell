@@ -1467,7 +1467,11 @@ export type TerminalOutputGapMessage = {
   streamId: string
   fromSeq: number
   toSeq: number
-  reason: 'queue_overflow' | 'replay_window_exceeded' | 'replay_budget_exceeded'
+  reason:
+    | 'queue_overflow'
+    | 'replay_window_exceeded'
+    | 'replay_budget_exceeded'
+    | 'handoff_boundary_reached'
   attachRequestId?: string
   /** Restore contract (negotiated pacedTerminalReplayV1 only): the terminal's current headSeq at gap-emission time. */
   headSeq?: number

@@ -32,18 +32,27 @@
 //! When the replay cursor reaches the fixed attach-time target, the
 //! accumulated live range drains as ordinary delivery (pages, not
 //! credit-gated) in the SPAWNED drain task toward a FIXED target — the
-//! head captured ONCE when the drain starts, NEVER re-captured: when the
-//! target is covered, the completing page read re-fans the frames
-//! produced after it through the normal live fan-out path and clears the
-//! deferral atomically in the same registry lock hold, so ongoing
-//! production can never turn the drain into a moving-head chase and
-//! never occupies the connection dispatcher. Between pages the drain
-//! task waits on the connection queue's REAL backpressure (the writer's
-//! backlog watermark) — the sink itself admits without yielding, so the
-//! gate is what bounds the drain against self-spilling its own
-//! unconsumed pages. A retention advance past the drain cursor reports
-//! the exact bounds-carrying gap and resumes from the ring front — never
-//! a silent forward jump.
+//! head captured ONCE when the drain starts, NEVER re-captured. When
+//! that target is covered, the COMPLETION BOUNDARY B is captured ONCE
+//! under the same hold (the registry records it on the subscriber —
+//! `TargetCovered`), and the staged post-target remainder pages toward
+//! B and ONLY B through the bounded post-target handoff — the boundary
+//! NEVER moves again, so a producer appending at-or-above drain speed
+//! cannot postpone completion (the moving-head chase is structurally
+//! gone: no completion-path code reads the terminal's current head
+//! after completion start). The completing hold clears the deferral
+//! atomically with its delivery, and the frames the producer staged
+//! past B flow through the normal live fan-out path in that same hold.
+//! Retention overrunning the handoff cursor mid-handoff is the plan:146
+//! bounded-baseline exit: the registry sinks the exact bounds-carrying
+//! gap (ordered ahead of everything), sweeps the retained window through
+//! the normal live path, clears the deferral, and the session COMPLETES
+//! AT THE RING FRONT — the paged handoff never resumes toward the
+//! unreachable boundary. Between pages the drain task waits on the
+//! connection queue's REAL backpressure (the writer's backlog
+//! watermark) — the sink itself admits without yielding, so the gate is
+//! what bounds the drain against self-spilling its own unconsumed
+//! pages.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -309,21 +318,28 @@ pub(crate) fn drive_session(
 /// starving same-connection input).
 ///
 /// The drain target is the head captured ONCE at drain start — NEVER
-/// re-captured: when the target is covered, the registry's
-/// `TargetCovered` verdict hands the staged post-target remainder to the
-/// BOUNDED post-target handoff (`handoff_paced_tail`), which delivers it
-/// page-budget-sized per lock hold — the lock released between chunks,
-/// the same backlog-gated loop — until a chunk covers the terminal's
-/// current head and the deferral clears atomically in that hold. No
-/// completion or handoff path ever bulk-clones a retained suffix or
-/// admits data outside the page budget; a sustained producer can never
-/// turn the drain into a moving-head chase. Between pages the task
-/// waits on the connection queue's REAL backpressure (the writer's
-/// backlog watermark — the sink itself admits without yielding and
-/// evicts past the byte limit, so this gate is what bounds the drain
-/// and keeps it from self-spilling its own unconsumed pages). `cancel`
-/// fires on the connection's teardown (any exit reason), bounding the
-/// task's lifetime with the connection's own.
+/// re-captured. When the target is covered, the registry's
+/// `TargetCovered` verdict captures the COMPLETION BOUNDARY B ONCE under
+/// that hold (recorded on the subscriber) and the staged post-target
+/// remainder pages toward B and ONLY B through the bounded post-target
+/// handoff (`handoff_paced_tail`) — page-budget-sized per lock hold, the
+/// lock released between chunks, the same backlog-gated loop. The
+/// completing hold clears the deferral atomically with its delivery and
+/// the frames staged past B flow through the normal live fan-out path in
+/// that hold; a retention overrun past the handoff cursor mid-handoff is
+/// the plan:146 bounded-baseline exit (`GapCompleted`): the exact
+/// bounds-carrying gap is sunk (ordered ahead of everything), the
+/// retained window sweeps through the normal live path, and the session
+/// COMPLETES AT THE RING FRONT — never a resumption toward the
+/// unreachable boundary. No completion or handoff path ever bulk-clones
+/// a retained suffix or admits pages outside the page budget; a
+/// sustained producer can never turn the drain into a moving-head
+/// chase. Between pages the task waits on the connection queue's REAL
+/// backpressure (the writer's backlog watermark — the sink itself admits
+/// without yielding and evicts past the byte limit, so this gate is what
+/// bounds the drain and keeps it from self-spilling its own unconsumed
+/// pages). `cancel` fires on the connection's teardown (any exit
+/// reason), bounding the task's lifetime with the connection's own.
 ///
 /// Page order, the deferral contract, and lock discipline are preserved:
 /// the session leaves `PacedSessions` when it enters the drain (credits
@@ -420,11 +436,14 @@ pub(crate) fn spawn_paced_drain(
                     end_seq,
                     serialized_bytes,
                 } => {
-                    // THE FIXED TARGET IS COVERED — never re-captured: the
-                    // staged post-target remainder now flows through the
-                    // bounded handoff (page-budget-sized chunks, gated,
-                    // lock released between them) instead of a bulk
-                    // re-fan.
+                    // THE FIXED TARGET IS COVERED — COMPLETION START (never
+                    // re-captured): the registry recorded the completion
+                    // boundary B (the head under this hold) on the
+                    // subscriber; the staged post-target remainder now pages
+                    // toward B and ONLY B through the bounded handoff
+                    // (page-budget-sized chunks, gated, lock released
+                    // between them) — never a bulk re-fan, never a moving
+                    // current-head target.
                     tracing::debug!(
                         terminal_id = %terminal_id,
                         attach_request_id = %attach_request_id,
@@ -443,6 +462,11 @@ pub(crate) fn spawn_paced_drain(
                     head_seq,
                     oldest_retained_seq,
                 } => {
+                    // DRAIN-PHASE retention overrun (before the target was
+                    // covered): the exact bounds-carrying gap, then continue
+                    // toward the still-FIXED target from the resumed front.
+                    // (Mid-handoff overruns take the plan:146 exit below —
+                    // the paged handoff never resumes.)
                     sink(retention_gap(
                         &terminal_id,
                         &stream_id,
@@ -461,6 +485,41 @@ pub(crate) fn spawn_paced_drain(
                     );
                     session.page_end = resume_from;
                 }
+                PacedTailCompletion::GapCompleted {
+                    lost_from,
+                    lost_to,
+                    end_seq,
+                    serialized_bytes: _,
+                } => {
+                    // THE plan:146 BOUNDED-BASELINE EXIT (mid-handoff
+                    // retention overrun): the registry already sank the
+                    // exact bounds-carrying gap (ordered ahead of the
+                    // swept retained window) and CLEARED the deferral in
+                    // the same hold — the session COMPLETES AT THE RING
+                    // FRONT with the gap recorded; the paged handoff never
+                    // resumes toward the unreachable boundary, and the
+                    // client's bounded baseline recovery owns the post-gap
+                    // state.
+                    tracing::info!(
+                        terminal_id = %terminal_id,
+                        attach_request_id = %attach_request_id,
+                        lost_from,
+                        lost_to,
+                        last_seq = end_seq,
+                        pages = session.pages + 1,
+                        "ws.restore.paced_expired"
+                    );
+                    session.page_end = session.page_end.max(end_seq);
+                    session.pages += 1;
+                    tracing::info!(
+                        terminal_id = %terminal_id,
+                        attach_request_id = %attach_request_id,
+                        last_seq = session.page_end,
+                        pages = session.pages,
+                        "ws.restore.paced_complete"
+                    );
+                    return;
+                }
                 PacedTailCompletion::CaughtUp => {
                     // The ring drained at or below the cursor (a quiet or
                     // slower terminal): the registry's atomic clear already
@@ -475,9 +534,10 @@ pub(crate) fn spawn_paced_drain(
                     return;
                 }
                 PacedTailCompletion::Completed { end_seq, .. } => {
-                    // The page/chunk covered the terminal's current head:
-                    // everything staged was delivered in that hold and the
-                    // deferral cleared atomically with it.
+                    // The completing hold: the chunk covered the FIXED
+                    // boundary B, everything staged past it flowed through
+                    // the normal live fan-out path in the same hold, and
+                    // the deferral cleared atomically with that delivery.
                     session.page_end = session.page_end.max(end_seq);
                     session.pages += 1;
                     tracing::info!(

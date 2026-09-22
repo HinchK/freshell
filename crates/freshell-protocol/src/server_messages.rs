@@ -337,6 +337,18 @@ pub enum TerminalOutputGapReason {
     QueueOverflow,
     ReplayWindowExceeded,
     ReplayBudgetExceeded,
+    /// Responsive-terminal-restore W1 (round-4, plan:146): the paced
+    /// session's FIXED delivery boundary was reached with output staged
+    /// beyond it — the connection missed the declared interval's sequenced
+    /// output, but the ring RETAINED it (delivery loss, not retention
+    /// loss). Emitted ONLY on connections that negotiated
+    /// `pacedTerminalReplayV1` (the paced completion core is its only
+    /// emitter). The client repairs from its surface cursor (the same
+    /// checkpoint-cursor delta repair as `queue_overflow`): a finite
+    /// delivery window cannot guarantee convergence against indefinitely
+    /// faster output production, so the bounded session reports the exact
+    /// interval and the client's bounded baseline recovery fetches it.
+    HandoffBoundaryReached,
 }
 
 /// `terminal.attach.ready.replayResetReason` — why the attach's effective

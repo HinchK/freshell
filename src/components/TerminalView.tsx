@@ -5073,7 +5073,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           } else {
             const reason = msg.reason === 'replay_window_exceeded'
               ? 'reconnect window exceeded'
-              : 'slow link backlog'
+              : msg.reason === 'handoff_boundary_reached'
+                ? 'restore boundary reached'
+                : 'slow link backlog'
             writeLocalXtermNotice(term, `\r\n[Output gap ${msg.fromSeq}-${msg.toSeq}: ${reason}]\r\n`)
           }
           // The generation is gap-tainted from here on: any completion it
@@ -5110,24 +5112,30 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           // negotiated lane only): a queue_overflow gap on the STILL-OPEN
           // connection means this connection missed sequenced output — the
           // shared restore contract requires repair from retained output,
-          // never silent advancement and never a stranded screen. The ring
-          // retained the spilled range, so the repair RESUMES from the
-          // surface checkpoint cursor (the checkpoint-aware delta resume):
-          // a delta attach refills the visible surface WITHOUT clearing
-          // it. One bounded repair attach per gap, through the recovery
-          // accounting — repeated gaps exhaust to the visible retry strip.
-          // If the server answers that retention has expired past the
-          // cursor (the bounds-carrying gap), the existing honest-loss UX
-          // applies below — never a destructive rebuild. Only when no
-          // valid checkpoint exists may the repair fall back to a full
-          // hydrate, and even then the viewport is not cleared before the
-          // new baseline is actually established by attach content (the
-          // deferred content reset). Old servers never emit this
-          // negotiated gap shape; their local-notice behavior (pinned
+          // never silent advancement and never a stranded screen. The
+          // round-4 fixed-boundary exit (plan:146) is the SAME delivery
+          // loss: the paced session completed at its FIXED boundary with
+          // output staged past it, and the server declared the exact
+          // retained interval as the `handoff_boundary_reached` gap — the
+          // ring still holds it, so the identical checkpoint-cursor
+          // repair fetches it. In both shapes the ring retained the
+          // declared range, so the repair RESUMES from the surface
+          // checkpoint cursor (the checkpoint-aware delta resume): a delta
+          // attach refills the visible surface WITHOUT clearing it. One
+          // bounded repair attach per gap, through the recovery accounting
+          // — repeated gaps exhaust to the visible retry strip. If the
+          // server answers that retention has expired past the cursor (the
+          // bounds-carrying gap), the existing honest-loss UX applies
+          // below — never a destructive rebuild. Only when no valid
+          // checkpoint exists may the repair fall back to a full hydrate,
+          // and even then the viewport is not cleared before the new
+          // baseline is actually established by attach content (the
+          // deferred content reset). Old servers never emit these
+          // negotiated gap shapes; their local-notice behavior (pinned
           // above) is unchanged.
           if (
             pacedReplayNegotiated
-            && msg.reason === 'queue_overflow'
+            && (msg.reason === 'queue_overflow' || msg.reason === 'handoff_boundary_reached')
             && gapDecision.requiresSurfaceQuarantine
           ) {
             recordTerminalPerfAuditEvent('terminal.restore.queue_overflow_repair', {
@@ -5136,6 +5144,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               activeAttachRequestId: currentAttachRef.current?.requestId,
               fromSeq: msg.fromSeq,
               toSeq: msg.toSeq,
+              reason: msg.reason,
             })
             // The repair generation must not refund the streak on a clean
             // completion: repeated gaps still exhaust to the retry strip.

@@ -1802,9 +1802,11 @@ async fn producing_drain_completes_within_a_countable_page_bound_with_no_undecla
                 }
             }
             Some("terminal.output.gap") => {
-                assert_eq!(
-                    value["reason"], "replay_window_exceeded",
-                    "the producing-drain fixture only ever declares retention gaps: {value}"
+                assert!(
+                    value["reason"] == "replay_window_exceeded"
+                        || value["reason"] == "handoff_boundary_reached",
+                    "the producing-drain fixture only ever declares retention gaps and \
+                     the round-4 fixed-boundary delivery gaps: {value}"
                 );
                 declared_gaps.push((
                     value["fromSeq"].as_i64().unwrap_or(0),

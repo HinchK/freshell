@@ -10998,6 +10998,85 @@ describe('TerminalView lifecycle updates', () => {
       expect(retryStrip).toHaveAttribute('role', 'alert')
     })
 
+    it('a handoff_boundary_reached gap repairs from the surface checkpoint cursor — the fixed boundary exit is fetchable delivery loss', async () => {
+      // Round-4 server contract (plan:146): the paced session's FIXED
+      // delivery boundary completed with output staged past it, and the
+      // server declared the exact retained interval as the
+      // `handoff_boundary_reached` delivery gap. The frames are RETAINED
+      // and fetchable — the client's bounded baseline recovery (the SAME
+      // checkpoint-cursor delta repair as queue_overflow) must fetch them
+      // on the open connection: never a viewport wipe, never silent
+      // advancement.
+      wsMocks.capabilities = { pacedTerminalReplayV1: true }
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-boundary-gap-repair',
+      })
+
+      const repairAttaches = () => sentMessages().filter(
+        (msg) => msg?.type === 'terminal.attach' && msg.terminalId === terminalId,
+      )
+
+      // A contiguous applied prefix establishes a valid surface checkpoint.
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'ok' })
+      term.write.mockClear()
+      term.clear.mockClear()
+      wsMocks.send.mockClear()
+      expect(repairAttaches()).toEqual([])
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 2,
+          toSeq: 9,
+          reason: 'handoff_boundary_reached',
+          headSeq: 9,
+          oldestRetainedSeq: 1,
+        })
+      })
+
+      // THE REPAIR: the boundary gap is fetchable delivery loss — the
+      // checkpoint-cursor delta attach goes out on the SAME connection
+      // (no transport flap), with the viewport never cleared before the
+      // refilled content.
+      const repair = repairAttaches()
+      expect(repair.length).toBe(1)
+      expect(repair[0]).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'transport_reconnect',
+        sinceSeq: 1,
+        attachRequestId: expect.any(String),
+      })
+      expect(term.clear).not.toHaveBeenCalled()
+
+      // The repair completes: the declared interval refills the surface on
+      // the SAME connection, no retry strip.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 9,
+          replayFromSeq: 2,
+          replayToSeq: 9,
+          attachRequestId: repair[0]!.attachRequestId,
+          effectiveSinceSeq: 1,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 2,
+          seqEnd: 9,
+          data: 'REFILLED',
+          attachRequestId: repair[0]!.attachRequestId,
+        })
+      })
+      expectTerminalWriteContaining(term, 'REFILLED')
+      expect(term.clear).not.toHaveBeenCalled()
+      expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+    })
+
     it('queues local gap notices behind a pending replay write', async () => {
       const { terminalId, term } = await renderTerminalHarness({
         status: 'running',

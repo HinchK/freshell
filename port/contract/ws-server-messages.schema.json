@@ -4388,7 +4388,8 @@
           "enum": [
             "queue_overflow",
             "replay_window_exceeded",
-            "replay_budget_exceeded"
+            "replay_budget_exceeded",
+            "handoff_boundary_reached"
           ],
           "type": "string"
         },
