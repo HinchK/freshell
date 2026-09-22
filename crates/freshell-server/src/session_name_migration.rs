@@ -65,7 +65,7 @@ use serde_json::{json, Map, Value};
 
 use crate::session_metadata::SessionMetadataStore;
 use crate::session_names::{
-    order_boot_legacy_candidates, SessionNames, NAME_MIGRATION_BOOT_IMPORT_ID,
+    digest_bytes, order_boot_legacy_candidates, SessionNames, NAME_MIGRATION_BOOT_IMPORT_ID,
     NAME_MIGRATION_DIR_NAME, NAME_MIGRATION_IMPORT_CANDIDATE_LIMIT,
 };
 use crate::settings_store::SettingsStore;
@@ -131,7 +131,8 @@ pub(crate) async fn run_session_name_consolidation(inputs: SessionNameConsolidat
         return;
     }
 
-    if !names.migration_completed() {
+    let receipt_was_complete = names.migration_completed();
+    if !receipt_was_complete {
         // The plan's batching rule: at most 100 candidates per
         // envelope/importId. Order the gathered candidates best-first by
         // the deterministic total order first, THEN chunk: the
@@ -218,7 +219,81 @@ pub(crate) async fn run_session_name_consolidation(inputs: SessionNameConsolidat
     // field survives. Failures log loudly and leave the retry to the next
     // boot; canonical readers already stopped consulting the fields the
     // moment the receipt committed.
+    //
+    // Round-2 carried finding F3 (adjudicated): once the receipt was ALREADY
+    // complete at boot, any title field still in the fresh evidence was
+    // written POST-migration — in the narrow dual-server scenario that is a
+    // side-by-side legacy binary, whose value the closed receipt can never
+    // import and the create-once `server.json` can never cover. Preserve it
+    // in a content-addressed create-once LATE backup before suppression —
+    // the same recovery policy as a late BROWSER import's per-import
+    // backup: the alias is never reactivated, but the string is never lost.
+    if receipt_was_complete && evidence_has_title_fields(&evidence) {
+        if let Err(error) = write_late_legacy_evidence_once(&data_dir, &evidence) {
+            tracing::error!(
+                target: "freshell_server::session_names",
+                op = "legacy_name_late_backup",
+                name_ref = "-",
+                revision = 0,
+                class = "persistence",
+                attempt = 1,
+                "session_names.operation_failed: cannot write the late legacy-evidence \
+                 backup; keeping the late fields for the next boot instead of losing \
+                 them to cleanup: {error}"
+            );
+            return;
+        }
+    }
     cleanup_legacy_title_fields(&settings, &metadata, &evidence).await;
+}
+
+/// Whether the freshly gathered evidence still carries any scoped title
+/// field to suppress.
+fn evidence_has_title_fields(evidence: &LegacyEvidence) -> bool {
+    !evidence.session_rows_with_title.is_empty()
+        || !evidence.resolved_terminal_ids.is_empty()
+        || !evidence.metadata_rows_with_derived_title.is_empty()
+}
+
+/// The create-once, content-addressed backup of POST-migration legacy
+/// title evidence: one file per distinct evidence snapshot under
+/// `name-migration-v1/late-legacy-evidence/`, never rewritten, mirroring
+/// `server.json`'s body shape (raw sources plus the affected keys) so the
+/// documented recovery procedure — a deliberate canonical user rename
+/// through the normal API, never restoring a backup — has the string.
+fn write_late_legacy_evidence_once(
+    data_dir: &Path,
+    evidence: &LegacyEvidence,
+) -> Result<(), String> {
+    let dir = data_dir
+        .join(NAME_MIGRATION_DIR_NAME)
+        .join("late-legacy-evidence");
+    let body = json!({
+        "version": 1,
+        "migration": "unified-agent-names-v1",
+        "phase": "late",
+        "sources": evidence.raw_sources,
+        "sessionRowsWithTitle": evidence.session_rows_with_title,
+        "resolvedTerminals": evidence.resolved_terminal_ids,
+        "metadataRowsWithDerivedTitle": evidence.metadata_rows_with_derived_title,
+        "unresolvedTerminals": evidence.unresolved_terminal_ids,
+        // Recovery policy: same as server.json — never copy this over the
+        // live name document or reactivate an alias.
+        "recovery": "submit a deliberate canonical user rename through the normal API; \
+                     never restore a backup over the live document",
+    });
+    let bytes = serde_json::to_vec(&body)
+        .map_err(|e| format!("cannot serialize the late legacy-evidence backup: {e}"))?;
+    let digest = digest_bytes(&bytes);
+    let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let path = dir.join(format!("{hex}.json"));
+    if path.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let tmp = dir.join(format!(".{hex}.json.tmp"));
+    atomic_write_durable(&path, &tmp, &bytes)
+        .map_err(|e| format!("late legacy-evidence backup write failed: {e}"))
 }
 
 /// The boot module's wiring inputs.

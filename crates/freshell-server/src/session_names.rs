@@ -471,7 +471,7 @@ pub(crate) fn clock_offset_ms_for_tests(data_dir: &Path) -> i64 {
     clock_offset_ms(data_dir)
 }
 
-fn digest_bytes(bytes: &[u8]) -> [u8; 32] {
+pub(crate) fn digest_bytes(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);

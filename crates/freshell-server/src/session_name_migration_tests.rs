@@ -684,6 +684,143 @@ async fn server_backup_is_written_once_and_preserves_original_content() {
     drop(tmp);
 }
 
+/// Round-2 carried finding F3 (adjudicated): after the consolidation
+/// receipt commits, a side-by-side LEGACY writer (an old binary sharing
+/// this Freshell home) can still write a scoped `titleOverride` to the
+/// config. The next new-server boot gathers it as fresh evidence, skips
+/// the import (receipt closed), and the idempotent cleanup deletes it —
+/// with the create-once `server.json` already frozen and the import path
+/// never seeing it. The late value must still get a recovery copy before
+/// suppression, mirroring the late BROWSER import's per-import backup:
+/// never reactivating the alias, never losing the string.
+#[tokio::test]
+async fn post_migration_legacy_title_fields_get_a_late_recovery_copy() {
+    let (tmp, home) = fresh_home();
+    seed_config(
+        &home,
+        json!({
+            "claude:s1": { "titleOverride": "Original Name", "titleSource": "user" },
+        }),
+        json!({}),
+    );
+    let settings = Arc::new(store_at(&home));
+    let names = open_store(&home).await;
+    let metadata = open_metadata(&home).await;
+    run_session_name_consolidation(consolidation_inputs(
+        &home,
+        names.clone(),
+        settings.clone(),
+        metadata.clone(),
+        TerminalIdentityRegistry::new(),
+    ))
+    .await;
+    assert!(names.migration_completed());
+    assert!(
+        settings
+            .session_overrides()
+            .get("claude:s1")
+            .unwrap()
+            .get("titleOverride")
+            .is_none(),
+        "boot 1 cleaned the migrated field"
+    );
+
+    // The side-by-side legacy writer: an old binary writes a NEW scoped
+    // titleOverride straight into the config, post-migration.
+    seed_config(
+        &home,
+        json!({
+            "claude:s1": { "titleOverride": "Post-Migration Legacy Title", "titleSource": "user" },
+        }),
+        json!({}),
+    );
+
+    // Boot 2 (fresh process): the receipt is complete, so the import is
+    // skipped and the cleanup suppresses the late field — but a content-
+    // addressed late-evidence backup preserves it first.
+    let names2 = open_store(&home).await;
+    let settings2 = Arc::new(store_at(&home));
+    run_session_name_consolidation(consolidation_inputs(
+        &home,
+        names2.clone(),
+        settings2.clone(),
+        open_metadata(&home).await,
+        TerminalIdentityRegistry::new(),
+    ))
+    .await;
+    assert!(
+        settings2
+            .session_overrides()
+            .get("claude:s1")
+            .unwrap()
+            .get("titleOverride")
+            .is_none(),
+        "the late legacy field is still suppressed (no reactivated alias)"
+    );
+    assert!(
+        read_config(&home)["sessionOverrides"]["claude:s1"]
+            .get("titleOverride")
+            .is_none(),
+        "the suppression flushed"
+    );
+
+    // The recovery copy: one late-evidence file under the migration dir,
+    // preserving the late title verbatim.
+    let late_dir = home
+        .join(".freshell")
+        .join(NAME_MIGRATION_DIR_NAME)
+        .join("late-legacy-evidence");
+    let mut late_files: Vec<_> = std::fs::read_dir(&late_dir)
+        .unwrap_or_else(|e| panic!("the late-evidence backup dir exists: {e}"))
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    late_files.sort();
+    assert!(
+        !late_files.is_empty(),
+        "a late legacy writer's title gets a recovery copy before suppression"
+    );
+    let mut found = false;
+    for path in &late_files {
+        let body: Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        if body
+            .get("sources")
+            .and_then(|s| s.get("config.sessionOverrides"))
+            .and_then(|v| v.get("claude:s1"))
+            .and_then(|row| row.get("titleOverride"))
+            == Some(&json!("Post-Migration Legacy Title"))
+        {
+            found = true;
+        }
+    }
+    assert!(
+        found,
+        "the late recovery copy preserves the post-migration title verbatim: {late_files:?}"
+    );
+
+    // The recovery copy is create-once per content: a THIRD boot with the
+    // fields already cleaned writes nothing new.
+    run_session_name_consolidation(consolidation_inputs(
+        &home,
+        names2.clone(),
+        settings2.clone(),
+        open_metadata(&home).await,
+        TerminalIdentityRegistry::new(),
+    ))
+    .await;
+    let late_files_after: Vec<_> = std::fs::read_dir(&late_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    assert_eq!(
+        late_files_after.len(),
+        late_files.len(),
+        "an already-clean boot adds no late backups"
+    );
+    drop(tmp);
+}
+
 /// Scope-only cleanup: title fields leave the scoped rows; summary, archive
 /// and delete data survive; unsupported providers keep everything.
 #[tokio::test]
