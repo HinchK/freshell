@@ -766,6 +766,22 @@ impl OpencodeServeManager {
             .map(|r| r.base_url.clone())
     }
 
+    /// The CURRENT running daemon's spawn identity: the `ownership_id`
+    /// minted at its cold start — unique per daemon GENERATION, stable
+    /// across `ensure_started` fast paths, `None` while no daemon runs.
+    /// The freshopencode runtime's daemon-generation fence (Task 4 delta
+    /// round 2): a session bridge stamped with any other id was spawned
+    /// against a SUPERSEDED daemon and is dead for revival purposes even
+    /// while its task is still draining.
+    pub async fn ownership_id(&self) -> Option<String> {
+        self.inner
+            .running
+            .lock()
+            .await
+            .as_ref()
+            .map(|r| r.ownership_id.clone())
+    }
+
     /// Idempotent start: allocate a loopback port, spawn the ownership-tagged sidecar,
     /// wait (bounded) for health, then connect the SSE consumer. Concurrent callers are
     /// single-flighted by the `running` mutex (`ensureStarted`, `serve-manager.ts:181-194`).

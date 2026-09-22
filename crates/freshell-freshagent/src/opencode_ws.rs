@@ -366,6 +366,21 @@ struct OpencodeSession {
     /// `freshAgent.session.snapshot` / `freshAgent.session.changed` / `freshAgent.error`
     /// for the lifetime of the session. `None` until materialized; aborted on kill.
     serve_bridge: Option<tokio::task::JoinHandle<()>>,
+    /// Delta round 2 (fresheyes Major — the doomed-bridge revival race): the
+    /// `ownership_id` of the daemon GENERATION the current `serve_bridge`
+    /// task was spawned against — the daemon-generation fence. Written ONLY
+    /// by [`FreshOpencodeState::install_serve_bridge`], together with the
+    /// handle, so `serve_bridge` is `Some` ⟹ this is `Some`. Read by
+    /// [`FreshOpencodeState::restart_session_bridge_guarded`]'s liveness
+    /// check: the manager's loss path fans `Lost` and re-warms
+    /// INDEPENDENTLY of the bridge tasks, so a bridge still draining its
+    /// closed channel when the new daemon's `Started` revival pass runs is
+    /// ALIVE-but-DOOMED — bound to a superseded generation it must be
+    /// restarted against, never mistaken for health by task liveness alone.
+    /// Not cleared on kill/handoff teardown: a torn-down session has no
+    /// handle, and a stale stamp with no handle is dead by the
+    /// absent-handle arm alone.
+    serve_bridge_daemon: Option<String>,
     /// Retire-on-kill (delta-review round 5): set by `handle_kill` inside its
     /// session-lock phase. A send that took this session's Arc just before the
     /// kill's map removal is Parking on this lock and would otherwise
@@ -440,6 +455,7 @@ impl OpencodeSession {
             turn_errored: Arc::new(AtomicBool::new(false)),
             last_turn_complete_at: Arc::new(StdMutex::new(None)),
             serve_bridge: None,
+            serve_bridge_daemon: None,
             killed: Arc::new(AtomicBool::new(false)),
             close_pending: 0,
             provenance: None,
@@ -1867,11 +1883,8 @@ impl FreshOpencodeState {
             // PR-3: `bindServeStream(state)` (adapter.ts:349) -- start the persistent
             // serve-SSE bridge ONCE, right after materialization. A later send never
             // re-enters this branch (mirrors `if (state.unsubscribeServe ...) return`).
-            session.serve_bridge = Some(self.spawn_serve_bridge(
-                manager.clone(),
-                durable_id.clone(),
-                session.turn_errored.clone(),
-            ));
+            self.install_serve_bridge(&manager, &mut session, &durable_id)
+                .await;
 
             // kata b8ke Task 3: the materialization's registration is
             // complete — commit `Live{FreshAgent}` for the minted `ses_*`
@@ -4369,11 +4382,8 @@ impl FreshOpencodeState {
         );
         child_session.provenance = fork_provenance.clone();
         child_session.real_session_id = Some(child.id.clone());
-        child_session.serve_bridge = Some(self.spawn_serve_bridge(
-            manager,
-            child.id.clone(),
-            child_session.turn_errored.clone(),
-        ));
+        self.install_serve_bridge(&manager, &mut child_session, &child.id)
+            .await;
         self.sessions
             .lock()
             .await
@@ -5765,11 +5775,8 @@ impl FreshOpencodeState {
             sink.as_ref()
                 .and_then(|s| s.load_provenance(PROVIDER, session_id))
         });
-        session.serve_bridge = Some(self.spawn_serve_bridge(
-            manager,
-            session_id.to_string(),
-            session.turn_errored.clone(),
-        ));
+        self.install_serve_bridge(&manager, &mut session, session_id)
+            .await;
         let session_arc = Arc::new(TokioMutex::new(session));
 
         self.sessions
@@ -6055,6 +6062,32 @@ impl FreshOpencodeState {
         })
     }
 
+    /// Install a fresh serve-SSE bridge on `session` for `real_id`, stamped
+    /// with the CURRENT daemon's `ownership_id` — the daemon-generation
+    /// fence [`Self::restart_session_bridge_guarded`] compares against.
+    /// EVERY bridge install goes through here (materialization, the resume
+    /// and fork-child constructions, the guarded restart), so the
+    /// handle/stamp pair can never drift apart.
+    async fn install_serve_bridge(
+        &self,
+        manager: &OpencodeServeManager,
+        session: &mut OpencodeSession,
+        real_id: &str,
+    ) {
+        // Read the identity BEFORE spawning: the stamp names the daemon
+        // whose event stream the bridge is about to subscribe to. A daemon
+        // lost in between is caught by the fence itself (the stamp no longer
+        // matches the running daemon, or none runs) — the next revival pass
+        // or fenced attach restarts the bridge.
+        let daemon = manager.ownership_id().await;
+        session.serve_bridge = Some(self.spawn_serve_bridge(
+            manager.clone(),
+            real_id.to_string(),
+            session.turn_errored.clone(),
+        ));
+        session.serve_bridge_daemon = daemon;
+    }
+
     // ── Task 4 (opencode daemon-death recovery): the runtime-level self-heal ──
 
     /// Arm the runtime's daemon-loss watcher (2026-09-20 incident: the shared
@@ -6163,7 +6196,12 @@ impl FreshOpencodeState {
     /// sessions whose bridge was actually restarted (the client treats that
     /// push as snapshot-invalidating → transcript refetch). Called on watcher
     /// arming and on every `DaemonSignal::Started` — never dependent on
-    /// having observed `Lost`.
+    /// having observed `Lost`. "Dead" is judged by the shared tail's
+    /// daemon-generation fence ([`Self::restart_session_bridge_guarded`]):
+    /// a bridge still bound to a LOST daemon generation restarts even
+    /// while its old task is draining (the doomed-bridge revival race,
+    /// delta round 2); a bridge already bound to the CURRENT daemon is
+    /// healthy and is neither restarted nor re-pushed.
     ///
     /// The ownership coordinator (plan-review round 3) is respected at every
     /// step: (1) `base_url()` is None → return (daemon absent — nothing to
@@ -6242,8 +6280,8 @@ impl FreshOpencodeState {
             }
             // (3c/3d) The shared guarded-restart tail, under the session
             // lock; the snapshot push goes ONLY to actually-restarted
-            // bridges. `Ok(None)` (bridge alive / unmaterialized) is the
-            // quiet no-op.
+            // bridges. `Ok(None)` (bridge alive against the CURRENT daemon /
+            // unmaterialized) is the quiet no-op.
             let restarted = {
                 let mut session = session_arc.lock().await;
                 self.restart_session_bridge_guarded(&mut session).await
@@ -6283,10 +6321,22 @@ impl FreshOpencodeState {
     /// single-flighted, so concurrent attach/send/compact callers cannot
     /// spawn a second daemon.
     ///
+    /// Delta round 2 (fresheyes Major — the doomed-bridge revival race):
+    /// task liveness alone is NOT bridge health. The manager's loss path
+    /// fans `Lost` and re-warms INDEPENDENTLY of the bridge tasks, so a
+    /// bridge still draining its closed channel when the new daemon's
+    /// `Started` revival pass (or a fenced attach) reaches this tail is
+    /// ALIVE-but-DOOMED. The daemon-generation fence: the bridge is
+    /// healthy ONLY while its task is unfinished AND its
+    /// [`OpencodeSession::serve_bridge_daemon`] stamp matches the CURRENT
+    /// daemon's `ownership_id` (an absent daemon orphans every bridge; an
+    /// unstamped handle is unreachable by construction — every install
+    /// stamps — and fails toward recovery).
+    ///
     /// `Ok(Some(real_id))` — the bridge was (re)started; `Ok(None)` — nothing
-    /// to do (unmaterialized, or the bridge is alive); `Err` — the BOUNDED
-    /// respawn failed (the caller answers typed, never a silent
-    /// half-attached state).
+    /// to do (unmaterialized, or the bridge is alive against the current
+    /// daemon); `Err` — the BOUNDED respawn failed (the caller answers
+    /// typed, never a silent half-attached state).
     async fn restart_session_bridge_guarded(
         &self,
         session: &mut OpencodeSession,
@@ -6297,18 +6347,28 @@ impl FreshOpencodeState {
         let Some(real_id) = session.real_session_id.clone() else {
             return Ok(None);
         };
+        let manager = self.fresh_agent.ensure_manager().await;
+        let current_daemon = manager.ownership_id().await;
+        let bridge_bound_to_current_daemon = matches!(
+            (&session.serve_bridge_daemon, &current_daemon),
+            (Some(stamp), Some(current)) if stamp == current
+        );
         let bridge_dead = session
             .serve_bridge
             .as_ref()
-            .map(tokio::task::JoinHandle::is_finished)
+            .map(|handle| handle.is_finished() || !bridge_bound_to_current_daemon)
             .unwrap_or(true);
         if !bridge_dead {
             return Ok(None);
         }
-        let manager = self.fresh_agent.ensure_manager().await;
         manager.ensure_started().await?;
-        session.serve_bridge =
-            Some(self.spawn_serve_bridge(manager, real_id.clone(), session.turn_errored.clone()));
+        // The superseded/draining task is ABORTED, not merely detached:
+        // dropping a JoinHandle does not reap the task, and a doomed
+        // bridge must not outlive the replacement it lost to.
+        if let Some(old) = session.serve_bridge.take() {
+            old.abort();
+        }
+        self.install_serve_bridge(&manager, session, &real_id).await;
         Ok(Some(real_id))
     }
 }
@@ -13289,8 +13349,7 @@ mod tests {
             OpencodeSession::new(id.to_string(), None, model.map(str::to_string), None);
         session.real_session_id = Some(id.to_string());
         let manager = st.fresh_agent.ensure_manager().await;
-        session.serve_bridge =
-            Some(st.spawn_serve_bridge(manager, id.to_string(), session.turn_errored.clone()));
+        st.install_serve_bridge(&manager, &mut session, id).await;
         st.sessions
             .lock()
             .await
@@ -18672,6 +18731,135 @@ mod tests {
         assert!(
             manager.base_url().await.is_some(),
             "the manager's backoff-guarded re-warm respawned the daemon"
+        );
+    }
+
+    /// Delta round 2 (fresheyes Major — the doomed-bridge revival race): the
+    /// manager's loss path clears the running entry, fans `Lost`, and
+    /// re-warms INDEPENDENTLY of the per-session bridge tasks — a bridge
+    /// task still draining its closed channel when the new daemon's
+    /// `Started` revival pass runs was treated as healthy (task liveness
+    /// alone), so the pass answered `Ok(None)`: no restart, no recovery
+    /// snapshot, and the pane dead-ended on NO bridge. The interleaving is
+    /// forced to its extreme here: the session's bridge is a task that
+    /// never finishes on its own (the real bridge's draining window
+    /// between consuming `Lost` and observing channel-closed, held open
+    /// past any revival pass), the daemon generation moves A→B underneath
+    /// it, and the `Started`-driven revival pass must nevertheless
+    /// RESTART the bridge bound to the new daemon and push the client's
+    /// recovery snapshot.
+    #[tokio::test]
+    async fn revival_restarts_a_bridge_still_draining_from_a_lost_daemon_generation() {
+        let (st, mut rx, exited, _spawns, manager) = selfheal_state(5, 50).await;
+
+        let (_placeholder, durable) =
+            materialized_selfheal_session(&st, &mut rx, "req-doomed-bridge").await;
+
+        // THE DOOMED BRIDGE: swap the materialized session's live bridge for
+        // a stand-in task that never finishes on its own — a bridge
+        // provably ALIVE (so the pre-fix liveness check is fooled) yet
+        // doomed (its daemon is about to be lost). The drop-guard records
+        // the abort the restart owes the superseded task: a restart that
+        // merely dropped the handle would leak the still-draining task.
+        let doomed_aborted = Arc::new(AtomicBool::new(false));
+        struct AbortWitness(Arc<AtomicBool>);
+        impl Drop for AbortWitness {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let witness = doomed_aborted.clone();
+        {
+            let session_arc = st
+                .sessions
+                .lock()
+                .await
+                .get(&durable)
+                .cloned()
+                .expect("the materialized session is tracked under its durable id");
+            let mut session = session_arc.lock().await;
+            if let Some(old) = session.serve_bridge.take() {
+                old.abort();
+            }
+            session.serve_bridge = Some(tokio::spawn(async move {
+                let _abort_witness = AbortWitness(witness);
+                std::future::pending::<()>().await
+            }));
+        }
+
+        exited.store(true, Ordering::SeqCst); // daemon generation A dies
+
+        // The loss completes — the typed edge proves the watcher's Lost arm
+        // ran (lose_daemon cleared the running entry before the edge was
+        // fanned, and scheduled the re-warm).
+        let loss_frames = frames_until(&mut rx, |f| {
+            f["type"] == "freshAgent.event"
+                && f["event"]["code"] == "OPENCODE_DAEMON_LOST"
+                && f["sessionId"].as_str() == Some(durable.as_str())
+        })
+        .await;
+
+        exited.store(false, Ordering::SeqCst); // the re-warm's respawn now succeeds
+
+        // `DaemonSignal::Started` → the LEVEL-TRIGGERED revival pass runs
+        // while the doomed bridge task is provably STILL ALIVE. It must
+        // not be fooled by task liveness: the bridge is bound to the LOST
+        // daemon generation, so it restarts against the new daemon and
+        // pushes the snapshot-invalidating idle frame (the client's
+        // transcript refetch). On the pre-fix code this never arrives —
+        // the pass sees the unfinished task, answers Ok(None), and the
+        // session is left with NO bridge.
+        let revive_frames = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                && f["sessionId"].as_str() == Some(durable.as_str())
+        })
+        .await;
+
+        // The restart ABORTED the superseded draining task (bounded wait —
+        // the abort drop is scheduler-side).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !doomed_aborted.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the revival restart must abort the doomed draining bridge task"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The session now holds a NEW live bridge, bound to the respawned
+        // daemon.
+        assert!(
+            session_serve_bridge_alive(&st, &durable).await,
+            "the doomed bridge was replaced by a live bridge bound to the new daemon"
+        );
+        assert!(
+            manager.base_url().await.is_some(),
+            "the manager's backoff-guarded re-warm respawned the daemon"
+        );
+
+        // Exactly ONE recovery snapshot for the actually-restarted bridge
+        // (a later level-triggered pass must no-op against the now-current
+        // bridge — push only to actually-restarted bridges), and NO chime
+        // anywhere in the post-loss window.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut all = loss_frames;
+        all.extend(revive_frames);
+        all.extend(drain_frames(&mut rx));
+        let pushes = all
+            .iter()
+            .filter(|f| {
+                is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                    && f["sessionId"].as_str() == Some(durable.as_str())
+            })
+            .count();
+        assert_eq!(
+            pushes, 1,
+            "exactly ONE recovery snapshot for the restarted bridge: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .all(|f| f["event"]["type"] != "freshAgent.turn.complete"),
+            "a daemon loss is never a positive completion — no chime: {all:?}"
         );
     }
 
