@@ -16,6 +16,7 @@ import { updateTab, switchToNextTab, switchToPrevTab } from '@/store/tabsSlice'
 import {
   applyReconcileAttach,
   applyReattachToLiveTerminal,
+  bumpPaneReconcileEpoch,
   clearPaneCloseError,
   clearPaneReconcileNotice,
   clearReconcilePendingPane,
@@ -212,6 +213,14 @@ export const RESERVE_RETRY_WINDOW_MS = 30_000
 export const RESERVE_RETRY_FLOOR_MS = 250
 export const INVALID_TERMINAL_LAUNCH_RETRY_MAX_ATTEMPTS = 5
 export const INVALID_TERMINAL_LAUNCH_RETRY_DELAY_MS = 500
+// Task 7 fence-heal follow-up (the vacant-recovery lane): the minimum
+// wall-clock spacing between a pane's automatic vacant-session
+// recoveries — bounds exit→recreate→exit crash loops (each recovery is
+// a fresh spawn; without the interval a CLI that dies instantly would
+// auto-respawn unboundedly). A single cross-device kill heals
+// immediately (the first recovery is never spaced); a repeated external
+// kill inside the window merely delays the next heal.
+export const VACANT_RECOVERY_MIN_INTERVAL_MS = 10_000
 const MOBILE_KEYBAR_HEIGHT_PX = 40
 const MOBILE_KEY_REPEAT_INITIAL_DELAY_MS = 320
 const MOBILE_KEY_REPEAT_INTERVAL_MS = 70
@@ -842,6 +851,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const terminalOwnerConvergenceRef = useRef(terminalOwnerConvergence)
   terminalOwnerConvergenceRef.current = terminalOwnerConvergence
   const terminalConvergenceAdoptedRef = useRef<string | null>(null)
+
+  // Task 7 fence-heal follow-up (the vacant-recovery lane): the bridge to
+  // the lifecycle effect's resumeRecoveryCreate closure (re-published each
+  // effect run; consumed by the component-scope vacant-recovery effect
+  // declared after the lifecycle effect), and the last-auto-recovery
+  // timestamp enforcing the crash-loop quiet interval.
+  const resumeRecoveryCreateRef = useRef<((deadTerminalId?: string) => void) | null>(null)
+  const vacantRecoveryLastAtRef = useRef(0)
 
   // b8ke ext r11 F2: the convergence effect — the committed same-kind
   // owner broadcast drives the pane onto the new authoritative terminal.
@@ -3786,6 +3803,66 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         foldRefusalFencePair(dispatch, appStore.getState(), contentRef.current ?? {}, refusal)
       }
 
+      // b8ke fence-heal (Task 7 follow-up): the recovery-create lane shared
+      // by the INVALID_TERMINAL_ID reconnect recovery, the
+      // pane-terminal-scoped refused-arm refusal routing (the cross-device
+      // kill shape), and the vacant-recovery lane (an exited session pane
+      // whose canonical record folded vacant): mint a NEW createRequestId
+      // (the r35 NEXT-decision fresh capture at send time), mark it restore
+      // (the rate-limit exemption), clear the dead terminal's handles, and
+      // let the lifecycle effect's createRequestId dependency re-fire the
+      // resume create. The dead terminal id is optional — the
+      // vacant-recovery lane's pane may know the death only from the exit
+      // fold (the id lives in lastKnownTerminalIdRef, absent in a fresh
+      // mount whose terminal came from storage).
+      const resumeRecoveryCreate = (deadTerminalId?: string) => {
+        writeLocalXtermNotice(term, '\r\n[Reconnecting...]\r\n')
+        const newRequestId = nanoid()
+        if (debugRef.current) log.debug('[TRACE resumeSessionId] recovery-create', {
+          paneId: paneIdRef.current,
+          oldRequestId: requestIdRef.current,
+          newRequestId,
+          resumeSessionId: contentRef.current?.resumeSessionId,
+        })
+        clearTerminalRestoreRequestId(requestIdRef.current)
+        addTerminalRestoreRequestId(newRequestId)
+        requestIdRef.current = newRequestId
+        reviveAttemptedRef.current = null
+        clearQuarantineRepair()
+        currentAttachRef.current = null
+        if (deadTerminalId) {
+          clearTerminalCursor(deadTerminalId)
+          forgetSentViewport(deadTerminalId)
+        }
+        resetParserAppliedSurface()
+        lastSentViewportRef.current = null
+        terminalIdRef.current = undefined
+        deferredAttachStateRef.current = {
+          mode: 'none',
+          pendingIntent: null,
+          pendingSinceSeq: 0,
+          pendingReason: 'initial_hydrate',
+        }
+        applySeqState(createAttachSeqState())
+        updateContent({
+          terminalId: undefined,
+          serverInstanceId: undefined,
+          streamId: undefined,
+          createRequestId: newRequestId,
+          status: 'creating',
+        })
+        const currentTab = tabRef.current
+        if (currentTab) {
+          dispatch(updateTab({ id: currentTab.id, updates: { status: 'creating' } }))
+        }
+      }
+      // Ref bridge (Task 7 vacant-recovery lane): the latest closure is
+      // re-published on every lifecycle effect run; the component-scope
+      // vacant-recovery effect (declared after this one) consumes it. The
+      // closure reads refs at call time, so a bridge call is safe across
+      // re-fires.
+      resumeRecoveryCreateRef.current = resumeRecoveryCreate
+
       // F9: the server no longer knows the terminal this still-launching pane
       // points at. Pump bounded same-requestId re-creates instead of minting a
       // fresh recovery identity for a pane that never finished launching.
@@ -5232,6 +5309,36 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           && hasRefusalFencePair(msg)
         ) {
           foldRefusalFence(msg)
+          // b8ke fence-heal (Task 7 follow-up): the fold heals the store the
+          // NEXT decision reads — but nothing re-drives the pane's attach
+          // after a refused attach: the pane's one-shot attach can race the
+          // owner-frame fold (the cross-device kill's terminal.meta
+          // retirement broadcast re-fires the attach lifecycle BEFORE the
+          // vacant frame folds) and then wedge "Recovering terminal output"
+          // behind the single refused attempt. The stale-observed-generation
+          // arm bumps the pane's reconcileEpoch — the lifecycle effect's
+          // ONLY re-fire signal — so the attach re-drives with the healed
+          // pair at send time (the r35 NEXT-decision re-capture). The
+          // refused/foreign-owner arm instead routes the VACANT record
+          // shape (the durable stop's released record — the cross-device
+          // kill) to the existing recovery-create lane (the resume), which
+          // re-captures the healed fence at send time; in-flight/foreign-
+          // live records keep the R5-3 transition-blocking discipline (no
+          // attach storm, no lifecycle-start suppression bypass).
+          if ((msg.message ?? '').startsWith(STALE_REFUSAL_MESSAGE_PREFIX)) {
+            dispatch(bumpPaneReconcileEpoch({ tabId, paneId }))
+          } else {
+            const canonical = resolveCanonicalPaneSession(
+              appStore.getState(),
+              contentRef.current ?? {},
+            )
+            const record = canonical
+              ? selectSessionRuntimeOwner(appStore.getState(), canonical.provider, canonical.sessionId)
+              : undefined
+            if (record?.ownerKind === 'vacant') {
+              resumeRecoveryCreate(tid)
+            }
+          }
           return
         }
 
@@ -5528,49 +5635,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             if (tabSessionRefFallback) {
               updateContent({ sessionRef: tabSessionRefFallback })
             }
-            writeLocalXtermNotice(term, '\r\n[Reconnecting...]\r\n')
-            const newRequestId = nanoid()
-            if (debugRef.current) log.debug('[TRACE resumeSessionId] INVALID_TERMINAL_ID reconnecting', {
-              paneId: paneIdRef.current,
-              oldRequestId: requestIdRef.current,
-              newRequestId,
-              resumeSessionId: current?.resumeSessionId,
-            })
-            // Any INVALID_TERMINAL_ID reconnect is restoring a terminal that existed
-            // before the server lost state. Always mark it as restore so the
-            // subsequent terminal.create bypasses the server's rate limit.
-            // Clear the old ID's flag (if any) to resolve/clean up the set, but
-            // mark the new request regardless — non-restore terminals also need
-            // rate-limit bypass when burst-reconnecting after a server restart.
-            clearTerminalRestoreRequestId(requestIdRef.current)
-            addTerminalRestoreRequestId(newRequestId)
-            requestIdRef.current = newRequestId
-            reviveAttemptedRef.current = null
-            clearQuarantineRepair()
-            currentAttachRef.current = null
-            clearTerminalCursor(currentTerminalId)
-            resetParserAppliedSurface()
-            forgetSentViewport(currentTerminalId)
-            lastSentViewportRef.current = null
-            terminalIdRef.current = undefined
-            deferredAttachStateRef.current = {
-              mode: 'none',
-              pendingIntent: null,
-              pendingSinceSeq: 0,
-              pendingReason: 'initial_hydrate',
-            }
-            applySeqState(createAttachSeqState())
-            updateContent({
-              terminalId: undefined,
-              serverInstanceId: undefined,
-              streamId: undefined,
-              createRequestId: newRequestId,
-              status: 'creating',
-            })
-            const currentTab = tabRef.current
-            if (currentTab) {
-              dispatch(updateTab({ id: currentTab.id, updates: { status: 'creating' } }))
-            }
+            // b8ke fence-heal (Task 7 follow-up): extracted into
+            // resumeRecoveryCreate (shared with the pane-terminal-scoped
+            // refused-arm refusal routing).
+            resumeRecoveryCreate(currentTerminalId)
           } else if (current?.status === 'exited') {
             writeLocalXtermNotice(term, '\r\n[Terminal exited - use the + button or split to start a new session]\r\n')
           }
@@ -5862,6 +5930,44 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     runRefreshAttach,
     syncContentRefWithSessionAssociation,
     writeLocalXtermNotice,
+  ])
+
+  // Task 7 fence-heal follow-up (the vacant-recovery lane): an EXITED
+  // session pane whose canonical session record folds VACANT (the
+  // cross-device kill shape — the pane folded its terminal.exit and the
+  // stop commit broadcast the vacant owner) previously had NO re-drive:
+  // the lifecycle effect's deps (createRequestId/reconcileEpoch) never
+  // changed, and the only observed heal was another device's
+  // attach-refusal broadcast racing the pane's pre-exit state (incidental
+  // and ~13% flaky). The pane now recovers from ITS OWN observation —
+  // the exit fold plus the vacant record — through the same
+  // recovery-create lane (the re-minted resume) the typed-refusal branch
+  // uses. Session panes only (a durable sessionRef — plain shells keep
+  // the user-driven reconnect affordance); a quiet interval bounds
+  // exit→recreate→exit crash loops; fresh-agent divergence keeps the
+  // cross-kind recovery card in charge. Declared AFTER the lifecycle
+  // effect so the ref bridge holds the latest closure when this runs.
+  useEffect(() => {
+    if (!isTerminal || !terminalContent) return
+    if (terminalContent.status !== 'exited') return
+    if (!terminalContent.sessionRef) return
+    if (freshAgentOwnerDivergenceRef.current !== null) return
+    if (terminalRuntimeOwner?.ownerKind !== 'vacant') return
+    const resumeRecovery = resumeRecoveryCreateRef.current
+    if (!resumeRecovery) return
+    const now = Date.now()
+    if (now - vacantRecoveryLastAtRef.current < VACANT_RECOVERY_MIN_INTERVAL_MS) return
+    vacantRecoveryLastAtRef.current = now
+    log.info('vacant-recovery: re-driving the recovery-create for the exited session pane', {
+      paneId,
+      sessionRef: terminalContent.sessionRef,
+    })
+    resumeRecovery(lastKnownTerminalIdRef.current ?? undefined)
+  }, [
+    isTerminal,
+    terminalContent?.status,
+    terminalContent?.sessionRef,
+    terminalRuntimeOwner?.ownerKind,
   ])
 
   useEffect(() => {

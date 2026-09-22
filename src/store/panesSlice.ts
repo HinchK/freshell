@@ -2346,6 +2346,27 @@ export const panesSlice = createSlice({
     },
 
     /**
+     * b8ke fence-heal (Task 7 follow-up): bump a terminal pane's
+     * reconcileEpoch — the lifecycle effect's ONLY re-fire signal on an
+     * unchanged createRequestId (the same bump applyReattachToLiveTerminal
+     * and the reconcile verdict folds use). The pane-terminal-scoped typed
+     * refusal handler dispatches this after folding the refusal's CURRENT
+     * pair, so the pane's attach lifecycle re-drives with the healed fence
+     * read at send time (the r35 NEXT-decision re-capture) instead of
+     * wedging behind a single refused attach with no further actor (the
+     * cross-device kill incident shape).
+     */
+    bumpPaneReconcileEpoch: (
+      state,
+      action: PayloadAction<{ tabId: string; paneId: string }>
+    ) => {
+      const { tabId, paneId } = action.payload
+      const content = findReconcileTerminalContent(state, tabId, paneId)
+      if (!content) return
+      content.reconcileEpoch = (content.reconcileEpoch ?? 0) + 1
+    },
+
+    /**
      * kata b8ke: fold the typed failure of an atomic reopen handoff onto
      * the pane it was invoked for. The pane is KEPT (identity fields are
      * never touched) — the banner + Retry surface renders from this field.
@@ -2765,6 +2786,7 @@ export const {
   clearTerminalLiveHandles,
   applyReconcileAttach,
   applyReattachToLiveTerminal,
+  bumpPaneReconcileEpoch,
   setPaneHandoffError,
   clearPaneHandoffError,
   setPaneLaunchFailure,

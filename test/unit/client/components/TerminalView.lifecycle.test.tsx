@@ -3830,6 +3830,324 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
+    // b8ke fence-heal (Task 7 follow-up): the pane-terminal-scoped typed
+    // refusal's fold has no automatic consumer — the pane's one-shot attach
+    // can race the owner-frame fold (the cross-device kill's terminal.meta
+    // retirement broadcast re-fires the pane's attach lifecycle BEFORE the
+    // vacant frame folds) and then wedge "Recovering terminal output"
+    // behind the single refused attach, because nothing re-drives it (the
+    // recorded incident's cross-device shape). The branch must bump the
+    // pane's reconcileEpoch — the lifecycle effect's ONLY re-fire signal on
+    // an unchanged createRequestId — so the attach re-drives itself with
+    // the healed pair (the r35 NEXT-decision re-capture): no user Retry,
+    // no reconnect.
+    it('a pane-terminal-scoped typed refusal auto-re-drives the attach with the healed pair (no user/reconnect actor)', async () => {
+      const { store } = setupTypedPane({
+        content: { status: 'running', terminalId: 't-attach-b8ke' },
+        seed: (seededStore) => {
+          act(() => {
+            seededStore.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+              generation: 3,
+              terminalId: 't-attach-b8ke',
+            })))
+          })
+        },
+      })
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+        expect(sentMessages().filter((m: any) => m.type === 'terminal.attach').length).toBeGreaterThan(0)
+      })
+      const attachCountBefore = sentMessages().filter((m: any) => m.type === 'terminal.attach').length
+
+      // The typed refusal: no requestId, the pane's own terminalId.
+      act(() => {
+        messageHandler!({
+          type: 'error',
+          code: 'SESSION_RESERVED',
+          terminalId: 't-attach-b8ke',
+          ownerEpoch: 1,
+          ownerGeneration: 8,
+          message: 'Session ownership moved on (stale observed generation); refresh and retry.',
+          timestamp: new Date().toISOString(),
+        })
+      })
+
+      // The fold landed on the pane's owner record.
+      const folded = store.getState().freshAgent.runtimeOwners[`codex:${TYPED_SESSION_ID}`]
+      expect(folded.generation).toBe(8)
+
+      // THE CONTRACT: the refusal itself re-drives the attach — a NEW
+      // terminal.attach arrives automatically carrying the healed pair.
+      await waitFor(() => {
+        expect(
+          sentMessages().filter((m: any) => m.type === 'terminal.attach').length,
+        ).toBe(attachCountBefore + 1)
+      })
+      const reattach = [...sentMessages()]
+        .reverse()
+        .find((m: any) => m.type === 'terminal.attach')!
+      expect(reattach).toMatchObject({
+        terminalId: 't-attach-b8ke',
+        observedEpoch: 1,
+        observedGeneration: 8,
+      })
+    })
+
+    // b8ke fence-heal (Task 7 follow-up): the refused/foreign-owner arm of
+    // the pane-terminal-scoped typed refusal (the cross-device kill's
+    // vacant-key adopt refusal — "A lifecycle operation is in flight for
+    // this session; retry after it settles.") previously had NO consumer:
+    // the pane's one-shot attach wedged "Recovering terminal output" behind
+    // the single refused attempt (and bumping on this arm storms
+    // attach→refuse→bump at ~300Hz). The branch now routes the VACANT
+    // record shape to the existing recovery-create lane (the resume), which
+    // re-captures the healed fence at send time; in-flight/foreign-live
+    // records keep the R5-3 transition-blocking discipline.
+    it('a pane-terminal-scoped refused-arm refusal with a vacant record routes to the recovery-create (fix b)', async () => {
+      const { store } = setupTypedPane({
+        content: { status: 'running', terminalId: 't-attach-b8ke' },
+        seed: (seededStore) => {
+          act(() => {
+            seededStore.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+              generation: 2,
+              ownerKind: 'vacant',
+              terminalId: undefined,
+              transition: 'released',
+            })))
+          })
+        },
+      })
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+        expect(sentMessages().filter((m: any) => m.type === 'terminal.attach').length).toBeGreaterThan(0)
+      })
+
+      // The refused-arm typed refusal: no requestId, the pane's own
+      // terminalId, the pair, the in-flight copy.
+      act(() => {
+        messageHandler!({
+          type: 'error',
+          code: 'SESSION_RESERVED',
+          terminalId: 't-attach-b8ke',
+          ownerEpoch: 1,
+          ownerGeneration: 2,
+          message: 'A lifecycle operation is in flight for this session; retry after it settles.',
+          timestamp: new Date().toISOString(),
+        })
+      })
+
+      // The fold landed on the pane's owner record (merge-only: the vacant
+      // owner identity is preserved).
+      const folded = store.getState().freshAgent.runtimeOwners[`codex:${TYPED_SESSION_ID}`]
+      expect(folded.generation).toBe(2)
+      expect(folded.ownerKind).toBe('vacant')
+
+      // THE CONTRACT: the recovery-create fires — a NEW terminal.create
+      // with the pane's sessionRef (the resume), NOT an attach storm.
+      await waitFor(() => {
+        expect(sentMessages().filter((m: any) => m.type === 'terminal.create').length).toBeGreaterThan(0)
+      })
+      const createCall = [...sentMessages()]
+        .reverse()
+        .find((m: any) => m.type === 'terminal.create')!
+      expect(createCall).toMatchObject({
+        sessionRef: { provider: 'codex', sessionId: TYPED_SESSION_ID },
+      })
+    })
+
+    // Task 7 fence-heal follow-up (the vacant-recovery lane): the recorded
+    // e2e incident's FINAL shape — the pane folds its terminal.exit
+    // (status 'exited', stored terminalId cleared) and the canonical
+    // record folds the commit's VACANT owner frame, yet NOTHING re-drives
+    // the pane: the lifecycle effect's deps never changed, and the only
+    // passing-run heal was an OTHER device's attach-refusal broadcast
+    // racing the pane's pre-exit state (incidental, ~13% flake). A session
+    // pane (a durable sessionRef) must recover from ITS OWN observation:
+    // exited + vacant → the recovery-create (a re-minted requestId, the
+    // resume). No other actor required.
+    it('an exited session pane auto-recovery-creates when the canonical record folds vacant (the cross-device kill shape)', async () => {
+      const { store } = setupTypedPane({
+        content: { status: 'running', terminalId: 't-kill-b8ke' },
+        seed: (seededStore) => {
+          act(() => {
+            seededStore.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+              generation: 1,
+              terminalId: 't-kill-b8ke',
+            })))
+          })
+        },
+      })
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+        expect(sentMessages().filter((m: any) => m.type === 'terminal.attach').length).toBeGreaterThan(0)
+      })
+
+      // The wire order of the recorded incident: the commit's VACANT frame
+      // first, then the terminal.exit fan (the PTY reap lands after the
+      // stop commit).
+      act(() => {
+        store.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+          generation: 2,
+          ownerKind: 'vacant',
+          terminalId: undefined,
+          transition: 'released',
+        })))
+      })
+      act(() => {
+        messageHandler!({ type: 'terminal.exit', terminalId: 't-kill-b8ke', exitCode: 1 })
+      })
+
+      // THE CONTRACT: the pane's own observation (exit + vacant)
+      // re-drives the recovery-create — no other device's refusal
+      // broadcast, no user action, no reconnect. The lane's 'exited' gate
+      // proves the exit fold ran; the recovery re-mints the request id.
+      await waitFor(() => {
+        expect(sentMessages().filter((m: any) => m.type === 'terminal.create').length).toBeGreaterThan(0)
+      })
+      const recoveryCreate = [...sentMessages()]
+        .reverse()
+        .find((m: any) => m.type === 'terminal.create')!
+      // Re-minted (council rule 2's sanctioned recovery mint), never the
+      // dead request id.
+      expect(recoveryCreate.requestId).not.toBe('req-b8ke')
+      expect(recoveryCreate).toMatchObject({
+        sessionRef: { provider: 'codex', sessionId: TYPED_SESSION_ID },
+      })
+    })
+
+    // The lane is SESSION-panes-only: a plain shell pane (no durable
+    // sessionRef) never auto-recreates — the exited shell keeps its
+    // user-driven reconnect affordance.
+    it('an exited shell pane (no durable sessionRef) never auto-recovery-creates on vacant', async () => {
+      const { store } = setupTypedPane({
+        content: { status: 'running', terminalId: 't-shell-b8ke', sessionRef: undefined },
+        seed: (seededStore) => {
+          act(() => {
+            seededStore.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+              generation: 1,
+              terminalId: 't-shell-b8ke',
+            })))
+          })
+        },
+      })
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+        expect(sentMessages().filter((m: any) => m.type === 'terminal.attach').length).toBeGreaterThan(0)
+      })
+
+      act(() => {
+        store.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+          generation: 2,
+          ownerKind: 'vacant',
+          terminalId: undefined,
+          transition: 'released',
+        })))
+      })
+      act(() => {
+        messageHandler!({ type: 'terminal.exit', terminalId: 't-shell-b8ke', exitCode: 1 })
+      })
+
+      await waitFor(() => {
+        const leaf = store.getState().panes.layouts['tab-b8ke']
+        expect(leaf?.type === 'leaf' && leaf.content.kind === 'terminal' && leaf.content.status).toBe('exited')
+      })
+      expect(sentMessages().filter((m: any) => m.type === 'terminal.create')).toHaveLength(0)
+    })
+
+    // Crash-loop bound: a recovery that spawns a terminal which dies
+    // again immediately must not auto-recover again within the quiet
+    // interval (an unbounded exit→recreate→exit spawn loop otherwise).
+    it('a recovery whose new terminal dies immediately does not auto-recover again within the quiet interval', async () => {
+      const { store } = setupTypedPane({
+        content: { status: 'running', terminalId: 't-kill-b8ke' },
+        seed: (seededStore) => {
+          act(() => {
+            seededStore.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+              generation: 1,
+              terminalId: 't-kill-b8ke',
+            })))
+          })
+        },
+      })
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+      })
+
+      act(() => {
+        store.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+          generation: 2,
+          ownerKind: 'vacant',
+          terminalId: undefined,
+          transition: 'released',
+        })))
+      })
+      act(() => {
+        messageHandler!({ type: 'terminal.exit', terminalId: 't-kill-b8ke', exitCode: 1 })
+      })
+
+      // Recovery #1 fires.
+      await waitFor(() => {
+        expect(sentMessages().filter((m: any) => m.type === 'terminal.create').length).toBeGreaterThan(0)
+      })
+      const recoveryRequestId = ([...sentMessages()]
+        .reverse()
+        .find((m: any) => m.type === 'terminal.create')!).requestId as string
+
+      // The recovered terminal anchors and FULLY launches (attach.ready
+      // clears the launch attempt), then dies immediately, and the
+      // session goes vacant again (the exit-watcher release).
+      act(() => {
+        messageHandler!({
+          type: 'terminal.created',
+          requestId: recoveryRequestId,
+          terminalId: 't-kill-2-b8ke',
+          createdAt: Date.now(),
+        })
+      })
+      await waitFor(() => {
+        expect(latestAttachRequestIdForTerminal('t-kill-2-b8ke')).toBeDefined()
+      })
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId: 't-kill-2-b8ke',
+          attachRequestId: latestAttachRequestIdForTerminal('t-kill-2-b8ke'),
+          seq: 0,
+        })
+      })
+      await waitFor(() => {
+        const leaf = store.getState().panes.layouts['tab-b8ke']
+        expect(leaf?.type === 'leaf' && leaf.content.kind === 'terminal' && leaf.content.terminalId).toBe('t-kill-2-b8ke')
+      })
+      act(() => {
+        store.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+          generation: 3,
+          ownerKind: 'vacant',
+          terminalId: undefined,
+          transition: 'released',
+        })))
+      })
+      act(() => {
+        messageHandler!({ type: 'terminal.exit', terminalId: 't-kill-2-b8ke', exitCode: 1 })
+      })
+
+      // THE CONTRACT: exactly ONE recovery create — the second death does
+      // not re-arm the lane within the quiet interval. Let any wrong-side
+      // effect flush, then assert both the fold (status exited — no
+      // recovery refired) and the create count.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      })
+      const leaf = store.getState().panes.layouts['tab-b8ke']
+      expect(leaf?.type === 'leaf' && leaf.content.kind === 'terminal' && leaf.content.status).toBe('exited')
+      expect(sentMessages().filter((m: any) => m.type === 'terminal.create')).toHaveLength(1)
+    })
+
     // b8ke fence-heal fast path (plan-review round 1, finding 4): a
     // stale-observed-generation refusal carrying the pair PROVES the
     // request's own pair can never win a re-drive — the branch folds the

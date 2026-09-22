@@ -414,7 +414,7 @@ export class WsClient {
 
     if (perfConfig.enabled) {
       const start = performance.now()
-      this.messageHandlers.forEach((handler) => handler(msg))
+      this.dispatchToHandlers(msg)
       const durationMs = performance.now() - start
       if (durationMs >= perfConfig.wsMessageSlowMs) {
         logClientPerf('perf.ws_message_handlers_slow', {
@@ -423,8 +423,30 @@ export class WsClient {
         }, 'warn')
       }
     } else {
-      this.messageHandlers.forEach((handler) => handler(msg))
+      this.dispatchToHandlers(msg)
     }
+  }
+
+  /**
+   * Task 7 fence-heal follow-up: every registered message handler receives
+   * every frame ISOLATED — one handler's synchronous throw is logged and
+   * skipped, never load-bearing for the rest. The old bare forEach let a
+   * single throwing handler abort the iteration and silently starve every
+   * LATER handler of the frame (the recorded e2e wedge: a pane's
+   * terminal.exit fold never ran because an earlier handler threw on the
+   * same frame).
+   */
+  private dispatchToHandlers(msg: ServerMessage): void {
+    this.messageHandlers.forEach((handler) => {
+      try {
+        handler(msg)
+      } catch (error) {
+        log.warn('Uncaught error in a ws message handler (isolated; dispatch continues)', {
+          messageType: msg?.type,
+          error: error instanceof Error ? { message: error.message, stack: error.stack } : error,
+        })
+      }
+    })
   }
 
   /**
