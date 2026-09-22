@@ -420,7 +420,10 @@ mod tests {
         let mut n = NoiseScanner::new();
         // First sweep: each distinct composition is new content (fail-open).
         for c in &compositions {
-            n.observe(c);
+            assert!(
+                n.observe(c),
+                "first sweep composition must be meaningful (fail-open)"
+            );
         }
         // Spinner-only unit (braille glyph, zero significant chars) is noise even
         // the first time — registry.rs:185-186 count==0 path.

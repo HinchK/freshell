@@ -355,6 +355,18 @@ export const TerminalIdleSchema = z.object({
   reason: z.enum(['grace', 'queue-empty']),
 })
 
+/**
+ * `terminal.stuck` — the terminal-mode wedged-agent flag, emitted once per
+ * stuck/unstuck transition (and to fresh subscribers while flagged).
+ * Drives the pane's "Agent appears stuck" card; never a completion edge.
+ */
+export const TerminalStuckSchema = z.object({
+  type: z.literal('terminal.stuck'),
+  terminalId: z.string(),
+  at: z.number(),
+  stuck: z.boolean(),
+})
+
 // ──────────────────────────────────────────────────────────────
 // SDK content block schemas (from Claude Code NDJSON)
 // ──────────────────────────────────────────────────────────────
@@ -680,6 +692,16 @@ export const TerminalKillSchema = z.object({
    */
   observedEpoch: z.number().int().nonnegative().optional(),
   observedGeneration: z.number().int().nonnegative().optional(),
+  /**
+   * Wedge-backstop Task 2: WHY the client is killing this terminal.
+   * `'stuck-recovery'` = the "Agent appears stuck" card's restart/start-fresh
+   * action — the server runs the process-only kill and deliberately SKIPS the
+   * durable pane-close envelope so the follow-up respawn can resume the
+   * session. Absent or any other value keeps today's full pane-close
+   * semantics. Additive optional; WS_PROTOCOL_VERSION stays put (older
+   * servers accept-and-strip inbound).
+   */
+  reason: z.string().optional(),
 })
 
 export const CodexActivityListSchema = z.object({
@@ -1498,6 +1520,12 @@ export type AmplifierActivityUpdatedMessage = z.infer<typeof AmplifierActivityUp
 
 export type TerminalTurnCompleteMessage = z.infer<typeof TerminalTurnCompleteSchema>
 export type TerminalIdleMessage = z.infer<typeof TerminalIdleSchema>
+/**
+ * `terminal.stuck` — the terminal-mode wedged-agent flag, emitted once per
+ * stuck/unstuck transition (and to fresh subscribers while flagged). Drives
+ * the pane's "Agent appears stuck" card; never a completion edge.
+ */
+export type TerminalStuckMessage = z.infer<typeof TerminalStuckSchema>
 
 // -- Sessions --
 
@@ -1796,6 +1824,7 @@ export type ServerMessage =
   | AmplifierActivityUpdatedMessage
   | TerminalTurnCompleteMessage
   | TerminalIdleMessage
+  | TerminalStuckMessage
   | SessionsChangedMessage
   | SettingsUpdatedMessage
   | UiCommandMessage

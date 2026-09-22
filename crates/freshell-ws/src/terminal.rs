@@ -9390,6 +9390,7 @@ mod terminal_kill_stop_wedge_tests {
             create_request_id: None,
             observed_epoch: None,
             observed_generation: None,
+            reason: None,
         }
     }
 
