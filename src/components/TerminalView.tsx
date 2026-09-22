@@ -5847,11 +5847,15 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // ── Wedge-backstop (terminal-mode deadman): the stuck card's actions ──
   // Both actions kill the wedged terminal through the CORRELATED close-ack
   // helper and only then re-drive the pane. Three load-bearing details:
-  // (1) reason:'stuck-recovery' on the kill — a bare terminal.kill is the
-  //     DURABLE pane-close primitive (close envelope + identity retirement +
-  //     recovery suppression); the stuck restart must kill the process
-  //     WITHOUT retiring the session so the respawn's restore:create can
-  //     resume it (Task 3's server branch).
+  // (1) the kill's close semantics, chosen by the action. Restart sends
+  //     reason:'stuck-recovery' — the server kills the process WITHOUT the
+  //     durable pane-close envelope or identity retirement, so the
+  //     respawn's restore:create can resume the session (Task 3's server
+  //     branch). Start-fresh sends the DEFAULT durable close (NO reason
+  //     field): the user is abandoning the conversation, so its identity
+  //     must be retired (envelope + tombstone) exactly like the freshcodex
+  //     twin's startNewConversation — a resumable abandoned session could
+  //     resurrect as a duplicate (delta-review r2, Major).
   // (2) the await-first order — the reconcile reset must not fire before
   //     the correlated terminal.killed resolves (pinned by the matrix's
   //     A/B/B' arms in TerminalView.stuckCard.test.tsx).
@@ -5860,7 +5864,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   //     entry (pinned by the matrix's G arms: one kill, one reset, and a
   //     failed kill stays retryable).
   // (Hooks-legal placement: before the terminal-content conditional return.)
-  const killStuckTerminalAndAwait = useCallback(async (): Promise<KillAck | null> => {
+  const killStuckTerminalAndAwait = useCallback(async (
+    /** 'restart' = the resumable stuck-recovery kill; 'fresh' = the DEFAULT
+     *  durable close (no reason on the wire — the abandoned identity is
+     *  retired, the freshcodex startNewConversation semantics). */
+    action: 'restart' | 'fresh',
+  ): Promise<KillAck | null> => {
     const tid = terminalIdRef.current
     if (!tid) return null
     // Advisory guard (matrix arm E): the opencode replay-window replacement
@@ -5877,7 +5886,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       const fence = resolveTerminalKillFence(appStore, {
         sessionRef: content?.sessionRef,
       })
-      const ack = await sendTerminalKillAndAwait(tid, { ...fence, reason: 'stuck-recovery' })
+      // Restart keeps the session resumable (reason:'stuck-recovery' → the
+      // server's process-only branch); start-fresh omits the reason — the
+      // DEFAULT durable close (envelope + identity retirement), so the
+      // abandoned session can never resurrect as a duplicate.
+      const ack = action === 'restart'
+        ? await sendTerminalKillAndAwait(tid, { ...fence, reason: 'stuck-recovery' })
+        : await sendTerminalKillAndAwait(tid, fence)
       if (!ack.ok) {
         // Keep the card; the user can retry. The server close stays
         // authoritative — nothing about the pane is changed on failure.
@@ -5897,7 +5912,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   }, [appStore, dispatch, paneId])
 
   const restartStuckAgentPane = useCallback(async () => {
-    const ack = await killStuckTerminalAndAwait()
+    const ack = await killStuckTerminalAndAwait('restart')
     if (!ack) return
     dispatch(resetPaneForReconcileCreate({
       tabId,
@@ -5907,13 +5922,14 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     }))
   }, [killStuckTerminalAndAwait, dispatch, tabId, paneId])
 
-  // Start fresh: the same bounded kill-await (still reason:'stuck-recovery'
-  // — even a fresh conversation must not corrupt the durable session's close
-  // state), then the genuinely-new-conversation reset — intent 'fresh'
-  // clears sessionRef/resumeSessionId/codexDurability (startFreshConversation
-  // semantics).
+  // Start fresh: the same bounded kill-await, but with the DEFAULT durable
+  // close (no stuck-recovery reason — the user is abandoning the
+  // conversation, so its identity must be retired like the freshcodex
+  // twin's startNewConversation), then the genuinely-new-conversation
+  // reset — intent 'fresh' clears sessionRef/resumeSessionId/codexDurability
+  // (startFreshConversation semantics).
   const startFreshFromStuckPane = useCallback(async () => {
-    const ack = await killStuckTerminalAndAwait()
+    const ack = await killStuckTerminalAndAwait('fresh')
     if (!ack) return
     dispatch(resetPaneForReconcileCreate({
       tabId,

@@ -607,17 +607,23 @@ describe('TerminalView stuck card (wedge-backstop LB-7 matrix)', () => {
   })
 
   // ── F: start-fresh behavioral coverage ──
-  it('start fresh (arm F): kills with reason stuck-recovery, then exactly one fresh reset with the session identity cleared', async () => {
+  it('start fresh (arm F): kills with the DEFAULT durable close (no reason), then exactly one fresh reset with the session identity cleared', async () => {
     const { store, paneContent } = makeStore({ stuck: { at: 123, terminalId: TID } })
     await renderPane(store, paneContent)
 
     await clickStartFresh()
     const kills = sentKills()
     expect(kills).toHaveLength(1)
+    // The fresh path rides the DEFAULT durable close: NO reason field —
+    // the user is abandoning the conversation, so its identity must be
+    // retired (close envelope + tombstone), mirroring the freshcodex
+    // twin's startNewConversation; a resumable abandoned session could
+    // resurrect as a duplicate. reason:'stuck-recovery' is the RESTART-only
+    // resumable branch (delta-review r2, Major).
+    expect(kills[0].reason).toBeUndefined()
     expect(kills[0]).toMatchObject({
       type: 'terminal.kill',
       terminalId: TID,
-      reason: 'stuck-recovery',
       observedEpoch: FENCE_EPOCH,
       observedGeneration: FENCE_GENERATION,
     })

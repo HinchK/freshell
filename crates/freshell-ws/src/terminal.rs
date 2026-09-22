@@ -7702,8 +7702,8 @@ async fn handle_kill(
     // kills (older clients). (DETACH stays non-retiring, unchanged.)
     //
     // Wedge-backstop Task 3 exception: a kill whose `reason` is
-    // `"stuck-recovery"` (the "Agent appears stuck" card's restart /
-    // start-fresh action) is a PROCESS-ONLY kill — it skips the durable
+    // `"stuck-recovery"` (the "Agent appears stuck" card's restart
+    // action) is a PROCESS-ONLY kill — it skips the durable
     // close (and the identity retirement/tombstone consult inside it) so
     // the pane's session stays resumable for the follow-up restore:create
     // respawn; see the stuck_recovery branch below. Everything else about

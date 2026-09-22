@@ -5988,9 +5988,23 @@ mod tests {
         // agent-mode row under the window → no transition.
         // agent-mode row with status != Running → no transition (the 5320
         // suite's headless exit shape, `finish_pty_exit`).
+        // Deterministic boundary (delta-review round 2, Minor): the
+        // under-window arm previously relied on the shared 100ms test
+        // window with a never-fed row — its age had to stay under 100ms
+        // from creation through the sweep, so a scheduler pause flipped
+        // it into flag territory (age past the window while still inside
+        // the 300s activity-fresh bound). A 60s window with the row
+        // backdated to 59s keeps the arm a genuine under-threshold probe
+        // (agent-mode + Running + activity-fresh — the window is the ONLY
+        // non-qualifying condition) with ~1s of scheduler headroom.
+        const WINDOW_MS: i64 = 60_000;
+        const UNDER_WINDOW_AGE_MS: i64 = 59_000;
         let reg = stuck_test_registry("opencode");
-        // `T` (opencode, just created) IS the under-window arm: its
-        // meaningful clock is fresh, so it must never flag.
+        reg.set_stuck_window_ms(WINDOW_MS);
+        // `T` (opencode) IS the under-window arm: backdated to 59s — one
+        // second inside the 60s window and well inside the 300s
+        // activity-fresh bound, so it must never flag.
+        reg.backdate_last_activity("T", now_ms() - UNDER_WINDOW_AGE_MS);
 
         // Shell-mode row: identical wedge shape, wrong mode.
         reg.register_headless(HeadlessTerminal {
@@ -6005,7 +6019,7 @@ mod tests {
             "T-shell",
             frame(1, "\r\x1b[2K⠋ (1s • esc to interrupt)", "S-shell"),
         );
-        reg.backdate_last_activity("T-shell", now_ms() - (STUCK_TEST_WINDOW_MS + 1));
+        reg.backdate_last_activity("T-shell", now_ms() - (WINDOW_MS + 1));
         reg.feed(
             "T-shell",
             frame(2, "\r\x1b[2K⠙ (2s • esc to interrupt)", "S-shell"),
@@ -6024,7 +6038,7 @@ mod tests {
             "T-exited",
             frame(1, "\r\x1b[2K⠋ (1s • esc to interrupt)", "S-exited"),
         );
-        reg.backdate_last_activity("T-exited", now_ms() - (STUCK_TEST_WINDOW_MS + 1));
+        reg.backdate_last_activity("T-exited", now_ms() - (WINDOW_MS + 1));
         reg.feed(
             "T-exited",
             frame(2, "\r\x1b[2K⠙ (2s • esc to interrupt)", "S-exited"),

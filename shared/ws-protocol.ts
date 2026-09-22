@@ -696,12 +696,13 @@ export const TerminalKillSchema = z.object({
   observedGeneration: z.number().int().nonnegative().optional(),
   /**
    * Wedge-backstop Task 2: WHY the client is killing this terminal.
-   * `'stuck-recovery'` = the "Agent appears stuck" card's restart/start-fresh
-   * action — the server runs the process-only kill and deliberately SKIPS the
+   * `'stuck-recovery'` = the "Agent appears stuck" card's restart action —
+   * the server runs the process-only kill and deliberately SKIPS the
    * durable pane-close envelope so the follow-up respawn can resume the
-   * session. Absent or any other value keeps today's full pane-close
-   * semantics. Additive optional; WS_PROTOCOL_VERSION stays put (older
-   * servers accept-and-strip inbound).
+   * session (the card's start-fresh action omits the reason — the abandoned
+   * identity must be retired by the full durable close). Absent or any
+   * other value keeps today's full pane-close semantics. Additive optional;
+   * WS_PROTOCOL_VERSION stays put (older servers accept-and-strip inbound).
    */
   reason: z.string().optional(),
 })
