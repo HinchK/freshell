@@ -31,7 +31,7 @@ import {
   updatePaneTitle,
 } from '@/store/panesSlice'
 import { buildReconcileRequestForPanes, foldVerdicts } from '@/lib/pane-reconcile'
-import type { PaneReconcileRequest } from '@shared/ws-protocol'
+import type { PaneReconcileRequest, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import {
   derivePaneOwnerDivergence,
   deriveTerminalOwnerConvergence,
@@ -40,6 +40,7 @@ import {
   selectSessionRuntimeOwner,
 } from '@/store/selectors/runtimeOwner'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
+import { applyRuntimeOwner } from '@/store/freshAgentSlice'
 import { recordPaneTabActivity } from '@/store/tabRecencySlice'
 import { updateSettingsLocal } from '@/store/settingsSlice'
 import { clearPaneRuntimeActivity } from '@/store/paneRuntimeActivitySlice'
@@ -4705,6 +4706,28 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             if (associationResult === 'reconciled') {
               syncContentRefWithSessionAssociation(createdSessionRef)
             }
+          }
+          // b8ke fence-heal (fix c): the create's OWN committed pair, folded
+          // BEFORE the queued attach fires — the first attach is born fresh
+          // even when the store still holds a stale pre-create record. The
+          // frame omits the trio on legacy servers and identity-less spawns.
+          if (
+            msg.sessionRef
+            && msg.ownerKind
+            && typeof msg.ownerEpoch === 'number'
+            && typeof msg.ownerGeneration === 'number'
+          ) {
+            appStore.dispatch(applyRuntimeOwner({
+              type: 'session.runtimeOwner',
+              provider: msg.sessionRef.provider,
+              sessionId: msg.sessionRef.sessionId,
+              epoch: msg.ownerEpoch,
+              generation: msg.ownerGeneration,
+              ownerKind: msg.ownerKind,
+              terminalId: msg.terminalId,
+              operationId: `terminal-created:${msg.terminalId}`,
+              transition: 'handoff-committed',
+            } as SessionRuntimeOwnerMessage))
           }
           // Kata dtfn anchor 1 (ledger A11): flush buffered keystrokes AFTER
           // the created sessionRef is folded into contentRef above, so each

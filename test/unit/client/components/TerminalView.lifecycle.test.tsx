@@ -3654,6 +3654,40 @@ describe('TerminalView lifecycle updates', () => {
       expect(createCalls()[1].observedGeneration).not.toBe(9)
     })
 
+    // b8ke fence-heal (fix c): the create's committed owner pair rides the
+    // terminal.created frame — folding it BEFORE the queued attach fires
+    // means a just-created pane's FIRST attach is born fresh even when the
+    // store still holds a stale pre-create record (the attach re-selects
+    // the fence from the store at send time).
+    it('folds the created frame owner pair so the queued attach is born fresh over a stale record', async () => {
+      // describe-scoped messageHandler capture (wsMocks.onMessage) + file-scoped sentMessages()
+      const { store } = await setupTypedPane({
+        // seed the STALE pre-create record via the seed CALLBACK (the proven
+        // idiom from the r35 test at :3604-3608):
+        seed: (seededStore) => {
+          act(() => seededStore.dispatch(applyRuntimeOwner(
+            runtimeOwnerFrame({ provider: 'codex', sessionId: TYPED_SESSION_ID, generation: 3 }),
+          )))
+        },
+      })
+      messageHandler!({
+        type: 'terminal.created',
+        requestId: 'req-b8ke',
+        terminalId: 'tid-new-1',
+        createdAt: Date.now(),
+        sessionRef: { provider: 'codex', sessionId: TYPED_SESSION_ID, startedAt: 0 },
+        ownerKind: 'terminal',
+        ownerEpoch: 9,
+        ownerGeneration: 6,
+      })
+      const attach = sentMessages().find((m: any) => m.type === 'terminal.attach')!
+      expect(attach.observedEpoch).toBe(9)
+      expect(attach.observedGeneration).toBe(6) // the committed pair, NOT the stale 3
+      // and the store record advanced:
+      const rec = store.getState().freshAgent.runtimeOwners[`codex:${TYPED_SESSION_ID}`]
+      expect(rec.generation).toBe(6)
+    })
+
     it('b8ke ext r7: a terminal pane holding the PRE-REKEY id resolves the alias chain to the canonical owner', async () => {
       // The pane's sessionRef names the OLD durable id; the runtime-owners
       // map carries the multi-hop rekey mirror chain (old → mid →

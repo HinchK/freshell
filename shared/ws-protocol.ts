@@ -1222,6 +1222,10 @@ export type TerminalCreatedMessage = {
   restoreError?: RestoreError
   /** Resume-validation: operator-visible notice set when the server dropped a stale resume id and spawned fresh. The client writes it into the pane's xterm. Additive; Node never sets it. */
   notice?: string
+  /** b8ke fence-heal: the create's committed owner pair (additive, absent on legacy servers). */
+  ownerKind?: 'terminal'
+  ownerEpoch?: number
+  ownerGeneration?: number
 }
 
 export type TerminalAttachReadyMessage = {
