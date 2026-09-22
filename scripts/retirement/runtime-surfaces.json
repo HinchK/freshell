@@ -22,6 +22,11 @@
       "role": "test-gate"
     },
     {
+      "id": "workflow-demos",
+      "path": ".github/workflows/demos.yml",
+      "role": "test-gate"
+    },
+    {
       "id": "electron-builder-config",
       "path": "config/electron-builder.yml",
       "role": "packaging-config"
