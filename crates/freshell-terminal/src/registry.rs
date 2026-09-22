@@ -237,7 +237,8 @@ struct TerminalShared {
     /// `inventory()`/`DirectoryEntry` and spec-pinned to bump on EVERY
     /// output frame, terminal-core.md §1.3), repaint noise (spinner frames,
     /// ticking counters, status-bar redraws) does not refresh this.
-    /// Read ONLY by `enforce_idle_kills`.
+    /// Read by `enforce_idle_kills` (idle reaping) and
+    /// `enforce_stuck_detection` (the two-clock stuck differential).
     last_meaningful_activity_at: i64,
     /// Set (epoch ms) while `enforce_stuck_detection` flags this row stuck;
     /// cleared by the first meaningful activity. Surface-only state.
@@ -785,6 +786,44 @@ pub struct StuckTransition {
     pub mode: String,
     pub stuck: bool,
     pub at: i64,
+}
+
+/// Why [`TerminalRegistry::enforce_stuck_detection`] cleared a stuck flag —
+/// computed at predicate time (under the row lock, the same instant the
+/// flag flips) so the deferred log names the cause that actually fired
+/// instead of always claiming a meaningful-activity resume (delta-review
+/// round 3). Not part of the `StuckTransition` payload — log accuracy only.
+#[derive(Clone, Copy, Debug)]
+enum StuckClearCause {
+    MeaningfulActivityResumed,
+    RepaintOutputStopped,
+    TerminalNotRunning,
+    /// `set_meta` permits demoting a live row's mode; no production caller
+    /// does (association stamps agent modes ONTO rows), but the label stays
+    /// honest rather than guessing a clock cause.
+    ModeNoLongerAgent,
+}
+
+impl StuckClearCause {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::MeaningfulActivityResumed => "meaningful-activity-resumed",
+            Self::RepaintOutputStopped => "repaint-output-stopped",
+            Self::TerminalNotRunning => "terminal-not-running",
+            Self::ModeNoLongerAgent => "mode-no-longer-agent",
+        }
+    }
+
+    fn message(&self) -> &'static str {
+        match self {
+            Self::MeaningfulActivityResumed => "meaningful activity resumed; stuck flag cleared",
+            Self::RepaintOutputStopped => {
+                "repaint output went stale; stuck flag cleared (no longer a repaint loop)"
+            }
+            Self::TerminalNotRunning => "terminal no longer running; stuck flag cleared",
+            Self::ModeNoLongerAgent => "mode changed away from agent mode; stuck flag cleared",
+        }
+    }
 }
 
 /// Outcome of the attach-time geometry application (TERM-07;
@@ -1369,7 +1408,7 @@ impl TerminalRegistry {
         // is deferred to a second pass because no kill happens; the row lock
         // IS the atomicity boundary for the flag flip. Structured logging is
         // deferred until after the locks drop (the DIAG-01 discipline).
-        let mut collected: Vec<(StuckTransition, i64)> = {
+        let mut collected: Vec<(StuckTransition, i64, Option<StuckClearCause>)> = {
             let inner = self.inner.lock().expect("registry lock");
             inner
                 .terminals
@@ -1391,10 +1430,31 @@ impl TerminalRegistry {
                                     at: now,
                                 },
                                 now.saturating_sub(s.last_meaningful_activity_at),
+                                None,
                             ))
                         }
                         (true, false) => {
                             s.stuck_since = None;
+                            // Delta-review round 3 (log accuracy): a clear
+                            // has distinct causes — compute which one
+                            // stopped the predicate from matching HERE, at
+                            // predicate time under the row lock (the clocks
+                            // and status may move on before the deferred
+                            // log fires). Not-running takes priority:
+                            // `finish_pty_exit` refreshes both clocks while
+                            // leaving the status, so checking the clocks
+                            // first would mislabel a plain exit.
+                            let cause = if s.status != TerminalRunStatus::Running {
+                                StuckClearCause::TerminalNotRunning
+                            } else if now.saturating_sub(s.last_meaningful_activity_at) <= window {
+                                StuckClearCause::MeaningfulActivityResumed
+                            } else if now.saturating_sub(s.last_activity_at)
+                                >= STUCK_ACTIVITY_FRESH_MS
+                            {
+                                StuckClearCause::RepaintOutputStopped
+                            } else {
+                                StuckClearCause::ModeNoLongerAgent
+                            };
                             Some((
                                 StuckTransition {
                                     terminal_id: s.terminal_id.clone(),
@@ -1403,6 +1463,7 @@ impl TerminalRegistry {
                                     at: now,
                                 },
                                 0,
+                                Some(cause),
                             ))
                         }
                         _ => None,
@@ -1413,7 +1474,7 @@ impl TerminalRegistry {
         // Deterministic order for observability/tests (mirrors the idle
         // reaper's `candidates.sort()`).
         collected.sort_by(|a, b| a.0.terminal_id.cmp(&b.0.terminal_id));
-        for (t, meaningful_idle_ms) in &collected {
+        for (t, meaningful_idle_ms, cleared_cause) in &collected {
             if t.stuck {
                 tracing::warn!(
                     component = "terminal-registry",
@@ -1424,16 +1485,19 @@ impl TerminalRegistry {
                     "agent pane flagged stuck; surfacing to pane"
                 );
             } else {
+                let cause = cleared_cause.expect("clear transitions carry their cause");
                 tracing::info!(
                     component = "terminal-registry",
                     event = "terminal_stuck_cleared",
                     terminal_id = %t.terminal_id,
                     mode = %t.mode,
-                    "meaningful activity resumed; stuck flag cleared"
+                    reason = cause.reason(),
+                    "{}",
+                    cause.message()
                 );
             }
         }
-        collected.into_iter().map(|(t, _)| t).collect()
+        collected.into_iter().map(|(t, _, _)| t).collect()
     }
 
     /// `registry.create()` (`terminal-registry.ts:1544-1740`): spawn the PTY and
@@ -6086,6 +6150,68 @@ mod tests {
         let cleared = reg.enforce_stuck_detection();
         assert_eq!(cleared.len(), 1);
         assert!(!cleared[0].stuck);
+    }
+
+    /// Delta-review round 3 (log accuracy): a clear has three distinct
+    /// causes — the clear log must name the one that ACTUALLY fired instead
+    /// of always claiming a meaningful-activity resume. Pinned via the house
+    /// `tracing_capture` helper (the DIAG-01 event-field discipline).
+    #[test]
+    fn stuck_detection_clear_log_names_the_actual_cause_per_arm() {
+        let reg = stuck_test_registry("opencode");
+
+        // Cause: genuinely-new output refreshed the meaningful clock while
+        // the row still runs.
+        flag_stuck_row(&reg);
+        reg.feed("T", frame(9, "meaningful new text line\n", "S"));
+        let (events, _guard) = tracing_capture::capture();
+        let cleared = reg.enforce_stuck_detection();
+        drop(_guard);
+        assert_eq!(cleared.len(), 1);
+        assert!(!cleared[0].stuck);
+        assert_stuck_clear_reason(&events, "meaningful-activity-resumed");
+
+        // Cause: the repaint stream froze — raw output went stale, so the
+        // pane is no longer provably a repaint loop.
+        flag_stuck_row(&reg);
+        reg.backdate_last_activity(
+            "T",
+            now_ms() - (STUCK_ACTIVITY_FRESH_MS + STUCK_TEST_WINDOW_MS + 1),
+        );
+        let (events, _guard) = tracing_capture::capture();
+        let cleared = reg.enforce_stuck_detection();
+        drop(_guard);
+        assert_eq!(cleared.len(), 1);
+        assert!(!cleared[0].stuck);
+        assert_stuck_clear_reason(&events, "repaint-output-stopped");
+
+        // Cause: the terminal exited while flagged — status left Running.
+        // `finish_pty_exit` ALSO refreshes both clocks, so this arm proves
+        // the not-running cause must take priority over the clock causes.
+        flag_stuck_row(&reg);
+        assert!(reg.finish_pty_exit("T", 0));
+        let (events, _guard) = tracing_capture::capture();
+        let cleared = reg.enforce_stuck_detection();
+        drop(_guard);
+        assert_eq!(cleared.len(), 1);
+        assert!(!cleared[0].stuck);
+        assert_stuck_clear_reason(&events, "terminal-not-running");
+    }
+
+    fn assert_stuck_clear_reason(
+        events: &Arc<StdMutex<Vec<tracing_capture::CapturedEvent>>>,
+        reason: &str,
+    ) {
+        let captured = events.lock().unwrap();
+        let cleared = captured
+            .iter()
+            .find(|e| e.fields.get("event").map(String::as_str) == Some("terminal_stuck_cleared"))
+            .expect("expected a terminal_stuck_cleared tracing event");
+        assert_eq!(
+            cleared.fields.get("reason").map(String::as_str),
+            Some(reason),
+            "the clear log must name the cause that actually fired"
+        );
     }
 
     #[test]
