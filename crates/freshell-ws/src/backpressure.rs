@@ -93,6 +93,30 @@ impl Default for Term09Config {
 /// (`(limit / 64).clamp(64, ..)`) rather than tuning pressure.
 pub const TERM09_QUEUE_MAX_BYTES_FLOOR: usize = 64 * 1024;
 
+/// Responsive-terminal-restore round-5 (finding 1, degenerate settings):
+/// the paced-replay page-budget ceiling implied by a TERM-09 queue cap.
+/// The drain-admission watermark is `queue_max_bytes / 2`
+/// ([`crate::connection_writer`]'s reserve-then-admit gate), and the
+/// queue's own byte cap evicts past `queue_max_bytes` — so a page larger
+/// than the watermark can only admit into a fully drained queue (slow
+/// but live), while a page larger than the whole cap self-spills on
+/// admission. The server boot therefore CLAMPS the registry's page
+/// budget to this ceiling at the one place both knobs are known
+/// (`freshell-server`'s TERM-09 resolution; the ws test harness mirrors
+/// the same relationship), documenting the queue-cap >= page-budget
+/// relationship instead of leaving it to chance. With the defaults this
+/// is a no-op (the 128 KiB page budget sits far below the 8 MiB
+/// watermark); it only bites the small-queue settings — the supported
+/// 64 KiB floor caps pages at 32 KiB.
+///
+/// The clamped budget still exceeds one realtime frame's envelope by a
+/// wide margin at every valid queue setting (the 64 KiB floor's 32 KiB
+/// ceiling vs the 16 KiB `MAX_REALTIME_MESSAGE_BYTES` chunk cap), so the
+/// page builder's single-frame atomic page never exceeds its budget.
+pub const fn paced_page_budget_ceiling(queue_max_bytes: usize) -> i64 {
+    (queue_max_bytes / 2) as i64
+}
+
 /// Per-field sanity floor for `catastrophic_stall_ms` (env
 /// `TERMINAL_WS_CATASTROPHIC_STALL_MS`): the monitor samples at
 /// `stall / 4` (10 ms minimum), so a window below 100 ms would make the
@@ -285,6 +309,31 @@ impl CatastrophicMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paced_page_budget_ceiling_tracks_the_admission_watermark() {
+        // Round-5 finding 1 (degenerate settings): the page-budget ceiling
+        // is the queue's drain-admission watermark (queue cap / 2), so the
+        // boot clamp keeps every paced page inside the reserve-then-admit
+        // gate's normal grant arm — never larger than the queue itself
+        // (self-spill) and never deadlocking the gate.
+        assert_eq!(
+            paced_page_budget_ceiling(16 * 1024 * 1024),
+            8 * 1024 * 1024,
+            "the default 16 MiB queue leaves the 128 KiB default budget untouched"
+        );
+        assert_eq!(
+            paced_page_budget_ceiling(TERM09_QUEUE_MAX_BYTES_FLOOR),
+            32 * 1024,
+            "the supported 64 KiB queue floor caps pages at 32 KiB — the degenerate \
+             default-128-KiB-page case must not self-spill a 64 KiB queue"
+        );
+        // The clamped budget always dwarfs one realtime frame's envelope
+        // (the 16 KiB MAX_REALTIME_MESSAGE_BYTES chunk cap), so the page
+        // builder's single-frame atomic page never exceeds the budget at
+        // any valid queue setting.
+        assert!(paced_page_budget_ceiling(TERM09_QUEUE_MAX_BYTES_FLOOR) > 16 * 1024);
+    }
 
     #[test]
     fn term09_config_defaults_spill_before_disconnect() {

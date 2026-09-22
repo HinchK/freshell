@@ -48,11 +48,13 @@
 //! gap (ordered ahead of everything), sweeps the retained window through
 //! the normal live path, clears the deferral, and the session COMPLETES
 //! AT THE RING FRONT — the paged handoff never resumes toward the
-//! unreachable boundary. Between pages the drain task waits on the
-//! connection queue's REAL backpressure (the writer's backlog
-//! watermark) — the sink itself admits without yielding, so the gate is
-//! what bounds the drain against self-spilling its own unconsumed
-//! pages.
+//! unreachable boundary. Between pages the drain task holds a
+//! RESERVATION on the connection queue's admission capacity
+//! (reserve-then-admit, round-5): the reservation accounts for the page
+//! it is about to admit and for every other concurrent pane drain's
+//! in-flight reservation, so the un-credited drain is bounded by the
+//! connection queue's REAL consumption and can never self-spill its own
+//! unconsumed pages.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -323,7 +325,7 @@ pub(crate) fn drive_session(
 /// that hold (recorded on the subscriber) and the staged post-target
 /// remainder pages toward B and ONLY B through the bounded post-target
 /// handoff (`handoff_paced_tail`) — page-budget-sized per lock hold, the
-/// lock released between chunks, the same backlog-gated loop. The
+/// lock released between chunks, the same admission-reserved loop. The
 /// completing hold clears the deferral atomically with its delivery and
 /// the frames staged past B flow through the normal live fan-out path in
 /// that hold; a retention overrun past the handoff cursor mid-handoff is
@@ -334,12 +336,15 @@ pub(crate) fn drive_session(
 /// unreachable boundary. No completion or handoff path ever bulk-clones
 /// a retained suffix or admits pages outside the page budget; a
 /// sustained producer can never turn the drain into a moving-head
-/// chase. Between pages the task waits on the connection queue's REAL
-/// backpressure (the writer's backlog watermark — the sink itself admits
-/// without yielding and evicts past the byte limit, so this gate is what
-/// bounds the drain and keeps it from self-spilling its own unconsumed
-/// pages). `cancel` fires on the connection's teardown (any exit
-/// reason), bounding the task's lifetime with the connection's own.
+/// chase. Between pages the task holds a RESERVATION on the connection
+/// queue's admission capacity (round-5 finding 1, reserve-then-admit):
+/// the grant accounts for the page about to be admitted and for every
+/// other concurrent pane drain's in-flight reservation — the sink
+/// itself admits without yielding and evicts past the byte limit, so
+/// the reservation is what bounds the drain and keeps it from
+/// self-spilling its own unconsumed pages. `cancel` fires on the
+/// connection's teardown (any exit reason), bounding the task's
+/// lifetime with the connection's own.
 ///
 /// Page order, the deferral contract, and lock discipline are preserved:
 /// the session leaves `PacedSessions` when it enters the drain (credits
@@ -380,17 +385,39 @@ pub(crate) fn spawn_paced_drain(
         // FIXED target, then — once it is covered — the bounded post-target
         // handoff toward the terminal's current head. The phase never
         // re-captures the drain target.
+        //
+        // RESERVE-THEN-ADMIT (round-5 finding 1): every page and every
+        // handoff chunk reserves its full budget under the connection
+        // queue's own lock BEFORE the registry builds and sinks it, so the
+        // reservation accounts for the page about to be admitted AND for
+        // every other concurrent pane drain's in-flight reservation — the
+        // concurrent wakes can no longer each admit a full page on top of
+        // the same pre-admission backlog. The permit is held across the
+        // whole iteration (the page's bytes become real backlog before
+        // the release; an iteration that sinks a retention gap instead
+        // releases the reservation unused). The server boot clamps the
+        // page budget to the connection queue's admission ceiling, so the
+        // grant is always reachable — and the gate itself can never
+        // deadlock whatever the budget (a page larger than the watermark
+        // admits into a fully drained queue).
+        let admission_bytes = budget.max(0) as usize;
         let mut handing_off = false;
         loop {
-            // REAL backpressure first: while the connection queue holds a
-            // backlog at/above the watermark, wait for the writer pump to
-            // drain real frames (or the connection to die — the cancel
-            // path is the escape). The gate runs before EVERY page and
-            // EVERY handoff chunk, so no completion path can admit data
-            // outside the page budget against the connection's real
-            // consumption.
-            tokio::select! {
-                _ = writer.wait_backlog_below_watermark() => {}
+            // The RAII permit is held to the END of the loop body (dropped
+            // at each `return` inside the match and after the match for
+            // continuing arms): its only role is the reservation's
+            // lifetime, hence the underscore binding.
+            let _permit = tokio::select! {
+                permit = writer.reserve_drain_admission(admission_bytes) => {
+                    match permit {
+                        Some(permit) => permit,
+                        None => {
+                            // The writer pump is gone; the cancel path owns
+                            // the exit.
+                            return;
+                        }
+                    }
+                }
                 _ = cancel.changed() => {
                     tracing::debug!(
                         terminal_id = %terminal_id,
@@ -399,7 +426,7 @@ pub(crate) fn spawn_paced_drain(
                     );
                     return;
                 }
-            }
+            };
             let verdict = if handing_off {
                 registry.handoff_paced_tail(
                     &terminal_id,

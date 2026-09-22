@@ -1821,6 +1821,30 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Responsive-terminal-restore round-5 (finding 1, degenerate
+    // settings): clamp the paced-replay page budget to the queue-derived
+    // admission ceiling — the ONE place both knobs are known. The drain's
+    // reserve-then-admit gate grants a page while backlog + reservations
+    // + page stay at-or-below the watermark (queue cap / 2); a page
+    // budget above that ceiling could only admit into a fully drained
+    // queue, and one above the whole cap would self-spill on admission
+    // (a 64 KiB queue — the supported floor — is smaller than the default
+    // 128 KiB page). With default settings this is a no-op (128 KiB <<
+    // the 8 MiB watermark); the clamp only bites the small-queue
+    // settings, honestly bounding pages to what the queue can carry.
+    {
+        let paced_page_ceiling =
+            freshell_ws::backpressure::paced_page_budget_ceiling(term09.queue_max_bytes);
+        if registry.paced_page_max_bytes() > paced_page_ceiling {
+            tracing::info!(
+                page_budget = registry.paced_page_max_bytes(),
+                clamped_page_budget = paced_page_ceiling,
+                queue_max_bytes = term09.queue_max_bytes,
+                "server.config.paced_page_budget_clamped"
+            );
+            registry.set_paced_page_max_bytes(paced_page_ceiling);
+        }
+    }
     let ws_state = WsState {
         auto_resume_tx,
         auto_resume_cancels: Default::default(),
@@ -4275,6 +4299,52 @@ mod tests {
         let tuned = resolve_term09_config().expect("ordered env must boot");
         assert_eq!(tuned.queue_max_bytes, 2 * 1024 * 1024);
         assert_eq!(tuned.catastrophic_buffered_bytes, 8 * 1024 * 1024);
+    }
+
+    /// Responsive-terminal-restore round-5 (finding 1, degenerate
+    /// settings): the boot wiring after `resolve_term09_config` clamps
+    /// the paced page budget to the queue-derived admission ceiling, so a
+    /// supported floor-sized queue never faces a default page larger
+    /// than the queue itself — the clamp the reserve-then-admit drain
+    /// gate relies on for its always-grantable, never-self-spilling
+    /// admissions.
+    #[test]
+    fn paced_page_budget_clamps_to_the_queue_admission_ceiling() {
+        // The exact relationship the boot applies (budget vs ceiling).
+        let clamp = |budget: i64, queue_max_bytes: usize| {
+            budget.min(freshell_ws::backpressure::paced_page_budget_ceiling(
+                queue_max_bytes,
+            ))
+        };
+        // Default settings: the default 128 KiB budget is far below the
+        // 16 MiB queue's 8 MiB ceiling — the clamp is a no-op.
+        assert_eq!(
+            clamp(
+                freshell_terminal::DEFAULT_PACED_PAGE_MAX_BYTES,
+                16 * 1024 * 1024,
+            ),
+            freshell_terminal::DEFAULT_PACED_PAGE_MAX_BYTES,
+        );
+        // THE DEGENERATE FLOOR: the supported 64 KiB queue (the TERM-09
+        // env floor) is SMALLER than the default 128 KiB page — the boot
+        // clamp caps the registry's budget at the 32 KiB watermark.
+        assert_eq!(
+            clamp(
+                freshell_terminal::DEFAULT_PACED_PAGE_MAX_BYTES,
+                freshell_ws::backpressure::TERM09_QUEUE_MAX_BYTES_FLOOR,
+            ),
+            32 * 1024,
+            "a 64 KiB queue must never carry a 128 KiB page"
+        );
+        // The wiring's mechanism: the registry carries the clamped value
+        // through the real setter/getter pair the boot uses.
+        let registry = freshell_terminal::TerminalRegistry::new();
+        let clamped = clamp(
+            registry.paced_page_max_bytes(),
+            freshell_ws::backpressure::TERM09_QUEUE_MAX_BYTES_FLOOR,
+        );
+        registry.set_paced_page_max_bytes(clamped);
+        assert_eq!(registry.paced_page_max_bytes(), 32 * 1024);
     }
 
     fn env_test_temp_dir(tag: &str) -> std::path::PathBuf {

@@ -1,6 +1,6 @@
 use super::*;
 use futures_util::task::AtomicWaker;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 #[derive(Default)]
 struct Capture {
@@ -89,15 +89,16 @@ async fn join(task: tokio::task::JoinHandle<WriterExit>) -> WriterExit {
         .unwrap()
 }
 
-/// The paced drain's backlog gate (responsive-terminal-restore W1): while
-/// the connection's output backlog sits at/above the watermark the gate
-/// PENDS — the sink itself (`push_server`) admits without yielding, so
-/// this gate is what bounds a producing drain by the connection queue's
-/// REAL consumption. The gate releases only when the writer pump
-/// completes actual frame sends and the published backlog drops below
-/// the watermark.
+/// The paced drain's admission reservation (responsive-terminal-restore
+/// W1, round-5): while the connection's output backlog cannot absorb a
+/// page of `bytes` at/under the watermark, the reservation PENDS — the
+/// sink itself (`push_server`) admits without yielding, so this gate is
+/// what bounds a producing drain by the connection queue's REAL
+/// consumption. The reservation grants only when the writer pump has
+/// completed actual frame sends and the published backlog leaves room
+/// for the page (backlog + reservation + page <= watermark).
 #[tokio::test]
-async fn backlog_gate_waits_for_real_queue_consumption() {
+async fn drain_admission_waits_for_real_queue_consumption() {
     let (sender, pump) = WriterSender::new(4096, 4096, Duration::from_secs(10));
     let capture = Arc::new(Capture::default());
     capture.block_flush.store(true, Ordering::SeqCst);
@@ -113,21 +114,223 @@ async fn backlog_gate_waits_for_real_queue_consumption() {
         "the fixture holds the backlog at/above the watermark (pending {})",
         sender.pending_output_bytes()
     );
-    let gate = sender.wait_backlog_below_watermark();
-    tokio::pin!(gate);
-    // The gate is CLOSED: it must not resolve while the backlog stands.
+    let permit = sender.reserve_drain_admission(1024);
+    tokio::pin!(permit);
+    // The reservation is CLOSED: it must not resolve while the backlog
+    // cannot absorb the page.
     assert!(
-        tokio::time::timeout(Duration::from_millis(100), &mut gate)
+        tokio::time::timeout(Duration::from_millis(100), &mut permit)
             .await
             .is_err(),
-        "the gate stays closed while the backlog is at/above the watermark"
+        "the reservation stays closed while the backlog cannot absorb the page"
     );
+    {
+        let queues = sender.shared.queues.lock().unwrap();
+        assert_eq!(queues.drain_reserved, 0, "nothing was reserved yet");
+    }
     // REAL consumption releases it: the in-flight frame's flush completes
     // and `finish_frame` publishes the drained backlog.
     unblock(&capture);
-    tokio::time::timeout(Duration::from_secs(2), &mut gate)
+    let permit = tokio::time::timeout(Duration::from_secs(2), permit)
         .await
-        .expect("the gate opens when the pump drains real frames");
+        .expect("the reservation grants when the pump drains real frames");
+    {
+        let queues = sender.shared.queues.lock().unwrap();
+        assert_eq!(
+            queues.drain_reserved, 1024,
+            "the granted permit holds its bytes"
+        );
+    }
+    drop(permit);
+    {
+        let queues = sender.shared.queues.lock().unwrap();
+        assert_eq!(
+            queues.drain_reserved, 0,
+            "dropping the permit releases the reservation"
+        );
+    }
+    sender.stop_without_close();
+    let _ = join(task).await;
+}
+
+/// Round-5 finding 1 (degenerate settings): a drain page LARGER than the
+/// admission watermark (a queue/page relationship the boot clamp exists
+/// to prevent — injected directly here) must still admit once the queue
+/// fully drains: the reservation gate can never DEADLOCK, whatever the
+/// budget. The oversize page admits into a fully drained queue only.
+#[tokio::test]
+async fn an_oversize_drain_page_admits_into_a_fully_drained_queue() {
+    let (sender, pump) = WriterSender::new(64 * 1024, 4096, Duration::from_secs(10));
+    // The degenerate shape: the 64 KiB minimum queue (watermark 32 KiB)
+    // against the default-sized 128 KiB page budget.
+    assert_eq!(sender.backlog_watermark(), 32 * 1024);
+    let capture = Arc::new(Capture::default());
+    capture.block_flush.store(true, Ordering::SeqCst);
+    assert!(sender.push_server(output(1)));
+    let task = tokio::spawn(pump.run(TestSink(Arc::clone(&capture))));
+    started(&capture).await;
+    // The oversize reservation pends while ANY backlog stands (the
+    // in-flight frame alone blocks it): grantable only into a fully
+    // drained queue.
+    let permit = sender.reserve_drain_admission(128 * 1024);
+    tokio::pin!(permit);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut permit)
+            .await
+            .is_err(),
+        "the oversize reservation waits for a fully drained queue"
+    );
+    unblock(&capture);
+    let permit = tokio::time::timeout(Duration::from_secs(2), permit)
+        .await
+        .expect("the oversize page admits once the queue is fully drained — no deadlock");
+    drop(permit);
+    sender.stop_without_close();
+    let _ = join(task).await;
+}
+
+/// Round-5 finding 1 (Major), the reviewer's exact scenario: MULTIPLE pane
+/// drains awakened together against a JUST-UNDER-WATERMARK backlog with
+/// FULL-SIZE pages. The drain admission gate must account for the page it
+/// is about to admit AND reserve admission capacity atomically, so
+/// concurrent pane drains can never double-book the watermark. Observed
+/// end state: ZERO queue_overflow evictions and the admitted aggregate
+/// never exceeding the watermark + one page.
+///
+/// The reviewer's numbers: the supported 256 KiB queue cap, the default
+/// 128 KiB paced page budget (watermark = 128 KiB).
+#[tokio::test]
+async fn concurrent_full_size_drain_admissions_never_self_spill_the_queue() {
+    let events = crate::invariants::capture::capture();
+    let (sender, pump) = WriterSender::new(256 * 1024, 4096, Duration::from_secs(10));
+    let capture = Arc::new(Capture::default());
+    capture.block_flush.store(true, Ordering::SeqCst);
+    let watermark = sender.backlog_watermark();
+    assert_eq!(watermark, 128 * 1024, "the reviewer's 256 KiB queue shape");
+
+    // One FULL-SIZE paced page: a single output frame whose serialized
+    // size sits just under the default 128 KiB page budget.
+    let page = |terminal_id: &'static str, seq: i64| {
+        let mut message = output(seq);
+        if let ServerMessage::TerminalOutput(frame) = &mut message {
+            frame.terminal_id = terminal_id.to_string();
+            frame.data = "P".repeat(128 * 1024 - 256);
+        }
+        message
+    };
+    let page_bytes = serde_json::to_string(&page("drain-admit-probe", 1))
+        .unwrap()
+        .len();
+    assert!(
+        page_bytes < 128 * 1024,
+        "the fixture's page is a realistic full-size page (serialized {page_bytes})"
+    );
+
+    // Fill the backlog to JUST UNDER the watermark (the reviewer's
+    // "just-under-watermark" wake state) with the socket blocked.
+    let mut seq = 0;
+    while sender.pending_output_bytes() < watermark - 2048 {
+        seq += 1;
+        assert!(sender.push_server(named_output("drain-admit-fill", seq)));
+    }
+    let task = tokio::spawn(pump.run(TestSink(Arc::clone(&capture))));
+    started(&capture).await;
+    let backlog_at_wake = sender.pending_output_bytes();
+    assert!(
+        backlog_at_wake < watermark,
+        "the fixture wakes the drains just under the watermark ({backlog_at_wake})"
+    );
+    let spill_count = || {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e.message.contains("queue_overflow_spill")
+                    && e.fields
+                        .get("terminal_id")
+                        .is_some_and(|id| id.starts_with("drain-admit"))
+            })
+            .count()
+    };
+    assert_eq!(spill_count(), 0, "no spill before the drains wake");
+
+    // THE CONCURRENT WAKE: three pane drains reserve their full-size page
+    // admissions together against the just-under-watermark backlog. The
+    // reserve-then-admit gate must grant NONE of them while the backlog
+    // stands (each reservation accounts for its own page — the page can
+    // no longer ride on top of the backlog unaccounted).
+    let max_observed = Arc::new(AtomicUsize::new(0));
+    let mut drains = Vec::new();
+    for (drain, terminal_id) in ["drain-admit-a", "drain-admit-b", "drain-admit-c"]
+        .into_iter()
+        .enumerate()
+    {
+        let sender = sender.clone();
+        let max_observed = Arc::clone(&max_observed);
+        drains.push(tokio::spawn(async move {
+            let permit = sender
+                .reserve_drain_admission(page_bytes)
+                .await
+                .expect("the writer is alive");
+            assert!(sender.push_server(page(terminal_id, 1 + drain as i64)));
+            let observed = sender.pending_output_bytes();
+            max_observed.fetch_max(observed, Ordering::SeqCst);
+            drop(permit);
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    {
+        let queues = sender.shared.queues.lock().unwrap();
+        assert_eq!(
+            queues.drain_reserved, 0,
+            "no reservation is granted against a backlog the page cannot join \
+             without crossing the watermark"
+        );
+    }
+    assert_eq!(
+        spill_count(),
+        0,
+        "no page was admitted while the backlog stood (the socket is blocked)"
+    );
+    assert_eq!(
+        max_observed.load(Ordering::SeqCst),
+        0,
+        "no drain admitted anything before the queue drained"
+    );
+
+    // REAL consumption releases the admissions: the pump drains the
+    // backlog, the reservations grant, and every drain completes its page.
+    unblock(&capture);
+    for drain in drains {
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .expect("each reserved drain completes")
+            .unwrap();
+    }
+
+    // THE BOUND: zero drain-induced queue_overflow evictions, and the
+    // admitted aggregate never exceeded the watermark + one page.
+    let observed = max_observed.load(Ordering::SeqCst);
+    assert_eq!(
+        spill_count(),
+        0,
+        "THE BOUND: concurrent pane drains must never evict the connection's own pages \
+         (observed aggregate {observed}B vs watermark {watermark}B + one page {page_bytes}B)"
+    );
+    assert!(
+        observed <= watermark + page_bytes,
+        "THE BOUND: the admitted aggregate ({observed}) must never exceed the watermark \
+         ({watermark}) + one page ({page_bytes})",
+    );
+    {
+        let queues = sender.shared.queues.lock().unwrap();
+        assert_eq!(
+            queues.drain_reserved, 0,
+            "every reservation was released after its page became real backlog"
+        );
+    }
+
     sender.stop_without_close();
     let _ = join(task).await;
 }

@@ -139,6 +139,14 @@ struct Queues {
     /// coalesced gap later is delivery, not a spill occurrence.
     spill_last_logged: Option<std::time::Instant>,
     spill_suppressed: u64,
+    /// Total bytes reserved by in-flight drain admissions
+    /// (responsive-terminal-restore W1, round-5 finding 1): the paced
+    /// drain task reserves its page's budget BEFORE building and sinking
+    /// the page, so concurrent pane drains can never double-book the
+    /// admission watermark (the reserve-then-admit gate). Released by the
+    /// [`DrainAdmission`] guard's Drop — after the page's bytes are real
+    /// queued backlog, or unused when the admission produced no page.
+    drain_reserved: usize,
 }
 
 impl Queues {
@@ -243,6 +251,29 @@ struct NextFrame {
     flushed: Option<oneshot::Sender<()>>,
 }
 
+/// One granted drain-admission reservation (round-5 finding 1): the
+/// holder may build and sink one budget-bounded paced page — its bytes
+/// were accounted atomically under the queue's lock BEFORE the page was
+/// produced, alongside every other in-flight drain reservation. The
+/// guard is the reservation's lifetime: dropping it releases the
+/// capacity (after the page's bytes became real queued backlog, or unused
+/// when the admission produced no page — a retention gap, a Gone
+/// verdict, a cancelled session).
+pub(crate) struct DrainAdmission {
+    shared: Arc<Shared>,
+    bytes: usize,
+}
+
+impl Drop for DrainAdmission {
+    fn drop(&mut self) {
+        // Also runs after the pump's Drop reset the queue state: the
+        // saturating subtraction keeps a stale guard's release inert.
+        if let Ok(mut queues) = self.shared.queues.lock() {
+            queues.drain_reserved = queues.drain_reserved.saturating_sub(self.bytes);
+        }
+    }
+}
+
 impl WriterSender {
     pub(super) fn new(
         output_limit: usize,
@@ -265,6 +296,7 @@ impl WriterSender {
                 completed_sends: 0,
                 spill_last_logged: None,
                 spill_suppressed: 0,
+                drain_reserved: 0,
             }),
             output_limit: output_limit.max(1),
             control_limit: control_limit.max(1),
@@ -611,30 +643,75 @@ impl WriterSender {
         (self.shared.output_limit / 2).max(1)
     }
 
-    /// Wait until the connection's output backlog drops below
-    /// [`Self::backlog_watermark`] (or the writer dies — then the caller's
-    /// cancel path is the escape). The `watch` channel is fed by the
-    /// writer pump on every completed frame send, and a `watch` receiver
-    /// retains unseen-change marks, so subscribe-then-check-then-await
-    /// can never miss a wakeup: this is REAL backpressure (the sink's
-    /// `push_server` admits without yielding; this gate is what makes a
-    /// producing drain wait for actual socket consumption).
-    pub(crate) async fn wait_backlog_below_watermark(&self) {
-        let watermark = self.backlog_watermark();
+    /// Try to reserve `bytes` of DRAIN admission capacity under the
+    /// queue's own lock (round-5 finding 1, the atomic reserve-then-admit
+    /// gate): the grant accounts for the page the caller is about to
+    /// admit AND for every other in-flight drain reservation, so
+    /// concurrent pane drains can never double-book the watermark the way
+    /// the old check-then-act gate did (each woken drain observed the
+    /// same pre-admission backlog and every one admitted a full page on
+    /// top of it). `None` means not grantable now, or the writer is gone
+    /// (the caller's cancel path owns the exit).
+    ///
+    /// The grant limit is `max(watermark, bytes)`: a page that FITS the
+    /// watermark admits while the aggregate — backlog, every other
+    /// reservation, and this page — stays at-or-below the watermark,
+    /// leaving the cap's upper half as headroom for live traffic, so a
+    /// gated drain can never push the queue into evicting its own pages.
+    /// A page LARGER than the watermark (a degenerate queue/page
+    /// relationship the server boot's page-budget clamp exists to
+    /// prevent) still admits into a fully drained queue, so the gate can
+    /// never DEADLOCK, whatever the budget.
+    fn try_reserve_drain_admission(&self, bytes: usize) -> Option<DrainAdmission> {
+        let mut queues = self.shared.queues.lock().expect("writer queue lock");
+        if queues.closed {
+            return None;
+        }
+        let backlog = queues
+            .output
+            .pending_bytes()
+            .saturating_add(queues.in_flight_output_bytes);
+        let limit = self.backlog_watermark().max(bytes);
+        if backlog
+            .saturating_add(queues.drain_reserved)
+            .saturating_add(bytes)
+            > limit
+        {
+            return None;
+        }
+        queues.drain_reserved = queues.drain_reserved.saturating_add(bytes);
+        Some(DrainAdmission {
+            shared: Arc::clone(&self.shared),
+            bytes,
+        })
+    }
+
+    /// Wait until the connection's output backlog can absorb a drain page
+    /// of `bytes` (reserve-then-admit, round-5 finding 1): the reservation
+    /// is granted atomically against the backlog, every other in-flight
+    /// drain reservation, and the page itself. The `watch` channel is fed
+    /// by the writer pump on every completed frame send, and a `watch`
+    /// receiver retains unseen-change marks, so subscribe-then-check-then-
+    /// await can never miss a wakeup: this is REAL backpressure (the
+    /// sink's `push_server` admits without yielding; the reservation is
+    /// what bounds a producing drain by the connection queue's actual
+    /// consumption). `None` = the writer pump is gone; the caller's
+    /// cancel path owns the exit.
+    pub(crate) async fn reserve_drain_admission(&self, bytes: usize) -> Option<DrainAdmission> {
         loop {
-            if self.pending_output_bytes() < watermark {
-                return;
+            if let Some(permit) = self.try_reserve_drain_admission(bytes) {
+                return Some(permit);
             }
             let mut rx = self.shared.backlog.subscribe();
             // Re-check after subscribing: a drain between the first check
             // and the subscription is covered by the retained change mark.
-            if self.pending_output_bytes() < watermark {
-                return;
+            if let Some(permit) = self.try_reserve_drain_admission(bytes) {
+                return Some(permit);
             }
             if rx.changed().await.is_err() {
                 // The writer pump is gone; the caller's cancel path owns
                 // the exit.
-                return;
+                return None;
             }
         }
     }
@@ -925,6 +1002,7 @@ impl Drop for WriterPump {
             queues.control_bytes = 0;
             queues.in_flight_output_bytes = 0;
             queues.controls_since_last_output = 0;
+            queues.drain_reserved = 0;
             queues.output = DeliveryQueue::new(
                 self.shared.output_limit,
                 metadata_limit(self.shared.output_limit),

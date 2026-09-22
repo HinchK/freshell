@@ -260,7 +260,19 @@ async fn spawn_server_with(
         Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
 
     let registry = freshell_terminal::TerminalRegistry::new();
-    registry.set_paced_page_max_bytes(page_budget);
+    // Round-5 finding 1 (degenerate settings): mirror the server boot's
+    // page-budget clamp — the boot applies the queue-derived admission
+    // ceiling right after TERM-09 resolution, so a paced page always fits
+    // the connection queue's drain-admission watermark. The harness
+    // applies the SAME relationship so every paced fixture runs the
+    // production shape (with default knobs this is a no-op).
+    let effective_page_budget =
+        page_budget.min(freshell_ws::backpressure::paced_page_budget_ceiling(
+            queue_max_bytes.unwrap_or_else(|| {
+                freshell_ws::backpressure::Term09Config::default().queue_max_bytes
+            }),
+        ));
+    registry.set_paced_page_max_bytes(effective_page_budget);
     registry.set_scrollback_max_bytes(ring_chars);
 
     let state = WsState {
@@ -1345,6 +1357,178 @@ async fn input_on_the_same_connection_is_serviced_while_a_producing_drain_is_sti
     // and they end here.
 }
 
+/// Round-5 finding 1 (degenerate settings): the MINIMUM supported queue —
+/// the TERM-09 64 KiB floor — is smaller than one default 128 KiB paced
+/// page. The server boot clamps the page budget to the queue's admission
+/// ceiling (32 KiB; this harness mirrors the boot's clamp), and the
+/// drain's reserve-then-admit gate then walks the restore page by page
+/// into the tiny queue. The paced session must COMPLETE within the
+/// window (never deadlock — the reservation's oversize arm admits into
+/// a fully drained queue even if the clamp were bypassed) and the
+/// connection must NEVER self-spill its own pages: ZERO client-visible
+/// `queue_overflow` gaps and ZERO server-side spill events across the
+/// whole restore.
+#[tokio::test]
+async fn a_minimum_queue_restore_never_deadlocks_or_self_spills() {
+    let events = global_capture();
+    let ring = 512 * 1024;
+    // The degenerate pairing, as configured: the default 128 KiB page
+    // budget request against the 64 KiB queue floor (the harness mirrors
+    // the boot clamp, so the effective budget is 32 KiB).
+    let url = spawn_server_with(ring, 128 * 1024, Some(64 * 1024)).await;
+    let mut driver = connect(&url).await;
+    hello(&mut driver, false).await;
+    let terminal_id = create_shell_terminal(&mut driver, "create-min-queue").await;
+
+    // A large BOUNDED flood (`yes | head -n 100000`, ~5 MB): the producer
+    // demonstrably outruns the attach target, so the un-credited drain
+    // walks a real staged remainder through the tiny queue — the
+    // degenerate paging this test exists to cover — and it
+    // self-terminates (SIGPIPE leaves the shell at its prompt).
+    let mut primer = connect(&url).await;
+    hello(&mut primer, false).await;
+    attach(&mut primer, &terminal_id, "attach-min-queue-primer").await;
+    send_input(
+        &mut driver,
+        &terminal_id,
+        &flood_command(100_000, "FLOOD-DONE-MARKER"),
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let Some(value) = next_json_or_timeout(&mut primer, Duration::from_secs(2)).await
+            else {
+                continue;
+            };
+            if value.get("type").and_then(|v| v.as_str()) == Some("terminal.output") {
+                let data = value.get("data").and_then(|d| d.as_str()).unwrap_or("");
+                if data.contains("STREAMDATA") && !data.contains("yes '") {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("the bounded flood must start producing before the attach");
+    primer
+        .send(WsMessage::Text(
+            serde_json::json!({ "type": "terminal.detach", "terminalId": terminal_id }).to_string(),
+        ))
+        .await
+        .expect("primer detaches");
+
+    // The negotiated restore over the minimum-sized queue.
+    let mut paced = connect(&url).await;
+    hello(&mut paced, true).await;
+    let arid = "attach-min-queue";
+    let (ready, page1) = paced_attach_first_page(&mut paced, &terminal_id, arid).await;
+    let target = ready["replayToSeq"].as_i64().expect("replayToSeq");
+    let mut credited = page1
+        .iter()
+        .map(|f| f["seqEnd"].as_i64().unwrap_or(0))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        credited > 0,
+        "the producer staged content before the attach"
+    );
+    // The first page is consumed: credit its end so the session can page
+    // on toward the fixed target (the credited phase's one-page-per-credit
+    // contract).
+    if credited < target {
+        credit(&mut paced, &terminal_id, arid, credited).await;
+    }
+
+    // THE CLAMP IS VISIBLE: the session's first page is bounded by the
+    // clamped 32 KiB budget (the boot-mirrored ceiling for this queue),
+    // never the requested 128 KiB default — a full-size unclamped page
+    // would already have self-spilled the 64 KiB queue at attach.
+    let start = wait_for_restore_event_of_terminal(&events, &terminal_id, "ws.restore.paced_start")
+        .await
+        .expect("the paced start event is captured");
+    let page_bytes: i64 = start
+        .fields
+        .get("page_bytes")
+        .and_then(|v| v.parse().ok())
+        .expect("paced_start carries page_bytes");
+    assert!(
+        page_bytes > 0 && page_bytes <= 32 * 1024,
+        "the clamp caps pages at the queue's admission ceiling (got {page_bytes}B)"
+    );
+
+    // Consume at full speed, crediting toward the fixed target, then
+    // through the un-credited drain. THE BOUND: no queue_overflow gap may
+    // EVER arrive — the clamped, reserved admissions keep the aggregate
+    // inside the 64 KiB queue. Retention gaps (`replay_window_exceeded`)
+    // are the ring churn this fixture's 5 MB flood produces; they are the
+    // honest declared loss and legal.
+    let spill_events = || {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| {
+                e.message.contains("queue_overflow_spill")
+                    && e.fields.get("terminal_id").map(String::as_str) == Some(terminal_id.as_str())
+            })
+            .count()
+    };
+    let drain_completed = || {
+        events.lock().unwrap().iter().any(|e| {
+            e.message == "ws.restore.paced_complete"
+                && e.fields.get("terminal_id").map(String::as_str) == Some(terminal_id.as_str())
+        })
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    while !drain_completed() && tokio::time::Instant::now() < deadline {
+        let Some(value) = next_json_or_timeout(&mut paced, Duration::from_secs(5)).await else {
+            continue;
+        };
+        match value.get("type").and_then(|v| v.as_str()) {
+            Some("terminal.output") => {
+                let end = value["seqEnd"].as_i64().unwrap_or(0);
+                if end > credited {
+                    credited = end;
+                    if end < target {
+                        credit(&mut paced, &terminal_id, arid, end).await;
+                    }
+                }
+            }
+            Some("terminal.output.gap") => {
+                assert_ne!(
+                    value.get("reason").and_then(|v| v.as_str()).unwrap_or(""),
+                    "queue_overflow",
+                    "THE BOUND: a 64 KiB queue must never spill its own clamped \
+                     restore pages: {value}"
+                );
+            }
+            _ => {}
+        }
+    }
+    if !drain_completed() {
+        let terminal_events = {
+            let events = events.lock().unwrap();
+            events
+                .iter()
+                .filter(|e| {
+                    e.fields.get("terminal_id").map(String::as_str) == Some(terminal_id.as_str())
+                })
+                .map(|e| (e.message.clone(), e.fields.clone()))
+                .collect::<Vec<_>>()
+        };
+        panic!(
+            "NO DEADLOCK: the minimum-queue restore must complete within the window \
+             (the reservation's oversize arm admits into a fully drained queue); \
+             terminal events: {terminal_events:?}"
+        );
+    }
+    assert_eq!(
+        spill_events(),
+        0,
+        "THE BOUND: zero server-side spill events across the whole restore"
+    );
+}
+
 /// Read ONE frame (400ms quiet window) and route it to its pane's bucket
 /// (0 = terminal A, 1 = terminal B of the caller's pair). Returns false
 /// on a quiet read. Gap frames assert the no-self-spill bound inline.
@@ -1405,17 +1589,26 @@ async fn read_and_route_by_pane(
 /// ungated lock hold per pane: N panes aggregated up to N rings past the
 /// cap in a single gate-pass each, and the queue evicted the drains' own
 /// pages (client-visible `queue_overflow` gaps and undeclared holes).
+///
+/// Round-5 finding 1: the fixture now uses REALISTIC page sizes — the
+/// production-default 128 KiB budget and the production-default 16 MiB
+/// queue (the pre-round-5 fixture shrank pages to 4 KiB, avoiding the
+/// full-size concurrency this test exists to cover). The tight-watermark
+/// aggregate bound itself (concurrent full-size pages against a
+/// just-under-watermark backlog) is pinned deterministically at the
+/// writer unit lane
+/// (`concurrent_full_size_drain_admissions_never_self_spill_the_queue`);
+/// THIS test proves the end-to-end shape: two concurrently-draining
+/// panes with production-size pages never spill the connection.
 #[tokio::test]
 async fn multiple_restoring_panes_on_one_connection_stay_within_the_connection_queue_bound() {
     let events = global_capture();
     let ring = 512 * 1024;
     // The bound this test asserts: the gated drains' aggregate backlog
-    // stays below the queue cap, so the connection NEVER self-spills. The
-    // fixture sizes it: the backlog watermark is half the cap (128 KiB),
-    // each gate-pass admits at most one 4 KiB page/chunk, so both panes'
-    // drains running concurrently hold the backlog at ≈ watermark +
-    // panes × budget ≈ 136 KiB < the 256 KiB cap.
-    let url = spawn_server_with(ring, PAGE_BUDGET, Some(256 * 1024)).await;
+    // stays below the queue cap, so the connection NEVER self-spills.
+    // Full-size pages: the production-default 128 KiB budget under the
+    // production-default 16 MiB queue cap.
+    let url = spawn_server_with(ring, 128 * 1024, None).await;
     let mut driver = connect(&url).await;
     hello(&mut driver, false).await;
     let terminal_a = create_shell_terminal(&mut driver, "create-multi-a").await;
