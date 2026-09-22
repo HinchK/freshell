@@ -1888,6 +1888,56 @@ mod tests {
         );
     }
 
+    /// b8ke fence-heal (Task 4, review N-1): `terminal.killed`'s additive
+    /// stale-claim trio round-trips — camelCase, present when Some, omitted
+    /// when None so every non-stale kill answer stays byte-identical on the
+    /// wire (frozen-client parity, the created-frame pair discipline).
+    #[test]
+    fn terminal_killed_round_trips_the_additive_owner_trio_and_omits_it_when_none() {
+        let with_trio = ServerMessage::TerminalKilled(TerminalKilled {
+            request_id: "req-fenceheal-kill-1".into(),
+            terminal_id: "t-91".into(),
+            success: false,
+            error: Some("stale claim".into()),
+            owner_kind: Some("terminal".into()),
+            owner_epoch: Some(7),
+            owner_generation: Some(3),
+        });
+        let json = serde_json::to_string(&with_trio).expect("serialize");
+        assert!(
+            json.contains(r#""type":"terminal.killed""#),
+            "wire tag must be exact: {json}"
+        );
+        assert!(json.contains(r#""ownerKind":"terminal""#), "{json}");
+        assert!(json.contains(r#""ownerEpoch":7"#), "{json}");
+        assert!(json.contains(r#""ownerGeneration":3"#), "{json}");
+        let back: ServerMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, with_trio);
+
+        let legacy = ServerMessage::TerminalKilled(TerminalKilled {
+            request_id: "req-fenceheal-kill-1".into(),
+            terminal_id: "t-91".into(),
+            success: true,
+            error: None,
+            owner_kind: None,
+            owner_epoch: None,
+            owner_generation: None,
+        });
+        let legacy_json = serde_json::to_string(&legacy).expect("serialize");
+        assert!(
+            !legacy_json.contains("ownerKind"),
+            "omit-when-absent keeps legacy killed frames byte-identical: {legacy_json}"
+        );
+        assert!(
+            !legacy_json.contains("ownerEpoch"),
+            "omit-when-absent keeps legacy killed frames byte-identical: {legacy_json}"
+        );
+        assert!(
+            !legacy_json.contains("ownerGeneration"),
+            "omit-when-absent keeps legacy killed frames byte-identical: {legacy_json}"
+        );
+    }
+
     #[test]
     fn error_message_accepts_additive_owner_fields_without_changing_the_frozen_text() {
         // The REAL repo type is `ErrorMsg` with its existing required +

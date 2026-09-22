@@ -6890,6 +6890,118 @@ async fn a_stale_generation_create_refusal_carries_the_current_pair() {
     ws_state.registry.kill(&terminal_id);
 }
 
+/// b8ke fence-heal (fix b server contract, review M-1): the create's ADOPT
+/// arm — the ATOMIC adopt guard — is the arm that refuses a fence the wire
+/// claim let through, and its refusal must carry the coordinator's CURRENT
+/// (epoch, generation) pair so the client folds the fresh pair instead of
+/// looping on the stale one. The lane claim's staleness gate only refuses
+/// fences OLDER than the record (`observedGeneration < current`), while the
+/// atomic adopt demands the fence name the Live record EXACTLY — so a fence
+/// naming a DIFFERENT generation (here one AHEAD of the record: the shape a
+/// client holds after a sweep re-created the record at a lower generation,
+/// or any well-meant fence that simply doesn't match) passes the lane claim
+/// (AdoptLive) and is refused by the adopt guard. Deterministic — no race
+/// window needed. The Adopt arm's session-suffixed message is the
+/// discriminator proving THIS arm answered, never the wire-claim Refused
+/// arm (whose message carries no suffix).
+#[tokio::test]
+async fn a_stale_generation_adopt_create_refusal_carries_the_current_pair() {
+    let (url, _registry, ws_state) = spawn_server().await;
+    let mut ws = connect(&url).await;
+
+    // Seed the session Live exactly as the wire-claim refusal test does:
+    // one terminal-lane create whose settle commits Live{Terminal}.
+    let sid = uuid::Uuid::new_v4().to_string();
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-fenceheal-adopt-seed",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+        }),
+    )
+    .await;
+    let created = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "terminal.created" && v["requestId"] == "req-fenceheal-adopt-seed"
+    })
+    .await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let ownership = ws_state.ownership.as_ref().expect("coordinator wired");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !matches!(
+        ownership.observe("claude", &sid).state,
+        freshell_ownership::OwnershipState::Live { .. }
+    ) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never committed Live"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // THE ADOPT-LANE STALE CREATE: the observed pair names a DIFFERENT
+    // record than the committed Live one (one generation AHEAD) — the lane
+    // claim's less-than gate passes it (AdoptLive), so the ATOMIC adopt
+    // guard is the arm that must refuse it carrying the CURRENT pair.
+    let current = ownership.observe("claude", &sid);
+    send_json(
+        &mut ws,
+        &json!({
+            "type": "terminal.create",
+            "requestId": "req-fenceheal-adopt-stale",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "sessionRef": { "provider": "claude", "sessionId": sid },
+            "observedEpoch": current.epoch,
+            "observedGeneration": current.generation + 1,
+        }),
+    )
+    .await;
+    let refused = await_frame(&mut ws, Duration::from_secs(10), |v| {
+        v["type"] == "error"
+            && v["code"] == "SESSION_RESERVED"
+            && v["requestId"] == "req-fenceheal-adopt-stale"
+    })
+    .await;
+    assert_eq!(
+        refused["code"], "SESSION_RESERVED",
+        "the adopt-lane stale create is the typed refusal: {refused}"
+    );
+    assert!(
+        refused["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&format!("(session {sid})")),
+        "the session-suffixed message proves the ADOPT arm answered (the \
+         wire-claim Refused arm's message carries no suffix): {refused}"
+    );
+    assert_eq!(
+        refused["ownerEpoch"],
+        json!(current.epoch),
+        "the refusal carries the current epoch: {refused}"
+    );
+    assert_eq!(
+        refused["ownerGeneration"],
+        json!(current.generation),
+        "the refusal carries the current generation: {refused}"
+    );
+    // Nothing spawned: the incumbent Live owner stands untouched.
+    let after = ownership.observe("claude", &sid);
+    assert!(
+        matches!(after.state, freshell_ownership::OwnershipState::Live { .. }),
+        "the adopt-lane stale create must not disturb the incumbent owner: {:?}",
+        after.state
+    );
+    ws_state.registry.kill(&terminal_id);
+}
+
 /// b8ke fence-heal (fixes a + c): the terminal-lane create settle commits
 /// Live{Terminal} and BROADCASTS the authoritative owner frame carrying the
 /// commit's OWN (epoch, generation) pair — captured from the claim ticket
