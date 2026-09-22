@@ -39,7 +39,7 @@ A message typed into a freshopencode pane while that pane's compaction is still 
 - Every refusal for a `freshAgent.send` request must use `send_error(&request_id, code, message)` (opencode_ws.rs:826-842 — the top-level `error` frame the client correlates by requestId at FreshAgentView.tsx:2356-2414), never `emit_fresh_agent_error` (:686-696 — session-scoped nested broadcast). WIRE REALITY (verified :826-842): `send_error`'s top-level `code` field is ALWAYS `ErrorCode::InternalError`; the `code` argument lands in the message text (`format!("{code}: {message}")` — the established send-path idiom, e.g. :1462/:1518). The binding contract here is: the refusal arrives as a top-level `error` frame carrying the send's `requestId`, with the code string visible in the message. Tests assert requestId + message content — never a wire `error.code` like SESSION_RESERVED. SCOPE: this binds the send-during-compact path's refusals (the queue arm's fence parse, every drain-time refusal, the killed/close_pending gate). The PRE-EXISTING first-send materialization arms (nested SESSION_RESERVED / LEDGER_WRITE_FAILED broadcasts at :1670-:1883) are out of scope: they have their own intentional client recovery (the SESSION_RESERVED redrive at FreshAgentView.tsx:2315-2326, markSessionLost for INVALID_SESSION_ID) and belong to a different feature lane.
 - The compact-during-turn refusal (:3595-3605) is NOT touched. The client (src/) is NOT touched.
 - Structured WARNs use `tracing::warn!(target: "freshell_freshagent::opencode", …)` (precedents :1512-1517, :3917-3923). WARN-capture assertions use the crate's existing `info_capture::capture()` facility (:6786-6797 → `(Arc<Mutex<Vec<CapturedEvent{message, fields}>>>, DefaultGuard)`; user precedent :6807-6851) — the request id is a structured FIELD, never message text.
-- Test-facility facts (pinned by the load-bearing finder + the round-2 review, reports under the logs dir): `insert_compact_session` is ASYNC (:12991-12998 — every call needs `.await`); `compact_state_gated(config_body: &str, …)` (:12935-12987 — pass e.g. `r#"{"model":null}"#`); `send_msg_fenced(…, Option<u64>, Option<u64>)` (:6868-6886); there is NO `kill_msg`/`interrupt_msg` helper — build `FreshAgentKill`/`FreshAgentInterrupt` inline exactly as :15293-15300/:15353-15358 do; `fenced_observed(&registry, id) -> (Option<u64>, Option<u64>)` (:11413-11419); `seed_live_fresh_owner` (:11421-11452); `CompactFakeHttp` records EVERY request at ARRIVAL (:12700-12702, `recorded()` :12753 / `summarize_requests()` :12757); `frames_until` (:13001-13049) collects frames up to the FIRST match of its predicate — one call pins ONE frame; waiting for two different frames means TWO sequential calls; total-order assertions over a run use ONE `drain_frames(&mut rx)` at the end (frames land in emission order). The `Answered500`/`MidflightTransport` arms answer IMMEDIATELY today (only `OkAnswered` consults the summarize gate at :12884) — Task 3 hoists the consult. The prompt arm answers immediately (:12892-12898) — Task 3 adds the one-shot prompt gate. The DURABLE_CLOSE_FAILED clean-failure kill arm (:3100-3199) decrements `close_pending` (:3186) with `killed` NEVER set — the session survives "exactly as if the kill never ran"; existing kill-path test fixtures around :8359-:8942 rig the clean-failure arms.
+- Test-facility facts (pinned by the load-bearing finder + the round-2 review, reports under the logs dir): `insert_compact_session` is ASYNC (:12991-12998 — every call needs `.await`); `compact_state_gated(config_body: &str, …)` (:12935-12987 — pass e.g. `r#"{"model":null}"#`); `send_msg_fenced(…, Option<u64>, Option<u64>)` (:6868-6886); there is NO `kill_msg`/`interrupt_msg` helper — build `FreshAgentKill`/`FreshAgentInterrupt` inline exactly as :15293-15300/:15353-15358 do; `fenced_observed(&registry, id) -> (Option<u64>, Option<u64>)` (:11413-11419); `seed_live_fresh_owner` (:11421-11452); `CompactFakeHttp` records EVERY request at ARRIVAL (:12700-12702, `recorded()` :12753 / `summarize_requests()` :12757); `RecordedRequest.body` is `Option<serde_json::Value>` (:12671-12675 — NO Display; `r.body.to_string()` does not compile, the round-3 review's finding) — every test that asserts on a recorded body uses a tiny test-module helper `fn r_body_contains(r: &RecordedRequest, needle: &str) -> bool { serde_json::to_string(&r.body).unwrap_or_default().contains(needle) }` (serializing the whole JSON body; `None` serializes to `null` — the :12804-12805 parse precedent is the existing body idiom); `frames_until` (:13001-13049) collects frames up to the FIRST match of its predicate — one call pins ONE frame; waiting for two different frames means TWO sequential calls; CONSUMED frames are gone (each receiver drains its own buffer), so total-order assertions over a whole run need a SECOND broadcast receiver subscribed before the drive (the Task 3 `compact_state_gated_tx` fixture variant returns the bus sender — the channel is `broadcast::channel::<String>(64)` built at :12953) and ONE `drain_frames` on it at the end. The `Answered500`/`MidflightTransport` arms answer IMMEDIATELY today (only `OkAnswered` consults the summarize gate at :12884) — Task 3 hoists the consult. The prompt arm answers immediately (:12892-12898) — Task 3 adds the one-shot prompt gate. The DURABLE_CLOSE_FAILED clean-failure kill arm (:3100-3199) decrements `close_pending` (:3186) with `killed` NEVER set — the session survives "exactly as if the kill never ran"; existing kill-path test fixtures around :8359-:8942 rig the clean-failure arms.
 - Focused Rust command: `cargo test -p freshell-freshagent --lib <filter> --locked` and `cargo test -p freshell-opencode --lib <filter> --locked` — cargo accepts exactly ONE positional TESTNAME filter per invocation; multiple tests are SEQUENTIAL single-filter invocations (narrowed selectors are uncoordinated).
 - The new e2e specs must NOT be added to `CLOUD_SKIP_SPECS` (test/e2e-browser/playwright.cloud.config.ts:30-76) and must pass on the cloud backend (scoped cloud runs take POSITIONAL spec paths — `npm run test:e2e:cloud -- test/e2e-browser/specs/<spec>.ts`).
 
@@ -98,22 +98,30 @@ test('a raw send during a parked compaction is queued and delivered after the co
     }
     await page.evaluate((f) => window.__FRESHELL_TEST_HARNESS__?.sendWsMessage(f), frame)
     // SYNC 1: the frame provably left the page (the harness records every
-    // client-sent frame, injected ones included).
+    // client-sent frame, injected ones included). window_getSent is ASYNC
+    // (a page.evaluate wrapper) — it MUST be awaited INSIDE the poll
+    // callback (the round-3 review's finding: calling .some on the
+    // un-awaited promise throws).
     await expect
-      .poll(() => (window_getSent(page) as any[]).some(
-        (m) => (m as any).requestId === 'e2e-queued-during-compact'))
+      .poll(async () => (await window_getSent(page)).some(
+        (m: any) => m.requestId === 'e2e-queued-during-compact'))
       .toBe(true)
 
-    // SYNC 2 + the NEGATIVE HOLD: the compact is provably still parked (no
-    // audit entry after the summarize receipt — the knob gates the
-    // response, and nothing else emits until it lands). Dwell a bounded
-    // 1.5s inside that provably-parked window, then assert the queued
-    // prompt NEVER posted. (A single immediate poll would be vacuous —
-    // absence after a positive sync plus a bounded dwell while the gate is
-    // verifiably held is the honest negative form.)
+    // SYNC 2 + the NEGATIVE HOLD: the gate FILE still existing PROVES the
+    // compact is still parked — the knob consumes/rm's the file the
+    // moment it appears, so `stat(gatePath)` succeeding ⟺ not yet
+    // released. (Counting audit events does NOT prove parked-ness: the
+    // fixture records many event kinds per session — listen,
+    // session_create_requested, config_get, status, transcript — the
+    // round-3 review's finding.) Dwell a bounded 1.5s inside that
+    // provably-parked window, then assert the queued prompt NEVER
+    // posted. (A single immediate poll would be vacuous — absence after
+    // positive syncs plus a bounded dwell while the gate is verifiably
+    // held is the honest negative form.)
     await page.waitForTimeout(1_500)
+    expect(await fs.promises.stat(gatePath).then(() => true, () => false))
+      .toBe(true) // still parked
     const auditWhileParked = readOpencodeAudit(lane.auditLogPath)
-    expect(auditWhileParked.filter(e => e.event !== 'summarize').length).toBe(1) // only the first turn's prompt
     expect(auditWhileParked.some(
       e => e.event === 'prompt_async' && e.prompt === 'sent while compacting')).toBe(false)
 
@@ -132,6 +140,7 @@ test('a raw send during a parked compaction is queued and delivered after the co
   } finally {
     await lane.server.stop().catch(() => {})
     await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    await fs.rm(gateDir, { recursive: true, force: true }).catch(() => {})
   }
 })
 ```
@@ -175,6 +184,7 @@ test('a composer-typed message during a parked compaction is held, flushed on id
   } finally {
     await lane.server.stop().catch(() => {})
     await fs.rm(lane.sharedRoot, { recursive: true, force: true }).catch(() => {})
+    await fs.rm(gateDir, { recursive: true, force: true }).catch(() => {})
   }
 })
 ```
@@ -268,7 +278,7 @@ async fn send_during_an_in_flight_compact_is_queued_accepted_and_leaves_the_comp
             .recorded()
             .iter()
             .any(|r| r.url.contains("prompt_async")
-                && r.body.to_string().contains("queued text")),
+                && r_body_contains(&r, "queued text")),
         "the queued send must NOT POST while the compact is in flight"
     );
 
@@ -452,12 +462,13 @@ git commit -m "feat(fresh-agent): queue freshopencode sends during an in-flight 
   - `TurnTask { kind, handle, compact_settled_rx, settling: Arc<AtomicBool> }` — the emission-complete marker each drive task flips at the END of its settle tail (see Step 3b for the ordering-critical placement);
   - `async fn send_locked(&self, session_arc: &Arc<TokioMutex<OpencodeSession>>, session: &mut tokio::sync::MutexGuard<'_, OpencodeSession>, msg: FreshAgentSend, session_id: String, send_fence: Option<crate::ownership_lane::ObservedFence>, already_accepted: bool)` (Task 5 later adds the `op_guard` parameter);
   - `async fn drain_pending_sends(&self, lookup_id: &str)`;
-  - `fn drain_boxed(this: &Self, id: String) -> Pin<Box<dyn Future<Output = ()> + Send>>` — the dyn-erased boundary (a PLAIN fn, never an async fn);
+  - `fn drain_boxed(this: Self, id: String) -> Pin<Box<dyn Future<Output = ()> + Send>>` — the dyn-erased boundary (a PLAIN fn, never an async fn; takes the state BY VALUE — an owned `FreshOpencodeState` clone moved into the boxed `'static` future; a `&Self` borrow cannot compile, the round-3 review's finding);
   - `fn drain_detached(this: &Self, id: &str)` — the ONE spawn helper every trigger site calls;
   - test-only: `await_prompt_posted(&http, text)` bounded async waiter on the compact fake's recordings;
-  - test-fixture: `CompactFakeHttp::arm_prompt_gate(&self) -> Arc<tokio::sync::Notify>` (one-shot prompt park) and the hoisted summarize gate consult (Step 1 companion edits).
+  - test-fixture: `CompactFakeHttp::arm_prompt_gate(&self) -> Arc<tokio::sync::Notify>` (one-shot prompt park) and the hoisted summarize gate consult (Step 1 companion edits);
+  - test-fixture: `compact_state_gated_tx` — a variant of `compact_state_gated` (:12935-12987) that ALSO returns the bus sender (`Arc<tokio::sync::broadcast::Sender<String>>` — the channel is built at :12953 as `broadcast::channel::<String>(64)`; clone the Arc before it moves into `FreshAgentState::new`). The FIFO test subscribes a SECOND receiver from it before the compact drive — a broadcast channel buffers each receiver INDEPENDENTLY, so that receiver sees every frame from its subscribe point even while the first receiver's `frames_until`/`drain_frames` calls consume theirs (the round-3 review's finding: total-order assertions over frames earlier calls already consumed are unreachable). ~10 frames total in this rig — well under the 64-slot capacity; no lag drops.
 
-**Step 1: Write the failing behavioral tests** (+ the two test-facility companion edits they need)
+**Step 1: Write the failing behavioral tests** (+ the three test-facility companion edits they need)
 
 The FIFO test below doubles as the self-deadlock/ordering red: without the END-of-tail `settling` flip, the compact tail's drain trips over its own still-registered task and the queued prompts NEVER post; with a START-of-tail flip, the next send's `running` would precede the compact's trailing `idle` — the end-of-test frame-order assertions pin which one is correct.
 
@@ -506,8 +517,13 @@ and in the prompt arm (:12892-12898), after the busy-budget insert, before the r
 #[tokio::test]
 async fn a_queued_send_drains_after_the_compact_settles_in_fifo_order() {
     let summarize_gate = Arc::new(tokio::sync::Notify::new());
-    let (st, http, mut rx) = compact_state_gated(
+    // The _tx variant exposes the bus sender: a SECOND, untouched
+    // receiver carries the total frame order for assertion (6) even
+    // though this test's earlier frames_until/drain_frames calls
+    // consume the first receiver (the round-3 review's finding).
+    let (st, http, mut rx, bus_tx) = compact_state_gated_tx(
         r#"{"model":null}"#, SummarizeOutcome::OkAnswered, Some(summarize_gate.clone()), None).await;
+    let mut order_rx = bus_tx.subscribe();
     insert_compact_session(&st, "ses_q2", Some("prov/model")).await;
     tokio::time::timeout(std::time::Duration::from_secs(2),
         st.handle_compact(compact_msg("ses_q2"))).await.expect("compact registers");
@@ -539,7 +555,7 @@ async fn a_queued_send_drains_after_the_compact_settles_in_fifo_order() {
     // first queued send is in flight (parked), the second has NOT
     // started — the drain drives exactly one entry per settle tail.
     assert!(!http.recorded().iter().any(|r| r.url.contains("prompt_async")
-        && r.body.to_string().contains("second queued")),
+        && r_body_contains(&r, "second queued")),
         "one-at-a-time: the second queued send has not POSTed while the first is in flight");
 
     // (3) Release the first send's prompt; its settle tail drives the
@@ -554,10 +570,10 @@ async fn a_queued_send_drains_after_the_compact_settles_in_fifo_order() {
     let summarize_ix = recorded.iter().position(|r| r.url.contains("summarize"))
         .expect("summarize POST recorded");
     let first_ix = recorded.iter().position(|r| r.url.contains("prompt_async")
-        && r.body.to_string().contains("first queued"))
+        && r_body_contains(&r, "first queued"))
         .expect("first queued send drained");
     let second_ix = recorded.iter().position(|r| r.url.contains("prompt_async")
-        && r.body.to_string().contains("second queued"))
+        && r_body_contains(&r, "second queued"))
         .expect("second queued send drained");
     assert!(summarize_ix < first_ix, "drain waits for the compact settle");
     assert!(first_ix < second_ix, "FIFO order");
@@ -573,7 +589,10 @@ async fn a_queued_send_drains_after_the_compact_settles_in_fifo_order() {
     // before send #1 starts (running), and send #1 settles before send #2
     // starts. One drain_frames at the end gives the total emission
     // order; positional assertions on the running/idle snapshot lists.
-    let all_frames = drain_frames(&mut rx);
+    // drain the SECOND receiver — the first receiver's earlier
+    // frames_until/drain_frames calls already consumed its frames, so
+    // the full emission order survives only in order_rx.
+    let all_frames = drain_frames(&mut order_rx);
     let running_ix: Vec<usize> = all_frames.iter().enumerate()
         .filter(|(_, f)| is_event(f, "freshAgent.session.snapshot", Some("running")))
         .map(|(i, _)| i).collect();
@@ -879,8 +898,12 @@ struct TurnTask {
     /// through any cycle of opaque async-fn futures (E0283/E0733) — no
     /// generator may store another opaque drain/send future. This
     /// boundary erases the drain's concrete future type at the spawn
-    /// edge, so every spawn site is immune by construction.
-    fn drain_boxed(this: &Self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    /// edge, so every spawn site is immune by construction. The state
+    /// is taken BY VALUE (an owned clone moved into the boxed
+    /// future): a `&Self` borrow into a `'static` boxed future cannot
+    /// compile (tokio::spawn requires 'static — the round-3 review's
+    /// finding).
+    fn drain_boxed(this: Self, id: String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         Box::pin(async move { this.drain_pending_sends(&id).await })
     }
 
@@ -892,7 +915,7 @@ struct TurnTask {
     fn drain_detached(this: &Self, id: &str) {
         let this = this.clone();
         let id = id.to_string();
-        tokio::spawn(Self::drain_boxed(&this, id));
+        tokio::spawn(Self::drain_boxed(this, id));
     }
 ```
 
@@ -1012,7 +1035,7 @@ async fn kill_with_a_queued_send_drops_it_with_a_warn_and_it_never_posts() {
     // queue was dropped under the phase-3 lock; the drain's killed gate
     // and the decrement sites' self-gating spawns never drive).
     assert!(!http.recorded().iter().any(|r| r.url.contains("prompt_async")
-        && r.body.to_string().contains("must die with the pane")),
+        && r_body_contains(&r, "must die with the pane")),
         "kill drops the queue — the message must never reach the daemon");
     // (2) The drop is observable: one WARN naming the dropped request
     // (message + the structured request_id field).
@@ -1133,6 +1156,7 @@ git commit -m "feat(fresh-agent): freshopencode kill/handoff drop queued sends (
 
 **Files:**
 - Modify: `crates/freshell-opencode/src/serve.rs` (`run_turn` :1491-1503 — gains the additive second witness param; `prompt_async` :1079-1086 — gains the same additive param, mirroring `compact`'s two-witness collection :1208-1217)
+- Modify: `crates/freshell-freshagent/src/lib.rs` (the REST send path's DIRECT `prompt_async` caller at :5774-5778 — gains the trailing `None` for the new param)
 - Modify: `crates/freshell-freshagent/src/opencode_ws.rs` (`drain_pending_sends`, the Task 3 loop; `send_locked` — adds the `op_guard` parameter + the fresh per-drive dispatch witness + the select! release; the send drive task)
 - Test: `crates/freshell-opencode/src/serve.rs` (the mirror of the :1982 witness test); `crates/freshell-freshagent/src/opencode_ws.rs` (two new tests beside the Task 3 drain tests)
 
@@ -1198,7 +1222,7 @@ async fn a_stale_queued_fence_refuses_typed_at_drain_and_the_queue_continues() {
         "the stale queued send refuses with the guard's stale-fence message");
     // (2) It never POSTs.
     assert!(!http.recorded().iter().any(|r| r.url.contains("prompt_async")
-        && r.body.to_string().contains("stale one")));
+        && r_body_contains(&r, "stale one")));
     // (3) The queue CONTINUES: the current entry drains and POSTs.
     await_prompt_posted(&http, "current one").await;
     let session_arc = st.sessions.lock().await.get("ses_q6").cloned().unwrap();
@@ -1247,7 +1271,7 @@ Expected: FAIL — the stale entry POSTs like a current one (no `error` frame wi
 
 **Step 3: Add the minimal production implementation**
 
-(a) **serve.rs — the additive witness param.** `prompt_async` (:1079-1086) gains a trailing `dispatched_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>` and collects BOTH witnesses into the vec passed to `json_request_maybe_witnessed` — the exact shape `compact` uses (:1208-1217: both flip INSIDE the request leg at the true send point). `run_turn` (:1491-1503) gains the same trailing param and threads it through. `#[allow(clippy::too_many_arguments)]` on `run_turn` if it trips (the compact precedent, :1195). The existing call sites (`run_turn`'s single freshagent caller, any serve.rs test callers) pass `None` for the new param — behavior-identical.
+(a) **serve.rs — the additive witness param.** `prompt_async` (:1079-1086) gains a trailing `dispatched_witness: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>` and collects BOTH witnesses into the vec passed to `json_request_maybe_witnessed` — the exact shape `compact` uses (:1208-1217: both flip INSIDE the request leg at the true send point). `run_turn` (:1491-1503) gains the same trailing param and threads it through. `#[allow(clippy::too_many_arguments)]` on `run_turn` if it trips (the compact precedent, :1195). ALL existing `prompt_async`/`run_turn` call sites pass `None` for the new param — behavior-identical — including the DIRECT REST-path caller `manager.prompt_async(&durable_id, body, &route, Some(accepted))` in `crates/freshell-freshagent/src/lib.rs:5774-5778` (the round-3 review's finding: missing this caller breaks the freshell-freshagent build), `run_turn`'s freshagent send-drive caller (Task 3's `send_locked`), and any serve.rs test callers.
 
 (b) **The freshagent drain's guard consult** — in `drain_pending_sends`, replace the Task 3 placeholder comment with:
 
@@ -1363,7 +1387,7 @@ Expected: PASS — including the whole fence suite (:7818-8082), the compact gua
 **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-opencode/src/serve.rs crates/freshell-freshagent/src/opencode_ws.rs
+git add crates/freshell-opencode/src/serve.rs crates/freshell-freshagent/src/opencode_ws.rs crates/freshell-freshagent/src/lib.rs
 git commit -m "feat(fresh-agent): guard-armed request-correlated stale-fence refusal for freshopencode queued-send drains (dispatch-boundary release via the fresh witness)"
 ```
 
@@ -1418,4 +1442,4 @@ git commit -m "docs: freshopencode send-during-compact queue behavior (AGENTS.md
 4. Client regression (Task 6): the FreshAgentView outgoing-message-queue vitest suite stays green, untouched.
 5. The repo's pre-push gate (cargo fmt, clippy, targeted cargo test) runs on push; the branch's final full-suite gate runs via the coordinator (`FRESHELL_TEST_SUMMARY=… npm test`) from the worktree — pass the GCLOUD_* identity env explicitly (GCLOUD_IDENT, GCLOUD_ROBOT_HOME, GCLOUD_ROBOT_ACCOUNT): ambient tool shells do not source ~/.bashrc and the cloud lanes fail closed on expired ambient gcloud.
 6. No client (src/) changes; the compact-during-turn refusal (:3595) and the other `is_finished()` readers (:4596, :5213/:5483) are untouched.
-7. Design evidence and API pins live in `.worktrees/.the-usual-logs/send-during-compact-queue/reports/` (load-bearing-finder.md, load-bearing-strategist.md, the five planning reports, recursion-probe.rs); the round-1 plan-review report (fresheyes-plan/usual-fresheyes-20260921T023038Z-2052070.md) is the provenance of the v3 corrections and the round-2 report (fresheyes-plan/usual-fresheyes-20260921T191335Z-3352756.md) of these v4 corrections (all six findings verified against the code before this rewrite: the recursion by compiled probe, the guard contract by the compact's own :3783-3807 discipline, the stranding by the :3186 DURABLE_CLOSE_FAILED arm, the ordering by the broadcast flow, the e2e vacuity by the poll semantics, the pane coverage by the sendOpencodeTurn precedent :2137-2165).
+7. Design evidence and API pins live in `.worktrees/.the-usual-logs/send-during-compact-queue/reports/` (load-bearing-finder.md, load-bearing-strategist.md, the five planning reports, recursion-probe.rs); the round-1 plan-review report (fresheyes-plan/usual-fresheyes-20260921T023038Z-2052070.md) is the provenance of the v3 corrections, the round-2 report (fresheyes-plan/usual-fresheyes-20260921T191335Z-3352756.md) of the v4 corrections (all findings verified against the code before each rewrite: the recursion by compiled probe, the guard contract by the compact's own :3783-3807 discipline, the stranding by the :3186 DURABLE_CLOSE_FAILED arm, the ordering by the broadcast flow, the e2e vacuity by the poll semantics, the pane coverage by the sendOpencodeTurn precedent :2137-2165), and the round-3 report (fresheyes-plan/usual-fresheyes-20260921T195828Z-3581443.md) of the v5 corrections (all six findings + the minor verified against the code: the `&Self`-into-`'static` borrow by the probe's by-value shape, the missed lib.rs:5774-5778 REST caller by inspection, the `Option<Value>` body type at :12671-12675, the async poll helper by the harness's page.evaluate definition, the fixture's multi-event audit vocabulary by the gate file's consume-on-release semantics, the consumed-frames problem by the broadcast receiver's per-receiver buffers). The plan review ended at the cap: `FAILED/non-converged` — the reviewer endorsed the architecture; the remaining findings were mechanical sketch bugs, all remediated here; the Stage 5 delta review decides the final code's readiness.
