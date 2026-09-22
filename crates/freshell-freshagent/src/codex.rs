@@ -17690,9 +17690,104 @@ pub(crate) mod tests {
         .await;
         assert!(
             !after.matched,
-            "a crash after the ordinary sequence must not ring for the already-completed turn: {:?}",
+            "a sidecar kill after the gated completion must not add an edge: {:?}",
             after.frames
         );
+    }
+
+    /// The-usual SDD focused E3R3-1 (OPTIONAL post-PASS pin): the durable
+    /// already-rang set retains its full capacity — after CAP (8) DISTINCT
+    /// lifecycle-loss mints the EARLIEST id is still gated. The reviewer's
+    /// eviction corner (a 9th mint evicting the oldest id, letting a very
+    /// late duplicate double-ring) is a RECORDED RESIDUAL (nine
+    /// concurrent lifecycle losses on one session plus an unusually late
+    /// trailing duplicate is far outside realistic volume; an unbounded
+    /// set was rejected as a slow per-session leak) — this test pins the
+    /// within-cap guarantee the design actually promises.
+    #[tokio::test]
+    async fn the_already_rang_set_retains_its_capacity_of_distinct_ids() {
+        let (transport, peer) = freshell_codex::new_channel_transport();
+        let (client, notifs) = CodexAppServerClient::connect(transport);
+        let client = Arc::new(client);
+
+        let (st, mut rx) = state_with_bus();
+        st.set_codex_quiet_window_ms_for_tests(150);
+
+        let child = spawn_sleeper();
+        let pid = child.id().expect("sleeper pid");
+
+        let active_turn: Arc<StdMutex<Option<String>>> =
+            Arc::new(StdMutex::new(Some("turn-1".to_string())));
+        insert_fake_session_with_real_consumer(
+            &st,
+            "thread-rang-cap",
+            client,
+            active_turn.clone(),
+            notifs,
+            child,
+            "codex-sidecar-test-rang-cap",
+        )
+        .await;
+        let turn_in_flight = {
+            let sessions = st.sessions.lock().await;
+            sessions
+                .get("thread-rang-cap")
+                .expect("session tracked")
+                .turn_in_flight
+                .clone()
+        };
+
+        // Eight DISTINCT lifecycle-loss mints — the set's exact capacity.
+        // Each systemError retires the tracker + latch, so each iteration
+        // installs a fresh turn id and re-arms the latch (the production
+        // install discipline mirrored by the fixture's seed invariant).
+        for i in 1..=STATUS_RANG_TURN_IDS_CAP {
+            *active_turn.lock().expect("active_turn mutex") = Some(format!("turn-{i}"));
+            turn_in_flight.store(true, Ordering::SeqCst);
+            peer.emit_notification(
+                "thread/status/changed",
+                json!({ "threadId": "thread-rang-cap", "status": { "type": "systemError" } }),
+            );
+            let edge = collect_frames_until(&mut rx, std::time::Duration::from_secs(2), |w| {
+                w["event"]["type"] == "freshAgent.turn.complete"
+            })
+            .await;
+            assert!(
+                edge.matched,
+                "mint {i} rings the errored end of turn-{i}: {:?}",
+                edge.frames
+            );
+        }
+
+        // The EARLIEST id (turn-1) is still within the capacity: its LATE
+        // matching completion must publish the snapshot and add NO second
+        // edge.
+        peer.emit_notification(
+            "turn/completed",
+            json!({ "threadId": "thread-rang-cap", "turnId": "turn-1", "status": "failed" }),
+        );
+        let completion = collect_frames_until(&mut rx, std::time::Duration::from_secs(2), |w| {
+            w["event"]["type"] == "freshAgent.session.snapshot" && w["event"]["status"] == "idle"
+        })
+        .await;
+        assert!(
+            completion.matched,
+            "the late completion for the earliest id still publishes its idle snapshot: {:?}",
+            completion.frames
+        );
+        let trailing = collect_frames_until(&mut rx, std::time::Duration::from_millis(400), |w| {
+            w["event"]["type"] == "freshAgent.turn.complete"
+        })
+        .await;
+        assert!(
+            !trailing.matched,
+            "after exactly CAP distinct mints the EARLIEST id is still gated — no second edge: {:?}",
+            trailing.frames
+        );
+
+        // No deadman stuck flag ever fired (every mint disarmed its window).
+        // Safety: the targeted SIGKILL is this test's OWN fixture child.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
     }
 
     /// The-usual SDD focused-r1 FR1-1 (stale-slot protection): a late
