@@ -5925,18 +5925,44 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // Start fresh: the same bounded kill-await, but with the DEFAULT durable
   // close (no stuck-recovery reason — the user is abandoning the
   // conversation, so its identity must be retired like the freshcodex
-  // twin's startNewConversation), then the genuinely-new-conversation
-  // reset — intent 'fresh' clears sessionRef/resumeSessionId/codexDurability
-  // (startFreshConversation semantics).
+  // twin's startNewConversation), then the REMINT — a genuinely new pane
+  // identity, NOT resetPaneForReconcileCreate (focused-round-1 Finding 1):
+  // that fold is the reconcile lane's D4 PRESERVE, but the durable close
+  // the kill just journaled stores this pane's createRequestId, and
+  // recovery classifies panes carrying a closed createRequestId as
+  // deliberately closed — a preserved id would let the new conversation
+  // inherit the abandoned close identity and be omitted from recovery
+  // after a server restart. The remint is the terminal lane's
+  // clearTerminalContentForRecreate semantics (the dead-live-handle
+  // recovery's path) driven through updateContent: a fresh-nanoid
+  // createRequestId — the lifecycle effect re-fires sendCreate on the id
+  // change itself, so no reconcileEpoch bump (that is only the same-id
+  // fold's signal) — with the live handles cleared, status 'creating', and
+  // the abandoned session identity + presentation state cleared
+  // (startFreshConversation semantics: sessionRef / resumeSessionId /
+  // codexDurability, plus the znhn#1 rule that the retired session's
+  // crashTrace must not leak onto the new conversation).
   const startFreshFromStuckPane = useCallback(async () => {
     const ack = await killStuckTerminalAndAwait('fresh')
     if (!ack) return
-    dispatch(resetPaneForReconcileCreate({
-      tabId,
-      paneId,
-      intent: 'fresh',
-    }))
-  }, [killStuckTerminalAndAwait, dispatch, tabId, paneId])
+    updateContent({
+      createRequestId: nanoid(),
+      terminalId: undefined,
+      serverInstanceId: undefined,
+      streamId: undefined,
+      status: 'creating',
+      sessionRef: undefined,
+      resumeSessionId: undefined,
+      codexDurability: undefined,
+      crashTrace: undefined,
+      restoreError: undefined,
+      launchFailure: undefined,
+      handoffError: undefined,
+      // A user-driven fresh start is not a reconcile-verdict result — a
+      // stale verdict flag must never steer the new create.
+      pendingReconcile: undefined,
+    })
+  }, [killStuckTerminalAndAwait, updateContent])
 
   // NOW we can do the conditional return - after all hooks
   if (!isTerminal || !terminalContent) {

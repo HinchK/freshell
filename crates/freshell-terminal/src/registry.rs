@@ -5994,15 +5994,18 @@ mod tests {
         // from creation through the sweep, so a scheduler pause flipped
         // it into flag territory (age past the window while still inside
         // the 300s activity-fresh bound). A 60s window with the row
-        // backdated to 59s keeps the arm a genuine under-threshold probe
-        // (agent-mode + Running + activity-fresh — the window is the ONLY
-        // non-qualifying condition) with ~1s of scheduler headroom.
+        // backdated to half the window keeps the arm a genuine
+        // under-threshold probe (agent-mode + Running + activity-fresh —
+        // the window is the ONLY non-qualifying condition).
         const WINDOW_MS: i64 = 60_000;
-        const UNDER_WINDOW_AGE_MS: i64 = 59_000;
+        // Half the window: the margin IS the scheduler-jitter budget —
+        // 30s, three orders beyond any plausible mid-test pause — while
+        // the row still probes the under-threshold side of the boundary.
+        const UNDER_WINDOW_AGE_MS: i64 = WINDOW_MS / 2;
         let reg = stuck_test_registry("opencode");
         reg.set_stuck_window_ms(WINDOW_MS);
-        // `T` (opencode) IS the under-window arm: backdated to 59s — one
-        // second inside the 60s window and well inside the 300s
+        // `T` (opencode) IS the under-window arm: backdated to half the
+        // window — 30s inside the 60s window and well inside the 300s
         // activity-fresh bound, so it must never flag.
         reg.backdate_last_activity("T", now_ms() - UNDER_WINDOW_AGE_MS);
 

@@ -139,6 +139,10 @@ interface StoreOptions {
   status?: TerminalPaneContent['status']
   terminalId?: string
   withSessionRef?: boolean
+  /** Seed a codexDurability ref on the pane (arm F): the fresh remint must
+   * clear it — an uncleared ref would ride the identity-less create and
+   * restore the abandoned codex thread. */
+  codexDurability?: boolean
   /** Preload a stuck entry for the pane (the flagged state). */
   stuck?: { at: number; terminalId: string }
 }
@@ -156,6 +160,9 @@ function makeStore(opts: StoreOptions = {}) {
     ...(opts.withSessionRef === false
       ? {}
       : { sessionRef: { provider: mode, sessionId: SESSION_ID } }),
+    ...(opts.codexDurability
+      ? { codexDurability: { schemaVersion: 1, state: 'durable' as const, durableThreadId: 'dur-stuck-1' } }
+      : {}),
   }
   const root: PaneNode = { type: 'leaf', id: PANE, content: paneContent }
   const store = configureStore({
@@ -607,8 +614,11 @@ describe('TerminalView stuck card (wedge-backstop LB-7 matrix)', () => {
   })
 
   // ── F: start-fresh behavioral coverage ──
-  it('start fresh (arm F): kills with the DEFAULT durable close (no reason), then exactly one fresh reset with the session identity cleared', async () => {
-    const { store, paneContent } = makeStore({ stuck: { at: 123, terminalId: TID } })
+  it('start fresh (arm F): kills with the DEFAULT durable close (no reason), then remints the pane identity with the session identity cleared', async () => {
+    const { store, paneContent } = makeStore({
+      stuck: { at: 123, terminalId: TID },
+      codexDurability: true,
+    })
     await renderPane(store, paneContent)
 
     await clickStartFresh()
@@ -638,12 +648,28 @@ describe('TerminalView stuck card (wedge-backstop LB-7 matrix)', () => {
 
     const content = paneState(store)
     expect(content.status).toBe('creating')
-    expect(content.pendingReconcile).toBe('fresh')
-    expect(content.reconcileEpoch).toBe(1)
+    // THE REMINT (focused-round-1 Finding 1): the durable close the kill
+    // just journaled stores this pane's createRequestId, and recovery
+    // classifies panes carrying a closed createRequestId as deliberately
+    // closed — the fresh conversation must take a NEW pane identity (the
+    // clearTerminalContentForRecreate remint; the freshcodex twin's
+    // startNewConversation mirrors it with updatePaneContent + a fresh
+    // nanoid), or it inherits the abandoned close identity and can be
+    // omitted from recovery after a server restart.
+    expect(content.createRequestId).not.toBe(REQ)
+    expect(typeof content.createRequestId).toBe('string')
+    // The remint is NOT a reconcile-verdict fold: no pendingReconcile flag
+    // (a user-driven fresh start is not a verdict result) and no epoch
+    // bump — the createRequestId change itself is what re-fires the
+    // lifecycle effect's sendCreate (the epoch is only the same-id fold's
+    // re-fire signal).
+    expect(content.pendingReconcile).toBeUndefined()
+    expect(content.reconcileEpoch).toBeUndefined()
     // Fresh semantics: the stale session identity is cleared — a genuinely
     // new identity-less conversation (startFreshConversation's contract).
     expect(content.sessionRef).toBeUndefined()
     expect(content.resumeSessionId).toBeUndefined()
+    expect(content.codexDurability).toBeUndefined()
     expect(selectExitRecordFrom(store.getState().terminalLifecycle, PANE)).toBeUndefined()
   })
 
