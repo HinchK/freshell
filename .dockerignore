@@ -67,6 +67,7 @@ port/vm-bridge/*
 !.github/workflows/electron-build.yml
 !.github/workflows/electron-release.yml
 !.github/workflows/rust-tests.yml
+!.github/workflows/demos.yml
 !.github/workflows/port-contract.yml
 !.github/workflows/rust-clippy.yml
 !.github/workflows/typecheck-client.yml
