@@ -2948,11 +2948,39 @@ async fn bound_elsewhere_attach_commits_ownership_for_the_unclaimed_holder() {
         }),
     )
     .await;
-    let attached = await_frame(&mut ws_b, Duration::from_secs(20), |v| {
-        (v["type"] == "terminal.created" || v["type"] == "error")
-            && v["requestId"] == "attach-gap-2"
-    })
-    .await;
+    // b8ke fence-heal: collect BOTH the created reply and the
+    // session.runtimeOwner broadcast — separate delivery paths, no ordering
+    // guarantee between them, and `await_frame` DROPS non-matching frames
+    // (it would eat whichever of the two arrives first). Broadcasts fan
+    // out to every connection, so the SAME test socket sees both.
+    // Deadline note: the broadcast is queued to the bus BEFORE the created
+    // reply is sent, so 10s is generous — and it must stay well under the
+    // 30s sleeper's remaining lifetime, or a no-broadcast (RED) spin would
+    // let the holder PTY exit and fail the settle-commit observe below
+    // for an unrelated reason.
+    let mut attached: Option<Value> = None;
+    let mut broadcast: Option<Value> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while (attached.is_none() || broadcast.is_none()) && tokio::time::Instant::now() < deadline {
+        let msg = match tokio::time::timeout(Duration::from_millis(50), ws_b.next()).await {
+            Err(_) => continue, // no frame within the tick — re-check the deadline
+            Ok(None) => panic!("stream ended while collecting"),
+            Ok(Some(Err(e))) => panic!("ws error while collecting: {e}"),
+            Ok(Some(Ok(msg))) => msg,
+        };
+        let WsMessage::Text(text) = msg else {
+            continue;
+        };
+        let value: Value = serde_json::from_str(&text).expect("json frame");
+        if (value["type"] == "terminal.created" || value["type"] == "error")
+            && value["requestId"] == "attach-gap-2"
+        {
+            attached = Some(value);
+        } else if value["type"] == "session.runtimeOwner" && value["sessionId"] == json!(sid) {
+            broadcast = Some(value);
+        }
+    }
+    let attached = attached.expect("the attach create's terminal.created reply arrived");
     assert_eq!(
         attached["type"], "terminal.created",
         "the attach create must succeed: {attached}"
@@ -2975,6 +3003,42 @@ async fn bound_elsewhere_attach_commits_ownership_for_the_unclaimed_holder() {
             panic!("the attach settle must commit coverage for the live holder, got {other:?}")
         }
     }
+
+    // b8ke fence-heal: the attach-claim commit also broadcasts its own
+    // committed pair and rides it on the created frame. Both carry the
+    // (epoch, generation) captured from the claim ticket BEFORE the
+    // consuming commit (r32 F2 — never a re-observed current generation),
+    // so every connected client folds the fresh fence and the attaching
+    // pane's queued first attach is born fresh.
+    let broadcast = broadcast.expect(
+        "the attach-claim commit broadcast the committed owner frame \
+         (session.runtimeOwner for the attached session id)",
+    );
+    let current = ownership.observe("claude", &sid);
+    assert_eq!(broadcast["ownerKind"], json!("terminal"), "{broadcast}");
+    assert_eq!(
+        broadcast["transition"],
+        json!("handoff-committed"),
+        "{broadcast}"
+    );
+    assert_eq!(broadcast["terminalId"], json!(holder), "{broadcast}");
+    assert_eq!(broadcast["epoch"], json!(current.epoch), "{broadcast}");
+    assert_eq!(
+        broadcast["generation"],
+        json!(current.generation),
+        "{broadcast}"
+    );
+    assert!(
+        !broadcast["operationId"].as_str().unwrap_or("").is_empty(),
+        "the broadcast names the committing operation: {broadcast}"
+    );
+    assert_eq!(attached["ownerKind"], json!("terminal"), "{attached}");
+    assert_eq!(attached["ownerEpoch"], json!(current.epoch), "{attached}");
+    assert_eq!(
+        attached["ownerGeneration"],
+        json!(current.generation),
+        "{attached}"
+    );
 }
 
 // ── kata b8ke Task 5: the side-effect-free snapshot GET ────────────────────

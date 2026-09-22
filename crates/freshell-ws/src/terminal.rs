@@ -3866,6 +3866,25 @@ pub(crate) async fn handle_create(
                         // `create.request_id` (same discipline as the main
                         // spawn path's dedupe locals).
                         let dedupe_request_id = create.request_id.clone();
+                        // b8ke fence-heal (fix c): the created frame rides the
+                        // commit's own pair so the attaching pane's queued
+                        // first attach is born fresh. The literal is built
+                        // pre-commit but only SENT post-commit (the commit's
+                        // Err arm below answers an error and never sends it),
+                        // so reading the claim ticket's generation HERE, on
+                        // the immutable ticket, is reading the committed pair
+                        // the frame will ride; None when no claim exists or
+                        // the coordinator is unwired (frozen-client parity —
+                        // Task 1's owner_trio pattern).
+                        let owner_trio: Option<(&str, u64, u64)> =
+                            match (terminal_ownership.as_ref(), state.ownership.as_ref()) {
+                                (Some(claim), Some(ownership)) => Some((
+                                    "terminal",
+                                    ownership.boot_epoch(),
+                                    claim.ticket.generation(),
+                                )),
+                                _ => None,
+                            };
                         let created = ServerMessage::TerminalCreated(TerminalCreated {
                             created_at: now_ms(),
                             request_id: create.request_id,
@@ -3878,9 +3897,9 @@ pub(crate) async fn handle_create(
                                 .identity
                                 .session_ref_for(&terminal_id)
                                 .or(Some(locator)),
-                            owner_kind: None,
-                            owner_epoch: None,
-                            owner_generation: None,
+                            owner_kind: owner_trio.map(|(kind, _, _)| kind.to_string()),
+                            owner_epoch: owner_trio.map(|(_, epoch, _)| epoch),
+                            owner_generation: owner_trio.map(|(_, _, gen)| gen),
                         });
                         // Attaching to the winner IS a successful create for
                         // this requestId: settle the dedupe entry exactly
@@ -3908,6 +3927,16 @@ pub(crate) async fn handle_create(
                         // double-committed, never clobbering the later owner).
                         if let Some(ownership_claim) = terminal_ownership.take() {
                             let locator = ownership_claim.locator.clone();
+                            // b8ke fence-heal (fix a), r32 F2: capture the
+                            // claim ticket's OWN pair BEFORE the consuming
+                            // commit() — the broadcast below carries THIS
+                            // pair, never a re-observed current generation
+                            // (the same pre-commit capture as the frame's
+                            // owner_trio above; the ticket is immutable, so
+                            // both reads are the committed pair).
+                            let owner_operation_id =
+                                ownership_claim.ticket.operation_id().to_string();
+                            let owner_generation = ownership_claim.ticket.generation();
                             match ownership_claim.commit(&terminal_id) {
                                 Ok(()) => {
                                     tracing::info!(
@@ -3915,6 +3944,23 @@ pub(crate) async fn handle_create(
                                         provider = %locator.provider,
                                         session_id = %locator.session_id,
                                         "session_ref.ownership_committed (terminal lane, attach)"
+                                    );
+                                    // b8ke fence-heal (fix a): the attach-claim
+                                    // commit broadcasts the authoritative owner
+                                    // frame (the r29 F1 "every ownership
+                                    // transition broadcasts" invariant, extended
+                                    // to the terminal lane's attach claim) so
+                                    // every connected client folds the fresh
+                                    // fence instead of wedging behind its
+                                    // pre-attach observed fence.
+                                    crate::identity_ownership::broadcast_owner_frame(
+                                        state,
+                                        &locator.provider,
+                                        &locator.session_id,
+                                        &terminal_id,
+                                        &owner_operation_id,
+                                        owner_generation,
+                                        "handoff-committed",
                                     );
                                 }
                                 Err(outcome) => {
