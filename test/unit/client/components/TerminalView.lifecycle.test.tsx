@@ -10679,6 +10679,108 @@ describe('TerminalView lifecycle updates', () => {
       expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
     })
 
+    it('a no-checkpoint repair answered by expired retention disarms the deferred clear — the pre-gap surface is preserved', async () => {
+      // Round-2 fix: the deferred content reset must NOT survive a
+      // server-declared unreconstructible prefix. When the no-checkpoint
+      // repair hydrate is answered by a replay_window_exceeded gap (the
+      // retained history expired past the requested baseline), the
+      // server has just declared that the missing prefix CANNOT be
+      // rebuilt — the pre-gap screen is the best available surface and
+      // the pending clear must be DISARMED, so the retained suffix
+      // appends after the honest-loss UX instead of wiping the screen
+      // mid-restore.
+      wsMocks.capabilities = { pacedTerminalReplayV1: true }
+      const { terminalId, term } = await renderTerminalHarness({
+        status: 'running',
+        terminalId: 'term-v2-gap-repair-disarm',
+        ackInitialAttach: false,
+      })
+
+      const repairAttaches = () => sentMessages().filter(
+        (msg) => msg?.type === 'terminal.attach' && msg.terminalId === terminalId,
+      )
+
+      // A usable pre-gap surface: real content on screen, no streamId —
+      // no valid checkpoint exists for the repair decision.
+      messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 1, data: 'PRE-GAP-VISIBLE' })
+      term.clear.mockClear()
+      wsMocks.send.mockClear()
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 2,
+          toSeq: 5,
+          reason: 'queue_overflow',
+        })
+      })
+
+      const repair = repairAttaches()
+      expect(repair.length).toBe(1)
+      expect(repair[0]).toMatchObject({
+        type: 'terminal.attach',
+        terminalId,
+        intent: 'viewport_hydrate',
+        sinceSeq: 0,
+        attachRequestId: expect.any(String),
+      })
+
+      // The server's answer: retention expired past the requested
+      // baseline. The ready declares the retention reset (the baseline
+      // adjusted to the ring front), the bounds-carrying gap declares
+      // the prefix unreconstructible, and the retained suffix follows.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 24,
+          replayFromSeq: 21,
+          replayToSeq: 24,
+          attachRequestId: repair[0]!.attachRequestId,
+          effectiveSinceSeq: 20,
+          requestedSinceSeq: 0,
+          oldestRetainedSeq: 21,
+          replayResetReason: 'retention_lost',
+        })
+        messageHandler!({
+          type: 'terminal.output.gap',
+          terminalId,
+          fromSeq: 1,
+          toSeq: 20,
+          reason: 'replay_window_exceeded',
+          headSeq: 24,
+          oldestRetainedSeq: 21,
+          attachRequestId: repair[0]!.attachRequestId,
+        })
+        messageHandler!({
+          type: 'terminal.output',
+          terminalId,
+          seqStart: 21,
+          seqEnd: 24,
+          data: 'RETAINED-SUFFIX',
+          attachRequestId: repair[0]!.attachRequestId,
+        })
+      })
+
+      // THE DISARM: the pending deferred clear was consumed by the
+      // retention gap, so the arriving suffix content does NOT wipe the
+      // screen — the pre-gap content survives on the surface and the
+      // suffix appends after the honest-loss UX.
+      expect(term.clear).not.toHaveBeenCalled()
+      const writes = term.write.mock.calls.map(([data]: [string]) => String(data)).join('')
+      expect(writes).toContain('PRE-GAP-VISIBLE')
+      expect(writes).toContain('RETAINED-SUFFIX')
+      expect(
+        writes.indexOf('PRE-GAP-VISIBLE'),
+        'the pre-gap content precedes the retained suffix on the surface',
+      ).toBeLessThan(writes.lastIndexOf('RETAINED-SUFFIX'))
+      expect(screen.getByTestId('restore-retention-loss-notice')).toBeTruthy()
+      // The retention gap does NOT initiate another repair (its reason is
+      // replay_window_exceeded, not queue_overflow): no repair loop.
+      expect(repairAttaches().length).toBe(1)
+    })
+
     it('repeated negotiated queue_overflow gaps exhaust to the visible retry strip', async () => {
       wsMocks.capabilities = { pacedTerminalReplayV1: true }
       const { terminalId } = await renderTerminalHarness({
@@ -11482,13 +11584,95 @@ describe('TerminalView lifecycle updates', () => {
       // The mount attach is the pane's INITIAL hydration (never counted).
       expect(attachCount()).toBe(1)
 
-      // Each flap's reconnect attach completes CLEANLY on the converged
-      // pane: ready received, empty window, no gap — the ordinary
-      // shape of an idle pane's reconnect (it delivers no new coverage
-      // bytes, yet it is a SUCCESSFUL restore, not a broken cycle).
+      // A converged surface with a real cursor: frames applied to the
+      // mount attach establish coverage 4, so every reconnect resume
+      // requests sinceSeq 4 (the checkpoint cursor).
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 4,
+          replayFromSeq: 1,
+          replayToSeq: 4,
+        })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 4, data: 'CONVERGED' })
+      })
+
+      // Each flap's reconnect attach completes CLEANLY and with the
+      // cursor CONFIRMED: the ready carries effectiveSinceSeq == the
+      // requested sinceSeq (the server confirmed the client's surface
+      // cursor) with an empty window and no gap — the ordinary shape of
+      // an idle converged pane's reconnect (it delivers no new coverage
+      // bytes, yet the server CONFIRMED convergence, so it is a
+      // SUCCESSFUL restore, not a broken cycle).
       const ackCleanRestore = () => {
         const attach = attachMessagesFor(terminalId).at(-1)
         expect(attach?.attachRequestId).toBeTruthy()
+        expect(attach?.sinceSeq).toBe(4)
+        act(() => {
+          messageHandler!({
+            type: 'terminal.attach.ready',
+            terminalId,
+            headSeq: 4,
+            replayFromSeq: 5,
+            replayToSeq: 4,
+            attachRequestId: attach!.attachRequestId,
+            effectiveSinceSeq: 4,
+            requestedSinceSeq: 4,
+          })
+        })
+      }
+
+      // FAR past the bound (3): every flap still auto-attaches because each
+      // cursor-confirmed clean completion resets the progressless streak.
+      for (let flap = 0; flap < 6; flap += 1) {
+        act(() => { reconnectHandler?.() })
+        expect(attachCount(), `flap ${flap} attaches`).toBe(2 + flap)
+        ackCleanRestore()
+      }
+      expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+
+      // And the pane keeps auto-attaching on the next flap after that.
+      act(() => { reconnectHandler?.() })
+      expect(attachCount()).toBe(8)
+      expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+    })
+
+    it('recovery bounding: an empty-window ready that never confirms the surface cursor is not a clean restore — the cycle still exhausts', async () => {
+      // Round-2 bound precision: a mere empty-window attach.ready does NOT
+      // reset the progressless streak. Without cursor confirmation (the
+      // ready carries no effectiveSinceSeq — the legacy shape, or any
+      // answer that never says "your cursor is valid") and with no
+      // coverage advance, the cycle is exactly the flapping
+      // reconnect-loop the recovery bound exists to stop: the pane may
+      // reach attach.ready forever while never converging.
+      const { terminalId } = await renderResumablePane('recovery-unconfirmed')
+
+      const attachCount = () => attachMessagesFor(terminalId).length
+      expect(attachCount()).toBe(1)
+
+      // A real surface cursor first: frames applied to the mount attach.
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 4,
+          replayFromSeq: 1,
+          replayToSeq: 4,
+        })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 4, data: 'SEEDED' })
+      })
+      const baseCount = attachCount()
+      expect(baseCount).toBe(1)
+
+      // Each flap's reconnect resumes from the cursor (sinceSeq 4) and the
+      // server answers with an EMPTY window — but the ready carries NO
+      // effectiveSinceSeq: the server never confirmed the client's
+      // surface cursor, and no coverage advanced. NOT a clean restore.
+      const ackUnconfirmedReady = () => {
+        const attach = attachMessagesFor(terminalId).at(-1)
+        expect(attach?.attachRequestId).toBeTruthy()
+        expect(attach?.sinceSeq).toBe(4)
         act(() => {
           messageHandler!({
             type: 'terminal.attach.ready',
@@ -11501,19 +11685,78 @@ describe('TerminalView lifecycle updates', () => {
         })
       }
 
-      // FAR past the bound (3): every flap still auto-attaches because each
-      // clean completion resets the progressless streak.
-      for (let flap = 0; flap < 6; flap += 1) {
+      for (let flap = 1; flap <= 3; flap += 1) {
         act(() => { reconnectHandler?.() })
-        expect(attachCount(), `flap ${flap} attaches`).toBe(2 + flap)
-        ackCleanRestore()
+        expect(attachCount(), `flap ${flap} attaches`).toBe(baseCount + flap)
+        ackUnconfirmedReady()
       }
-      expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
 
-      // And the pane keeps auto-attaching on the next flap after that.
+      // The bound trips: unconfirmed empty reconnects are progressless
+      // attempts, and the pane reaches the visible retry state with the
+      // surface preserved (no wipe, no kill, no replacement).
       act(() => { reconnectHandler?.() })
-      expect(attachCount()).toBe(8)
-      expect(screen.queryByTestId('restore-recovery-retry')).toBeNull()
+      expect(
+        attachCount(),
+        'unconfirmed empty reconnects still exhaust to the bound',
+      ).toBe(baseCount + 3)
+      expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
+    })
+
+    it('recovery bounding: an empty-window ready whose effectiveSinceSeq is not the requested cursor is not a clean restore', async () => {
+      // The second unconfirmed shape: the server DID answer with the
+      // contract fields but adjusted the baseline (retention loss or a
+      // stream swap rewound the head below the client's cursor) — the
+      // client's surface cursor was NOT confirmed, so the completion is
+      // not convergence evidence either.
+      const { terminalId } = await renderResumablePane('recovery-adjusted')
+
+      const attachCount = () => attachMessagesFor(terminalId).length
+      expect(attachCount()).toBe(1)
+
+      act(() => {
+        messageHandler!({
+          type: 'terminal.attach.ready',
+          terminalId,
+          headSeq: 4,
+          replayFromSeq: 1,
+          replayToSeq: 4,
+        })
+        messageHandler!({ type: 'terminal.output', terminalId, seqStart: 1, seqEnd: 4, data: 'SEEDED' })
+      })
+      const baseCount = attachCount()
+
+      const ackAdjustedReady = () => {
+        const attach = attachMessagesFor(terminalId).at(-1)
+        expect(attach?.attachRequestId).toBeTruthy()
+        act(() => {
+          messageHandler!({
+            type: 'terminal.attach.ready',
+            terminalId,
+            // The server's head sits BELOW the client's cursor and the
+            // baseline was adjusted to the head: an empty window whose
+            // effectiveSinceSeq (2) != the requested cursor (4).
+            headSeq: 2,
+            replayFromSeq: 3,
+            replayToSeq: 2,
+            attachRequestId: attach!.attachRequestId,
+            effectiveSinceSeq: 2,
+            requestedSinceSeq: 4,
+          })
+        })
+      }
+
+      for (let flap = 1; flap <= 3; flap += 1) {
+        act(() => { reconnectHandler?.() })
+        expect(attachCount(), `flap ${flap} attaches`).toBe(baseCount + flap)
+        ackAdjustedReady()
+      }
+
+      act(() => { reconnectHandler?.() })
+      expect(
+        attachCount(),
+        'cursor-adjusted empty reconnects still exhaust to the bound',
+      ).toBe(baseCount + 3)
+      expect(screen.getByTestId('restore-recovery-retry')).toBeTruthy()
     })
 
     it('recovery bounding: a gap-tainted generation never resets the streak on completion', async () => {

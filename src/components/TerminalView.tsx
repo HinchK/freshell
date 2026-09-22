@@ -1058,7 +1058,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // generation's first content frame arrives (the deferred content reset:
   // "the viewport must not be cleared before the new baseline is actually
   // established by attach content"). Null when no deferred reset is
-  // pending; cleared once fired and re-armed per attach.
+  // pending; cleared once fired and re-armed per attach. A
+  // `replay_window_exceeded` gap in THIS generation DISARMS it (the
+  // server just declared the prefix unreconstructible — the pre-gap
+  // screen is the best available surface and must be preserved).
   const repairContentResetPendingRef = useRef<string | null>(null)
   const surfaceEpochRef = useRef(0)
   const geometryEpochRef = useRef(1)
@@ -1264,11 +1267,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // repair fallback): when a hydrate attach deferred its viewport clear
   // (`deferViewportClearUntilContent`), the pre-gap surface stays visible
   // until that generation's first content frame ACTUALLY arrives — the
-  // new baseline is established by attach content, never before. If the
-  // repair dies without content, nothing is cleared and the pre-gap
-  // surface survives. Same direct-clear discipline as the attach-time
-  // clear (both run before the triggering frame is queued, and queued
-  // stale-generation writes were already dropped by the generation swap).
+  // new baseline is established by attach content, never before. Two
+  // paths retire the pending clear WITHOUT wiping: the repair dying
+  // without content (nothing is cleared and the pre-gap surface
+  // survives), and — the round-2 disarm — a `replay_window_exceeded`
+  // gap in this generation (the server declared the prefix
+  // unreconstructible, so the pre-gap screen is the best available
+  // surface and the existing honest-loss UX proceeds; see the gap arm).
+  // Same direct-clear discipline as the attach-time clear (both run
+  // before the triggering frame is queued, and queued stale-generation
+  // writes were already dropped by the generation swap).
   const consumeRepairContentReset = useCallback((terminalId: string, attachRequestId?: unknown) => {
     if (repairContentResetPendingRef.current !== attachRequestId) return
     repairContentResetPendingRef.current = null
@@ -5015,6 +5023,22 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               headSeq: gapHeadSeq,
               oldestRetainedSeq: gapOldestRetainedSeq,
             })
+            // Round-2 disarm (the deferred content reset must not survive
+            // a server-declared unreconstructible prefix): when THIS
+            // generation's repair hydrate deferred its viewport clear
+            // (the no-checkpoint fallback), the retention gap declares
+            // the missing prefix CANNOT be rebuilt — the pre-gap screen
+            // is the best available surface, so the pending clear is
+            // DISARMED here, before any suffix frame can consume it and
+            // wipe the screen mid-restore. The honest-loss UX proceeds
+            // and the retained suffix appends onto the preserved
+            // surface.
+            if (
+              typeof msg.attachRequestId === 'string'
+              && repairContentResetPendingRef.current === msg.attachRequestId
+            ) {
+              repairContentResetPendingRef.current = null
+            }
           } else {
             const reason = msg.reason === 'replay_window_exceeded'
               ? 'reconnect window exceeded'
