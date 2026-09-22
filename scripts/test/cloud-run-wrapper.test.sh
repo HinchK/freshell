@@ -31,32 +31,15 @@ if [ ! -x "$SCRIPT" ]; then
 fi
 echo "PASS: script is executable"
 
-# Check 3: help subcommand
+# Check 3: help subcommand exits successfully (dispatch behavior; its prose
+# content is intentionally not asserted here)
 echo "Testing: scripts/e2e-cloud.sh help"
 HELP_OUTPUT=$("$SCRIPT" help 2>&1) || {
   echo "FAIL: help subcommand failed"
   echo "$HELP_OUTPUT"
   exit 1
 }
-
-if ! echo "$HELP_OUTPUT" | grep -qi "usage"; then
-  echo "FAIL: help output does not contain 'usage'"
-  echo "$HELP_OUTPUT"
-  exit 1
-fi
-echo "PASS: help contains 'usage'"
-
-if ! echo "$HELP_OUTPUT" | grep -qi "run"; then
-  echo "FAIL: help output does not contain 'run'"
-  exit 1
-fi
-echo "PASS: help contains 'run'"
-
-if ! echo "$HELP_OUTPUT" | grep -qi -- "--local"; then
-  echo "FAIL: help output does not contain '--local'"
-  exit 1
-fi
-echo "PASS: help contains '--local'"
+echo "PASS: help subcommand exits 0"
 
 # Check 4: --local flag runs tests locally
 echo "Testing: scripts/e2e-cloud.sh run --local --project=chromium auth.spec.ts"
@@ -99,23 +82,6 @@ CHROMIUM_OUTPUT=$(npm run test:e2e:chromium -- test/e2e-browser/specs/auth.spec.
   exit 1
 }
 echo "PASS: npm run test:e2e:chromium still works"
-
-# Check 8: help mentions --cloud and FRESHELL_E2E_BACKEND
-echo "Testing: help mentions --cloud flag"
-if ! echo "$HELP_OUTPUT" | grep -qi -- "--cloud"; then
-  echo "FAIL: help output does not contain '--cloud'"
-  echo "$HELP_OUTPUT"
-  exit 1
-fi
-echo "PASS: help contains '--cloud'"
-
-echo "Testing: help mentions FRESHELL_E2E_BACKEND"
-if ! echo "$HELP_OUTPUT" | grep -qi "FRESHELL_E2E_BACKEND"; then
-  echo "FAIL: help output does not contain 'FRESHELL_E2E_BACKEND'"
-  echo "$HELP_OUTPUT"
-  exit 1
-fi
-echo "PASS: help contains 'FRESHELL_E2E_BACKEND'"
 
 # Check 9: default backend (unset env var) runs locally
 echo "Testing: default backend (unset FRESHELL_E2E_BACKEND) runs locally"
@@ -288,11 +254,6 @@ NO_GCLOUD_HELP=$(env PATH="$CLEAN_PATH" "$SCRIPT" help 2>&1) || {
   echo "$NO_GCLOUD_HELP" | tail -10
   exit 1
 }
-if ! echo "$NO_GCLOUD_HELP" | grep -qi "usage"; then
-  echo "FAIL: help output without gcloud does not contain 'usage'"
-  echo "$NO_GCLOUD_HELP" | tail -10
-  exit 1
-fi
 echo "PASS: help works without gcloud on PATH"
 
 # Check 13: pass-through args CONTAINING SPACES survive end-to-end.

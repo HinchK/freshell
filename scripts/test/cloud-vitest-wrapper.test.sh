@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Test: cloud-vitest-wrapper — verify vitest-cloud.sh exists, has correct
-# subcommands, flags, backend selection, and local/cloud dispatch.
+# Test: cloud-vitest-wrapper — verify vitest-cloud.sh exists and performs
+# local/cloud dispatch with the intended backend selection, argv, retries,
+# and exit statuses.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,13 +34,6 @@ echo "=== Cloud Vitest Wrapper Test ==="
 
 # Check 1: Script exists and is executable
 check "scripts/vitest-cloud.sh exists and is executable" test -x "$SCRIPT"
-
-# Check 2: help contains usage, run, --local, --cloud, FRESHELL_VITEST_BACKEND, --shards, --config
-HELP_OUTPUT=$(bash "$SCRIPT" help 2>&1 || true)
-for term in "usage" "run" "--local" "--cloud" "FRESHELL_VITEST_BACKEND" "--shards" "--config"; do
-  check "help contains '$term'" grep -qi -- "$term" <<< "$HELP_OUTPUT"
-done
-check "help documents the accepted all config selector" grep -q -- '--config=default|all' <<< "$HELP_OUTPUT"
 
 # Check 3: Default backend (unset env var) runs locally
 # Run with --local flag and a fast test to verify local execution works

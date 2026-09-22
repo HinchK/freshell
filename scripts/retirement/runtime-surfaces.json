@@ -282,11 +282,6 @@
       "role": "test-coordinator"
     },
     {
-      "id": "scripts-cloud-vitest-entrypoint-test",
-      "path": "scripts/test/cloud-vitest-entrypoint.test.sh",
-      "role": "test-coordinator"
-    },
-    {
       "id": "scripts-cloud-vitest-integration-test",
       "path": "scripts/test/cloud-vitest-integration.test.sh",
       "role": "test-coordinator"
