@@ -248,7 +248,34 @@ pub enum PacedPage {
 /// COMPLETES AT THE RING FRONT (the retained window swept through the
 /// normal live path, the gap recorded) — never a resumption toward an
 /// unreachable B.
-#[derive(Debug, Clone, PartialEq)]
+/// Why a paced tail completed with a recorded gap (round-5 finding 3,
+/// diagnostics): `GapCompleted` is produced by two SEMANTICALLY
+/// different exits, and every structured log event about one carries
+/// this mandatory reason so consumers can filter them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacedGapExitReason {
+    /// A GENUINE retention overrun (the plan:146 bounded-baseline
+    /// exit): the ring evicted part of the range the handoff still
+    /// owed — the lost interval is UNFETCHABLE (sunk as a
+    /// `replay_window_exceeded` retention gap).
+    RetentionOverrun,
+    /// The ordinary fixed-boundary residual exit: the completing chunk
+    /// covered B with frames staged past it — the declared interval is
+    /// RETAINED and fetchable (sunk as a `handoff_boundary_reached`
+    /// delivery gap; the client's checkpoint-cursor repair fetches it).
+    HandoffBoundaryResidual,
+}
+
+impl PacedGapExitReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RetentionOverrun => "retention_overrun",
+            Self::HandoffBoundaryResidual => "handoff_boundary_residual",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub enum PacedTailCompletion {
     /// Nothing was staged beyond the cursor within the completion's own
@@ -281,14 +308,14 @@ pub enum PacedTailCompletion {
     /// completion start). The caller advances its cursor to `end_seq` and
     /// switches to handoff calls.
     TargetCovered { end_seq: i64, serialized_bytes: u64 },
-    /// The plan:146 bounded-baseline exit (only
-    /// [`TerminalRegistry::handoff_paced_tail`] reports this): retention
-    /// overran the handoff cursor mid-handoff. The EXACT bounds-carrying
-    /// gap for the evicted interval was sunk through the subscriber's
-    /// sink FIRST, then the retained window (the ring front through the
-    /// head) flowed through the normal live fan-out path in the same
-    /// completing hold, and the deferral was CLEARED — the session
-    /// COMPLETES AT THE RING FRONT with the gap recorded. Never a
+    /// The plan:146 bounded-baseline exit: retention overran the handoff
+    /// cursor mid-handoff (`handoff_paced_tail`) or the completing chunk
+    /// covered the fixed boundary with a staged residual
+    /// (`complete_at_fixed_boundary`) — see [`PacedGapExitReason`] for the
+    /// two producers' semantics. In both shapes the EXACT bounds-carrying
+    /// gaps were sunk through the subscriber's sink FIRST (ordered ahead
+    /// of everything else), the deferral was CLEARED in the same hold,
+    /// and the session COMPLETES with the gap recorded — never a
     /// resumption of the paged handoff toward an unreachable B (a finite
     /// retention window cannot guarantee convergence against indefinitely
     /// faster output production — plan:146). Ends the paced session.
@@ -297,6 +324,9 @@ pub enum PacedTailCompletion {
         lost_to: i64,
         end_seq: i64,
         serialized_bytes: u64,
+        /// The mandatory diagnostics discriminator (round-5 finding 3):
+        /// which of the two gap exits produced this verdict.
+        reason: PacedGapExitReason,
     },
     /// Retention evicted part of the range the DRAIN phase still owes
     /// toward its fixed target — the exact bounds-carrying interval as
@@ -2810,6 +2840,9 @@ impl TerminalRegistry {
                 lost_to: oldest - 1,
                 end_seq: from_seq,
                 serialized_bytes: 0,
+                // THE plan:146 bounded-baseline exit: a GENUINE retention
+                // overrun (round-5 finding 3's diagnostics discriminator).
+                reason: PacedGapExitReason::RetentionOverrun,
             };
         }
         // Everything past `boundary` that the producer staged while the
@@ -4720,6 +4753,9 @@ fn complete_at_fixed_boundary(
             lost_to: back.1,
             end_seq,
             serialized_bytes,
+            // The ordinary fixed-boundary residual exit (round-5 finding
+            // 3's diagnostics discriminator): RETAINED, fetchable loss.
+            reason: PacedGapExitReason::HandoffBoundaryResidual,
         };
     }
     sub.paced_deferred = false;
@@ -7469,6 +7505,7 @@ mod tests {
                     lost_from,
                     lost_to,
                     end_seq,
+                    reason,
                     ..
                 } => {
                     // THE plan:146 FIXED-BOUNDARY EXIT: the session
@@ -7484,6 +7521,18 @@ mod tests {
                         lost_to, produced as i64,
                         "the delivery gap declares everything staged past the boundary \
                          through the producing head"
+                    );
+                    // Round-5 finding 3: the diagnostics carry the
+                    // mandatory gap-exit reason — the ORDINARY fetchable
+                    // fixed-boundary residual exit, never a retention
+                    // overrun (the declared interval is RETAINED and the
+                    // client's checkpoint-cursor repair fetches it).
+                    assert_eq!(
+                        reason,
+                        PacedGapExitReason::HandoffBoundaryResidual,
+                        "the fixed-boundary residual's GapCompleted carries the \
+                         handoff_boundary_residual reason (structured diagnostics \
+                         consumers filter on)"
                     );
                     declared_lost_to = lost_to;
                     cursor = cursor.max(end_seq);
@@ -7724,6 +7773,7 @@ mod tests {
                 lost_from,
                 lost_to,
                 end_seq,
+                reason,
                 ..
             } => {
                 assert_eq!(
@@ -7740,6 +7790,17 @@ mod tests {
                     end_seq, cursor,
                     "the session's delivered-through boundary stays at the cursor — \
                      nothing is swept in the exit hold (plan:145)"
+                );
+                // Round-5 finding 3: the diagnostics carry the mandatory
+                // gap-exit reason — a genuine retention overrun (the lost
+                // interval is UNFETCHABLE), never the fetchable
+                // fixed-boundary residual exit.
+                assert_eq!(
+                    reason,
+                    PacedGapExitReason::RetentionOverrun,
+                    "the mid-handoff retention overrun's GapCompleted carries the \
+                     retention_overrun reason (structured diagnostics consumers \
+                     filter on)"
                 );
             }
             PacedTailCompletion::Completed { .. } | PacedTailCompletion::CaughtUp => {

@@ -517,6 +517,7 @@ pub(crate) fn spawn_paced_drain(
                     lost_to,
                     end_seq,
                     serialized_bytes: _,
+                    reason,
                 } => {
                     // THE plan:146 BOUNDED-BASELINE EXIT (mid-handoff
                     // retention overrun): the registry already sank the
@@ -526,10 +527,16 @@ pub(crate) fn spawn_paced_drain(
                     // FRONT with the gap recorded; the paged handoff never
                     // resumes toward the unreachable boundary, and the
                     // client's bounded baseline recovery owns the post-gap
-                    // state.
+                    // state. Round-5 finding 3: the event carries the
+                    // MANDATORY gap-exit reason so production diagnostics
+                    // distinguish a genuine unfetchable retention overrun
+                    // (`retention_overrun`) from the ordinary fetchable
+                    // fixed-boundary residual exit
+                    // (`handoff_boundary_residual`).
                     tracing::info!(
                         terminal_id = %terminal_id,
                         attach_request_id = %attach_request_id,
+                        reason = reason.as_str(),
                         lost_from,
                         lost_to,
                         last_seq = end_seq,
