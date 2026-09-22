@@ -695,6 +695,25 @@ const freshAgentSlice = createSlice({
     },
 
     /**
+     * b8ke fence-heal (fix b): merge a typed stale-refusal's CURRENT
+     * (epoch, generation) into the EXISTING runtimeOwners record —
+     * ownerKind/transition/terminalId/aliasOf are preserved (the refusal
+     * corrects the fence pair only; it must not fabricate or clear owner
+     * identity). No record → no-op (nothing to correct; broadcasts,
+     * the created-frame fold, or the ready replay repopulate records).
+     * Same monotonic gate as applyRuntimeOwner: same-epoch older drops,
+     * a different epoch always wins.
+     */
+    applyRuntimeOwnerFenceRefresh(state, action: PayloadAction<{ provider: string; sessionId: string; epoch: number; generation: number }>) {
+      const { provider, sessionId, epoch, generation } = action.payload
+      const key = `${provider}:${sessionId}`
+      const existing = state.runtimeOwners[key]
+      if (!existing) return
+      if (existing.epoch === epoch && generation < existing.generation) return
+      state.runtimeOwners[key] = { ...existing, epoch, generation, updatedAt: Date.now() }
+    },
+
+    /**
      * kata b8ke (round-2 review): the ready handler dispatches this BEFORE
      * folding the ready.runtimeOwners replay — the client resets its
      * owner/generation state on every (re)connect so a restarted server's
@@ -714,6 +733,7 @@ export const {
   addUserMessage,
   appendStreamDelta,
   applyRuntimeOwner,
+  applyRuntimeOwnerFenceRefresh,
   clearPendingCreate,
   clearPendingCreateFailure,
   clearPendingCreateFailureForSession,

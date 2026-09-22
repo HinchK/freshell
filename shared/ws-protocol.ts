@@ -1277,6 +1277,15 @@ export type TerminalKilledMessage = {
   terminalId: string
   success: boolean
   error?: string
+  /** b8ke fence-heal (fix b): the typed stale-claim refusal trio (the
+   *  StaleClaim arm's coordinator CURRENTS — the owning kind, its
+   *  generation, and the emitting server's boot epoch), additive and
+   *  absent on every non-stale kill answer (frozen-client parity). The
+   *  correlated close flow surfaces the pair on its await failure result
+   *  so the caller can fold it into the runtimeOwners fence. */
+  ownerKind?: 'terminal' | 'fresh-agent'
+  ownerEpoch?: number
+  ownerGeneration?: number
 }
 
 /**

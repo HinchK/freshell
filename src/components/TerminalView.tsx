@@ -68,6 +68,8 @@ import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
 import { resolveTerminalKillFence, sendTerminalKill } from '@/lib/terminal-kill'
+import { foldRefusalFencePair, hasRefusalFencePair, STALE_REFUSAL_MESSAGE_PREFIX } from '@/lib/owner-fence-heal'
+import type { RefusalFencePair } from '@/lib/owner-fence-heal'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import {
   buildCodexIdentityMismatchRepairContent,
@@ -3777,6 +3779,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         }, delay)
       }
 
+      // b8ke fence-heal (fix b): fold a typed refusal's CURRENT pair into
+      // THIS pane's runtimeOwners fence (canonicalized inside the helper —
+      // the same key the pane's next claim's fence read resolves).
+      const foldRefusalFence = (refusal: RefusalFencePair) => {
+        foldRefusalFencePair(dispatch, appStore.getState(), contentRef.current ?? {}, refusal)
+      }
+
       // F9: the server no longer knows the terminal this still-launching pane
       // points at. Pump bounded same-requestId re-creates instead of minting a
       // fresh recovery identity for a pane that never finished launching.
@@ -5174,11 +5183,55 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
               },
             }))
           }
+          // b8ke fence-heal (fix b): fold the refusal's CURRENT (epoch,
+          // generation) into the pane's runtimeOwners fence (merge-only —
+          // the record's owner identity is preserved). The NEXT decision
+          // (the card's user Retry / a reconcile re-materialization) then
+          // re-captures the fresh pair; the r35 automatic re-drive keeps
+          // its captured per-request pair.
+          foldRefusalFence(msg)
+          // b8ke fence-heal fast path (plan-review round 1, finding 4): a
+          // stale-observed-generation refusal carrying the pair PROVES the
+          // request's own pair can never win a re-drive — abandon the
+          // request to the reconcile flow (resolveReserveExhaustionViaReconcile
+          // sends one pane.reconcile.request; its re-materialized request
+          // re-captures the FRESH pair from the folded store) instead of
+          // looping the bounded re-drive. Refusals WITHOUT the pair (legacy
+          // servers; the r35-pinned frame models no owner fields) keep the
+          // existing bounded re-drive — the in-flight-lifecycle refusals
+          // (different frozen message) keep it too.
+          if (
+            hasRefusalFencePair(msg)
+            && (msg.message ?? '').startsWith(STALE_REFUSAL_MESSAGE_PREFIX)
+          ) {
+            resolveReserveExhaustionViaReconcile()
+            return
+          }
           // Another create holds this sessionRef's lease. Re-drive the SAME
           // terminal.create after the server's hint (floored), bounded by a
           // wall-clock window; on exhaustion, auto-resolve via a single-pane
           // reconcile instead of surfacing a dead-end error.
           redriveAfterSessionReserved(reqId, msg.retryAfterMs)
+          return
+        }
+
+        // b8ke fence-heal (fix b): the pane-terminal-scoped typed refusal
+        // (no requestId, the pane's own terminalId — a refused attach or a
+        // fire-and-forget kill, identical frame shape) previously matched
+        // NO branch: the pane silently never attached and refused kills
+        // went unfelt (the wedge). Fold the refusal's CURRENT pair so the
+        // next attach/kill claim — each re-reads the fence at send time —
+        // is fresh. The pair presence keys the branch: only typed
+        // ownership refusals carry it, so INVALID_TERMINAL_ID and other
+        // no-requestId frames keep their own handling below.
+        if (
+          msg.type === 'error'
+          && !msg.requestId
+          && msg.terminalId
+          && msg.terminalId === tid
+          && hasRefusalFencePair(msg)
+        ) {
+          foldRefusalFence(msg)
           return
         }
 

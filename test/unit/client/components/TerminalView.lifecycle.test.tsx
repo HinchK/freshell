@@ -146,6 +146,7 @@ import TerminalView, {
   __getLastSentViewportCacheSizeForTests,
   __resetLastSentViewportCacheForTests,
   isEngagementInput,
+  RESERVE_RETRY_FLOOR_MS,
 } from '@/components/TerminalView'
 import { resetEnsureExtensionsRegistryCacheForTests } from '@/hooks/useEnsureExtensionsRegistry'
 
@@ -3686,6 +3687,203 @@ describe('TerminalView lifecycle updates', () => {
       // and the store record advanced:
       const rec = store.getState().freshAgent.runtimeOwners[`codex:${TYPED_SESSION_ID}`]
       expect(rec.generation).toBe(6)
+    })
+
+    // b8ke fence-heal (fix b): the typed create refusal's CURRENT pair
+    // folds into the pane's runtimeOwners record (merge-only) — the
+    // automatic re-drive keeps its captured per-request pair (the r35
+    // contract), and the NEXT decision (the card's user Retry launch, a
+    // reconcileEpoch bump) re-captures the FRESH pair from the folded store.
+    it('a typed create refusal folds the fresh pair; the re-drive keeps the ORIGINAL pair and the user Retry re-captures fresh (fix b)', async () => {
+      const { store } = setupTypedPane({
+        seed: (seededStore) => {
+          act(() => {
+            seededStore.dispatch(applyRuntimeOwner(runtimeOwnerFrame({ generation: 5 })))
+          })
+        },
+      })
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+        expect(createCalls()).toHaveLength(1)
+      })
+      // The first create carried the observed fence (epoch 1, generation 5).
+      expect(createCalls()[0]).toMatchObject({
+        requestId: 'req-b8ke',
+        observedEpoch: 1,
+        observedGeneration: 5,
+      })
+
+      // The typed refusal carrying the coordinator's CURRENT pair (the
+      // in-flight-lease shape: ownerKind present, no stale-generation
+      // prefix — the bounded automatic re-drive still applies).
+      act(() => {
+        messageHandler!({
+          type: 'error',
+          code: 'SESSION_RESERVED',
+          message: 'Another terminal.create for this sessionRef is in flight',
+          requestId: 'req-b8ke',
+          ownerKind: 'terminal',
+          ownerEpoch: 1,
+          ownerGeneration: 9,
+          timestamp: new Date().toISOString(),
+        })
+      })
+
+      // The fold landed on the pane's owner record (merge-only: the
+      // refusal's current pair never clears the owner identity).
+      const folded = store.getState().freshAgent.runtimeOwners[`codex:${TYPED_SESSION_ID}`]
+      expect(folded.generation).toBe(9)
+      expect(folded.ownerKind).toBe('terminal')
+
+      // r35 intact: the automatic re-drive re-sends the SAME request
+      // carrying the ORIGINAL (epoch 1, generation 5) pair.
+      await waitFor(() => {
+        expect(createCalls()).toHaveLength(2)
+      })
+      expect(createCalls()[1]).toMatchObject({
+        requestId: 'req-b8ke',
+        observedEpoch: 1,
+        observedGeneration: 5,
+      })
+      expect(createCalls()[1].observedGeneration).not.toBe(9)
+
+      // The user's Retry launch is a NEW lifecycle decision (the
+      // reconcileEpoch bump is its only re-fire signal) — it re-captures
+      // the FRESH (folded) pair.
+      const card = await screen.findByTestId('terminal-launch-failure-card')
+      fireEvent.click(within(card).getByRole('button', { name: 'Retry launch' }))
+
+      await waitFor(() => {
+        expect(createCalls()).toHaveLength(3)
+      })
+      expect(createCalls()[2]).toMatchObject({
+        requestId: 'req-b8ke',
+        observedEpoch: 1,
+        observedGeneration: 9,
+      })
+    })
+
+    // b8ke fence-heal (fix b): the pane-terminal-scoped typed refusal (no
+    // requestId, the pane's own terminalId — a refused attach or a
+    // fire-and-forget kill, identical frame shape) previously matched NO
+    // branch: the pane silently never attached (the wedge). The fold
+    // refreshes the fence so the NEXT attach — the reconnect path falls
+    // through unconditionally to attachTerminal, and the send-time fence
+    // read re-selects from the store — carries the fresh pair.
+    it('a pane-terminal-scoped typed refusal folds the fresh pair and the next attach carries it (fix b)', async () => {
+      const { store } = setupTypedPane({
+        content: { status: 'running', terminalId: 't-attach-b8ke' },
+        seed: (seededStore) => {
+          act(() => {
+            seededStore.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+              generation: 3,
+              terminalId: 't-attach-b8ke',
+            })))
+          })
+        },
+      })
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+        const mountAttach = sentMessages().find((m: any) => m.type === 'terminal.attach')
+        expect(mountAttach).toBeTruthy()
+      })
+      // The mount-time attach carried the observed fence (epoch 1, generation 3).
+      const mountAttach = sentMessages().find((m: any) => m.type === 'terminal.attach')!
+      expect(mountAttach).toMatchObject({
+        terminalId: 't-attach-b8ke',
+        observedEpoch: 1,
+        observedGeneration: 3,
+      })
+
+      // The typed refusal: no requestId, the pane's own terminalId.
+      act(() => {
+        messageHandler!({
+          type: 'error',
+          code: 'SESSION_RESERVED',
+          terminalId: 't-attach-b8ke',
+          ownerEpoch: 1,
+          ownerGeneration: 8,
+          message: 'Session ownership moved on (stale observed generation); refresh and retry.',
+          timestamp: new Date().toISOString(),
+        })
+      })
+
+      // The fold landed on the pane's owner record.
+      const folded = store.getState().freshAgent.runtimeOwners[`codex:${TYPED_SESSION_ID}`]
+      expect(folded.generation).toBe(8)
+
+      // The next attach (driven via the reconnect handler — it falls
+      // through unconditionally to attachTerminal for visible panes with
+      // a terminalId) carries the FRESH pair from the send-time fence read.
+      act(() => {
+        reconnectHandler?.()
+      })
+      const reattach = [...sentMessages()]
+        .reverse()
+        .find((m: any) => m.type === 'terminal.attach')!
+      expect(reattach).toMatchObject({
+        terminalId: 't-attach-b8ke',
+        observedEpoch: 1,
+        observedGeneration: 8,
+      })
+    })
+
+    // b8ke fence-heal fast path (plan-review round 1, finding 4): a
+    // stale-observed-generation refusal carrying the pair PROVES the
+    // request's own pair can never win a re-drive — the branch folds the
+    // pair and abandons the request to the reconcile flow instead of
+    // looping the bounded re-drive. Refusals WITHOUT the pair (legacy
+    // servers; the r35-pinned frame models no owner fields) keep the
+    // bounded re-drive — that test stays green unchanged.
+    it('a stale-prefix create refusal carrying the pair abandons the re-drive for the reconcile flow (fix b fast path)', async () => {
+      const { store } = setupTypedPane({
+        seed: (seededStore) => {
+          act(() => {
+            seededStore.dispatch(applyRuntimeOwner(runtimeOwnerFrame({ generation: 5 })))
+          })
+        },
+      })
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+        expect(createCalls()).toHaveLength(1)
+      })
+      expect(createCalls()[0]).toMatchObject({
+        requestId: 'req-b8ke',
+        observedEpoch: 1,
+        observedGeneration: 5,
+      })
+
+      // The stale-prefix refusal carrying the CURRENT pair.
+      act(() => {
+        messageHandler!({
+          type: 'error',
+          code: 'SESSION_RESERVED',
+          message: 'Session ownership moved on (stale observed generation); refresh and retry.',
+          requestId: 'req-b8ke',
+          ownerEpoch: 1,
+          ownerGeneration: 9,
+          timestamp: new Date().toISOString(),
+        })
+      })
+
+      // The store holds the folded pair…
+      const folded = store.getState().freshAgent.runtimeOwners[`codex:${TYPED_SESSION_ID}`]
+      expect(folded.generation).toBe(9)
+
+      // …and the request is abandoned to the reconcile flow: exactly one
+      // pane.reconcile.request naming this pane's createRequestId…
+      const reconcile = sentMessages().find((m: any) => m.type === 'pane.reconcile.request')
+      expect(reconcile).toBeTruthy()
+      expect(JSON.stringify(reconcile)).toContain('req-b8ke')
+
+      // …with NO further same-requestId terminal.create inside the
+      // re-drive window (the re-drive cannot win with the proven-stale
+      // pair).
+      await new Promise((resolve) => setTimeout(resolve, RESERVE_RETRY_FLOOR_MS + 100))
+      expect(createCalls()).toHaveLength(1)
     })
 
     it('b8ke ext r7: a terminal pane holding the PRE-REKEY id resolves the alias chain to the canonical owner', async () => {

@@ -169,6 +169,49 @@ describe('kill-ack', () => {
       emit({ type: 'terminal.killed', requestId: sent.requestId, terminalId: 'term-fence', success: true })
       await expect(pending).resolves.toEqual({ ok: true })
     })
+
+    // b8ke fence-heal (fix b): the correlated TerminalKilled{success:false}
+    // ack is the ONLY frame the await resolves from (the server's Error-arm
+    // refusals send request_id: None and never correlate) — so the typed
+    // stale-claim refusal's CURRENT pair must ride the await failure result
+    // for the CALLER (TabBar, which holds the sessionRef identity) to fold.
+    it('surfaces the typed refusal pair off the correlated TerminalKilled{success:false} ack (b8ke fence-heal fix b)', async () => {
+      const pending = sendTerminalKillAndAwait('term-refused', { createRequestId: 'cr-refused' })
+      const sent = mockSend.mock.calls[0][0]
+      emit({
+        type: 'terminal.killed',
+        requestId: sent.requestId,
+        terminalId: 'term-refused',
+        success: false,
+        error: 'ownership moved to a newer runtime; refresh and retry',
+        ownerKind: 'terminal',
+        ownerEpoch: 12,
+        ownerGeneration: 40,
+      })
+      await expect(pending).resolves.toEqual({
+        ok: false,
+        error: 'ownership moved to a newer runtime; refresh and retry',
+        ownerEpoch: 12,
+        ownerGeneration: 40,
+      })
+      expect(consumeTerminalReleaseMark('term-refused')).toBe(false, 'a refused close is NOT released')
+    })
+
+    it('a failure ack WITHOUT the pair resolves as before (legacy-server parity — no fabricated fields)', async () => {
+      const pending = sendTerminalKillAndAwait('term-untyped')
+      const sent = mockSend.mock.calls[0][0]
+      emit({
+        type: 'terminal.killed',
+        requestId: sent.requestId,
+        terminalId: 'term-untyped',
+        success: false,
+        error: 'the terminal close could not be recorded durably',
+      })
+      await expect(pending).resolves.toEqual({
+        ok: false,
+        error: 'the terminal close could not be recorded durably',
+      })
+    })
   })
 
   describe('sendFreshAgentKillAndAwait', () => {

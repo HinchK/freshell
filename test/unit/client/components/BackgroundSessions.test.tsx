@@ -12,6 +12,7 @@ import freshAgentReducer, { applyRuntimeOwner } from '../../../../src/store/fres
 
 const sentMessages: any[] = []
 const mockGetTerminalDirectoryPage = vi.fn()
+const wsMessageHandlers = vi.hoisted(() => new Set<(msg: unknown) => void>())
 
 vi.mock('@/lib/ws-client', () => ({
   getWsClient: () => ({
@@ -19,7 +20,12 @@ vi.mock('@/lib/ws-client', () => ({
     send: (msg: any) => {
       sentMessages.push(msg)
     },
-    onMessage: () => () => {},
+    onMessage: (handler: (msg: unknown) => void) => {
+      wsMessageHandlers.add(handler)
+      return () => {
+        wsMessageHandlers.delete(handler)
+      }
+    },
   }),
 }))
 
@@ -46,6 +52,7 @@ function makeStore() {
 describe('BackgroundSessions', () => {
   beforeEach(() => {
     sentMessages.length = 0
+    wsMessageHandlers.clear()
     mockGetTerminalDirectoryPage.mockReset()
     mockGetTerminalDirectoryPage.mockResolvedValue({
       items: [
@@ -209,5 +216,69 @@ describe('BackgroundSessions', () => {
     await user.click(kill)
     // No owner record for the session → no pair on the wire.
     expect(sentMessages).toContainEqual({ type: 'terminal.kill', terminalId: 'term-codex-1' })
+  })
+
+  // b8ke fence-heal (fix b): detached terminals have NO mounted
+  // TerminalView to consume their typed kill refusal — the component's own
+  // ws subscription folds the refusal's CURRENT pair onto the row's session
+  // record, so the NEXT Kill click (send-time fence read) carries the fresh
+  // pair instead of looping on the refused stale one.
+  it('a typed kill refusal for a background row folds the fresh pair — the NEXT Kill click sends it (fix b)', async () => {
+    const store = makeStore()
+    store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'codex-sess-abc',
+      epoch: 12,
+      generation: 34,
+      ownerKind: 'terminal',
+      operationId: 'handoff-1',
+      transition: 'handoff-committed',
+    }))
+    const user = userEvent.setup()
+    render(
+      <Provider store={store}>
+        <BackgroundSessions />
+      </Provider>,
+    )
+    const kill = await screen.findByRole('button', { name: /kill/i })
+
+    // The first Kill carries the observed (stale) pair.
+    await user.click(kill)
+    expect(sentMessages).toContainEqual({
+      type: 'terminal.kill',
+      terminalId: 'term-codex-1',
+      observedEpoch: 12,
+      observedGeneration: 34,
+    })
+
+    // The typed refusal (no requestId; the row's own terminalId) lands on
+    // the component's message subscription.
+    const refusal = {
+      type: 'error',
+      code: 'SESSION_RESERVED',
+      terminalId: 'term-codex-1',
+      ownerKind: 'terminal',
+      ownerEpoch: 12,
+      ownerGeneration: 40,
+      message: 'ownership moved to a newer runtime; refresh and retry',
+      timestamp: new Date().toISOString(),
+    }
+    for (const handler of [...wsMessageHandlers]) handler(refusal)
+
+    // The fold landed on the row's session record (merge-only).
+    const folded = store.getState().freshAgent.runtimeOwners['codex:codex-sess-abc']
+    expect(folded.generation).toBe(40)
+    expect(folded.ownerKind).toBe('terminal')
+
+    // The NEXT Kill click sends the fresh pair.
+    sentMessages.length = 0
+    await user.click(kill)
+    expect(sentMessages).toContainEqual({
+      type: 'terminal.kill',
+      terminalId: 'term-codex-1',
+      observedEpoch: 12,
+      observedGeneration: 40,
+    })
   })
 })

@@ -65,9 +65,22 @@ export const KILL_ACK_TIMEOUT_MESSAGE =
 
 export type KillAck =
   | { ok: true }
-  | { ok: false; error?: string; timedOut?: true }
+  | {
+      ok: false
+      error?: string
+      timedOut?: true
+      /** b8ke fence-heal (fix b): the typed stale-claim refusal's CURRENT
+       *  (epoch, generation) pair, lifted off the correlated
+       *  `terminal.killed{success:false}` ack (the only frame this await
+       *  resolves from — the server's Error-arm refusals send
+       *  `request_id: None` and never correlate). The CALLER (which holds
+       *  the sessionRef identity) folds it into the runtimeOwners fence so
+       *  the next attempt is born fresh. Absent on every non-stale answer. */
+      ownerEpoch?: number
+      ownerGeneration?: number
+    }
 
-type FrameVerdict = { ok: boolean; error?: string; grace?: number }
+type FrameVerdict = { ok: boolean; error?: string; grace?: number; ownerEpoch?: number; ownerGeneration?: number }
 
 function awaitCloseFrame(
   match: (msg: unknown) => FrameVerdict | null,
@@ -98,7 +111,14 @@ function awaitCloseFrame(
         }
         return
       }
-      finish(verdict.ok ? { ok: true } : { ok: false, error: verdict.error })
+      finish(verdict.ok
+        ? { ok: true }
+        : {
+            ok: false,
+            error: verdict.error,
+            ...(verdict.ownerEpoch !== undefined ? { ownerEpoch: verdict.ownerEpoch } : {}),
+            ...(verdict.ownerGeneration !== undefined ? { ownerGeneration: verdict.ownerGeneration } : {}),
+          })
     })
     timer = setTimeout(() => finish({ ok: false, timedOut: true }), timeoutMs)
   })
@@ -142,7 +162,15 @@ export function sendTerminalKillAndAwait(
   const wait = awaitCloseFrame((msg) => {
     const m = msg as Record<string, unknown>
     if (m.type === 'terminal.killed' && m.requestId === requestId) {
-      return { ok: m.success !== false, error: typeof m.error === 'string' ? m.error : undefined }
+      // b8ke fence-heal (fix b): surface the typed stale-claim refusal's
+      // CURRENT pair on the failure result — the caller folds it into the
+      // runtimeOwners fence (kill-ack itself holds only the terminalId).
+      return {
+        ok: m.success !== false,
+        error: typeof m.error === 'string' ? m.error : undefined,
+        ...(typeof m.ownerEpoch === 'number' ? { ownerEpoch: m.ownerEpoch } : {}),
+        ...(typeof m.ownerGeneration === 'number' ? { ownerGeneration: m.ownerGeneration } : {}),
+      }
     }
     // Legacy-server fallbacks (see the module doc). The exit arm is
     // DEFERRED (F7): on a current server the correlated terminal.killed
