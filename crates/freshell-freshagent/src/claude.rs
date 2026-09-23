@@ -12428,17 +12428,38 @@ rl.on('line', (line) => {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        // THE REFUSAL WINDOW: a handoff owns the key's transition.
-        let freshell_ownership::BeginOutcome::Granted { generation: _ } = registry.begin_handoff(
-            "claude",
-            FRESH_CREATE_DURABLE_ID,
-            freshell_ownership::RuntimeOwnerKind::Terminal,
-            "handoff-blocking-d3-f1",
-            None,
-            "test",
-            0,
-        ) else {
-            panic!("expected the Handoff begin to be granted")
+        // THE REFUSAL WINDOW: a handoff owns the key's transition. The
+        // begin honors the registry's own transient contract: the
+        // create's adoption can still hold its attach guard
+        // (`in_flight_attaches > 0` on a Vacant record — the b8ke ext
+        // r32 F1 exit-during-guard window) after the identity binding is
+        // recorded, so a single-shot begin can answer
+        // `Blocked { retry_after_ms }` under heavy parallel load. The
+        // production handoff caller RETRIES Blocked; the test applies the
+        // same bounded retry instead of assuming an always-instant
+        // grant (the kata-hsrh flake discipline).
+        let begin_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        let _handoff_generation = loop {
+            match registry.begin_handoff(
+                "claude",
+                FRESH_CREATE_DURABLE_ID,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "handoff-blocking-d3-f1",
+                None,
+                "test",
+                0,
+            ) {
+                freshell_ownership::BeginOutcome::Granted { generation } => break generation,
+                freshell_ownership::BeginOutcome::Blocked { retry_after_ms, .. } => {
+                    assert!(
+                        tokio::time::Instant::now() < begin_deadline,
+                        "the Handoff begin never cleared its transient Blocked window"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(retry_after_ms.min(50)))
+                        .await;
+                }
+                other => panic!("expected the Handoff begin to be granted, got {other:?}"),
+            }
         };
 
         st.handle_kill(kill_msg(&placeholder)).await;
