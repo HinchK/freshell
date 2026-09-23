@@ -5964,6 +5964,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // - settled 'exited' with a non-zero exit record → alert + Relaunch
   // - settled 'exited' with NO record (post-reload — the ephemeral slice is
   //   empty) → codeless alert + Relaunch
+  // - settled 'exited' with a CLEAN (code 0) record whose canonical owner
+  //   record is VACANT (the killed-session shape, the-usual focused fix 2)
+  //   → quiet recovery bar + Reopen (the user-driven path; never automatic)
   // - settled 'error' WITH a recorded non-zero exit: a crash BEFORE
   //   terminal.attach.ready settles via failLaunch as 'error', not 'exited' —
   //   the dominant timing for a fast-crashing CLI. Same user situation
@@ -5973,8 +5976,23 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const settledDead =
     (terminalContent.status === 'exited' && (exitRecord ? exitRecord.exitCode !== 0 : true)) ||
     (terminalContent.status === 'error' && Boolean(exitRecord && exitRecord.exitCode !== 0))
+  // the-usual focused fix 2 (Major): the killed-session recovery affordance.
+  // A clean exit (code 0 — the terminal.kill wire contract) whose canonical
+  // runtime-owner record folds VACANT is the cross-device-kill shape: the
+  // session is durably stopped and the pane must surface the user-driven
+  // reopen action (never an automatic relaunch). Deliberate clean exits stay
+  // quiet: a session whose record is still Live (or absent) exited on
+  // purpose, and the fenced/in-progress/divergent owner states own their own
+  // typed cards — the affordance renders only when no owner card does.
+  const killedSessionVacant = Boolean(
+    isAgentPane
+    && terminalContent.status === 'exited'
+    && exitRecord?.exitCode === 0
+    && freshAgentOwnerDivergence === null
+    && terminalRuntimeOwner?.ownerKind === 'vacant'
+  )
   const showExitBanner = Boolean(
-    isAgentPane && (activeNotice || terminalContent.crashTrace || settledDead)
+    isAgentPane && (activeNotice || terminalContent.crashTrace || settledDead || killedSessionVacant)
   )
 
   // ── kata b8ke: typed recovery surfaces ──
@@ -6236,6 +6254,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             notice={activeNotice ?? null}
             crashTrace={terminalContent.crashTrace ?? null}
             settledDead={settledDead}
+            vacantRecovery={killedSessionVacant}
             resumeCycles={resumeCycles}
             canResume={Boolean(
               terminalContent.sessionRef && terminalContent.sessionRef.provider === terminalContent.mode

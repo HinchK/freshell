@@ -1332,24 +1332,26 @@ test.describe('Session handoff across two devices (rust only)', () => {
     }
   })
 
-  // the-usual ownership-fence-fix Task 7 Test B (delta round-4 rework, F1):
-  // the cross-device leg. Device A opens the seeded session (terminal-lane
-  // resume create) and stays connected; device B attaches to the SAME
-  // terminal from its own sidebar, then KILLS it via the real shift-click
-  // affordance -- committing a new ownership generation (the durable stop)
-  // behind A's back. A's pane folds the exit and must converge to the
-  // honest EXITED state and STAY there: a killed session NEVER
-  // auto-restarts (delta F1) -- nothing moves until the user acts (a
-  // bounded negative poll pins the stillness). The USER-DRIVEN reopen
-  // -- A closes the dead pane's tab and clicks the same session row in
-  // its sidebar (the fresh resume-create) -- must converge with NO
-  // page reload: post-fix every terminal-lane commit broadcasts its own
-  // committed (epoch, generation) pair AND terminal.created carries it
-  // (folded before the queued attach), so the reopen's attach lands and
-  // A's page is live again. Pre-fix the commits were silent: the reopen's
-  // queued attach was refused typed forever -- the recorded incident's
-  // exact wedge (the pane stuck "Recovering terminal output", no PTY
-  // output until a page reload).
+  // the-usual ownership-fence-fix Task 7 Test B (delta round-4 rework, F1;
+  // focused review 2): the cross-device leg. Device A opens the seeded
+  // session (terminal-lane resume create) and stays connected; device B
+  // attaches to the SAME terminal from its own sidebar, then KILLS it via
+  // the real shift-click affordance -- committing a new ownership generation
+  // (the durable stop) behind A's back. A's pane folds the exit and must
+  // converge to the honest EXITED state and STAY there: a killed session
+  // NEVER auto-restarts (delta F1) -- nothing moves until the user acts (a
+  // bounded negative poll pins the stillness). The pane must also SURFACE
+  // its recovery affordance (focused review 2: the killed-session shape --
+  // clean exit code 0 + the canonical owner record folded VACANT -- renders
+  // the in-pane Reopen action, never an actionless dead pane). The
+  // USER-DRIVEN reopen -- A clicks that surfaced in-pane affordance (the
+  // respawn resume-create) -- must converge with NO page reload: post-fix
+  // every terminal-lane commit broadcasts its own committed (epoch,
+  // generation) pair AND terminal.created carries it (folded before the
+  // queued attach), so the reopen's attach lands and A's page is live
+  // again. Pre-fix the commits were silent: the reopen's queued attach was
+  // refused typed forever -- the recorded incident's exact wedge (the pane
+  // stuck "Recovering terminal output", no PTY output until a page reload).
   test('cross-device kill+reopen does not wedge a connected page (no reload)', async ({ browser }) => {
     const CODEX_SESSION_ID = '21000000-aaaa-4bbb-8ccc-000000000002'
     const SESSION_TITLE = 'fence-heal cross-device codex session'
@@ -1483,41 +1485,36 @@ test.describe('Session handoff across two devices (rust only)', () => {
       await expect(aRow).toHaveAttribute('data-is-running', 'false', { timeout: 15_000 })
       // A kill is a CLEAN exit by wire contract (the registry fans
       // terminal.exit{exitCode:0} on the kill path), so the loud crash
-      // banner intentionally does NOT render: the pane surfaces its
-      // honest quiet exited state, and recovery is USER-DRIVEN, never
-      // automatic.
+      // banner intentionally does NOT render — but the killed-session
+      // shape (clean exit + the stop commit's VACANT owner record) must
+      // SURFACE the recovery affordance (focused review 2): never an
+      // actionless dead pane. Recovery is USER-DRIVEN, never automatic.
+      const reopenButton = deviceA.page
+        .locator(`[data-context="terminal"][data-tab-id="${aTabId}"]`)
+        .getByRole('button', { name: 'Reopen codex session' })
+      await expect(reopenButton).toBeVisible({ timeout: 15_000 })
       await deviceA.page.waitForTimeout(8_000)
       expect((await deviceA.harness.getPaneLayout(aTabId))?.content?.terminalId ?? null).toBe(null)
       expect((await deviceA.harness.getPaneLayout(aTabId))?.content?.status).toBe('exited')
 
-      // 5. The USER-DRIVEN reopen (no reload): A closes the dead pane's
-      //    tab (plain close is DETACH-ONLY — the terminal is already
-      //    dead), then clicks the same session row in its sidebar — a
-      //    fresh resume-create that commits a new ownership generation.
-      //    Post-fix the commit broadcasts its own committed pair AND
-      //    terminal.created carries it (folded before the queued
-      //    attach), so the reopened pane lands on a new terminal;
-      //    pre-fix (base_ref) the reopen wedged behind the silent
-      //    commits (the recorded incident).
-      await deviceA.page
-        .locator(`[data-context="tab"][data-tab-id="${aTabId}"]`)
-        .getByRole('button', { name: /close/i })
-        .click()
-      await expect(async () => {
-        expect(await deviceA.harness.getTabCount()).toBe(aTabCountBefore)
-      }).toPass({ timeout: 15_000 })
-      await aRow.click()
-      await expect(async () => {
-        expect(await deviceA.harness.getTabCount()).toBe(aTabCountBefore + 1)
-      }).toPass({ timeout: 15_000 })
-      const reopenedTabId = (await deviceA.harness.getActiveTabId())!
+      // 5. The USER-DRIVEN reopen (no reload): A clicks the pane's SURFACED
+      //    recovery affordance — the respawn resume-create that commits a
+      //    new ownership generation in the SAME pane. Post-fix the commit
+      //    broadcasts its own committed pair AND terminal.created carries it
+      //    (folded before the queued attach), so the reopened pane lands on a
+      //    new terminal; pre-fix (base_ref) the reopen wedged behind the
+      //    silent commits (the recorded incident).
+      const aTabCountAtReopen = await deviceA.harness.getTabCount()
+      await reopenButton.click()
       const reopenedTerminalId: string = await expect
         .poll(
-          async () => (await deviceA.harness.getPaneLayout(reopenedTabId))?.content?.terminalId ?? null,
+          async () => (await deviceA.harness.getPaneLayout(aTabId))?.content?.terminalId ?? null,
           { timeout: 30_000 },
         )
         .not.toBeNull()
-        .then(async () => (await deviceA.harness.getPaneLayout(reopenedTabId))?.content?.terminalId)
+        .then(async () => (await deviceA.harness.getPaneLayout(aTabId))?.content?.terminalId)
+      // The reopen stays in the SAME pane/tab — no new tab was minted.
+      expect(await deviceA.harness.getTabCount()).toBe(aTabCountAtReopen)
       // A TRUE kill never resurrects the dead terminal: the reopen is a
       // new PTY.
       expect(reopenedTerminalId).not.toBe(firstTerminalId)
@@ -1534,7 +1531,7 @@ test.describe('Session handoff across two devices (rust only)', () => {
       // 6. A round-trips input on the reopened terminal -- the connected page
       //    never wedged and never reloaded.
       await deviceA.page
-        .locator(`[data-context="terminal"][data-tab-id="${reopenedTabId}"] .xterm`)
+        .locator(`[data-context="terminal"][data-tab-id="${aTabId}"] .xterm`)
         .first()
         .click()
       await deviceA.page.keyboard.type('fence-heal-cross-device')

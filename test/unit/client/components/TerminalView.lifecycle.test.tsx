@@ -7,6 +7,7 @@ import panesReducer, { removeLayout, requestPaneRefresh, setPaneCloseError } fro
 import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/settingsSlice'
 import connectionReducer, { setStatus as setConnectionStatus } from '@/store/connectionSlice'
 import freshAgentReducer, { applyRuntimeOwner } from '@/store/freshAgentSlice'
+import terminalLifecycleReducer from '@/store/terminalLifecycleSlice'
 import sessionActivityReducer from '@/store/sessionActivitySlice'
 import tabRecencyReducer from '@/store/tabRecencySlice'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
@@ -3467,6 +3468,11 @@ describe('TerminalView lifecycle updates', () => {
           settings: settingsReducer,
           connection: connectionReducer,
           freshAgent: freshAgentReducer,
+          // The production store always mounts the ephemeral exit/notice
+          // slice (store.ts); the focused-fix-2 killed-session test pins the
+          // exit-record-driven recovery affordance, whose render conditions
+          // read it (selectExitRecord).
+          terminalLifecycle: terminalLifecycleReducer,
         },
         preloadedState: {
           tabs: {
@@ -4405,6 +4411,92 @@ describe('TerminalView lifecycle updates', () => {
       expect(sentMessages().filter((m: any) => m.type === 'terminal.create')).toHaveLength(0)
     })
 
+    // the-usual ownership-fence-fix focused review 2 (Major): the killed
+    // session pane must SURFACE its recovery affordance. The cross-device
+    // kill shape — a clean exit (code 0, the terminal.kill wire contract)
+    // whose stop-commit owner frame folds the canonical record VACANT —
+    // shows the in-pane reopen action (never an automatic relaunch).
+    // Pre-fix, code 0 fell through every settledDead rule and the pane was
+    // a quiet, actionless exited terminal (the reviewer's e2e workaround:
+    // closeTab + sidebar reopen).
+    it('a clean-exit killed session (vacant record) surfaces the reopen affordance; the click drives the recovery create', async () => {
+      const { store } = setupTypedPane({
+        content: { status: 'running', terminalId: 't-killed-vacant' },
+        seed: (seededStore) => {
+          act(() => {
+            seededStore.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+              generation: 1,
+              terminalId: 't-killed-vacant',
+            })))
+          })
+        },
+      })
+
+      await waitFor(() => {
+        expect(messageHandler).not.toBeNull()
+        expect(sentMessages().filter((m: any) => m.type === 'terminal.attach' && m.terminalId === 't-killed-vacant').length).toBeGreaterThan(0)
+      })
+
+      // The kill's exit fold (code 0). The record is still terminal-Live in
+      // the exit-vs-vacant race window — the pane is honestly exited and
+      // the affordance must NOT render yet (no false "reopen" while the
+      // owner state is unsettled).
+      act(() => {
+        messageHandler!({ type: 'terminal.exit', terminalId: 't-killed-vacant', exitCode: 0 })
+      })
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      })
+      expect(screen.queryByTestId('terminal-vacant-recovery-bar')).toBeNull()
+
+      // The stop commit's VACANT frame folds after — the killed-session
+      // shape: the recovery affordance surfaces in the pane.
+      act(() => {
+        store.dispatch(applyRuntimeOwner(runtimeOwnerFrame({
+          generation: 2,
+          ownerKind: 'vacant',
+          terminalId: undefined,
+          transition: 'released',
+        })))
+      })
+      const bar = await screen.findByTestId('terminal-vacant-recovery-bar')
+      expect(bar).toHaveTextContent('codex session was stopped (code 0)')
+
+      // THE CONTRACT (bounded negative): nothing relaunched automatically —
+      // the affordance is the user's path, the pane stays exited until the
+      // user acts.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50))
+      })
+      expect(sentMessages().filter((m: any) => m.type === 'terminal.create')).toHaveLength(0)
+
+      // The USER-DRIVEN reopen: click the surfaced affordance. It dispatches
+      // the recovery-create flow (the respawn create keeping the durable
+      // sessionRef), which re-fires the lifecycle effect. Pinned by the
+      // flow's observable output — the create frame — rather than a
+      // dispatch spy: swapping store.dispatch mid-test changes the identity
+      // react-redux hands the component and alone re-fires the lifecycle
+      // effect once (a test-only artifact that would auto-create here).
+      fireEvent.click(within(bar).getByRole('button', { name: 'Reopen codex session' }))
+      await waitFor(() => {
+        expect(createCalls()).toHaveLength(1)
+      })
+      expect(createCalls()[0]).toMatchObject({
+        requestId: 'req-b8ke',
+        sessionRef: { provider: 'codex', sessionId: TYPED_SESSION_ID },
+        // The respawn lane's rate-limit exemption (resetPaneForReconcileCreate
+        // marks the create restore — the resumeRecoveryCreate-equivalent).
+        restore: true,
+        // The FRESH observed pair (the vacant record's generation 2 — the
+        // fence re-captured at send time after the reconcileEpoch bump).
+        observedEpoch: 1,
+        observedGeneration: 2,
+      })
+      // The pane left its exited state — the reopen is in flight.
+      const leaf = store.getState().panes.layouts['tab-b8ke']
+      expect(leaf?.type === 'leaf' && leaf.content.kind === 'terminal'
+        ? leaf.content.status : undefined).toBe('creating')
+    })
 
     it('a terminal pane whose session is fresh-agent-owned renders the recovery card with a direct open action', async () => {
       const { store } = setupTypedPane({
