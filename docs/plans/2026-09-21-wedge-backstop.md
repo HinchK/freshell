@@ -397,7 +397,7 @@ Expected: PASS (zero failures; pre-existing suite untouched).
 - [ ] **Step 7: Commit the task**
 
 ```bash
-git add crates/freshell-terminal/src/registry.rs crates/freshell-terminal/src/idle_noise.rs
+git add crates/freshell-terminal/src/registry.rs crates/freshell-terminal/src/idle_noise.rs crates/freshell-terminal/tests/stuck_real_pty.rs
 git commit -m "feat(terminal): registry stuck sweep flags agent panes past meaningful-idle window"
 ```
 

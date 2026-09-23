@@ -176,20 +176,38 @@ const OPENCODE_CAPTURE_FIRST_60_UNITS: [&str; 60] = [
     "\x1b[?2026h\x1b[?25l\x1b[38;4H\x1b[38;2;27;40;59m\x1b[48;2;10;10;10m⬝⬝⬝⬝⬝⬝⬝⬝\x1b[0m\x1b[0m\x1b[34;6H\x1b[?25h\x1b[?2026l",
 ];
 
+/// Recovery-record tag walking lowercase letters in base-26 (aa, ab, …, az,
+/// ba, …). `NoiseScanner` strips ASCII DIGITS (and whitespace) from
+/// fingerprints but keeps letters, so digit-only record variation is
+/// invisible to the classifier — every record after the first repeated its
+/// fingerprint and classified as ring-repeat noise (episode-3 r5, review
+/// Finding 2). 26² = 676 distinct tags ≈ 169 s of distinct records at the
+/// capture cadence, far beyond the test's bound, so every record the test
+/// can observe is a genuinely new fingerprint that refreshes the
+/// meaningful clock.
+fn recovery_tag(n: usize) -> String {
+    const LETTERS: [char; 26] = [
+        'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r',
+        's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+    ];
+    [LETTERS[(n / 26) % 26], LETTERS[n % 26]].iter().collect()
+}
+
 /// The emitter child role (module docs): when the parent re-execs this test
 /// binary as the pty child, the harness runs only this test; the magic env
 /// var routes it to the child role — write the embedded units to raw stdout
 /// at the capture cadence forever, then switch to genuinely-new text lines
-/// once the sentinel file appears (each line a fresh fingerprint, so each
-/// refreshes the meaningful clock). In a NORMAL harness run (the flag
-/// unset) it is a fast no-op. `write_all` + `flush` on the locked stdout is
-/// one unbuffered write per unit (the units contain no `\n`, so the
-/// LineWriter cannot split early; `io::Write` bypasses libtest's per-test
-/// output capture and hits fd 1 directly — exactly the raw
-/// `os.write(1, ...)` contract the retired python emitter had). The first
-/// 60 units contain no `\n`/`\r`/TAB (only ESC), so the pty's default
-/// OPOST/ONLCR output processing is a no-op on them and the writes are
-/// byte-faithful to the capture; the recovery lines end `\r\n` as before.
+/// once the sentinel file appears (each line a fresh fingerprint via its
+/// [`recovery_tag`] letters, so each refreshes the meaningful clock). In a
+/// NORMAL harness run (the flag unset) it is a fast no-op. `write_all` +
+/// `flush` on the locked stdout is one unbuffered write per unit (the units
+/// contain no `\n`, so the LineWriter cannot split early; `io::Write`
+/// bypasses libtest's per-test output capture and hits fd 1 directly —
+/// exactly the raw `os.write(1, ...)` contract the retired python emitter
+/// had). The first 60 units contain no `\n`/`\r`/TAB (only ESC), so the
+/// pty's default OPOST/ONLCR output processing is a no-op on them and the
+/// writes are byte-faithful to the capture; the recovery lines end `\r\n`
+/// as before.
 #[test]
 fn stuck_real_pty_emitter_child() {
     if std::env::var_os(EMITTER_ENV).is_none() {
@@ -203,7 +221,8 @@ fn stuck_real_pty_emitter_child() {
     let mut n: usize = 0;
     loop {
         let bytes: Vec<u8> = if switch.exists() {
-            format!("recovery line {n}: genuinely new content {n}\r\n").into_bytes()
+            let tag = recovery_tag(n);
+            format!("recovery line {tag}: genuinely new content {tag}\r\n").into_bytes()
         } else {
             OPENCODE_CAPTURE_FIRST_60_UNITS[n % OPENCODE_CAPTURE_FIRST_60_UNITS.len()]
                 .as_bytes()
@@ -266,6 +285,28 @@ fn frame_fragments(data: &str) -> usize {
     let ends = data.matches(SYNC_END).count();
     begins + ends - 2 * complete_units_in(data)
 }
+
+/// Whole `recovery line` records observed across frames — the flow gauge
+/// for the sustained-recovery check. A record the pty split across frames
+/// contributes nothing until its literal is whole in one frame (an
+/// undercount, never an overcount), so "the count grew" means at least one
+/// complete new record genuinely arrived.
+fn count_recovery_records(frames: &[String]) -> usize {
+    frames
+        .iter()
+        .map(|data| data.matches("recovery line").count())
+        .sum()
+}
+
+/// Sustained-recovery window (episode-3 r5, review Finding 2): keep
+/// sweeping PAST the point where a frozen meaningful clock would re-flag
+/// (the 1 s test window from the first recovery record's ingest) while
+/// requiring the record stream to keep flowing. A genuinely-meaningful
+/// stream refreshes the meaningful clock on every record, so the wedge
+/// differential can never re-fire; with digit-only record variation only
+/// the FIRST record classifies meaningful and the pane re-flags ~1 s in.
+const SUSTAINED_PAST_WINDOW: Duration = Duration::from_millis(1_500);
+const SUSTAINED_DEADLINE: Duration = Duration::from_millis(3_000);
 
 /// One whole test, in order: warm the ring through real reads, flag, then
 /// clear on meaningful output. ~18 s nominal, hard-bounded under 30 s.
@@ -433,6 +474,47 @@ fn real_pty_capture_stream_flags_stuck_and_clears_on_meaningful() {
     assert_eq!(cleared[0].terminal_id, "T-real");
     // Idempotent while meaningful output keeps flowing.
     assert!(reg.enforce_stuck_detection().is_empty());
+
+    // Sustained recovery (episode-3 r5, review Finding 2): the idempotent
+    // assert above is only non-vacuous if the recovery records are
+    // genuinely distinct to the scanner — otherwise the meaningful clock
+    // froze at the FIRST record and the assert passed only because the
+    // 1 s window had not yet elapsed. Prove the sustained contract for
+    // real: keep sweeping past the window while the record stream
+    // provably keeps flowing (new complete records observed), and assert
+    // the differential never re-fires. A re-flag here means the later
+    // records classified as ring-repeat noise — the exact vacuousness
+    // this phase exists to catch.
+    let past_window_at = Instant::now() + SUSTAINED_PAST_WINDOW;
+    let sustained_deadline = Instant::now() + SUSTAINED_DEADLINE;
+    let records_before = count_recovery_records(&output_frame_data(&seen));
+    let mut records_after;
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        records_after = count_recovery_records(&output_frame_data(&seen));
+        let transitions = reg.enforce_stuck_detection();
+        assert!(
+            transitions.is_empty(),
+            "sustained recovery must not re-flag: {records_before} records at \
+             the clear grew to {records_after}, yet the sweep re-fired \
+             ({transitions:?}) — later recovery records classified as noise \
+             (digit-only variation is invisible to the scanner)"
+        );
+        if Instant::now() >= past_window_at && records_after > records_before {
+            break;
+        }
+        assert!(
+            Instant::now() < sustained_deadline,
+            "sustained recovery stalled: {records_after} records after \
+             {SUSTAINED_DEADLINE:?} (emitter or reader wedged?)"
+        );
+    }
+    eprintln!(
+        "stuck_real_pty recovery: {records_before} complete records at the \
+         clear, {records_after} through the sustained window — every record a \
+         genuinely distinct fingerprint, no re-flag past the \
+         {REAL_PTY_TEST_WINDOW_MS} ms window"
+    );
 
     // Cleanup: the registry's own kill (group SIGKILL), then drop the dir.
     assert!(reg.kill("T-real"));
