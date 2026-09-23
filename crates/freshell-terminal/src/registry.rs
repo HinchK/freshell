@@ -3979,16 +3979,39 @@ mod tests {
         /// test-harness thread, so this reliably observes every `tracing`
         /// event emitted by (synchronous) registry calls made while the
         /// guard is held.
+        ///
+        /// Parallel-capture flake fix (pre-existing on this branch): a
+        /// capture's `Dispatch::new` and first-time `tracing` callsite
+        /// registrations rebuild the process-wide callsite Interest cache,
+        /// and a rebuild that resolves `get_default()` on a thread with no
+        /// subscriber consults the global `NoSubscriber` — caching
+        /// `Interest::never()` and silently dropping later events that the
+        /// emitting test's own thread-local subscriber WOULD have captured
+        /// (observed as an intermittent `terminal.killed` miss in
+        /// `enforce_idle_kills_emits_killed_by_idle_and_a_sweep_summary_event`,
+        /// roughly one failure per 4-6 parallel runs, reproduced on the
+        /// pre-remediation baseline). Two defenses, by construction:
+        ///  * a bare no-op global `Registry` is installed once — every
+        ///    `get_default()` fallback and every JustOne-path rebuild then
+        ///    consults a subscriber that answers `Interest::always()`, so a
+        ///    `never` cache can never be minted anywhere in the process;
+        ///  * each capture forces a rebuild with its own thread default
+        ///    already installed, so no window opens on a stale cache.
         pub fn capture() -> (
             Arc<Mutex<Vec<CapturedEvent>>>,
             tracing::subscriber::DefaultGuard,
         ) {
+            static GLOBAL_SINK: std::sync::Once = std::sync::Once::new();
+            GLOBAL_SINK.call_once(|| {
+                let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+            });
             let events = Arc::new(Mutex::new(Vec::new()));
             let layer = CaptureLayer {
                 events: Arc::clone(&events),
             };
             let subscriber = tracing_subscriber::registry().with(layer);
             let guard = tracing::subscriber::set_default(subscriber);
+            tracing::callsite::rebuild_interest_cache();
             (events, guard)
         }
     }
