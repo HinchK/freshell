@@ -57,6 +57,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -6893,11 +6894,6 @@ impl FreshOpencodeState {
         session: &OpencodeSession,
         real_id: &str,
     ) -> IdleVerdict {
-        // The delivery-order fast path: a running delivered before this
-        // idle makes it trustworthy without a poll.
-        if session.daemon_busy_after_idle.load(Ordering::SeqCst) {
-            return IdleVerdict::Trusted;
-        }
         // Focused episode 3 round 1: the identity's blind spot — the
         // running can be GENUINELY missed (the SSE transport reconnects
         // WITHOUT replaying missed events; a lagged broadcast drops
@@ -6937,6 +6933,7 @@ impl FreshOpencodeState {
         this: &Self,
         real_id: &str,
         session_id: &str,
+        observed_idle: bool,
     ) -> IdleVerdict {
         let session_arc = {
             let guard = this.sessions.lock().await;
@@ -6951,7 +6948,21 @@ impl FreshOpencodeState {
         };
         let session = session_arc.lock().await;
         let abort_in_flight_now = session.abort_in_flight.load(Ordering::SeqCst) > 0;
-        let verdict = Self::poll_daemon_idle(this, &session, real_id).await;
+        let busy_now = session.daemon_busy_after_idle.load(Ordering::SeqCst);
+        // The trust verdict. `observed_idle` distinguishes the two
+        // callers: an actual IDLE EVENT following a delivered running is
+        // trusted (the daemon's running->idle transition); the recovery
+        // watcher (no idle event — its own poll cadence) must treat a
+        // delivered running as BUSY, not trust.
+        let verdict = if busy_now {
+            if observed_idle {
+                IdleVerdict::Trusted
+            } else {
+                IdleVerdict::NotTrusted
+            }
+        } else {
+            Self::poll_daemon_idle(this, &session, real_id).await
+        };
         let mut released = false;
         match verdict {
             IdleVerdict::Trusted => {
@@ -7022,34 +7033,69 @@ impl FreshOpencodeState {
         verdict
     }
 
-    /// Focused episode 3 round 3, Major 2: a poll failure is transient —
-    /// retry the live check on a bounded backoff ladder. Every attempt
-    /// re-runs the same locked conclusion (a fresh poll under the lock);
-    /// a Trusted or NotTrusted answer concludes the ladder. On
-    /// exhaustion the deferral stays WARN-observable and recoverable
-    /// (the round-3 manual-recovery contract).
-    fn arm_status_poll_retry(this: &Self, real_id: &str, session_id: &str) {
+    /// The orphaned-turn recovery wait: the interrupted compact's own
+    /// bounded runtime (the serve crate's `compact_timeout`, 600s) —
+    /// the watcher gives the daemon that long to settle.
+    const ORPHAN_RECOVERY_IDLE_WAIT: Duration = Duration::from_secs(600);
+    /// The recovery watcher's poll cadence: a background liveness
+    /// fallback, not a hot path.
+    const ORPHAN_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+    /// Focused episode 3 round 4: ANY non-Trusted conclusion (the daemon
+    /// polled busy/retry, or the poll failed transitively) arms the
+    /// automatic recovery watcher — stopping on a busy answer (the
+    /// round-3 ladder) left a terminal idle MISSED in the explicitly
+    /// supported SSE reconnect/lag windows stranded forever: no local
+    /// turn task, no further idle event, the latch blocking every drain.
+    /// The watcher polls the daemon's LIVE status map on a fixed cadence
+    /// — no dependency on any further SSE event — re-running the locked
+    /// conclusion (a fresh poll under the session lock) each time, until
+    /// the daemon settles (Trusted → release + deliver) or the
+    /// interrupted compact's own bounded runtime elapses (the 600s
+    /// compact_timeout class) — then the deferral stays WARN-observable
+    /// and recoverable (the round-3 manual contract).
+    fn arm_orphan_idle_recovery(this: &Self, real_id: &str) {
         let this = this.clone();
         let real_id = real_id.to_string();
-        let session_id = session_id.to_string();
         tokio::spawn(async move {
-            for attempt in 1..=8u32 {
-                tokio::time::sleep(Duration::from_millis(100u64 * attempt as u64)).await;
-                match Self::conclude_idle_observation(&this, &real_id, &session_id).await {
-                    IdleVerdict::PollFailed => continue,
-                    _ => return,
+            let deadline = Instant::now() + Self::ORPHAN_RECOVERY_IDLE_WAIT;
+            loop {
+                tokio::time::sleep(Self::ORPHAN_RECOVERY_POLL_INTERVAL).await;
+                if Instant::now() >= deadline {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %real_id,
+                        "fresh_agent_interrupt_orphan_recovery_exhausted");
+                    return;
+                }
+                match Self::conclude_idle_observation(&this, &real_id, &real_id, false).await {
+                    IdleVerdict::Trusted => return, // concluded: released + drained
+                    // Still busy/retry (or a transient poll failure) —
+                    // keep watching for the daemon's settlement.
+                    _ => continue,
                 }
             }
-            tracing::warn!(target: "freshell_freshagent::opencode",
-                session_id = %real_id,
-                "fresh_agent_interrupt_status_poll_retry_exhausted");
         });
     }
 
     async fn observe_daemon_idle(this: &Self, real_id: &str, session_id: &str) {
-        let verdict = Self::conclude_idle_observation(this, real_id, session_id).await;
-        if matches!(verdict, IdleVerdict::PollFailed) {
-            Self::arm_status_poll_retry(this, real_id, session_id);
+        let verdict = Self::conclude_idle_observation(this, real_id, session_id, true).await;
+        if matches!(verdict, IdleVerdict::Trusted) {
+            return;
+        }
+        // NotTrusted (busy/retry now) or PollFailed (transient): the
+        // automatic watcher owns the eventual terminal idle — even when
+        // the SSE idle is missed entirely. It arms ONLY when the orphan
+        // deferral is actually pending (a racy re-check is benign: the
+        // watcher's conclusion no-ops when nothing is left to release).
+        let latch_armed = {
+            let guard = this.sessions.lock().await;
+            guard
+                .get(real_id)
+                .and_then(|session_arc| session_arc.try_lock().ok())
+                .is_some_and(|session| session.orphaned_daemon_turn.load(Ordering::SeqCst))
+        };
+        if latch_armed {
+            Self::arm_orphan_idle_recovery(this, real_id);
         }
     }
 }
@@ -18488,7 +18534,10 @@ mod tests {
         await_abort_posted(&http).await;
 
         // The daemon idles during the abort window — remembered (Major 3,
-        // episode 2 round 1) but NOT trusted for a Transport settlement.
+        // episode 2 round 1) but NOT trusted for a Transport settlement
+        // (the live status map says busy — the compact still runs in
+        // this fiction, and the recovery watcher's polls agree).
+        http.arm_status_busy("ses_q19", 1000);
         FreshOpencodeState::observe_daemon_idle(&st, "ses_q19", "ses_q19").await;
         for _ in 0..25 {
             tokio::task::yield_now().await;
@@ -19588,7 +19637,83 @@ mod tests {
         let session = session_arc.lock().await;
         assert!(
             !session.orphaned_daemon_turn.load(Ordering::SeqCst),
-            "the retry ladder concluded the terminal idle — no strand"
+            "the recovery watcher concluded the terminal idle — no strand"
+        );
+        assert!(session.pending_sends.is_empty());
+    }
+
+    /// Focused episode 3 round 4: the round-3 ladder stopped on a busy
+    /// answer — so a terminal idle MISSED in the supported SSE
+    /// reconnect/lag windows stranded the queue forever (no local turn
+    /// task, no further idle event, the latch blocking every drain).
+    /// The recovery watcher now owns it: a busy/retry verdict arms the
+    /// automatic poll watcher, which delivers WITHOUT any further idle
+    /// event once the daemon's live status settles.
+    #[tokio::test]
+    async fn a_missed_terminal_idle_is_recovered_by_the_poll_watcher() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q32", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q32")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q32", "needs the watcher")),
+        )
+        .await;
+
+        // The abort FAILS (answered 500) and settles — counter zero,
+        // latch armed.
+        http.arm_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q32".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort 500)");
+
+        // A stale idle polls BUSY (the compact still runs) — the verdict
+        // arms the automatic watcher.
+        http.arm_status_busy("ses_q32", 5);
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q32", "ses_q32").await;
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "the busy verdict releases nothing"
+        );
+
+        // The compact settles and its terminal idle is MISSED entirely —
+        // no observe call, no idle event. The watcher's live polling
+        // drains the busy budget, sees the daemon settle, and delivers
+        // automatically.
+        await_prompt_posted(&http, "needs the watcher").await;
+        let session_arc = st.sessions.lock().await.get("ses_q32").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(
+            !session.orphaned_daemon_turn.load(Ordering::SeqCst),
+            "the watcher recovered the missed terminal idle — no strand"
         );
         assert!(session.pending_sends.is_empty());
     }
