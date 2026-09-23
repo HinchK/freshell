@@ -15,7 +15,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -61,7 +61,7 @@ function runHelper(
 ): Promise<HelperAnswer> {
   const childEnv: Record<string, string | undefined> = {
     ...process.env,
-    FRESHELL_CLAUDE_SDK_SESSION_NAMES_MODULE: FAKE_SDK,
+        FRESHELL_CLAUDE_SDK_SESSION_NAMES_MODULE: pathToFileURL(FAKE_SDK).href,
     ...env,
   }
   // The Rust parent deliberately SETS OR REMOVES the project-key override for
@@ -183,7 +183,7 @@ describe('Claude session-names helper (SDK boundary injected)', () => {
     const child = spawn(process.execPath, [HELPER], {
       env: {
         ...process.env,
-        FRESHELL_CLAUDE_SDK_SESSION_NAMES_MODULE: FAKE_SDK,
+    FRESHELL_CLAUDE_SDK_SESSION_NAMES_MODULE: pathToFileURL(FAKE_SDK).href,
         CLAUDE_CONFIG_DIR: root,
         CLAUDE_CODE_PROJECT_DIR_NAME: 'leaked-project-key',
       },

@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto'
 import { chmodSync, mkdtempSync, mkdirSync, lstatSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>()
@@ -335,7 +336,7 @@ describe('prepare-electron-runtime staging', () => {
       encoding: 'utf8',
       env: {
         ...process.env,
-        FRESHELL_CLAUDE_SDK_SESSION_NAMES_MODULE: stagedFakeSdk,
+        FRESHELL_CLAUDE_SDK_SESSION_NAMES_MODULE: pathToFileURL(stagedFakeSdk).href,
       },
       input: JSON.stringify({ op: 'read', sessionId: 'staged-session', dir: '/work/project' }) + '\n',
     })
