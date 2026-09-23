@@ -175,10 +175,31 @@ test.describe('Freshopencode first-send reload regression', () => {
         return events.some((event) => event.event === 'session_create_requested')
       }, { timeout: 15_000 }).toBe(true)
 
-      const duringSend = await getFreshOpencodePaneState(page)
-      expect(duringSend.sessionId).toMatch(/^freshopencode-/)
-      expect(duringSend.status).toBe('running')
-      expect(duringSend.sessionRef?.sessionId).toMatch(/^freshopencode-/)
+      // Two layers, evidence-corrected (Task 4): the PRIMARY failure was
+      // deterministic, not load lag — on every freshopencode first send
+      // the server's running broadcast is snapshot-invalidating, and the
+      // placeholder short-circuit snapshot it triggers replies
+      // status 'idle'; applySnapshot's pane-content status write was UNGATED
+      // (unlike the session-record write), so that idle snapshot clobbered
+      // the optimistic 'running' even unloaded (Expected "running",
+      // Received "idle" — every run, not just under load). Fixed by the
+      // production gate (Task 4: the pane-content status adoption now
+      // mirrors the session-record gate). The SECONDARY layer the poll also
+      // covers is load lag — the audit write (fake CLI process) and the
+      // client's status broadcast (WS -> Redux) are different pipelines,
+      // and under full-lane load the broadcast can lag the audit event.
+      // Poll instead of a one-shot read: FAKE_OPENCODE_HANG_SESSION_CREATE=1
+      // pins the turn in flight, so 'running' is a stable steady state —
+      // polling to it does not weaken the pinned contract (the submitted
+      // prompt must stay visible across reload while materialization is
+      // pending).
+      await expect.poll(async () => getFreshOpencodePaneState(page), { timeout: 30_000 }).toMatchObject({
+        sessionId: expect.stringMatching(/^freshopencode-/),
+        status: 'running',
+        sessionRef: {
+          sessionId: expect.stringMatching(/^freshopencode-/),
+        },
+      })
 
       await page.reload()
       await harness.waitForHarness()

@@ -300,6 +300,14 @@ pub struct TerminalCreate {
     /// frozen-wire compat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live_terminal: Option<LiveTerminalRef>,
+    /// kata b8ke delayed-request fence: the (epoch, generation) pair the
+    /// client observed when it decided to act. A pair sent together is the
+    /// fence (the server stale-rejects pre-restart epochs and superseded
+    /// generations); neither-sent is legacy-unfenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pane_id: Option<String>,
     /// const `"fresh_after_restore_unavailable"`. Legacy client repair hint;
@@ -385,6 +393,15 @@ pub struct TerminalAttach {
     /// Additive optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,
+    /// b8ke ext r8 F2: the attach's observed ownership fence — terminal
+    /// .attach participates in the coordinator (a queued cross-device
+    /// attach is generation-fenced: an in-Handoff/in-transition key answers
+    /// the typed refusal, a stale generation answers typed, a current
+    /// attach restamps under the held claim). Additive optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -499,9 +516,17 @@ pub struct TerminalKill {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     /// The closing pane's createRequestId — the durable close envelope's key
-    /// when the registry probe cannot answer (reaper race / stale pane).
+    /// when the registry probe can no longer answer (reaper race / stale pane).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub create_request_id: Option<String>,
+    /// kata b8ke delayed-request fence (Task 4): the (epoch, generation) pair
+    /// the client observed when it decided to kill — feeds the fenced stop
+    /// claim. Neither-sent is legacy-unfenced (the server falls back to the
+    /// retained stamp).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<u64>,
 }
 
 // --- *.activity.list --------------------------------------------------------
@@ -721,6 +746,13 @@ pub struct FreshAgentCreate {
         with = "double_option"
     )]
     pub model_selection: Option<Option<ModelSelection>>,
+    /// kata b8ke delayed-request fence: the (epoch, generation) pair the
+    /// client observed when it decided to act. A pair sent together is the
+    /// fence; neither-sent is legacy-unfenced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<u64>,
     /// Free string here (unlike `codingcli.create`, which uses the enum).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<String>,
@@ -756,6 +788,13 @@ pub struct FreshAgentAttach {
     pub session_type: SessionType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// kata b8ke delayed-request fence: attach can cold-resume an untracked
+    /// session (registering a runtime), so it carries the observed
+    /// (epoch, generation) pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<u64>,
     /// Retained solely so the handler can detect-and-reject; see kata ejh6.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_session_id: Option<String>,
@@ -801,6 +840,14 @@ pub struct FreshAgentSend {
     pub request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settings: Option<FreshAgentSendSettings>,
+    /// b8ke ext r8 F5: the delayed-request fence (additive; the pair
+    /// rides the coordinator's generation discipline so a queued send
+    /// landing after a crash + generation advance is typed-refused, never
+    /// an unfenced recreation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_epoch: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -839,6 +886,15 @@ pub struct FreshAgentCompact {
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
+    /// b8ke ext r21 F2: the delayed-request fence (additive, parity with
+    /// send/attach/kill): the pair rides the coordinator's generation
+    /// discipline so a queued compact/undo/redo/fork landing after a
+    /// crash + generation advance is typed-refused, never an unfenced
+    /// recreation of the runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -877,6 +933,12 @@ pub struct FreshAgentKill {
     pub session_type: SessionType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// kata b8ke delayed-request fence: kill feeds the fenced stop claim, so
+    /// it carries the observed (epoch, generation) pair.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -900,6 +962,15 @@ pub struct FreshAgentFork {
     /// stamps the connection's identity without a tabKey).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tab_id: Option<String>,
+    /// b8ke ext r21 F2: the delayed-request fence (additive, parity with
+    /// send/attach/kill): the pair rides the coordinator's generation
+    /// discipline so a queued compact/undo/redo/fork landing after a
+    /// crash + generation advance is typed-refused, never an unfenced
+    /// recreation of the runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -923,6 +994,15 @@ pub struct FreshAgentUndo {
     pub turn_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// b8ke ext r21 F2: the delayed-request fence (additive, parity with
+    /// send/attach/kill): the pair rides the coordinator's generation
+    /// discipline so a queued compact/undo/redo/fork landing after a
+    /// crash + generation advance is typed-refused, never an unfenced
+    /// recreation of the runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -938,6 +1018,15 @@ pub struct FreshAgentRedo {
     pub turn_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// b8ke ext r21 F2: the delayed-request fence (additive, parity with
+    /// send/attach/kill): the pair rides the coordinator's generation
+    /// discipline so a queued compact/undo/redo/fork landing after a
+    /// crash + generation advance is typed-refused, never an unfenced
+    /// recreation of the runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_generation: Option<u64>,
 }
 
 // --- hoststats.* -----------------------------------------------------------
@@ -948,4 +1037,57 @@ pub struct FreshAgentRedo {
 pub struct HostStatsRefresh {
     #[serde(rename = "requestId")]
     pub request_id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_messages_accept_the_observed_fence_pair() {
+        // Round-2 review: EVERY message that can create/resume/register a
+        // runtime carries the observed (epoch, generation) fence —
+        // terminal.create, freshAgent.create, freshAgent.attach (can
+        // cold-resume an untracked session), and freshAgent.kill (feeds the
+        // fenced stop claim). A pair sent together is the fence;
+        // neither-sent is legacy-unfenced.
+        let json = r#"{"type":"terminal.create","requestId":"r1","mode":"codex","shell":"system","observedEpoch":9,"observedGeneration":4}"#;
+        let msg: ClientMessage = serde_json::from_str(json).expect("parse");
+        match msg {
+            ClientMessage::TerminalCreate(c) => {
+                assert_eq!(c.observed_epoch, Some(9));
+                assert_eq!(c.observed_generation, Some(4));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let create = r#"{"type":"freshAgent.create","requestId":"r3","sessionType":"freshcodex","observedEpoch":9,"observedGeneration":4}"#;
+        match serde_json::from_str::<ClientMessage>(create).expect("parse create") {
+            ClientMessage::FreshAgentCreate(c) => {
+                assert_eq!(c.observed_epoch, Some(9));
+                assert_eq!(c.observed_generation, Some(4));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let attach = r#"{"type":"freshAgent.attach","sessionId":"s1","sessionType":"freshcodex","provider":"codex","observedEpoch":9,"observedGeneration":4}"#;
+        match serde_json::from_str::<ClientMessage>(attach).expect("parse attach") {
+            ClientMessage::FreshAgentAttach(a) => {
+                assert_eq!(a.observed_epoch, Some(9));
+                assert_eq!(a.observed_generation, Some(4));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        let kill = r#"{"type":"freshAgent.kill","sessionId":"s1","sessionType":"freshcodex","provider":"codex","observedEpoch":9,"observedGeneration":4}"#;
+        match serde_json::from_str::<ClientMessage>(kill).expect("parse kill") {
+            ClientMessage::FreshAgentKill(k) => {
+                assert_eq!(k.observed_epoch, Some(9));
+                assert_eq!(k.observed_generation, Some(4));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // Omitted fields still parse (additive-optional, old clients
+        // unaffected).
+        let json_legacy =
+            r#"{"type":"terminal.create","requestId":"r2","mode":"codex","shell":"system"}"#;
+        assert!(serde_json::from_str::<ClientMessage>(json_legacy).is_ok());
+    }
 }

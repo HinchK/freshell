@@ -28,12 +28,24 @@ import { LOCAL_ONLY_SPECS } from './playwright.config.js'
 // are not installed, or because they depend on environment-specific
 // rendering/timing that differs in cloud.
 export const CLOUD_SKIP_SPECS = [
-  // Requires opencode binary
-  // (freshopencode-model-picker.spec.ts is cloud-legal: every fetch is routed
-  // and the sidecar is suppressed via the test harness, so it needs no binary)
+  // Provider-pane boot/lifecycle pipelines under parallel load: these
+  // specs install hermetic FAKE opencode CLIs (fixtures/fake-opencode.cjs on
+  // the spawned server's PATH), so no network binary is required — the
+  // cloud lane excludes them because it does not guarantee provider-boot
+  // timing under 2-CPU/2-worker contention (the same class that bursts on
+  // the 48-worker local lane). (freshopencode-model-picker.spec.ts IS
+  // cloud-legal: every fetch is routed and the sidecar is suppressed via
+  // the test harness, so it needs no binary and no pane lifecycle.)
   'freshopencode-db-history.spec.ts',
   'freshopencode-restart-recovery.spec.ts',
   'freshopencode-first-send-reload-repro.spec.ts',
+  // Same provider-lifecycle-timing class as its model above, plus a
+  // backoff-guarded daemon respawn window: 2-CPU/2-worker cloud contention
+  // cannot guarantee daemon-death + re-warm timing. Cloud PR coverage for
+  // the incident class is carried by the cloud-legal
+  // freshopencode-snapshot-409-recovery.spec.ts; this spec is the local-lane
+  // end-to-end proof.
+  'freshopencode-daemon-death-selfheal.spec.ts',
   'opencode-restart-recovery.spec.ts',
   'opencode-terminal-restore-rust.spec.ts',
   // Requires codex binary
@@ -42,7 +54,10 @@ export const CLOUD_SKIP_SPECS = [
   // Requires amplifier/claude binary
   'amplifier-restore-rust.spec.ts',
   'remote-tab-linkage-rust.spec.ts',
-  // Requires fresh-agent binaries (claude/codex/opencode sidecars)
+  // Provider-pane lifecycle surfaces over mocked WS/REST (no binaries
+  // needed): excluded because its server-side layout-sync/registry
+  // propagation and settings-modal render waits are timing-sensitive under
+  // cloud load.
   'fresh-agent-centralization-smoke.spec.ts',
   // Environment-sensitive: viewport rendering differs in cloud
   'mobile-viewport.spec.ts',
@@ -69,7 +84,7 @@ export const CLOUD_SKIP_SPECS = [
 
 // Test titles to exclude via grepInvert (keeps the spec file but skips
 // specific tests within it). Must be RegExp, not strings.
-const CLOUD_SKIP_TITLES = [
+export const CLOUD_SKIP_TITLES = [
   // Screenshot comparison fails due to font rendering differences in cloud
   /new JS asset after the click/,
 ]

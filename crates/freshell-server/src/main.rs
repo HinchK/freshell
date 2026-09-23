@@ -159,6 +159,601 @@ pub(crate) fn build_session_sources(
     ]
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn recover_stale_start(
+    ownership: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+    registry: &freshell_terminal::TerminalRegistry,
+    fresh_codex: freshell_freshagent::FreshCodexState,
+    fresh_claude: freshell_freshagent::FreshClaudeState,
+    fresh_opencode: freshell_freshagent::FreshOpencodeState,
+    rec: freshell_ownership::RecoveredStart,
+    settle_budget: std::time::Duration,
+    state_broadcast_tx: &tokio::sync::broadcast::Sender<String>,
+) {
+    // 1. The operation's OWN cancellation first (the registered
+    //    handle — the production start paths register through
+    //    `ownership_lane::register_start_cancellation_for_ticket`).
+    if let Some(cancel) = rec.cancellation.as_ref() {
+        cancel();
+    }
+    // 2. The settle BOUNDED — a timeout means the operation is STILL
+    //    RUNNING: unconfirmed, never Vacant.
+    let operation_dead = match rec.settle {
+        Some(settle) => tokio::time::timeout(settle_budget, Box::into_pin(settle))
+            .await
+            .is_ok(),
+        // Nothing registered: nothing can confirm the operation's
+        // death — fail closed.
+        None => false,
+    };
+    // 3. The partial-runtime reap — CONSUMED. Only a confirmed death
+    //    (or the provable absence of any registered runtime) counts.
+    //    b8ke focused episode-2 round-2 F5: the reap evidence is
+    //    consulted INDEPENDENT of the settle-guard's ordering — a
+    //    handler that unwinds normally FAILS its lease guard first
+    //    (removing the kill handle) and only THEN drops the settle
+    //    guard, so by the time the settle resolves the lane's raw-kill
+    //    path finds no handle and would answer `false` — fencing a
+    //    runtime the handler already reaped. The recorded partial pid is
+    //    the independent evidence: absent from `/proc` → the runtime is
+    //    CONFIRMED GONE (no signal is sent; a present pid cannot be
+    //    confirmed and keeps the fence — fail closed).
+    let runtime_dead = match rec.partial_runtime.as_ref() {
+        // No partial was ever registered: nothing of the start exists
+        // to kill (the operation's own settle decides below).
+        None => true,
+        Some(partial) => match partial.kind {
+            freshell_ownership::RuntimeOwnerKind::Terminal => {
+                match partial.terminal_id.as_deref() {
+                    // A terminal partial always carries its terminal id
+                    // once registered; None is unreachable — fail
+                    // closed.
+                    None => false,
+                    Some(tid) => {
+                        // b8ke ext r16 F2: confirm by the RECORDED PID —
+                        // row-absence is NEVER confirmed death.
+                        // `TerminalRegistry::kill_internal` removes the
+                        // row BEFORE its blocking PTY kill completes, so
+                        // a concurrent kill can make the row-based
+                        // `terminal_is_dead` poll report dead while the
+                        // recorded process still lives (pre-r16 that
+                        // shortcut let the watchdog commit the session
+                        // to plain Vacant over a live process). The
+                        // pid is captured BEFORE the kill (the row
+                        // removal would erase it), falling back to the
+                        // partial's registered pid; an undeterminable
+                        // pid (neither source) stays UNCONFIRMED — the
+                        // typed fence stays.
+                        let row_pid = registry.pid_of(tid);
+                        let recorded_pid = partial.pid.or(row_pid);
+                        // Best-effort kill (a no-op for an already-dead
+                        // row).
+                        let _ = registry.kill(tid);
+                        match recorded_pid {
+                            Some(pid) => {
+                                // The recorded PID's OS-level death is
+                                // the evidence — the bounded poll.
+                                let deadline =
+                                    tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                                loop {
+                                    if !freshell_terminal::registry::pid_alive(pid) {
+                                        break true;
+                                    }
+                                    if tokio::time::Instant::now() >= deadline {
+                                        break false;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                                }
+                            }
+                            // No pid handle anywhere: the runtime's
+                            // death is UNDETERMINABLE — fail closed.
+                            None => false,
+                        }
+                    }
+                }
+            }
+            freshell_ownership::RuntimeOwnerKind::FreshAgent => {
+                let lane_raw = match rec.provider.as_str() {
+                    "codex" => fresh_codex.kill_raw_for_watchdog(&rec.session_id).await,
+                    "claude" => fresh_claude.kill_raw_for_watchdog(&rec.session_id).await,
+                    "opencode" => {
+                        fresh_opencode
+                            .fresh_agent()
+                            .opencode_kill_raw_for_watchdog(&rec.session_id)
+                            .await
+                    }
+                    // An unknown provider's runtime cannot be confirmed —
+                    // fail closed.
+                    _ => false,
+                };
+                lane_raw || {
+                    // b8ke focused episode-2 round-3 F6: direct-PID
+                    // disappearance is NEVER sufficient on its own — the
+                    // claude runtime includes the ownership-tagged CLI
+                    // grandchild (and codex's, its sidecar tree), and
+                    // descendants are only signaled best-effort on several
+                    // failure paths. The independent fallback is the
+                    // lane's recorded-identity confirm: the confirmed-tree
+                    // reap machinery (condemned-prior kill-and-confirm /
+                    // quiescing teardown), which either settles the whole
+                    // recorded tree or stays unconfirmed — never reopens
+                    // over a descendant that can still write.
+                    let confirmed = match rec.provider.as_str() {
+                        "codex" => fresh_codex.confirm_fenced_prior_dead(&rec.session_id).await,
+                        "claude" => {
+                            fresh_claude
+                                .confirm_fenced_prior_dead(&rec.session_id)
+                                .await
+                        }
+                        "opencode" => {
+                            fresh_opencode
+                                .confirm_fenced_prior_dead(&rec.session_id)
+                                .await
+                        }
+                        _ => false,
+                    };
+                    if !confirmed {
+                        tracing::warn!(target: "freshell_ownership",
+                            provider = %rec.provider, session_id = %rec.session_id,
+                            pid = ?partial.pid,
+                            event = "ownership.start.reap_descendant_unconfirmed",
+                            "the recorded partial's direct pid is gone but the recorded \
+                             TREE could not be confirmed dead — the fence holds (fail closed)"
+                        );
+                    }
+                    confirmed
+                }
+            }
+        },
+    };
+    // 4. The decision: ONLY confirmed death reopens the key;
+    //    everything unconfirmable fences TYPED (StaleStart — the
+    //    recovery paths are the operation's own unwind release, a
+    //    confirmed-death probe, or the lane teardowns).
+    //
+    //    b8ke focused episode-2 round-2 F6: both outcomes carry the
+    //    required diagnostic schema — the target runtime kind, the
+    //    runtime id/pid the record holds, and the stale age — so the
+    //    transition identifies WHICH process was cancelled or left
+    //    unconfirmed.
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let duration_ms = now_ms.saturating_sub(rec.since_ms);
+    let (runtime_id, runtime_pid) = match rec.partial_runtime.as_ref() {
+        Some(partial) => (partial.terminal_id.clone(), partial.pid),
+        None => (None, None),
+    };
+    if operation_dead && runtime_dead {
+        let _ = ownership.commit_stop(
+            &rec.provider,
+            &rec.session_id,
+            &rec.operation_id,
+            rec.generation,
+        );
+        tracing::warn!(target: "freshell_ownership",
+            event = "ownership.start.recovered",
+            operation_id = %rec.operation_id,
+            provider = %rec.provider, session_id = %rec.session_id,
+            initiator = %rec.initiator, from_kind = ?rec.kind,
+            epoch = ownership.boot_epoch(), generation = rec.generation,
+            runtime_id = ?runtime_id, pid = ?runtime_pid,
+            duration_ms, to_kind = ?rec.kind,
+            outcome = "recovered_vacant_confirmed",
+            failure_reason = "STARTING_TIMEOUT",
+            "the stale start's operation settled and its partial runtime is \
+             confirmed dead — the key reopens");
+    } else {
+        let fenced = ownership.fence_unconfirmed_stop(
+            &rec.provider,
+            &rec.session_id,
+            &rec.operation_id,
+            rec.generation,
+            freshell_ownership::FenceReason::StaleStart,
+        );
+        tracing::error!(target: "freshell_ownership",
+            event = "ownership.start.recovery_fenced",
+            operation_id = %rec.operation_id,
+            provider = %rec.provider, session_id = %rec.session_id,
+            initiator = %rec.initiator, from_kind = ?rec.kind,
+            epoch = ownership.boot_epoch(), generation = rec.generation,
+            runtime_id = ?runtime_id, pid = ?runtime_pid,
+            duration_ms, to_kind = ?rec.kind,
+            operation_settled = operation_dead,
+            runtime_confirmed_dead = runtime_dead,
+            outcome = ?fenced,
+            failure_reason = "STARTING_TIMEOUT",
+            "the stale start could NOT be confirmed dead (operation settle \
+             or partial reap unconfirmed) — the key fences typed StaleStart, \
+             NEVER plain Vacant; a confirmed-death probe or the lane teardowns \
+             release it");
+        // b8ke e3r4 F5: broadcast the fence so every connected device
+        // converges on the typed recovery state immediately.
+        broadcast_fenced_transition(
+            state_broadcast_tx,
+            &rec.provider,
+            &rec.session_id,
+            ownership.boot_epoch(),
+            rec.generation,
+            Some(rec.kind),
+            "stale-start",
+            &rec.operation_id,
+        );
+    }
+}
+
+/// b8ke focused episode-2 round-2 F5: the stale-start sweep's CONFIRMED-
+/// DEATH PROBE over `Fenced{StaleStart}` records. The sweep itself only
+/// recovers `Starting` records — a fence created before its runtime's
+/// reap evidence existed (the handler reaped the runtime, then the fence
+/// landed on a record whose settle had not resolved yet) would otherwise
+/// be permanent: the generic fail never releases, and the sweep never
+/// revisits fenced records. This probe re-examines each stale-start
+/// fence's recorded prior pid every sweep: ABSENT from `/proc` → the
+/// runtime is confirmed gone → `release_fenced` (the strict release
+/// discipline — confirmed death only, never on faith); PRESENT → the
+/// fence holds (the partial records no start time, so a live pid cannot
+/// be identified as the original — fail closed; no signal is ever sent).
+/// A fence with NO recorded pid can never confirm: it holds.
+/// b8ke e3 post-cap F3: broadcast a fence RELEASE (the key reopened to
+/// Vacant through the confirmed-death probe) so connected devices drop
+/// their fenced recovery state immediately — pre-post-cap the probe
+/// released without broadcasting and clients retained `fenced:true`
+/// indefinitely.
+#[allow(clippy::too_many_arguments)] // the fence release transition's field set
+fn broadcast_fence_released(
+    broadcast_tx: &tokio::sync::broadcast::Sender<String>,
+    provider: &str,
+    session_id: &str,
+    epoch: u64,
+    generation: u64,
+    _prior_kind: Option<freshell_ownership::RuntimeOwnerKind>,
+    reason: &str,
+    operation_id: &str,
+) {
+    use freshell_protocol::{ServerMessage, SessionRuntimeOwner};
+    let frame = serde_json::to_string(&ServerMessage::SessionRuntimeOwner(SessionRuntimeOwner {
+        provider: provider.to_string(),
+        session_id: session_id.to_string(),
+        epoch,
+        generation,
+        owner_kind: "vacant".to_string(),
+        previous_kind: None,
+        terminal_id: None,
+        operation_id: operation_id.to_string(),
+        transition: "released".to_string(),
+        reason: Some(reason.to_string()),
+        fenced: None,
+        alias_of: None,
+    }))
+    .unwrap_or_default();
+    let _ = broadcast_tx.send(frame);
+}
+
+/// b8ke e3r4 F5: broadcast a FENCE transition so every connected device
+/// converges on the fenced state immediately (previously the stale
+/// watchdogs mutated ownership silently — devices kept their stale owner
+/// state until reconnect). The frame mirrors the handoff failure
+/// broadcast: transition "handoff-failed", `fenced: true`, the typed
+/// reason.
+#[allow(clippy::too_many_arguments)] // the fence transition's field set
+fn broadcast_fenced_transition(
+    broadcast_tx: &tokio::sync::broadcast::Sender<String>,
+    provider: &str,
+    session_id: &str,
+    epoch: u64,
+    generation: u64,
+    prior_kind: Option<freshell_ownership::RuntimeOwnerKind>,
+    reason: &str,
+    operation_id: &str,
+) {
+    use freshell_protocol::{ServerMessage, SessionRuntimeOwner};
+    let owner_kind = prior_kind
+        .map(|k| match k {
+            freshell_ownership::RuntimeOwnerKind::Terminal => "terminal",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent => "fresh-agent",
+        })
+        .unwrap_or("vacant");
+    let frame = serde_json::to_string(&ServerMessage::SessionRuntimeOwner(SessionRuntimeOwner {
+        provider: provider.to_string(),
+        session_id: session_id.to_string(),
+        epoch,
+        generation,
+        owner_kind: owner_kind.to_string(),
+        previous_kind: None,
+        terminal_id: None,
+        operation_id: operation_id.to_string(),
+        transition: "handoff-failed".to_string(),
+        reason: Some(reason.to_string()),
+        fenced: Some(true),
+        alias_of: None,
+    }))
+    .unwrap_or_default();
+    let _ = broadcast_tx.send(frame);
+}
+
+async fn probe_stale_start_fences(
+    ownership: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+    registry: &freshell_terminal::TerminalRegistry,
+    fresh_codex: &freshell_freshagent::FreshCodexState,
+    fresh_claude: &freshell_freshagent::FreshClaudeState,
+    fresh_opencode: &freshell_freshagent::FreshOpencodeState,
+    broadcast_tx: &tokio::sync::broadcast::Sender<String>,
+) {
+    for fence in ownership.stale_start_fences() {
+        // b8ke d4 F2: the death probe is selected by the fence's
+        // PRIOR KIND, never the provider. A TERMINAL prior gets the
+        // TERMINAL liveness evidence — the recorded pid/pane identity
+        // (e4r3 F2: the PID's OS-level death, with the row-based probe
+        // only for the pid-less pre-spawn shape). Pre-d4 a terminal
+        // prior went to the provider's FRESH probe: the opencode Fresh
+        // probe answered "true" because no Fresh Agent map/turn existed
+        // (releasing while the terminal still ran), and the claude/codex
+        // Fresh probes answered "false" forever (wedging even a dead
+        // terminal's fence).
+        if fence.prior_kind == Some(freshell_ownership::RuntimeOwnerKind::Terminal) {
+            // b8ke e4r3 F2: the confirmed-reap evidence is the recorded
+            // PID's OS-level death, NEVER row absence — kill() removes the
+            // row BEFORE signaling/reaping the PTY, so a probe landing in
+            // the row-removed-but-not-yet-reaped interval would read the
+            // missing row as confirmed reap and release the fence while
+            // the old runtime's reap is still in progress (permitting a
+            // second writer). The pid probe reads the ACTUAL process: a
+            // kill-in-progress runtime stays "alive" until the waiter
+            // thread's reap completes (a not-yet-reaped zombie still
+            // answers kill(pid, 0)).
+            //
+            // b8ke e4r4: the PID-less shape (the PRE-SPAWN partial
+            // registration) consults the stale operation's SETTLEMENT
+            // evidence exactly like the other stale-reason probes — the
+            // production create registers the pre-spawn identity BEFORE
+            // its async work (up to 45s), and the watchdog's 5s
+            // settlement wait can expire with the operation STILL ACTIVE,
+            // so an UNSETTLED start holds the fence (the old-generation
+            // handler can still spawn its CLI — the cancellation callback
+            // is only a registry kill, a no-op before spawn — and
+            // releasing would admit a second writer over the
+            // still-capable one). Only the CONCLUDED settlement plus the
+            // absent-row evidence releases; an UNREGISTERED settlement
+            // (no evidence the operation ever concluded) fails closed.
+            let (confirmed_gone, probe_evidence) =
+                match (fence.prior_terminal_id.as_deref(), fence.prior_pid) {
+                    // b8ke e4 post-cap F3: branch-accurate probe labels — the
+                    // PID-bearing branch releases solely from the OS-level
+                    // pid_alive check and records THAT evidence, never the
+                    // row-liveness label (the wrong safety evidence in the
+                    // structured transition log misled diagnosis).
+                    (_, Some(pid)) => (
+                        !freshell_terminal::registry::pid_alive(pid),
+                        "terminal-pid-death",
+                    ),
+                    (Some(tid), None) => (
+                        match fence.settle_concluded {
+                            Some(true) => registry.terminal_is_dead(tid),
+                            Some(false) | None => false,
+                        },
+                        "terminal-row-liveness",
+                    ),
+                    (None, None) => (false, "terminal-row-liveness"),
+                };
+            if !confirmed_gone {
+                continue;
+            }
+            let released = ownership.release_fenced(
+                &fence.provider,
+                &fence.session_id,
+                &fence.operation_id,
+                fence.generation,
+            );
+            if released == freshell_ownership::CommitOutcome::Committed {
+                broadcast_fence_released(
+                    broadcast_tx,
+                    &fence.provider,
+                    &fence.session_id,
+                    ownership.boot_epoch(),
+                    fence.generation,
+                    fence.prior_kind,
+                    if fence.reason == freshell_ownership::FenceReason::StaleStop {
+                        "stale-stop"
+                    } else {
+                        "stale-start"
+                    },
+                    &fence.operation_id,
+                );
+                let (release_event, release_failure_reason) =
+                    if fence.reason == freshell_ownership::FenceReason::StaleStop {
+                        ("ownership.stop.fence_probe_released", "STOPPING_TIMEOUT")
+                    } else {
+                        ("ownership.start.fence_probe_released", "STARTING_TIMEOUT")
+                    };
+                tracing::warn!(target: "freshell_ownership",
+                    event = release_event,
+                    operation_id = %fence.operation_id,
+                    provider = %fence.provider, session_id = %fence.session_id,
+                    from_kind = ?fence.prior_kind,
+                    // b8ke e4r2 F2: the STABLE transition schema keeps
+                    // to_kind at every transition — a release creates no
+                    // new runtime owner, so the vacancy is the None value
+                    // (never a deleted field).
+                    to_kind = ?Option::<freshell_ownership::RuntimeOwnerKind>::None,
+                    runtime_id = ?fence.prior_terminal_id,
+                    pid = ?fence.prior_pid,
+                    generation = fence.generation,
+                    initiator = %fence.initiator,
+                    duration_ms = freshell_ownership::now_epoch_ms()
+                        .saturating_sub(fence.since_ms),
+                    probe = probe_evidence,
+                    fence_reason = ?fence.reason,
+                    epoch = ownership.boot_epoch(),
+                    outcome = ?released,
+                    failure_reason = release_failure_reason,
+                    "the fenced TERMINAL prior's pane is confirmed dead — the \
+                     probe releases the key");
+            }
+            continue;
+        }
+        // A Fresh Agent prior (or a zombie-Starting synthesis with no
+        // recorded prior): the provider's kind-aware lane machinery.
+        // b8ke ext r25 F1(a): the provider's evidence is consulted
+        // FIRST (the strongest — the lane's confirmed-tree reap), and
+        // the recorded PID's OS-level death is the FALLBACK that closes
+        // the permanent-wedge gap: the recovery probe relied
+        // exclusively on the provider's retained
+        // live-session/condemned-prior evidence, so once both records
+        // were gone the lane could NEVER confirm and the fence held
+        // forever. Mirroring the terminal arm's discipline (the PID
+        // captured at fence time): confirmed dead at OS level → the
+        // probe releases; provably alive → the fence holds; PID
+        // absent/unverifiable → the PID-less evidence paths below (the
+        // fence stays typed). Reason-aware:
+        //   • A recorded PID: the lane's confirmed-tree confirm
+        //     (`confirm_fenced_prior_dead`) OR the PID's OS-level death.
+        //   • A PID-LESS fence: the REASON-APPROPRIATE settle evidence
+        //     gates the release — `Some(false)` (the operation is STILL
+        //     RUNNING) holds; `Some(true)` (concluded) releases on the
+        //     kind-aware lane-absence answer; `None` (NO registration —
+        //     the opencode production shape: no per-session pid and no
+        //     start settlement) routes through
+        //     `confirm_fenced_prior_dead`, the kind-aware lane
+        //     confirmation, instead of rejecting forever.
+        let confirmed_gone = match fence.prior_pid {
+            Some(pid) => {
+                let lane_confirmed = match fence.provider.as_str() {
+                    "codex" => {
+                        fresh_codex
+                            .confirm_fenced_prior_dead(&fence.session_id)
+                            .await
+                    }
+                    "claude" => {
+                        fresh_claude
+                            .confirm_fenced_prior_dead(&fence.session_id)
+                            .await
+                    }
+                    "opencode" => {
+                        fresh_opencode
+                            .confirm_fenced_prior_dead(&fence.session_id)
+                            .await
+                    }
+                    _ => false,
+                };
+                lane_confirmed || !freshell_terminal::registry::pid_alive(pid)
+            }
+            None => match fence.settle_concluded {
+                // Still in flight: the fence holds (fail closed).
+                Some(false) => false,
+                // Concluded: the kind-aware lane confirmation. For
+                // OpenCode this is confirm_fenced_prior_dead — the KILL
+                // PATH'S OWN EVIDENCE (the retained accepted-daemon-turn
+                // witness + the REST-turn registry + the session map),
+                // NEVER bare map presence: an explicit kill removes every
+                // map alias BEFORE it aborts the daemon-side turn, so
+                // bare absence released to Vacant while the old turn
+                // could still write, and a kill dying before the removal
+                // left an unrecoverable "live" fence (e3 post-cap F2).
+                Some(true) => match fence.provider.as_str() {
+                    "codex" => !fresh_codex.has_live_session(&fence.session_id).await,
+                    "claude" => !fresh_claude.has_live_session(&fence.session_id).await,
+                    "opencode" => {
+                        fresh_opencode
+                            .confirm_fenced_prior_dead(&fence.session_id)
+                            .await
+                    }
+                    _ => false,
+                },
+                // NO registration (the opencode shape): the kind-aware
+                // lane confirmation decides — never a permanent hold.
+                None => match fence.provider.as_str() {
+                    "codex" => {
+                        fresh_codex
+                            .confirm_fenced_prior_dead(&fence.session_id)
+                            .await
+                    }
+                    "claude" => {
+                        fresh_claude
+                            .confirm_fenced_prior_dead(&fence.session_id)
+                            .await
+                    }
+                    "opencode" => {
+                        fresh_opencode
+                            .confirm_fenced_prior_dead(&fence.session_id)
+                            .await
+                    }
+                    _ => false,
+                },
+            },
+        };
+        if !confirmed_gone {
+            continue;
+        }
+        let released = ownership.release_fenced(
+            &fence.provider,
+            &fence.session_id,
+            &fence.operation_id,
+            fence.generation,
+        );
+        if released == freshell_ownership::CommitOutcome::Committed {
+            // b8ke e3 post-cap F3: broadcast the RELEASE — connected
+            // devices drop their fenced recovery state immediately
+            // (pre-post-cap the probe reopened the key silently and
+            // clients retained fenced:true indefinitely).
+            broadcast_fence_released(
+                broadcast_tx,
+                &fence.provider,
+                &fence.session_id,
+                ownership.boot_epoch(),
+                fence.generation,
+                fence.prior_kind,
+                if fence.reason == freshell_ownership::FenceReason::StaleStop {
+                    "stale-stop"
+                } else {
+                    "stale-start"
+                },
+                &fence.operation_id,
+            );
+            // b8ke e3 post-cap F5: the event name + failure reason are
+            // REASON-APPROPRIATE — a stop-reason release is a STOP
+            // diagnostic (STOPPING_TIMEOUT), never a misclassified
+            // STARTING_TIMEOUT start diagnostic.
+            let (release_event, release_failure_reason) =
+                if fence.reason == freshell_ownership::FenceReason::StaleStop {
+                    ("ownership.stop.fence_probe_released", "STOPPING_TIMEOUT")
+                } else {
+                    ("ownership.start.fence_probe_released", "STARTING_TIMEOUT")
+                };
+            tracing::warn!(target: "freshell_ownership",
+                event = release_event,
+                operation_id = %fence.operation_id,
+                provider = %fence.provider, session_id = %fence.session_id,
+                from_kind = ?fence.prior_kind,
+                // b8ke e4r2 F2: the STABLE transition schema keeps to_kind
+                // at every transition — a release creates no new runtime
+                // owner, so the vacancy is the None value (never a deleted
+                // field).
+                to_kind = ?Option::<freshell_ownership::RuntimeOwnerKind>::None,
+                runtime_id = ?fence.prior_terminal_id,
+                pid = ?fence.prior_pid,
+                generation = fence.generation,
+                initiator = %fence.initiator,
+                duration_ms = freshell_ownership::now_epoch_ms()
+                    .saturating_sub(fence.since_ms),
+                probe = if fence.prior_pid.is_some() {
+                    "lane-confirmed-tree-reap"
+                } else if fence.settle_concluded.is_some() {
+                    "kind-aware-liveness-absent-and-settled"
+                } else {
+                    "kind-aware-lane-confirmation"
+                },
+                fence_reason = ?fence.reason,
+                epoch = ownership.boot_epoch(),
+                outcome = ?released,
+                failure_reason = release_failure_reason,
+                "the stale-start fence's recorded runtime is confirmed gone — the \
+                 probe releases the key (never plain faith)");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     // Legacy parity: `import 'dotenv/config'` (`server/index.ts:2-3`) loads
@@ -373,6 +968,15 @@ async fn main() -> ExitCode {
     fresh_codex_state.set_session_leases(Arc::clone(&fresh_agent_leases));
     fresh_claude_state.set_session_leases(Arc::clone(&fresh_agent_leases));
 
+    // kata b8ke: the ONE server-wide runtime-ownership coordinator shared
+    // by the terminal lane and every fresh-agent provider (Task 3 wires the
+    // fresh-agent lanes; Task 4 adds the WsState field for the terminal
+    // lane). The per-boot epoch is minted at construction (see
+    // `freshell_ownership`'s crate doc).
+    let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    fresh_codex_state.set_ownership(Arc::clone(&ownership));
+    fresh_claude_state.set_ownership(Arc::clone(&ownership));
+
     // SESSION-09 fix-forward: mint the shared `sessions.changed` revision
     // counter BEFORE `fresh_agent_state` so it can be wired into both
     // producers -- see `FreshAgentState::with_shared_sessions_revision`'s doc
@@ -392,16 +996,38 @@ async fn main() -> ExitCode {
     // SAME instance via `fresh_agent_state.layout`. Constructed BEFORE
     // `fresh_agent_state` and wired at `new()`-time so the
     // `fresh_opencode_state` clone (taken immediately below) shares it too.
-    let layout_store = freshell_freshagent::layout_store::LayoutStore::default();
+    // kata b8ke Task 10 (round-1 review, DURABILITY): persisted under the
+    // same config-dir resolution the settings store uses — a server
+    // restart reloads the pane registry instead of losing it, so
+    // respawn/attach resolution for browser-created panes survives restarts.
+    // A `None` home (headless/ephemeral run) has nowhere to persist and
+    // stays in-memory only — the pre-existing behavior. Round-2 review M2:
+    // constructed with the OFFLOAD writer, so every persist is serialized
+    // under the layout lock and durably written from `spawn_blocking` (the
+    // repo's A13 discipline) instead of fsyncing on the async runtime
+    // while holding the mutex; the queue is drained at graceful shutdown
+    // below.
+    let layout_store = match home.as_deref() {
+        Some(home_dir) => freshell_freshagent::layout_store::LayoutStore::with_persistence_offload(
+            home_dir.join(".freshell").join("layout-store.json"),
+            tokio::runtime::Handle::current(),
+        ),
+        None => freshell_freshagent::layout_store::LayoutStore::default(),
+    };
     let fresh_agent_state =
         FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx))
             .with_shared_sessions_revision(Arc::clone(&sessions_revision))
-            .with_layout(layout_store.clone());
+            .with_layout(layout_store.clone())
+            .with_ownership(Arc::clone(&ownership));
     // The freshopencode WS fresh-agent slice: the post-handshake loop dispatches
     // `freshAgent.create`/`send`/`kill`/`interrupt` (opencode) here.
     let mut fresh_opencode_state =
         freshell_freshagent::FreshOpencodeState::new(fresh_agent_state.clone());
     fresh_opencode_state.set_session_leases(Arc::clone(&fresh_agent_leases));
+    // kata b8ke Task 3: the SAME ONE coordinator (the registry + the retained
+    // stamp map live on the shared `FreshAgentState`, so the REST and WS
+    // opencode surfaces see identical ownership state).
+    fresh_opencode_state.set_ownership(Arc::clone(&ownership));
 
     // The shared, connection-independent terminal registry: terminals are owned by
     // `terminalId` here (not by the socket that created them), so a second/reconnected
@@ -409,7 +1035,13 @@ async fn main() -> ExitCode {
     // makes the multi-client / reconnection / hot-across-reload flows work.
     // Cloned (cheap Arc) into the files REST surface too, whose `candidate-dirs`
     // sources the running terminals' cwds for the DirectoryPicker.
-    let registry = freshell_terminal::TerminalRegistry::new();
+    // kata b8ke Task 4: the SAME ONE ownership coordinator the fresh-agent
+    // states hold (~:325) reaches the terminal lane's RELEASE side here —
+    // the registry's kill/exit/confirmed-kill paths release coordinator
+    // ownership fenced (release-only integration; the WS/REST/auto-resume
+    // lanes claim).
+    let registry = freshell_terminal::TerminalRegistry::new()
+        .with_ownership(std::sync::Arc::clone(&ownership));
     // HOST-PRESSURE PANE (Task 9, docs/plans/2026-08-25-host-pressure-pane.md):
     // the Rust host-stats collector — freshell-platform readers over
     // freshell-ws's trait bridge. Constructed here (not at the ~1311
@@ -738,6 +1370,95 @@ async fn main() -> ExitCode {
     let fresh_claude_state = fresh_claude_state;
     let fresh_codex_state = fresh_codex_state;
     let fresh_opencode_state = fresh_opencode_state;
+
+    // kata b8ke Task 3: the bounded Starting-state timeout watchdog (5s
+    // sweep, 30s max age) — the RAII tickets handle panics; this backstop
+    // recovers leaked tickets (e.g. a detached task killed without unwind)
+    // so a stranded Starting claim can never wedge a session.
+    // Round-2 review: the sweep CANCELS FIRST — it never flips a live spawn
+    // to Vacant underneath it.
+    // b8ke delta round-2 F2: the per-record recovery FAILS CLOSED — the
+    // pre-fix host unconditionally commit_stop'd to plain Vacant (the
+    // registered cancellation was never invoked, settle timeouts were
+    // ignored, and the raw reap results were discarded), so a blocked or
+    // hung start could release the key while its operation/runtime still
+    // proceeded — a competing lifecycle request then took ownership and the
+    // one-writer guarantee broke. The recovery now: invoke the operation's
+    // registered cancellation; await its settle BOUNDED (a timeout is
+    // UNCONFIRMED); consume the partial-runtime reap results (an
+    // unconfirmable reap is UNCONFIRMED); and only CONFIRMED death reopens
+    // the key — everything unconfirmable fences with the TYPED
+    // `StaleStart` reason, whose recovery paths are the operation's own
+    // unwind (the ticket's typed fail releases exactly this fence), a
+    // confirmed-death probe (`release_fenced`), or the lane teardowns.
+    {
+        let ownership = Arc::clone(&ownership);
+        let registry = registry.clone();
+        let fresh_codex = fresh_codex_state.clone();
+        let fresh_claude = fresh_claude_state.clone();
+        let fresh_opencode = fresh_opencode_state.clone();
+        // b8ke e3r4 F5: the watchdog's own broadcast handle (the fence
+        // transitions broadcast; the outer Arc stays with the server).
+        let broadcast_tx = Arc::clone(&broadcast_tx);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                // b8ke e3r2 F2 + e3r4 F5: the stale-Stopping watchdog —
+                // over-aged Stopping records (a stop operation that died
+                // between claim and commit) fence TYPED alongside the
+                // stale-start sweep, so a key can never strand in Stopping
+                // until restart. The fence releases through the
+                // confirmed-death probe only (the e3r4 reconciliation);
+                // and every fence BROADCASTS the transition so connected
+                // devices converge immediately (previously the sweep
+                // discarded every returned transition).
+                for rec in ownership.recover_stale_stoppings(now, 30_000) {
+                    broadcast_fenced_transition(
+                        &broadcast_tx,
+                        &rec.provider,
+                        &rec.session_id,
+                        ownership.boot_epoch(),
+                        rec.generation,
+                        rec.prior.as_ref().map(|(owner, _)| owner.kind),
+                        "stale-stop",
+                        &rec.operation_id,
+                    );
+                }
+                for rec in ownership.recover_stale_starts(now, 30_000) {
+                    recover_stale_start(
+                        &ownership,
+                        &registry,
+                        fresh_codex.clone(),
+                        fresh_claude.clone(),
+                        fresh_opencode.clone(),
+                        rec,
+                        std::time::Duration::from_secs(5),
+                        &broadcast_tx,
+                    )
+                    .await;
+                }
+                // b8ke focused episode-2 round-2 F5: the StaleStart
+                // fences are revisitable — the confirmed-death probe
+                // releases a fence whose recorded runtime is provably
+                // gone (a fence created before its reap evidence
+                // existed), so the StaleStart state is never permanent.
+                probe_stale_start_fences(
+                    &ownership,
+                    &registry,
+                    &fresh_codex,
+                    &fresh_claude,
+                    &fresh_opencode,
+                    &broadcast_tx,
+                )
+                .await;
+            }
+        });
+    }
     // Task 18 (DEV-0008 closure): the shared terminal-metadata registry (the
     // port of `server/terminal-metadata-service.ts`, `freshell_ws::terminal_meta`).
     // Written by the WS create/kill/exit paths and the association drains
@@ -1144,7 +1865,15 @@ async fn main() -> ExitCode {
     // clones of each state share the `Arc<OnceLock>` field, so this covers
     // every route's clone.
     let fresh_agent_identity_sink: freshell_freshagent::SharedPaneIdentitySink =
-        std::sync::Arc::new(identity_sink::LedgerIdentitySink::new(pane_ledger.clone()));
+        // b8ke focused ep5 r3 F1: the bridge carries the ONE server-wide
+        // ownership coordinator — the authoritative binding write's
+        // execution-time ownership re-validation consults it inside the
+        // spawn_blocking closure (the canceled/superseded handoff's
+        // orphaned write is refused typed).
+        std::sync::Arc::new(identity_sink::LedgerIdentitySink::new(
+            pane_ledger.clone(),
+            Some(std::sync::Arc::clone(&ownership)),
+        ));
     fresh_codex_state.set_identity_sink(fresh_agent_identity_sink.clone());
     fresh_claude_state.set_identity_sink(fresh_agent_identity_sink.clone());
     fresh_opencode_state.set_identity_sink(fresh_agent_identity_sink.clone());
@@ -1275,7 +2004,9 @@ async fn main() -> ExitCode {
                 tracing::warn!(
                     provider = %provider,
                     stale_session_id = %stale_id,
-                    "resume validation (REST): cached session missing on disk; spawning fresh"
+                    "resume validation (REST): cached session missing on disk; the row is \
+                     retired as missing and the create answers the typed SESSION_MISSING — \
+                     nothing is spawned"
                 );
                 let _ = ledger.retire_missing(provider, stale_id);
             })
@@ -1322,6 +2053,11 @@ async fn main() -> ExitCode {
         // Per-boot fresh-agent respawn-answer counter (campaign §4.3, V2/A7):
         // in-memory by design — a restart intentionally resets it.
         fresh_agent_respawn_counts: Default::default(),
+        // kata b8ke Task 4: the terminal lane's coordinator handle — the
+        // SAME ONE registry the fresh states and the terminal registry hold
+        // (the create/kill claims and the ready-frame owner replay consult
+        // it).
+        ownership: Some(std::sync::Arc::clone(&ownership)),
         auth_token: Arc::clone(&auth_token),
         // Shared (not moved) so `GET /api/health` reports the SAME `instanceId`.
         server_instance_id: Arc::clone(&server_instance_id),
@@ -1902,6 +2638,147 @@ async fn main() -> ExitCode {
         fresh_claude_state.clone(),
     );
 
+    // kata b8ke Task 6: the atomic session handoff runner + its
+    // `POST /api/sessions/handoff` router. Minted with the SAME fresh
+    // states, terminal registry, coordinator, broadcast bus, and CLI specs
+    // every other lane holds (the REST spawn state is the fully-wired
+    // `fresh_agent_state` — the terminal-target pipeline needs its registry
+    // and CLI-spec wiring; the opencode slice carries the shared serve).
+    // b8ke e3r1 F4 + e3r2 F3: the handoff commit AWAITS the durable flavor
+    // write INSIDE the Handoff window (before the owner commit) through
+    // the host's writer — persistence completes before success returns,
+    // the coordinator's own generation discipline serializes consecutive
+    // handoffs' writes (a detached out-of-generation overwrite is
+    // impossible), and a failure surfaces as the typed
+    // SESSION_METADATA_WRITE_FAILED handoff failure (never log-only). The
+    // writer routes through the metadata API's core (set + the
+    // changed-gated sessions.changed revision broadcast).
+    struct HandoffFlavorWriter {
+        store: session_metadata::SessionMetadataStore,
+        broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+        sessions_revision: Arc<std::sync::atomic::AtomicI64>,
+    }
+    /// b8ke ext r28 F4: the STAGED half — the durable mutation (the
+    /// store's atomic merge + rename + the changed-gated broadcast)
+    /// happens ONLY in `commit`, which the runner awaits AFTER the
+    /// coordinator commits Live(targetKind). A cancellation before the
+    /// commit drops this handle and NOTHING durable changed.
+    struct StagedHandoffFlavor {
+        store: session_metadata::SessionMetadataStore,
+        broadcast_tx: Arc<tokio::sync::broadcast::Sender<String>>,
+        sessions_revision: Arc<std::sync::atomic::AtomicI64>,
+        provider: String,
+        session_id: String,
+        flavor: String,
+    }
+    impl freshell_freshagent::session_handoff::StagedFlavor for StagedHandoffFlavor {
+        fn commit(
+            self: Box<Self>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        {
+            let StagedHandoffFlavor {
+                store,
+                broadcast_tx,
+                sessions_revision,
+                provider,
+                session_id,
+                flavor,
+            } = *self;
+            Box::pin(async move {
+                session_metadata::apply_session_metadata(
+                    &store,
+                    &broadcast_tx,
+                    &sessions_revision,
+                    &provider,
+                    &session_id,
+                    &flavor,
+                    Some("explicit"),
+                )
+                .await
+                .map(|_| ())
+                .map_err(|err| err.to_string())
+            })
+        }
+    }
+    impl freshell_freshagent::session_handoff::FlavorWrite for HandoffFlavorWriter {
+        fn stage(
+            &self,
+            provider: &str,
+            session_id: &str,
+            flavor: &str,
+        ) -> freshell_freshagent::session_handoff::StagedFlavorFuture {
+            let store = self.store.clone();
+            let broadcast_tx = Arc::clone(&self.broadcast_tx);
+            let sessions_revision = Arc::clone(&self.sessions_revision);
+            let (provider, session_id, flavor) = (
+                provider.to_string(),
+                session_id.to_string(),
+                flavor.to_string(),
+            );
+            Box::pin(async move {
+                // b8ke ext r28 F4: the PRE-COMMIT probe — the metadata
+                // directory must accept a temp write BEFORE the target
+                // commits; a disk failure answers the typed
+                // SESSION_METADATA_WRITE_FAILED failure (the uncommitted
+                // target reaped), never a post-commit surprise. No
+                // durable mutation happens here.
+                store
+                    .probe_writable()
+                    .await
+                    .map_err(|err| err.to_string())?;
+                Ok(Some(Box::new(StagedHandoffFlavor {
+                    store,
+                    broadcast_tx,
+                    sessions_revision,
+                    provider,
+                    session_id,
+                    flavor,
+                })
+                    as Box<
+                        dyn freshell_freshagent::session_handoff::StagedFlavor,
+                    >))
+            })
+        }
+
+        /// b8ke e3r3 F4: the hidden-flavor preservation read — the
+        /// session's current durable flavor from the store.
+        fn current_flavor(
+            &self,
+            provider: &str,
+            session_id: &str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send>> {
+            let store = self.store.clone();
+            let (provider, session_id) = (provider.to_string(), session_id.to_string());
+            Box::pin(async move {
+                store.get(&provider, &session_id).await.and_then(|entry| {
+                    entry
+                        .get("sessionType")
+                        .and_then(|v| v.as_str().map(str::to_string))
+                })
+            })
+        }
+    }
+    let flavor_writer: freshell_freshagent::session_handoff::FlavorWriter =
+        Arc::new(HandoffFlavorWriter {
+            store: session_metadata_store.clone(),
+            broadcast_tx: Arc::clone(&broadcast_tx),
+            sessions_revision: Arc::clone(&sessions_revision),
+        });
+    let handoff_runner = Arc::new(
+        freshell_freshagent::SessionHandoffRunner::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            Arc::clone(&ownership),
+            registry.clone(),
+            fresh_codex_state.clone(),
+            fresh_claude_state.clone(),
+            fresh_opencode_state.clone(),
+            fresh_agent_state.clone(),
+            Arc::clone(&cli_commands),
+        )
+        .with_flavor_writer(Some(Arc::clone(&flavor_writer))),
+    );
+
     // `POST /api/session-metadata` (`server/sessions-router.ts:220-244` +
     // `session-metadata-store.ts`): persists sidebar/fresh-agent `sessionType` tags to
     // `<home>/.freshell/session-metadata.json` through the SAME store instance Task 20's
@@ -1979,6 +2856,9 @@ async fn main() -> ExitCode {
         .merge(freshell_ws::router(ws_state))
         .merge(freshell_freshagent::router(fresh_agent_state.clone()))
         .merge(freshell_freshagent::snapshot::router(snapshot_state))
+        .merge(freshell_freshagent::session_handoff::handoff_router(
+            handoff_runner,
+        ))
         .merge(session_metadata::router(session_metadata_state))
         .merge(checkpoints::router(checkpoints_state))
         .merge(attachments::router(attachments_state))
@@ -2383,6 +3263,12 @@ async fn main() -> ExitCode {
     freshell_codex::launch_lifecycle::CodexTerminalLaunchManager::global()
         .shutdown()
         .await;
+    // kata b8ke Task 10 (round-2 review M2): drain the layout store's
+    // ordered persist writer before exit, so a graceful SIGTERM/SIGINT
+    // restart loses no queued layout write. (A hard kill can still lose
+    // the in-flight tail — the registry is re-syncable from connected
+    // clients, which re-send their layout on reconnect.)
+    layout_store.flush_persistence().await;
     // DIAG-01 lifecycle context: the terminal "we are done" marker. Every
     // owner above has run (WS drain, registry kill_all, all three fresh-agent
     // sidecar reapers, the codex launch manager); the logging writer flushes
@@ -3553,6 +4439,7 @@ mod sessions_sweep_tests {
             reconcile_deferral_budget_ms:
                 freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
             fresh_agent_respawn_counts: Default::default(),
+            ownership: None,
         };
 
         let mut gen_rx = index.subscribe_changes();
@@ -4206,5 +5093,2326 @@ mod tests {
         load_dotenv_from(&dir);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// b8ke delta round-2 F2: the stale-Starting watchdog's PRODUCTION-path
+/// tests — the per-record recovery (`recover_stale_start`, the same
+/// function the production loop drives) against a REAL coordinator and
+/// REAL lane states, replacing the old coordinator-unit demonstration of
+/// a hypothetical host. The matrix: an UNREGISTERED stale start (the
+/// blocked/hung shape) fences typed StaleStart — NEVER plain Vacant (the
+/// pre-fix watchdog commit_stop'd unconditionally, releasing the key
+/// while the operation could still proceed); a REGISTERED start's
+/// cancellation is invoked and its completed settle + confirmed partial
+/// reap vacate; an unconfirmed partial reap fences; the operation's own
+/// unwind releases the fence.
+#[cfg(test)]
+mod stale_start_watchdog_tests {
+    use super::*;
+    use freshell_ownership::{BeginOutcome, FenceReason, OwnershipState, RuntimeOwnershipRegistry};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    type WatchdogStates = (
+        Arc<RuntimeOwnershipRegistry>,
+        freshell_terminal::TerminalRegistry,
+        freshell_freshagent::FreshCodexState,
+        freshell_freshagent::FreshClaudeState,
+        freshell_freshagent::FreshOpencodeState,
+    );
+
+    fn watchdog_states() -> WatchdogStates {
+        let ownership = Arc::new(RuntimeOwnershipRegistry::new());
+        let registry = freshell_terminal::TerminalRegistry::new();
+        let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
+        let auth_token = Arc::new("stale-start-watchdog-test-token".to_string());
+        let fresh_codex = freshell_freshagent::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            serde_json::json!({ "freshAgent": { "enabled": true } }),
+        );
+        let fresh_claude = freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+        let fresh_agent =
+            freshell_freshagent::FreshAgentState::new(Arc::clone(&auth_token), broadcast_tx);
+        let fresh_opencode = freshell_freshagent::FreshOpencodeState::new(fresh_agent);
+        (
+            ownership,
+            registry,
+            fresh_codex,
+            fresh_claude,
+            fresh_opencode,
+        )
+    }
+
+    async fn begin_stale_start(ownership: &Arc<RuntimeOwnershipRegistry>, op: &str) -> u64 {
+        let BeginOutcome::Granted { generation } = ownership.begin_start(
+            "claude",
+            "sid-stale",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            op,
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected Granted")
+        };
+        generation
+    }
+
+    /// Recover THE one stale start through the PRODUCTION function.
+    async fn recover_one(states: &WatchdogStates, settle_budget: std::time::Duration) {
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1, "exactly one stale start recovered");
+        let rec = recs.into_iter().next().unwrap();
+        // e3r4 F5: the broadcast handle (tests drain it when needed).
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        recover_stale_start(
+            &states.0,
+            &states.1,
+            states.2.clone(),
+            states.3.clone(),
+            states.4.clone(),
+            rec,
+            settle_budget,
+            &tx,
+        )
+        .await;
+        // The recovery consumed the record: no second recovery fires.
+        assert!(states.0.recover_stale_starts(0, 0).is_empty());
+    }
+
+    /// THE F2 red/green: an UNREGISTERED stale start (nothing can confirm
+    /// the operation's death) fences typed StaleStart — pre-fix the
+    /// watchdog commit_stop'd unconditionally to plain Vacant, releasing
+    /// the key while the blocked operation/runtime could still proceed.
+    #[tokio::test]
+    async fn an_unregistered_stale_start_fences_never_vacant() {
+        let states = watchdog_states();
+        begin_stale_start(&states.0, "op-unregistered").await;
+        // Nothing registered: no cancellation, no settle, no partial.
+        let _ = recover_one(&states, std::time::Duration::from_millis(50)).await;
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale").state,
+                OwnershipState::Fenced {
+                    reason: FenceReason::StaleStart,
+                    ..
+                }
+            ),
+            "the unregistered stale start must fence typed, got {:?}",
+            states.0.observe("claude", "sid-stale").state
+        );
+        // A competing lifecycle request is BLOCKED through the fence —
+        // the one-writer guarantee holds.
+        assert!(matches!(
+            states.0.begin_start(
+                "claude",
+                "sid-stale",
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "op-competing",
+                None,
+                "test",
+                1,
+            ),
+            BeginOutcome::Blocked { .. }
+        ));
+    }
+
+    /// The production-path cancellation test (replacing the old
+    /// hypothetical-host unit demonstration): a start registered through
+    /// the PRODUCTION helper (`register_start_cancellation_for_ticket`)
+    /// has its cancellation INVOKED by the watchdog, and the fired settle
+    /// (the guard's Drop — the operation's completed unwind) + the
+    /// confirmed partial reap vacate the key.
+    #[tokio::test]
+    async fn a_registered_stale_start_cancellation_is_invoked_and_the_settled_key_vacates() {
+        let states = watchdog_states();
+        let generation = begin_stale_start(&states.0, "op-registered").await;
+        // The PRODUCTION registration: a REAL ticket + the shared helper
+        // the claude/codex/terminal lanes use.
+        // The PRODUCTION shape: the start HOLDS its ticket (own_ticket)
+        // while it runs — the RAII drop is the operation's typed unwind.
+        let own_ticket = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states.0),
+            "claude",
+            "sid-stale",
+            "op-registered",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            generation,
+            "test",
+        ));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel = {
+            let cancelled = Arc::clone(&cancelled);
+            Arc::new(move || cancelled.store(true, Ordering::SeqCst)) as Arc<dyn Fn() + Send + Sync>
+        };
+        let guard = freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+            &Some(Arc::clone(&states.0)),
+            "claude",
+            "sid-stale",
+            &own_ticket,
+            cancel,
+        );
+        // The partial runtime: a TERMINAL identity whose RECORDED PID is
+        // genuinely DEAD (b8ke ext r16 F2: row-absence is never confirmed
+        // death — the old shape registered a row-less terminal id with no
+        // pid and treated the absent row as a provably-dead runtime, the
+        // exact shortcut F2 removes). The recorded pid's OS-level
+        // disappearance is the evidence.
+        let mut short_lived = std::process::Command::new("sleep")
+            .arg("0.05")
+            .spawn()
+            .expect("spawn the short-lived process");
+        let dead_pid = short_lived.id();
+        // Reap the child (a zombie's pid lingers until waited) — then
+        // the pid is genuinely gone.
+        let _ = short_lived.wait();
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while freshell_terminal::registry::pid_alive(dead_pid) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fixture: the short-lived process never died"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        states.0.register_partial_runtime(
+            "claude",
+            "sid-stale",
+            "op-registered",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: Some("t-never-existed".into()),
+                live_session_key: None,
+                pid: Some(dead_pid),
+                ownership_id: None,
+            },
+        );
+        // The operation COMPLETES: the guard's Drop fires the settle.
+        drop(guard);
+
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1);
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        recover_stale_start(
+            &states.0,
+            &states.1,
+            states.2.clone(),
+            states.3.clone(),
+            states.4.clone(),
+            recs.into_iter().next().unwrap(),
+            std::time::Duration::from_secs(5),
+            &tx,
+        )
+        .await;
+
+        assert!(
+            cancelled.load(Ordering::SeqCst),
+            "the watchdog must invoke the registered start cancellation"
+        );
+        assert_eq!(
+            states.0.observe("claude", "sid-stale").state,
+            OwnershipState::Vacant,
+            "the settled operation + confirmed-dead partial vacate the key"
+        );
+    }
+
+    /// b8ke ext r16 F2: the row-removed-but-pid-alive shape must NOT
+    /// vacate. `TerminalRegistry::kill_internal` removes the registry row
+    /// BEFORE its blocking PTY kill completes, so a concurrent kill can
+    /// make the row-based `terminal_is_dead` poll report dead while the
+    /// recorded process still lives — the watchdog must confirm by the
+    /// RECORDED PID (captured before any row removal can erase it), and
+    /// only a confirmed PID death vacates (pre-r16 the row's absence was
+    /// treated as confirmed death, so the watchdog could commit the
+    /// session to plain Vacant while the old process remained alive).
+    #[tokio::test]
+    async fn a_row_removed_but_live_recorded_pid_stale_start_does_not_vacate() {
+        let states = watchdog_states();
+        let generation = begin_stale_start(&states.0, "op-r16-f2-live-pid").await;
+        let own_ticket = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states.0),
+            "claude",
+            "sid-stale",
+            "op-r16-f2-live-pid",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            generation,
+            "test",
+        ));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancel = {
+            let cancelled = Arc::clone(&cancelled);
+            Arc::new(move || cancelled.store(true, Ordering::SeqCst)) as Arc<dyn Fn() + Send + Sync>
+        };
+        let guard = freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+            &Some(Arc::clone(&states.0)),
+            "claude",
+            "sid-stale",
+            &own_ticket,
+            cancel,
+        );
+        // THE CONCURRENT-KILL SHAPE: the partial's recorded PID is a LIVE
+        // external process whose registry row is already GONE (a
+        // concurrent kill_internal removed it).
+        let mut live_child = std::process::Command::new("sleep")
+            .arg("300")
+            .spawn()
+            .expect("spawn the external live process");
+        let live_pid = live_child.id();
+        assert!(
+            freshell_terminal::registry::pid_alive(live_pid),
+            "fixture: the recorded pid is alive"
+        );
+        states.0.register_partial_runtime(
+            "claude",
+            "sid-stale",
+            "op-r16-f2-live-pid",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: Some("t-row-removed".into()),
+                live_session_key: None,
+                pid: Some(live_pid),
+                ownership_id: None,
+            },
+        );
+        // The operation COMPLETES (the settle fires) — only the runtime
+        // confirmation decides.
+        drop(guard);
+
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1);
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        recover_stale_start(
+            &states.0,
+            &states.1,
+            states.2.clone(),
+            states.3.clone(),
+            states.4.clone(),
+            recs.into_iter().next().unwrap(),
+            std::time::Duration::from_secs(5),
+            &tx,
+        )
+        .await;
+
+        // THE CONTRACT: the LIVE recorded pid is not a confirmed death —
+        // the key fences typed StaleStart, NEVER plain Vacant.
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale").state,
+                OwnershipState::Fenced {
+                    reason: FenceReason::StaleStart,
+                    ..
+                }
+            ),
+            "the live recorded pid must NOT vacate — got {:?}",
+            states.0.observe("claude", "sid-stale").state
+        );
+        let _ = live_child.kill();
+        let _ = live_child.wait();
+    }
+
+    /// b8ke r22 follow-up (the r20 F1 contract reshape): a SETTLED stale
+    /// start whose partial runtime reap is UNCONFIRMABLE fences — the
+    /// settle resolved (the guard dropped, the flag fired: the r20 sweep
+    /// only converts a fired/unregistered witness, the still-running
+    /// handler protection) but the runtime cannot be confirmed dead, so the
+    /// key fences, never Vacant. The downstream contract is unchanged: the
+    /// ticket's unwind never releases and release_fenced (the
+    /// confirmed-death probe) is the only release. Pre-r20 the settle
+    /// TIMEOUT was the unconfirmable source; the r20 sweep-skip makes
+    /// that shape unreachable (the sweep never fences a still-running
+    /// handler — the ownership crate's
+    /// a_witnessed_slow_start_is_not_swept_while_its_handler_runs pins
+    /// the skip itself).
+    #[tokio::test]
+    async fn a_settle_timeout_fences_the_still_running_start() {
+        let states = watchdog_states();
+        let generation = begin_stale_start(&states.0, "op-settle-timeout").await;
+        // The start's ticket + the settlement witness (the production
+        // registration).
+        let own_ticket = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states.0),
+            "claude",
+            "sid-stale",
+            "op-settle-timeout",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            generation,
+            "test",
+        ));
+        let guard = freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+            &Some(Arc::clone(&states.0)),
+            "claude",
+            "sid-stale",
+            &own_ticket,
+            Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
+        );
+        // The UNCONFIRMABLE partial: a FreshAgent runtime for a session
+        // with NO lane state — the reap cannot confirm its death (no live
+        // session to kill, no recorded identity to confirm), so the fence
+        // holds even with the settle resolved.
+        states.0.register_partial_runtime(
+            "claude",
+            "sid-stale",
+            "op-settle-timeout",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some("sid-stale".into()),
+                pid: None,
+                ownership_id: None,
+            },
+        );
+        // The r20 contract: the settle must FIRE before the sweep converts
+        // the record (the guard's drop is the operation's conclusion).
+        drop(guard);
+        let _ = recover_one(&states, std::time::Duration::from_millis(50)).await;
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale").state,
+                OwnershipState::Fenced {
+                    reason: FenceReason::StaleStart,
+                    ..
+                }
+            ),
+            "the settle RESOLVED but the partial reap is UNCONFIRMABLE — the \
+             stale start's key fences, never Vacant"
+        );
+        // b8ke focused episode-2 round-1 F1: the operation's own unwind
+        // (its ticket's typed fail) is NOT a confirmed runtime death — it
+        // proves only the handler cannot commit, never that the detached
+        // sidecar died. The fence HOLDS through the unwind (the delta-r2
+        // arm released it to Vacant over the unconfirmed runtime).
+        assert!(matches!(
+            states.0.fail(
+                "claude",
+                "sid-stale",
+                "op-settle-timeout",
+                generation,
+                false
+            ),
+            freshell_ownership::FailOutcome::ForeignOperation
+        ));
+        assert!(matches!(
+            states.0.observe("claude", "sid-stale").state,
+            OwnershipState::Fenced {
+                reason: FenceReason::StaleStart,
+                ..
+            }
+        ));
+        // THE ONLY RELEASE: a confirmed-death probe invoking release_fenced
+        // — never a stray fail, never plain Vacant.
+        assert!(matches!(
+            states
+                .0
+                .release_fenced("claude", "sid-stale", "op-settle-timeout", generation),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+        assert_eq!(
+            states.0.observe("claude", "sid-stale").state,
+            OwnershipState::Vacant
+        );
+    }
+
+    // ── b8ke focused episode-2 round-2 F6: the transition-log schema ──────
+
+    /// A minimal thread-local tracing capture of `freshell_ownership`
+    /// events (the init_capture pattern) — each captured event: (event,
+    /// fields-on-the-event-line).
+    mod transition_log_capture {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing::{Event, Subscriber};
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+        use tracing_subscriber::Layer;
+
+        #[derive(Default)]
+        struct FieldVisitor {
+            pub event: String,
+            pub fields: Vec<String>,
+        }
+
+        impl Visit for FieldVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "event" {
+                    return; // captured separately via record_str
+                }
+                self.fields.push(format!("{}={:?}", field.name(), value));
+            }
+
+            fn record_str(&mut self, field: &Field, value: &str) {
+                if field.name() == "event" {
+                    self.event = value.to_string();
+                } else {
+                    self.fields.push(format!("{}={}", field.name(), value));
+                }
+            }
+
+            fn record_u64(&mut self, field: &Field, value: u64) {
+                self.fields.push(format!("{}={}", field.name(), value));
+            }
+
+            fn record_i64(&mut self, field: &Field, value: i64) {
+                self.fields.push(format!("{}={}", field.name(), value));
+            }
+
+            fn record_bool(&mut self, field: &Field, value: bool) {
+                self.fields.push(format!("{}={}", field.name(), value));
+            }
+        }
+
+        /// One captured `freshell_ownership` event: (event, fields).
+        type CapturedTransitionEvent = (String, Vec<String>);
+
+        struct CaptureLayer(Arc<Mutex<Vec<CapturedTransitionEvent>>>);
+
+        impl<S> Layer<S> for CaptureLayer
+        where
+            S: Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                if event.metadata().target() != "freshell_ownership" {
+                    return;
+                }
+                let mut visitor = FieldVisitor::default();
+                event.record(&mut visitor);
+                self.0
+                    .lock()
+                    .expect("capture lock")
+                    .push((visitor.event, visitor.fields));
+            }
+        }
+
+        /// Per-test scoped capture (e2r3): a PRIVATE sink + a thread-
+        /// scoped `set_default` subscriber. A process-global default is
+        /// UNUSABLE here — the extensions suite installs its own global
+        /// layer and only one global can exist per process, so the two
+        /// capture tests race and the loser silently sees no events (the
+        /// full-suite flake). The scoped default serves the test's own
+        /// thread: `#[tokio::test]` runs a CURRENT-THREAD runtime, so the
+        /// recovery task — driven from the test task — emits from this
+        /// same thread. The spawned detached background tasks (deferred
+        /// adoptions) are the only emitters that can escape, and none of
+        /// them run during these captures.
+        pub struct CaptureGuard {
+            sink: Arc<Mutex<Vec<CapturedTransitionEvent>>>,
+            _subscriber: tracing::subscriber::DefaultGuard,
+        }
+
+        impl CaptureGuard {
+            /// This capture's events, in emission order.
+            pub fn events(&self) -> Vec<CapturedTransitionEvent> {
+                self.sink.lock().expect("capture lock").clone()
+            }
+        }
+
+        pub fn install() -> CaptureGuard {
+            let sink = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&sink)));
+            CaptureGuard {
+                sink,
+                _subscriber: tracing::subscriber::set_default(subscriber),
+            }
+        }
+    }
+
+    /// b8ke focused episode-2 round-2 F6: BOTH stale-start transition
+    /// outcomes carry the required diagnostic schema — the target runtime
+    /// kind (`to_kind`), the runtime ID/PID the record holds, and the
+    /// stale age (`duration_ms`) — so the transition identifies WHICH
+    /// process was cancelled or left unconfirmed. The fenced outcome
+    /// carries the same field set.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stale_start_transition_logs_carry_the_required_schema() {
+        // The fenced outcome: a REAL live partial (unconfirmable → fences)
+        // with the capture installed.
+        let states = watchdog_states();
+        let sink = transition_log_capture::install();
+        let generation = begin_stale_start(&states.0, "op-log-fields").await;
+        let mut live = tokio::process::Command::new("sleep")
+            .arg("300")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the live partial");
+        let live_pid = live.id().expect("live pid");
+        states.0.register_partial_runtime(
+            "claude",
+            "sid-stale",
+            "op-log-fields",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some("sid-stale".into()),
+                pid: Some(live_pid),
+                ownership_id: None,
+            },
+        );
+        let _ = recover_one(&states, std::time::Duration::from_millis(50)).await;
+        let _ = live.kill().await;
+
+        let events = sink.events();
+        let fenced = events
+            .iter()
+            .find(|(event, _)| event == "ownership.start.recovery_fenced")
+            .expect("the fenced transition event is captured")
+            .clone();
+        for field in ["to_kind=", "pid=", "duration_ms="] {
+            assert!(
+                fenced.1.iter().any(|f| f.starts_with(field)),
+                "the fenced transition log must carry {field} — got {:?}",
+                fenced.1
+            );
+        }
+
+        // The recovered outcome: a REAL exited partial + the settle fired
+        // + the LEASE KILL HANDLE (the confirmed-tree evidence — the
+        // consolidated F6 semantics: the recovery vacates only with the
+        // lane's tree confirm). Same schema on the recovered transition.
+        let states2 = watchdog_states();
+        let sink2 = transition_log_capture::install();
+        let generation2 = begin_stale_start(&states2.0, "op-log-fields-2").await;
+        let mut exited = tokio::process::Command::new("true")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the reaped partial");
+        let exited_pid = exited.id().expect("exited pid");
+        let _ = exited.wait().await;
+        let own_ticket = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states2.0),
+            "claude",
+            "sid-stale",
+            "op-log-fields-2",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            generation2,
+            "test",
+        ));
+        let guard = freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+            &Some(Arc::clone(&states2.0)),
+            "claude",
+            "sid-stale",
+            &own_ticket,
+            Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
+        );
+        states2.0.register_partial_runtime(
+            "claude",
+            "sid-stale",
+            "op-log-fields-2",
+            generation2,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some("sid-stale".into()),
+                pid: Some(exited_pid),
+                ownership_id: None,
+            },
+        );
+        states2
+            .3
+            .leases()
+            .claim("claude", "sid-stale", "op-log-fields-2", 0);
+        states2.3.leases().set_kill_handle(
+            "claude",
+            "sid-stale",
+            "op-log-fields-2",
+            exited_pid,
+            "log-fields-tree-tag",
+        );
+        drop(guard); // the settle fires
+        let recs = states2.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1);
+        let (tx2, _rx2) = tokio::sync::broadcast::channel::<String>(64);
+        recover_stale_start(
+            &states2.0,
+            &states2.1,
+            states2.2.clone(),
+            states2.3.clone(),
+            states2.4.clone(),
+            recs.into_iter().next().unwrap(),
+            std::time::Duration::from_secs(5),
+            &tx2,
+        )
+        .await;
+        assert_eq!(
+            states2.0.observe("claude", "sid-stale").state,
+            OwnershipState::Vacant
+        );
+        let events2 = sink2.events();
+        let recovered = events2
+            .iter()
+            .find(|(event, _)| event == "ownership.start.recovered")
+            .expect("the recovered transition event is captured")
+            .clone();
+        for field in ["to_kind=", "pid=", "duration_ms="] {
+            assert!(
+                recovered.1.iter().any(|f| f.starts_with(field)),
+                "the recovered transition log must carry {field} — got {:?}",
+                recovered.1
+            );
+        }
+
+        // b8ke focused episode-2 round-3 F8: the REKEY transition carries
+        // the full schema too (from_kind + to_kind + duration_ms) — driven
+        // directly through the registry's rekey_live (the Adopt-path move
+        // the claude rollback uses).
+        let states_rk = watchdog_states();
+        let sink_rk = transition_log_capture::install();
+        let BeginOutcome::Granted { generation: rk_gen } = states_rk.0.begin_start(
+            "claude",
+            "rk-old",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "rk-op",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!()
+        };
+        let rk_owner = freshell_ownership::OwnerIdentity {
+            kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            terminal_id: None,
+            live_session_key: Some("rk-map-key".into()),
+            pid: Some(4242),
+            ownership_id: None,
+        };
+        assert!(matches!(
+            states_rk
+                .0
+                .commit_live("claude", "rk-old", "rk-op", rk_gen, rk_owner),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+        assert!(matches!(
+            states_rk.0.rekey_live(
+                "claude",
+                "rk-old",
+                "rk-new",
+                "rk-map-key",
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("rk-map-key".into()),
+                    pid: Some(4242),
+                    ownership_id: Some("rekey-op-schema".into()),
+                },
+                "test-rekey",
+                "rekey-op-schema",
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+        let events_rk = sink_rk.events();
+        let rekey = events_rk
+            .iter()
+            .find(|(event, _)| event == "ownership.live.rekey_live")
+            .expect("the rekey transition event is captured")
+            .clone();
+        for field in ["from_kind=", "to_kind=", "duration_ms=", "pid="] {
+            assert!(
+                rekey.1.iter().any(|f| f.starts_with(field)),
+                "the rekey transition log must carry {field} — got {:?}",
+                rekey.1
+            );
+        }
+
+        // F8: the fence-release record carries the initiator + the probe
+        // that confirmed — b8ke e4r1 F3: a RELEASE transition creates NO
+        // new runtime owner (the record is Vacant after release_fenced), so
+        // the log carries NO to_kind — the field falsely described a
+        // terminal-to-terminal transition and contradicted the vacant
+        // release broadcast.
+        let states_fr = watchdog_states();
+        let sink_fr = transition_log_capture::install();
+        let generation_fr = begin_stale_start(&states_fr.0, "op-fence-release-log").await;
+        let own_ticket_fr = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states_fr.0),
+            "claude",
+            "sid-stale",
+            "op-fence-release-log",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            generation_fr,
+            "test",
+        ));
+        let guard_fr = freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+            &Some(Arc::clone(&states_fr.0)),
+            "claude",
+            "sid-stale",
+            &own_ticket_fr,
+            Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
+        );
+        // b8ke r22 follow-up (the r20 F1 contract): the settle must FIRE
+        // before the sweep converts a witnessed start — the operation
+        // concluded (the guard's drop) precedes the recovery.
+        drop(guard_fr);
+        let recs_fr = states_fr.0.recover_stale_starts(0, 0);
+        assert_eq!(recs_fr.len(), 1);
+        let rec_fr = recs_fr.into_iter().next().unwrap();
+        assert!(matches!(
+            states_fr.0.fence_unconfirmed_stop(
+                "claude",
+                "sid-stale",
+                "op-fence-release-log",
+                rec_fr.generation,
+                FenceReason::StaleStart
+            ),
+            freshell_ownership::FenceOutcome::Fenced
+        ));
+        let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(
+            &states_fr.0,
+            &states_fr.1,
+            &states_fr.2,
+            &states_fr.3,
+            &states_fr.4,
+            &probe_tx,
+        )
+        .await;
+        assert_eq!(
+            states_fr.0.observe("claude", "sid-stale").state,
+            OwnershipState::Vacant
+        );
+        let events_fr = sink_fr.events();
+        let released_fr = events_fr
+            .iter()
+            .find(|(event, _)| event == "ownership.start.fence_probe_released")
+            .expect("the fence-release event is captured")
+            .clone();
+        // b8ke e4r2 F2: the release record carries the STABLE transition
+        // schema — every field present at every coordinator transition, the
+        // vacancy expressed as None values (to_kind=None: a release creates
+        // no new runtime owner — the field is retained, never deleted).
+        for field in [
+            "operation_id=",
+            "provider=",
+            "session_id=",
+            "from_kind=",
+            "to_kind=",
+            "runtime_id=",
+            "pid=",
+            "generation=",
+            "outcome=",
+            "initiator=",
+            "duration_ms=",
+            "probe=",
+            "fence_reason=",
+            "epoch=",
+            "failure_reason=",
+        ] {
+            assert!(
+                released_fr.1.iter().any(|f| f.starts_with(field)),
+                "the fence-release log must carry {field} — got {:?}",
+                released_fr.1
+            );
+        }
+        assert!(
+            released_fr.1.iter().any(|f| f == "to_kind=None"),
+            "the release's to_kind is the STABLE-SCHEMA None value (the \
+             release creates no new runtime owner) — got {:?}",
+            released_fr.1
+        );
+
+        // b8ke e3 post-cap F5: a STOP-reason release logs through the
+        // STOP's own diagnostic (ownership.stop.fence_probe_released +
+        // STOPPING_TIMEOUT) — never the misclassified start event.
+        let states_ss = watchdog_states();
+        let sink_ss = transition_log_capture::install();
+        let freshell_ownership::BeginOutcome::Granted { generation: g_ss } =
+            states_ss.0.begin_start(
+                "opencode",
+                "sid-stale",
+                freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                "op-live-ss",
+                None,
+                "test",
+                0,
+            )
+        else {
+            panic!()
+        };
+        assert!(matches!(
+            states_ss.0.commit_live(
+                "opencode",
+                "sid-stale",
+                "op-live-ss",
+                g_ss,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("sid-stale".into()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+        let claim_ss = freshell_ownership::StopClaim {
+            expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            expected_runtime: None,
+            observed: freshell_ownership::ObservedFence {
+                epoch: states_ss.0.boot_epoch(),
+                generation: g_ss,
+            },
+        };
+        match states_ss.0.begin_stop(
+            "opencode",
+            "sid-stale",
+            "op-stranded-ss",
+            &claim_ss,
+            "test",
+            0,
+        ) {
+            freshell_ownership::StopOutcome::Granted { generation: sg } => {
+                let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                assert!(states_ss.0.register_stop_settlement(
+                    "opencode",
+                    "sid-stale",
+                    "op-stranded-ss",
+                    sg,
+                    Arc::clone(&flag),
+                ));
+            }
+            other => panic!("expected the stop claim granted, got {other:?}"),
+        }
+        assert_eq!(states_ss.0.recover_stale_stoppings(10_000, 5_000).len(), 1);
+        let (tx_ss, _rx_ss) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(
+            &states_ss.0,
+            &states_ss.1,
+            &states_ss.2,
+            &states_ss.3,
+            &states_ss.4,
+            &tx_ss,
+        )
+        .await;
+        assert_eq!(
+            states_ss.0.observe("opencode", "sid-stale").state,
+            OwnershipState::Vacant
+        );
+        let events_ss = sink_ss.events();
+        let stop_release = events_ss
+            .iter()
+            .find(|(event, _)| event == "ownership.stop.fence_probe_released")
+            .expect("the STOP-reason release logs through the STOP event")
+            .clone();
+        assert!(
+            stop_release
+                .1
+                .iter()
+                .any(|f| f == "failure_reason=STOPPING_TIMEOUT"),
+            "the STOP release's failure reason is STOPPING_TIMEOUT — got {:?}",
+            stop_release.1
+        );
+        assert!(
+            !events_ss
+                .iter()
+                .any(|(e, f)| e == "ownership.start.fence_probe_released"
+                    && f.iter().any(|x| x == "failure_reason=STARTING_TIMEOUT")
+                    && f.iter().any(|x| x.starts_with("session_id=sid-stale"))),
+            "no misclassified START diagnostic for the stop-reason release"
+        );
+    }
+
+    /// b8ke e3r4 F5: the stale-stop watchdog's fence transition
+    /// BROADCASTS (the session.runtimeOwner frame) so connected devices
+    /// converge immediately; the frame carries the fenced marker + the
+    /// typed reason.
+    #[tokio::test]
+    async fn the_stale_stop_fence_transition_broadcasts_the_owner_frame() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        broadcast_fenced_transition(
+            &tx,
+            "claude",
+            "sid-bcast",
+            7,
+            3,
+            Some(freshell_ownership::RuntimeOwnerKind::FreshAgent),
+            "stale-stop",
+            "op-bcast",
+        );
+        let raw = rx.try_recv().expect("the fence transition broadcast");
+        let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(frame["type"], "session.runtimeOwner");
+        assert_eq!(frame["sessionId"], "sid-bcast");
+        assert_eq!(frame["ownerKind"], "fresh-agent");
+        assert_eq!(frame["transition"], "handoff-failed");
+        assert_eq!(frame["reason"], "stale-stop");
+        assert_eq!(frame["fenced"], true);
+        assert_eq!(frame["epoch"], 7);
+        assert_eq!(frame["generation"], 3);
+    }
+
+    /// b8ke d4 F2: a TERMINAL-prior stale fence for the OPENCODE provider
+    /// probes the TERMINAL row's liveness — NEVER the Fresh Agent lane
+    /// (pre-d4 the opencode Fresh probe answered "true" because no Fresh
+    /// map/turn existed, releasing while the terminal still ran). The fence
+    /// HOLDS while the recorded pane runs and releases on its confirmed
+    /// death.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_terminal_prior_fence_probes_the_terminal_row_not_the_fresh_lane() {
+        let states = watchdog_states();
+        let live_tid = "T-d4-f2-live";
+        // A REAL running terminal row with the recorded identity.
+        let spec = freshell_platform::SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            env_overrides: std::collections::BTreeMap::new(),
+            cwd: Some("/tmp".into()),
+            cols: 80,
+            rows: 24,
+        };
+        let env = std::collections::BTreeMap::new();
+        states
+            .1
+            .create(
+                &spec,
+                &env,
+                live_tid.to_string(),
+                "S-d4-f2".to_string(),
+                "shell",
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("spawn the live terminal");
+        assert!(
+            !states.1.terminal_is_dead(live_tid),
+            "precondition: the terminal runs"
+        );
+
+        // The stale-start record whose PARTIAL is the TERMINAL owner.
+        let freshell_ownership::BeginOutcome::Granted { generation } = states.0.begin_start(
+            "opencode",
+            "sid-stale",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-d4-f2",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected Granted")
+        };
+        // b8ke e4r4: the production create's settlement registration —
+        // the PID-less prior releases only once the stale operation's
+        // settlement CONCLUDED. b8ke r22 follow-up (the r20 F1 contract
+        // reshape): the sweep only converts a FIRED/unregistered witness,
+        // so the settle must fire BEFORE the recovery — the
+        // "unsettled fence" probe phase is now unreachable through the
+        // production sweep (the r20 sweep-skip IS the still-running
+        // protection, subsuming the e4r4 unsettled-holds arm; the
+        // ownership crate's r20-F1 tests pin the skip).
+        let own_ticket_d4f2 = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states.0),
+            "opencode",
+            "sid-stale",
+            "op-d4-f2",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            generation,
+            "test",
+        ));
+        let settle_guard_d4f2 =
+            freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+                &Some(Arc::clone(&states.0)),
+                "opencode",
+                "sid-stale",
+                &own_ticket_d4f2,
+                Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
+            );
+        states.0.register_partial_runtime(
+            "opencode",
+            "sid-stale",
+            "op-d4-f2",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: Some(live_tid.to_string()),
+                live_session_key: None,
+                pid: None,
+                ownership_id: None,
+            },
+        );
+        // The settle fires BEFORE the sweep (the r20 contract: the flag
+        // must be fired for the conversion).
+        drop(settle_guard_d4f2);
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1);
+        assert!(matches!(
+            states.0.fence_unconfirmed_stop(
+                "opencode",
+                "sid-stale",
+                "op-d4-f2",
+                recs[0].generation,
+                FenceReason::StaleStart,
+            ),
+            freshell_ownership::FenceOutcome::Fenced
+        ));
+
+        // (a) THE PROBE HOLDS while the terminal runs — the TERMINAL-row
+        // evidence is the gate (pre-d4: the opencode Fresh probe released
+        // it here because no Fresh record existed — the terminal still
+        // ran). The settled flag does NOT shortcut the row check.
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
+        assert!(
+            matches!(
+                states.0.observe("opencode", "sid-stale").state,
+                OwnershipState::Fenced { .. }
+            ),
+            "the fence HOLDS while the recorded terminal still runs"
+        );
+
+        // (b) The terminal's confirmed death releases the fence (the
+        // settled + dead-row evidence). b8ke r22 follow-up: the
+        // "holds through the dead row while UNSETTLED" phase is subsumed
+        // by the r20 sweep-skip (an unsettled start is never swept, so
+        // its fence is never armed) — the reachable probe contract is
+        // settled → dead row → releases.
+        states.1.kill(live_tid);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !states.1.terminal_is_dead(live_tid) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the terminal never died"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
+        assert_eq!(
+            states.0.observe("opencode", "sid-stale").state,
+            OwnershipState::Vacant,
+            "the confirmed terminal death + the concluded settlement \
+             release the fence"
+        );
+    }
+
+    /// b8ke d4 F2 + e4r4: a TERMINAL-prior stale fence for the CLAUDE
+    /// provider releases on the terminal's confirmed death ONCE the
+    /// stale operation's settlement CONCLUDED — the settled-vs-unsettled
+    /// contract (an unsettled start holds even through a gone row). Pre-d4
+    /// the Fresh probe answered "false" forever (no Fresh record exists),
+    /// wedging even a dead terminal's fence.
+    #[tokio::test]
+    async fn a_claude_terminal_prior_fence_releases_on_confirmed_terminal_death() {
+        let states = watchdog_states();
+        // The recorded pane is ABSENT from the registry (it exited before
+        // the fence — terminal_is_dead for a gone row is true).
+        let gone_tid = "T-d4-f2-gone";
+        assert!(
+            states.1.terminal_is_dead(gone_tid),
+            "precondition: the recorded pane is gone (confirmed dead)"
+        );
+
+        let freshell_ownership::BeginOutcome::Granted { generation } = states.0.begin_start(
+            "claude",
+            "sid-stale",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-d4-f2c",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected Granted")
+        };
+        // b8ke e4r4: the production create's settlement registration —
+        // the PID-less prior releases only once the stale operation's
+        // settlement CONCLUDED (the settled-vs-unsettled contract).
+        let own_ticket_d4f2c = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states.0),
+            "claude",
+            "sid-stale",
+            "op-d4-f2c",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            generation,
+            "test",
+        ));
+        let settle_guard_d4f2c =
+            freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+                &Some(Arc::clone(&states.0)),
+                "claude",
+                "sid-stale",
+                &own_ticket_d4f2c,
+                Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
+            );
+        states.0.register_partial_runtime(
+            "claude",
+            "sid-stale",
+            "op-d4-f2c",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: Some(gone_tid.to_string()),
+                live_session_key: None,
+                pid: None,
+                ownership_id: None,
+            },
+        );
+        // b8ke r22 follow-up (the r20 F1 contract): the settle must FIRE
+        // before the sweep converts a witnessed start. The "holds while
+        // unsettled" probe phase is subsumed by the r20 sweep-skip (an
+        // unsettled start is never swept, so the fence is never armed)
+        // — the reachable release contract is: settled + the gone row →
+        // the probe releases.
+        drop(settle_guard_d4f2c);
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1);
+        assert!(matches!(
+            states.0.fence_unconfirmed_stop(
+                "claude",
+                "sid-stale",
+                "op-d4-f2c",
+                recs[0].generation,
+                FenceReason::StaleStart,
+            ),
+            freshell_ownership::FenceOutcome::Fenced
+        ));
+
+        // THE PROBE: the terminal row is gone and the stale operation's
+        // settlement CONCLUDED (pre-d4 the claude Fresh probe's false
+        // wedged it forever; pre-e4r4 the absent row released too
+        // early for an unsettled start — now unreachable: the r20
+        // sweep never arms an unsettled fence).
+        let sink_d4f2c = transition_log_capture::install();
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
+        assert_eq!(
+            states.0.observe("claude", "sid-stale").state,
+            OwnershipState::Vacant,
+            "the dead terminal's fence releases with the settlement \
+             concluded (pre-d4: the Fresh probe wedged it forever)"
+        );
+
+        // b8ke e4r2 F2: the TERMINAL-prior release record carries the same
+        // STABLE transition schema as the Fresh Agent arm — every field
+        // present, the vacancy expressed as the None to_kind (the release
+        // creates no new runtime owner).
+        let events_d4f2c = sink_d4f2c.events();
+        let released_d4f2c = events_d4f2c
+            .iter()
+            .find(|(event, _)| event == "ownership.start.fence_probe_released")
+            .expect("the terminal-prior release event is captured")
+            .clone();
+        for field in [
+            "operation_id=",
+            "provider=",
+            "session_id=",
+            "from_kind=",
+            "to_kind=",
+            "runtime_id=",
+            "pid=",
+            "generation=",
+            "outcome=",
+            "initiator=",
+            "duration_ms=",
+            "probe=",
+            "fence_reason=",
+            "epoch=",
+            "failure_reason=",
+        ] {
+            assert!(
+                released_d4f2c.1.iter().any(|f| f.starts_with(field)),
+                "the terminal-prior release log must carry {field} — got {:?}",
+                released_d4f2c.1
+            );
+        }
+        assert!(
+            released_d4f2c.1.iter().any(|f| f == "to_kind=None"),
+            "the terminal-prior release's to_kind is the STABLE-SCHEMA None \
+             value — got {:?}",
+            released_d4f2c.1
+        );
+        // b8ke e4 post-cap F3: branch-accurate probe labels — the
+        // PID-less row branch records the row-liveness evidence.
+        assert!(
+            released_d4f2c
+                .1
+                .iter()
+                .any(|f| f == "probe=terminal-row-liveness"),
+            "the PID-less row-branch release records the row-liveness \
+             evidence label — got {:?}",
+            released_d4f2c.1
+        );
+        assert!(
+            released_d4f2c
+                .1
+                .iter()
+                .any(|f| f == "from_kind=Some(Terminal)"),
+            "the terminal-prior release's from_kind names the fenced \
+             TERMINAL prior — got {:?}",
+            released_d4f2c.1
+        );
+    }
+
+    /// b8ke e4r3 F2: the terminal-prior fence probe's evidence is the
+    /// recorded PID's OS-level death, NEVER row absence — kill() removes
+    /// the row BEFORE signaling/reaping the PTY, so a probe landing in the
+    /// row-removed-but-not-yet-reaped interval must HOLD the fence (row
+    /// absence becomes true merely because the kill is in progress);
+    /// the release happens only after the reap completes (the recorded
+    /// runtime is actually gone).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_kill_in_flight_terminal_prior_holds_its_fence_until_the_reap_completes() {
+        let states = watchdog_states();
+        let sink_e4r3 = transition_log_capture::install();
+        // A REAL live runtime the registry never knew (the recorded pid)
+        // plus a terminal id whose row is ABSENT — the exact shape a kill
+        // in progress produces after removing the row (and the shape a
+        // never-spawned id produces before any kill).
+        let mut prior = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn the recorded prior's stand-in process");
+        let prior_pid = prior.id();
+        let reaping_tid = "T-e4r3-f2-reaping";
+        assert!(
+            states.1.terminal_is_dead(reaping_tid),
+            "precondition: the recorded terminal id's row is absent (the \
+             kill-in-progress interval's row shape)"
+        );
+        assert!(
+            freshell_terminal::registry::pid_alive(prior_pid),
+            "precondition: the recorded runtime still lives"
+        );
+
+        let freshell_ownership::BeginOutcome::Granted { generation } = states.0.begin_start(
+            "claude",
+            "sid-stale",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-e4r3-f2",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected Granted")
+        };
+        states.0.register_partial_runtime(
+            "claude",
+            "sid-stale",
+            "op-e4r3-f2",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: Some(reaping_tid.to_string()),
+                live_session_key: None,
+                pid: Some(prior_pid),
+                ownership_id: None,
+            },
+        );
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1);
+        assert!(matches!(
+            states.0.fence_unconfirmed_stop(
+                "claude",
+                "sid-stale",
+                "op-e4r3-f2",
+                recs[0].generation,
+                FenceReason::StaleStart,
+            ),
+            freshell_ownership::FenceOutcome::Fenced
+        ));
+
+        // THE PROBE, mid-interval: the row is absent but the recorded
+        // runtime STILL LIVES — the fence must HOLD (pre-e4r3 the
+        // row-absence predicate read the missing row as confirmed reap
+        // and released, permitting another writer before the old
+        // runtime's reap completed).
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale").state,
+                OwnershipState::Fenced { .. }
+            ),
+            "the fence HOLDS while the recorded runtime still lives — row \
+             absence is not confirmed reap"
+        );
+
+        // The reap completes (the recorded runtime is actually gone): the
+        // probe now releases.
+        prior.kill().expect("SIGKILL the recorded prior");
+        let _ = prior.wait().expect("reap the recorded prior");
+        assert!(
+            !freshell_terminal::registry::pid_alive(prior_pid),
+            "precondition: the reap completed"
+        );
+        probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
+        assert_eq!(
+            states.0.observe("claude", "sid-stale").state,
+            OwnershipState::Vacant,
+            "the reap completed — the probe releases"
+        );
+
+        // b8ke e4 post-cap F3: the PID-bearing branch's release record
+        // carries ITS OWN evidence label — the OS-level pid-death probe —
+        // never the row-liveness label (pre-post-cap every terminal
+        // release logged probe=terminal-row-liveness, recording the wrong
+        // safety evidence for the pid branch).
+        let events_e4r3 = sink_e4r3.events();
+        let released_e4r3 = events_e4r3
+            .iter()
+            .find(|(event, _)| *event == "ownership.start.fence_probe_released")
+            .expect("the pid-branch release event is captured")
+            .clone();
+        assert!(
+            released_e4r3
+                .1
+                .iter()
+                .any(|f| f == "probe=terminal-pid-death"),
+            "the PID-bearing release records the pid-death evidence label — \
+             got {:?}",
+            released_e4r3.1
+        );
+    }
+
+    /// b8ke e4r4: the PID-less PRE-SPAWN terminal identity is only safely
+    /// dead when the stale operation's settlement CONCLUDED — the
+    /// production create registers the pre-spawn identity BEFORE its
+    /// async work (up to 45s); the 30s watchdog cancels the stale start
+    /// and its 5s settlement wait can expire with the operation STILL
+    /// ACTIVE, so the same-pass StaleStart fence must HOLD (the
+    /// old-generation handler can still spawn its CLI — the cancellation
+    /// callback is only a registry kill, a no-op before spawn — and
+    /// releasing would admit a second writer over the still-capable
+    /// one). The release needs BOTH the concluded settlement and the
+    /// absent-row evidence.
+    #[tokio::test]
+    async fn a_pidless_terminal_fence_holds_until_its_start_settlement_concludes() {
+        let states = watchdog_states();
+        // The PRE-SPAWN shape: the terminal id is recorded, the row is
+        // absent (the CLI has not spawned), the pid is not recorded.
+        let pre_spawn_tid = "T-e4r4-presence";
+        assert!(
+            states.1.terminal_is_dead(pre_spawn_tid),
+            "precondition: the pre-spawn row is absent"
+        );
+
+        let freshell_ownership::BeginOutcome::Granted { generation } = states.0.begin_start(
+            "claude",
+            "sid-stale",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-e4r4-f1",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected Granted")
+        };
+        // The production create's settlement registration (the ticket the
+        // start-cancellation machinery arms — the operation's guard; its
+        // drop concludes the settlement). b8ke r22 follow-up (the r20 F1
+        // contract reshape): the settle must FIRE before the sweep
+        // converts a witnessed start — the still-running-handler
+        // protection (the sweep's skip) subsumes the e4r4 "unsettled
+        // holds" contract: an unsettled pre-spawn start is never swept,
+        // so a production-path fence always carries a concluded
+        // settlement.
+        let own_ticket = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states.0),
+            "claude",
+            "sid-stale",
+            "op-e4r4-f1",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            generation,
+            "test",
+        ));
+        let settle_guard =
+            freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+                &Some(Arc::clone(&states.0)),
+                "claude",
+                "sid-stale",
+                &own_ticket,
+                Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
+            );
+        states.0.register_partial_runtime(
+            "claude",
+            "sid-stale",
+            "op-e4r4-f1",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                terminal_id: Some(pre_spawn_tid.to_string()),
+                live_session_key: None,
+                pid: None,
+                ownership_id: None,
+            },
+        );
+        // The settle fires BEFORE the sweep (the r20 contract).
+        drop(settle_guard);
+        // THE WATCHDOG PASS: the sweep converts the stale start and the
+        // probe runs in the SAME pass.
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1);
+        assert!(matches!(
+            states.0.fence_unconfirmed_stop(
+                "claude",
+                "sid-stale",
+                "op-e4r4-f1",
+                recs[0].generation,
+                FenceReason::StaleStart,
+            ),
+            freshell_ownership::FenceOutcome::Fenced
+        ));
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(&states.0, &states.1, &states.2, &states.3, &states.4, &tx).await;
+        // THE CONTRACT: the settlement concluded and the pre-spawn row is
+        // absent — the probe RELEASES (the e4r4 evidence: the row absence
+        // + the concluded settlement). Pre-e4r4 the absent row alone
+        // released even for an unsettled handler that could still spawn
+        // — the r20 sweep-skip now prevents that fence from ever arming.
+        assert_eq!(
+            states.0.observe("claude", "sid-stale").state,
+            OwnershipState::Vacant,
+            "the settlement concluded and the row is absent — the probe \
+             releases"
+        );
+    }
+
+    /// b8ke e3 post-cap F3: the COMPLETE fence-to-release convergence
+    /// sequence — the ENTRY broadcast (the fenced transition, from the
+    /// stale-start recovery) AND the RELEASE broadcast (the probe's
+    /// reopened-to-Vacant frame) both reach the bus: connected devices see
+    /// the fence, then see it clear. Pre-post-cap the probe released
+    /// silently and clients retained fenced:true indefinitely.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_fence_entry_and_release_both_broadcast_the_convergence_sequence() {
+        let states = watchdog_states();
+        let (bus_tx, mut bus_rx) = tokio::sync::broadcast::channel::<String>(64);
+
+        // The stale-stop shape (the watchdog's fenced transition): a Live
+        // owner, a stranded stop with a FIRED settlement flag, the watchdog
+        // fences typed StaleStop — the sweep's ENTRY broadcast fires (the
+        // same helper the watchdog loop calls) — then the probe releases
+        // (the PID-less Some(true) arm → the opencode lane confirms) and
+        // its RELEASE broadcast fires.
+        let freshell_ownership::BeginOutcome::Granted { generation } = states.0.begin_start(
+            "opencode",
+            "sid-stale",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-live-seq",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected Granted")
+        };
+        assert!(matches!(
+            states.0.commit_live(
+                "opencode",
+                "sid-stale",
+                "op-live-seq",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("sid-stale".into()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+        let stop_claim = freshell_ownership::StopClaim {
+            expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            expected_runtime: None,
+            observed: freshell_ownership::ObservedFence {
+                epoch: states.0.boot_epoch(),
+                generation,
+            },
+        };
+        match states.0.begin_stop(
+            "opencode",
+            "sid-stale",
+            "op-stranded-seq",
+            &stop_claim,
+            "test",
+            0,
+        ) {
+            freshell_ownership::StopOutcome::Granted {
+                generation: stop_gen,
+            } => {
+                let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                assert!(states.0.register_stop_settlement(
+                    "opencode",
+                    "sid-stale",
+                    "op-stranded-seq",
+                    stop_gen,
+                    Arc::clone(&stop_flag),
+                ));
+            }
+            other => panic!("expected the stop claim granted, got {other:?}"),
+        }
+        let fenced = states.0.recover_stale_stoppings(10_000, 5_000);
+        assert_eq!(fenced.len(), 1, "the watchdog fenced the vanished stop");
+
+        // THE ENTRY broadcast — the sweep's own helper.
+        broadcast_fenced_transition(
+            &bus_tx,
+            "opencode",
+            "sid-stale",
+            states.0.boot_epoch(),
+            fenced[0].generation,
+            fenced[0].prior.as_ref().map(|(o, _)| o.kind),
+            "stale-stop",
+            &fenced[0].operation_id,
+        );
+        let mut saw_entry = false;
+        while let Ok(raw) = bus_rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "session.runtimeOwner"
+                && frame["transition"] == "handoff-failed"
+                && frame["fenced"] == true
+                && frame["sessionId"] == "sid-stale"
+            {
+                saw_entry = true;
+            }
+        }
+        assert!(saw_entry, "the fence ENTRY broadcast reached the bus");
+
+        // THE RELEASE: the probe (PID-less, stop evidence fired → the
+        // opencode lane confirms) + its broadcast.
+        probe_stale_start_fences(
+            &states.0, &states.1, &states.2, &states.3, &states.4, &bus_tx,
+        )
+        .await;
+        assert_eq!(
+            states.0.observe("opencode", "sid-stale").state,
+            OwnershipState::Vacant
+        );
+        let mut saw_release = false;
+        while let Ok(raw) = bus_rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "session.runtimeOwner"
+                && frame["transition"] == "released"
+                && frame["sessionId"] == "sid-stale"
+            {
+                saw_release = true;
+            }
+        }
+        assert!(
+            saw_release,
+            "the probe's RELEASE broadcast reached the bus (pre-post-cap the \
+             probe released silently and clients kept fenced:true forever)"
+        );
+    }
+
+    /// b8ke e3 post-cap F2: a kill task dying AFTER the map removal but
+    /// BEFORE its daemon-turn abort leaves the RETAINED witness — the
+    /// probe consults it (never bare map presence): the turn is SETTLED
+    /// (the accepted flag cleared) and only then does the key release.
+    /// Pre-post-cap the bare map-absence check released to Vacant while
+    /// the old daemon turn could still write (the competing-writer hole).
+    #[tokio::test]
+    async fn a_dying_kill_s_retained_witness_settles_the_turn_before_release() {
+        let states = watchdog_states();
+        // The stale-start record with REGISTERED, FIRED settle evidence
+        // (the concluded operation) under the OPENCODE provider.
+        let freshell_ownership::BeginOutcome::Granted { generation } = states.0.begin_start(
+            "opencode",
+            "sid-stale",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-witness",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected Granted")
+        };
+        let settle_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        assert!(states.0.register_start_cancellation(
+            "opencode",
+            "sid-stale",
+            "op-witness",
+            generation,
+            Arc::new(|| {}),
+            Box::new(std::future::ready(())),
+            Some(Arc::clone(&settle_flag)),
+        ));
+        settle_flag.store(true, std::sync::atomic::Ordering::SeqCst); // concluded
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1);
+        assert!(matches!(
+            states.0.fence_unconfirmed_stop(
+                "opencode",
+                "sid-stale",
+                "op-witness",
+                recs[0].generation,
+                FenceReason::StaleStart,
+            ),
+            freshell_ownership::FenceOutcome::Fenced
+        ));
+
+        // THE DYING-KILL SHAPE: the map aliases are GONE (the kill died
+        // after the removal) but the retained witness holds an ACCEPTED
+        // daemon-side turn the kill never aborted.
+        let accepted_turn = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        states
+            .4
+            .insert_condemned_for_test("sid-stale", Arc::clone(&accepted_turn), None);
+        assert!(
+            accepted_turn.load(std::sync::atomic::Ordering::SeqCst),
+            "precondition: the daemon turn is still accepted"
+        );
+
+        // THE PROBE: consults the witness — the turn SETTLES, then the
+        // key releases (pre-post-cap: released with the turn still
+        // accepted).
+        let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(
+            &states.0, &states.1, &states.2, &states.3, &states.4, &probe_tx,
+        )
+        .await;
+        assert!(
+            !accepted_turn.load(std::sync::atomic::Ordering::SeqCst),
+            "the probe SETTLED the retained daemon turn before releasing \
+             (pre-post-cap: bare map absence released with the turn still \
+             accepted — the competing-writer hole)"
+        );
+        assert_eq!(
+            states.0.observe("opencode", "sid-stale").state,
+            OwnershipState::Vacant,
+            "the key released AFTER the turn settled"
+        );
+        assert!(
+            !states.4.has_condemned_for_test("sid-stale"),
+            "the consumed witness cleared"
+        );
+    }
+
+    /// b8ke e3r4 F3: an OpenCode-shaped stale fence (PID-less, NO start
+    /// settlement — the production shape) releases through the
+    /// kind-aware LANE CONFIRMATION instead of rejecting forever. The
+    /// probe's `None`-evidence arm routes to confirm_fenced_prior_dead,
+    /// which answers true when the lane holds nothing for the session
+    /// (the PID-less runtime's whole identity is absent).
+    #[tokio::test]
+    async fn an_opencode_shaped_stale_fence_releases_through_the_lane_confirmation() {
+        let states = watchdog_states();
+        // The OpenCode shape: NO partial (PID-less) + NO start settlement —
+        // the stale start begins under the OPENCODE provider.
+        let BeginOutcome::Granted { generation } = states.0.begin_start(
+            "opencode",
+            "sid-stale",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-fence-oc",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected Granted")
+        };
+        let _ = generation;
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1);
+        let rec = recs.into_iter().next().unwrap();
+        assert!(rec.partial_runtime.is_none());
+        assert!(matches!(
+            states.0.fence_unconfirmed_stop(
+                "opencode",
+                "sid-stale",
+                "op-fence-oc",
+                rec.generation,
+                FenceReason::StaleStart,
+            ),
+            freshell_ownership::FenceOutcome::Fenced
+        ));
+        // The enumerated fence carries NO settle evidence (the opencode
+        // lane never registers start settlement) and NO pid.
+        let fences = states.0.stale_start_fences();
+        assert_eq!(fences.len(), 1);
+        assert_eq!(fences[0].prior_pid, None);
+        assert_eq!(fences[0].settle_concluded, None);
+        // THE PROBE: the None-evidence arm routes through the lane
+        // confirmation — the empty opencode lane holds nothing for the
+        // session → confirmed dead → RELEASES (pre-e3r4: rejected
+        // forever, blocked until restart).
+        let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(
+            &states.0, &states.1, &states.2, &states.3, &states.4, &probe_tx,
+        )
+        .await;
+        assert_eq!(
+            states.0.observe("opencode", "sid-stale").state,
+            OwnershipState::Vacant,
+            "the opencode-shaped stale fence released through the kind-aware \
+             lane confirmation"
+        );
+    }
+
+    /// b8ke focused episode-2 round-3 F6: an UNCONFIRMABLE partial reap
+    /// (a REAL LIVE runtime the lane cannot confirm — no lease handle, no
+    /// condemned record) fences — the reap result is CONSUMED, never
+    /// discarded into a Vacant.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_unconfirmable_partial_reap_fences_the_key() {
+        let states = watchdog_states();
+        let generation = begin_stale_start(&states.0, "op-reap-false").await;
+        let mut live = tokio::process::Command::new("sleep")
+            .arg("300")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the live partial runtime");
+        let live_pid = live.id().expect("live pid");
+        states.0.register_partial_runtime(
+            "claude",
+            "sid-stale",
+            "op-reap-false",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some("sid-stale".into()),
+                pid: Some(live_pid),
+                ownership_id: None,
+            },
+        );
+        let _ = recover_one(&states, std::time::Duration::from_millis(50)).await;
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale").state,
+                OwnershipState::Fenced {
+                    reason: FenceReason::StaleStart,
+                    ..
+                }
+            ),
+            "the false raw reap + LIVE pid must fence, never release to Vacant"
+        );
+        let _ = live.kill().await;
+    }
+
+    /// b8ke focused episode-2 post-cap F4: a handler-reaped runtime with
+    /// NO TREE EVIDENCE fences at recovery (fail-closed — the SWEEP and
+    /// the RECOVERY never accept bare pid disappearance;
+    /// recover_stale_start refuses it). b8ke ext r25 F1(a): the probe's
+    /// Fresh Agent arm then closes the loop for the PID-bearing shape —
+    /// the recorded PID's OS-level death (mirroring the terminal arm's
+    /// discipline) is the confirmed-reap evidence the provider's
+    /// gone-records can never supply: confirmed dead → the fence
+    /// RELEASES; provably alive → the fence holds; PID absent → the
+    /// fence stays typed. Pre-r25 this exact fence was PERMANENT (the
+    /// probe relied exclusively on the provider's retained
+    /// live-session/condemned-prior evidence, and the acknowledged
+    /// force-clear excluded the stale reasons — the wrong-comment
+    /// pre-r25 test asserted the hold as the contract).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_reaped_runtime_with_no_tree_evidence_fences_and_the_pid_confirmed_probe_releases() {
+        let states = watchdog_states();
+        let generation = begin_stale_start(&states.0, "op-reaped").await;
+        let mut reaped = tokio::process::Command::new("true")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the reaped runtime");
+        let reaped_pid = reaped.id().expect("reaped pid");
+        let _ = reaped.wait().await;
+        let own_ticket = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states.0),
+            "claude",
+            "sid-stale",
+            "op-reaped",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            generation,
+            "test",
+        ));
+        let guard = freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+            &Some(Arc::clone(&states.0)),
+            "claude",
+            "sid-stale",
+            &own_ticket,
+            Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
+        );
+        states.0.register_partial_runtime(
+            "claude",
+            "sid-stale",
+            "op-reaped",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some("sid-stale".into()),
+                pid: Some(reaped_pid),
+                ownership_id: None,
+            },
+        );
+        drop(guard);
+
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1);
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        recover_stale_start(
+            &states.0,
+            &states.1,
+            states.2.clone(),
+            states.3.clone(),
+            states.4.clone(),
+            recs.into_iter().next().unwrap(),
+            std::time::Duration::from_secs(5),
+            &tx,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale").state,
+                OwnershipState::Fenced {
+                    reason: FenceReason::StaleStart,
+                    ..
+                }
+            ),
+            "a reaped runtime with NO tree evidence fences at recovery — \
+             direct-pid disappearance is never sufficient"
+        );
+        // b8ke ext r25 F1(a): the probe's PID-level death confirmation
+        // closes the loop — the recorded PID (captured at fence time) is
+        // confirmed dead at OS level, mirroring the terminal arm, so the
+        // fence releases automatically (the key reopens). The provider's
+        // records are gone and can never confirm; without this path the
+        // fence was permanent.
+        let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(
+            &states.0, &states.1, &states.2, &states.3, &states.4, &probe_tx,
+        )
+        .await;
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale").state,
+                OwnershipState::Vacant
+            ),
+            "the PID-dead stale fence releases automatically — the probe \
+             confirms the recorded PID's OS-level death (the terminal arm's \
+             discipline); the provider's gone-records can never wedge the \
+             fence permanently"
+        );
+        // The reopened key accepts the next writer.
+        assert!(matches!(
+            states.0.begin_start(
+                "claude",
+                "sid-stale",
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "op-post-release",
+                None,
+                "test",
+                freshell_ownership::now_epoch_ms(),
+            ),
+            freshell_ownership::BeginOutcome::Granted { .. }
+        ));
+    }
+
+    /// b8ke ext r25 F1(a) — the HOLD arm: a stale fence whose recorded
+    /// PID is PROVABLY ALIVE never releases on the PID path. The OS-level
+    /// confirmation is fail-closed: alive → the fence stays; only a
+    /// confirmed-dead PID reopens the key (and after the live prior's
+    /// actual death the probe releases — the OS evidence).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_stale_fence_with_a_provably_alive_pid_holds() {
+        let states = watchdog_states();
+        // NOTE: begin_stale_start hardcodes "sid-stale"; this test arms its
+        // OWN Starting claim on its own sid so the partial registration
+        // lands on the SAME key.
+        let freshell_ownership::BeginOutcome::Granted { generation } = states.0.begin_start(
+            "claude",
+            "sid-stale-alive",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-alive-prior",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected Granted")
+        };
+        let mut alive = tokio::process::Command::new("sleep")
+            .arg("300")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the live prior runtime");
+        let alive_pid = alive.id().expect("alive pid");
+        let own_ticket = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states.0),
+            "claude",
+            "sid-stale-alive",
+            "op-alive-prior",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            generation,
+            "test",
+        ));
+        let guard = freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+            &Some(Arc::clone(&states.0)),
+            "claude",
+            "sid-stale-alive",
+            &own_ticket,
+            Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
+        );
+        states.0.register_partial_runtime(
+            "claude",
+            "sid-stale-alive",
+            "op-alive-prior",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some("sid-stale-alive".into()),
+                pid: Some(alive_pid),
+                ownership_id: None,
+            },
+        );
+        drop(guard);
+
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1);
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        recover_stale_start(
+            &states.0,
+            &states.1,
+            states.2.clone(),
+            states.3.clone(),
+            states.4.clone(),
+            recs.into_iter().next().unwrap(),
+            std::time::Duration::from_secs(5),
+            &tx,
+        )
+        .await;
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale-alive").state,
+                OwnershipState::Fenced {
+                    reason: FenceReason::StaleStart,
+                    ..
+                }
+            ),
+            "the stale start with a live prior fences at recovery"
+        );
+
+        // THE PROBE: the recorded PID is PROVABLY ALIVE — the fence
+        // holds (fail closed; the PID arm never releases a live
+        // runtime).
+        let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(
+            &states.0, &states.1, &states.2, &states.3, &states.4, &probe_tx,
+        )
+        .await;
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale-alive").state,
+                OwnershipState::Fenced { .. }
+            ),
+            "a provably-alive recorded PID keeps the fence held — the \
+             OS-level confirmation only releases a confirmed-dead PID"
+        );
+        // After the live prior's ACTUAL death the probe releases — the
+        // OS-level pid-death evidence (the fail-closed check now sees
+        // the dead pid).
+        let _ = alive.kill().await;
+        let _ = alive.wait().await;
+        probe_stale_start_fences(
+            &states.0, &states.1, &states.2, &states.3, &states.4, &probe_tx,
+        )
+        .await;
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale-alive").state,
+                OwnershipState::Vacant
+            ),
+            "after the live prior's confirmed death the probe releases \
+             the fence (the OS-level pid-death evidence)"
+        );
+    }
+
+    /// b8ke focused episode-2 round-3 F6 (the positive shape): a reaped
+    /// runtime WITH tree evidence — the lease kill handle the handler's
+    /// own lane reap left — vacates at recovery: the lane's confirmed-
+    /// tree reap settles the WHOLE recorded tree, never just the pid.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_reaped_runtime_with_tree_evidence_vacates_at_recovery() {
+        let states = watchdog_states();
+        let generation = begin_stale_start(&states.0, "op-reaped-tree").await;
+        let mut reaped = tokio::process::Command::new("true")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the reaped runtime");
+        let reaped_pid = reaped.id().expect("reaped pid");
+        let _ = reaped.wait().await;
+        let own_ticket = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states.0),
+            "claude",
+            "sid-stale",
+            "op-reaped-tree",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            generation,
+            "test",
+        ));
+        let guard = freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+            &Some(Arc::clone(&states.0)),
+            "claude",
+            "sid-stale",
+            &own_ticket,
+            Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
+        );
+        states.0.register_partial_runtime(
+            "claude",
+            "sid-stale",
+            "op-reaped-tree",
+            generation,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some("sid-stale".into()),
+                pid: Some(reaped_pid),
+                ownership_id: None,
+            },
+        );
+        states
+            .3
+            .leases()
+            .claim("claude", "sid-stale", "op-reaped-tree", 0);
+        states.3.leases().set_kill_handle(
+            "claude",
+            "sid-stale",
+            "op-reaped-tree",
+            reaped_pid,
+            "r54-tree-tag",
+        );
+        drop(guard);
+
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1);
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        recover_stale_start(
+            &states.0,
+            &states.1,
+            states.2.clone(),
+            states.3.clone(),
+            states.4.clone(),
+            recs.into_iter().next().unwrap(),
+            std::time::Duration::from_secs(5),
+            &tx,
+        )
+        .await;
+
+        assert_eq!(
+            states.0.observe("claude", "sid-stale").state,
+            OwnershipState::Vacant,
+            "the lease-handle confirmed-tree reap settles the whole recorded \
+             tree — the settled start vacates at recovery"
+        );
+    }
+
+    /// b8ke focused episode-2 post-cap F4: the StaleStart fence probe is
+    /// FAIL-CLOSED. A PID-ful fence releases ONLY through the lane's
+    /// confirmed-tree reap (an exited pid with NO tree evidence holds);
+    /// a PID-LESS fence releases ONLY on the positive kind-aware answer
+    /// (lane session absent) AND the operation's registered settle
+    /// CONCLUDED (`settle_fired == Some(true)`). The unregistered
+    /// pre-registration shape — the exact state `an_unregistered_stale_
+    /// start_fences_never_vacant` pins as fenced — can NEVER prove
+    /// conclusion: the probe HOLDS it (the contradictory e2r3 release
+    /// assertion is gone), and the operator force-clear is the escape.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stale_start_fences_are_revisited_by_the_confirmed_death_probe() {
+        // (a) b8ke ext r25 F1(a): a PID-ful fence with NO tree evidence —
+        // the lane confirm answers false (no condemned record, no live
+        // session), but the recorded prior pid is confirmed dead at OS
+        // level, so the probe RELEASES through the PID-level death
+        // confirmation (the terminal arm's discipline). Pre-r25 the
+        // gone-records wedged this fence permanently.
+        let states = watchdog_states();
+        let generation_dead = begin_stale_start(&states.0, "op-fence-dead").await;
+        let mut exited = tokio::process::Command::new("true")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the exited runtime");
+        let exited_pid = exited.id().expect("exited pid");
+        let _ = exited.wait().await;
+        states.0.register_partial_runtime(
+            "claude",
+            "sid-stale",
+            "op-fence-dead",
+            generation_dead,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some("sid-stale".into()),
+                pid: Some(exited_pid),
+                ownership_id: None,
+            },
+        );
+        let recs = states.0.recover_stale_starts(0, 0);
+        assert_eq!(recs.len(), 1);
+        let rec = recs.into_iter().next().unwrap();
+        assert!(matches!(
+            states.0.fence_unconfirmed_stop(
+                "claude",
+                "sid-stale",
+                "op-fence-dead",
+                rec.generation,
+                FenceReason::StaleStart
+            ),
+            freshell_ownership::FenceOutcome::Fenced
+        ));
+        let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(
+            &states.0, &states.1, &states.2, &states.3, &states.4, &probe_tx,
+        )
+        .await;
+        assert!(
+            matches!(
+                states.0.observe("claude", "sid-stale").state,
+                OwnershipState::Vacant
+            ),
+            "b8ke ext r25 F1(a): an exited prior pid with NO tree evidence \
+             RELEASES on the probe — the recorded PID's OS-level death is \
+             the confirmed-reap evidence (the terminal arm's discipline); \
+             bare pid disappearance still never licenses the SWEEP (the \
+             same rule recover_stale_start enforces), but the probe's \
+             PID arm closes the permanent-wedge gap"
+        );
+
+        // (b) A PID-ful fence whose prior pid is a REAL LIVE process:
+        // unconfirmable — the fence HOLDS.
+        let states2 = watchdog_states();
+        let generation_live = begin_stale_start(&states2.0, "op-fence-live").await;
+        let mut live = tokio::process::Command::new("sleep")
+            .arg("300")
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn the live runtime");
+        let live_pid = live.id().expect("live pid");
+        states2.0.register_partial_runtime(
+            "claude",
+            "sid-stale",
+            "op-fence-live",
+            generation_live,
+            freshell_ownership::OwnerIdentity {
+                kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                terminal_id: None,
+                live_session_key: Some("sid-stale".into()),
+                pid: Some(live_pid),
+                ownership_id: None,
+            },
+        );
+        let recs2 = states2.0.recover_stale_starts(0, 0);
+        assert_eq!(recs2.len(), 1);
+        let rec2 = recs2.into_iter().next().unwrap();
+        assert!(matches!(
+            states2.0.fence_unconfirmed_stop(
+                "claude",
+                "sid-stale",
+                "op-fence-live",
+                rec2.generation,
+                FenceReason::StaleStart
+            ),
+            freshell_ownership::FenceOutcome::Fenced
+        ));
+        let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(
+            &states2.0, &states2.1, &states2.2, &states2.3, &states2.4, &probe_tx,
+        )
+        .await;
+        assert!(
+            matches!(
+                states2.0.observe("claude", "sid-stale").state,
+                OwnershipState::Fenced { .. }
+            ),
+            "a LIVE recorded pid is unconfirmable — the probe must not release"
+        );
+
+        // (c) A PID-LESS fence with NO registration ever armed (the
+        // pre-registration shape — the same state the unregistered test
+        // pins as fenced): conclusion is UNPROVABLE, the probe HOLDS.
+        let states3 = watchdog_states();
+        begin_stale_start(&states3.0, "op-fence-nopid").await;
+        let recs3 = states3.0.recover_stale_starts(0, 0);
+        assert_eq!(recs3.len(), 1);
+        let rec3 = recs3.into_iter().next().unwrap();
+        assert!(rec3.partial_runtime.is_none());
+        assert!(matches!(
+            states3.0.fence_unconfirmed_stop(
+                "claude",
+                "sid-stale",
+                "op-fence-nopid",
+                rec3.generation,
+                FenceReason::StaleStart
+            ),
+            freshell_ownership::FenceOutcome::Fenced
+        ));
+        let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(
+            &states3.0, &states3.1, &states3.2, &states3.3, &states3.4, &probe_tx,
+        )
+        .await;
+        assert!(
+            matches!(
+                states3.0.observe("claude", "sid-stale").state,
+                OwnershipState::Fenced { .. }
+            ),
+            "a PID-LESS fence with no registration can never prove the \
+             operation concluded — the probe HOLDS (never re-accept the \
+             mere absence of a registration)"
+        );
+
+        // (d) THE POSITIVE SHAPE: a PID-LESS fence whose operation armed
+        // its registration and CONCLUDED (the guard dropped → settle
+        // fired) AND whose lane reports no live session — the kind-aware
+        // positive answer releases it. This is the opencode recovery
+        // path: retryable ops unblock WITHOUT a restart.
+        let states4 = watchdog_states();
+        let generation_settled = begin_stale_start(&states4.0, "op-fence-settled").await;
+        let own_ticket = Some(freshell_ownership::OperationTicket::new(
+            Arc::clone(&states4.0),
+            "claude",
+            "sid-stale",
+            "op-fence-settled",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            generation_settled,
+            "test",
+        ));
+        let guard = freshell_freshagent::ownership_lane::register_start_cancellation_for_ticket(
+            &Some(Arc::clone(&states4.0)),
+            "claude",
+            "sid-stale",
+            &own_ticket,
+            Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>,
+        );
+        // b8ke r22 follow-up (the r20 F1 contract): the settle must FIRE
+        // before the sweep converts a witnessed start — the "unsettled
+        // keeps the fence held" phase is subsumed by the r20 sweep-skip
+        // (an unsettled start is never swept, so its fence is never
+        // armed). The production-path contract: a CONCLUDED operation +
+        // a lane with no live session releases — the kind-aware positive
+        // answer (the opencode recovery path).
+        drop(guard);
+        let recs4 = states4.0.recover_stale_starts(0, 0);
+        assert_eq!(recs4.len(), 1);
+        let rec4 = recs4.into_iter().next().unwrap();
+        assert!(matches!(
+            states4.0.fence_unconfirmed_stop(
+                "claude",
+                "sid-stale",
+                "op-fence-settled",
+                rec4.generation,
+                FenceReason::StaleStart
+            ),
+            freshell_ownership::FenceOutcome::Fenced
+        ));
+        let (probe_tx, _probe_rx) = tokio::sync::broadcast::channel::<String>(64);
+        probe_stale_start_fences(
+            &states4.0, &states4.1, &states4.2, &states4.3, &states4.4, &probe_tx,
+        )
+        .await;
+        assert_eq!(
+            states4.0.observe("claude", "sid-stale").state,
+            OwnershipState::Vacant,
+            "a CONCLUDED operation + a lane with no live session releases — \
+             the kind-aware positive answer (the opencode recovery path)"
+        );
+
+        let _ = live.kill().await;
     }
 }

@@ -97,6 +97,8 @@ fn seed_bound_row(ledger: &PaneLedger, provider: &str, session_id: &str) {
             create_request_id: None,
             origin_create_request_id: None,
             provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: now_ms(),
         })
         .expect("seed bound ledger row");
@@ -194,6 +196,7 @@ async fn spawn_server_with_probe(
         session_existence: probe,
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
+        ownership: None,
     };
 
     let router = freshell_ws::router(state.clone());
@@ -386,6 +389,7 @@ async fn spawn_managed_codex_server_with_probe(
         session_existence: probe,
         reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
         fresh_agent_respawn_counts: Default::default(),
+        ownership: None,
     };
 
     let router = freshell_ws::router(state.clone());
@@ -480,14 +484,18 @@ fn restore_create_with_legacy_resume_id(request_id: &str, mode: &str, session_id
 
 // ── the six pinned behaviors ─────────────────────────────────────────────────
 
-/// Case 1 — THE incident shape: a restore of an amplifier id that is
-/// definitively absent from the store must SUCCEED as a fresh spawn (never an
-/// error), carry the operator notice, retire the stale Bound row as
-/// SessionMissing, and never resurrect the stale dir. NOTE (AD-5): an empty
-/// home + stale id is byte-identical on disk to a never-used stub GC'd at
-/// terminal exit — gating it is the DECIDED behavior, not an accident.
+/// Case 1 — THE incident shape, reshaped (b8ke ext r16 F3): a restore of
+/// an amplifier id that is definitively absent from the store answers the
+/// TYPED SESSION_MISSING refusal — nothing was started, no replacement
+/// session was substituted (pre-r16 the gate-fired create spawned a fresh
+/// stub and carried the operator notice; the request's non-goal is
+/// unqualified — boot-restore of a gone session lands in the typed
+/// missing state, and the pane's explicit start-fresh action is the ONLY
+/// new-session path). NOTE (AD-5): an empty home + stale id is
+/// byte-identical on disk to a never-used stub GC'd at terminal exit —
+/// gating it is the DECIDED behavior, not an accident.
 #[tokio::test(flavor = "multi_thread")]
-async fn restore_true_amplifier_absent_spawns_fresh_with_notice() {
+async fn restore_true_amplifier_absent_answers_the_typed_missing_refusal() {
     let probe = StubProbe::answering("amplifier", "stale-amp", SessionExistence::Absent);
     let (url, registry, ledger, _state) = spawn_server_with_probe(probe, false).await;
     seed_bound_row(&ledger, "amplifier", "stale-amp");
@@ -501,14 +509,18 @@ async fn restore_true_amplifier_absent_spawns_fresh_with_notice() {
     .await;
     let frame = next_created_or_error(&mut ws, "req-gate-1").await;
 
+    // THE TYPED MISSING REFUSAL: nothing was started.
     assert_eq!(
-        frame["type"], "terminal.created",
-        "the gate-fired create must SUCCEED as a fresh spawn, got {frame}"
+        frame["type"], "error",
+        "the gate-fired restore answers the typed missing refusal, never a fresh spawn: {frame}"
     );
-    let notice = notice_of(&frame).expect("gate fire must carry the operator notice");
+    assert_eq!(frame["code"], json!("SESSION_MISSING"), "{frame}");
     assert!(
-        notice.contains("stale-amp"),
-        "notice must name the stale id: {notice}"
+        frame["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stale-amp"),
+        "the refusal names the stale id: {frame}"
     );
 
     // The stale row is retired as SessionMissing — never retried forever.
@@ -521,21 +533,11 @@ async fn restore_true_amplifier_absent_spawns_fresh_with_notice() {
         Some(RetiredReason::SessionMissing)
     );
 
-    // The spawned resume id is a FRESH mint, not the stale ref.
-    let fresh_id = frame["sessionRef"]["sessionId"]
-        .as_str()
-        .expect("created frame carries the fresh sessionRef")
-        .to_string();
-    assert_ne!(fresh_id, "stale-amp");
-
-    // Disk truth: the stale dir was NOT resurrected; the fresh stub exists.
+    // Disk truth: NOTHING was stubbed — neither the stale dir nor any
+    // fresh replacement.
     assert!(
         !amplifier_session_dir_exists(&amp_home, "stale-amp"),
         "the amplifier pre-create must never re-stub the stale id"
-    );
-    assert!(
-        amplifier_session_dir_exists(&amp_home, &fresh_id),
-        "the fresh UUID stub must exist under the temp amplifier home"
     );
 
     registry.kill_all();

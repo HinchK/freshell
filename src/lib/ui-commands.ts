@@ -10,6 +10,7 @@ import {
   isScopedPaneContent,
   selectTabNameSourcePaneId,
 } from '@/store/selectors/sessionNameSelectors'
+import { forceLayoutResync } from '@/store/layoutMirrorMiddleware'
 
 type DispatchFn = (action: any) => any
 
@@ -181,6 +182,10 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
       dispatch(addTab({
         id: msg.payload.id,
         title: msg.payload.title,
+        // Explicit creator-provided name (REST/MCP `name`): an explicit title
+        // outranks mirrored session titles and registry auto-titles in
+        // getTabDisplayTitle (rename-scope-contract display precedence).
+        titleSetByUser: msg.payload.title ? true : undefined,
         mode: msg.payload.mode,
         shell: msg.payload.shell,
         initialCwd: msg.payload.initialCwd,
@@ -253,5 +258,10 @@ export function handleUiCommand(msg: any, runtimeOrDispatch: UiCommandRuntime | 
       return dispatch(resizePanes({ tabId: msg.payload.tabId, splitId: msg.payload.splitId, sizes: msg.payload.sizes }))
     case 'pane.swap':
       return dispatch(swapPanes({ tabId: msg.payload.tabId, paneId: msg.payload.paneId, otherId: msg.payload.otherId }))
+    case 'layout.resync':
+      // kata b8ke Task 10: the server's re-sync handshake (respawn/attach
+      // missed this pane in every synced layout) — the layout mirror
+      // re-sends the current layout immediately, dedupe gate bypassed.
+      return dispatch(forceLayoutResync())
   }
 }

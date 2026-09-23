@@ -109,6 +109,7 @@ export function FreshAgentSettingsButton({
   )
   const [open, setOpen] = useState(false)
   const buttonRef = useRef<HTMLButtonElement>(null)
+  const glyphRef = useRef<SVGSVGElement | null>(null)
   const popoverRef = useRef<HTMLDivElement>(null)
   const [popoverPos, setPopoverPos] = useState<{ top: number; right: number } | undefined>(undefined)
   const [probedCapabilities, setProbedCapabilities] = useState<FreshAgentModelCapabilitiesResponse | undefined>(undefined)
@@ -270,12 +271,12 @@ export function FreshAgentSettingsButton({
   }, [close, open])
 
   return (
-    <div className="relative">
+    <div className="relative flex h-full">
       <button
         ref={buttonRef}
         type="button"
         className={cn(
-          'inline-flex h-6 w-6 items-center justify-center rounded opacity-60 transition-opacity hover:opacity-100 sm:h-4 sm:w-4',
+          'inline-flex h-full aspect-square items-center justify-center rounded opacity-60 transition-opacity hover:opacity-100',
           open && 'bg-background/50 opacity-100',
         )}
         title="Agent settings"
@@ -286,9 +287,10 @@ export function FreshAgentSettingsButton({
           event.stopPropagation()
           if (!open && buttonRef.current) {
             // The popover is portaled to document.body to escape the pane
-            // header's overflow-hidden clip stripe; anchor it to the gear's
-            // viewport rect (same 4px gap the old in-header mt-1 produced).
-            const rect = buttonRef.current.getBoundingClientRect()
+            // header's overflow-hidden clip stripe; anchor it to the gear
+            // glyph's viewport rect (same 4px gap the old in-header mt-1
+            // produced).
+            const rect = (glyphRef.current ?? buttonRef.current).getBoundingClientRect()
             setPopoverPos({
               top: rect.bottom + 4,
               right: Math.max(8, window.innerWidth - rect.right),
@@ -297,7 +299,7 @@ export function FreshAgentSettingsButton({
           setOpen((value) => !value)
         }}
       >
-        <Settings className="h-[18px] w-[18px] sm:h-3 sm:w-3" />
+        <Settings ref={glyphRef} className="h-5 w-5 sm:h-3 sm:w-3" />
       </button>
 
       {open && popoverPos ? createPortal(

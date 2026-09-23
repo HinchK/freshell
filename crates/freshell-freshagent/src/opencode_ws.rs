@@ -65,8 +65,8 @@ use tokio::sync::Mutex as TokioMutex;
 
 use freshell_codex::next_monotonic_turn_complete_at;
 use freshell_opencode::{
-    normalize_opencode_effort, normalize_opencode_model, ChangedReason, OpencodeServeManager,
-    SdkProviderEvent, ServeError, SessionSignal, SnapshotStatus,
+    normalize_opencode_effort, normalize_opencode_model, ChangedReason, DaemonSignal,
+    OpencodeServeManager, SdkProviderEvent, ServeError, SessionSignal, SnapshotStatus,
 };
 use freshell_protocol::{
     ErrorCode, ErrorMsg, FreshAgentAttach, FreshAgentCompact, FreshAgentConfigure,
@@ -157,6 +157,73 @@ pub struct FreshOpencodeState {
     /// [`Self::fresh_agent`] so the REST spawn pipeline and this WS slice
     /// resolve the SAME handle for `freshopencode-<createRequestId>`.
     naming: crate::naming::NamingSink,
+    /// b8ke focused round-2 review R2-1: the CONDEMNED-SESSION record —
+    /// the canonical real `ses_*` id → the daemon-side quiescence identity
+    /// (the accepted-turn flag + the session's route) every
+    /// `opencode_kill_for_handoff` records BEFORE its first cancellable
+    /// await. A cancelled/panicked teardown leaves the record behind (the
+    /// sessions-map entry is already gone), and the handoff watcher's
+    /// replacement probe re-issues the daemon-side abort through exactly
+    /// this record. Cleared by whichever path settles the acceptance.
+    condemned_sessions: Arc<std::sync::Mutex<HashMap<String, CondemnedOpencodeSession>>>,
+    /// Task 4 (opencode daemon-death recovery): the daemon-loss watcher's
+    /// arming cell — set-once per state (Arc-shared across every clone), so
+    /// the FIRST `handle_send`/`handle_attach`/`handle_compact` arms exactly
+    /// ONE runtime-level listener on the manager's `DaemonSignal` stream for
+    /// the process lifetime. The watcher makes a shared-daemon death
+    /// observable (the typed `OPENCODE_DAEMON_LOST` edge per materialized
+    /// session) and recoverable (the level-triggered bridge revival on every
+    /// `Started`), mirroring the freshcodex onExit self-heal. See
+    /// [`Self::ensure_daemon_loss_watcher`].
+    daemon_loss_watcher: Arc<std::sync::OnceLock<()>>,
+    /// ep2-r3 test seam (`cfg(test)`-only): when armed for a durable id, the
+    /// post-commit rescue tail parks BETWEEN its map re-lookup clone and the
+    /// session-lock take — the exact window the ep2-r3 fresheyes Major pins
+    /// (a kill/handoff completing against the rescue's retained `Arc`).
+    /// Never compiled into production builds. See [`Self::arm_rescue_stall`].
+    #[cfg(test)]
+    rescue_stall: Arc<StdMutex<Option<RescueStallGate>>>,
+    /// ep2-r5 test seam (`cfg(test)`-only): when armed for a durable id, the
+    /// post-commit rescue tail parks BEFORE its map re-lookup — the window
+    /// where a same-key kill+replace can complete while the rescue is in
+    /// flight, so the re-lookup then observes whichever session (the
+    /// original or a replacement) the mover left under the key. Never
+    /// compiled into production builds. See
+    /// [`Self::arm_rescue_lookup_stall`].
+    #[cfg(test)]
+    rescue_lookup_stall: Arc<StdMutex<Option<RescueStallGate>>>,
+}
+
+/// The armed rescue-stall gate's state (ep2-r3 test seam, `cfg(test)`-only).
+#[cfg(test)]
+struct RescueStallGate {
+    /// The durable id this gate intercepts (the rescue is per-durable).
+    key: String,
+    /// Fires when the rescue has CLONED the session `Arc` out of the map and
+    /// is about to proceed — the exact parked point the finding's interleave
+    /// needs.
+    entered_tx: std::sync::mpsc::Sender<()>,
+    /// The test's release: the rescue parks until this oneshot resolves.
+    release_rx: StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+/// The handles [`FreshOpencodeState::arm_rescue_stall`] hands the test
+/// (ep2-r3 test seam, `cfg(test)`-only): `entered` fires at the parked point;
+/// `release` lets the rescue proceed.
+#[cfg(test)]
+pub(crate) struct RescueStallHandles {
+    pub(crate) entered: std::sync::mpsc::Receiver<()>,
+    pub(crate) release: tokio::sync::oneshot::Sender<()>,
+}
+
+/// The condemned opencode session's quiescence identity (b8ke focused
+/// round-2 review R2-1): the per-session accepted-daemon-turn flag (the
+/// SAME flag the send/compact drives arm) and the route the daemon-side
+/// abort must be issued at.
+#[derive(Clone)]
+struct CondemnedOpencodeSession {
+    daemon_turn_accepted: Arc<AtomicBool>,
+    route: Option<String>,
 }
 
 /// The cached result of a completed opencode `freshAgent.create`, keyed by `requestId` in
@@ -323,6 +390,14 @@ struct OpencodeSession {
     /// completion gating suppresses `freshAgent.turn.complete` (`state.turnAborted`,
     /// adapter.ts:521,334-335). Reset to `false` at the top of every `handle_send`.
     turn_aborted: Arc<AtomicBool>,
+    /// b8ke focused review FR1: TRUE from the moment a prompt POST is
+    /// ACCEPTED by the shared daemon until the daemon-side turn is known
+    /// settled — `run_turn`'s accepted witness arms it, and it stays armed
+    /// across an `IdleTimeout` (the LOCAL task finished, but the turn still
+    /// executes INSIDE the daemon). The handoff stop path aborts the
+    /// daemon-side turn whenever this is set, NOT whenever the local task
+    /// is unfinished — a finished local task can mean IdleTimeout.
+    daemon_turn_accepted: Arc<AtomicBool>,
     /// PR-3: flipped `true` by the serve-stream bridge when it observes a `session.error`
     /// SSE event during the in-flight turn (`state.turnErrored`, adapter.ts:278-282,334-335).
     /// Reset to `false` at the top of every `handle_send`.
@@ -336,6 +411,21 @@ struct OpencodeSession {
     /// `freshAgent.session.snapshot` / `freshAgent.session.changed` / `freshAgent.error`
     /// for the lifetime of the session. `None` until materialized; aborted on kill.
     serve_bridge: Option<tokio::task::JoinHandle<()>>,
+    /// Delta round 2 (fresheyes Major — the doomed-bridge revival race): the
+    /// `ownership_id` of the daemon GENERATION the current `serve_bridge`
+    /// task was spawned against — the daemon-generation fence. Written ONLY
+    /// by [`FreshOpencodeState::install_serve_bridge`], together with the
+    /// handle, so `serve_bridge` is `Some` ⟹ this is `Some`. Read by
+    /// [`FreshOpencodeState::restart_session_bridge_guarded`]'s liveness
+    /// check: the manager's loss path fans `Lost` and re-warms
+    /// INDEPENDENTLY of the bridge tasks, so a bridge still draining its
+    /// closed channel when the new daemon's `Started` revival pass runs is
+    /// ALIVE-but-DOOMED — bound to a superseded generation it must be
+    /// restarted against, never mistaken for health by task liveness alone.
+    /// Not cleared on kill/handoff teardown: a torn-down session has no
+    /// handle, and a stale stamp with no handle is dead by the
+    /// absent-handle arm alone.
+    serve_bridge_daemon: Option<String>,
     /// Retire-on-kill (delta-review round 5): set by `handle_kill` inside its
     /// session-lock phase. A send that took this session's Arc just before the
     /// kill's map removal is Parking on this lock and would otherwise
@@ -406,9 +496,11 @@ impl OpencodeSession {
             effort,
             turn_task: None,
             turn_aborted: Arc::new(AtomicBool::new(false)),
+            daemon_turn_accepted: Arc::new(AtomicBool::new(false)),
             turn_errored: Arc::new(AtomicBool::new(false)),
             last_turn_complete_at: Arc::new(StdMutex::new(None)),
             serve_bridge: None,
+            serve_bridge_daemon: None,
             killed: Arc::new(AtomicBool::new(false)),
             close_pending: 0,
             provenance: None,
@@ -416,7 +508,107 @@ impl OpencodeSession {
     }
 }
 
+/// Settle an ACCEPTED daemon-side turn to confirmed quiescence (b8ke
+/// focused review FR1, refactored for the round-4 R4-2/R4-3 REST-lane
+/// needs): the bounded abort loop against the PEEKED manager at its
+/// READ-ONLY base (the manager cell is never created here and
+/// `require_base` is never consulted — a stop path must never spawn a
+/// daemon), retrying transport failures until the daemon answers. Only a
+/// landed abort (a 2xx answer), an observably absent daemon (no
+/// manager/no running entry), a 404 (no such session daemon-side), or a
+/// provably-never-delivered abort against a dead listener settles the
+/// acceptance. The shared daemon is never killed or discarded. Shared by
+/// the WS lane's stop paths and the REST drive's retained-witness settle.
+pub(crate) async fn settle_accepted_daemon_turn(
+    fresh_agent: &crate::FreshAgentState,
+    real: &str,
+    route: &Option<String>,
+    accepted: &Arc<AtomicBool>,
+) {
+    // Three consecutive provable non-deliveries: the daemon's private
+    // loopback port has no listener — the process is gone, so nothing
+    // runs daemon-side.
+    const UNDELIVERED_SETTLE_THRESHOLD: u32 = 3;
+    let mut consecutive_undelivered: u32 = 0;
+    loop {
+        let Some(manager) = fresh_agent.peek_running_manager().await else {
+            // The manager cell is absent: the shared serve is not
+            // running — nothing executes daemon-side.
+            accepted.store(false, Ordering::SeqCst);
+            return;
+        };
+        let Some(base) = manager.base_url().await else {
+            // The manager exists but nothing is running (a prior
+            // discard/shutdown): nothing executes daemon-side.
+            accepted.store(false, Ordering::SeqCst);
+            return;
+        };
+        match manager.abort_at(real, route, &base).await {
+            Ok(()) => {
+                // The daemon answered the abort — the daemon-side turn
+                // is settled.
+                accepted.store(false, Ordering::SeqCst);
+                return;
+            }
+            Err(ServeError::Http { status: 404, .. }) => {
+                // The daemon does not know the session — no turn of
+                // ours exists daemon-side.
+                accepted.store(false, Ordering::SeqCst);
+                return;
+            }
+            Err(ServeError::Undelivered(_)) => {
+                consecutive_undelivered += 1;
+                if consecutive_undelivered >= UNDELIVERED_SETTLE_THRESHOLD {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %real,
+                        "freshagent.opencode.handoff_stop_abort_undelivered: the shared \
+                         serve's loopback listener is gone — no daemon-side turn remains"
+                    );
+                    accepted.store(false, Ordering::SeqCst);
+                    return;
+                }
+            }
+            Err(_) => {
+                consecutive_undelivered = 0;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 impl FreshOpencodeState {
+    /// b8ke e3 post-cap F2: test seam — retain a condemned-session
+    /// witness (the kill path's retained accepted-daemon-turn evidence).
+    /// Test-only seeding route for cross-crate consumers; production code
+    /// must never call this.
+    #[doc(hidden)]
+    pub fn insert_condemned_for_test(
+        &self,
+        session_id: &str,
+        daemon_turn_accepted: Arc<std::sync::atomic::AtomicBool>,
+        route: Option<String>,
+    ) {
+        self.condemned_sessions
+            .lock()
+            .expect("condemned sessions lock")
+            .insert(
+                session_id.to_string(),
+                CondemnedOpencodeSession {
+                    daemon_turn_accepted,
+                    route,
+                },
+            );
+    }
+
+    /// b8ke e3 post-cap F2: test seam — peek a condemned-session witness.
+    /// Test-only; production code must never call this.
+    #[doc(hidden)]
+    pub fn has_condemned_for_test(&self, session_id: &str) -> bool {
+        self.condemned_sessions
+            .lock()
+            .expect("condemned sessions lock")
+            .contains_key(session_id)
+    }
     /// Build the state around an existing [`FreshAgentState`] (REUSED, not duplicated),
     /// so this slice and the REST tabs slice share exactly one `opencode serve` sidecar.
     pub fn new(fresh_agent: FreshAgentState) -> Self {
@@ -430,6 +622,12 @@ impl FreshOpencodeState {
             fork_in_flight: crate::InFlightRegistry::new(),
             rollback_in_flight: crate::InFlightRegistry::new(),
             naming: crate::naming::NamingSink::default(),
+            condemned_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            daemon_loss_watcher: Arc::new(std::sync::OnceLock::new()),
+            #[cfg(test)]
+            rescue_stall: Arc::new(StdMutex::new(None)),
+            #[cfg(test)]
+            rescue_lookup_stall: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -446,6 +644,17 @@ impl FreshOpencodeState {
         &self.fresh_agent
     }
 
+    /// b8ke ext r23 F1: resolve a wire id to its canonical coordinator key
+    /// — the placeholder (`freshopencode-*`) resolves to the durable `ses_*`
+    /// key through the registry's alias chain (the materialization creates
+    /// the `Aliased{to}` record). Unwired (no coordinator): the identity.
+    pub fn resolve_ownership_key(&self, session_id: &str) -> String {
+        match self.fresh_agent.ownership.as_ref() {
+            Some(registry) => registry.resolve_canonical(PROVIDER, session_id),
+            None => session_id.to_string(),
+        }
+    }
+
     /// Replace the default lease map with the ONE server-wide shared map (Task 13;
     /// called by `main.rs` before this state is cloned into the router).
     pub fn set_session_leases(
@@ -455,13 +664,183 @@ impl FreshOpencodeState {
         self.leases = leases;
     }
 
+    /// Wire the ONE server-wide runtime-ownership coordinator (kata b8ke
+    /// Task 3; called by `main.rs` next to `set_session_leases`). The
+    /// registry and the retained-stamp map live on the SHARED
+    /// [`FreshAgentState`] — the REST send-keys materialization and this WS
+    /// slice drive the same opencode sessions, so both surfaces must see
+    /// the same coordinator state.
+    pub fn set_ownership(&mut self, registry: Arc<freshell_ownership::RuntimeOwnershipRegistry>) {
+        self.fresh_agent.ownership = Some(registry);
+    }
+
+    /// Side-effect-free coordinator read for `(provider, session_id)`
+    /// (kata b8ke Task 3). `Vacant`/0 when the registry is unwired.
+    pub fn ownership_snapshot(
+        &self,
+        provider: &str,
+        session_id: &str,
+    ) -> freshell_ownership::OwnershipSnapshot {
+        self.fresh_agent.ownership_snapshot(provider, session_id)
+    }
+
+    /// Arm the `cfg(test)`-only rescue stall (ep2-r3): the post-commit
+    /// rescue tail for `durable` fires `entered` once it has CLONED the
+    /// session `Arc` out of the sessions map, then parks until the test
+    /// sends on `release` — the deterministic interleaving point for "a
+    /// kill/handoff completes between the rescue's map lookup and its
+    /// session-lock take". One-shot per arming.
+    #[cfg(test)]
+    fn arm_rescue_stall(&self, durable: &str) -> RescueStallHandles {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.rescue_stall.lock().expect("rescue stall mutex") = Some(RescueStallGate {
+            key: durable.to_string(),
+            entered_tx,
+            release_rx: StdMutex::new(Some(release_rx)),
+        });
+        RescueStallHandles {
+            entered,
+            release: release_tx,
+        }
+    }
+
+    /// Take the armed rescue stall for `durable`, if it matches (one-shot;
+    /// `cfg(test)`-only, ep2-r3).
+    #[cfg(test)]
+    fn take_rescue_stall(&self, durable: &str) -> Option<RescueStallGate> {
+        let mut guard = self.rescue_stall.lock().expect("rescue stall mutex");
+        match guard.as_ref() {
+            Some(g) if g.key == durable => guard.take(),
+            _ => None,
+        }
+    }
+
+    /// Arm the `cfg(test)`-only PRE-LOOKUP rescue stall (ep2-r5): the
+    /// post-commit rescue tail for `durable` fires `entered` BEFORE its
+    /// map re-lookup, then parks until the test sends on `release` — the
+    /// deterministic interleaving point for "a kill and a same-key
+    /// replacement resume complete while the rescue is in flight" (the
+    /// re-lookup below then finds whichever session the mover left under
+    /// the key). One-shot per arming.
+    #[cfg(test)]
+    fn arm_rescue_lookup_stall(&self, durable: &str) -> RescueStallHandles {
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self
+            .rescue_lookup_stall
+            .lock()
+            .expect("rescue lookup stall mutex") = Some(RescueStallGate {
+            key: durable.to_string(),
+            entered_tx,
+            release_rx: StdMutex::new(Some(release_rx)),
+        });
+        RescueStallHandles {
+            entered,
+            release: release_tx,
+        }
+    }
+
+    /// Take the armed pre-lookup rescue stall for `durable`, if it matches
+    /// (one-shot; `cfg(test)`-only, ep2-r5).
+    #[cfg(test)]
+    fn take_rescue_lookup_stall(&self, durable: &str) -> Option<RescueStallGate> {
+        let mut guard = self
+            .rescue_lookup_stall
+            .lock()
+            .expect("rescue lookup stall mutex");
+        match guard.as_ref() {
+            Some(g) if g.key == durable => guard.take(),
+            _ => None,
+        }
+    }
+
+    /// kata b8ke Task 3: begin this lane's coordinator claim. See
+    /// [`crate::ownership_lane::begin_lane_claim`].
+    fn begin_lane_claim_at(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        observed: Option<freshell_ownership::ObservedFence>,
+        initiator: &str,
+    ) -> crate::ownership_lane::LaneClaim {
+        crate::ownership_lane::begin_lane_claim(
+            &self.fresh_agent.ownership,
+            PROVIDER,
+            session_id,
+            operation_id,
+            observed,
+            initiator,
+            crate::session_lease::now_epoch_ms(),
+        )
+    }
+
+    /// kata b8ke Task 3: commit this lane's claim and retain the stamp in
+    /// the SHARED map (a REST-materialized `ses_*` can be killed through this
+    /// WS lane and vice versa). See
+    /// [`crate::ownership_lane::commit_lane_claim`].
+    fn commit_lane_claim_at(
+        &self,
+        ticket: &mut Option<freshell_ownership::OperationTicket>,
+        session_id: &str,
+    ) -> Result<(), freshell_ownership::CommitOutcome> {
+        crate::ownership_lane::commit_lane_claim(
+            &self.fresh_agent.ownership,
+            &self.fresh_agent.ownership_stamps,
+            // b8ke ext r29 F1: every commit-to-Live broadcasts the owner
+            // record on the shared bus — the materialization commit
+            // included (the frame names the durable id every device
+            // converges on).
+            Some(&self.fresh_agent.broadcast_tx),
+            PROVIDER,
+            session_id,
+            ticket,
+            session_id,
+            // OpenCode passes pid: None — the shared `opencode serve`
+            // daemon is NOT the per-session writer and must never be killed
+            // (OpenCode invariant).
+            None,
+        )
+    }
+
+    /// The post-commit rescue's committed fence (fresheyes ep2-r5): the
+    /// `(epoch, generation)` pair the lane's own claim committed `Live`
+    /// under — the registry's boot epoch and the ticket's generation
+    /// (the exact generation `commit_live` lands at, so a still-own
+    /// coordinator observation reports the SAME pair back). `None` when
+    /// the coordinator is unwired or the caller holds no ticket (the
+    /// under-ticket handoff continuation — the runner's single `Live`
+    /// commit is still ahead — or the unwired lane, where no
+    /// coordinator observation exists to fence against).
+    fn committed_lane_fence(
+        ownership: &Option<Arc<freshell_ownership::RuntimeOwnershipRegistry>>,
+        ticket: Option<&freshell_ownership::OperationTicket>,
+    ) -> Option<freshell_ownership::ObservedFence> {
+        match (ownership.as_ref(), ticket) {
+            (Some(registry), Some(ticket)) => Some(freshell_ownership::ObservedFence {
+                epoch: registry.boot_epoch(),
+                generation: ticket.generation(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The initiator label for a coordinator transition event: the
+    /// connection's device id when the provenance carries one, else the lane
+    /// label (diagnostic, not audit-grade).
+    fn initiator_for(provenance: Option<&crate::BindProvenance>, lane: &str) -> String {
+        provenance
+            .and_then(|p| p.device_id.clone())
+            .unwrap_or_else(|| lane.to_string())
+    }
+
     /// Wire the P1.13 identity-event sink (set-once; later calls are no-ops).
     pub fn set_identity_sink(&self, sink: SharedPaneIdentitySink) {
         let _ = self.identity_sink.set(sink);
     }
 
     /// The wired identity sink, if any.
-    fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
+    pub(crate) fn identity_sink(&self) -> Option<SharedPaneIdentitySink> {
         self.identity_sink.get().cloned()
     }
 
@@ -620,19 +999,32 @@ impl FreshOpencodeState {
     /// failure surfaces as a user-visible `LEDGER_WRITE_FAILED` `freshAgent.error`
     /// broadcast but NEVER blocks the caller's reply — the same failure policy at
     /// every call site.
-    async fn record_binding_row(&self, upsert: crate::identity_sink::FreshAgentBindingUpsert) {
+    /// b8ke ext r22 F2: the binding row write returns its typed outcome —
+    /// the CREATE/RESUME lanes propagate the failure (the runtime torn
+    /// down, the claim settling typed), never a bare LEDGER_WRITE_FAILED
+    /// notification under a committed Live; the maintenance lanes
+    /// (rollback/refresh) log-and-continue by discarding the Result.
+    /// b8ke ext r26 F4: the MATERIALIZATION and FORK lanes propagate the
+    /// failure too (the create/fork contract covers every lane that
+    /// registers a NEW durable identity) — only the maintenance lanes
+    /// still discard.
+    async fn record_binding_row(
+        &self,
+        upsert: crate::identity_sink::FreshAgentBindingUpsert,
+    ) -> Result<(), std::io::Error> {
         let Some(sink) = self.identity_sink() else {
-            return;
+            return Ok(());
         };
         let session_id = upsert.session_id.clone();
         if let Err(e) = sink.record_binding(upsert).await {
-            tracing::warn!(error = %e, session = %session_id, "freshagent.opencode.binding_write_failed");
-            self.emit_fresh_agent_error(
-                &session_id,
-                "LEDGER_WRITE_FAILED",
-                "Failed to persist this session's resume record - settings may not survive a server restart.",
+            tracing::error!(target: "invariant",
+                error = %e, session = %session_id,
+                "freshagent.opencode.binding_write_failed: the durable row write failed — \
+                 the failure propagates to the lane's typed path (kata b8ke ext r22 F2)"
             );
+            return Err(e);
         }
+        Ok(())
     }
 
     /// Retire-on-kill round 2/3 (focused-ep5-r1 Finding 2, -r2 Finding 4),
@@ -715,6 +1107,9 @@ impl FreshOpencodeState {
     fn fail_create(&self, request_id: &str, code: &str, message: &str) {
         self.broadcast(&ServerMessage::FreshAgentCreateFailed(
             FreshAgentCreateFailed {
+                owner_kind: None,
+                owner_generation: None,
+                owner_epoch: None,
                 code: code.to_string(),
                 message: message.to_string(),
                 request_id: request_id.to_string(),
@@ -725,6 +1120,9 @@ impl FreshOpencodeState {
 
     fn send_error(&self, request_id: &Option<String>, code: &str, message: &str) {
         self.broadcast(&ServerMessage::Error(ErrorMsg {
+            owner_kind: None,
+            owner_generation: None,
+            owner_epoch: None,
             code: ErrorCode::InternalError,
             message: format!("{code}: {message}"),
             timestamp: now_iso(),
@@ -926,10 +1324,145 @@ impl FreshOpencodeState {
             guard.get(&durable_id).cloned()
         };
         let in_memory_hit = existing.is_some();
+        // b8ke e3 post-cap F4: the PRE-AWAIT observation — the coordinator's
+        // generation + the owner identity captured BEFORE any of this
+        // handler's session-mutation/binding awaits. The post-await recheck
+        // compares AGAINST THIS (generation AND identity must match);
+        // pre-post-cap the predicate accepted any Live{FreshAgent} or
+        // Vacant/Aliased, so a kill or same-kind turnover during the await
+        // left stale durable metadata and still succeeded.
+        let pre_await = self.fresh_agent.ownership_snapshot(PROVIDER, &durable_id);
+        let (pre_await_generation, pre_await_owner) = match &pre_await.state {
+            freshell_ownership::OwnershipState::Live {
+                owner, generation, ..
+            } => (Some(*generation), Some(owner.clone())),
+            _ => (None, None),
+        };
+        // b8ke ext r15 F1: the request fence is parsed BEFORE ANY
+        // ownership mutation — the map-hit/Vacant compatibility claim
+        // below carries it, and a half-sent (or stale) pair must refuse
+        // with NOTHING mutated (pre-r15 the claim ran first with None:
+        // a stale request reclaimed a since-vacated key, and a half-sent
+        // create mutated ownership before the INVALID_FENCE refusal).
+        let create_fence =
+            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %durable_id, request_id = %request_id, code = err.code(),
+                    "fresh_agent_create_refused: the observed fence is half-sent (invalid)");
+                    self.fail_create(&request_id, err.code(), err.message());
+                    return;
+                }
+            };
+        // b8ke delta round-3 F2: an in-memory hit still CONSULTS the
+        // coordinator — a delayed create-resume during a Handoff must be
+        // blocked or typed, never a silent reuse of a runtime the handoff
+        // owns.
+        if in_memory_hit {
+            let snap = self.fresh_agent.ownership_snapshot(PROVIDER, &durable_id);
+            match snap.state {
+                freshell_ownership::OwnershipState::Handoff { .. }
+                | freshell_ownership::OwnershipState::Starting { .. }
+                | freshell_ownership::OwnershipState::Stopping { .. }
+                | freshell_ownership::OwnershipState::Fenced { .. } => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %durable_id, state = ?snap.state,
+                        "fresh_agent_create_refused: a lifecycle transition owns this \
+                         session — the in-memory fast path is blocked (typed)");
+                    self.fail_create(
+                        &request_id,
+                        "SESSION_RESERVED",
+                        "A lifecycle operation owns this session; retry after it settles",
+                    );
+                    return;
+                }
+                // b8ke e3r1 F3: a live session over a VACANT key is
+                // REGISTERED as the authoritative owner before the reuse
+                // proceeds — never reused unowned.
+                freshell_ownership::OwnershipState::Vacant => {
+                    let adopt_op = format!("adopt-{}", uuid::Uuid::new_v4());
+                    // b8ke ext r15 F1: the compatibility claim is FENCED
+                    // with the request's observed pair — a stale
+                    // generation can never reclaim a since-vacated key.
+                    match self.begin_lane_claim_at(
+                        &durable_id,
+                        &adopt_op,
+                        create_fence,
+                        "freshopencode/map-hit-adopt",
+                    ) {
+                        crate::ownership_lane::LaneClaim::Granted(ticket) => {
+                            let mut ticket_opt = Some(ticket);
+                            if let Err(outcome) = crate::ownership_lane::commit_lane_claim(
+                                &self.fresh_agent.ownership,
+                                &self.fresh_agent.ownership_stamps,
+                                Some(&self.fresh_agent.broadcast_tx),
+                                PROVIDER,
+                                &durable_id,
+                                &mut ticket_opt,
+                                &durable_id,
+                                None,
+                            ) {
+                                tracing::warn!(target: "freshell_freshagent::opencode",
+                                    session_id = %durable_id, outcome = ?outcome,
+                                    "fresh_agent_create_adopt_commit_stale: the coordinator \
+                                     moved on while registering the existing session — the \
+                                     reuse is refused (never a live writer left unowned)");
+                                self.fail_create(
+                                    &request_id,
+                                    "SESSION_RESERVED",
+                                    "A lifecycle operation owns this session; retry after it settles",
+                                );
+                                return;
+                            }
+                        }
+                        crate::ownership_lane::LaneClaim::Unwired
+                        | crate::ownership_lane::LaneClaim::Adopt => {}
+                        crate::ownership_lane::LaneClaim::Refused(_) => {
+                            self.fail_create(
+                                &request_id,
+                                "SESSION_RESERVED",
+                                "A lifecycle operation owns this session; retry after it settles",
+                            );
+                            return;
+                        }
+                    }
+                }
+                // b8ke e3r4 F4: a TERMINAL owner means a handoff
+                // committed — the delayed create is a TYPED refusal,
+                // never a wildcard fall-through that reasserts a Fresh
+                // Agent binding beside the terminal owner.
+                freshell_ownership::OwnershipState::Live {
+                    owner: observed_owner,
+                    ..
+                } if observed_owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %durable_id,
+                        "fresh_agent_create_refused: a TERMINAL owner owns the \
+                         session (a handoff committed) — the delayed create is a \
+                         typed refusal, never a Fresh Agent reassertion beside it");
+                    self.fail_create(
+                        &request_id,
+                        "SESSION_RESERVED",
+                        "The session is owned by a terminal runtime; reopen it as \
+                         the terminal instead",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
         let session_arc = match existing {
             Some(session_arc) => session_arc,
             None => match self
-                .resume_durable_session(&durable_id, msg.cwd.as_deref(), provenance.clone())
+                .resume_durable_session(
+                    &durable_id,
+                    msg.cwd.as_deref(),
+                    provenance.clone(),
+                    // kata b8ke Task 3: the create's delayed-request fence.
+                    create_fence,
+                    None,
+                )
                 .await
             {
                 Ok(session_arc) => session_arc,
@@ -961,6 +1494,23 @@ impl FreshOpencodeState {
         // precedence): merge msg over the resumed session's values BEFORE
         // normalization, so an omitted param recovers the recorded value instead of
         // being rewritten to the default.
+        // b8ke e3 post-cap F4: the PRE-PARK row state — captured BEFORE the
+        // session-mutation scope (the re-park overwrites session.provenance),
+        // so the binding write's rollback restores the row's EARLIER
+        // attribution, never the turnover's stale one.
+        let (pre_park_provenance, pre_park_settings) = {
+            let session = session_arc.lock().await;
+            (
+                session.provenance.clone(),
+                crate::identity_sink::FreshAgentSettings {
+                    model: session.model.clone(),
+                    sandbox: None,
+                    permission_mode: None,
+                    effort: session.effort.clone(),
+                    cwd: session.cwd.clone(),
+                },
+            )
+        };
         {
             let mut session = session_arc.lock().await;
             // D8 (focused-ep1 Finding A, branch 1 — same-process in-memory
@@ -984,6 +1534,76 @@ impl FreshOpencodeState {
             }
         }
 
+        // b8ke e3 post-cap F4: the durable write's rollback payload —
+        // the PRE-write settings + parked provenance captured BEFORE the
+        // binding write, so a turnover during the write's own await can
+        // restore the row (a compensating upsert).
+        let mut binding_write_rollback: Option<crate::identity_sink::FreshAgentBindingUpsert> =
+            None;
+        // b8ke ext r27 F1: the OBSERVED (epoch, generation) fence for BOTH
+        // the refresh write below AND the compensating upsert it can leave
+        // behind — the pair this handler observed BEFORE any of its
+        // awaits (the delayed-write fence baseline). Pre-r27 both writes
+        // carried (None, None), so a handoff committing while the write
+        // was stalled left the compensating upsert UNFENCED: the ledger's
+        // delayed-write comparison could not refuse it and the stale
+        // fresh-agent compensation overwrote the new TERMINAL owner's
+        // authoritative recovery row (live_terminal_id erased,
+        // pane_kind rewritten). Carrying the observed pair makes the
+        // stale compensation refuse typed (STALE_BINDING_PAIR) — the
+        // new owner's row survives. (None, None) stays the legacy shape
+        // when no coordinator or no Live owner was observed.
+        let observed_binding_pair = pre_await_generation.map(|generation| {
+            (
+                self.fresh_agent
+                    .ownership
+                    .as_ref()
+                    .map(|registry| registry.boot_epoch())
+                    .unwrap_or(pre_await.epoch),
+                generation,
+            )
+        });
+
+        // b8ke e3 post-cap F4: the PRE-WRITE recheck — after the
+        // session-mutation awaits, BEFORE the durable binding write: the
+        // coordinator's generation and the owner identity must STILL match
+        // the pre-await capture (a kill or turnover during the awaits
+        // answers typed and the durable write NEVER happens).
+        {
+            let snap = self.fresh_agent.ownership_snapshot(PROVIDER, &durable_id);
+            let still_owns = match (&snap.state, &pre_await_owner) {
+                (
+                    freshell_ownership::OwnershipState::Live {
+                        owner, generation, ..
+                    },
+                    Some(pre_owner),
+                ) => {
+                    owner.kind == pre_owner.kind
+                        && owner.ownership_id == pre_owner.ownership_id
+                        && owner.live_session_key == pre_owner.live_session_key
+                        && Some(*generation) == pre_await_generation
+                }
+                _ => false,
+            };
+            // The unwired-coordinator shape (pre_await_owner == None — no
+            // coordinator observed): the legacy path proceeds; the strict
+            // comparison only gates a COORDINATED create.
+            if in_memory_hit && pre_await_owner.is_some() && !still_owns {
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %durable_id, state = ?snap.state,
+                    "fresh_agent_create_aborted_pre_write: a lifecycle transition \
+                     moved the key during this create's awaits — the durable \
+                     binding write is PREVENTED and the create answers typed");
+                self.fail_create(
+                    &request_id,
+                    "SESSION_RESERVED",
+                    "A lifecycle operation committed while this create was in flight; \
+                     retry after it settles",
+                );
+                return;
+            }
+        }
+
         // D8 (focused-ep1 Finding A, branch 1): the in-memory hit bypasses
         // `resume_durable_session`, so it must perform that lane's SAME
         // awaited refresh write itself (durable-before-answer) — the CURRENT
@@ -999,7 +1619,10 @@ impl FreshOpencodeState {
                     session.cwd.clone(),
                 )
             };
-            self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+            // Capture the PRE-write row state for the rollback (the
+            // PRE-PARK capture above — the row's state before this
+            // handler's own re-park).
+            binding_write_rollback = Some(crate::identity_sink::FreshAgentBindingUpsert {
                 provider: PROVIDER.into(),
                 session_id: durable_id.clone(),
                 mode: SESSION_TYPE.into(),
@@ -1008,16 +1631,97 @@ impl FreshOpencodeState {
                 supersedes: None,
                 // Unified agent names: no naming fact on this ledger edge.
                 name_transition: None,
-                provenance: crate::identity_sink::ProvenanceUpdate::Replace(p),
-                settings: crate::identity_sink::FreshAgentSettings {
-                    model,
-                    sandbox: None,
-                    permission_mode: None,
-                    effort,
-                    cwd,
+                provenance: match pre_park_provenance.clone() {
+                    Some(parked) => crate::identity_sink::ProvenanceUpdate::Replace(parked),
+                    None => crate::identity_sink::ProvenanceUpdate::Inherit,
                 },
-            })
-            .await;
+                // b8ke ext r27 F1: the compensating upsert carries the
+                // OBSERVED pair — a stale compensation (a handoff
+                // committed while the write stalled) is refused typed by
+                // the ledger's delayed-write fence instead of overwriting
+                // the new terminal owner's recovery row.
+                observed_epoch: observed_binding_pair.map(|(epoch, _)| epoch),
+                observed_generation: observed_binding_pair.map(|(_, generation)| generation),
+                // b8ke focused ep5 r2 F1: a lane write.
+                authoritative: false,
+                settings: pre_park_settings.clone(),
+            });
+            let _ = self
+                .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                    provider: PROVIDER.into(),
+                    session_id: durable_id.clone(),
+                    mode: SESSION_TYPE.into(),
+                    create_request_id: None,
+                    resolves_pending: None,
+                    supersedes: None,
+                    // Unified agent names: no naming fact on this ledger edge.
+                    name_transition: None,
+                    provenance: crate::identity_sink::ProvenanceUpdate::Replace(p),
+                    // b8ke ext r27 F1: the refresh write carries the SAME
+                    // observed pair (it can land after a turnover's
+                    // terminal-side row write — the fence refuses it typed
+                    // instead of letting it corrupt the new owner's row).
+                    observed_epoch: observed_binding_pair.map(|(epoch, _)| epoch),
+                    observed_generation: observed_binding_pair.map(|(_, generation)| generation),
+                    // b8ke focused ep5 r2 F1: a lane write.
+                    authoritative: false,
+                    settings: crate::identity_sink::FreshAgentSettings {
+                        model,
+                        sandbox: None,
+                        permission_mode: None,
+                        effort,
+                        cwd,
+                    },
+                })
+                .await;
+        }
+
+        // b8ke e3r4 F4 + e3 post-cap F4: the POST-WRITE RECHECK — strict:
+        // the coordinator's generation and owner identity must STILL match
+        // the pre-await capture. A turnover during the BINDING WRITE's own
+        // await rolled the durable row already (the write landed during the
+        // race) — so on mismatch the write is ROLLED BACK (a compensating
+        // upsert restoring the PRE-write settings; the provenance merge's
+        // keep-when-None restores the row's earlier attribution), then the
+        // create answers typed — no `freshAgent.created` reassertion.
+        {
+            let snap = self.fresh_agent.ownership_snapshot(PROVIDER, &durable_id);
+            let still_owns = match (&snap.state, &pre_await_owner) {
+                (
+                    freshell_ownership::OwnershipState::Live {
+                        owner, generation, ..
+                    },
+                    Some(pre_owner),
+                ) => {
+                    owner.kind == pre_owner.kind
+                        && owner.ownership_id == pre_owner.ownership_id
+                        && owner.live_session_key == pre_owner.live_session_key
+                        && Some(*generation) == pre_await_generation
+                }
+                _ => false,
+            };
+            let stale = in_memory_hit && pre_await_owner.is_some() && !still_owns;
+            if stale {
+                // ROLL the durable binding write back — the compensating
+                // upsert restores the PRE-write settings (captured before
+                // the mutation scope) with keep-when-None provenance.
+                if let Some(rollback) = binding_write_rollback.take() {
+                    let _ = self.record_binding_row(rollback).await;
+                }
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %durable_id, state = ?snap.state,
+                    "fresh_agent_create_aborted_post_await: a lifecycle transition \
+                     committed while the delayed create awaited its binding writes — \
+                     the create aborts typed (never a Fresh Agent reassertion beside \
+                     the committed owner)");
+                self.fail_create(
+                    &request_id,
+                    "SESSION_RESERVED",
+                    "A lifecycle operation committed while this create was in flight; \
+                     retry after it settles",
+                );
+                return;
+            }
         }
 
         // requestId dedup cache: a duplicate create replays the DURABLE id (never a
@@ -1068,6 +1772,10 @@ impl FreshOpencodeState {
     pub async fn handle_send(&self, msg: FreshAgentSend) {
         let request_id = msg.request_id.clone();
         let session_id = msg.session_id.clone();
+
+        // Task 4: arm the runtime's daemon-loss watcher (idempotent — the
+        // first opencode WS traffic arms the one process-level listener).
+        self.ensure_daemon_loss_watcher().await;
 
         let session_arc = {
             let guard = self.sessions.lock().await;
@@ -1132,9 +1840,37 @@ impl FreshOpencodeState {
             return;
         }
 
+        // b8ke ext r31 F1: the request's observed fence is parsed BEFORE
+        // ANY side effect (the turn-flag resets, the redo destroy, the
+        // busy broadcast, the materialization) — the pair is ONE fence
+        // (the r29 F7 discipline): a half-sent pair is an INVALID fence,
+        // never a silently-downgraded legacy request, and refuses typed
+        // with NOTHING mutated. The parsed pair then feeds the
+        // materialization's ownership claim below — pre-r31 the claim
+        // ran with `None` and DISCARDED the pair the protocol and client
+        // explicitly carry because `freshAgent.send` can create a
+        // runtime: a delayed old-generation send could claim a
+        // since-vacated placeholder and mint/rekey a durable session as
+        // if it had observed nothing.
+        let send_fence =
+            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    drop(session);
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %session_id, request_id = ?request_id,
+                        code = err.code(),
+                        "fresh_agent_send_refused: the observed fence is half-sent \
+                         (invalid) — the send mutates nothing"
+                    );
+                    self.send_error(&request_id, err.code(), err.message());
+                    return;
+                }
+            };
+
         // materializeOrSend:334-335 -- a fresh turn starts un-aborted and un-errored;
-        // `handle_interrupt` flips `turn_aborted` while we are parked on idle, and the
-        // serve-stream bridge flips `turn_errored` if the turn reports an error.
+        // `handle_interrupt` flips `turn_aborted` while we are parked on idle, and
+        // the serve-stream bridge flips `turn_errored` if the turn reports an error.
         session.turn_aborted.store(false, Ordering::SeqCst);
         session.turn_errored.store(false, Ordering::SeqCst);
 
@@ -1214,6 +1950,104 @@ impl FreshOpencodeState {
             // ONE server-wide, and gating would starve the spawn budget on
             // ~50-70s worst-case cold-start holds (see the lib.rs comment for
             // the arithmetic). Revisit if the sidecar ever grows fork fan-out.
+            //
+            // b8ke ext r26 F3: the PRE-MUTATION claim — the placeholder
+            // identity (the pane-scoped id the lane already knows, before
+            // the provider mints anything) holds the in-flight start for
+            // the WHOLE cold-start window, mirroring the REST/MCP lane's
+            // provisional-key discipline. The settle witness registers
+            // with the ticket (the r20 F1 discipline), so the stale-start
+            // sweep skips the live slow cold-start; the cancel closure is
+            // a NO-OP by design — the shared serve daemon is NOT the
+            // per-session writer and must never be killed (OpenCode
+            // invariant). At the mint the SAME ticket rekeys to the
+            // durable id in one atomic step, so the durable key is
+            // coordinator-owned from the moment the id exists — a
+            // claim refusal, cancellation, panic, or shutdown after the
+            // provider mutation can never leave the minted session
+            // outside coordinator ownership and typed recovery, and a
+            // competing lifecycle operation on the placeholder (or a
+            // duplicate first-send) answers the typed conflict BEFORE
+            // any provider mutation.
+            let claim_key = self
+                .fresh_agent
+                .resolve_canonical_session(PROVIDER, &session.placeholder_id);
+            let materialize_op = format!("send-materialize-{}", uuid::Uuid::new_v4());
+            let start_pid_slot = crate::ownership_lane::sidecar_pid_cancel_slot();
+            let mut _start_cancellation: Option<crate::ownership_lane::StartCancellationGuard> =
+                None;
+            let mut own_ticket: Option<freshell_ownership::OperationTicket> = None;
+            match self.begin_lane_claim_at(
+                &claim_key,
+                &materialize_op,
+                // b8ke ext r31 F1: the request's observed pair — the
+                // coordinator's fence check refuses a stale (or
+                // stale-epoch) pair typed BEFORE any provider mutation,
+                // so delayed old-generation traffic can never claim a
+                // since-vacated placeholder and materialize over it
+                // (the None shape remains ONLY the genuine legacy
+                // client).
+                send_fence,
+                "freshopencode/send-materialize",
+            ) {
+                crate::ownership_lane::LaneClaim::Granted(ticket) => {
+                    own_ticket = Some(ticket);
+                    _start_cancellation = Some(
+                        crate::ownership_lane::register_start_cancellation_for_ticket(
+                            &self.fresh_agent.ownership,
+                            PROVIDER,
+                            &claim_key,
+                            &own_ticket,
+                            crate::ownership_lane::pid_slot_cancellation(&start_pid_slot),
+                        ),
+                    );
+                }
+                crate::ownership_lane::LaneClaim::Unwired => {}
+                crate::ownership_lane::LaneClaim::Adopt => {
+                    // The placeholder resolves to a LIVE same-kind owner —
+                    // an earlier materialization for this pane completed
+                    // (the key is `Aliased{to: the durable id}` after its
+                    // rekey); the duplicate first-send answers typed.
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        provider = PROVIDER, session_id = %claim_key,
+                        placeholder_id = %session.placeholder_id,
+                        "freshagent.opencode.materialize_claim_refused: the \
+                         placeholder resolves to a live owner; the pane is not \
+                         materialized by this send"
+                    );
+                    self.emit_fresh_agent_error(
+                        &session_id,
+                        "SESSION_RESERVED",
+                        "Another resume for this session is in flight",
+                    );
+                    return;
+                }
+                crate::ownership_lane::LaneClaim::Refused(outcome) => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        provider = PROVIDER, session_id = %claim_key,
+                        placeholder_id = %session.placeholder_id,
+                        outcome = ?outcome,
+                        "freshagent.opencode.materialize_claim_refused: the coordinator \
+                         refused the placeholder's pre-spawn claim; the pane is not \
+                         materialized (kata b8ke ext r26 F3)"
+                    );
+                    // b8ke ext r31 F1: a STALE observed fence is an
+                    // honest stale refusal — the same SESSION_RESERVED
+                    // the client's bounded re-drive understands, with the
+                    // message that says what to do (refresh and retry);
+                    // every other refusal stays the in-flight conflict.
+                    let message = if matches!(
+                        outcome,
+                        freshell_ownership::BeginOutcome::StaleGeneration { .. }
+                    ) {
+                        "The observed ownership fence is stale; refresh and retry"
+                    } else {
+                        "Another resume for this session is in flight"
+                    };
+                    self.emit_fresh_agent_error(&session_id, "SESSION_RESERVED", message);
+                    return;
+                }
+            }
             let created = match manager.create_session(None, None, cwd.as_deref()).await {
                 Ok(created) => created,
                 Err(err) => {
@@ -1226,6 +2060,66 @@ impl FreshOpencodeState {
                 }
             };
             let durable_id = created.id;
+
+            // b8ke ext r26 F3: the MINT-TIME REKEY — the SAME ticket's
+            // in-flight record moves from the placeholder key to the
+            // minted durable `ses_*` id in ONE atomic step
+            // (`rekey_starting`: the placeholder becomes
+            // `Aliased{to: the durable id}` — the rekey family's
+            // resolution record — and the durable key holds the SAME
+            // operation's `Starting`, witnesses carried; the ticket
+            // survives via `rekey_session_id`, so the registration tail
+            // below lands under the CANONICAL key). The durable key is
+            // coordinator-owned from the moment the id exists: a
+            // competitor that claimed the freshly discoverable session
+            // inside the cold-start window left a record under it and
+            // the rekey REFUSES typed — the pane is NOT registered (the
+            // daemon-side session is abandoned; the shared serve is
+            // never killed — OpenCode invariant), never two writers.
+            if let Some(ticket) = own_ticket.as_mut() {
+                let Some(registry) = self.fresh_agent.ownership.as_ref() else {
+                    unreachable!("a live ticket implies a wired coordinator");
+                };
+                match registry.rekey_starting(
+                    PROVIDER,
+                    ticket.session_id(),
+                    &durable_id,
+                    ticket.operation_id(),
+                    ticket.generation(),
+                ) {
+                    freshell_ownership::CommitOutcome::Committed => {
+                        ticket.rekey_session_id(&durable_id);
+                    }
+                    outcome => {
+                        tracing::error!(target: "invariant",
+                            provider = PROVIDER, session_id = %durable_id,
+                            placeholder_id = %session.placeholder_id,
+                            outcome = ?outcome,
+                            "freshagent.opencode.materialize_rekey_refused: the minted \
+                             session id was claimed by another owner during the \
+                             cold-start window — the pane is not registered (kata b8ke \
+                             ext r26 F3)"
+                        );
+                        self.emit_fresh_agent_error(
+                            &session_id,
+                            "SESSION_RESERVED",
+                            "The minted session id was claimed by another owner during the create",
+                        );
+                        return;
+                    }
+                }
+            }
+            // The shared `opencode serve` daemon is NOT the per-session writer
+            // and must never be killed — pid stays `None` (OpenCode
+            // invariant): the watchdog has no partial runtime to reap.
+            crate::ownership_lane::register_partial_fresh_runtime(
+                &self.fresh_agent.ownership,
+                PROVIDER,
+                &durable_id,
+                &own_ticket,
+                &durable_id,
+                None,
+            );
             session.real_session_id = Some(durable_id.clone());
             if let Some(dir) = created.directory.filter(|d| !d.is_empty()) {
                 session.cwd = Some(dir);
@@ -1240,56 +2134,88 @@ impl FreshOpencodeState {
 
             // D8: stamps parked on the session at create reach the
             // materialization row here (Some asserts, None inherits).
-            self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
-                provider: PROVIDER.into(),
-                session_id: durable_id.clone(),
-                mode: SESSION_TYPE.into(),
-                // Task 3 binding fix: the lineage key is the CREATE requestId,
-                // derived from the placeholder minted at handle_create
-                // (`freshopencode-<createRequestId>`) — NOT this send's
-                // requestId (the old bug; every materialization re-keyed the
-                // lineage to the triggering send). A born-durable placeholder
-                // strips to None.
-                create_request_id: session
-                    .placeholder_id
-                    .strip_prefix(crate::OPENCODE_PLACEHOLDER_PREFIX)
-                    .map(str::to_string),
-                resolves_pending: Some(session.placeholder_id.clone()),
-                supersedes: None,
-                // Unified agent names (Task 4, T2-M5 wired): the
-                // materialization's DECLARED classification — the same
-                // InitialMaterialization the dedicated bind lane below
-                // folds through the shared classification-driven fold
-                // (opencode persistence is verified at materialization).
-                name_transition: Some(crate::naming::NameTransition::binding(
-                    crate::naming::NameTransitionReason::InitialMaterialization,
-                    freshell_protocol::native_location::NativeAcquisition {
-                        location: freshell_protocol::native_location::NativeLocation::Opencode {
-                            database_path: freshell_sessions::parse::default_opencode_data_home()
-                                .join("opencode.db")
-                                .display()
-                                .to_string(),
-                            native_session_id: Some(durable_id.clone()),
-                            original_directory: session.cwd.clone(),
-                            owned_local_endpoint: None,
+            // b8ke ext r26 F4: the binding failure PROPAGATES — the
+            // materialization is torn down (never a materialized
+            // broadcast, a started bridge, or a committed Live over a
+            // session missing from the authoritative recovery registry);
+            // the ticket's RAII drop settles the rekeyed claim typed and
+            // the pane answers the typed recoverable error.
+            if let Err(e) = self
+                .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                    provider: PROVIDER.into(),
+                    session_id: durable_id.clone(),
+                    mode: SESSION_TYPE.into(),
+                    // Task 3 binding fix: the lineage key is the CREATE requestId,
+                    // derived from the placeholder minted at handle_create
+                    // (`freshopencode-<createRequestId>`) — NOT this send's
+                    // requestId (the old bug; every materialization re-keyed the
+                    // lineage to the triggering send). A born-durable placeholder
+                    // strips to None.
+                    create_request_id: session
+                        .placeholder_id
+                        .strip_prefix(crate::OPENCODE_PLACEHOLDER_PREFIX)
+                        .map(str::to_string),
+                    resolves_pending: Some(session.placeholder_id.clone()),
+                    supersedes: None,
+                    // Unified agent names (Task 4, T2-M5 wired): the
+                    // materialization's DECLARED classification — the same
+                    // InitialMaterialization the dedicated bind lane below
+                    // folds through the shared classification-driven fold
+                    // (opencode persistence is verified at materialization).
+                    name_transition: Some(crate::naming::NameTransition::binding(
+                        crate::naming::NameTransitionReason::InitialMaterialization,
+                        freshell_protocol::native_location::NativeAcquisition {
+                            location: freshell_protocol::native_location::NativeLocation::Opencode {
+                                database_path: freshell_sessions::parse::default_opencode_data_home()
+                                    .join("opencode.db")
+                                    .display()
+                                    .to_string(),
+                                native_session_id: Some(durable_id.clone()),
+                                original_directory: session.cwd.clone(),
+                                owned_local_endpoint: None,
+                            },
+                            evidence:
+                                freshell_protocol::native_location::NativeEvidenceKind::PersistedMetadata,
+                            persistence:
+                                freshell_protocol::native_location::NativePersistence::Verified,
                         },
-                        evidence:
-                            freshell_protocol::native_location::NativeEvidenceKind::PersistedMetadata,
-                        persistence:
-                            freshell_protocol::native_location::NativePersistence::Verified,
+                        session.placeholder_id.clone(),
+                    )),
+                    provenance: session.provenance.clone().into(),
+                    observed_epoch: None,
+                    observed_generation: None,
+                    // b8ke focused ep5 r2 F1: a lane write.
+                    authoritative: false,
+                    settings: crate::identity_sink::FreshAgentSettings {
+                        model: session.model.clone(),
+                        sandbox: None,
+                        permission_mode: None,
+                        effort: session.effort.clone(),
+                        cwd: session.cwd.clone(),
                     },
-                    session.placeholder_id.clone(),
-                )),
-                provenance: session.provenance.clone().into(),
-                settings: crate::identity_sink::FreshAgentSettings {
-                    model: session.model.clone(),
-                    sandbox: None,
-                    permission_mode: None,
-                    effort: session.effort.clone(),
-                    cwd: session.cwd.clone(),
-                },
-            })
-            .await;
+                })
+                .await
+            {
+                tracing::error!(target: "invariant",
+                    provider = PROVIDER, session_id = %durable_id, error = %e,
+                    "freshagent.opencode.materialize_binding_failed_typed: the durable \
+                     row write failed — the session is torn down (kata b8ke ext r26 F4)"
+                );
+                {
+                    let mut guard = self.sessions.lock().await;
+                    guard.remove(&session.placeholder_id);
+                    guard.remove(&durable_id);
+                }
+                session.real_session_id = None;
+                session.killed.store(true, Ordering::SeqCst);
+                self.emit_fresh_agent_error(
+                    &session_id,
+                    "LEDGER_WRITE_FAILED",
+                    "This session's resume record could not be persisted; the pane is \
+                     not materialized — retry the send",
+                );
+                return;
+            }
 
             // Unified agent names (Task 2): commit the pending→durable name
             // transfer BEFORE the materialized frame publishes the identity
@@ -1318,11 +2244,47 @@ impl FreshOpencodeState {
             // PR-3: `bindServeStream(state)` (adapter.ts:349) -- start the persistent
             // serve-SSE bridge ONCE, right after materialization. A later send never
             // re-enters this branch (mirrors `if (state.unsubscribeServe ...) return`).
-            session.serve_bridge = Some(self.spawn_serve_bridge(
-                manager.clone(),
-                durable_id.clone(),
-                session.turn_errored.clone(),
-            ));
+            self.install_serve_bridge(&manager, &mut session, &durable_id)
+                .await;
+
+            // kata b8ke Task 3: the materialization's registration is
+            // complete — commit `Live{FreshAgent}` for the minted `ses_*`
+            // key (the stamp lands in the SHARED map). A stale/foreign
+            // commit means the key was recovered mid-materialization: tear
+            // the just-registered session down (map keys, bridge) — the
+            // shared serve is never touched.
+            if let Err(outcome) = self.commit_lane_claim_at(&mut own_ticket, &durable_id) {
+                tracing::error!(target: "invariant",
+                    provider = PROVIDER, session_id = %durable_id,
+                    outcome = ?outcome,
+                    "freshagent.opencode.materialize_commit_stale: the coordinator moved on \
+                     while the materialization registered; the uncommitted session is torn down"
+                );
+                {
+                    let mut guard = self.sessions.lock().await;
+                    guard.remove(&session.placeholder_id);
+                    guard.remove(&durable_id);
+                }
+                if let Some(bridge) = session.serve_bridge.take() {
+                    bridge.abort();
+                }
+                session.killed.store(true, Ordering::SeqCst);
+                self.emit_fresh_agent_error(
+                    &session_id,
+                    "SESSION_RESERVED",
+                    "Session ownership changed during materialization",
+                );
+                return;
+            }
+            // b8ke ext r23 F1 carried the placeholder→durable COORDINATOR
+            // ALIAS as an explicit `alias_vacant_key` call here; b8ke ext
+            // r26 F3's pre-mint claim makes it inherent — the mint-time
+            // rekey leaves the placeholder key as the resolution alias
+            // (`Aliased{to: the durable id}`), the same record shape, so a
+            // placeholder-holding pane (a restored/offline pane or a
+            // direct REST caller) resolves to the REAL key through the
+            // canonical chain exactly as before. When the coordinator is
+            // unwired there is no alias to record.
             durable_id
         };
 
@@ -1338,25 +2300,30 @@ impl FreshOpencodeState {
             // D8: same session-carried stamps (a per-send refresh re-asserts
             // them via `Replace`; a conn-less refresh lane carries `None` →
             // `Inherit` and the ledger merge preserves them).
-            self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
-                provider: PROVIDER.into(),
-                session_id: acked_session_id.clone(),
-                mode: SESSION_TYPE.into(),
-                create_request_id: None,
-                resolves_pending: None,
-                supersedes: None,
-                // Unified agent names: no naming fact on this ledger edge.
-                name_transition: None,
-                provenance: session.provenance.clone().into(),
-                settings: crate::identity_sink::FreshAgentSettings {
-                    model: session.model.clone(),
-                    sandbox: None,
-                    permission_mode: None,
-                    effort: session.effort.clone(),
-                    cwd: session.cwd.clone(),
-                },
-            })
-            .await;
+            let _ = self
+                .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                    provider: PROVIDER.into(),
+                    session_id: acked_session_id.clone(),
+                    mode: SESSION_TYPE.into(),
+                    create_request_id: None,
+                    resolves_pending: None,
+                    supersedes: None,
+                    // Unified agent names: no naming fact on this ledger edge.
+                    name_transition: None,
+                    provenance: session.provenance.clone().into(),
+                    observed_epoch: None,
+                    observed_generation: None,
+                    // b8ke focused ep5 r2 F1: a lane write.
+                    authoritative: false,
+                    settings: crate::identity_sink::FreshAgentSettings {
+                        model: session.model.clone(),
+                        sandbox: None,
+                        permission_mode: None,
+                        effort: session.effort.clone(),
+                        cwd: session.cwd.clone(),
+                    },
+                })
+                .await;
         }
 
         // A send whose settings CHANGED the session record converges every
@@ -1425,10 +2392,18 @@ impl FreshOpencodeState {
         let turn_aborted = session.turn_aborted.clone();
         let turn_errored = session.turn_errored.clone();
         let last_turn_complete_at = session.last_turn_complete_at.clone();
+        let daemon_turn_accepted = session.daemon_turn_accepted.clone();
 
         let turn_task = tokio::spawn(async move {
             // `run_turn` (freshell-opencode/serve.rs) prompts + awaits idle against the
-            // REAL opencode serve session (adapter.ts materializeOrSend:363-368).
+            // REAL opencode serve session (adapter.ts materializeOrSend:363-368). The
+            // accepted witness (b8ke focused FR1 + round-2 R2-4) arms the session's
+            // daemon-turn-accepted flag at the prompt POST's DISPATCH boundary —
+            // the moment the send is issued onto the transport, before the
+            // response is processed: from that moment the turn may execute
+            // INSIDE the shared daemon (delivery precedes the response, and an
+            // ambiguous response failure counts as accepted), and only a
+            // settled outcome below (or a confirmed abort) may disarm it.
             let result = manager
                 .run_turn(
                     &real_id,
@@ -1437,8 +2412,22 @@ impl FreshOpencodeState {
                     effort.as_deref(),
                     DEFAULT_TURN_TIMEOUT,
                     route,
+                    Some(daemon_turn_accepted.clone()),
                 )
                 .await;
+            match &result {
+                // The idle edge was observed (or the daemon itself is gone —
+                // nothing runs daemon-side): the accepted turn is settled.
+                Ok(()) | Err(ServeError::SidecarLost { .. }) => {
+                    daemon_turn_accepted.store(false, Ordering::SeqCst);
+                }
+                // IdleTimeout: the LOCAL await gave up, but the daemon-side
+                // turn still runs — the flag STAYS armed (the stop path must
+                // still abort it). Other errors are ambiguous — keep it armed
+                // (fail closed: the stop path would rather issue one redundant
+                // abort than miss a live daemon-side writer).
+                Err(_) => {}
+            }
 
             settle_turn_outcome(
                 &fresh_agent,
@@ -1530,25 +2519,29 @@ impl FreshOpencodeState {
         let cwd = session.cwd.clone();
         drop(session);
         if let Some(durable_id) = durable_id {
-            self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
-                provider: PROVIDER.into(),
-                session_id: durable_id,
-                mode: SESSION_TYPE.into(),
-                create_request_id: None,
-                resolves_pending: None,
-                supersedes: None,
-                // Unified agent names: no naming fact on this ledger edge.
-                name_transition: None,
-                provenance: provenance.into(),
-                settings: crate::identity_sink::FreshAgentSettings {
-                    model: model.clone(),
-                    sandbox: None,
-                    permission_mode: None,
-                    effort: effort.clone(),
-                    cwd,
-                },
-            })
-            .await;
+            let _ = self
+                .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                    provider: PROVIDER.into(),
+                    session_id: durable_id,
+                    mode: SESSION_TYPE.into(),
+                    create_request_id: None,
+                    resolves_pending: None,
+                    supersedes: None,
+                    // Unified agent names: no naming fact on this ledger edge.
+                    name_transition: None,
+                    provenance: provenance.into(),
+                    observed_epoch: None,
+                    observed_generation: None,
+                    authoritative: false,
+                    settings: crate::identity_sink::FreshAgentSettings {
+                        model: model.clone(),
+                        sandbox: None,
+                        permission_mode: None,
+                        effort: effort.clone(),
+                        cwd,
+                    },
+                })
+                .await;
         }
 
         // Broadcast keyed at the CLIENT-ADDRESSED id (the id the configure
@@ -1601,6 +2594,392 @@ impl FreshOpencodeState {
         );
     }
 
+    /// Test-only seam for the b8ke focused FR1 red/green: settle the
+    /// session's LOCAL turn task (abort + join, exactly what a completed
+    /// `run_turn` looks like to the stop path — the IdleTimeout shape)
+    /// WITHOUT touching the daemon-turn-accepted flag. Production code must
+    /// never call this; the production IdleTimeout completes the task
+    /// through `run_turn`'s own deadline while leaving the acceptance
+    /// armed.
+    #[doc(hidden)]
+    pub async fn settle_local_turn_task_for_test(&self, session_id: &str) {
+        let session_arc = {
+            let guard = self.sessions.lock().await;
+            guard.get(session_id).cloned()
+        };
+        let Some(session_arc) = session_arc else {
+            return;
+        };
+        let task = session_arc.lock().await.turn_task.take();
+        if let Some(task) = task {
+            task.abort_and_settle().await;
+        }
+    }
+
+    // ── kata b8ke Task 6: the handoff runner's opencode entry points ────────
+
+    /// The handoff runner's PRIOR-stop entry point. Thin `handle_kill`-shaped
+    /// lane teardown for ONE session — NO coordinator stop (the runner owns
+    /// the in-flight `Handoff`), NO durable-row retire (the session CONTINUES
+    /// as the handoff's target kind), NO `freshAgent.killed` broadcast (the
+    /// pane transition is the client-side `session.runtimeOwner` fold,
+    /// Task 8), and NEVER a touch of the shared `opencode serve` daemon
+    /// (OpenCode invariant): the per-session turn task + serve-SSE bridge are
+    /// aborted and settled, the map keys (placeholder AND durable aliases of
+    /// the same Arc) are removed, and the lease binding is cleared. The
+    /// awaited turn-task settle IS the confirmed reap.
+    pub(crate) async fn opencode_kill_for_handoff(
+        &self,
+        session_id: &str,
+        initiator: &str,
+    ) -> crate::session_handoff::StopResult {
+        tracing::info!(target: "freshell_freshagent::opencode",
+            session_id = %session_id, initiator,
+            "freshagent.opencode.handoff_stop: stopping the prior freshopencode session for \
+             handoff (the shared serve is never touched)"
+        );
+        // The canonical stamp key: a durable `ses_*` directly; a placeholder
+        // resolves through the live session's real id (handle_kill's rule).
+        let session_arc = {
+            let guard = self.sessions.lock().await;
+            guard.get(session_id).cloned()
+        };
+        let canonical = if session_id.starts_with("ses_") {
+            Some(session_id.to_string())
+        } else {
+            match session_arc.as_ref() {
+                Some(arc) => arc.lock().await.real_session_id.clone(),
+                None => None,
+            }
+        };
+        if let Some(canonical) = canonical.as_deref() {
+            crate::ownership_lane::take_retained_stamp(
+                &self.fresh_agent.ownership_stamps,
+                canonical,
+            );
+        }
+        let Some(session_arc) = session_arc else {
+            // b8ke focused round-2 review R2-1: a cancelled earlier teardown
+            // may have left the condemned daemon-side turn unquiesced (the
+            // session is gone from the map but the accepted-turn abort never
+            // landed) — settle it through the condemned-session record
+            // before `AlreadyGone` is true. (Bind before the `if let`: the
+            // guard must never live across the await below.)
+            let condemned = self
+                .condemned_sessions
+                .lock()
+                .expect("condemned sessions lock")
+                .remove(session_id);
+            if let Some(condemned) = condemned {
+                self.abort_accepted_daemon_turn(
+                    session_id,
+                    &condemned.route,
+                    &condemned.daemon_turn_accepted,
+                )
+                .await;
+            }
+            // b8ke focused round-3 review R3-1: a REST-driven turn on this
+            // canonical id is STILL an in-flight writer the map never saw —
+            // quiesce it (condemn + abort the accepted daemon turn) before
+            // `AlreadyGone` is true. Pre-fix, the stop answered
+            // AlreadyGone/Reaped while the REST-driven daemon turn kept
+            // mutating the session.
+            self.quiesce_rest_opencode_turn(session_id).await;
+            return crate::session_handoff::StopResult::AlreadyGone;
+        };
+        let (turn_task, bridge, real, route, daemon_turn_accepted) = {
+            let mut s = session_arc.lock().await;
+            s.killed.store(true, Ordering::SeqCst);
+            (
+                s.turn_task.take(),
+                s.serve_bridge.take(),
+                s.real_session_id.clone(),
+                s.cwd.clone(),
+                s.daemon_turn_accepted.clone(),
+            )
+        };
+        // b8ke focused round-2 review R2-1: the condemned-session record —
+        // BEFORE the first await that a cancellation can land in (the map
+        // removal happens next, after which nothing else can reach this
+        // session's accepted daemon turn). The replacement watcher's
+        // probe re-issues the daemon-side abort through exactly this
+        // record; the confirmed end below clears it.
+        let condemn_key = real.clone().unwrap_or_else(|| session_id.to_string());
+        self.condemned_sessions
+            .lock()
+            .expect("condemned sessions lock")
+            .insert(
+                condemn_key.clone(),
+                CondemnedOpencodeSession {
+                    daemon_turn_accepted: daemon_turn_accepted.clone(),
+                    route: route.clone(),
+                },
+            );
+        // The map removal: its own short synchronous section (every key
+        // aliasing this Arc goes; the killed flag has gated sends).
+        {
+            let mut guard = self.sessions.lock().await;
+            guard.retain(|_, candidate| !Arc::ptr_eq(candidate, &session_arc));
+        }
+        // The settlement awaits (phase 5 of `handle_kill`): the turn task's
+        // abort + settle, then the daemon-side turn abort, then the
+        // serve-SSE bridge teardown.
+        if let Some(task) = turn_task {
+            task.abort_and_settle().await;
+        }
+        // b8ke focused review FR1: abort whenever the session has any
+        // ACCEPTED daemon-side turn — NOT only while the local task lives.
+        // A finished local `run_turn` can mean `IdleTimeout`: the local
+        // await gave up while the turn still executes INSIDE the shared
+        // daemon, and Reaped may only be reported once that turn is
+        // confirmed aborted/settled. Abort through the PEEKED manager at
+        // its CAPTURED base (never a `require_base` re-lookup, which could
+        // spawn a replacement daemon after the running entry disappeared),
+        // retrying transport failures — the runner's reap budget bounds the
+        // wait, and the shared daemon itself is NEVER killed or discarded
+        // (OpenCode invariant).
+        if daemon_turn_accepted.load(Ordering::SeqCst) {
+            if let Some(real) = real.as_deref() {
+                self.abort_accepted_daemon_turn(real, &route, &daemon_turn_accepted)
+                    .await;
+            }
+        }
+        // b8ke focused round-3 review R3-1: a REST-driven turn on the SAME
+        // canonical id is an in-flight writer this map never saw — quiesce
+        // it before the reap is reported (the confirmed end below is the
+        // whole canonical session's quiescence).
+        match real.as_deref().unwrap_or(session_id) {
+            canonical if canonical.starts_with("ses_") => {
+                self.quiesce_rest_opencode_turn(canonical).await;
+            }
+            _ => {}
+        }
+        if let Some(bridge) = bridge {
+            bridge.abort();
+        }
+        if let Some(real) = real.as_deref() {
+            self.leases.clear_binding(PROVIDER, real);
+        }
+        // Quiescence confirmed — the condemned-session record clears with
+        // it (b8ke focused round-2 R2-1).
+        self.condemned_sessions
+            .lock()
+            .expect("condemned sessions lock")
+            .remove(&condemn_key);
+        crate::session_handoff::StopResult::Reaped
+    }
+
+    /// b8ke focused round-2 review R2-1: the bounded quiescence probe for a
+    /// fenced freshopencode prior. A condemned-session record means an
+    /// `opencode_kill_for_handoff` was cancelled or panicked between arming
+    /// its record and settling the accepted daemon-side turn — this probe
+    /// re-issues the abort through the record (never spawning or killing
+    /// the shared daemon — OpenCode invariant) and confirms on its
+    /// settlement. A still-mapped session (the cancelled kill never reached
+    /// the map removal) instead gets the lane's own full teardown re-run —
+    /// its `Reaped` answer IS the confirmed quiescence. b8ke focused
+    /// round-3 review R3-1: a REST-driven turn witness is the same class
+    /// of un-settled daemon-side writer — quiescing it through the shared
+    /// registry IS the confirmation. Never confirms on less: `false`
+    /// keeps the fence held (fail-closed).
+    pub async fn confirm_fenced_prior_dead(&self, session_id: &str) -> bool {
+        if self.has_live_session(session_id).await {
+            return matches!(
+                self.opencode_kill_for_handoff(session_id, "handoff-watcher-replacement")
+                    .await,
+                crate::session_handoff::StopResult::Reaped
+            );
+        }
+        // Bind before the `if let`: the guard must never live across the
+        // abort await.
+        let condemned = self
+            .condemned_sessions
+            .lock()
+            .expect("condemned sessions lock")
+            .get(session_id)
+            .cloned();
+        if let Some(condemned) = condemned {
+            self.abort_accepted_daemon_turn(
+                session_id,
+                &condemned.route,
+                &condemned.daemon_turn_accepted,
+            )
+            .await;
+            self.condemned_sessions
+                .lock()
+                .expect("condemned sessions lock")
+                .remove(session_id);
+            return true;
+        }
+        // R3-1: a lingering REST-driven turn (a cancelled stop took no
+        // witness — or the drive armed after it) is the remaining
+        // daemon-side writer this lane can settle. R4-2: the [take +
+        // condemn + accepted read] runs under the session's
+        // dispatch/condemn gate, exactly like quiesce_rest_opencode_turn.
+        let rest_turn = {
+            let gate = self.fresh_agent.rest_turn_gate(session_id);
+            let _gate = gate.lock().await;
+            let rest_turn = self
+                .fresh_agent
+                .rest_opencode_turns
+                .lock()
+                .expect("rest opencode turns lock")
+                .remove(session_id);
+            let Some(rest_turn) = rest_turn else {
+                // b8ke e3r4 F3: the PID-less lane's kind-aware answer —
+                // the session map + the daemon-side witness registries are
+                // this runtime's WHOLE identity; holding NOTHING for the
+                // session means no per-session writer exists anywhere:
+                // CONFIRMED DEAD (pre-e3r4 this arm returned false, so a
+                // cancelled/panicked opencode stop could never recover
+                // through the probe — blocked until restart).
+                tracing::info!(target: "freshell_freshagent::opencode",
+                    session_id = %session_id,
+                    "opencode.confirm_fenced_prior_dead: the lane holds nothing for \
+                     the session — the PID-less runtime's whole identity is absent, \
+                     confirmed dead"
+                );
+                return true;
+            };
+            rest_turn.condemned.store(true, Ordering::SeqCst);
+            let accepted = rest_turn.daemon_turn_accepted.load(Ordering::SeqCst);
+            (rest_turn, accepted)
+        };
+        let (rest_turn, accepted) = rest_turn;
+        if accepted {
+            self.abort_accepted_daemon_turn(
+                session_id,
+                &rest_turn.route,
+                &rest_turn.daemon_turn_accepted,
+            )
+            .await;
+        }
+        true
+    }
+
+    /// b8ke focused round-3 review R3-1: quiesce the REST-driven turn
+    /// witness for a canonical durable `ses_*` id — the REST send-keys
+    /// participation half of every opencode lifecycle stop. The witness
+    /// entry is TAKEN from the shared registry and CONDEMNED (a drive
+    /// that has not dispatched yet refuses to), and an ACCEPTED daemon
+    /// turn is aborted to confirmed settlement through the PEEKED manager
+    /// at its CAPTURED base (never a `require_base` re-lookup — a stop
+    /// path must never spawn a daemon; the shared serve itself is NEVER
+    /// killed or discarded — OpenCode invariant). A witness that was never
+    /// armed (no accepted turn) settles immediately.
+    ///
+    /// b8ke focused round-4 review R4-2: the [take + condemn + accepted
+    /// read] runs UNDER the session's dispatch/condemn GATE (the same one
+    /// the REST drive holds across its [re-check + arming + prompt POST]
+    /// critical section) — the interleaving is total: either this stop
+    /// sees the drive's ARMED witness (the POST already issued; the abort
+    /// below confirms the daemon-side turn's death BEFORE the reap is
+    /// reported) or the condemnation lands first and the drive's own
+    /// re-check refuses the dispatch typed. The abort itself runs AFTER
+    /// the gate section: the drive has nothing left that could re-arm.
+    pub(crate) async fn quiesce_rest_opencode_turn(&self, canonical: &str) {
+        // Bind before the await: the guard must never live across it.
+        let witness = {
+            let gate = self.fresh_agent.rest_turn_gate(canonical);
+            let _gate = gate.lock().await;
+            let witness = self
+                .fresh_agent
+                .rest_opencode_turns
+                .lock()
+                .expect("rest opencode turns lock")
+                .remove(canonical);
+            let Some(witness) = witness else {
+                return;
+            };
+            witness.condemned.store(true, Ordering::SeqCst);
+            let accepted = witness.daemon_turn_accepted.load(Ordering::SeqCst);
+            (witness, accepted)
+        };
+        let (witness, accepted) = witness;
+        if accepted {
+            self.abort_accepted_daemon_turn(
+                canonical,
+                &witness.route,
+                &witness.daemon_turn_accepted,
+            )
+            .await;
+        }
+    }
+
+    /// Abort an ACCEPTED daemon-side turn to confirmed settlement (b8ke
+    /// focused review FR1) — the handoff stop path's quiescence step. The
+    /// abort is issued through the PEEKED manager at its READ-ONLY base
+    /// (the manager cell is never created here and `require_base` is never
+    /// consulted — a stop path must never spawn a daemon), and a transport
+    /// failure is NOT a reap: the abort is retried until the daemon
+    /// answers (the runner's reap timeout bounds the caller; the detached
+    /// watcher keeps this alive past it). Only a landed abort (a 2xx
+    /// answer), an observably absent daemon (no manager/no running entry),
+    /// or a provably-never-delivered abort against a dead listener settles
+    /// the acceptance. The shared daemon is never killed or discarded.
+    async fn abort_accepted_daemon_turn(
+        &self,
+        real: &str,
+        route: &Option<String>,
+        accepted: &Arc<AtomicBool>,
+    ) {
+        settle_accepted_daemon_turn(&self.fresh_agent, real, route, accepted).await
+    }
+
+    /// The handoff runner's TARGET-resume entry point —
+    /// [`Self::resume_durable_session`] in UNDER-TICKET mode (the runner
+    /// holds the claim and performs the ONE `commit_live`; this lane skips
+    /// both its own claim and its own commit) against the SHARED serve. The
+    /// `ses_*` id is unchanged by construction (serve-side resume only);
+    /// pid stays `None` (the shared serve is never the per-session writer —
+    /// OpenCode invariant).
+    pub(crate) async fn opencode_resume_for_handoff(
+        &self,
+        session_id: &str,
+        cwd: Option<&str>,
+        operation_id: &str,
+        generation: u64,
+    ) -> Result<(freshell_ownership::OwnerIdentity, OpencodeSessionHandle), (String, String)> {
+        match self
+            .resume_durable_session(
+                session_id,
+                cwd,
+                None,
+                None,
+                Some((operation_id, generation)),
+            )
+            .await
+        {
+            // ep2-r5: the under-ticket resume hands its committed session
+            // INSTANCE out with the identity — the runner's post-commit
+            // rescue re-check verifies this exact `Arc` against the map
+            // (a same-key replacement can never satisfy it).
+            Ok(session_arc) => Ok((
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some(session_id.to_string()),
+                    // OpenCode invariant: the shared serve daemon is not the
+                    // per-session writer — never a kill target, never the pid.
+                    pid: None,
+                    ownership_id: None,
+                },
+                OpencodeSessionHandle::new(session_arc),
+            )),
+            Err(ResumeOpencodeError::NotFound) => Err((
+                "opencode session not known to the shared serve".to_string(),
+                session_id.to_string(),
+            )),
+            Err(ResumeOpencodeError::Manager(err)) => {
+                Err(("opencode serve failure".to_string(), err.to_string()))
+            }
+            Err(ResumeOpencodeError::Reserved) => Err((
+                "opencode session reserved by another lifecycle operation".to_string(),
+                session_id.to_string(),
+            )),
+        }
+    }
+
     // ── freshAgent.kill (WS) ────────────────────────────────────────────────
 
     /// Handle a `freshAgent.kill` for opencode: remove the session's bookkeeping (both
@@ -1609,6 +2988,29 @@ impl FreshOpencodeState {
     /// child is reused by every session and torn down only by
     /// [`crate::FreshAgentState::shutdown`] at server shutdown.
     pub async fn handle_kill(&self, msg: FreshAgentKill) {
+        // b8ke delta review F7: a half-sent observed pair (exactly one of
+        // epoch/generation) is the typed invalid-fence refusal — BEFORE the
+        // durable close envelope, the enumeration gate, or any live-state
+        // mutation. The kill never proceeds as a silently downgraded legacy
+        // request.
+        let stop_fence =
+            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %msg.session_id, code = err.code(),
+                    "fresh_agent_kill_refused: the observed fence is half-sent (invalid)");
+                    self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                        provider: PROVIDER.to_string(),
+                        session_id: msg.session_id.clone(),
+                        session_type: SESSION_TYPE.to_string(),
+                        success: false,
+                        code: Some(err.code().to_string()),
+                        message: Some(err.message().to_string()),
+                    }));
+                    return;
+                }
+            };
         // Retire-on-kill close-durability rule (delta-r6): the durable close
         // — every row retire plus every pending-marker delete — is recorded
         // BEFORE any live-state mutation (map removal, the killed flag) and
@@ -1693,6 +3095,394 @@ impl FreshOpencodeState {
             }
         }
 
+        // b8ke delta round-3 F1: THE COORDINATOR CLAIM COMES FIRST —
+        // BEFORE the phase-2 durable close envelope. Pre-d3 the envelope
+        // retired the pane-ledger rows BEFORE this claim, so every typed
+        // refusal returned with the durable rows CLOSED although the
+        // runtime still ran. Now: the claim decides first; the envelope
+        // runs ONLY after the coordinator licenses the stop, and its
+        // Clean failure unwinds a GRANTED claim via `abort_stop`
+        // (Stopping → Live at the pre-stop generation). The claim is built
+        // from the lane's OWN retained stamp (pid `None` — the shared
+        // serve daemon is NEVER a kill target), resolved for the wire id
+        // (a durable `ses_*`) or through the live session's
+        // `real_session_id` (a placeholder-addressed kill).
+        // `NotLive{Vacant}`: the kill proceeds (idempotent lane cleanup)
+        // and skips the commit. NO retained stamp: the kill still CONSULTS
+        // the coordinator through an observed-owner claim — never a
+        // silent lane-local skip.
+        let mut stop_generation: Option<u64> = None;
+        let mut stop_op_id: Option<String> = None;
+        let mut stop_key: Option<String> = None;
+        // b8ke e3r1 F2: the granted claim's consumed stamp, captured for
+        // the abort path's restoration.
+        let mut taken_stop_stamp: Option<(String, crate::ownership_lane::OwnershipStamp)> = None;
+        // b8ke e3r3 F7: the granted stop's settlement guard.
+        let mut _stop_settlement: Option<crate::ownership_lane::StopSettlementGuard> = None;
+        if let Some(registry) = self.fresh_agent.ownership.as_ref() {
+            // Round-6 lock order (map guard NEVER held across a per-session
+            // lock wait): clone the Arc out under a short map section, drop
+            // the guard, THEN lock the session.
+            let session_arc = {
+                let guard = self.sessions.lock().await;
+                guard.get(&msg.session_id).cloned()
+            };
+            let canonical = if msg.session_id.starts_with("ses_") {
+                Some(msg.session_id.clone())
+            } else {
+                match session_arc.as_ref() {
+                    Some(arc) => arc.lock().await.real_session_id.clone(),
+                    None => None,
+                }
+            };
+            let stop_stamp = canonical.and_then(|id| {
+                crate::ownership_lane::peek_retained_stamp(&self.fresh_agent.ownership_stamps, &id)
+                    .map(|st| (id, st))
+            });
+            if let Some((stop_session_id, stamp)) = stop_stamp {
+                let claim = crate::ownership_lane::stop_claim_from_stamp(&stamp, stop_fence);
+                let kill_op_id = format!("kill-{}", uuid::Uuid::new_v4());
+                let stop_outcome = crate::ownership_lane::begin_fresh_agent_stop(
+                    registry,
+                    PROVIDER,
+                    &stop_session_id,
+                    &kill_op_id,
+                    &claim,
+                    "freshopencode/kill",
+                    crate::session_lease::now_epoch_ms(),
+                );
+                let refused = match stop_outcome {
+                    freshell_ownership::StopOutcome::Granted { generation } => {
+                        // e3r2 F2: Option-tolerant take — a concurrent exit
+                        // watcher can remove the stamp between the claim
+                        // and the take; an EXPECTED race, never a panic.
+                        taken_stop_stamp = crate::ownership_lane::take_retained_stamp(
+                            &self.fresh_agent.ownership_stamps,
+                            &stop_session_id,
+                        )
+                        .map(|st| (stop_session_id.clone(), st));
+                        if taken_stop_stamp.is_none() {
+                            tracing::warn!(target: "freshell_freshagent::opencode",
+                                session_id = %stop_session_id,
+                                "fresh_agent_kill_stamp_raced: the exit watcher removed the \
+                                 stamp between the stop claim and the take — the kill proceeds \
+                                 coherently under the held claim (never a panic)"
+                            );
+                        }
+                        stop_generation = Some(generation);
+                        stop_op_id = Some(kill_op_id.clone());
+                        stop_key = Some(stop_session_id.clone());
+                        _stop_settlement =
+                            Some(crate::ownership_lane::register_stop_settlement_for_claim(
+                                &self.fresh_agent.ownership,
+                                PROVIDER,
+                                &stop_session_id,
+                                &kill_op_id,
+                                generation,
+                            ));
+                        None
+                    }
+                    freshell_ownership::StopOutcome::NotLive {
+                        state: freshell_ownership::OwnershipState::Vacant,
+                    } => {
+                        crate::ownership_lane::take_retained_stamp(
+                            &self.fresh_agent.ownership_stamps,
+                            &stop_session_id,
+                        );
+                        None
+                    }
+                    freshell_ownership::StopOutcome::NotLive { ref state } => Some((
+                        "LIFECYCLE_IN_FLIGHT",
+                        format!(
+                            "a lifecycle operation is in flight ({state:?}); retry after it settles"
+                        ),
+                    )),
+                    freshell_ownership::StopOutcome::BlockedHandoff { .. } => Some((
+                        "HANDOFF_IN_FLIGHT",
+                        "a handoff owns this session's transition; retry after it settles"
+                            .to_string(),
+                    )),
+                    freshell_ownership::StopOutcome::StaleClaim { .. } => Some((
+                        "STALE_CLAIM",
+                        "ownership moved to a newer runtime; refresh and retry".to_string(),
+                    )),
+                };
+                if let Some((refusal_code, refusal_message)) = refused {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %msg.session_id, outcome = ?stop_outcome,
+                        "fresh_agent_kill_refused: the ownership coordinator refused the \
+                         stop (kata b8ke) — nothing is killed"
+                    );
+                    // Task 3 review I-1: the refusal killed NOTHING, so it
+                    // must roll the pre-kill enumeration gate back exactly
+                    // like the Clean-failure abort arm above — a held gate
+                    // bricks every subsequent `freshAgent.send` with
+                    // SESSION_NOT_FOUND (the send gate refuses while
+                    // `close_pending > 0`), and the refusal's own
+                    // "retry after it settles" message promises a
+                    // retryable, fully operational session.
+                    if let Some(session_arc) = &session_arc {
+                        let mut s = session_arc.lock().await;
+                        s.close_pending = s.close_pending.saturating_sub(1);
+                    }
+                    self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                        provider: PROVIDER.to_string(),
+                        session_id: msg.session_id,
+                        session_type: SESSION_TYPE.to_string(),
+                        success: false,
+                        code: Some(refusal_code.to_string()),
+                        message: Some(refusal_message),
+                    }));
+                    return;
+                }
+            } else {
+                // b8ke delta round-3 F1: NO retained stamp — the kill STILL
+                // consults the coordinator through an observed-owner claim
+                // (never a silent lane-local skip); a refusal answers typed
+                // with the ledger bound.
+                // b8ke e3r2 F1: observe the CANONICAL durable id — the
+                // noncanonical wire id (a placeholder) can hold no
+                // coordinator record, which made every state read as
+                // Vacant and licensed the wildcard proceed.
+                let canonical_observed = match session_arc.as_ref() {
+                    Some(arc) => arc.lock().await.real_session_id.clone(),
+                    None => None,
+                }
+                .unwrap_or_else(|| msg.session_id.clone());
+                let snap = registry.observe(PROVIDER, &canonical_observed);
+                match snap.state.clone() {
+                    freshell_ownership::OwnershipState::Live {
+                        owner, generation, ..
+                    } => {
+                        // b8ke e3r1 F1: the fallback authorizes ONLY THIS
+                        // LANE'S runtime — a foreign-kind live owner (a
+                        // completed handoff's terminal) is refused typed,
+                        // never fabricated into a claim; the request's
+                        // fence is honored.
+                        if owner.kind != freshell_ownership::RuntimeOwnerKind::FreshAgent {
+                            tracing::warn!(target: "freshell_freshagent::opencode",
+                                session_id = %msg.session_id, observed_kind = ?owner.kind,
+                                "fresh_agent_kill_refused_no_stamp: the coordinator's live \
+                                 owner is NOT this lane's Fresh Agent runtime — a delayed \
+                                 kill never fabricates a foreign-kind claim"
+                            );
+                            if let Some(session_arc) = &session_arc {
+                                let mut s = session_arc.lock().await;
+                                s.close_pending = s.close_pending.saturating_sub(1);
+                            }
+                            self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                                provider: PROVIDER.to_string(),
+                                session_id: msg.session_id,
+                                session_type: SESSION_TYPE.to_string(),
+                                success: false,
+                                code: Some("FOREIGN_OWNER".to_string()),
+                                message: Some(
+                                    "the session's live owner is not this agent runtime; \
+                                     refresh and retry"
+                                        .to_string(),
+                                ),
+                            }));
+                            return;
+                        }
+                        let claim = freshell_ownership::StopClaim {
+                            expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                            expected_runtime: Some(owner.clone()),
+                            observed: stop_fence.unwrap_or(freshell_ownership::ObservedFence {
+                                epoch: snap.epoch,
+                                generation,
+                            }),
+                        };
+                        let kill_op_id = format!("kill-{}", uuid::Uuid::new_v4());
+                        // b8ke e3r3 F1: observe, claim, and stop on the SAME
+                        // CANONICAL key (canonical_observed). Pre-e3r3 the
+                        // claim ran against the WIRE id (msg.session_id): a
+                        // placeholder-addressed materialized session observed
+                        // the durable Live owner, claimed the VACANT
+                        // placeholder, tore down both map aliases, and never
+                        // committed the stop against the canonical record —
+                        // a successful kill while the registry still showed
+                        // the runtime Live.
+                        let stop_outcome = crate::ownership_lane::begin_fresh_agent_stop(
+                            registry,
+                            PROVIDER,
+                            &canonical_observed,
+                            &kill_op_id,
+                            &claim,
+                            "freshopencode/kill",
+                            crate::session_lease::now_epoch_ms(),
+                        );
+                        match stop_outcome {
+                            freshell_ownership::StopOutcome::Granted { generation } => {
+                                stop_generation = Some(generation);
+                                stop_op_id = Some(kill_op_id.clone());
+                                stop_key = Some(canonical_observed.clone());
+                                // b8ke e3r4 F1: the same stop bookkeeping
+                                // as the stamp-present path — the
+                                // settlement guard + rollback evidence
+                                // (a synthesized stamp from the OBSERVED
+                                // owner; opencode's owner pid is None —
+                                // the shared daemon — so the unwind's
+                                // atomic restore treats an unprobeable
+                                // stamp as live by policy, and the
+                                // registry follows).
+                                // b8ke e3 post-cap F1: the rollback stamp
+                                // mirrors what abort_stop restores — the
+                                // ORIGINAL owner identity at the PRE-stop
+                                // Live generation with the owner's own
+                                // ownership_id.
+                                taken_stop_stamp = Some((
+                                    canonical_observed.clone(),
+                                    crate::ownership_lane::OwnershipStamp {
+                                        epoch: registry.boot_epoch(),
+                                        generation,
+                                        operation_id: owner
+                                            .ownership_id
+                                            .clone()
+                                            .unwrap_or_default(),
+                                        owner: owner.clone(),
+                                    },
+                                ));
+                                _stop_settlement = Some(
+                                    crate::ownership_lane::register_stop_settlement_for_claim(
+                                        &self.fresh_agent.ownership,
+                                        PROVIDER,
+                                        &canonical_observed,
+                                        &kill_op_id,
+                                        generation,
+                                    ),
+                                );
+                            }
+                            freshell_ownership::StopOutcome::NotLive {
+                                state: freshell_ownership::OwnershipState::Vacant,
+                            } => {}
+                            other => {
+                                let (refusal_code, refusal_message) = match &other {
+                                    freshell_ownership::StopOutcome::NotLive { state } => (
+                                        "LIFECYCLE_IN_FLIGHT",
+                                        format!(
+                                            "a lifecycle operation is in flight ({state:?}); \
+                                             retry after it settles"
+                                        ),
+                                    ),
+                                    freshell_ownership::StopOutcome::BlockedHandoff { .. } => (
+                                        "HANDOFF_IN_FLIGHT",
+                                        "a handoff owns this session's transition; \
+                                         retry after it settles"
+                                            .to_string(),
+                                    ),
+                                    _ => (
+                                        "STALE_CLAIM",
+                                        "ownership moved to a newer runtime; \
+                                         refresh and retry"
+                                            .to_string(),
+                                    ),
+                                };
+                                tracing::warn!(target: "freshell_freshagent::opencode",
+                                    session_id = %msg.session_id, outcome = ?other,
+                                    "fresh_agent_kill_refused_no_stamp: the ownership \
+                                     coordinator refused the observed-owner stop — nothing \
+                                     is killed, nothing durable is touched"
+                                );
+                                if let Some(session_arc) = &session_arc {
+                                    let mut s = session_arc.lock().await;
+                                    s.close_pending = s.close_pending.saturating_sub(1);
+                                }
+                                self.broadcast(&ServerMessage::FreshAgentKilled(
+                                    FreshAgentKilled {
+                                        provider: PROVIDER.to_string(),
+                                        session_id: msg.session_id,
+                                        session_type: SESSION_TYPE.to_string(),
+                                        success: false,
+                                        code: Some(refusal_code.to_string()),
+                                        message: Some(refusal_message),
+                                    },
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                    freshell_ownership::OwnershipState::Handoff { .. } => {
+                        // b8ke e3r2 F1: a HANDOFF owns the transition — the
+                        // concurrent/delayed kill answers the TYPED
+                        // in-flight refusal.
+                        tracing::warn!(target: "freshell_freshagent::opencode",
+                            session_id = %msg.session_id,
+                            "fresh_agent_kill_refused_no_stamp: a handoff owns this \
+                             session's transition — the kill is refused typed"
+                        );
+                        if let Some(session_arc) = &session_arc {
+                            let mut s = session_arc.lock().await;
+                            s.close_pending = s.close_pending.saturating_sub(1);
+                        }
+                        self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                            provider: PROVIDER.to_string(),
+                            session_id: msg.session_id,
+                            session_type: SESSION_TYPE.to_string(),
+                            success: false,
+                            code: Some("HANDOFF_IN_FLIGHT".to_string()),
+                            message: Some(
+                                "a handoff owns this session's transition; retry after it settles"
+                                    .to_string(),
+                            ),
+                        }));
+                        return;
+                    }
+                    freshell_ownership::OwnershipState::Starting { .. }
+                    | freshell_ownership::OwnershipState::Stopping { .. } => {
+                        tracing::warn!(target: "freshell_freshagent::opencode",
+                            session_id = %msg.session_id, state = ?snap.state,
+                            "fresh_agent_kill_refused_no_stamp: a lifecycle operation is \
+                             in flight — the kill is refused typed"
+                        );
+                        if let Some(session_arc) = &session_arc {
+                            let mut s = session_arc.lock().await;
+                            s.close_pending = s.close_pending.saturating_sub(1);
+                        }
+                        self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                            provider: PROVIDER.to_string(),
+                            session_id: msg.session_id,
+                            session_type: SESSION_TYPE.to_string(),
+                            success: false,
+                            code: Some("LIFECYCLE_IN_FLIGHT".to_string()),
+                            message: Some(
+                                "a lifecycle operation is in flight; retry after it settles"
+                                    .to_string(),
+                            ),
+                        }));
+                        return;
+                    }
+                    freshell_ownership::OwnershipState::Fenced { .. } => {
+                        tracing::warn!(target: "freshell_freshagent::opencode",
+                            session_id = %msg.session_id, state = ?snap.state,
+                            "fresh_agent_kill_refused_no_stamp: the key is FENCED — the \
+                             kill is refused typed"
+                        );
+                        if let Some(session_arc) = &session_arc {
+                            let mut s = session_arc.lock().await;
+                            s.close_pending = s.close_pending.saturating_sub(1);
+                        }
+                        self.broadcast(&ServerMessage::FreshAgentKilled(FreshAgentKilled {
+                            provider: PROVIDER.to_string(),
+                            session_id: msg.session_id,
+                            session_type: SESSION_TYPE.to_string(),
+                            success: false,
+                            code: Some("SESSION_FENCED".to_string()),
+                            message: Some(
+                                "the session is fenced pending recovery; retry with the \
+                                 acknowledged force-clear or after the fence clears"
+                                    .to_string(),
+                            ),
+                        }));
+                        return;
+                    }
+                    _ => {
+                        // Genuinely Vacant (or residue): lane-local cleanup
+                        // proceeds — the coordinator holds nothing to stop.
+                    }
+                }
+            }
+        }
+
         // Phase 2 — THE durable close: ONE failure-atomic envelope over the
         // COMPLETE identity set plus the pending markers
         // (`retire_closed_batch` → `PaneLedger::close_identities`,
@@ -1746,6 +3536,81 @@ impl FreshOpencodeState {
                         // first: the session is resumable exactly as if the
                         // kill never ran (F6: no placeholder close stands to
                         // roll back — the one envelope landed nothing).
+                        // b8ke e3r2 F4 + e3r3 F2/F8: THE LIVENESS
+                        // VERDICT COMES FIRST — exactly ONE mutation path
+                        // follows. LIVE → abort_stop + the atomic-if-live
+                        // stamp restore; EXITED during the awaited close →
+                        // commit_stop (Vacant), never a dead runtime
+                        // recorded Live. The verdict+restore is ATOMIC
+                        // w.r.t. the exit watcher (the recorded incarnation
+                        // is re-validated under the stamps lock at restore
+                        // time).
+                        // b8ke e3r3 F2/F8: THE ATOMIC VERDICT PRECEDES
+                        // the registry mutation (probe+restore under the
+                        // stamps lock; the restore's verdict drives the
+                        // registry — restored/live → abort_stop; refused/
+                        // dead → commit_stop/Vacant, never a dead runtime
+                        // recorded Live). opencode's shared daemon has no
+                        // per-session pid: a None-pid stamp restores by
+                        // default (the daemon handle is managed
+                        // separately).
+                        let restored_live_stamp = taken_stop_stamp
+                            .clone()
+                            .map(|(stamp_key, stamp)| {
+                                crate::ownership_lane::restore_retained_stamp_if_live(
+                                    &self.fresh_agent.ownership_stamps,
+                                    &stamp_key,
+                                    stamp,
+                                    true,
+                                )
+                            })
+                            .unwrap_or(false);
+                        if let (Some(key), Some(op_id), Some(generation)) =
+                            (stop_key.clone(), stop_op_id.clone(), stop_generation)
+                        {
+                            if let Some(registry) = self.fresh_agent.ownership.as_ref() {
+                                if restored_live_stamp {
+                                    let _ = registry.abort_stop(PROVIDER, &key, &op_id, generation);
+                                } else {
+                                    tracing::warn!(target: "freshell_freshagent::opencode",
+                                        session_id = %key,
+                                        "fresh_agent_kill_abort_runtime_exited: the runtime \
+                                         exited during the awaited close — NOT restored; the \
+                                         key ends Vacant"
+                                    );
+                                    let outcome =
+                                        registry.commit_stop(PROVIDER, &key, &op_id, generation);
+                                    // b8ke ext r18 F1: the successful
+                                    // commit-to-Vacant BROADCASTS the
+                                    // release frame (every commit site, not
+                                    // only the main kill arm).
+                                    if matches!(
+                                        outcome,
+                                        freshell_ownership::CommitOutcome::Committed
+                                    ) {
+                                        if let Some(frame) =
+                                            crate::ownership_lane::released_owner_frame(
+                                                &self.fresh_agent.ownership,
+                                                PROVIDER,
+                                                &key,
+                                                &op_id,
+                                                // b8ke ext r32 F2: the
+                                                // COMMITTED transition's
+                                                // own pair — never a
+                                                // re-observed generation.
+                                                registry.boot_epoch(),
+                                                generation,
+                                            )
+                                        {
+                                            self.broadcast(&frame);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Release the enumeration gate (the abort leaves
+                        // the session resumable exactly as if the kill never
+                        // ran — F6: the one envelope landed nothing).
                         if let Some(session_arc) = &session_arc {
                             let mut s = session_arc.lock().await;
                             s.close_pending = s.close_pending.saturating_sub(1);
@@ -1755,6 +3620,11 @@ impl FreshOpencodeState {
                             session_id: msg.session_id,
                             session_type: SESSION_TYPE.to_string(),
                             success: false,
+                            code: Some("DURABLE_CLOSE_FAILED".to_string()),
+                            message: Some(
+                                "the pane-ledger close failed; nothing was killed — retry"
+                                    .to_string(),
+                            ),
                         }));
                         return;
                     }
@@ -1774,7 +3644,7 @@ impl FreshOpencodeState {
         // still be caught loud (the invariant probe below) and the kill
         // would answer failure — never masquerade a broken gate as success.
         if let Some(session_arc) = &session_arc {
-            let (turn_task, bridge, real, strays) = {
+            let (turn_task, bridge, real, strays, daemon_turn_accepted, route) = {
                 let mut s = session_arc.lock().await;
                 let strays: Vec<String> = s
                     .real_session_id
@@ -1788,6 +3658,13 @@ impl FreshOpencodeState {
                     s.serve_bridge.take(),
                     s.real_session_id.clone(),
                     strays,
+                    // b8ke focused round-3 R3-2: the accepted-daemon-turn
+                    // witness rides the same extraction — the kill must
+                    // quiesce the daemon-side turn (the per-session
+                    // /abort), exactly like interrupt/handoff, before
+                    // declaring the reap confirmed.
+                    s.daemon_turn_accepted.clone(),
+                    s.cwd.clone(),
                 )
             };
             // DEFENSIVE invariant probe (F6, must never fire): an identity
@@ -1815,6 +3692,27 @@ impl FreshOpencodeState {
                 }
             }
 
+            // b8ke e3 post-cap F2: RETAIN THE WITNESS BEFORE the map
+            // removal — the accepted-daemon-turn witness (the
+            // condemned-session record) enters the shared registry HERE,
+            // so a kill task dying between the map removal and its
+            // phase-5 daemon-turn abort leaves the evidence the probe
+            // (confirm_fenced_prior_dead) needs to settle the turn and
+            // confirm. Pre-post-cap the witness lived only in this task's
+            // locals: a dying kill left the probe seeing bare map
+            // absence (releasing to Vacant while the old daemon turn
+            // could still write) or bare map presence (an unrecoverable
+            // fence when the kill died before removal).
+            if let Some(real_id) = real.as_deref() {
+                self.condemned_sessions
+                    .lock()
+                    .expect("condemned sessions lock")
+                    .entry(real_id.to_string())
+                    .or_insert_with(|| CondemnedOpencodeSession {
+                        daemon_turn_accepted: daemon_turn_accepted.clone(),
+                        route: route.clone(),
+                    });
+            }
             // Phase 4 — the map removal, its own short synchronous section
             // (every key aliasing this Arc goes; the killed flag has gated
             // sends since phase 3, so no new key can appear for it).
@@ -1829,6 +3727,45 @@ impl FreshOpencodeState {
                 // ep4-r6 F2: join + await the compact's pre-drive-redo settle
                 // before the kill answers — the compensation must have landed.
                 task.abort_and_settle().await;
+            }
+            // b8ke focused round-3 R3-2: abort whenever the session has any
+            // ACCEPTED daemon-side turn — NOT only while the local task
+            // lives (a finished local `run_turn` can mean IdleTimeout: the
+            // turn still executes INSIDE the shared daemon, and Reaped may
+            // only be reported — the stop committed — once that turn is
+            // confirmed aborted/settled). Same discipline as
+            // `handle_interrupt`/`opencode_kill_for_handoff`; the shared
+            // serve itself is NEVER killed (OpenCode invariant).
+            if daemon_turn_accepted.load(Ordering::SeqCst) {
+                if let Some(real) = real.as_deref() {
+                    self.abort_accepted_daemon_turn(real, &route, &daemon_turn_accepted)
+                        .await;
+                    // The kill SURVIVED its own abort — the retained
+                    // witness clears (it exists only for a dying kill).
+                    self.condemned_sessions
+                        .lock()
+                        .expect("condemned sessions lock")
+                        .remove(real);
+                }
+            } else if let Some(real) = real.as_deref() {
+                // No accepted turn: the witness was retained defensively —
+                // clear it so it cannot outlive the completed kill.
+                self.condemned_sessions
+                    .lock()
+                    .expect("condemned sessions lock")
+                    .remove(real);
+            }
+            // b8ke focused round-3 R3-1: a REST-driven turn on the SAME
+            // canonical id is an in-flight writer the WS session map never
+            // saw — the kill's reap confirmation covers it too (condemn +
+            // abort the accepted daemon turn before the stop commits).
+            let canonical_for_rest: Option<&str> = match real.as_deref() {
+                Some(id) if id.starts_with("ses_") => Some(id),
+                _ if msg.session_id.starts_with("ses_") => Some(msg.session_id.as_str()),
+                _ => None,
+            };
+            if let Some(canonical) = canonical_for_rest {
+                self.quiesce_rest_opencode_turn(canonical).await;
             }
             // PR-3: stop the persistent serve-SSE bridge too (`unsubscribeServe?.()`,
             // adapter.ts:568) so it doesn't keep broadcasting for a dead session.
@@ -1850,6 +3787,41 @@ impl FreshOpencodeState {
             .clear_for_session(|record| record.placeholder_id == msg.session_id)
             .await;
 
+        // kata b8ke Task 3: the settlement awaits (phase 5 — the turn task
+        // abort + the serve-SSE bridge teardown) are done, i.e. the reap is
+        // confirmed — commit the stop (Stopping → Vacant). NEVER before the
+        // reap (round-1 review). The shared `opencode serve` daemon was
+        // never touched (OpenCode invariant).
+        if let (Some(registry), Some(generation), Some(op_id), Some(key)) = (
+            self.fresh_agent.ownership.as_ref(),
+            stop_generation,
+            stop_op_id.as_deref(),
+            stop_key.as_deref(),
+        ) {
+            let outcome = crate::ownership_lane::commit_fresh_agent_stop(
+                registry, PROVIDER, key, op_id, generation,
+            );
+            // b8ke ext r18 F1: a SUCCESSFUL commit-to-Vacant BROADCASTS
+            // the release frame — connected panes and the kill →
+            // immediate recreate sequence converge on the vacant owner
+            // and the NEW generation (the shared `opencode serve`
+            // daemon is untouched — the OpenCode invariant).
+            if matches!(outcome, freshell_ownership::CommitOutcome::Committed) {
+                if let Some(frame) = crate::ownership_lane::released_owner_frame(
+                    &self.fresh_agent.ownership,
+                    PROVIDER,
+                    key,
+                    op_id,
+                    // b8ke ext r32 F2: the COMMITTED transition's own
+                    // pair — never a re-observed generation.
+                    registry.boot_epoch(),
+                    generation,
+                ) {
+                    self.broadcast(&frame);
+                }
+            }
+        }
+
         // `adapter.ts kill()` is unconditional (`return true` even for an
         // already-removed/unknown session) — idempotent, matching the codex/claude
         // `freshAgent.killed{success:true}` pattern. Every durable-close
@@ -1864,6 +3836,8 @@ impl FreshOpencodeState {
             session_id: msg.session_id,
             session_type: SESSION_TYPE.to_string(),
             success: !close_reported_failure && !close_invariant_broken,
+            code: None,
+            message: None,
         }));
     }
 
@@ -1886,7 +3860,7 @@ impl FreshOpencodeState {
             return;
         };
 
-        let (real_id, route, turn_aborted) = {
+        let (real_id, route, turn_aborted, daemon_turn_accepted) = {
             let mut session = session_arc.lock().await;
             session.turn_aborted.store(true, Ordering::SeqCst);
             if let Some(task) = session.turn_task.take() {
@@ -1898,6 +3872,7 @@ impl FreshOpencodeState {
                 session.real_session_id.clone(),
                 session.cwd.clone(),
                 session.turn_aborted.clone(),
+                session.daemon_turn_accepted.clone(),
             )
         };
 
@@ -1914,6 +3889,10 @@ impl FreshOpencodeState {
         let manager = self.fresh_agent.ensure_manager().await;
         match manager.abort(&real_id, &route).await {
             Ok(()) => {
+                // b8ke focused FR1: the daemon answered the abort — the
+                // daemon-side turn is settled; disarm the acceptance so a
+                // later handoff stop does not issue a redundant abort.
+                daemon_turn_accepted.store(false, Ordering::SeqCst);
                 self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
             }
             Err(_) => {
@@ -1994,6 +3973,25 @@ impl FreshOpencodeState {
     /// Markers survive regardless (decision 6).
     pub async fn handle_compact(&self, msg: FreshAgentCompact) {
         let session_id = msg.session_id.clone();
+        // b8ke ext r29 F2: the compact's delayed-request fence (the wire's
+        // additive observedEpoch/observedGeneration pair — parity with
+        // send/attach/kill): a half-sent pair is the typed INVALID_FENCE
+        // refusal BEFORE any state interaction (the F7 discipline).
+        let compact_fence =
+            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %session_id, code = err.code(),
+                        "fresh_agent_compact_refused: the observed fence is half-sent (invalid)");
+                    self.emit_fresh_agent_error(&session_id, err.code(), err.message());
+                    return;
+                }
+            };
+        // Task 4: arm the runtime's daemon-loss watcher (idempotent — the
+        // fence parse above stays the FIRST interaction, so a typed refusal
+        // still mutates nothing).
+        self.ensure_daemon_loss_watcher().await;
         let session_arc = {
             let guard = self.sessions.lock().await;
             guard.get(&session_id).cloned()
@@ -2040,6 +4038,47 @@ impl FreshOpencodeState {
             return;
         }
 
+        // b8ke ext r29 F2 + focused ep5 r1 F1: the coordinator-backed OP
+        // GUARD — the reclaim-less lane's decision point (BEFORE the redo
+        // destroy, the running-status broadcast, or the summarize POST).
+        // The ext-r29 snapshot consult verified only the pair; the guard
+        // now ARMS the coordinator's attach guard on the real (durable)
+        // id and HOLDS it across the whole mutation window: a compact
+        // whose supplied pair predates the CURRENT record answers the
+        // typed stale refusal (never mutating newer history), a
+        // lifecycle transition already owning the key refuses typed,
+        // a terminal-owned key refuses typed, and a handoff arriving
+        // AFTER the arm answers the coordinator's typed Blocked until
+        // the guard releases — the check-then-act window does not
+        // exist. An unfenced request against a Live{FreshAgent} key is
+        // the typed FENCE_REQUIRED refusal (ep5 r4 F2 — an unfenced
+        // history mutation can never be told apart from a current one, so
+        // it never arms); every other state still routes through the same
+        // guard with the coordinator's current pair. The guard moves into
+        // the detached drive below and releases once the summarize POST is
+        // answered (the provider mutation is done; the await-idle tail
+        // is read-only and stays quiesceable through the existing
+        // abort machinery).
+        let op_guard = match crate::ownership_lane::arm_reclaimless_op_guard(
+            &self.fresh_agent.ownership,
+            PROVIDER,
+            &real_id,
+            &format!("compact-{}", uuid::Uuid::new_v4()),
+            compact_fence,
+            "freshopencode/compact",
+        ) {
+            crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
+            crate::ownership_lane::LaneOpGuard::Unwired => None,
+            crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %session_id, real_id = %real_id,
+                    "fresh_agent_compact_refused: the op guard refused to arm");
+                drop(session);
+                self.emit_fresh_agent_error(&session_id, "SESSION_RESERVED", &message);
+                return;
+            }
+        };
+
         // adapter.ts:360-361 — FIRST: a fresh compact starts un-aborted/un-errored.
         session.turn_aborted.store(false, Ordering::SeqCst);
         session.turn_errored.store(false, Ordering::SeqCst);
@@ -2048,6 +4087,13 @@ impl FreshOpencodeState {
         let turn_aborted = session.turn_aborted.clone();
         let turn_errored = session.turn_errored.clone();
         let last_turn_complete_at = session.last_turn_complete_at.clone();
+        // b8ke focused round-2 review R2-5: the compact is a first-class
+        // accepted daemon-side operation — it arms the SAME
+        // `daemon_turn_accepted` witness the send drive arms, at the SAME
+        // dispatch boundary (inside the summarize POST's request leg), so a
+        // handoff landing mid-compaction quiesces the daemon-side
+        // summarization through the abort before reporting Reaped.
+        let daemon_turn_accepted = session.daemon_turn_accepted.clone();
 
         // adapter.ts:362 `emitStatus(state, 'running')` — BEFORE the upstream request.
         self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "running")));
@@ -2159,17 +4205,62 @@ impl FreshOpencodeState {
             settled_tx: Some(compact_settled_tx),
         };
         let collected_witness = summarize_dispatched.clone();
+        let compact_accepted_witness = daemon_turn_accepted.clone();
         let compact_task = tokio::spawn(async move {
-            let result = match manager
-                .compact(
-                    &compact_id,
-                    &model_pair.provider_id,
-                    &model_pair.model_id,
-                    &route,
-                    Some(collected_witness),
-                )
-                .await
-            {
+            // b8ke focused ep5 r1 F1: the op guard moved INTO the drive
+            // (the same constructed-outside-moved-in discipline as
+            // `undo_guard`): a never-started future still drops it, and
+            // the guard releases the moment the summarize POST is
+            // ANSWERED — the provider mutation is done there. The
+            // await-idle/settle tail is read-only polling and stays
+            // quiesceable through the existing abort machinery.
+            let mut op_guard = op_guard;
+            // b8ke focused ep5 r1 F1: the guard releases at the DISPATCH
+            // boundary — the moment the summarize POST's request leg runs
+            // (the `summarize_dispatched` witness fires inside it), NOT
+            // at the POST's answer. Rationale: the dispatch is the
+            // mutation's point of no return — pre-dispatch, a handoff
+            // arriving in the arm→dispatch window would advance the
+            // generation while the operation still mutates history (the
+            // check-then-act window this guard closes); POST-dispatch,
+            // the reviewed R2-5 abort machinery owns the window — a
+            // handoff landing mid-summarize ABORTS the daemon-side work
+            // before the reap (the quiesce contract
+            // `opencode_handoff_during_compaction_aborts_the_daemon_side_
+            // summarize` pins). The select races the dispatch witness
+            // against the POST: whichever resolves first drops the guard
+            // exactly once (a fast answered POST, a never-dispatched
+            // failure, or the dispatch boundary itself).
+            let dispatch_witness = collected_witness.clone();
+            let mut compact_fut = Box::pin(manager.compact(
+                &compact_id,
+                &model_pair.provider_id,
+                &model_pair.model_id,
+                &route,
+                Some(collected_witness),
+                Some(compact_accepted_witness),
+            ));
+            let mut released_at_dispatch = Box::pin(async {
+                loop {
+                    if dispatch_witness.load(std::sync::atomic::Ordering::SeqCst) {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            });
+            let compact_result = tokio::select! {
+                _ = &mut released_at_dispatch => {
+                    drop(op_guard.take());
+                    compact_fut.as_mut().await
+                }
+                result = compact_fut.as_mut() => result,
+            };
+            // Release the futures' borrows (the boxed compact future holds
+            // `&route`; the match below MOVES route into await_idle).
+            drop(compact_fut);
+            drop(released_at_dispatch);
+            drop(op_guard.take());
+            let result = match compact_result {
                 Ok(()) => {
                     // The 2xx landed — the reverted tail is genuinely deleted
                     // and the PRE-DRIVE destroy already retired redo (F4);
@@ -2224,6 +4315,21 @@ impl FreshOpencodeState {
             // unconditionally + the gated chime); a serve error additionally surfaces
             // loudly (the SAME nested envelope `emit_fresh_agent_error` builds) and
             // never produces a false turn-complete.
+            //
+            // b8ke focused round-2 review R2-5: the accepted-daemon-operation
+            // witness settles with the SAME discipline the send drive uses —
+            // the idle edge was observed (or the daemon itself is gone:
+            // nothing runs daemon-side) ⇒ the acceptance is settled; any
+            // other error is ambiguous ⇒ the flag STAYS armed (fail closed:
+            // a later handoff would rather issue one redundant abort than
+            // miss live daemon-side work). An ABORT of this task never
+            // reaches here at all — the flag stays armed for the stop path.
+            match &result {
+                Ok(()) | Err(ServeError::SidecarLost { .. }) => {
+                    daemon_turn_accepted.store(false, Ordering::SeqCst);
+                }
+                Err(_) => {}
+            }
             let succeeded = result.is_ok();
             settle_turn_outcome(
                 &fresh_agent,
@@ -2316,6 +4422,34 @@ impl FreshOpencodeState {
             return;
         };
 
+        // b8ke ext r29 F2: the fork's delayed-request fence (the wire's
+        // additive observedEpoch/observedGeneration pair — parity with
+        // send/attach/kill): a half-sent pair is the typed INVALID_FENCE
+        // refusal BEFORE any state interaction (the F7 discipline); a
+        // whole pair is consulted against the PARENT's current record at
+        // the decision point below AND threads into the provisional
+        // child's claim (never `None` — a pre-restart-epoch fork can never
+        // mint a child past the fence).
+        let fork_fence =
+            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %msg.session_id, code = err.code(),
+                        "fresh_agent_fork_refused: the observed fence is half-sent (invalid)");
+                    reply_sink(event_frame(
+                        &msg.session_id,
+                        json!({
+                            "type": "freshAgent.error",
+                            "sessionId": msg.session_id,
+                            "code": err.code(),
+                            "message": err.message(),
+                        }),
+                    ));
+                    return;
+                }
+            };
+
         let session_arc = {
             let guard = self.sessions.lock().await;
             guard.get(&msg.session_id).cloned()
@@ -2367,6 +4501,53 @@ impl FreshOpencodeState {
             )
         };
 
+        // b8ke ext r29 F2 + focused ep5 r1 F1: the coordinator-backed OP
+        // GUARD — the reclaim-less lane's decision point (BEFORE the
+        // provisional child's claim, the fork POST, or any provider
+        // mutation). The ext-r29 snapshot consult verified only the
+        // pair; the guard now ARMS the coordinator's attach guard on
+        // the real (durable) id — the canonical coordinator key — and
+        // HOLDS it across the whole fork window (the child claim, the
+        // provider POST, the child registration and commit): a fork
+        // whose supplied pair predates the CURRENT record answers the
+        // typed stale refusal (never minting a child from newer
+        // history), a lifecycle transition already owning the key
+        // refuses typed, a terminal-owned parent refuses typed, and a
+        // parent handoff arriving AFTER the arm answers the
+        // coordinator's typed Blocked until the guard releases at
+        // handler end (RAII) — the check-then-act window does not
+        // exist. An unfenced request against a Live{FreshAgent} key is
+        // the typed FENCE_REQUIRED refusal (ep5 r4 F2 — an unfenced
+        // history mutation can never be told apart from a current one,
+        // so it never arms); every other state still routes through the
+        // same guard with the coordinator's current pair.
+        let _op_guard = match crate::ownership_lane::arm_reclaimless_op_guard(
+            &self.fresh_agent.ownership,
+            PROVIDER,
+            &real_id,
+            &format!("fork-{}", uuid::Uuid::new_v4()),
+            fork_fence,
+            "freshopencode/fork",
+        ) {
+            crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
+            crate::ownership_lane::LaneOpGuard::Unwired => None,
+            crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %msg.session_id, real_id = %real_id,
+                    "fresh_agent_fork_refused: the op guard refused to arm");
+                reply_sink(event_frame(
+                    &msg.session_id,
+                    json!({
+                        "type": "freshAgent.error",
+                        "sessionId": msg.session_id,
+                        "code": "SESSION_RESERVED",
+                        "message": message,
+                    }),
+                ));
+                return;
+            }
+        };
+
         // D8 (focused-ep1-r5 Findings 1+2): fork provenance by precedence —
         // (1) the FORKING connection's provenance (fork is always
         // connection-initiated; parked provenance is SHARED across the
@@ -2399,6 +4580,103 @@ impl FreshOpencodeState {
             .filter(|id| id.starts_with("msg"));
 
         let manager = self.fresh_agent.ensure_manager().await;
+
+        // b8ke ext r26 F3: the fork's PRE-MUTATION claim — the
+        // request-scoped provisional identity (the fork request id the
+        // caller already carries, namespaced so it can never collide with
+        // a provider-minted session id) holds the in-flight start for the
+        // WHOLE fork window, mirroring the REST/MCP lane's
+        // provisional-key discipline. The settle witness registers with
+        // the ticket (the r20 F1 discipline); the cancel closure is a
+        // NO-OP by design — the shared serve daemon is NOT the
+        // per-session writer and must never be killed (OpenCode
+        // invariant). At the mint the SAME ticket rekeys to the child id
+        // in one atomic step, so the child key is coordinator-owned from
+        // the moment the id exists — a claim refusal, cancellation,
+        // panic, or shutdown after the provider mutation can never leave
+        // the minted child outside coordinator ownership and typed
+        // recovery, and a competing lifecycle operation on the
+        // operation identity answers the typed conflict BEFORE any
+        // provider mutation (pre-r26 the claim only happened AFTER
+        // `manager.fork`, leaving the fork window unowned).
+        let fork_request_key = msg
+            .request_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let provisional_id = format!("pending-fork-{fork_request_key}");
+        let claim_key = self
+            .fresh_agent
+            .resolve_canonical_session(PROVIDER, &provisional_id);
+        let fork_op_id = format!("fork-child-{}", uuid::Uuid::new_v4());
+        let start_pid_slot = crate::ownership_lane::sidecar_pid_cancel_slot();
+        let mut _start_cancellation: Option<crate::ownership_lane::StartCancellationGuard> = None;
+        let mut own_ticket: Option<freshell_ownership::OperationTicket> = None;
+        match self.begin_lane_claim_at(
+            &claim_key,
+            &fork_op_id,
+            // b8ke ext r29 F2: the operation's fence — the fork's observed
+            // pair threads into the provisional child's claim (never
+            // `None`: a pre-restart-epoch observation can never mint a
+            // child; the parent consult above already refused the
+            // stale-generation shape).
+            fork_fence,
+            &Self::initiator_for(fork_provenance.as_ref(), "freshopencode/fork"),
+        ) {
+            crate::ownership_lane::LaneClaim::Granted(ticket) => {
+                own_ticket = Some(ticket);
+                _start_cancellation = Some(
+                    crate::ownership_lane::register_start_cancellation_for_ticket(
+                        &self.fresh_agent.ownership,
+                        PROVIDER,
+                        &claim_key,
+                        &own_ticket,
+                        crate::ownership_lane::pid_slot_cancellation(&start_pid_slot),
+                    ),
+                );
+            }
+            crate::ownership_lane::LaneClaim::Unwired => {}
+            crate::ownership_lane::LaneClaim::Adopt => {
+                // The operation identity resolves to a LIVE same-kind owner
+                // — this request id already minted its child (a replayed
+                // fork request); the duplicate answers the typed conflict.
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    parent_session_id = %msg.session_id, session_id = %claim_key,
+                    "fresh_agent_fork_refused: the fork's operation identity \
+                     resolves to a live owner; the child is not created (kata b8ke \
+                     ext r26 F3)"
+                );
+                reply_sink(event_frame(
+                    &msg.session_id,
+                    json!({
+                        "type": "freshAgent.error",
+                        "sessionId": msg.session_id,
+                        "code": "SESSION_RESERVED",
+                        "message": "Another resume for this session is in flight",
+                    }),
+                ));
+                return;
+            }
+            crate::ownership_lane::LaneClaim::Refused(outcome) => {
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    parent_session_id = %msg.session_id, session_id = %claim_key,
+                    outcome = ?outcome,
+                    "fresh_agent_fork_refused: the ownership coordinator refused the \
+                     operation-identity claim before the provider mutation (kata b8ke \
+                     ext r26 F3)"
+                );
+                reply_sink(event_frame(
+                    &msg.session_id,
+                    json!({
+                        "type": "freshAgent.error",
+                        "sessionId": msg.session_id,
+                        "code": "SESSION_RESERVED",
+                        "message": "Another resume for this session is in flight",
+                    }),
+                ));
+                return;
+            }
+        }
+
         let child = match manager.fork(&real_id, &route, message_id).await {
             Ok(child) => child,
             Err(err) => {
@@ -2435,10 +4713,64 @@ impl FreshOpencodeState {
             return;
         }
 
+        // b8ke ext r26 F3: the MINT-TIME REKEY — the SAME ticket's
+        // in-flight record moves from the operation identity to the
+        // minted child id in ONE atomic step (`rekey_starting`: the
+        // provisional key becomes `Aliased{to: the child id}` — the rekey
+        // family's resolution record — and the child key holds the SAME
+        // operation's `Starting`, witnesses carried; the ticket survives
+        // via `rekey_session_id`, so the registration tail below lands
+        // under the CANONICAL key). A competitor that claimed the freshly
+        // discoverable child id inside the fork window left a record under
+        // it and the rekey REFUSES typed — the child is NOT registered
+        // (the daemon-side session is abandoned; the shared serve is never
+        // killed — OpenCode invariant), never two writers.
+        if let Some(ticket) = own_ticket.as_mut() {
+            let Some(registry) = self.fresh_agent.ownership.as_ref() else {
+                unreachable!("a live ticket implies a wired coordinator");
+            };
+            match registry.rekey_starting(
+                PROVIDER,
+                ticket.session_id(),
+                &child.id,
+                ticket.operation_id(),
+                ticket.generation(),
+            ) {
+                freshell_ownership::CommitOutcome::Committed => {
+                    ticket.rekey_session_id(&child.id);
+                }
+                outcome => {
+                    tracing::error!(target: "invariant",
+                        provider = PROVIDER, session_id = %child.id,
+                        parent_session_id = %real_id,
+                        outcome = ?outcome,
+                        "freshagent.opencode.fork_rekey_refused: the minted child id \
+                         was claimed by another owner during the fork window — the \
+                         child is not registered (kata b8ke ext r26 F3)"
+                    );
+                    reply_sink(event_frame(
+                        &msg.session_id,
+                        json!({
+                            "type": "freshAgent.error",
+                            "sessionId": msg.session_id,
+                            "code": "SESSION_RESERVED",
+                            "message": "The minted child session id was claimed by another owner during the fork",
+                        }),
+                    ));
+                    return;
+                }
+            }
+        }
+
         // adapter.ts fork:1005-1020 — the child lands in the SAME session map (its
         // placeholder IS its durable id), inherits model/effort from the parent, takes
         // cwd from `child.directory ?? state.cwd`, and gets its own serve-SSE bridge
         // (`bindServeStream(childState)`).
+        //
+        // kata b8ke Task 3 (carried finding): the child registration runs
+        // under the rekeyed ticket's held claim and commits Live at the
+        // minted child key below. No observed fence needed (a minted id
+        // was never observed); it still goes through the coordinator.
         let child_cwd = child
             .directory
             .clone()
@@ -2452,41 +4784,174 @@ impl FreshOpencodeState {
         );
         child_session.provenance = fork_provenance.clone();
         child_session.real_session_id = Some(child.id.clone());
-        child_session.serve_bridge = Some(self.spawn_serve_bridge(
-            manager,
-            child.id.clone(),
-            child_session.turn_errored.clone(),
-        ));
+        self.install_serve_bridge(&manager, &mut child_session, &child.id)
+            .await;
+        // ep2-r5: bind the child's session INSTANCE — the fork's rescue
+        // verifies this exact `Arc` against the map (a same-key
+        // replacement for the child can never satisfy it).
+        let child_session_arc = Arc::new(TokioMutex::new(child_session));
         self.sessions
             .lock()
             .await
-            .insert(child.id.clone(), Arc::new(TokioMutex::new(child_session)));
+            .insert(child.id.clone(), child_session_arc.clone());
 
         // P1.13: binding row for the child (the materialization record pattern,
         // `_pattern :600-626`) — AWAITED BEFORE the forked reply
         // (durable-before-answer). Opencode has no sandbox/permission concepts —
         // always `None`.
-        self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
-            name_transition: None,
-            provider: PROVIDER.into(),
-            session_id: child.id.clone(),
-            mode: SESSION_TYPE.into(),
-            create_request_id: None,
-            resolves_pending: None,
-            supersedes: None,
-            // D8 (focused-ep1-r5): the RESOLVED fork provenance (forking
-            // connection > parent's parked > parent's row); `Inherit` only
-            // when no source knows the attribution — never invented.
-            provenance: fork_provenance.into(),
-            settings: crate::identity_sink::FreshAgentSettings {
-                model,
-                sandbox: None,
-                permission_mode: None,
-                effort,
-                cwd: child_cwd.clone(),
-            },
-        })
-        .await;
+        // b8ke ext r26 F4: the binding failure PROPAGATES — the child is torn
+        // down and the fork answers the typed error, never a registered child
+        // with a live bridge and a committed Live over a row missing from the
+        // authoritative recovery registry (the pre-r26 log-and-continue
+        // discarded the Result); the ticket's RAII drop settles the rekeyed
+        // claim typed.
+        if let Err(e) = self
+            .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                // Unified agent names: no naming fact on this ledger edge
+                // (the fork's naming classification is driven by its
+                // dedicated lane).
+                name_transition: None,
+                provider: PROVIDER.into(),
+                session_id: child.id.clone(),
+                mode: SESSION_TYPE.into(),
+                create_request_id: None,
+                resolves_pending: None,
+                supersedes: None,
+                // D8 (focused-ep1-r5): the RESOLVED fork provenance (forking
+                // connection > parent's parked > parent's row); `Inherit` only
+                // when no source knows the attribution — never invented.
+                provenance: fork_provenance.into(),
+                observed_epoch: None,
+                observed_generation: None,
+                // b8ke focused ep5 r2 F1: a lane write.
+                authoritative: false,
+                settings: crate::identity_sink::FreshAgentSettings {
+                    model,
+                    sandbox: None,
+                    permission_mode: None,
+                    effort,
+                    cwd: child_cwd.clone(),
+                },
+            })
+            .await
+        {
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %child.id,
+                parent_session_id = %msg.session_id, error = %e,
+                "freshagent.opencode.fork_binding_failed_typed: the child's durable row \
+                 write failed — the child is torn down (kata b8ke ext r26 F4)"
+            );
+            // The sibling stale-commit teardown shape: KEEP the removed value
+            // so the bridge abort and the killed flag actually execute.
+            let removed = {
+                let mut guard = self.sessions.lock().await;
+                guard.remove(&child.id)
+            };
+            if let Some(removed) = removed {
+                let mut s = removed.lock().await;
+                s.killed.store(true, Ordering::SeqCst);
+                if let Some(task) = s.turn_task.take() {
+                    task.abort_and_settle().await;
+                }
+                if let Some(bridge) = s.serve_bridge.take() {
+                    bridge.abort();
+                }
+            }
+            reply_sink(event_frame(
+                &msg.session_id,
+                json!({
+                    "type": "freshAgent.error",
+                    "sessionId": msg.session_id,
+                    "code": "LEDGER_WRITE_FAILED",
+                    "message": "The forked session's resume record could not be \
+                                persisted; the child was torn down — retry the fork",
+                }),
+            ));
+            return;
+        }
+
+        // kata b8ke Task 3: the child's registration is complete — commit
+        // `Live{FreshAgent}` under the NEW child key (the stamp lands in the
+        // SHARED map). A stale/foreign commit tears the child down (map keys
+        // + bridge); the shared serve is never touched.
+        if let Err(outcome) = self.commit_lane_claim_at(&mut own_ticket, &child.id) {
+            tracing::error!(target: "invariant",
+                provider = PROVIDER, session_id = %child.id,
+                parent_session_id = %msg.session_id, outcome = ?outcome,
+                "freshagent.opencode.fork_commit_stale: the coordinator moved on while the \
+                 fork child registered; the uncommitted child is torn down"
+            );
+            // Task 3 review M-1: KEEP the removed value — the re-get below
+            // could never find the just-removed entry, so the bridge abort
+            // and the killed flag never executed (the child's serve-SSE
+            // bridge task leaked, broadcasting for a torn-down session).
+            // The teardown is the sibling stale-commit shape
+            // (`resume_commit_stale` below).
+            let removed = {
+                let mut guard = self.sessions.lock().await;
+                guard.remove(&child.id)
+            };
+            if let Some(removed) = removed {
+                let mut s = removed.lock().await;
+                s.killed.store(true, Ordering::SeqCst);
+                if let Some(task) = s.turn_task.take() {
+                    task.abort_and_settle().await;
+                }
+                if let Some(bridge) = s.serve_bridge.take() {
+                    bridge.abort();
+                }
+            }
+            reply_sink(event_frame(
+                &msg.session_id,
+                json!({
+                    "type": "freshAgent.error",
+                    "sessionId": msg.session_id,
+                    "code": "INTERNAL_ERROR",
+                    "message": "session ownership changed during fork; the child was torn down",
+                }),
+            ));
+            return;
+        }
+
+        // fresheyes ep2-r2 Major (the transitional-window dead bridge): the
+        // commit landed, so the child is now visible to every future
+        // revival trigger — but the triggers that fired inside the
+        // construction window are already spent. The rescue tail re-checks
+        // the bridge HERE, before the success reply: an operation must
+        // never answer success over a bridge its own window got killed
+        // (daemon loss swept the just-subscribed sender; the one-shot
+        // `Started` revival skipped the unpublished/`Starting` child).
+        //
+        // ep2-r3: a REFUSAL (the child was killed/handed off between the
+        // commit and this tail — the mover's teardown owns the cleanup)
+        // answers the stale-commit ownership-changed error frame instead:
+        // never a successful forked reply over a retired child, and never
+        // a resurrected bridge for it either.
+        // ep2-r5: the refusal set now includes a same-key REPLACEMENT for
+        // the child — the rescue is bound to the fork's committed instance
+        // and the child's committed (epoch, generation) fence, so it can
+        // only ever verify the fork's own child.
+        if matches!(
+            self.rescue_transitional_bridge_after_commit(
+                &child.id,
+                false,
+                &OpencodeSessionHandle::new(child_session_arc),
+                Self::committed_lane_fence(&self.fresh_agent.ownership, own_ticket.as_ref()),
+            )
+            .await,
+            TransitionalBridgeRescue::Refused
+        ) {
+            reply_sink(event_frame(
+                &msg.session_id,
+                json!({
+                    "type": "freshAgent.error",
+                    "sessionId": msg.session_id,
+                    "code": "INTERNAL_ERROR",
+                    "message": "session ownership changed during fork; the child was torn down",
+                }),
+            ));
+            return;
+        }
 
         reply_sink(ServerMessage::FreshAgentForked(FreshAgentForked {
             request_id: msg.request_id.clone(),
@@ -2562,6 +5027,24 @@ impl FreshOpencodeState {
             ));
             return;
         };
+        // b8ke ext r29 F2: the undo/redo frame's delayed-request fence (the
+        // wire's additive observedEpoch/observedGeneration pair — parity
+        // with the codex rollback since ext r21 F2): a half-sent pair is
+        // the typed INVALID_FENCE refusal; a whole pair is consulted
+        // against the record at the decision point below — a queued
+        // old-generation rollback can never mutate newer history.
+        let rollback_fence =
+            match crate::ownership_lane::wire_fence(op.observed_epoch, op.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %op.session_id, request_id = %op.request_id,
+                        code = err.code(),
+                        "fresh_agent_rollback_refused: the observed fence is half-sent (invalid)");
+                    reply_sink(rollback_error_frame(&op, err.code(), err.message()));
+                    return;
+                }
+            };
         let session_arc = { self.sessions.lock().await.get(&op.session_id).cloned() };
         let Some(session_arc) = session_arc else {
             reply_sink(rollback_error_frame(
@@ -2607,6 +5090,44 @@ impl FreshOpencodeState {
             ));
             return;
         }
+        // b8ke ext r29 F2 + focused ep5 r1 F1: the coordinator-backed OP
+        // GUARD — the reclaim-less lane's decision point (BEFORE the
+        // manager reads, the ledger write, or the revert POST). The
+        // ext-r29 snapshot consult verified only the pair; the guard now
+        // ARMS the coordinator's attach guard on the real (durable) id —
+        // the canonical coordinator key — and HOLDS it across the whole
+        // mutation sequence (the record write, the revert POST, the
+        // post-verify triad): a rollback whose supplied pair predates the
+        // CURRENT record answers the typed stale refusal (never mutating
+        // newer history), a lifecycle transition already owning the key
+        // refuses typed, a terminal-owned key refuses typed, and a
+        // handoff arriving AFTER the arm answers the coordinator's typed
+        // Blocked until the guard releases at handler end (RAII) — the
+        // check-then-act window does not exist. An unfenced request
+        // against a Live{FreshAgent} key is the typed FENCE_REQUIRED
+        // refusal (ep5 r4 F2 — an unfenced history mutation can never be
+        // told apart from a current one, so it never arms); every other
+        // state still routes through the same guard with the
+        // coordinator's current pair.
+        let _op_guard = match crate::ownership_lane::arm_reclaimless_op_guard(
+            &self.fresh_agent.ownership,
+            PROVIDER,
+            &real_id,
+            &format!("rollback-{}", uuid::Uuid::new_v4()),
+            rollback_fence,
+            "freshopencode/rollback",
+        ) {
+            crate::ownership_lane::LaneOpGuard::Armed(guard) => Some(guard),
+            crate::ownership_lane::LaneOpGuard::Unwired => None,
+            crate::ownership_lane::LaneOpGuard::Refused { message } => {
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %op.session_id, real_id = %real_id,
+                    request_id = %op.request_id,
+                    "fresh_agent_rollback_refused: the op guard refused to arm");
+                reply_sink(rollback_error_frame(&op, "SESSION_RESERVED", &message));
+                return;
+            }
+        };
         let route = session.cwd.clone();
         let manager = self.fresh_agent.ensure_manager().await;
         let info = match manager.get_session(&real_id, &route).await {
@@ -3122,16 +5643,274 @@ impl FreshOpencodeState {
     /// `freshAgent.error` frame instead (never panics, never tears down the shared
     /// sidecar, never mis-declares a possibly-live session lost).
     pub async fn handle_attach(&self, msg: FreshAgentAttach) {
+        // b8ke delta review F7: a half-sent observed pair (exactly one of
+        // epoch/generation) is the typed invalid-fence refusal — before any
+        // state interaction. The attach never proceeds as a silently
+        // downgraded legacy request.
+        let attach_fence =
+            match crate::ownership_lane::wire_fence(msg.observed_epoch, msg.observed_generation) {
+                Ok(fence) => fence,
+                Err(err) => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %msg.session_id, code = err.code(),
+                    "fresh_agent_attach_refused: the observed fence is half-sent (invalid)");
+                    self.emit_fresh_agent_error(&msg.session_id, err.code(), err.message());
+                    return;
+                }
+            };
+        // Task 4: arm the runtime's daemon-loss watcher (idempotent — the
+        // fence parse above stays the FIRST interaction, so a typed refusal
+        // still mutates nothing).
+        self.ensure_daemon_loss_watcher().await;
         let session_arc = {
             let guard = self.sessions.lock().await;
             guard.get(&msg.session_id).cloned()
         };
+        // b8ke gate C fix: the coordinator consult (the map-hit
+        // registration + the r12/r38 arm) applies ONLY to MATERIALIZED
+        // sessions — a real durable `ses_*` whose serve-SSE bridge the
+        // attach tail can actually restart. An UNMATERIALIZED placeholder
+        // has NO runtime to own or guard: the create claimed nothing (the
+        // key is genuinely vacant), the tail below starts no bridge
+        // ("only meaningful once a durable session exists"), and the
+        // send's materialize claim owns the placeholder's coordinator
+        // lifecycle (the r26-F3 pre-mutation claim). Pre-fix the mount
+        // attach's map-hit registration registered the placeholder
+        // Live{FreshAgent} — NOTHING REAL — and that leaked record made
+        // every send's materialize claim answer AdoptLive (the typed
+        // "duplicate first-send" refusal), so the pane never materialized
+        // and its durable ref stayed the placeholder forever (the gate-C
+        // e2e regression: a fresh `freshopencode-*` id instead of the
+        // stable `ses_*` id).
+        let attach_row_materialized = if let Some(arc) = session_arc.as_ref() {
+            // Classify the map hit while holding the session lock. A fresh pane's
+            // placeholder has no provider runtime or bridge to adopt, so this is
+            // observation-only: emit the current snapshot and return while the
+            // classification still holds. If materialization wins the same lock
+            // first, the durable attach path below owns the guarded bridge restart.
+            let session = arc.lock().await;
+            if session.real_session_id.is_none() {
+                let running = session
+                    .turn_task
+                    .as_ref()
+                    .map(|task| !task.is_finished())
+                    .unwrap_or(false);
+                let status = if running { "running" } else { "idle" };
+                self.broadcast(&event_frame(
+                    &session.placeholder_id,
+                    snapshot_event(&session.placeholder_id, status),
+                ));
+                return;
+            }
+            true
+        } else {
+            false
+        };
+        // b8ke delta round-3 F2: an existing-session attach still CONSULTS
+        // the coordinator — a delayed attach during a Handoff (the map entry
+        // exists until the stop lands) must be BLOCKED or typed, never a
+        // silent reuse against a runtime the handoff owns.
+        if session_arc.is_some() && attach_row_materialized {
+            let snap = self
+                .fresh_agent
+                .ownership_snapshot(PROVIDER, &msg.session_id);
+            match snap.state {
+                freshell_ownership::OwnershipState::Handoff { .. }
+                | freshell_ownership::OwnershipState::Starting { .. }
+                | freshell_ownership::OwnershipState::Stopping { .. }
+                | freshell_ownership::OwnershipState::Fenced { .. } => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %msg.session_id, state = ?snap.state,
+                        "fresh_agent_attach_refused: a lifecycle transition owns this \
+                         session — the existing-session fast path is blocked (typed)");
+                    self.emit_fresh_agent_error(
+                        &msg.session_id,
+                        "SESSION_RESERVED",
+                        "A lifecycle operation owns this session; retry after it settles",
+                    );
+                    return;
+                }
+                // b8ke e3r1 F3: a live session over a VACANT key is
+                // REGISTERED as the authoritative owner (claim + commit)
+                // before the reuse proceeds — never reused unowned
+                // (pre-e3r1 a terminal claim could start a second writer
+                // beside the live one).
+                freshell_ownership::OwnershipState::Vacant => {
+                    let durable = match session_arc.as_ref() {
+                        Some(arc) => arc.lock().await.real_session_id.clone(),
+                        None => None,
+                    }
+                    .unwrap_or_else(|| msg.session_id.clone());
+                    let adopt_op = format!("adopt-{}", uuid::Uuid::new_v4());
+                    // b8ke ext r15 F1: the attach's compatibility claim is
+                    // FENCED with the request's observed pair (parsed at
+                    // handler entry, before any ownership mutation) — a
+                    // stale generation can never reclaim a since-vacated
+                    // key.
+                    match self.begin_lane_claim_at(
+                        &durable,
+                        &adopt_op,
+                        attach_fence,
+                        "freshopencode/map-hit-adopt",
+                    ) {
+                        crate::ownership_lane::LaneClaim::Granted(ticket) => {
+                            let mut ticket_opt = Some(ticket);
+                            if let Err(outcome) = crate::ownership_lane::commit_lane_claim(
+                                &self.fresh_agent.ownership,
+                                &self.fresh_agent.ownership_stamps,
+                                Some(&self.fresh_agent.broadcast_tx),
+                                PROVIDER,
+                                &durable,
+                                &mut ticket_opt,
+                                &durable,
+                                None,
+                            ) {
+                                tracing::warn!(target: "freshell_freshagent::opencode",
+                                    session_id = %durable, outcome = ?outcome,
+                                    "fresh_agent_attach_adopt_commit_stale: the coordinator \
+                                     moved on while registering the existing session — the \
+                                     reuse is refused (never a live writer left unowned)");
+                                self.emit_fresh_agent_error(
+                                    &msg.session_id,
+                                    "SESSION_RESERVED",
+                                    "A lifecycle operation owns this session; retry after it settles",
+                                );
+                                return;
+                            }
+                        }
+                        crate::ownership_lane::LaneClaim::Unwired
+                        | crate::ownership_lane::LaneClaim::Adopt => {}
+                        crate::ownership_lane::LaneClaim::Refused(_) => {
+                            self.emit_fresh_agent_error(
+                                &msg.session_id,
+                                "SESSION_RESERVED",
+                                "A lifecycle operation owns this session; retry after it settles",
+                            );
+                            return;
+                        }
+                    }
+                }
+                // b8ke e3r4 F4: a TERMINAL owner (a handoff committed)
+                // refuses the attach TYPED — never the wildcard reuse that
+                // restarts the old serve-event bridge beside the terminal
+                // owner.
+                freshell_ownership::OwnershipState::Live {
+                    owner: observed_owner,
+                    ..
+                } if observed_owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %msg.session_id,
+                        "fresh_agent_attach_refused: a TERMINAL owner owns the \
+                         session (a handoff committed) — the delayed attach is a \
+                         typed refusal, never a bridge restart beside it");
+                    self.emit_fresh_agent_error(
+                        &msg.session_id,
+                        "SESSION_RESERVED",
+                        "The session is owned by a terminal runtime; reopen it as \
+                         the terminal instead",
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // b8ke ext r12 F2: the existing-session attach's REAL claim — the
+        // guard arms under the coordinator lock and is held ACROSS the
+        // serve-bridge restart + the attach tail, so a handoff/stop begin
+        // inside the window answers the typed Blocked outcome (the
+        // coordinator covers the attach through completion; pre-r12 the
+        // point-in-time snapshot closed no window — a handoff could commit
+        // between the check and the bridge restart, and the delayed attach
+        // restarted the torn-down session's SSE bridge).
+        // Armed on the LIVE-key shapes only (the Vacant-key registration
+        // above holds its own claim; the untracked resume below claims
+        // through resume_durable_session).
+        // b8ke ext r38 F1: the arm is the ATOMIC ADOPT — the request's
+        // FULL observed pair plus the EXPECTED fresh-agent owner, validated
+        // in ONE coordinator-lock decision. Pre-r38 the arm passed NO
+        // generation at all: a terminal handoff committing between the
+        // state precheck and the arm let the guard arm on the terminal
+        // owner and the attach RESTART the superseded OpenCode event
+        // bridge beside the terminal. The absent pair (a legacy
+        // unfenced request) cannot adopt specifically — a lane that
+        // RESTARTS a runtime/bridge must adopt specifically — so it
+        // refuses typed (the FENCE_REQUIRED contract: re-observe the
+        // owner record and retry with the pair).
+        let mut existing_session_attach_guard = None;
+        if attach_row_materialized {
+            match attach_fence {
+                Some(adopt_fence) => {
+                    let expected_fresh_owner = freshell_ownership::OwnerIdentity {
+                        kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                        terminal_id: None,
+                        live_session_key: None,
+                        pid: None,
+                        ownership_id: None,
+                    };
+                    existing_session_attach_guard = match crate::ownership_lane::arm_adopt_guard(
+                        &self.fresh_agent.ownership,
+                        PROVIDER,
+                        &msg.session_id,
+                        &format!("attach-{}", uuid::Uuid::new_v4()),
+                        &expected_fresh_owner,
+                        adopt_fence,
+                        "freshopencode/attach",
+                    ) {
+                        crate::ownership_lane::LaneAttachGuard::Armed(guard) => Some(guard),
+                        crate::ownership_lane::LaneAttachGuard::Unwired => None,
+                        crate::ownership_lane::LaneAttachGuard::Refused => {
+                            self.emit_fresh_agent_error(
+                                &msg.session_id,
+                                "SESSION_RESERVED",
+                                "A lifecycle operation owns this session; retry after it settles",
+                            );
+                            return;
+                        }
+                    };
+                }
+                // The absent pair on a WIRED lane cannot adopt specifically —
+                // the existing-session attach restarts the serve-event
+                // bridge, so it refuses typed (the FENCE_REQUIRED
+                // contract: re-observe the owner record and retry with
+                // the pair). On an UNWIRED lane there is no coordinator
+                // to adopt from — the pre-wiring legacy semantics hold
+                // (no guard, the attach proceeds).
+                None if self.fresh_agent.ownership.is_some() => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %msg.session_id,
+                        code = "FENCE_REQUIRED",
+                        "fresh_agent_attach_refused: the existing-session attach carries \
+                         no observed ownership pair against a coordinator-wired lane — \
+                         the bridge restart must adopt the observed owner specifically; \
+                         the client re-observes the owner record and retries with the \
+                         pair (kata b8ke ext r38 F1)"
+                    );
+                    self.emit_fresh_agent_error(
+                        &msg.session_id,
+                        "SESSION_RESERVED",
+                        "The attach carried no observed ownership pair; re-observe the \
+                         session's owner record and retry",
+                    );
+                    return;
+                }
+                None => {}
+            }
+        }
         let session_arc = match session_arc {
             Some(session_arc) => session_arc,
             // Conn-less lane (D8): attach carries no tab identity — keep-when-None
             // merge preserves the create's provenance stamps.
             None => match self
-                .resume_durable_session(&msg.session_id, msg.cwd.as_deref(), None)
+                .resume_durable_session(
+                    &msg.session_id,
+                    msg.cwd.as_deref(),
+                    None,
+                    // kata b8ke Task 3: the attach's delayed-request fence
+                    // (round-2 lifecycle audit — attach can cold-resume an
+                    // untracked session, registering a runtime).
+                    attach_fence,
+                    None,
+                )
                 .await
             {
                 Ok(session_arc) => session_arc,
@@ -3158,23 +5937,32 @@ impl FreshOpencodeState {
         let (status_session_id, running, real_session_id) = {
             let mut session = session_arc.lock().await;
 
-            // Ensure the serve-SSE bridge is running (restart it if it died) -- only
-            // meaningful once a durable session exists; a not-yet-materialized session has
-            // never started a bridge (`bindServeStream` only fires from `materializeOrSend`).
-            if let Some(real_id) = session.real_session_id.clone() {
-                let bridge_dead = session
-                    .serve_bridge
-                    .as_ref()
-                    .map(tokio::task::JoinHandle::is_finished)
-                    .unwrap_or(true);
-                if bridge_dead {
-                    let manager = self.fresh_agent.ensure_manager().await;
-                    session.serve_bridge = Some(self.spawn_serve_bridge(
-                        manager,
-                        real_id,
-                        session.turn_errored.clone(),
-                    ));
-                }
+            // Ensure the serve-SSE bridge is running (restart it if it died) --
+            // only meaningful once a durable session exists; a not-yet-
+            // materialized session has never started a bridge (`bindServeStream`
+            // only fires from `materializeOrSend`). Task 4: the tail is the
+            // shared `restart_session_bridge_guarded` helper, which FIRST
+            // `ensure_started()`s the shared daemon (LB-05 — a restart without
+            // a daemon re-bridges into nothing; the incident's 3 attach
+            // attempts recovered NOTHING because nothing respawned the daemon
+            // for a map-hit). On a bounded respawn failure the attach answers
+            // the TYPED error path, never a silent half-attached state.
+            if let Err(err) = self.restart_session_bridge_guarded(&mut session).await {
+                drop(session);
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %msg.session_id, error = %err,
+                    "freshagent.opencode.attach_daemon_respawn_failed: the dead-bridge \
+                     restart could not bring the shared daemon back — the attach answers \
+                     the typed error instead of a silent half-attached state"
+                );
+                self.emit_fresh_agent_error(
+                    &msg.session_id,
+                    "OPENCODE_ATTACH_RESUME_FAILED",
+                    &format!(
+                        "The opencode serve daemon could not be restarted for this session: {err}"
+                    ),
+                );
+                return;
             }
 
             let status_session_id = session
@@ -3215,6 +6003,10 @@ impl FreshOpencodeState {
             &status_session_id,
             snapshot_event(&status_session_id, status),
         ));
+        // b8ke ext r12 F2: the existing-session attach's window CLOSES
+        // here — the guard covered the bridge restart + the attach tail
+        // through completion.
+        drop(existing_session_attach_guard);
     }
 
     /// Look up `session_id` against the shared `opencode serve` sidecar (`GET
@@ -3239,6 +6031,14 @@ impl FreshOpencodeState {
         session_id: &str,
         cwd: Option<&str>,
         provenance: Option<crate::BindProvenance>,
+        // kata b8ke Task 3: the calling lifecycle message's delayed-request
+        // fence (`None` = legacy unfenced sender — still cross-kind-checked).
+        observed: Option<freshell_ownership::ObservedFence>,
+        // kata b8ke Task 6: `Some((operation_id, generation))` when invoked
+        // as a handoff continuation — the runner holds the claim and
+        // performs the ONE `commit_live`, so this lane skips both its own
+        // claim and its own commit (under-ticket mode).
+        handoff: Option<(&str, u64)>,
     ) -> Result<Arc<TokioMutex<OpencodeSession>>, ResumeOpencodeError> {
         // D8 (focused-ep1-r5 Finding 2): "meaningful provenance" only — a
         // HOLLOW `Some` (a partially initialized client's hello) behaves like
@@ -3268,6 +6068,42 @@ impl FreshOpencodeState {
             return Err(ResumeOpencodeError::Reserved);
         }
         let resume_request_id = format!("attach-resume-{}", uuid::Uuid::new_v4());
+        // kata b8ke Task 3: the coordinator claim comes FIRST — before the
+        // provider lease — so the resume window is cross-kind-authoritative.
+        // AdoptLive adopts the winner's live session (the lease's BoundLive
+        // twin); every refusal answers the established retryable code.
+        // Task 6: under-ticket mode (handoff continuation) skips the claim —
+        // the runner holds it.
+        let mut own_ticket = if handoff.is_some() {
+            None
+        } else {
+            match self.begin_lane_claim_at(
+                session_id,
+                &resume_request_id,
+                observed,
+                "freshopencode/attach-resume",
+            ) {
+                crate::ownership_lane::LaneClaim::Granted(ticket) => Some(ticket),
+                crate::ownership_lane::LaneClaim::Unwired => None,
+                crate::ownership_lane::LaneClaim::Adopt => {
+                    // A same-kind live runtime the map fast-path missed — adopt
+                    // it if it registered, else the claim is stale lane info the
+                    // resume must not spawn over.
+                    if let Some(existing) = self.sessions.lock().await.get(session_id) {
+                        return Ok(existing.clone());
+                    }
+                    return Err(ResumeOpencodeError::Reserved);
+                }
+                crate::ownership_lane::LaneClaim::Refused(outcome) => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %session_id, outcome = ?outcome,
+                        "fresh_agent_resume_refused: the ownership coordinator refused the \
+                         claim (kata b8ke cross-kind authority)"
+                    );
+                    return Err(ResumeOpencodeError::Reserved);
+                }
+            }
+        };
         let mut lease_guard = match self.leases.claim(
             PROVIDER,
             session_id,
@@ -3399,11 +6235,8 @@ impl FreshOpencodeState {
             sink.as_ref()
                 .and_then(|s| s.load_provenance(PROVIDER, session_id))
         });
-        session.serve_bridge = Some(self.spawn_serve_bridge(
-            manager,
-            session_id.to_string(),
-            session.turn_errored.clone(),
-        ));
+        self.install_serve_bridge(&manager, &mut session, session_id)
+            .await;
         let session_arc = Arc::new(TokioMutex::new(session));
 
         self.sessions
@@ -3475,6 +6308,69 @@ impl FreshOpencodeState {
             ));
         }
 
+        // kata b8ke Task 3: the resume's registration survived every
+        // teardown gate — commit `Live{FreshAgent}` under the durable
+        // `ses_*` key (the stamp lands in the SHARED map: the kill/exit
+        // claim source for BOTH the REST and WS surfaces). Task 6:
+        // under-ticket mode (handoff continuation) SKIPS the commit — the
+        // handoff runner performs the ONE `commit_live` (single commit
+        // authority).
+        // b8ke ext r22 F2: the binding row's fence pair — captured at the
+        // moment this resume's commit runs (the delayed-write fence
+        // baseline the durable row carries below).
+        // b8ke ext r27 F2: the UNDER-TICKET continuation holds NO ticket
+        // by design — the SUPPLIED handoff (epoch, generation) stamps the
+        // row instead, so the target's durable row carries the handoff's
+        // generation (pre-r27 the derivation collapsed to (None, None)
+        // here, the row preserved the PRIOR generation, and a delayed
+        // prior-generation write could pass the ledger's comparison and
+        // replace the new owner's recovery metadata).
+        let (binding_epoch, binding_generation) = match (
+            self.fresh_agent.ownership.as_ref(),
+            own_ticket.as_ref(),
+            handoff,
+        ) {
+            (Some(registry), Some(ticket), _) => {
+                (Some(registry.boot_epoch()), Some(ticket.generation()))
+            }
+            (Some(registry), None, Some((_, handoff_generation))) => {
+                (Some(registry.boot_epoch()), Some(handoff_generation))
+            }
+            _ => (None, None),
+        };
+        if handoff.is_none() {
+            if let Err(outcome) = self.commit_lane_claim_at(&mut own_ticket, session_id) {
+                tracing::error!(target: "invariant",
+                    provider = PROVIDER, session_id = %session_id,
+                    outcome = ?outcome,
+                    "freshagent.opencode.resume_commit_stale: the coordinator moved on while the \
+                     resume registered; the uncommitted session is torn down"
+                );
+                let removed = {
+                    let mut guard = self.sessions.lock().await;
+                    guard.remove(session_id)
+                };
+                if let Some(removed) = removed {
+                    let mut s = removed.lock().await;
+                    s.killed.store(true, Ordering::SeqCst);
+                    if let Some(task) = s.turn_task.take() {
+                        task.abort_and_settle().await;
+                    }
+                    if let Some(bridge) = s.serve_bridge.take() {
+                        bridge.abort();
+                    }
+                }
+                return Err(ResumeOpencodeError::Manager(
+                    freshell_opencode::ServeError::Transport(format!(
+                        "opencode session {session_id} ownership changed during resume; torn down"
+                    )),
+                ));
+            }
+        }
+        // Under-ticket mode leaves own_ticket None (never claimed); in the
+        // normal mode the commit above consumed or disarmed it, and every
+        // early error return drops it armed for the RAII typed fail.
+
         // P1.13 (Task 8): refresh the binding row after a successful resume -- AWAITED
         // (durable-before-answer). The SETTINGS payload rides only when a record was
         // actually recovered (never launder a defaults row for a never-recorded
@@ -3507,19 +6403,104 @@ impl FreshOpencodeState {
             } else {
                 crate::identity_sink::FreshAgentSettings::default()
             };
-            self.record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
-                provider: PROVIDER.into(),
-                session_id: session_id.to_string(),
-                mode: SESSION_TYPE.into(),
-                create_request_id: None,
-                resolves_pending: None,
-                supersedes: None,
-                // Unified agent names: no naming fact on this ledger edge.
-                name_transition: None,
-                provenance,
-                settings,
-            })
-            .await;
+            // b8ke ext r22 F2: the binding failure PROPAGATES — the
+            // rebuilt session is torn down and the resume answers the
+            // typed failure (the claim settles through the teardown),
+            // never a bare LEDGER_WRITE_FAILED notification under a
+            // committed Live.
+            if let Err(e) = self
+                .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                    provider: PROVIDER.into(),
+                    session_id: session_id.to_string(),
+                    mode: SESSION_TYPE.into(),
+                    create_request_id: None,
+                    resolves_pending: None,
+                    supersedes: None,
+                    // Unified agent names: no naming fact on this ledger edge.
+                    name_transition: None,
+                    provenance,
+                    observed_epoch: binding_epoch,
+                    observed_generation: binding_generation,
+                    // b8ke focused ep5 r2 F1: the UNDER-TICKET shape (no own
+                    // ticket; the runner-supplied handoff generation stamped
+                    // the pair) is the handoff runner's OWN authoritative
+                    // target binding — the normal resume's own-ticket write
+                    // stays a lane write.
+                    authoritative: own_ticket.is_none() && handoff.is_some(),
+                    settings,
+                })
+                .await
+            {
+                tracing::error!(target: "invariant",
+                    provider = PROVIDER, session_id = %session_id,
+                    error = %e,
+                    "freshagent.opencode.resume_binding_failed_typed: the durable row \
+                     write failed — the rebuilt session is torn down (kata b8ke ext r22 F2)"
+                );
+                let removed = {
+                    let mut guard = self.sessions.lock().await;
+                    guard.remove(session_id)
+                };
+                if let Some(removed) = removed {
+                    let mut s = removed.lock().await;
+                    s.killed.store(true, Ordering::SeqCst);
+                    if let Some(task) = s.turn_task.take() {
+                        task.abort_and_settle().await;
+                    }
+                    if let Some(bridge) = s.serve_bridge.take() {
+                        bridge.abort();
+                    }
+                }
+                return Err(ResumeOpencodeError::Manager(
+                    freshell_opencode::ServeError::Transport(format!(
+                        "opencode session {session_id} resume record could not be persisted; torn down"
+                    )),
+                ));
+            }
+        }
+
+        // fresheyes ep2-r2 Major (the transitional-window dead bridge): the
+        // resume installed its bridge BEFORE the map publication and the
+        // claim commits above, so a daemon loss inside that window killed
+        // the fresh bridge with every recovery trigger spent (an
+        // unpublished session is invisible to the revival pass; a plain
+        // resume holds no `Live` state for it to rescue either; the
+        // re-warm's already-running fast path emits no second `Started`).
+        // Every failure gate has passed — the rescue tail re-checks the
+        // bridge HERE, before the success return, so the resume never
+        // hands back a session whose bridge died in its own window.
+        //
+        // ep2-r3: a REFUSAL (the session was killed/handed off between the
+        // commit and this tail — the mover's teardown owns the cleanup)
+        // answers the stale-commit ownership-changed error instead: never
+        // a handed-back retired session, and never a resurrected bridge for
+        // it either. The under-ticket handoff continuation runs inside the
+        // RUNNER's own lifecycle window (`handoff.is_some()`) — the rescue's
+        // coordinator observation is skipped for exactly that leg (the
+        // runner performs the one `commit_live`); the killed check and the
+        // map re-lookup remain its gates.
+        // ep2-r5: the refusal set now includes a same-key REPLACEMENT —
+        // the rescue is bound to THIS resume's committed instance (the
+        // `session_arc` it returns below, so a replacement under the key
+        // can never be adopted and the retired `Arc` can never be handed
+        // back) and, for the own-commit leg, the resume's committed
+        // (epoch, generation) fence.
+        if matches!(
+            self.rescue_transitional_bridge_after_commit(
+                session_id,
+                handoff.is_some(),
+                &OpencodeSessionHandle::new(Arc::clone(&session_arc)),
+                Self::committed_lane_fence(&self.fresh_agent.ownership, own_ticket.as_ref()),
+            )
+            .await,
+            TransitionalBridgeRescue::Refused
+        ) {
+            return Err(ResumeOpencodeError::Manager(
+                freshell_opencode::ServeError::Transport(format!(
+                    "opencode session {session_id} ownership changed during resume; \
+                     the session was retired mid-operation"
+                )),
+            ));
         }
 
         Ok(session_arc)
@@ -3607,6 +6588,655 @@ impl FreshOpencodeState {
                 }
             }
         })
+    }
+
+    /// Install a fresh serve-SSE bridge on `session` for `real_id`, stamped
+    /// with the CURRENT daemon's `ownership_id` — the daemon-generation
+    /// fence [`Self::restart_session_bridge_guarded`] compares against.
+    /// EVERY bridge install goes through here (materialization, the resume
+    /// and fork-child constructions, the guarded restart), so the
+    /// handle/stamp pair can never drift apart.
+    async fn install_serve_bridge(
+        &self,
+        manager: &OpencodeServeManager,
+        session: &mut OpencodeSession,
+        real_id: &str,
+    ) {
+        // Read the identity BEFORE spawning: the stamp names the daemon
+        // whose event stream the bridge is about to subscribe to. A daemon
+        // lost in between is caught by the fence itself (the stamp no longer
+        // matches the running daemon, or none runs) — the next revival pass
+        // or fenced attach restarts the bridge.
+        let daemon = manager.ownership_id().await;
+        session.serve_bridge = Some(self.spawn_serve_bridge(
+            manager.clone(),
+            real_id.to_string(),
+            session.turn_errored.clone(),
+        ));
+        session.serve_bridge_daemon = daemon;
+    }
+
+    // ── Task 4 (opencode daemon-death recovery): the runtime-level self-heal ──
+
+    /// Arm the runtime's daemon-loss watcher (2026-09-20 incident: the shared
+    /// `opencode serve` daemon died and NOTHING told the panes — no status
+    /// edge, no bridge revival; panes dead-ended on the snapshot 409).
+    /// Idempotent: the set-once [`OnceLock`] guarantees exactly ONE listener
+    /// per state no matter how many handlers call this. Armed from
+    /// [`Self::handle_send`] / [`Self::handle_attach`] / [`Self::handle_compact`]
+    /// — the opencode WS entry points — so the listener exists before any
+    /// session traffic can depend on it. The watcher task holds a FULL state
+    /// clone (LB-10), so `spawn_serve_bridge(&self, ..)` is callable directly.
+    ///
+    /// - `Lost{reason}`: WARN `freshagent.opencode.daemon_loss_observed`, then
+    ///   fan the typed `OPENCODE_DAEMON_LOST` edge out to every MATERIALIZED
+    ///   session ([`Self::fan_out_daemon_loss_edge`]). The manager's own
+    ///   backoff-guarded re-warm (Task 3) is already scheduled at that point.
+    /// - `Started`: the LEVEL-TRIGGERED revival pass
+    ///   ([`Self::revive_dead_bridges_if_daemon_running`]) — never dependent
+    ///   on having observed `Lost` (LB-02: tokio broadcast does NOT replay
+    ///   history to late subscribers).
+    /// - `Lagged`: continue (LB-08: never disarm on lag).
+    /// - `Closed`: the manager (and its signal sender) is gone — return.
+    ///
+    /// NO CHIME (the freshcodex onExit mirror's discipline): neither edge of
+    /// this watcher ever emits `freshAgent.turn.complete` — a crash is not a
+    /// positive completion.
+    async fn ensure_daemon_loss_watcher(&self) {
+        if self.daemon_loss_watcher.set(()).is_err() {
+            return; // already armed (the cell is Arc-shared across every clone)
+        }
+        let manager = self.fresh_agent.ensure_manager().await;
+        let state = self.clone();
+        let mut signals = manager.subscribe_daemon_signals();
+        tokio::spawn(async move {
+            // Arming-time LEVEL pass (LB-02): broadcast does NOT replay
+            // history — a daemon that re-warmed before this subscription
+            // must still get its dead bridges revived now.
+            state.revive_dead_bridges_if_daemon_running().await;
+            loop {
+                match signals.recv().await {
+                    Ok(DaemonSignal::Lost { reason }) => {
+                        tracing::warn!(target: "freshell_freshagent::opencode",
+                            reason = reason,
+                            "freshagent.opencode.daemon_loss_observed: the shared \
+                             opencode serve daemon was lost — fanning the typed edge \
+                             out to every materialized session; the manager's \
+                             backoff-guarded re-warm is already scheduled"
+                        );
+                        state.fan_out_daemon_loss_edge().await;
+                    }
+                    Ok(DaemonSignal::Started) => {
+                        // LEVEL-TRIGGERED revival (LB-02): revive whatever is
+                        // dead right now — no `saw_loss` heuristic.
+                        state.revive_dead_bridges_if_daemon_running().await;
+                    }
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => return,
+                }
+            }
+        });
+    }
+
+    /// The daemon-loss fan-out (Task 4): exactly ONE typed edge per
+    /// MATERIALIZED session —
+    /// `freshAgent.event{provider:"opencode", sessionType:"freshopencode",
+    /// event:{type:"freshAgent.error", code:"OPENCODE_DAEMON_LOST", message}}`
+    /// — which the client folds through the EXISTING generic `sessionError`
+    /// path (the dismissible "Agent error:" banner + busy-clear). The
+    /// sessions map is keyed by BOTH the placeholder and the durable id
+    /// pointing at the SAME session (`remember()` mirror) — dedupe by
+    /// `real_session_id` (BTreeSet) so each materialized session gets exactly
+    /// ONE edge. The message names the re-warm so the banner reads as the
+    /// self-heal it is, and NO chime ever accompanies it.
+    async fn fan_out_daemon_loss_edge(&self) {
+        const CODE: &str = "OPENCODE_DAEMON_LOST";
+        const MESSAGE: &str =
+            "The opencode serve daemon was lost unexpectedly - it is restarting automatically.";
+        for id in self.materialized_session_ids().await {
+            self.emit_fresh_agent_error(&id, CODE, MESSAGE);
+        }
+    }
+
+    /// The distinct durable `ses_*` ids of every MATERIALIZED session in the
+    /// map (dual-key dedupe), for the loss fan-out and the revival pass
+    /// alike. LB-01: the sessions-map guard is NEVER held across a
+    /// per-session lock (the documented contract above — the reverse edge
+    /// deadlocked production) — the session `Arc`s are cloned out under ONE
+    /// short map lock, the guard drops, and each session is read outside it.
+    async fn materialized_session_ids(&self) -> Vec<String> {
+        let arcs: Vec<Arc<TokioMutex<OpencodeSession>>> = {
+            let map = self.sessions.lock().await;
+            map.values().cloned().collect()
+        };
+        let mut ids = std::collections::BTreeSet::new();
+        for arc in arcs {
+            if let Some(id) = arc.lock().await.real_session_id.clone() {
+                ids.insert(id);
+            }
+        }
+        ids.into_iter().collect()
+    }
+
+    /// The LEVEL-TRIGGERED revival pass (Task 4, LB-02): restart dead/absent
+    /// serve-SSE bridges for MATERIALIZED sessions while the shared daemon
+    /// runs, and push `freshAgent.session.snapshot{status:"idle"}` ONLY to
+    /// sessions whose bridge was actually restarted (the client treats that
+    /// push as snapshot-invalidating → transcript refetch). Called on watcher
+    /// arming and on every `DaemonSignal::Started` — never dependent on
+    /// having observed `Lost`. "Dead" is judged by the shared tail's
+    /// daemon-generation fence ([`Self::restart_session_bridge_guarded`]):
+    /// a bridge still bound to a LOST daemon generation restarts even
+    /// while its old task is draining (the doomed-bridge revival race,
+    /// delta round 2); a bridge already bound to the CURRENT daemon is
+    /// healthy and is neither restarted nor re-pushed.
+    ///
+    /// The ownership coordinator (plan-review round 3) is respected at every
+    /// step: (1) `base_url()` is None → return (daemon absent — nothing to
+    /// revive into; the next `Started` or a fenced attach drives revival);
+    /// (2) snapshot the map (clone the `Arc`s under one short lock, drop the
+    /// guard); (3) per candidate OUTSIDE the map guard: RE-LOOKUP the id at
+    /// revival time (a killed/handed-off session's keys are gone — never act
+    /// on the retained `Arc` alone), observe the CANONICAL ownership state
+    /// fresh, skip on ANY transition (Handoff/Starting/Stopping/Fenced) or a
+    /// terminal owner, revive only `Live{FreshAgent}` (this runtime's own
+    /// sessions) behind the SAME `arm_adopt_guard` the attach path uses,
+    /// then run the shared [`Self::restart_session_bridge_guarded`] tail. An
+    /// unwired coordinator applies no gate (the pre-wiring legacy: map
+    /// membership is the only authority).
+    async fn revive_dead_bridges_if_daemon_running(&self) {
+        let manager = self.fresh_agent.ensure_manager().await;
+        if manager.base_url().await.is_none() {
+            return;
+        }
+        for durable in self.materialized_session_ids().await {
+            // (3a) Re-lookup at revival time — the retained Arc alone is
+            // stale the moment a kill/handoff removes the keys.
+            let session_arc = {
+                let map = self.sessions.lock().await;
+                map.get(&durable).cloned()
+            };
+            let Some(session_arc) = session_arc else {
+                continue;
+            };
+            // (3b) The ownership gate — armed with the SAME adopt-guard
+            // machinery the attach path uses, so the coordinator's
+            // atomicity rides along instead of being re-implemented.
+            let mut adopt_guard = None;
+            if self.fresh_agent.ownership.is_some() {
+                let snap = self
+                    .fresh_agent
+                    .canonical_ownership_snapshot(PROVIDER, &durable);
+                match snap.state {
+                    freshell_ownership::OwnershipState::Live { owner, .. }
+                        if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent =>
+                    {
+                        let expected = freshell_ownership::OwnerIdentity {
+                            kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                            terminal_id: None,
+                            live_session_key: None,
+                            pid: None,
+                            ownership_id: None,
+                        };
+                        match crate::ownership_lane::arm_adopt_guard(
+                            &self.fresh_agent.ownership,
+                            PROVIDER,
+                            &durable,
+                            &format!("daemon-revive-{}", uuid::Uuid::new_v4()),
+                            &expected,
+                            freshell_ownership::ObservedFence {
+                                epoch: snap.epoch,
+                                generation: snap.generation,
+                            },
+                            "freshopencode/daemon-revival",
+                        ) {
+                            crate::ownership_lane::LaneAttachGuard::Armed(guard) => {
+                                adopt_guard = Some(guard)
+                            }
+                            // The coordinator moved between the observe and
+                            // the arm — a lifecycle owns the window; skip,
+                            // never force.
+                            crate::ownership_lane::LaneAttachGuard::Refused => continue,
+                            crate::ownership_lane::LaneAttachGuard::Unwired => {}
+                        }
+                    }
+                    // Any transition (Handoff/Starting/Stopping/Fenced), a
+                    // terminal owner, a vacant key, any other kind: someone
+                    // else's window — never revive into it.
+                    _ => continue,
+                }
+            }
+            // (3c/3d) The shared guarded-restart tail, under the session
+            // lock; the snapshot push goes ONLY to actually-restarted
+            // bridges. `Ok(None)` (bridge alive against the CURRENT daemon /
+            // unmaterialized) is the quiet no-op.
+            let restarted = {
+                let mut session = session_arc.lock().await;
+                self.restart_session_bridge_guarded(&mut session).await
+            };
+            match restarted {
+                Ok(Some(real_id)) => {
+                    self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %durable, error = %err,
+                        "freshagent.opencode.daemon_revival_restart_failed: the \
+                         bridge restart's bounded daemon respawn failed — the next \
+                         Started signal or a fenced attach retries"
+                    );
+                }
+            }
+            // The guard covered the restart; release the window.
+            drop(adopt_guard);
+        }
+    }
+
+    /// The GUARD-HELD bridge-restart tail (the Task 4 refactor): the ONE
+    /// shared restart both [`Self::handle_attach`]'s dead-bridge arm and the
+    /// revival pass ([`Self::revive_dead_bridges_if_daemon_running`]) call.
+    /// Callers arm `ownership_lane::arm_adopt_guard` and hold it ACROSS this
+    /// call so a handoff beginning inside the window answers the typed
+    /// Blocked outcome. The caller holds the per-session lock here (NEVER
+    /// the sessions-map guard — LB-01).
+    ///
+    /// LB-05 (falsified → redesign): in the incident the fenced attach was
+    /// exercised 3× against the dead shared daemon and recovered nothing —
+    /// the tail only re-subscribed the bridge. A restart must first
+    /// `ensure_started()` the shared daemon (mirroring
+    /// `resume_durable_session`'s map-miss behavior); `ensure_started` is
+    /// single-flighted, so concurrent attach/send/compact callers cannot
+    /// spawn a second daemon.
+    ///
+    /// Delta round 2 (fresheyes Major — the doomed-bridge revival race):
+    /// task liveness alone is NOT bridge health. The manager's loss path
+    /// fans `Lost` and re-warms INDEPENDENTLY of the bridge tasks, so a
+    /// bridge still draining its closed channel when the new daemon's
+    /// `Started` revival pass (or a fenced attach) reaches this tail is
+    /// ALIVE-but-DOOMED. The daemon-generation fence: the bridge is
+    /// healthy ONLY while its task is unfinished AND its
+    /// [`OpencodeSession::serve_bridge_daemon`] stamp matches the CURRENT
+    /// daemon's `ownership_id` (an absent daemon orphans every bridge; an
+    /// unstamped handle is unreachable by construction — every install
+    /// stamps — and fails toward recovery).
+    ///
+    /// `Ok(Some(real_id))` — the bridge was (re)started; `Ok(None)` — nothing
+    /// to do (unmaterialized, or the bridge is alive against the current
+    /// daemon); `Err` — the BOUNDED respawn failed (the caller answers
+    /// typed, never a silent half-attached state).
+    async fn restart_session_bridge_guarded(
+        &self,
+        session: &mut OpencodeSession,
+    ) -> Result<Option<String>, ServeError> {
+        // Only meaningful once a durable session exists; a not-yet-
+        // materialized session has never started a bridge (`bindServeStream`
+        // only fires from `materializeOrSend`).
+        let Some(real_id) = session.real_session_id.clone() else {
+            return Ok(None);
+        };
+        let manager = self.fresh_agent.ensure_manager().await;
+        let current_daemon = manager.ownership_id().await;
+        let bridge_bound_to_current_daemon = matches!(
+            (&session.serve_bridge_daemon, &current_daemon),
+            (Some(stamp), Some(current)) if stamp == current
+        );
+        let bridge_dead = session
+            .serve_bridge
+            .as_ref()
+            .map(|handle| handle.is_finished() || !bridge_bound_to_current_daemon)
+            .unwrap_or(true);
+        if !bridge_dead {
+            return Ok(None);
+        }
+        manager.ensure_started().await?;
+        // The superseded/draining task is ABORTED, not merely detached:
+        // dropping a JoinHandle does not reap the task, and a doomed
+        // bridge must not outlive the replacement it lost to.
+        if let Some(old) = session.serve_bridge.take() {
+            old.abort();
+        }
+        self.install_serve_bridge(&manager, session, &real_id).await;
+        Ok(Some(real_id))
+    }
+
+    /// The POST-COMMIT transitional-bridge rescue tail (fresheyes ep2-r2
+    /// Major — the transitional-window dead bridge; HARDENED ep2-r3 — the
+    /// rescue can resurrect a killed/handed-off session): the fork-child
+    /// and resume constructions install the generation-fenced bridge
+    /// BEFORE the session is published in `sessions` and committed
+    /// `Live`, so a daemon loss landing inside that window kills the fresh
+    /// bridge (the loss sweep claims its just-subscribed sender; the fanned
+    /// `Lost` closes its channel) while every recovery trigger misses it —
+    /// the successor's one-shot `Started` revival pass cannot see an
+    /// unpublished session, deliberately skips transitional ownership
+    /// states, and the re-warm's already-running fast path emits no second
+    /// `Started`. The operation would otherwise answer success over a
+    /// permanently dead bridge. The tail closes the window from the
+    /// operation's own side: after the `Live` commit (the only state the
+    /// revival pass rescues), it re-runs the SAME fenced
+    /// [`Self::restart_session_bridge_guarded`] tail the revival pass
+    /// uses — a bridge still alive against the CURRENT daemon is the
+    /// quiet `Healthy` no-op (no push, no restart: the happy path is
+    /// byte-identical), a bridge stamped to the lost generation (or
+    /// exited, or absent) is restarted against the successor and the
+    /// client gets the one recovery snapshot. The position-independent
+    /// re-check covers BOTH window variants — the unpublished leg (a
+    /// revival pass can never see a session before its map publication)
+    /// and the published-`Starting` leg (a pass that sees it must skip
+    /// it) — because it judges the bridge's health at tail time, not
+    /// where in the window the loss landed.
+    ///
+    /// **ep2-r3 hardening — the rescue rides the ESTABLISHED
+    /// ownership-coordinator-gated restart discipline** (the same gates
+    /// the revival pass and the fenced attach use), never a bare
+    /// install on a retained `Arc`: (a) a FRESH map re-lookup — a miss
+    /// is the typed [`TransitionalBridgeRescue::Refused`] (the keys were
+    /// removed by a kill/handoff whose teardown already aborted the
+    /// bridge), never a silent success over the retired session;
+    /// (b) the CANONICAL ownership observation + `arm_adopt_guard` window
+    /// — revive only `Live{FreshAgent}`; every transition
+    /// (Handoff/Starting/Stopping/Fenced), a terminal owner, and a
+    /// vacant key refuse, and the guard is held ACROSS the restart so a
+    /// handoff beginning inside the window answers its typed Blocked
+    /// outcome; (c) the `killed` check UNDER the session lock — a
+    /// kill/close/handoff teardown that completed between the map clone
+    /// and the lock take is final, never resurrected (its detached
+    /// `JoinHandle` would keep broadcasting for the retired session).
+    /// `own_lifecycle_window` skips ONLY the observation (b): the
+    /// under-ticket handoff continuation resumes inside the RUNNER's own
+    /// held claim (the coordinator key is mid-transition by design and
+    /// the runner — not this lane — performs the one `commit_live`), so
+    /// the killed check and the map re-lookup remain its gates. Every
+    /// caller whose lifecycle window has ALREADY committed passes
+    /// `false` — the observation then sees the caller's own
+    /// `Live{FreshAgent}` and arms the adopt guard across the restart
+    /// (the revival pass's exact discipline): the lane's own-commit
+    /// tails (fork/resume) and, since ep2-r4, the handoff runner's
+    /// post-commit re-check for its freshopencode targets — the
+    /// runner's commit is the ONE `Live` commit an under-ticket
+    /// continuation ever gets, so the runner re-runs this seam after it
+    /// (a daemon loss in the runner's awaited flavor-write window kills
+    /// the just-rescued bridge with every other recovery trigger spent:
+    /// the successor's `Started` revival pass skips the transitional
+    /// owner, and the commit itself emits no new daemon signal).
+    ///
+    /// **ep2-r5 hardening — the rescue is bound to the identity the
+    /// CALLER committed, never to whichever session currently occupies
+    /// the durable id**: every caller passes its committed session
+    /// instance ([`OpencodeSessionHandle`]) and its committed ownership
+    /// fence (the `(epoch, generation)` pair observed at ITS commit).
+    /// The by-id map re-lookup must return the SAME instance
+    /// (`Arc::ptr_eq` against the caller's handle) — a same-key
+    /// REPLACEMENT (the original killed/removed and another resume's
+    /// brand-new session object under the same durable id, moved in
+    /// during the awaited post-commit work) is a different instance and
+    /// REFUSES, never gets adopted — and, when the coordinator gates
+    /// the call, the canonical observation must still hold the CALLER's
+    /// OWN committed `(epoch, generation)` era: a replacement's
+    /// same-kind `Live{FreshAgent}` at a NEWER generation refuses too
+    /// (the kind-only expected-owner check alone accepted it — the
+    /// finding's exact hole). On either mismatch the outcome is
+    /// [`TransitionalBridgeRescue::Refused`]: the operation surfaces its
+    /// typed ownership-changed error, never answers success carrying its
+    /// obsolete generation, and never restarts a bridge on the retired
+    /// instance (the resume caller would otherwise hand back its
+    /// removed-and-killed `Arc`). The under-ticket pre-commit leg
+    /// (`own_lifecycle_window = true`) passes no fence — the runner's
+    /// `Live` commit is still ahead — so the instance binding, the
+    /// killed check, and the map re-lookup remain its gates; the
+    /// post-commit callers (the fork/resume tails, the handoff runner's
+    /// re-check) always carry the committed fence.
+    ///
+    /// A [`TransitionalBridgeRescue::Refused`] never installs and never
+    /// pushes: the mover's teardown owns the cleanup (the kill/handoff
+    /// paths remove every key, set the killed flag, and abort the bridge
+    /// under the same locks this rescue re-verifies), and the OPERATION
+    /// surfaces its typed ownership-changed error — the stale-commit
+    /// path's shape — instead of answering success over the retired
+    /// session. A bounded respawn failure still WARNS and the operation
+    /// still succeeds (the session is registered and visible to the next
+    /// `Started` revival pass and fenced attaches — the revival pass's
+    /// failure handling, verbatim).
+    pub(crate) async fn rescue_transitional_bridge_after_commit(
+        &self,
+        durable: &str,
+        own_lifecycle_window: bool,
+        committed: &OpencodeSessionHandle,
+        committed_fence: Option<freshell_ownership::ObservedFence>,
+    ) -> TransitionalBridgeRescue {
+        // ep2-r5 test seam (`cfg(test)`-only): park BEFORE the map
+        // re-lookup — the window where a test can complete a same-key
+        // kill+replace while the rescue is in flight, so the re-lookup
+        // below then observes whichever session the mover left under the
+        // key. See [`Self::arm_rescue_lookup_stall`].
+        #[cfg(test)]
+        if let Some(gate) = self.take_rescue_lookup_stall(durable) {
+            let _ = gate.entered_tx.send(());
+            // Take the release receiver OUT of its Mutex before awaiting —
+            // the std guard is not Send and must not live across the await.
+            let release = gate
+                .release_rx
+                .lock()
+                .expect("rescue lookup stall latch mutex")
+                .take();
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+        }
+        // (a) The fresh map re-lookup — the retained-claim-alone rule (the
+        // revival pass's (3a)): a session whose map keys are gone was
+        // killed/handed off mid-operation and its teardown already aborted
+        // the bridge. Never act on the retained claim alone.
+        let session_arc = {
+            let map = self.sessions.lock().await;
+            map.get(durable).cloned()
+        };
+        let Some(session_arc) = session_arc else {
+            return TransitionalBridgeRescue::Refused;
+        };
+        // (a′) The committed-INSTANCE binding (ep2-r5): the re-lookup must
+        // return the SAME session instance the caller committed —
+        // `Arc::ptr_eq` against the caller's handle. A replacement resume
+        // under the same durable id is a brand-new object: adopting it
+        // would answer the operation's success over ITS OWN retired
+        // session while the replacement lives under the key (and the
+        // resume caller would hand back its removed-and-killed `Arc` for a
+        // later bridge restart). Refuse — the mover's teardown owns the
+        // original's cleanup and the replacement's own lifecycle owns the
+        // key now.
+        if !committed.ptr_eq(&session_arc) {
+            return TransitionalBridgeRescue::Refused;
+        }
+        // ep2-r3 test seam (`cfg(test)`-only): park the rescue in the exact
+        // window the fresheyes finding names — the session `Arc` is CLONED
+        // and the session lock is not yet taken — so a test can complete a
+        // real kill/handoff against the retained `Arc` before the rescue
+        // proceeds. See [`Self::arm_rescue_stall`].
+        #[cfg(test)]
+        if let Some(gate) = self.take_rescue_stall(durable) {
+            let _ = gate.entered_tx.send(());
+            // Take the release receiver OUT of its Mutex before awaiting —
+            // the std guard is not Send and must not live across the await.
+            let release = gate
+                .release_rx
+                .lock()
+                .expect("rescue release latch mutex")
+                .take();
+            if let Some(release) = release {
+                let _ = release.await;
+            }
+        }
+        // (b) The ownership gate — the revival pass's (3b) shape: observe
+        // the CANONICAL state fresh, revive only Live{FreshAgent}, and arm
+        // the SAME adopt-guard the attach path uses so the coordinator's
+        // atomicity rides across the restart below. An unwired coordinator
+        // applies no gate (the pre-wiring legacy: the killed check and the
+        // map re-lookup are the authority).
+        let mut adopt_guard = None;
+        if !own_lifecycle_window && self.fresh_agent.ownership.is_some() {
+            let snap = self
+                .fresh_agent
+                .canonical_ownership_snapshot(PROVIDER, durable);
+            match snap.state {
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent =>
+                {
+                    // (b′) The committed-FENCE binding (ep2-r5): the
+                    // coordinator must still hold the CALLER's OWN era —
+                    // the observed `(epoch, generation)` must EQUAL the
+                    // pair the caller committed, not merely be a
+                    // same-kind Live. A replacement resume committed at a
+                    // strictly newer per-key generation (generations are
+                    // monotonic and never reset), so the equality refuses
+                    // exactly the shape the kind-only check accepted
+                    // before.
+                    let Some(committed_fence) = committed_fence else {
+                        // A post-commit rescue over a WIRED coordinator
+                        // with no committed fence has no era to verify —
+                        // fail closed, never restart into an unverified
+                        // ownership window. Unreachable for the real
+                        // callers (a wired registry grants every
+                        // own-commit caller a ticket; the handoff runner
+                        // always carries its committed pair).
+                        return TransitionalBridgeRescue::Refused;
+                    };
+                    if snap.epoch != committed_fence.epoch
+                        || snap.generation != committed_fence.generation
+                    {
+                        return TransitionalBridgeRescue::Refused;
+                    }
+                    let expected = freshell_ownership::OwnerIdentity {
+                        kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                        terminal_id: None,
+                        live_session_key: None,
+                        pid: None,
+                        ownership_id: None,
+                    };
+                    match crate::ownership_lane::arm_adopt_guard(
+                        &self.fresh_agent.ownership,
+                        PROVIDER,
+                        durable,
+                        &format!("transitional-rescue-{}", uuid::Uuid::new_v4()),
+                        &expected,
+                        freshell_ownership::ObservedFence {
+                            epoch: snap.epoch,
+                            generation: snap.generation,
+                        },
+                        "freshopencode/transitional-rescue",
+                    ) {
+                        crate::ownership_lane::LaneAttachGuard::Armed(guard) => {
+                            adopt_guard = Some(guard)
+                        }
+                        // The coordinator moved between the observe and the
+                        // arm — a lifecycle owns the window; skip, never
+                        // force.
+                        crate::ownership_lane::LaneAttachGuard::Refused => {
+                            return TransitionalBridgeRescue::Refused
+                        }
+                        // Unreachable with a wired registry (checked above);
+                        // kept total against the enum.
+                        crate::ownership_lane::LaneAttachGuard::Unwired => {}
+                    }
+                }
+                // Any transition (Handoff/Starting/Stopping/Fenced), a
+                // terminal owner, a vacant key, any other kind: someone
+                // else's window — never revive into it.
+                _ => return TransitionalBridgeRescue::Refused,
+            }
+        }
+        // (c) The session lock: the killed check, then the shared guarded
+        // restart tail (the per-session lock is held here — never the
+        // sessions-map guard; LB-01). The adopt-guard (b) covers the
+        // restart and releases at the return below.
+        let restarted = {
+            let mut session = session_arc.lock().await;
+            if session.killed.load(Ordering::SeqCst) {
+                // A kill/close/handoff teardown marked the session retired
+                // while this rescue held its pre-lock clone — never
+                // resurrect; the teardown owns the cleanup.
+                return TransitionalBridgeRescue::Refused;
+            }
+            self.restart_session_bridge_guarded(&mut session).await
+        };
+        drop(adopt_guard);
+        match restarted {
+            Ok(Some(real_id)) => {
+                self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+                TransitionalBridgeRescue::Restarted
+            }
+            Ok(None) => TransitionalBridgeRescue::Healthy,
+            Err(err) => {
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %durable, error = %err,
+                    "freshagent.opencode.transitional_bridge_rescue_failed: the \
+                     post-commit bridge rescue's bounded daemon respawn failed — \
+                     the next Started signal or a fenced attach retries"
+                );
+                TransitionalBridgeRescue::RespawnFailed
+            }
+        }
+    }
+}
+
+/// The post-commit rescue's outcome (ep2-r3): the operation tail (the
+/// fork's reply, the resume's return, the handoff runner's post-commit
+/// re-check) consumes this to decide between its success path and its
+/// typed ownership-changed refusal. See
+/// [`FreshOpencodeState::rescue_transitional_bridge_after_commit`].
+pub(crate) enum TransitionalBridgeRescue {
+    /// The bridge was (re)started against the successor daemon and the
+    /// client got its one recovery snapshot (pushed by the rescue itself —
+    /// only actually-restarted bridges are ever pushed).
+    Restarted,
+    /// Nothing to do — the bridge is alive against the current daemon (or
+    /// the session is unmaterialized): the quiet no-op; the operation
+    /// succeeds unchanged.
+    Healthy,
+    /// The bounded daemon respawn failed — WARN-only; the operation still
+    /// succeeds (the registered session is visible to the next `Started`
+    /// revival pass and fenced attaches).
+    RespawnFailed,
+    /// The session was retired or transitioned between the commit and the
+    /// tail — its map keys are gone (a kill/handoff removed them), its
+    /// `killed` flag is set under the session lock, the map key now holds
+    /// a DIFFERENT session instance than the caller committed (a same-key
+    /// replacement), or the canonical ownership no longer holds the
+    /// caller's committed `(epoch, generation)` era (and is not this
+    /// operation's own lifecycle window): NEVER resurrect, never adopt
+    /// the replacement, never answer success carrying an obsolete
+    /// generation. The mover's teardown owns the cleanup; the operation
+    /// must surface its typed ownership-changed error instead of
+    /// answering success over the retired session.
+    Refused,
+}
+
+/// An opaque handle to ONE live freshopencode session instance (fresheyes
+/// ep2-r5): identity is the `Arc` pointer itself, so a same-key
+/// REPLACEMENT — another resume's brand-new session object under the
+/// SAME durable id — can never masquerade as the instance a caller
+/// committed. The handoff runner carries this out of its under-ticket
+/// resume (the Ok payload of
+/// [`FreshOpencodeState::opencode_resume_for_handoff`] → `start_target`)
+/// and hands it back to
+/// [`FreshOpencodeState::rescue_transitional_bridge_after_commit`],
+/// which verifies it with `Arc::ptr_eq` against the sessions map's
+/// current entry. The wrapped [`OpencodeSession`] stays private to this
+/// module; the runner only ever passes the handle through.
+#[derive(Clone)]
+pub(crate) struct OpencodeSessionHandle(Arc<TokioMutex<OpencodeSession>>);
+
+impl OpencodeSessionHandle {
+    /// Wrap the session instance a caller is committing (or has just
+    /// committed) under its durable id.
+    fn new(instance: Arc<TokioMutex<OpencodeSession>>) -> Self {
+        Self(instance)
+    }
+
+    /// The committed-instance binding (ep2-r5): true iff `current` IS the
+    /// session instance this handle was minted from.
+    fn ptr_eq(&self, current: &Arc<TokioMutex<OpencodeSession>>) -> bool {
+        Arc::ptr_eq(&self.0, current)
     }
 }
 
@@ -3878,6 +7508,74 @@ mod tests {
                 hostname: "127.0.0.1".into(),
                 port: 1,
             })
+        }
+    }
+
+    /// b8ke focused round-3 R3-2: a fake that RECORDS the per-session
+    /// `prompt_async` and `abort` POSTs (with the session id each was
+    /// issued for) — the kill/handoff quiescence tests assert the
+    /// daemon-side abort actually landed for the REAL session id.
+    #[derive(Default)]
+    struct AbortRecordingHttp {
+        next_session: AtomicUsize,
+        prompts: StdMutex<Vec<String>>,
+        aborts: StdMutex<Vec<String>>,
+    }
+    impl AbortRecordingHttp {
+        fn session_of(url: &str, marker: &str) -> Option<String> {
+            url.split(marker)
+                .nth(1)?
+                .split(['/', '?'])
+                .next()
+                .map(str::to_string)
+        }
+        fn await_prompt(&self, budget: Duration) -> String {
+            let deadline = std::time::Instant::now() + budget;
+            loop {
+                if let Some(id) = self.prompts.lock().unwrap().first().cloned() {
+                    return id;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the prompt POST was never dispatched"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+    impl ServeHttp for AbortRecordingHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let is_create = matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            let body = if is_create {
+                let n = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+                serde_json::to_vec(&json!({ "id": format!("ses_{n}"), "directory": null })).unwrap()
+            } else {
+                b"{}".to_vec()
+            };
+            if !is_create {
+                if let Some(id) = Self::session_of(&req.url, "/session/") {
+                    if req.url.contains("/prompt_async")
+                        && matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                    {
+                        self.prompts.lock().unwrap().push(id);
+                    } else if req.url.contains("/abort")
+                        && matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                    {
+                        self.aborts.lock().unwrap().push(id);
+                    }
+                }
+            }
+            Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) })
         }
     }
 
@@ -4199,7 +7897,7 @@ mod tests {
 
         let started = std::time::Instant::now();
         let out = state
-            .resume_durable_session("ses_wedged_1", None, None)
+            .resume_durable_session("ses_wedged_1", None, None, None, None)
             .await;
         std::env::remove_var("FRESHELL_OPENCODE_GET_SESSION_TIMEOUT_MS");
         assert!(
@@ -4227,6 +7925,8 @@ mod tests {
     fn create_msg(request_id: &str) -> FreshAgentCreate {
         FreshAgentCreate {
             naming_handle: None,
+            observed_epoch: None,
+            observed_generation: None,
             request_id: request_id.to_string(),
             session_type: SessionType::Freshopencode,
             cwd: None,
@@ -4376,7 +8076,27 @@ mod tests {
         }
     }
 
+    /// b8ke ext r31 F1: the RESHAPED helper pair. `send_msg` is now the
+    /// thin LEGACY wrapper (no observed pair — the genuine legacy-client
+    /// shape the dozens of pre-existing tests model); every test that
+    /// models a modern client builds its message with
+    /// [`send_msg_fenced`] so the observed pair is REAL, never
+    /// hardcoded to `None` by the helper (pre-r31 the helper always
+    /// set both fields to `None`, so the materialization tests never
+    /// exercised the fenced shapes the protocol and client carry).
     fn send_msg(session_id: &str, text: &str) -> FreshAgentSend {
+        send_msg_fenced(session_id, text, None, None)
+    }
+
+    /// The fenced-send builder: the caller states the observed pair
+    /// explicitly — `(Some, Some)` the fence, `(None, None)` the legacy
+    /// shape, any half the INVALID shape the handler must refuse.
+    fn send_msg_fenced(
+        session_id: &str,
+        text: &str,
+        observed_epoch: Option<u64>,
+        observed_generation: Option<u64>,
+    ) -> FreshAgentSend {
         FreshAgentSend {
             provider: AgentProvider::Opencode,
             session_id: session_id.to_string(),
@@ -4386,6 +8106,8 @@ mod tests {
             images: None,
             request_id: Some(format!("req-{text}")),
             settings: None,
+            observed_epoch,
+            observed_generation,
         }
     }
 
@@ -4598,6 +8320,8 @@ mod tests {
         );
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -4628,6 +8352,114 @@ mod tests {
         );
     }
 
+    /// b8ke focused review FR9: the half-fenced kill refusal carries the
+    /// typed INVALID_FENCE code in the `freshAgent.killed` answer — clients
+    /// reduce the code instead of the generic KILL_FAILED default.
+    /// Pre-fix the frame carried only `success:false`.
+    #[tokio::test]
+    async fn half_fenced_kill_refusal_carries_the_typed_invalid_fence_code() {
+        for (epoch, generation) in [(Some(3u64), None), (None, Some(7u64))] {
+            let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+            let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+            let st = FreshOpencodeState::new(fresh_agent);
+
+            st.handle_kill(FreshAgentKill {
+                observed_epoch: epoch,
+                observed_generation: generation,
+                provider: AgentProvider::Opencode,
+                session_id: "half-fenced-kill".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            })
+            .await;
+
+            let raw = rx.try_recv().expect("the refusal frame");
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(frame["type"], "freshAgent.killed", "{frame}");
+            assert_eq!(frame["success"], json!(false), "{frame}");
+            assert_eq!(
+                frame["code"],
+                json!("INVALID_FENCE"),
+                "the typed refusal code must ride the kill answer: {frame}"
+            );
+        }
+    }
+
+    /// b8ke e3r3 F1: a PLACEHOLDER-ADDRESSED kill on a materialized session
+    /// observes, claims, and stops on the CANONICAL durable key — the
+    /// canonical record commits to Vacant (pre-e3r3 the claim ran against
+    /// the wire id: the VACANT placeholder was claimed while the durable
+    /// Live owner stayed untouched — a successful kill with the registry
+    /// still showing the runtime Live).
+    #[tokio::test]
+    async fn a_placeholder_addressed_kill_commits_the_canonical_record_to_vacant() {
+        let (mut st, _killed) = state().await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-e3r3-f1"), None).await;
+        let placeholder = "freshopencode-req-e3r3-f1";
+        st.handle_send(send_msg(placeholder, "hi")).await;
+        let real_id = {
+            let sessions = st.sessions.lock().await;
+            let guard = sessions
+                .get(placeholder)
+                .expect("placeholder tracked")
+                .lock()
+                .await;
+            guard
+                .real_session_id
+                .clone()
+                .expect("the session materialized")
+        };
+
+        // The CANONICAL durable key holds a Live owner — the materialized
+        // runtime registered through the map-hit gate's adopting commit
+        // (e3r1 F3). CONSUME the retained stamp (the handoff's
+        // kill_for_handoff shape) so the kill runs the NO-STAMP FALLBACK —
+        // the path the canonical-claim contract lives on.
+        let _stamp =
+            crate::ownership_lane::take_retained_stamp(&st.fresh_agent.ownership_stamps, &real_id)
+                .expect("the map-hit registration retained the stamp");
+        assert!(
+            matches!(
+                registry.observe("opencode", &real_id).state,
+                freshell_ownership::OwnershipState::Live {
+                    owner,
+                    ..
+                } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            ),
+            "precondition: the materialized runtime is the canonical Live owner — \
+             got {:?}",
+            registry.observe("opencode", &real_id).state
+        );
+
+        // THE PLACEHOLDER-ADDRESSED KILL.
+        st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        // THE F1 CONTRACT: the CANONICAL record committed to Vacant (the
+        // kill's stop ran against the durable key — never a vacant
+        // placeholder claim with the real owner left Live).
+        assert!(
+            matches!(
+                registry.observe("opencode", &real_id).state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "the canonical record commits to Vacant — the registry no \
+             longer shows the killed runtime Live"
+        );
+    }
+
     /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
     /// explicit kill is an intentional session END. Killing a MATERIALIZED
     /// session must (a) retire its durable row `Closed` through the identity
@@ -4635,6 +8467,411 @@ mod tests {
     /// re-offer a pane the user just closed inside the 7s creation-race grace
     /// window — and (b) clear the pending marker, so a late resolution can
     /// never carry evidence for a pane that provably no longer exists.
+    /// b8ke e3r4 F4: a handoff committing MID-CREATE-AWAIT — the delayed
+    /// create's post-await recheck sees the committed TERMINAL owner and
+    /// ABORTS TYPED: no `freshAgent.created` reassertion beside the new
+    /// owner, no binding re-write. Deterministic via the identity sink's
+    /// binding stall (the create parks in its durable binding write).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_delayed_create_after_a_mid_await_handoff_commit_aborts_typed() {
+        // A manually-built state so the broadcast receiver is RETAINED
+        // (the created-frame reassertion is the observable).
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-e3r4-f4"), None).await;
+        let placeholder = "freshopencode-req-e3r4-f4";
+        st.handle_send(send_msg(placeholder, "hi")).await;
+        let real_id = {
+            let sessions = st.sessions.lock().await;
+            let guard = sessions
+                .get(placeholder)
+                .expect("placeholder tracked")
+                .lock()
+                .await;
+            guard
+                .real_session_id
+                .clone()
+                .expect("the session materialized")
+        };
+
+        // The in-memory create-resume shape: the DURABLE id tracked in
+        // the lane map (the "already rebound locally" keying), then the
+        // binding write STALLED — the handoff commits while the create
+        // awaits.
+        st.insert_live_session_for_test(&real_id).await;
+        // b8ke ext r27 F1: the pair the delayed create OBSERVES before
+        // any of its awaits (the pre-await snapshot the handler captures)
+        // — the compensating upsert must carry exactly this fence.
+        let expected_observed_pair = {
+            let snap = registry.observe("opencode", &real_id);
+            (snap.epoch, snap.generation)
+        };
+        // Drain the setup's frames (the created/materialized broadcasts).
+        while rx.try_recv().is_ok() {}
+        let stall = fake.arm_binding_stall("opencode", &real_id);
+        let st2 = st.clone();
+        let real_id_for_task = real_id.clone();
+        // MEANINGFUL provenance so the in-memory path performs its
+        // re-park + refresh binding write (the stall's park point).
+        let provenance = crate::identity_sink::BindProvenance {
+            client_instance_id: Some("client-e3r4-f4".into()),
+            device_id: Some("device-e3r4-f4".into()),
+            tab_key: Some("device-e3r4-f4:tab-1".into()),
+            asserted_at: 1,
+        };
+        let create_task = tokio::spawn(async move {
+            st2.handle_create_resume(
+                "req-e3r4-f4-resume".to_string(),
+                real_id_for_task,
+                &create_msg("req-e3r4-f4-resume"),
+                Some(provenance),
+            )
+            .await;
+        });
+        // Wait until the create is parked INSIDE its binding write.
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the create reached its binding write");
+
+        // THE HANDOFF COMMITS mid-await: the key goes Live{Terminal}.
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
+            "opencode",
+            &real_id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "handoff-mid-await",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected the handoff begin granted")
+        };
+        assert!(matches!(
+            registry.commit_live(
+                "opencode",
+                &real_id,
+                "handoff-mid-await",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-mid-await".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+
+        // Release the stall: the create's POST-AWAIT RECHECK sees the
+        // Terminal owner → aborts typed — no freshAgent.created.
+        let _ = stall.release.send(());
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(15), create_task).await;
+        // THE F4 CONTRACT: the delayed create ABORTED TYPED — NO
+        // `freshAgent.created` reassertion for its request id (pre-e3r4:
+        // the wildcard broadcast reasserted the Fresh Agent beside the
+        // committed terminal owner).
+        let mut saw_created_reassertion = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.created" && frame["requestId"] == "req-e3r4-f4-resume" {
+                saw_created_reassertion = true;
+            }
+        }
+        assert!(
+            !saw_created_reassertion,
+            "the delayed create emitted NO freshAgent.created reassertion \
+             beside the committed terminal owner"
+        );
+        // And the committed Terminal owner stays authoritative.
+        assert!(
+            matches!(
+                registry.observe("opencode", &real_id).state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal,
+            ),
+            "the committed Terminal owner stays authoritative"
+        );
+
+        // b8ke e3 post-cap F4: THE DURABLE STATE — the turnover happened
+        // during the binding write's own await, so the write landed; the
+        // post-write recheck must have ROLLED IT BACK: the LAST recorded
+        // upsert for the key is the compensating one (keep-when-None
+        // provenance — the PRE-write parked attribution restored), not
+        // the create's Replace reassertion.
+        {
+            let bindings = fake.bindings.lock().unwrap();
+            let last = bindings
+                .iter()
+                .rev()
+                .find(|b| b.session_id == real_id)
+                .expect("at least one binding write for the key");
+            assert_eq!(
+                last.provenance,
+                crate::identity_sink::ProvenanceUpdate::Inherit,
+                "the LAST durable write is the compensating ROLLBACK \
+                 (keep-when-None provenance) — the turnover's stale \
+                 metadata did not survive: {:?}",
+                last.provenance
+            );
+            // b8ke ext r27 F1: the compensating upsert CARRIES the
+            // OBSERVED (epoch, generation) pair — the delayed-write fence
+            // baseline. Pre-r27 it carried (None, None), so the real
+            // ledger could not refuse it and the stale fresh-agent
+            // compensation overwrote the new TERMINAL owner's
+            // authoritative recovery row. With the fence the ledger
+            // refuses the stale compensation typed (STALE_BINDING_PAIR)
+            // and the terminal owner's runtime kind AND terminal identity
+            // survive — pinned end-to-end (production sink + real
+            // PaneLedger) by a_stale_fenced_compensation_cannot_overwrite_
+            // the_terminal_owners_recovery_row (identity_sink tests).
+            assert_eq!(
+                last.observed_epoch,
+                Some(expected_observed_pair.0),
+                "the compensating upsert carries the observed epoch"
+            );
+            assert_eq!(
+                last.observed_generation,
+                Some(expected_observed_pair.1),
+                "the compensating upsert carries the observed generation — \
+                 pre-r27 it was unfenced and could overwrite the new terminal \
+                 owner's recovery row"
+            );
+        }
+    }
+
+    /// b8ke e3r4 F4: the ATTACH path refuses a TERMINAL-owned session
+    /// typed — never the wildcard reuse that restarts the old serve-event
+    /// bridge beside the committed terminal owner.
+    #[tokio::test]
+    async fn an_attach_after_a_terminal_handoff_is_refused_typed() {
+        let (mut st, _killed) = state().await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-e3r4-f4b"), None).await;
+        let placeholder = "freshopencode-req-e3r4-f4b";
+        st.handle_send(send_msg(placeholder, "hi")).await;
+        let real_id = {
+            let sessions = st.sessions.lock().await;
+            let guard = sessions
+                .get(placeholder)
+                .expect("placeholder tracked")
+                .lock()
+                .await;
+            guard
+                .real_session_id
+                .clone()
+                .expect("the session materialized")
+        };
+
+        // The committed TERMINAL owner (a completed handoff).
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
+            "opencode",
+            &real_id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "handoff-terminal",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("expected the handoff begin granted")
+        };
+        assert!(matches!(
+            registry.commit_live(
+                "opencode",
+                &real_id,
+                "handoff-terminal",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-attach".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        ));
+
+        // THE DELAYED ATTACH: the session is still in the lane's map —
+        // the terminal-owner gate must answer the TYPED refusal (never
+        // the wildcard reuse that restarts the serve bridge).
+        st.handle_attach(FreshAgentAttach {
+            provider: AgentProvider::Opencode,
+            session_id: real_id.clone(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+            observed_epoch: None,
+            observed_generation: None,
+            resume_session_id: None,
+            session_ref: None,
+        })
+        .await;
+
+        assert!(
+            matches!(
+                registry.observe("opencode", &real_id).state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal,
+            ),
+            "the terminal owner stays authoritative — the attach was \
+             refused typed (no bridge restart beside it)"
+        );
+    }
+
+    /// b8ke ext r38 F1: the existing-session attach arms the ATOMIC ADOPT
+    /// — the request's observed pair plus the expected fresh-agent owner,
+    /// validated in ONE coordinator decision. A STALE pair (ownership
+    /// advanced after the client observed it — a handoff-and-fail-restore
+    /// bumped the generation) refuses typed with NO bridge restart. This
+    /// is the deterministic stand-in for the precheck-to-arm race: a
+    /// terminal handoff committing between the state precheck and the arm
+    /// advances the generation the same way, so a client whose pair
+    /// predates the commit can never arm. Pre-r38 the arm passed NO pair
+    /// and armed on whatever was live (the laundering class) — a restart
+    /// over a record the request never observed.
+    #[tokio::test]
+    async fn a_stale_pair_existing_session_attach_refuses_typed_without_restarting_the_bridge() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        // A materialized session — the existing-session attach path.
+        st.handle_create(create_msg("req-r38-f1-oc-stale"), None)
+            .await;
+        let placeholder = "freshopencode-req-r38-f1-oc-stale";
+        st.handle_send(send_msg(placeholder, "hi")).await;
+        let real_id = {
+            let sessions = st.sessions.lock().await;
+            let guard = sessions
+                .get(placeholder)
+                .expect("placeholder tracked")
+                .lock()
+                .await;
+            guard
+                .real_session_id
+                .clone()
+                .expect("the session materialized")
+        };
+        // The create's adoption must commit the Live fresh-agent owner.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if matches!(
+                registry.observe("opencode", &real_id).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the create's adoption never committed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // The CLIENT'S pair — observed before the bump.
+        let before = registry.observe("opencode", &real_id);
+
+        // The generation ADVANCES without an owner flip: a handoff
+        // begin (granted) whose fail-restore reinstates the SAME
+        // fresh-agent Live record at the bumped generation.
+        let freshell_ownership::BeginOutcome::Granted { .. } = registry.begin_handoff(
+            "opencode",
+            &real_id,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-r38-f1-oc-bump",
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("the generation-bump handoff must grant")
+        };
+        let _ = registry.fail("opencode", &real_id, "op-r38-f1-oc-bump", 2, true);
+        assert!(
+            matches!(
+                registry.observe("opencode", &real_id).state,
+                freshell_ownership::OwnershipState::Live { owner, generation, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                        && generation == before.generation + 1,
+            ),
+            "the fail-restore must reinstate the fresh-agent owner at the \
+             bumped generation"
+        );
+
+        // THE DELAYED ATTACH with the STALE pair — the state precheck sees
+        // Live (passes); the ADOPT validates the pair and refuses typed.
+        st.handle_attach(FreshAgentAttach {
+            provider: AgentProvider::Opencode,
+            session_id: real_id.clone(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+            observed_epoch: Some(before.epoch),
+            observed_generation: Some(before.generation),
+            resume_session_id: None,
+            session_ref: None,
+        })
+        .await;
+
+        let mut saw_typed_refusal = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match rx.try_recv() {
+                Ok(frame) => {
+                    let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                    if frame["type"] == "freshAgent.event"
+                        && frame["event"]["type"] == "freshAgent.error"
+                        && frame["event"]["code"] == "SESSION_RESERVED"
+                    {
+                        saw_typed_refusal = true;
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the stale-pair attach never answered the typed refusal"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_typed_refusal,
+            "the stale-pair existing-session attach must answer the typed refusal"
+        );
+        // The fresh-agent owner stays authoritative at the bumped
+        // generation — the adopt never armed, the bridge never restarted.
+        assert!(
+            matches!(
+                registry.observe("opencode", &real_id).state,
+                freshell_ownership::OwnershipState::Live { owner, generation, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                        && generation == before.generation + 1,
+            ),
+            "the fresh-agent owner stays authoritative at the bumped generation"
+        );
+    }
+
+    /// Retire-on-kill (delta-review round 5, restore-open-sessions-only): an
+    /// explicit kill is an intentional session END. Killing a MATERIALIZED
+    /// session must (a) retire its durable row `Closed` through the identity
+    /// sink and (b) clear the pending marker.
     #[tokio::test]
     async fn handle_kill_retires_the_materialized_row_and_clears_the_pending_marker() {
         let (st, _killed) = state().await;
@@ -4666,6 +8903,8 @@ mod tests {
         };
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -4712,6 +8951,8 @@ mod tests {
         );
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -4754,6 +8995,8 @@ mod tests {
         // The evicted-session arm: a durable id no longer in the session map
         // still retires the row it names (idempotent when no row exists).
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: AgentProvider::Opencode,
             session_id: "ses_evicted".to_string(),
             session_type: SessionType::Freshopencode,
@@ -4812,6 +9055,8 @@ mod tests {
         let st2 = st.clone();
         let kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: AgentProvider::Opencode,
                 session_id: placeholder.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -4853,6 +9098,368 @@ mod tests {
             .expect("kill task completed");
     }
 
+    /// b8ke ext r31 F1 (half-fence): a `freshAgent.send` carrying exactly
+    /// ONE of the observed epoch/generation pair refuses typed
+    /// INVALID_FENCE with NOTHING mutated — no turn flags, no busy
+    /// broadcast, no claim (not even a Vacant replay entry), no provider
+    /// create. Pre-r31 the pair was discarded entirely and a half-fence
+    /// was treated as unfenced.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_half_fenced_send_refuses_typed_invalid_fence_and_never_materializes() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        st.handle_create(create_msg("req-r31-f1-half"), None).await;
+        let placeholder = "freshopencode-req-r31-f1-half";
+        // Drain the create-path frames so the next frame is this send's.
+        while rx.try_recv().is_ok() {}
+
+        st.handle_send(send_msg_fenced(
+            placeholder,
+            "materialize",
+            Some(registry.boot_epoch()),
+            None,
+        ))
+        .await;
+
+        // The typed INVALID_FENCE reply — the send's error shape.
+        let mut saw_invalid_fence = false;
+        while let Ok(frame) = rx.try_recv() {
+            if frame.contains("INVALID_FENCE") {
+                saw_invalid_fence = true;
+            }
+        }
+        assert!(
+            saw_invalid_fence,
+            "the half-fenced send answers the typed INVALID_FENCE refusal"
+        );
+        // NOTHING mutated: no materialization (no durable id minted)...
+        {
+            let sessions = st.sessions.lock().await;
+            let guard = sessions
+                .get(placeholder)
+                .expect("the placeholder session remains in the map");
+            assert!(
+                guard.lock().await.real_session_id.is_none(),
+                "the half-fenced send never materializes a durable session"
+            );
+        }
+        // ...and no coordinator record for the placeholder key (not even
+        // a Vacant replay entry — the claim never ran).
+        assert!(
+            !matches!(
+                registry.observe(PROVIDER, placeholder).state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ),
+            "the half-fenced send never claims the placeholder key"
+        );
+        assert_eq!(
+            registry.observe(PROVIDER, placeholder).generation,
+            0,
+            "the half-fenced never advances the placeholder's generation"
+        );
+    }
+
+    /// b8ke ext r31 F1 (stale fence — the exact finding): a DELAYED
+    /// old-generation send — the pane's observation predates the
+    /// placeholder key's last ownership cycle (a prior runtime held the
+    /// key at generation 1 and was released, leaving the key Vacant with
+    /// the monotone generation advanced) — refuses typed with NO
+    /// materialization. Pre-r31 the claim ran with `None`: the stale
+    /// send reclaimed the since-vacated placeholder as if it had
+    /// observed nothing and minted/rekeyed a durable session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_observed_fence_on_a_first_send_refuses_typed_and_never_materializes() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        st.handle_create(create_msg("req-r31-f1-stale"), None).await;
+        let placeholder = "freshopencode-req-r31-f1-stale";
+        // Drain the create-path frames.
+        while rx.try_recv().is_ok() {}
+
+        // THE SEED: the placeholder key held a prior owner at generation 1
+        // and was released — the key is Vacant with the monotone
+        // generation advanced to 1.
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, placeholder).state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "fixture: the create leaves the placeholder key Vacant"
+        );
+        let freshell_ownership::BeginOutcome::Granted { generation } =
+            crate::ownership_lane::claim_fresh_agent_ownership(
+                &registry,
+                PROVIDER,
+                placeholder,
+                "op-r31-seed-prior",
+                None,
+                "test",
+                1_000,
+            )
+        else {
+            panic!("fixture: the seed claim must grant")
+        };
+        let seed_owner = freshell_ownership::OwnerIdentity {
+            kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            terminal_id: None,
+            live_session_key: Some("seed".to_string()),
+            pid: None,
+            ownership_id: Some("op-r31-seed-prior".to_string()),
+        };
+        assert!(
+            matches!(
+                crate::ownership_lane::commit_fresh_agent_ownership(
+                    &registry,
+                    PROVIDER,
+                    placeholder,
+                    "op-r31-seed-prior",
+                    generation,
+                    seed_owner.clone(),
+                ),
+                freshell_ownership::CommitOutcome::Committed
+            ),
+            "fixture: the seed owner commits Live"
+        );
+        registry.release(
+            PROVIDER,
+            placeholder,
+            &freshell_ownership::ReleaseClaim {
+                operation_id: "op-r31-seed-prior".to_string(),
+                generation,
+                runtime: Some(seed_owner),
+            },
+            "test",
+        );
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, placeholder).state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "fixture: the seed owner released — the key is Vacant, generation monotone"
+        );
+
+        // THE DELAYED SEND: the pane's observation predates the seed
+        // cycle (generation 0 against the key's monotone 1).
+        st.handle_send(send_msg_fenced(
+            placeholder,
+            "materialize",
+            Some(registry.boot_epoch()),
+            Some(0),
+        ))
+        .await;
+
+        // The typed stale refusal: SESSION_RESERVED (the code the
+        // client's bounded re-drive understands) with the honest stale
+        // message.
+        let mut saw_stale_refusal = false;
+        while let Ok(frame) = rx.try_recv() {
+            if frame.contains("SESSION_RESERVED") && frame.contains("stale") {
+                saw_stale_refusal = true;
+            }
+        }
+        assert!(
+            saw_stale_refusal,
+            "the stale-fenced send answers the typed stale refusal"
+        );
+        // NO materialization: no durable id, no provider create.
+        {
+            let sessions = st.sessions.lock().await;
+            let guard = sessions
+                .get(placeholder)
+                .expect("the placeholder session remains in the map");
+            assert!(
+                guard.lock().await.real_session_id.is_none(),
+                "the stale-fenced send never materializes a durable session"
+            );
+        }
+        // The placeholder key is UNTOUCHED by the refused send: still
+        // Vacant at the seed's monotone generation (the refused claim
+        // never even created a replay entry).
+        let snap = registry.observe(PROVIDER, placeholder);
+        assert!(
+            matches!(snap.state, freshell_ownership::OwnershipState::Vacant),
+            "the placeholder key stays Vacant after the typed refusal"
+        );
+        assert_eq!(snap.generation, generation, "the generation is untouched");
+        // And no durable id ever entered the coordinator.
+        assert!(
+            !matches!(
+                registry.observe(PROVIDER, "ses_1").state,
+                freshell_ownership::OwnershipState::Live { .. }
+            ),
+            "no durable session was ever claimed"
+        );
+    }
+
+    /// b8ke ext r31 F1 (supplied-current — the control): a first send
+    /// whose observed pair is CURRENT (the boot epoch and the
+    /// placeholder key's current generation) proceeds exactly as the
+    /// legacy shape — the fence is the safety net, never a blanket
+    /// refusal. The materialization mints the durable id, rekeys the
+    /// placeholder to it, and commits the durable key Live{FreshAgent}.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_current_observed_fence_on_a_first_send_materializes() {
+        let (mut st, _killed) = state().await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        st.handle_create(create_msg("req-r31-f1-current"), None)
+            .await;
+        let placeholder = "freshopencode-req-r31-f1-current";
+
+        st.handle_send(send_msg_fenced(
+            placeholder,
+            "materialize",
+            Some(registry.boot_epoch()),
+            Some(0),
+        ))
+        .await;
+
+        // The durable id minted and the session bound to it.
+        {
+            let sessions = st.sessions.lock().await;
+            let guard = sessions
+                .get(placeholder)
+                .expect("the placeholder session remains in the map");
+            assert_eq!(
+                guard.lock().await.real_session_id.as_deref(),
+                Some("ses_1"),
+                "the current-fenced send materializes exactly like the legacy shape"
+            );
+        }
+        // The placeholder rekeyed to the durable id...
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, placeholder).state,
+                freshell_ownership::OwnershipState::Aliased { to, .. } if to == "ses_1"
+            ),
+            "the placeholder is aliased to the durable id"
+        );
+        // ...and the durable key Live{FreshAgent}.
+        assert!(matches!(
+            registry.observe(PROVIDER, "ses_1").state,
+            freshell_ownership::OwnershipState::Live {
+                owner, ..
+            } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ));
+    }
+
+    /// b8ke gate C fix: a fresh pane's MOUNT-TIME attach addresses an
+    /// UNMATERIALIZED placeholder — no durable session, no serve bridge,
+    /// nothing to own or guard. The attach's coordinator consult (the
+    /// map-hit registration + the arm) is SKIPPED for that shape, so the
+    /// placeholder key stays genuinely vacant and the send's materialize
+    /// claim (the r26-F3 pre-mutation claim) GRANTS and materializes.
+    /// Pre-fix the mount attach's map-hit registration committed
+    /// Live{FreshAgent} on the placeholder — registering NOTHING REAL —
+    /// and that leaked record made every send's materialize claim answer
+    /// AdoptLive (the typed "duplicate first-send" refusal), so the pane
+    /// never materialized and its durable ref stayed the placeholder
+    /// forever (the gate-C e2e regression: a fresh `freshopencode-*` id
+    /// instead of the stable `ses_*` id).
+    #[tokio::test]
+    async fn an_unfenced_mount_attach_on_a_fresh_placeholder_adopts_nothing_and_sends_still_materialize(
+    ) {
+        let (mut st, _killed) = state().await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        st.handle_create(create_msg("req-gate-c-mount-attach"), None)
+            .await;
+        let placeholder = "freshopencode-req-gate-c-mount-attach";
+
+        // Subscribe after create so this receiver observes only the mount-time attach
+        // frames below, including any typed refusal that would otherwise be easy to miss.
+        let mut rx = st.fresh_agent.broadcast_tx.subscribe();
+
+        // The pane's mount-time attach — no observed pair (none exists:
+        // the create claims nothing, so there is no owner record to
+        // observe), and NO registration may commit for it. Repeat the
+        // reconnect-shaped attach so a reservation error cannot be hidden
+        // as a one-time mount race, then repeat once with the placeholder's
+        // complete current Vacant fence.
+        st.handle_attach(attach_msg(placeholder)).await;
+        st.handle_attach(attach_msg(placeholder)).await;
+        let current = registry.observe(PROVIDER, placeholder);
+        let mut fenced_attach = attach_msg(placeholder);
+        fenced_attach.observed_epoch = Some(current.epoch);
+        fenced_attach.observed_generation = Some(current.generation);
+        st.handle_attach(fenced_attach).await;
+
+        let mut frames = Vec::new();
+        while let Ok(raw) = rx.try_recv() {
+            frames
+                .push(serde_json::from_str::<serde_json::Value>(&raw).expect("server JSON frame"));
+        }
+        assert_eq!(
+            frames
+                .iter()
+                .filter(|frame| {
+                    frame["type"] == "freshAgent.event"
+                        && frame["sessionId"] == placeholder
+                        && frame["event"]["type"] == "freshAgent.session.snapshot"
+                })
+                .count(),
+            3,
+            "each placeholder attach emits an observable snapshot: {frames:?}"
+        );
+        assert!(
+            frames.iter().all(|frame| {
+                frame["type"] != "freshAgent.event"
+                    || frame["sessionId"] != placeholder
+                    || frame["event"]["type"] != "freshAgent.error"
+            }),
+            "ordinary placeholder attach must not reserve a nonexistent writer: {frames:?}"
+        );
+
+        // THE REGRESSION PIN: the placeholder key stays VACANT — no leaked
+        // Live{FreshAgent} owner registered over nothing real.
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, placeholder).state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "an unmaterialized placeholder's mount attach must register \
+             nothing (state: {:?})",
+            registry.observe(PROVIDER, placeholder).state
+        );
+
+        // The send must still materialize — the placeholder's coordinator
+        // lifecycle belongs to the materialize claim (r26-F3).
+        st.handle_send(send_msg(placeholder, "materialize")).await;
+        {
+            let sessions = st.sessions.lock().await;
+            let guard = sessions
+                .get(placeholder)
+                .expect("the placeholder session remains in the map");
+            assert_eq!(
+                guard.lock().await.real_session_id.as_deref(),
+                Some("ses_1"),
+                "the send after an unfenced mount attach materializes the durable id"
+            );
+        }
+        // The placeholder rekeyed to the durable id (the r26-F3 shape).
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, placeholder).state,
+                freshell_ownership::OwnershipState::Aliased { to, .. } if to == "ses_1"
+            ),
+            "the placeholder is aliased to the durable id after materialization"
+        );
+    }
+
     /// Delta-r6 close-durability finding, re-staged for the round-4 (F6)
     /// topology: the enumeration's session-lock wait (the FIRST acquisition)
     /// must carry NOTHING — no durable close ever waits behind a park, and
@@ -4892,6 +9499,8 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: ph,
                 session_type: SessionType::Freshopencode,
@@ -4977,6 +9586,8 @@ mod tests {
         // The ledger fails every write (disk-full/permission shape).
         fake.set_fail_writes(true);
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -5030,6 +9641,202 @@ mod tests {
         );
     }
 
+    /// kata b8ke Task 3 review I-1: a typed kill REFUSAL (the coordinator
+    /// blocked the stop — here: a handoff owns the durable key's transition)
+    /// kills NOTHING, so it must also roll back the pre-kill enumeration
+    /// gate it armed — otherwise the still-live session is bricked for
+    /// sends (the send gate refuses SESSION_NOT_FOUND while
+    /// `close_pending > 0`, the exact contract the Clean-failure abort arm
+    /// above established). The refused kill must leave the session fully
+    /// operational for a subsequent send.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_kill_releases_the_enumeration_gate_and_the_session_stays_sendable() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-kill-refused"), None).await;
+        let placeholder = "freshopencode-req-kill-refused";
+        st.handle_send(send_msg(placeholder, "materialize")).await;
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        assert_eq!(
+            session_arc.lock().await.real_session_id.as_deref(),
+            Some("ses_1"),
+            "fixture: the send materialized the durable id (and committed Live{{FreshAgent}})"
+        );
+        // The refusal precondition: a handoff owns the durable key's
+        // transition, so the kill's fenced stop is typed-blocked.
+        let freshell_ownership::BeginOutcome::Granted { .. } = registry.begin_handoff(
+            "opencode",
+            "ses_1",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "ho-refused-1",
+            None,
+            "test",
+            crate::session_lease::now_epoch_ms() + 1,
+        ) else {
+            panic!("fixture: the handoff begins from the committed Live state")
+        };
+        while rx.try_recv().is_ok() {}
+
+        st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
+            provider: freshell_protocol::AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        // The refusal killed nothing: both map keys stand, the killed flag
+        // was never set, and the answer reports failure.
+        {
+            let sessions = st.sessions.lock().await;
+            assert!(
+                sessions.contains_key(placeholder) && sessions.contains_key("ses_1"),
+                "a refused kill must leave the session map untouched"
+            );
+        }
+        assert!(
+            !session_arc.lock().await.killed.load(Ordering::SeqCst),
+            "a refused kill must never mark the session killed"
+        );
+        let mut killed_frame = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.killed" {
+                killed_frame = Some(frame);
+            }
+        }
+        let killed_frame = killed_frame.expect("the kill answers freshAgent.killed");
+        assert_eq!(
+            killed_frame["success"], false,
+            "the refused kill reports success:false: {killed_frame}"
+        );
+        // THE regression: the gate is released, so a subsequent send is
+        // NOT bricked — it is accepted (never SESSION_NOT_FOUND).
+        st.handle_send(send_msg(placeholder, "operational")).await;
+        let mut saw_accepted = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert!(
+                frame["type"] != "error",
+                "the post-refusal send must not be refused: {frame}"
+            );
+            if frame["type"] == "freshAgent.send.accepted" {
+                saw_accepted = true;
+            }
+        }
+        assert!(
+            saw_accepted,
+            "the session the kill refused to stop must stay sendable"
+        );
+    }
+
+    /// b8ke focused round-3 review R3-2: an explicit `freshAgent.kill` on an
+    /// opencode session whose daemon-side turn is still ACCEPTED — the
+    /// local turn task FINISHED (the IdleTimeout shape) while the turn
+    /// executes INSIDE the shared daemon — must abort the daemon-side turn
+    /// (the per-session `/abort`, exactly like interrupt/handoff do)
+    /// BEFORE declaring the reap confirmed (Stopping → Vacant). Pre-fix,
+    /// the kill aborted only the local turn task + SSE bridge and
+    /// committed the stop with the daemon turn still running.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_during_an_accepted_daemon_turn_aborts_it_before_the_stop_commits() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let http = Arc::new(AbortRecordingHttp::default());
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+
+        st.handle_create(create_msg("req-kill-daemon-abort"), None)
+            .await;
+        let placeholder = "freshopencode-req-kill-daemon-abort";
+        st.handle_send(send_msg(placeholder, "hold this turn"))
+            .await;
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("session tracked").clone()
+        };
+        assert_eq!(
+            session_arc.lock().await.real_session_id.as_deref(),
+            Some("ses_1"),
+            "fixture: the send materialized the durable id (and committed Live{{FreshAgent}})"
+        );
+        // The prompt POST is dispatched onto the transport (the acceptance
+        // witness armed at the dispatch boundary); then the LOCAL task is
+        // settled — the IdleTimeout shape (a finished local task with the
+        // daemon-side turn still running).
+        let real_id = http.await_prompt(Duration::from_secs(10));
+        assert_eq!(real_id, "ses_1");
+        st.settle_local_turn_task_for_test(placeholder).await;
+        while rx.try_recv().is_ok() {}
+
+        st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
+            provider: freshell_protocol::AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        // THE R3-2 regression: the kill issued the per-session daemon-side
+        // abort for the REAL session id before declaring the reap
+        // confirmed.
+        let aborts = http.aborts.lock().unwrap().clone();
+        assert_eq!(
+            aborts,
+            vec!["ses_1".to_string()],
+            "the kill must abort the accepted daemon-side turn (per-session /abort)"
+        );
+        // The stop committed AFTER the abort: Stopping → Vacant.
+        assert_eq!(
+            registry.observe("opencode", "ses_1").state,
+            freshell_ownership::OwnershipState::Vacant,
+            "the kill's coordinator stop must commit (Stopping → Vacant)"
+        );
+        // The answer reports success (the quiesced kill).
+        let mut killed_frame = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.killed" {
+                killed_frame = Some(frame);
+            }
+        }
+        let killed_frame = killed_frame.expect("the kill answers freshAgent.killed");
+        assert_eq!(
+            killed_frame["success"], true,
+            "the quiesced kill answers success: {killed_frame}"
+        );
+    }
+
     /// Delta-r6-r4 (focused-episode-6 round 3, Finding 3), the opencode
     /// lane's PERSISTED class on the pre-lock envelope: the whole identity
     /// set's journal record IS durable although its write reports failure.
@@ -5064,6 +9871,8 @@ mod tests {
         fake.fail_retires_as_persisted
             .store(true, std::sync::atomic::Ordering::SeqCst);
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -5136,6 +9945,8 @@ mod tests {
         );
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: freshell_protocol::AgentProvider::Opencode,
             session_id: placeholder.to_string(),
             session_type: SessionType::Freshopencode,
@@ -5174,6 +9985,43 @@ mod tests {
     /// materialization critical section holds that same lock, so the kill's
     /// enumeration provably post-dates it) joins the ONE envelope — never a
     /// second close call, never a discovered-after-the-envelope identity.
+    /// b8ke ext r23 F1: the WS materialization creates the
+    /// placeholder→durable coordinator ALIAS (`Aliased{to: ses_*}` on the
+    /// placeholder key) — the pane's persisted `freshopencode-*` identity
+    /// resolves to the durable key through the canonical chain.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_ws_materialization_creates_the_placeholder_coordinator_alias() {
+        let (mut st, _killed) = state().await;
+        let registry = std::sync::Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(std::sync::Arc::clone(&registry));
+
+        st.handle_create(create_msg("req-r23f1-alias"), None).await;
+        let placeholder = "freshopencode-req-r23f1-alias".to_string();
+
+        st.handle_send(send_msg(&placeholder, "hello")).await;
+
+        // The session materialized: the placeholder key now resolves to
+        // the durable `ses_*` key through the coordinator's alias chain.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let resolved = registry.resolve_canonical("opencode", &placeholder);
+            if resolved.starts_with("ses_") {
+                match registry.observe("opencode", &placeholder).state {
+                    freshell_ownership::OwnershipState::Aliased { to, .. } => {
+                        assert_eq!(to, resolved);
+                        break;
+                    }
+                    other => panic!("the placeholder key holds an alias record, got {other:?}"),
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the placeholder never materialized to a durable id (resolved: {resolved})"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_materialization_completing_behind_the_kills_park_joins_the_one_envelope() {
         let (st, _killed) = state().await;
@@ -5198,6 +10046,8 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: ph,
                 session_type: SessionType::Freshopencode,
@@ -5276,6 +10126,8 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: ph,
                 session_type: SessionType::Freshopencode,
@@ -5354,6 +10206,8 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: ph,
                 session_type: SessionType::Freshopencode,
@@ -5427,6 +10281,8 @@ mod tests {
         // The close the user MEANT (before this attach): row Closed + fence.
         state
             .handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: AgentProvider::Opencode,
                 session_id: DURABLE_ID.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -5566,6 +10422,8 @@ mod tests {
         let st2 = st.clone();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: placeholder.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -5653,6 +10511,8 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: ph,
                 session_type: SessionType::Freshopencode,
@@ -5744,6 +10604,8 @@ mod tests {
         let ph = placeholder.to_string();
         let mut kill = tokio::spawn(async move {
             st2.handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: ph,
                 session_type: SessionType::Freshopencode,
@@ -6059,6 +10921,8 @@ mod tests {
 
     fn attach_msg(session_id: &str) -> FreshAgentAttach {
         FreshAgentAttach {
+            observed_epoch: None,
+            observed_generation: None,
             provider: AgentProvider::Opencode,
             session_id: session_id.to_string(),
             session_type: SessionType::Freshopencode,
@@ -6409,6 +11273,57 @@ mod tests {
         assert_eq!(send_accepted_count, 2, "both sends are still accepted");
     }
 
+    /// b8ke ext r29 F1: the MATERIALIZATION commit broadcasts the
+    /// committed owner record — pre-r29 the mint→durable re-key committed
+    /// Live{FreshAgent} for the durable `ses_*` key and proceeded
+    /// straight to the materialized frame (whose schema carries no epoch
+    /// or generation), so cross-device observers held no observed fence
+    /// for sessions created during the current connection. The
+    /// commit-to-Live now broadcasts the session.runtimeOwner record for
+    /// the durable id — the id every device converges on.
+    #[tokio::test]
+    async fn a_materialization_broadcasts_the_committed_owner_record() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let mut owner_rx = tx.subscribe();
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        st.set_ownership(registry.clone());
+
+        st.handle_create(create_msg("req-r29-f1-mat"), None).await;
+        let _ = rx.try_recv().unwrap(); // drain freshAgent.created
+
+        let placeholder = "freshopencode-req-r29-f1-mat";
+        st.handle_send(send_msg(placeholder, "one")).await;
+        let real_id = {
+            let guard = st.sessions.lock().await;
+            let session_arc = guard.get(placeholder).cloned().expect("session exists");
+            let s = session_arc.lock().await;
+            s.real_session_id.clone().expect("materialized")
+        };
+
+        let mut owner_frame = None;
+        while let Ok(raw) = owner_rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).expect("bus json");
+            if frame["type"] == "session.runtimeOwner" && frame["sessionId"] == json!(real_id) {
+                owner_frame = Some(frame);
+            }
+        }
+        let frame = owner_frame.expect("the materialization's commit broadcast the owner record");
+        assert_eq!(frame["provider"], "opencode");
+        assert_eq!(frame["ownerKind"], "fresh-agent");
+        assert_eq!(frame["transition"], "handoff-committed");
+        assert_eq!(frame["epoch"], registry.boot_epoch());
+        assert_eq!(
+            frame["generation"],
+            registry.observe(PROVIDER, &real_id).generation,
+            "the frame carries the COMMITTED generation: {frame}"
+        );
+        assert!(frame["fenced"].is_null(), "no fenced marker: {frame}");
+    }
+
     #[tokio::test]
     async fn kill_removes_session_but_does_not_terminate_the_shared_serve_child() {
         let (st, killed) = state().await;
@@ -6423,6 +11338,8 @@ mod tests {
         let real_id = session_arc.lock().await.real_session_id.clone().unwrap();
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: AgentProvider::Opencode,
             session_id: real_id.clone(),
             session_type: SessionType::Freshopencode,
@@ -6446,6 +11363,8 @@ mod tests {
         let st = FreshOpencodeState::new(fresh_agent);
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: AgentProvider::Opencode,
             session_id: "does-not-exist".to_string(),
             session_type: SessionType::Freshopencode,
@@ -6588,6 +11507,299 @@ mod tests {
             b.create_request_id.as_deref(),
             Some("r1"),
             "lineage is keyed by the CREATE requestId (placeholder-derived), never the send's"
+        );
+    }
+
+    /// b8ke ext r26 F3: the create-GATING http — the POST /session signals
+    /// its arrival from inside the parked future and then waits for the
+    /// test's release (a permit-storing `notify_one` wakes it
+    /// deterministically), holding the first send inside its cold-start
+    /// provider mutation.
+    struct GatedCreateHttp {
+        arrived_tx: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<tokio::sync::Notify>,
+    }
+    impl ServeHttp for GatedCreateHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let is_create = req.url.contains("/session")
+                && !req.url.contains("/message")
+                && !req.url.contains("/abort")
+                && !req.url.contains("/status")
+                && matches!(req.method, freshell_opencode::serve::HttpMethod::Post);
+            if is_create {
+                let arrived_tx = self.arrived_tx.clone();
+                let release = Arc::clone(&self.release);
+                return Box::pin(async move {
+                    let _ = arrived_tx.send(());
+                    release.notified().await;
+                    Ok(ServeHttpResponse::new(
+                        200,
+                        serde_json::to_vec(&json!({
+                            "id": "ses_gated_r26",
+                            "directory": null
+                        }))
+                        .unwrap(),
+                    ))
+                });
+            }
+            Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) })
+        }
+    }
+
+    /// b8ke ext r26 F3: the first send's PRE-MUTATION claim — the
+    /// placeholder identity (the pane-scoped id known before the
+    /// provider mints anything) holds the in-flight start BEFORE
+    /// `manager.create_session` issues its POST, mirroring the REST/MCP
+    /// lane's provisional-key discipline. Pre-r26 the claim only happened
+    /// AFTER the durable id was minted, so a refusal, cancellation,
+    /// panic, or shutdown during the ~50-70s cold-start window left the
+    /// minted session outside coordinator ownership and typed recovery,
+    /// and competing lifecycle operations were never blocked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_first_send_claims_the_placeholder_before_the_provider_mutation() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
+            .with_ownership(Arc::clone(&registry));
+        let (arrived_tx, mut arrived_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(GatedCreateHttp {
+                arrived_tx,
+                release: Arc::clone(&release),
+            }),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let manager = OpencodeServeManager::new(deps, ServeConfig::default());
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        st.handle_create(create_msg("r26-claim"), None).await;
+        let placeholder = "freshopencode-r26-claim";
+
+        let st2 = st.clone();
+        let send =
+            tokio::spawn(async move { st2.handle_send(send_msg(placeholder, "hello")).await });
+        arrived_rx
+            .recv()
+            .await
+            .expect("the first send reaches its provider mutation");
+
+        // THE PRE-MUTATION CLAIM: the placeholder key holds the in-flight
+        // start while the create POST is still open (pre-r26 this was
+        // Vacant — nothing claimed before the mint).
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, placeholder).state,
+                freshell_ownership::OwnershipState::Starting {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    ..
+                }
+            ),
+            "the placeholder holds the in-flight start before the provider \
+             mutation — got {:?}",
+            registry.observe(PROVIDER, placeholder).state
+        );
+        // A competing lifecycle operation on the placeholder is refused
+        // typed — the cold-start window blocks competing starts (pre-r26
+        // a terminal begin GRANTED here: two writers).
+        assert!(matches!(
+            registry.begin_start(
+                PROVIDER,
+                placeholder,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "op-r26-send-compete",
+                None,
+                "test",
+                crate::session_lease::now_epoch_ms(),
+            ),
+            freshell_ownership::BeginOutcome::Blocked { .. }
+        ));
+
+        // Release the parked create: the mint rekeys the SAME ticket to the
+        // durable id and the materialization commits Live with the
+        // placeholder left as the resolution alias.
+        release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(15), send)
+            .await
+            .expect("the send completes after the release")
+            .expect("the send task joins");
+        assert!(matches!(
+            registry.observe(PROVIDER, "ses_gated_r26").state,
+            freshell_ownership::OwnershipState::Live { owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ));
+        assert!(matches!(
+            registry.observe(PROVIDER, placeholder).state,
+            freshell_ownership::OwnershipState::Aliased { to, .. } if to == "ses_gated_r26"
+        ));
+        assert!(
+            st.has_live_session("ses_gated_r26").await,
+            "the materialized session registered"
+        );
+    }
+
+    /// b8ke ext r27 F2 (the OpenCode target arm): the handoff
+    /// continuation's durable binding write carries the SUPPLIED handoff
+    /// (epoch, generation) pair — pre-r27 the under-ticket lane derived
+    /// the pair from its OWN (deliberately absent) ticket, so the target
+    /// row preserved the PRIOR generation and a delayed prior-generation
+    /// write could pass the ledger's comparison and replace the new
+    /// owner's recovery metadata.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_handoff_target_resume_binding_carries_the_handoff_generation() {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<String>(64);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
+            .with_ownership(Arc::clone(&registry));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        // The refresh-write gate opens on a RECOVERED settings snapshot.
+        fake.settings.lock().unwrap().insert(
+            ("opencode".to_string(), "ses_r27_oc".to_string()),
+            crate::identity_sink::FreshAgentSettings {
+                model: Some("m".to_string()),
+                effort: Some("high".to_string()),
+                cwd: Some("/w".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let (owner, committed_instance) = st
+            .opencode_resume_for_handoff("ses_r27_oc", None, "handoff-op-r27", 9)
+            .await
+            .expect("the under-ticket target resume succeeds");
+        assert_eq!(owner.kind, freshell_ownership::RuntimeOwnerKind::FreshAgent);
+        // ep2-r5: the under-ticket resume carries its committed session
+        // INSTANCE out with the identity — the exact `Arc` registered
+        // under the durable id (the runner's post-commit rescue re-check
+        // binds to it).
+        let registered = st
+            .sessions
+            .lock()
+            .await
+            .get("ses_r27_oc")
+            .cloned()
+            .expect("the under-ticket resume registered the target session");
+        assert!(
+            committed_instance.ptr_eq(&registered),
+            "the carried handle IS the registered session instance (ep2-r5)"
+        );
+
+        let bindings = fake.bindings.lock().unwrap();
+        let last = bindings
+            .iter()
+            .rev()
+            .find(|b| b.session_id == "ses_r27_oc")
+            .expect("the target resume wrote its binding row");
+        assert_eq!(
+            last.observed_epoch,
+            Some(registry.boot_epoch()),
+            "the handoff continuation stamps the boot epoch"
+        );
+        assert_eq!(
+            last.observed_generation,
+            Some(9),
+            "the handoff continuation stamps the SUPPLIED handoff generation — \
+             pre-r27 it carried None (derived from its own absent ticket)"
+        );
+        // b8ke focused ep5 r2 F1: the under-ticket target binding is the
+        // runner's AUTHORITATIVE write (the terminal-row guard's
+        // accepting arm over the prior terminal's unstamped row).
+        assert!(
+            last.authoritative,
+            "the handoff continuation's binding is authoritative: {last:?}"
+        );
+    }
+
+    /// b8ke ext r26 F4: a first-send materialization whose durable
+    /// binding-row write FAILS tears the session down and answers the
+    /// typed error — never the pre-r26 log-and-continue that broadcast
+    /// materialization, started the bridge, and committed Live over a
+    /// session missing from the authoritative recovery registry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_materialization_binding_failure_tears_the_session_down_typed() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx))
+            .with_ownership(Arc::clone(&registry));
+        let (manager, _killed) = started_manager().await;
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        st.handle_create(create_msg("req-r26-f4"), None).await;
+        let placeholder = "freshopencode-req-r26-f4";
+        // Drain the create's frames so only the failed send's answer remains.
+        while rx.try_recv().is_ok() {}
+        // The ledger fails every write from here (disk-full/permission shape).
+        fake.set_fail_writes(true);
+
+        st.handle_send(send_msg(placeholder, "hello")).await;
+
+        // The session is torn down: both map keys gone, never a live
+        // session the recovery registry cannot resolve.
+        assert!(
+            !st.has_live_session(placeholder).await && !st.has_live_session("ses_1").await,
+            "the failed materialization must remove the session map entries"
+        );
+        // The coordinator never committed Live: the ticket's RAII drop
+        // settled the rekeyed claim typed (pre-r26 the failure was
+        // discarded and the materialization committed Live here).
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, "ses_1").state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "the failed materialization never commits Live — got {:?}",
+            registry.observe(PROVIDER, "ses_1").state
+        );
+        assert!(matches!(
+            registry.observe(PROVIDER, placeholder).state,
+            freshell_ownership::OwnershipState::Aliased { to, .. } if to == "ses_1"
+        ));
+        // The answer is the TYPED error — never a materialized broadcast
+        // or a send acceptance over an unregistered session.
+        let mut materialized = 0;
+        let mut ledger_error = None;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.session.materialized" {
+                materialized += 1;
+            }
+            if frame["type"] == "freshAgent.event" && frame["event"]["type"] == "freshAgent.error" {
+                ledger_error = Some(frame);
+            }
+        }
+        assert_eq!(materialized, 0, "no materialization broadcast on failure");
+        let ledger_error = ledger_error.expect("the failure surfaces a typed error");
+        assert_eq!(ledger_error["event"]["code"], json!("LEDGER_WRITE_FAILED"));
+        assert!(
+            ledger_error["event"]["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("could not be persisted"),
+            "the error message names the recoverable failure: {ledger_error}"
         );
     }
 
@@ -6784,6 +11996,8 @@ mod tests {
         // the map never held this session; the row is durable).
         state
             .handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: DURABLE_ID.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -6860,6 +12074,10 @@ mod tests {
             // Unified agent names: no naming fact on this ledger edge.
             name_transition: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -6917,6 +12135,10 @@ mod tests {
             // Unified agent names: no naming fact on this ledger edge.
             name_transition: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -6931,6 +12153,8 @@ mod tests {
         // durable serve session the local map never tracked — retired by name).
         state
             .handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: DURABLE_ID.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -7015,6 +12239,8 @@ mod tests {
         // The close the user will MEAN: row Closed + fence, before the resume.
         state
             .handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: DURABLE_ID.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -7049,6 +12275,8 @@ mod tests {
         // the commit decides.
         state
             .handle_kill(FreshAgentKill {
+                observed_epoch: None,
+                observed_generation: None,
                 provider: freshell_protocol::AgentProvider::Opencode,
                 session_id: DURABLE_ID.to_string(),
                 session_type: SessionType::Freshopencode,
@@ -7446,6 +12674,280 @@ mod tests {
         );
     }
 
+    // ── b8ke ext r15 F1: the map-hit/Vacant compatibility claims are FENCED ──
+
+    /// The F1 fixture: a live in-map MATERIALIZED session row (the
+    /// post-first-send shape — `real_session_id: Some`, per gate-C) over a
+    /// coordinator key the test controls (wired ownership + the session
+    /// row).
+    async fn fenced_state_with_map_row(
+        durable_id: &str,
+    ) -> (
+        FreshOpencodeState,
+        tokio::sync::broadcast::Receiver<String>,
+        Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let (manager, killed) = started_manager().await;
+        let _ = &killed;
+        fresh_agent.set_manager_for_test(manager).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        st.set_ownership(Arc::clone(&registry));
+        // Gate-C (7824b5aab): an attach finding an UNMATERIALIZED row
+        // (`real_session_id: None`, a fresh pane's placeholder) is
+        // observation-only — snapshot + return — and never reaches the r15
+        // F1 fenced map-hit adopt claim these tests exist to cover. Seed the
+        // POST-materialization shape instead: a real `ses_*` id.
+        let mut session = OpencodeSession::new(durable_id.to_string(), None, None, None);
+        session.real_session_id = Some(durable_id.to_string());
+        st.sessions
+            .lock()
+            .await
+            .insert(durable_id.to_string(), Arc::new(TokioMutex::new(session)));
+        (st, rx, registry)
+    }
+
+    /// Seed Live{FreshAgent} under the durable id, then COMPLETE A NEWER
+    /// STOP: the key ends VACANT at the ADVANCED generation (G+1) — the
+    /// since-vacated shape a stale reconnect request must never reclaim.
+    /// b8ke focused ep5 r1 F1: seed a LIVE `Live{FreshAgent}` owner record
+    /// for the id (the op guard's verification target) WITHOUT vacating it.
+    /// b8ke focused ep5 r4 F2: the FENCED client shape — observe the
+    /// coordinator's owner record, then send the op WITH the pair (the
+    /// post-F2 contract: an unfenced history mutation against a
+    /// Live{FreshAgent} key is the typed FENCE_REQUIRED refusal, so the
+    /// client re-observes and retries carrying the pair).
+    fn fenced_observed(
+        registry: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        sid: &str,
+    ) -> (Option<u64>, Option<u64>) {
+        let snap = registry.observe(PROVIDER, sid);
+        (Some(snap.epoch), Some(snap.generation))
+    }
+
+    fn seed_live_fresh_owner(
+        registry: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        durable_id: &str,
+    ) {
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            PROVIDER,
+            durable_id,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-ep5-seed",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("seed granted")
+        };
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                durable_id,
+                "op-ep5-seed",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some(durable_id.to_string()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+    }
+
+    async fn seed_live_then_stop_to_vacant(
+        registry: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        durable_id: &str,
+    ) -> u64 {
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+            PROVIDER,
+            durable_id,
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-f15-seed",
+            None,
+            "test",
+            1_000,
+        ) else {
+            panic!("seed granted")
+        };
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                durable_id,
+                "op-f15-seed",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some(durable_id.to_string()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        let stale_fence = freshell_ownership::ObservedFence {
+            epoch: registry.boot_epoch(),
+            generation,
+        };
+        let freshell_ownership::StopOutcome::Granted {
+            generation: stop_gen,
+        } = registry.begin_stop(
+            PROVIDER,
+            durable_id,
+            "op-f15-newer-stop",
+            &freshell_ownership::StopClaim {
+                expected_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                expected_runtime: None,
+                observed: stale_fence,
+            },
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        )
+        else {
+            panic!("the newer stop must begin")
+        };
+        assert_eq!(
+            registry.commit_stop(PROVIDER, durable_id, "op-f15-newer-stop", stop_gen),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        assert!(matches!(
+            registry.observe(PROVIDER, durable_id).state,
+            freshell_ownership::OwnershipState::Vacant
+        ));
+        generation
+    }
+
+    /// b8ke ext r15 F1 (a): a STALE-observed-generation create hitting a
+    /// since-vacated in-memory map entry CANNOT reclaim ownership. The
+    /// delayed request carries the OLD generation (G) while the key sits
+    /// Vacant at the advanced generation (G+1) — generation arithmetic must
+    /// refuse the claim (pre-r15 the map-hit compatibility claim passed
+    /// None, so the stale request GRANTED from Vacant and re-committed
+    /// Live{FreshAgent} — stale reconnect traffic reclaiming the global
+    /// owner and blocking or redirecting a subsequent terminal lifecycle
+    /// operation).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_fence_map_hit_resume_cannot_reclaim_vacated_ownership() {
+        let durable_id = "ses_r15_f1_stale";
+        let (st, mut rx, registry) = fenced_state_with_map_row(durable_id).await;
+        let stale_generation = seed_live_then_stop_to_vacant(&registry, durable_id).await;
+
+        // THE STALE REQUEST: the resume-create names the in-map durable id
+        // with the OLD observed generation.
+        let mut create = create_msg("req-r15-f1-stale");
+        create.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: durable_id.to_string(),
+        });
+        create.observed_epoch = Some(registry.boot_epoch());
+        create.observed_generation = Some(stale_generation);
+        st.handle_create(create, None).await;
+
+        // THE CONTRACT: the failure answers AND the key is NOT reclaimed.
+        let frame: serde_json::Value = serde_json::from_str(
+            &tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a frame within budget")
+                .expect("the bus stays open"),
+        )
+        .expect("json frame");
+        assert_eq!(frame["type"], "freshAgent.create.failed", "{frame}");
+        let snap = registry.observe(PROVIDER, durable_id);
+        assert!(
+            !matches!(snap.state, freshell_ownership::OwnershipState::Live { .. }),
+            "the stale request reclaimed NOTHING — state: {:?}",
+            snap.state
+        );
+    }
+
+    /// b8ke ext r15 F1 (b): an INVALID_FENCE create (a half-sent observed
+    /// pair) mutates NOTHING. Pre-r15 the map-hit compatibility block
+    /// claimed + committed Live{FreshAgent} BEFORE the fence parse refused,
+    /// so ownership (state AND generation) had already moved by the time
+    /// the INVALID_FENCE failure returned.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_invalid_fence_map_hit_create_mutates_no_ownership() {
+        let durable_id = "ses_r15_f1_invalid";
+        let (st, mut rx, registry) = fenced_state_with_map_row(durable_id).await;
+        let before = registry.observe(PROVIDER, durable_id);
+
+        // THE HALF-SENT REQUEST: exactly one of the pair present.
+        let mut create = create_msg("req-r15-f1-invalid");
+        create.session_ref = Some(freshell_protocol::SessionLocator {
+            provider: "opencode".to_string(),
+            session_id: durable_id.to_string(),
+        });
+        create.observed_epoch = Some(registry.boot_epoch());
+        create.observed_generation = None;
+        st.handle_create(create, None).await;
+
+        let frame: serde_json::Value = serde_json::from_str(
+            &tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a frame within budget")
+                .expect("the bus stays open"),
+        )
+        .expect("json frame");
+        assert_eq!(frame["type"], "freshAgent.create.failed", "{frame}");
+        assert!(
+            frame["code"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("INVALID_FENCE"),
+            "the typed invalid-fence refusal: {frame}"
+        );
+        let after = registry.observe(PROVIDER, durable_id);
+        assert_eq!(
+            before.state, after.state,
+            "the INVALID_FENCE create mutated NO ownership state"
+        );
+        assert_eq!(
+            before.generation, after.generation,
+            "the INVALID_FENCE create advanced NO generation"
+        );
+    }
+
+    /// b8ke ext r15 F1: the ATTACH counterpart — a stale-observed-generation
+    /// attach over a since-vacated in-memory map entry cannot reclaim
+    /// ownership either (the attach's map-hit adopt claim was the same
+    /// unfenced None).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_fence_map_hit_attach_cannot_reclaim_vacated_ownership() {
+        let durable_id = "ses_r15_f1_stale_attach";
+        let (st, mut rx, registry) = fenced_state_with_map_row(durable_id).await;
+        let stale_generation = seed_live_then_stop_to_vacant(&registry, durable_id).await;
+
+        let mut attach = attach_msg(durable_id);
+        attach.observed_epoch = Some(registry.boot_epoch());
+        attach.observed_generation = Some(stale_generation);
+        st.handle_attach(attach).await;
+
+        let frame: serde_json::Value = serde_json::from_str(
+            &tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a frame within budget")
+                .expect("the bus stays open"),
+        )
+        .expect("json frame");
+        assert!(
+            frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == json!("freshAgent.error"),
+            "the typed error answers: {frame}"
+        );
+        let snap = registry.observe(PROVIDER, durable_id);
+        assert!(
+            !matches!(snap.state, freshell_ownership::OwnershipState::Live { .. }),
+            "the stale attach reclaimed NOTHING — state: {:?}",
+            snap.state
+        );
+    }
+
     /// Focused-ep1 Finding A (branch 2 — settings-None skip): a
     /// connection-scoped create-resume whose ledger row is LINEAGE-ONLY
     /// (default settings — `load_settings` answers `None`) must STILL re-stamp
@@ -7475,6 +12977,10 @@ mod tests {
                 tab_key: Some("device-old:tab-old".into()),
                 asserted_at: 7_777,
             }),
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -7741,6 +13247,10 @@ mod tests {
                 tab_key: Some("device-row:tab-row".into()),
                 asserted_at: 7_777,
             }),
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings {
                 model: Some("big-model".into()),
                 sandbox: None,
@@ -7838,6 +13348,10 @@ mod tests {
             // Unified agent names: no naming fact on this ledger edge.
             name_transition: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings {
                 model: Some("big-model".into()),
                 sandbox: None,
@@ -7994,6 +13508,10 @@ mod tests {
                 tab_key: Some("device-row:tab-row".into()),
                 asserted_at: 7_777,
             }),
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -8079,6 +13597,10 @@ mod tests {
                 tab_key: Some("device-row:tab-row".into()),
                 asserted_at: 7_777,
             }),
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: crate::identity_sink::FreshAgentSettings::default(),
         })
         .await
@@ -8458,6 +13980,8 @@ mod tests {
             session_type: SessionType::Freshopencode,
             cwd: None,
             instructions: None,
+            observed_epoch: None,
+            observed_generation: None,
         }
     }
 
@@ -8515,6 +14039,12 @@ mod tests {
         /// a deterministic "serve cold-start in progress" window (the compact
         /// drive's `ensure_started` waits INSIDE it, pre-POST).
         health_gate: Option<Arc<tokio::sync::Notify>>,
+        /// b8ke focused ep5 r1 F1: when set, the `GET /config` park — the
+        /// compact HANDLER's model-resolution leg awaits it INLINE while
+        /// holding the coordinator op guard (the pre-mutation window: the
+        /// guard is armed in the handler before the resolution, and the
+        /// mutation/POST has not run).
+        config_gate: Option<Arc<tokio::sync::Notify>>,
     }
 
     impl CompactFakeHttp {
@@ -8524,6 +14054,7 @@ mod tests {
             bus_probe: tokio::sync::broadcast::Receiver<String>,
             summarize_gate: Option<Arc<tokio::sync::Notify>>,
             health_gate: Option<Arc<tokio::sync::Notify>>,
+            config_gate: Option<Arc<tokio::sync::Notify>>,
         ) -> Self {
             Self {
                 next_session: AtomicUsize::new(0),
@@ -8534,6 +14065,7 @@ mod tests {
                 bus_probe: StdMutex::new(bus_probe),
                 summarize_gate,
                 health_gate,
+                config_gate,
             }
         }
 
@@ -8704,7 +14236,13 @@ mod tests {
             }
             if method == "GET" && req.url.contains("/config") {
                 let body = self.config_body.clone();
-                return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+                let gate = self.config_gate.clone();
+                return Box::pin(async move {
+                    if let Some(gate) = gate {
+                        gate.notified().await;
+                    }
+                    Ok(ServeHttpResponse::new(200, body))
+                });
             }
             Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) })
         }
@@ -8721,7 +14259,7 @@ mod tests {
         Arc<CompactFakeHttp>,
         tokio::sync::broadcast::Receiver<String>,
     ) {
-        compact_state_gated(config_body, summarize_outcome, None).await
+        compact_state_gated(config_body, summarize_outcome, None, None).await
     }
 
     /// [`compact_state`] with an optional summarize gate (D1-F1: a deterministic
@@ -8730,6 +14268,7 @@ mod tests {
         config_body: &str,
         summarize_outcome: SummarizeOutcome,
         summarize_gate: Option<Arc<tokio::sync::Notify>>,
+        config_gate: Option<Arc<tokio::sync::Notify>>,
     ) -> (
         FreshOpencodeState,
         Arc<CompactFakeHttp>,
@@ -8743,6 +14282,7 @@ mod tests {
             tx.subscribe(),
             summarize_gate,
             None,
+            config_gate,
         ));
         let deps = ServeDeps {
             spawner: Arc::new(TrackedSpawner {
@@ -8766,10 +14306,20 @@ mod tests {
     }
 
     /// Insert a directly-materialized session (no send drove it) with the given model.
+    ///
+    /// Task 4 fixture fidelity: a materialized session carries a LIVE
+    /// serve-SSE bridge in production (`bindServeStream` fires at
+    /// materialization), so the fixture spawns one through the same
+    /// [`FreshOpencodeState::spawn_serve_bridge`] the materialization path
+    /// uses — the daemon-loss watcher (now armed by `handle_compact`)
+    /// otherwise "revives" the bridgeless fixture at its arming-time level
+    /// pass and pushes idle-snapshot frames these tests never modeled.
     async fn insert_compact_session(st: &FreshOpencodeState, id: &str, model: Option<&str>) {
         let mut session =
             OpencodeSession::new(id.to_string(), None, model.map(str::to_string), None);
         session.real_session_id = Some(id.to_string());
+        let manager = st.fresh_agent.ensure_manager().await;
+        st.install_serve_bridge(&manager, &mut session, id).await;
         st.sessions
             .lock()
             .await
@@ -8884,6 +14434,990 @@ mod tests {
         );
     }
 
+    /// b8ke ext r29 F2: the STALE-ON-ARRIVAL compact — the observed pair on
+    /// the wire (additive since ext r15) predates the CURRENT record (a
+    /// completed handoff / crash advance). Pre-r29 the compact IGNORED the
+    /// supplied pair entirely, so a queued old-generation compact could
+    /// mutate newer history (destroy redo, drive the summarize POST). The
+    /// consult at the decision point answers the typed stale refusal and
+    /// NOTHING reaches the provider.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_on_arrival_compact_is_refused_typed() {
+        let (mut st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        insert_compact_session(&st, "ses_r29_compact", Some("test-model")).await;
+        let sink = seed_redoable_record(&st, "ses_r29_compact").await;
+
+        // The record advances PAST the client's observation: seed Live then
+        // stop to Vacant (the crash-shaped advanced generation).
+        let stale_generation = seed_live_then_stop_to_vacant(&registry, "ses_r29_compact").await;
+
+        // THE STALE COMPACT: the pre-advance observed pair rides the wire.
+        let mut msg = compact_msg("ses_r29_compact");
+        msg.observed_epoch = Some(registry.boot_epoch());
+        msg.observed_generation = Some(stale_generation);
+        st.handle_compact(msg).await;
+
+        // The typed stale refusal — the nested SESSION_RESERVED error frame.
+        let mut saw_refusal = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).expect("broadcast json");
+            if frame["event"]["type"] == json!("freshAgent.error") {
+                assert_eq!(
+                    frame["event"]["code"],
+                    json!("SESSION_RESERVED"),
+                    "the stale compact answers the typed stale code: {frame}"
+                );
+                saw_refusal = true;
+            }
+        }
+        assert!(
+            saw_refusal,
+            "the stale compact must answer the typed refusal"
+        );
+        // NOTHING reached the provider — no summarize POST.
+        assert!(
+            http.summarize_requests().is_empty(),
+            "the refused compact never drove the summarize POST"
+        );
+        // The redo record SURVIVES (the destroy-redo drive never ran).
+        let record = sink.load_rollback(PROVIDER, "ses_r29_compact");
+        assert!(
+            record.expect("the record survives").can_redo,
+            "the refused compact never destroyed redo"
+        );
+    }
+
+    /// b8ke ext r29 F2: a half-sent observed pair (exactly one of
+    /// epoch/generation) on a compact is the typed INVALID_FENCE refusal
+    /// (the F7 discipline, which this lane never had).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_half_sent_compact_fence_is_refused_typed() {
+        let (mut st, _http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        insert_compact_session(&st, "ses_r29_half", Some("test-model")).await;
+        seed_live_then_stop_to_vacant(&registry, "ses_r29_half").await;
+
+        // HALF-SENT: the epoch without the generation.
+        let mut msg = compact_msg("ses_r29_half");
+        msg.observed_epoch = Some(registry.boot_epoch());
+        msg.observed_generation = None;
+        st.handle_compact(msg).await;
+
+        let mut saw_refusal = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).expect("broadcast json");
+            if frame["event"]["type"] == json!("freshAgent.error")
+                && frame["event"]["code"] == json!("INVALID_FENCE")
+            {
+                saw_refusal = true;
+            }
+        }
+        assert!(
+            saw_refusal,
+            "the half-sent fence must answer the typed INVALID_FENCE refusal"
+        );
+    }
+
+    /// b8ke ext r29 F2: the STALE-ON-ARRIVAL fork — the observed pair
+    /// predates the CURRENT record. Pre-r29 the fork ignored the supplied
+    /// pair (and claimed its provisional child with `None`), so a queued
+    /// old-generation fork could mint a child from newer history. The
+    /// consult answers the typed stale refusal on the requesting sink and
+    /// no fork POST ever leaves.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_on_arrival_fork_is_refused_typed() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let mut st = fork_state(http.clone()).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        insert_fork_parent(&st, "ses_r29_fork", Some("/w"), None, None).await;
+        let stale_generation = seed_live_then_stop_to_vacant(&registry, "ses_r29_fork").await;
+
+        // THE STALE FORK: the pre-advance observed pair rides the wire.
+        let mut msg = fork_msg("ses_r29_fork", "req-r29-f2-fork", None);
+        msg.observed_epoch = Some(registry.boot_epoch());
+        msg.observed_generation = Some(stale_generation);
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(msg, None, sink).await;
+
+        let frames = captured.lock().expect("captured mutex").clone();
+        let refused = frames.iter().any(|f| {
+            let v = serde_json::to_value(f).unwrap_or_default();
+            v["type"] == "freshAgent.event"
+                && v["event"]["type"] == json!("freshAgent.error")
+                && v["event"]["code"] == json!("SESSION_RESERVED")
+        });
+        assert!(
+            refused,
+            "the stale fork must answer the typed refusal: {frames:?}"
+        );
+        assert!(
+            http.fork_requests().is_empty(),
+            "the refused fork never issued the provider POST"
+        );
+        // No child was minted anywhere.
+        assert!(
+            !st.sessions.lock().await.contains_key("ses_child"),
+            "the refused fork never registered a child"
+        );
+    }
+
+    /// b8ke ext r29 F2: the STALE-ON-ARRIVAL undo — the observed pair
+    /// predates the CURRENT record. Pre-r29 the rollback ignored the
+    /// supplied pair, so a queued old-generation undo could mutate newer
+    /// history (the revert POST + the record rewrite). The consult answers
+    /// the typed stale refusal on the reply sink and NOTHING reaches the
+    /// provider.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_on_arrival_undo_is_refused_typed() {
+        let (mut st, _rx, _sink, http) = state_with_rollback_fake(None).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        let stale_generation = seed_live_then_stop_to_vacant(&registry, "ses_real").await;
+
+        // THE STALE UNDO: the pre-advance observed pair rides the op.
+        let mut op = undo_op("ses_real", "rb-r29-stale");
+        op.observed_epoch = Some(registry.boot_epoch());
+        op.observed_generation = Some(stale_generation);
+        let (sink, captured) = capturing_sink();
+        st.handle_rollback(op, sink).await;
+
+        let frames = captured.lock().expect("captured mutex").clone();
+        let refused = frames.iter().any(|f| {
+            let v = serde_json::to_value(f).unwrap_or_default();
+            v["type"] == "freshAgent.event"
+                && v["event"]["type"] == json!("freshAgent.error")
+                && v["event"]["code"] == json!("SESSION_RESERVED")
+                && v["event"]["requestId"] == json!("rb-r29-stale")
+                && v["event"]["rollback"] == json!(true)
+        });
+        assert!(
+            refused,
+            "the stale undo must answer the typed rollback-stamped refusal: {frames:?}"
+        );
+        assert!(
+            http.revert_posts().is_empty(),
+            "the refused undo never posted the revert"
+        );
+    }
+
+    /// b8ke focused ep5 r1 F1: the compact's op guard is HELD across the
+    /// arm→mutation window — a parent handoff arriving while the compact
+    /// is parked mid-preflight (the model-resolution GET /config leg,
+    /// AFTER the guard armed and BEFORE any mutation: the summarize POST,
+    /// the redo destroy) answers the coordinator's typed `Blocked`
+    /// (pre-ep5-r1 the bare snapshot consult held NOTHING, so the handoff
+    /// granted and advanced the generation while the old-kind operation
+    /// still mutated history). The guard releases at the summarize
+    /// DISPATCH boundary (the R2-5 abort machinery owns the
+    /// dispatched window), and the compact completes normally.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handoff_during_a_parked_compact_answers_blocked_and_the_compact_completes() {
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (mut st, http, mut rx) = compact_state_gated(
+            r#"{"model":"prov-a/mdl-x"}"#,
+            SummarizeOutcome::OkAnswered,
+            None,
+            Some(Arc::clone(&gate)),
+        )
+        .await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        // No session model — the handler MUST consult GET /config (the
+        // parked preflight leg) after arming the guard.
+        insert_compact_session(&st, "ses_ep5_compact", None).await;
+        seed_live_fresh_owner(&registry, "ses_ep5_compact");
+
+        let driven = st.clone();
+        let mut msg = compact_msg("ses_ep5_compact");
+        (msg.observed_epoch, msg.observed_generation) =
+            fenced_observed(&registry, "ses_ep5_compact");
+        let task = tokio::spawn(async move {
+            driven.handle_compact(msg).await;
+        });
+        // Park proof: the model-resolution GET /config is parked at the
+        // gate (the guard armed, no mutation yet).
+        {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if http.get_config_count() > 0 {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the compact never reached its config resolution"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        // THE CONTRACT: the handoff beginning inside the compact's
+        // guarded pre-mutation window answers the typed Blocked outcome.
+        match registry.begin_handoff(
+            PROVIDER,
+            "ses_ep5_compact",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-ep5-racing-handoff",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) {
+            freshell_ownership::BeginOutcome::Blocked {
+                state,
+                retry_after_ms,
+            } => {
+                assert!(retry_after_ms > 0);
+                assert!(
+                    matches!(state, freshell_ownership::OwnershipState::Live { .. }),
+                    "the blocked state names the still-Live owner: {state:?}"
+                );
+            }
+            other => panic!(
+                "a handoff begin inside the compact's guarded window must answer \
+                 Blocked — got {other:?}"
+            ),
+        }
+
+        // Release: the POST answers, the guard releases, the compact
+        // settles — NO error frame ever fired.
+        gate.notify_one();
+        let _ = task.await;
+        let mut saw_error = false;
+        let mut saw_running = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).expect("broadcast json");
+            if frame["event"]["type"] == json!("freshAgent.error") {
+                saw_error = true;
+            }
+            if frame["event"]["type"] == json!("freshAgent.session.snapshot")
+                && frame["event"]["status"] == json!("running")
+            {
+                saw_running = true;
+            }
+        }
+        assert!(!saw_error, "the guarded compact completed without error");
+        assert!(saw_running, "the compact ran: {rx:?}");
+    }
+
+    /// b8ke focused ep5 r1 F1: the reverse direction — a handoff ALREADY
+    /// owning the key (the record in Handoff) refuses the compact typed
+    /// even for a LEGACY-UNFENCED request (pre-ep5-r1 those passed the
+    /// snapshot consult unconditionally into the mutation).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_compact_while_a_handoff_owns_the_key_is_refused_typed() {
+        let (mut st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        insert_compact_session(&st, "ses_ep5_ho_compact", Some("prov-a/mdl-x")).await;
+        seed_live_fresh_owner(&registry, "ses_ep5_ho_compact");
+        let sink = seed_redoable_record(&st, "ses_ep5_ho_compact").await;
+
+        // The handoff ENTERS and stays open (the record → Handoff).
+        let freshell_ownership::BeginOutcome::Granted { .. } = registry.begin_handoff(
+            PROVIDER,
+            "ses_ep5_ho_compact",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-ep5-ho-held",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the held handoff must grant")
+        };
+
+        // The UNFENCED compact — refused typed, nothing mutated.
+        st.handle_compact(compact_msg("ses_ep5_ho_compact")).await;
+        let mut saw_refusal = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).expect("broadcast json");
+            if frame["event"]["type"] == json!("freshAgent.error") {
+                assert_eq!(frame["event"]["code"], json!("SESSION_RESERVED"), "{frame}");
+                saw_refusal = true;
+            }
+        }
+        assert!(saw_refusal, "the compact under a handoff must refuse typed");
+        assert!(
+            http.summarize_requests().is_empty(),
+            "the refused compact never drove the summarize POST"
+        );
+        assert!(
+            sink.load_rollback(PROVIDER, "ses_ep5_ho_compact")
+                .expect("the record survives")
+                .can_redo,
+            "the refused compact never destroyed redo"
+        );
+    }
+
+    /// b8ke focused ep5 r5 F3: the unfenced-absence decision is ATOMIC
+    /// with the arm — the deterministic observe→arm race the round-5
+    /// reviewer named. The compact's pre-arm snapshot sees `Handoff`; the
+    /// handoff then COMMITS `Live{FreshAgent}` at the SAME generation
+    /// while the guard is parked in its (r4) snapshot→arm window; the
+    /// released arm succeeds over the newly established owner. Pre-r5 the
+    /// laundered pair armed and the under-guard kind check ACCEPTED the
+    /// unfenced op — the stale compact mutated the newly established
+    /// owner's session. Post-r5 the absence check runs UNDER the guard
+    /// (the arm itself proves the record was Live{FreshAgent} at arm
+    /// time): the typed FENCE_REQUIRED refusal, no mutation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unfenced_compact_racing_a_handoff_commit_into_the_arm_window_is_refused_typed() {
+        let (mut st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        insert_compact_session(&st, "ses_ep5_r5_race", Some("prov-a/mdl-x")).await;
+        let sink = seed_redoable_record(&st, "ses_ep5_r5_race").await;
+        seed_live_fresh_owner(&registry, "ses_ep5_r5_race");
+
+        // The handoff ENTERS and stays open: the record → Handoff at
+        // generation N.
+        let race_generation = match registry.begin_handoff(
+            PROVIDER,
+            "ses_ep5_r5_race",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-r5-race",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) {
+            freshell_ownership::BeginOutcome::Granted { generation } => generation,
+            other => panic!("the race handoff must grant: {other:?}"),
+        };
+
+        // Arm the interlock: the compact's guard call parks after its
+        // snapshot (which sees Handoff{N}), between the observe and the
+        // arm.
+        crate::ownership_lane::OP_GUARD_INTERLOCK.arm(PROVIDER, "ses_ep5_r5_race");
+        let driven = st.clone();
+        let task = tokio::spawn(async move {
+            driven.handle_compact(compact_msg("ses_ep5_r5_race")).await;
+        });
+        {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !crate::ownership_lane::OP_GUARD_INTERLOCK.reached() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the compact's guard never reached the interlock"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+
+        // THE RACE WINDOW: the handoff COMMITS Live{FreshAgent} at the
+        // SAME generation the snapshot saw, while the guard is parked.
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                "ses_ep5_r5_race",
+                "op-r5-race",
+                race_generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("r5-race-newer".into()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+
+        // Release the parked arm: the record is Live{FreshAgent}@N now —
+        // the laundered pair arms, and the UNFENCED decision fires UNDER
+        // the guard: the typed FENCE_REQUIRED refusal.
+        crate::ownership_lane::OP_GUARD_INTERLOCK.release();
+        let _ = task.await;
+        let mut saw_refusal = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).expect("broadcast json");
+            if frame["event"]["type"] == json!("freshAgent.error") {
+                assert_eq!(frame["event"]["code"], json!("SESSION_RESERVED"), "{frame}");
+                assert!(
+                    frame["event"]["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("re-observe"),
+                    "the refusal names the FENCE_REQUIRED contract: {frame}"
+                );
+                saw_refusal = true;
+            }
+        }
+        assert!(
+            saw_refusal,
+            "the unfenced compact racing the handoff commit into the arm \
+             window must refuse typed (FENCE_REQUIRED), never arm over the \
+             newly established owner"
+        );
+        assert!(
+            http.summarize_requests().is_empty(),
+            "the refused compact never drove the summarize POST — the newer \
+             owner's history was never mutated"
+        );
+        assert!(
+            sink.load_rollback(PROVIDER, "ses_ep5_r5_race")
+                .expect("the record survives")
+                .can_redo,
+            "the refused compact never destroyed redo"
+        );
+        // The newly established owner stands untouched.
+        let settled = registry.observe(PROVIDER, "ses_ep5_r5_race");
+        assert_eq!(settled.generation, race_generation);
+        assert!(matches!(
+            settled.state,
+            freshell_ownership::OwnershipState::Live { ref owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ));
+    }
+
+    /// b8ke focused ep5 r4 F2: an UNFENCED history mutation arriving
+    /// after a COMPLETED OWNERSHIP CYCLE is refused typed — never
+    /// laundered into the current generation. The request was queued
+    /// when the session held generation N; the session then moved away
+    /// (a terminal handoff) and returned to Fresh Agent ownership at
+    /// N+2. Pre-F2 the absent pair was assigned the coordinator's
+    /// CURRENT generation (indistinguishable from a current request:
+    /// the guard armed and the stale operation mutated the newer
+    /// history). Post-F2 the typed FENCE_REQUIRED refusal answers it —
+    /// the client re-observes the owner record and retries WITH the
+    /// pair — and nothing is mutated.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unfenced_compact_after_a_completed_ownership_cycle_is_refused_typed() {
+        let (mut st, http, mut rx) =
+            compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        insert_compact_session(&st, "ses_ep5_cycle", Some("prov-a/mdl-x")).await;
+        let sink = seed_redoable_record(&st, "ses_ep5_cycle").await;
+        seed_live_fresh_owner(&registry, "ses_ep5_cycle");
+
+        // THE CYCLE: away — the terminal handoff commits at generation
+        // N+1 — then back — the fresh-agent handoff commits at N+2.
+        let away_generation = match registry.begin_handoff(
+            PROVIDER,
+            "ses_ep5_cycle",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-ep5-cycle-away",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) {
+            freshell_ownership::BeginOutcome::Granted { generation } => generation,
+            other => panic!("the away handoff must grant: {other:?}"),
+        };
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                "ses_ep5_cycle",
+                "op-ep5-cycle-away",
+                away_generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-cycle".into()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        let back_generation = match registry.begin_handoff(
+            PROVIDER,
+            "ses_ep5_cycle",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            "op-ep5-cycle-back",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) {
+            freshell_ownership::BeginOutcome::Granted { generation } => generation,
+            other => panic!("the back handoff must grant: {other:?}"),
+        };
+        assert_eq!(
+            registry.commit_live(
+                PROVIDER,
+                "ses_ep5_cycle",
+                "op-ep5-cycle-back",
+                back_generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    terminal_id: None,
+                    live_session_key: Some("cycle-fresh".into()),
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed
+        );
+        assert!(
+            back_generation > away_generation,
+            "the cycle advanced the generation"
+        );
+        assert!(matches!(
+            registry.observe(PROVIDER, "ses_ep5_cycle").state,
+            freshell_ownership::OwnershipState::Live { ref owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ));
+
+        // THE UNFENCED COMPACT — queued at generation N (the seed), its
+        // wire pair absent, arriving after the completed cycle. Refused
+        // typed with the FENCE_REQUIRED message; nothing mutated.
+        st.handle_compact(compact_msg("ses_ep5_cycle")).await;
+        let mut saw_refusal = false;
+        while let Ok(raw) = rx.try_recv() {
+            let frame: Value = serde_json::from_str(&raw).expect("broadcast json");
+            if frame["event"]["type"] == json!("freshAgent.error") {
+                assert_eq!(frame["event"]["code"], json!("SESSION_RESERVED"), "{frame}");
+                assert!(
+                    frame["event"]["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("re-observe"),
+                    "the refusal names the FENCE_REQUIRED contract: {frame}"
+                );
+                saw_refusal = true;
+            }
+        }
+        assert!(
+            saw_refusal,
+            "the unfenced compact after a completed cycle must refuse typed"
+        );
+        assert!(
+            http.summarize_requests().is_empty(),
+            "the refused compact never drove the summarize POST — the newer \
+             history was never mutated"
+        );
+        assert!(
+            sink.load_rollback(PROVIDER, "ses_ep5_cycle")
+                .expect("the record survives")
+                .can_redo,
+            "the refused compact never destroyed redo"
+        );
+
+        // The actionable contract: the SAME request WITH the re-observed
+        // pair arms and completes (the compact drives its summarize POST).
+        let mut msg = compact_msg("ses_ep5_cycle");
+        (msg.observed_epoch, msg.observed_generation) = fenced_observed(&registry, "ses_ep5_cycle");
+        st.handle_compact(msg).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while http.summarize_requests().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fenced retry never drove the summarize POST"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// b8ke focused ep5 r1 F1: the fork's op guard is HELD across the fork
+    /// window — a parent handoff arriving while the fork POST is parked
+    /// mid-flight answers the coordinator's typed `Blocked` (pre-ep5-r1
+    /// the parent handoff could advance the generation while the fork
+    /// created and committed its child). The guard releases at handler
+    /// end and the child completes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handoff_during_a_parked_fork_answers_blocked_and_the_child_completes() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *http.fork_gate.lock().expect("fork gate mutex") = Some(Arc::clone(&gate));
+        let mut st = fork_state(http.clone()).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        insert_fork_parent(&st, "ses_ep5_fork", Some("/w"), None, None).await;
+        seed_live_fresh_owner(&registry, "ses_ep5_fork");
+
+        let driven = st.clone();
+        let (sink, captured) = capturing_sink();
+        let reply_sink = sink.clone();
+        let mut fork_request = fork_msg("ses_ep5_fork", "req-ep5-fork", None);
+        (
+            fork_request.observed_epoch,
+            fork_request.observed_generation,
+        ) = fenced_observed(&registry, "ses_ep5_fork");
+        let task = tokio::spawn(async move {
+            driven.handle_fork(fork_request, None, reply_sink).await;
+        });
+        {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if !http.fork_requests().is_empty() {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the fork never POSTed"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        match registry.begin_handoff(
+            PROVIDER,
+            "ses_ep5_fork",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-ep5-racing-fork-handoff",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) {
+            freshell_ownership::BeginOutcome::Blocked {
+                state,
+                retry_after_ms,
+            } => {
+                assert!(retry_after_ms > 0);
+                assert!(
+                    matches!(state, freshell_ownership::OwnershipState::Live { .. }),
+                    "the blocked state names the still-Live owner: {state:?}"
+                );
+            }
+            other => panic!(
+                "a handoff begin inside the fork's guarded window must answer \
+                 Blocked — got {other:?}"
+            ),
+        }
+
+        gate.notify_one();
+        let _ = task.await;
+        let frames = captured.lock().expect("captured mutex").clone();
+        assert!(
+            frames.iter().any(|f| {
+                let v = serde_json::to_value(f).unwrap_or_default();
+                v["type"] == "freshAgent.forked" && v["sessionId"] == json!("ses_child")
+            }),
+            "the guarded fork completed and answered forked: {frames:?}"
+        );
+    }
+
+    /// b8ke focused ep5 r1 F1: the reverse direction — a handoff already
+    /// owning the key refuses an UNFENCED fork typed (pre-ep5-r1 the
+    /// unfenced shape passed unconditionally), and no child is minted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fork_while_a_handoff_owns_the_key_is_refused_typed() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let mut st = fork_state(http.clone()).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        insert_fork_parent(&st, "ses_ep5_ho_fork", Some("/w"), None, None).await;
+        seed_live_fresh_owner(&registry, "ses_ep5_ho_fork");
+
+        let freshell_ownership::BeginOutcome::Granted { .. } = registry.begin_handoff(
+            PROVIDER,
+            "ses_ep5_ho_fork",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-ep5-ho-held-fork",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the held handoff must grant")
+        };
+
+        let (sink, captured) = capturing_sink();
+        st.handle_fork(
+            fork_msg("ses_ep5_ho_fork", "req-ep5-ho-fork", None),
+            None,
+            sink,
+        )
+        .await;
+        let frames = captured.lock().expect("captured mutex").clone();
+        let refused = frames.iter().any(|f| {
+            let v = serde_json::to_value(f).unwrap_or_default();
+            v["type"] == "freshAgent.event"
+                && v["event"]["type"] == json!("freshAgent.error")
+                && v["event"]["code"] == json!("SESSION_RESERVED")
+        });
+        assert!(
+            refused,
+            "the fork under a handoff must refuse typed: {frames:?}"
+        );
+        assert!(
+            http.fork_requests().is_empty(),
+            "the refused fork never issued the provider POST"
+        );
+        assert!(
+            !st.sessions.lock().await.contains_key("ses_child"),
+            "the refused fork never minted a child"
+        );
+    }
+
+    /// b8ke focused ep5 r1 F1: the rollback's op guard is HELD across the
+    /// mutation sequence — a handoff arriving while the revert POST is
+    /// parked mid-flight answers the coordinator's typed `Blocked`. The
+    /// guard releases at handler end and the undo completes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handoff_during_a_parked_revert_answers_blocked_and_the_undo_completes() {
+        let (mut st, _rx, _sink, http) = state_with_rollback_fake(None).await;
+        let gate = http.arm_revert_gate();
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        seed_live_fresh_owner(&registry, "ses_real");
+
+        let driven = st.clone();
+        let (sink, captured) = capturing_sink();
+        let mut rollback_request = undo_op("ses_real", "rb-ep5-race");
+        (
+            rollback_request.observed_epoch,
+            rollback_request.observed_generation,
+        ) = fenced_observed(&registry, "ses_real");
+        let task = tokio::spawn(async move {
+            driven.handle_rollback(rollback_request, sink).await;
+        });
+        {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if !http.revert_posts().is_empty() {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the rollback never reached its revert POST"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        match registry.begin_handoff(
+            PROVIDER,
+            "ses_real",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-ep5-racing-rollback-handoff",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) {
+            freshell_ownership::BeginOutcome::Blocked {
+                state,
+                retry_after_ms,
+            } => {
+                assert!(retry_after_ms > 0);
+                assert!(
+                    matches!(state, freshell_ownership::OwnershipState::Live { .. }),
+                    "the blocked state names the still-Live owner: {state:?}"
+                );
+            }
+            other => panic!(
+                "a handoff begin inside the rollback's guarded window must \
+                 answer Blocked — got {other:?}"
+            ),
+        }
+
+        gate.notify_one();
+        let _ = task.await;
+        let frames = captured.lock().expect("captured mutex").clone();
+        assert!(
+            frames.iter().any(|f| {
+                let v = serde_json::to_value(f).unwrap_or_default();
+                v["type"] == "freshAgent.event"
+                    && v["event"]["type"] == json!("freshAgent.rolledBack")
+            }),
+            "the guarded undo completed: {frames:?}"
+        );
+    }
+
+    /// b8ke focused ep5 r1 F1: the reverse direction — a handoff already
+    /// owning the key refuses an UNFENCED undo typed; no revert POST, no
+    /// record mutation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rollback_while_a_handoff_owns_the_key_is_refused_typed() {
+        let (mut st, _rx, _sink, http) = state_with_rollback_fake(None).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        seed_live_fresh_owner(&registry, "ses_real");
+
+        let freshell_ownership::BeginOutcome::Granted { .. } = registry.begin_handoff(
+            PROVIDER,
+            "ses_real",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-ep5-ho-held-undo",
+            None,
+            "test",
+            freshell_ownership::now_epoch_ms(),
+        ) else {
+            panic!("the held handoff must grant")
+        };
+
+        let (reply, captured) = capturing_sink();
+        st.handle_rollback(undo_op("ses_real", "rb-ep5-ho"), reply)
+            .await;
+        let frames = captured.lock().expect("captured mutex").clone();
+        let refused = frames.iter().any(|f| {
+            let v = serde_json::to_value(f).unwrap_or_default();
+            v["type"] == "freshAgent.event"
+                && v["event"]["type"] == json!("freshAgent.error")
+                && v["event"]["code"] == json!("SESSION_RESERVED")
+        });
+        assert!(
+            refused,
+            "the undo under a handoff must refuse typed: {frames:?}"
+        );
+        assert!(
+            http.revert_posts().is_empty(),
+            "the refused undo never posted the revert"
+        );
+    }
+
+    /// b8ke focused ep5 r1 F1: the op guard's KIND verification — a
+    /// CURRENT-generation request over a TERMINAL-owned key (a completed
+    /// handoff; the finding's "current-generation terminal-owner request
+    /// passes" shape) refuses typed on every reclaim-less lane. One test
+    /// per lane pins the lane mapping over the shared helper's arm.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reclaimless_ops_over_a_terminal_owned_key_refuse_typed_on_every_lane() {
+        // ── compact ──
+        {
+            let (mut st, http, mut rx) =
+                compact_state(r#"{"model":null}"#, SummarizeOutcome::OkAnswered).await;
+            let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+            st.set_ownership(registry.clone());
+            insert_compact_session(&st, "ses_ep5_term", Some("prov-a/mdl-x")).await;
+            // A committed TERMINAL owner at the current generation.
+            let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+                PROVIDER,
+                "ses_ep5_term",
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "op-ep5-term-seed",
+                None,
+                "test",
+                1_000,
+            ) else {
+                panic!("the terminal seed must grant")
+            };
+            assert_eq!(
+                registry.commit_live(
+                    PROVIDER,
+                    "ses_ep5_term",
+                    "op-ep5-term-seed",
+                    generation,
+                    freshell_ownership::OwnerIdentity {
+                        kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                        terminal_id: Some("t-ep5".to_string()),
+                        live_session_key: None,
+                        pid: None,
+                        ownership_id: None,
+                    },
+                ),
+                freshell_ownership::CommitOutcome::Committed
+            );
+            st.handle_compact(compact_msg("ses_ep5_term")).await;
+            let mut saw_refusal = false;
+            while let Ok(raw) = rx.try_recv() {
+                let frame: Value = serde_json::from_str(&raw).expect("broadcast json");
+                if frame["event"]["type"] == json!("freshAgent.error") {
+                    assert_eq!(frame["event"]["code"], json!("SESSION_RESERVED"), "{frame}");
+                    saw_refusal = true;
+                }
+            }
+            assert!(
+                saw_refusal,
+                "the compact over a terminal owner refuses typed"
+            );
+            assert!(http.summarize_requests().is_empty());
+        }
+        // ── fork ──
+        {
+            let http = Arc::new(ForkFakeHttp::child_ok());
+            let mut st = fork_state(http.clone()).await;
+            let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+            st.set_ownership(registry.clone());
+            insert_fork_parent(&st, "ses_ep5_term", Some("/w"), None, None).await;
+            let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+                PROVIDER,
+                "ses_ep5_term",
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "op-ep5-term-seed-fork",
+                None,
+                "test",
+                1_000,
+            ) else {
+                panic!("the terminal seed must grant")
+            };
+            assert_eq!(
+                registry.commit_live(
+                    PROVIDER,
+                    "ses_ep5_term",
+                    "op-ep5-term-seed-fork",
+                    generation,
+                    freshell_ownership::OwnerIdentity {
+                        kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                        terminal_id: Some("t-ep5".to_string()),
+                        live_session_key: None,
+                        pid: None,
+                        ownership_id: None,
+                    },
+                ),
+                freshell_ownership::CommitOutcome::Committed
+            );
+            let (sink, captured) = capturing_sink();
+            st.handle_fork(fork_msg("ses_ep5_term", "req-ep5-term", None), None, sink)
+                .await;
+            let frames = captured.lock().expect("captured mutex").clone();
+            let refused = frames.iter().any(|f| {
+                let v = serde_json::to_value(f).unwrap_or_default();
+                v["type"] == "freshAgent.event"
+                    && v["event"]["type"] == json!("freshAgent.error")
+                    && v["event"]["code"] == json!("SESSION_RESERVED")
+            });
+            assert!(
+                refused,
+                "the fork over a terminal owner refuses typed: {frames:?}"
+            );
+            assert!(http.fork_requests().is_empty());
+        }
+        // ── rollback ──
+        {
+            let (mut st, _rx, _sink, http) = state_with_rollback_fake(None).await;
+            let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+            st.set_ownership(registry.clone());
+            let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_start(
+                PROVIDER,
+                "ses_real",
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "op-ep5-term-seed-undo",
+                None,
+                "test",
+                1_000,
+            ) else {
+                panic!("the terminal seed must grant")
+            };
+            assert_eq!(
+                registry.commit_live(
+                    PROVIDER,
+                    "ses_real",
+                    "op-ep5-term-seed-undo",
+                    generation,
+                    freshell_ownership::OwnerIdentity {
+                        kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                        terminal_id: Some("t-ep5".to_string()),
+                        live_session_key: None,
+                        pid: None,
+                        ownership_id: None,
+                    },
+                ),
+                freshell_ownership::CommitOutcome::Committed
+            );
+            let (reply, captured) = capturing_sink();
+            st.handle_rollback(undo_op("ses_real", "rb-ep5-term"), reply)
+                .await;
+            let frames = captured.lock().expect("captured mutex").clone();
+            let refused = frames.iter().any(|f| {
+                let v = serde_json::to_value(f).unwrap_or_default();
+                v["type"] == "freshAgent.event"
+                    && v["event"]["type"] == json!("freshAgent.error")
+                    && v["event"]["code"] == json!("SESSION_RESERVED")
+            });
+            assert!(
+                refused,
+                "the undo over a terminal owner refuses typed: {frames:?}"
+            );
+            assert!(http.revert_posts().is_empty());
+        }
+    }
+
     /// Seed a redo-capable rollback record for `session_id` (one user+assistant
     /// step undid at t2; redo live) and return the fake sink.
     async fn seed_redoable_record(
@@ -8934,6 +15468,7 @@ mod tests {
             r#"{"model":null}"#,
             SummarizeOutcome::OkAnswered,
             Some(gate.clone()),
+            None,
         )
         .await;
         insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
@@ -9277,6 +15812,7 @@ mod tests {
             tx.subscribe(),
             None,
             None,
+            None,
         ));
         let deps = ServeDeps {
             spawner: Arc::new(FailSpawner),
@@ -9342,6 +15878,7 @@ mod tests {
             tx.subscribe(),
             None,
             Some(health_gate.clone()),
+            None,
         ));
         let deps = ServeDeps {
             spawner: Arc::new(TrackedSpawner {
@@ -9444,6 +15981,7 @@ mod tests {
             tx.subscribe(),
             None,
             Some(health_gate.clone()),
+            None,
         ));
         let deps = ServeDeps {
             spawner: Arc::new(SpawnOnceThenRefuse {
@@ -10050,6 +16588,7 @@ mod tests {
             r#"{"model":null}"#,
             SummarizeOutcome::OkAnswered,
             Some(gate.clone()),
+            None,
         )
         .await;
         insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
@@ -10081,6 +16620,8 @@ mod tests {
         await_summarize_posted(&http).await;
 
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: AgentProvider::Opencode,
             session_id: "ses_1".to_string(),
             session_type: SessionType::Freshopencode,
@@ -10124,6 +16665,7 @@ mod tests {
             r#"{"model":null}"#,
             SummarizeOutcome::OkAnswered,
             Some(gate.clone()),
+            None,
         )
         .await;
         insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
@@ -10191,6 +16733,7 @@ mod tests {
             r#"{"model":null}"#,
             SummarizeOutcome::OkAnswered,
             Some(gate.clone()),
+            None,
         )
         .await;
         insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
@@ -10258,6 +16801,8 @@ mod tests {
         // The ownership invariant holds end-to-end: a kill mid-compact aborts the
         // registered drive — no false completion after the gate releases.
         st.handle_kill(FreshAgentKill {
+            observed_epoch: None,
+            observed_generation: None,
             provider: AgentProvider::Opencode,
             session_id: "ses_1".to_string(),
             session_type: SessionType::Freshopencode,
@@ -10301,6 +16846,8 @@ mod tests {
             request_id: Some(request_id.to_string()),
             cwd: None,
             tab_id: None,
+            observed_epoch: None,
+            observed_generation: None,
         }
     }
 
@@ -10434,6 +16981,157 @@ mod tests {
             .insert(id.to_string(), Arc::new(TokioMutex::new(session)));
     }
 
+    /// b8ke ext r26 F3: the fork's PRE-MUTATION claim — the request-scoped
+    /// provisional identity (`pending-fork-<requestId>`) holds the
+    /// in-flight start BEFORE `manager.fork` issues its provider POST, so
+    /// the whole fork window is coordinator-owned (pre-r26 the claim only
+    /// happened AFTER the provider mutation, leaving a refused, panicked,
+    /// or cancelled fork's minted child outside coordinator ownership and
+    /// typed recovery). ForkFakeHttp's gate parks the fork POST for the
+    /// window inspection.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_fork_claims_its_operation_identity_before_the_provider_mutation() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let mut st = fork_state(http.clone()).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
+        // b8ke focused ep5 r1 F1: the parent's committed Live{FreshAgent}
+        // record (production-faithful; the op guard verifies it).
+        seed_live_fresh_owner(&registry, "ses_parent");
+        let gate = Arc::new(tokio::sync::Notify::new());
+        *http.fork_gate.lock().expect("fork gate mutex") = Some(Arc::clone(&gate));
+        let (sink, captured) = capturing_sink();
+
+        let st2 = st.clone();
+        let mut fork_request = fork_msg("ses_parent", "fork-r26", None);
+        (
+            fork_request.observed_epoch,
+            fork_request.observed_generation,
+        ) = fenced_observed(&registry, "ses_parent");
+        let fork = tokio::spawn(async move { st2.handle_fork(fork_request, None, sink).await });
+
+        // THE PRE-MUTATION CLAIM: the request-scoped provisional key holds
+        // the in-flight start while the fork POST is still open (pre-r26
+        // this poll starved — nothing claimed before the mint).
+        let provisional = "pending-fork-fork-r26";
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if matches!(
+                registry.observe(PROVIDER, provisional).state,
+                freshell_ownership::OwnershipState::Starting {
+                    kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                    ..
+                }
+            ) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fork never claimed its provisional identity before the \
+                 provider mutation (r26 F3)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // A competing lifecycle operation on the provisional key is
+        // refused typed — the fork window blocks competing starts.
+        assert!(matches!(
+            registry.begin_start(
+                PROVIDER,
+                provisional,
+                freshell_ownership::RuntimeOwnerKind::Terminal,
+                "op-r26-fork-compete",
+                None,
+                "test",
+                crate::session_lease::now_epoch_ms(),
+            ),
+            freshell_ownership::BeginOutcome::Blocked { .. }
+        ));
+
+        // Release the parked fork POST: the minted child rekeys the SAME
+        // ticket, registers, and commits Live at `ses_child` with the
+        // provisional key left as the resolution alias.
+        gate.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(15), fork)
+            .await
+            .expect("the fork completes after the release")
+            .expect("the fork task joins");
+        assert_eq!(http.fork_requests().len(), 1, "exactly one fork POST");
+        assert!(matches!(
+            registry.observe(PROVIDER, "ses_child").state,
+            freshell_ownership::OwnershipState::Live { owner, .. }
+                if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+        ));
+        assert!(matches!(
+            registry.observe(PROVIDER, provisional).state,
+            freshell_ownership::OwnershipState::Aliased { to, .. } if to == "ses_child"
+        ));
+        // The forked reply landed on the requesting sink.
+        assert_eq!(
+            captured.lock().expect("captured mutex").len(),
+            1,
+            "exactly one reply on the requesting sink"
+        );
+    }
+
+    /// b8ke ext r26 F4: a fork whose child binding-row write FAILS tears
+    /// the child down and answers the typed error — never the pre-r26
+    /// log-and-continue that registered the child, started its bridge,
+    /// committed Live, and replied `freshAgent.forked` success over a
+    /// child missing from the authoritative recovery registry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fork_binding_failure_tears_the_child_down_typed() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let mut st = fork_state(http.clone()).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
+        // b8ke focused ep5 r1 F1: the parent's committed Live{FreshAgent}
+        // record (production-faithful — every live opencode session holds
+        // one; the op guard verifies it on the parent key).
+        seed_live_fresh_owner(&registry, "ses_parent");
+        fake.set_fail_writes(true);
+
+        let (sink, captured) = capturing_sink();
+        let mut fork_request = fork_msg("ses_parent", "fork-req-f4", None);
+        (
+            fork_request.observed_epoch,
+            fork_request.observed_generation,
+        ) = fenced_observed(&registry, "ses_parent");
+        st.handle_fork(fork_request, None, sink).await;
+
+        // The reply is the TYPED error, never the forked success.
+        let frames = captured.lock().expect("captured mutex").clone();
+        assert_eq!(frames.len(), 1, "exactly one reply on the requesting sink");
+        let v = serde_json::to_value(&frames[0]).unwrap();
+        assert_eq!(
+            v["event"]["code"],
+            json!("LEDGER_WRITE_FAILED"),
+            "the binding failure answers the typed error, got: {v}"
+        );
+        // The child is torn down: no map entry, never a live session the
+        // recovery registry cannot resolve.
+        assert!(
+            !st.has_live_session("ses_child").await,
+            "the failed fork must remove the child session entry"
+        );
+        assert!(
+            matches!(
+                registry.observe(PROVIDER, "ses_child").state,
+                freshell_ownership::OwnershipState::Vacant
+            ),
+            "the failed fork never commits Live — got {:?}",
+            registry.observe(PROVIDER, "ses_child").state
+        );
+        assert_eq!(
+            http.fork_requests().len(),
+            1,
+            "fixture: the provider fork happened (the failure is at the binding write)"
+        );
+    }
+
     #[tokio::test]
     async fn fork_registers_the_child_and_replies_forked_on_the_requesting_sink() {
         let http = Arc::new(ForkFakeHttp::child_ok());
@@ -10540,6 +17238,117 @@ mod tests {
             child.cwd.as_deref(),
             Some("/parent/cwd"),
             "child.directory ?? state.cwd (adapter.ts fork)"
+        );
+    }
+
+    /// kata b8ke Task 3 review M-1: a fork commit that goes STALE (the
+    /// coordinator moved on while the child registered — here: the
+    /// watchdog's stale-start recovery flips the child's `Starting` to
+    /// `Stopping` mid-fork) must tear the uncommitted child down
+    /// COMPLETELY: map keys gone, killed flag set, serve-SSE bridge
+    /// aborted. The pre-fix teardown re-got the just-removed map entry,
+    /// so the bridge task leaked (broadcasting for a session that no
+    /// longer exists) and the killed flag never landed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fork_commit_that_goes_stale_tears_the_child_down_completely() {
+        let http = Arc::new(ForkFakeHttp::child_ok());
+        let mut st = fork_state(http).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(registry.clone());
+        let fake = std::sync::Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
+        // b8ke focused ep5 r1 F1: the parent's committed Live{FreshAgent}
+        // record (production-faithful; the op guard verifies it).
+        seed_live_fresh_owner(&registry, "ses_parent");
+
+        // Park the fork BETWEEN its child-key claim and its lane commit: the
+        // child's binding-row write stalls behind the test's release.
+        let stall = fake.arm_binding_stall("opencode", "ses_child");
+        let (sink, captured) = capturing_sink();
+
+        // The mid-fork mover: once the fork parks on the child's binding
+        // write, capture the registered child (proving its serve-SSE bridge
+        // is live at the park), then move the coordinator on (b8ke ext
+        // r26 F1/F3: the fork's start is WITNESSED after the rekey — its
+        // settle flag has not fired, so the stale-start sweep correctly
+        // SKIPS it; the watchdog's recovery is driven here through the
+        // registry's own typed fail of the still-open operation, the same
+        // Released transition the sweep's concluded arm produces) and
+        // release the park.
+        let sessions = st.sessions.clone();
+        let registry_mover = registry.clone();
+        let mover = tokio::spawn(async move {
+            stall
+                .entered
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("the fork parks between its claim and its commit");
+            let child_arc = sessions
+                .lock()
+                .await
+                .get("ses_child")
+                .cloned()
+                .expect("the child registered before the park");
+            let bridge_was_live = child_arc.lock().await.serve_bridge.is_some();
+            let (held_op, held_generation) =
+                match registry_mover.observe(PROVIDER, "ses_child").state {
+                    freshell_ownership::OwnershipState::Starting {
+                        operation_id,
+                        generation,
+                        ..
+                    } => (operation_id, generation),
+                    other => panic!("expected the rekeyed child start, got {other:?}"),
+                };
+            let fail_outcome =
+                registry_mover.fail(PROVIDER, "ses_child", &held_op, held_generation, false);
+            stall.release.send(()).expect("release the stalled write");
+            (child_arc, bridge_was_live, fail_outcome)
+        });
+
+        let mut fork_request = fork_msg("ses_parent", "fork-req-stale", None);
+        (
+            fork_request.observed_epoch,
+            fork_request.observed_generation,
+        ) = fenced_observed(&registry, "ses_parent");
+        st.handle_fork(fork_request, None, sink).await;
+
+        let (child_arc, bridge_was_live, fail_outcome) = mover.await.expect("mover task completed");
+        assert!(
+            matches!(fail_outcome, freshell_ownership::FailOutcome::Released),
+            "fixture: the coordinator moved the child's start on (Released)"
+        );
+        assert!(
+            bridge_was_live,
+            "fixture: the child's serve-SSE bridge was live at the park"
+        );
+
+        // The child is GONE from the map...
+        assert!(
+            !st.sessions.lock().await.contains_key("ses_child"),
+            "the stale commit must remove the uncommitted child"
+        );
+        // ...AND fully torn down: killed flag set + serve bridge aborted
+        // (the pre-fix dead re-get left the bridge task leaked and the flag
+        // unset).
+        {
+            let s = child_arc.lock().await;
+            assert!(
+                s.killed.load(Ordering::SeqCst),
+                "the torn-down child is marked killed"
+            );
+            assert!(
+                s.serve_bridge.is_none(),
+                "the torn-down child's serve bridge was aborted"
+            );
+        }
+        // The fork answers the typed INTERNAL_ERROR, never a success.
+        let frames = captured.lock().expect("captured mutex").clone();
+        assert_eq!(frames.len(), 1, "exactly one reply on the requesting sink");
+        let v = serde_json::to_value(&frames[0]).unwrap();
+        assert_eq!(v["event"]["code"], "INTERNAL_ERROR");
+        assert_eq!(
+            v["event"]["message"],
+            "session ownership changed during fork; the child was torn down"
         );
     }
 
@@ -11353,6 +18162,8 @@ mod tests {
             provider: AgentProvider::Opencode,
             request_id: request_id.into(),
             cwd: None,
+            observed_epoch: None,
+            observed_generation: None,
         }
     }
 
@@ -12329,6 +19140,8 @@ mod tests {
                 sandbox: None,
                 effort: effort.map(|e| e.to_string()),
             }),
+            observed_epoch: None,
+            observed_generation: None,
         }
     }
 
@@ -12596,5 +19409,2025 @@ mod tests {
             .expect("a binding row re-snapshot");
         assert_eq!(last.settings.model.as_deref(), Some("prov/mdl-b"));
         assert_eq!(last.settings.effort.as_deref(), Some("low"));
+    }
+
+    // ── Task 4 (opencode daemon-death recovery): the runtime-level self-heal ──
+    //
+    // 2026-09-20 incident: the shared daemon died and NOTHING told the panes —
+    // no status edge, no respawn, no bridge revival; panes dead-ended on the
+    // snapshot 409. The runtime self-heal must make daemon loss observable and
+    // recoverable per session (mirroring the freshcodex onExit self-heal).
+    // (LB-02: revival is LEVEL-TRIGGERED — it runs on arming and on every
+    // `Started`, never dependent on having observed `Lost`.)
+
+    /// A serve whose "exit" is test-controlled: `exited()` reports `Some(0)`
+    /// once the shared flag is set (the Task 3 selfheal fixture shape) — the
+    /// flag-driven daemon death both the manager's exit watcher and the
+    /// runtime's loss listener observe.
+    struct FlagExitProcess {
+        exited: Arc<AtomicBool>,
+    }
+    impl ServeProcess for FlagExitProcess {
+        fn exited(&self) -> Option<i32> {
+            self.exited.load(Ordering::SeqCst).then_some(0)
+        }
+        fn take_fatal_startup_error(&self) -> Option<String> {
+            None
+        }
+        fn kill(&self) {}
+    }
+
+    /// Every generation hands out a [`FlagExitProcess`] sharing the flag;
+    /// spawns counted (the respawn accounting the fenced-attach test asserts).
+    struct FlagExitSpawner {
+        exited: Arc<AtomicBool>,
+        spawns: Arc<AtomicUsize>,
+    }
+    impl ProcessSpawner for FlagExitSpawner {
+        fn spawn(&self, _req: SpawnRequest) -> Result<Box<dyn ServeProcess>, String> {
+            self.spawns.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(FlagExitProcess {
+                exited: self.exited.clone(),
+            }))
+        }
+    }
+
+    /// Task 4 harness: a state wired to a STARTED selfheal-config fake manager
+    /// (tiny watch + backoff knobs so the manager's own backoff-guarded re-warm
+    /// runs at test speed) whose daemon's death is flag-controlled, plus the
+    /// bus receiver every frame assertion reads.
+    async fn selfheal_state(
+        backoff_initial_ms: u64,
+        backoff_max_ms: u64,
+    ) -> (
+        FreshOpencodeState,
+        tokio::sync::broadcast::Receiver<String>,
+        Arc<AtomicBool>,
+        Arc<AtomicUsize>,
+        OpencodeServeManager,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(256);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let exited = Arc::new(AtomicBool::new(false));
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let deps = ServeDeps {
+            spawner: Arc::new(FlagExitSpawner {
+                exited: exited.clone(),
+                spawns: spawns.clone(),
+            }),
+            http: Arc::new(FakeHttp {
+                next_session: AtomicUsize::new(0),
+            }),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(20),
+            daemon_watch_interval: Duration::from_millis(10),
+            re_warm_backoff_initial_ms: backoff_initial_ms,
+            re_warm_backoff_max_ms: backoff_max_ms,
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager.clone()).await;
+        (
+            FreshOpencodeState::new(fresh_agent),
+            rx,
+            exited,
+            spawns,
+            manager,
+        )
+    }
+
+    /// The session's durable `ses_*` id (the fixture must have materialized).
+    async fn real_session_id_of(st: &FreshOpencodeState, placeholder: &str) -> String {
+        let session_arc = {
+            let sessions = st.sessions.lock().await;
+            sessions.get(placeholder).expect("tracked").clone()
+        };
+        let durable = session_arc
+            .lock()
+            .await
+            .real_session_id
+            .clone()
+            .expect("the session materialized");
+        durable
+    }
+
+    /// Is the session's serve-SSE bridge live? False for an unmapped id (a
+    /// killed/handed-off session) and for a mapped session whose bridge is
+    /// dead/absent — the exact predicate the revival pass restarts on.
+    async fn session_serve_bridge_alive(st: &FreshOpencodeState, id: &str) -> bool {
+        let Some(session_arc) = st.sessions.lock().await.get(id).cloned() else {
+            return false;
+        };
+        let session = session_arc.lock().await;
+        session
+            .serve_bridge
+            .as_ref()
+            .map(|b| !b.is_finished())
+            .unwrap_or(false)
+    }
+
+    /// Bounded wait until the coordinator shows the durable id Live under a
+    /// FRESH-AGENT owner (the materialization commit the revival/attach gates
+    /// consult).
+    async fn await_freshagent_live(
+        registry: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        durable: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if matches!(
+                registry.observe("opencode", durable).state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            ) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the materialization's Live{{FreshAgent}} commit never landed for {durable}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Model the committed-terminal-handoff shape: `begin_handoff` (granted)
+    /// then `commit_live` under a TERMINAL owner — the exact pair of calls a
+    /// finished terminal handoff leaves behind in the coordinator.
+    async fn commit_terminal_owner(
+        registry: &Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        durable: &str,
+    ) {
+        let operation_id = format!("handoff-{durable}");
+        let freshell_ownership::BeginOutcome::Granted { generation } = registry.begin_handoff(
+            "opencode",
+            durable,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            &operation_id,
+            None,
+            "test",
+            0,
+        ) else {
+            panic!("the handoff begin must grant for {durable}")
+        };
+        assert!(
+            matches!(
+                registry.commit_live(
+                    "opencode",
+                    durable,
+                    &operation_id,
+                    generation,
+                    freshell_ownership::OwnerIdentity {
+                        kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                        terminal_id: Some(format!("t-{durable}")),
+                        live_session_key: None,
+                        pid: None,
+                        ownership_id: None,
+                    },
+                ),
+                freshell_ownership::CommitOutcome::Committed
+            ),
+            "the terminal owner commit must land for {durable}"
+        );
+    }
+
+    /// Materialize one session through the REAL create+send path and settle
+    /// its turn locally (the existing IdleTimeout-shaped seam) so the only
+    /// frames after it are the machinery under test. Returns
+    /// (placeholder, durable).
+    async fn materialized_selfheal_session(
+        st: &FreshOpencodeState,
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+        req: &str,
+    ) -> (String, String) {
+        st.handle_create(create_msg(req), None).await;
+        let placeholder = format!("freshopencode-{req}");
+        st.handle_send(send_msg(&placeholder, "materialize")).await;
+        let durable = real_session_id_of(st, &placeholder).await;
+        st.settle_local_turn_task_for_test(&placeholder).await;
+        let _ = drain_frames(rx);
+        (placeholder, durable)
+    }
+
+    /// Task 4 contract: the incident's silent half — a daemon that dies must
+    /// (a) fan a TYPED `OPENCODE_DAEMON_LOST` edge out to every MATERIALIZED
+    /// session (the dismissible banner + busy-clear the client folds through
+    /// the generic `sessionError` path), exactly ONE edge per session even
+    /// though the map is DUAL-KEYED (placeholder + durable id → the SAME
+    /// session), (b) NEVER chime (a crash is not a positive completion), and
+    /// (c) after the manager's backoff-guarded respawn, restart the dead
+    /// bridge and push the `status:"idle"` snapshot the client treats as a
+    /// transcript refetch.
+    #[tokio::test]
+    async fn daemon_loss_fans_out_a_typed_edge_then_revives_bridges_after_respawn() {
+        let (st, mut rx, exited, _spawns, manager) = selfheal_state(5, 50).await;
+
+        let (_placeholder, durable) =
+            materialized_selfheal_session(&st, &mut rx, "req-daemon-loss").await;
+        // Fixture honesty: the session is dual-keyed — the dedupe contract's
+        // whole point (two map keys, ONE materialized session).
+        assert_eq!(
+            st.sessions.lock().await.len(),
+            2,
+            "fixture: placeholder + durable keys both map the session"
+        );
+
+        exited.store(true, Ordering::SeqCst); // the daemon dies
+
+        // THE TYPED EDGE (the incident's missing half).
+        let loss_frames = frames_until(&mut rx, |f| {
+            f["type"] == "freshAgent.event"
+                && f["event"]["type"] == "freshAgent.error"
+                && f["event"]["code"] == "OPENCODE_DAEMON_LOST"
+        })
+        .await;
+        let edge = loss_frames.last().expect("the matching edge");
+        assert_eq!(edge["provider"], "opencode");
+        assert_eq!(edge["sessionType"], "freshopencode");
+        assert_eq!(edge["sessionId"].as_str(), Some(durable.as_str()));
+        assert_eq!(edge["event"]["sessionId"].as_str(), Some(durable.as_str()));
+        assert_eq!(
+            edge["event"]["message"].as_str(),
+            Some(
+                "The opencode serve daemon was lost unexpectedly - it is restarting automatically."
+            )
+        );
+
+        exited.store(false, Ordering::SeqCst); // the re-warm's respawn now succeeds
+
+        // `DaemonSignal::Started` → the LEVEL-TRIGGERED revival: the dead
+        // bridge restarts and the client sees the snapshot-invalidating idle
+        // push (never a remembered-`Lost` heuristic).
+        let revive_frames = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                && f["sessionId"].as_str() == Some(durable.as_str())
+        })
+        .await;
+
+        // NO chime ever accompanies a daemon loss, and the DUAL-KEYED session
+        // got exactly ONE edge — audit the whole post-loss window.
+        let mut all = loss_frames;
+        all.extend(revive_frames);
+        all.extend(drain_frames(&mut rx));
+        let edges = all
+            .iter()
+            .filter(|f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.error"
+                    && f["event"]["code"] == "OPENCODE_DAEMON_LOST"
+                    && f["sessionId"].as_str() == Some(durable.as_str())
+            })
+            .count();
+        assert_eq!(
+            edges, 1,
+            "exactly ONE loss edge for the dual-keyed session: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .all(|f| f["event"]["type"] != "freshAgent.turn.complete"),
+            "a daemon loss is never a positive completion — no chime: {all:?}"
+        );
+
+        assert!(
+            session_serve_bridge_alive(&st, &durable).await,
+            "the bridge must be restarted after the respawn"
+        );
+        assert!(
+            manager.base_url().await.is_some(),
+            "the manager's backoff-guarded re-warm respawned the daemon"
+        );
+    }
+
+    /// Delta round 2 (fresheyes Major — the doomed-bridge revival race): the
+    /// manager's loss path clears the running entry, fans `Lost`, and
+    /// re-warms INDEPENDENTLY of the per-session bridge tasks — a bridge
+    /// task still draining its closed channel when the new daemon's
+    /// `Started` revival pass runs was treated as healthy (task liveness
+    /// alone), so the pass answered `Ok(None)`: no restart, no recovery
+    /// snapshot, and the pane dead-ended on NO bridge. The interleaving is
+    /// forced to its extreme here: the session's bridge is a task that
+    /// never finishes on its own (the real bridge's draining window
+    /// between consuming `Lost` and observing channel-closed, held open
+    /// past any revival pass), the daemon generation moves A→B underneath
+    /// it, and the `Started`-driven revival pass must nevertheless
+    /// RESTART the bridge bound to the new daemon and push the client's
+    /// recovery snapshot.
+    #[tokio::test]
+    async fn revival_restarts_a_bridge_still_draining_from_a_lost_daemon_generation() {
+        let (st, mut rx, exited, _spawns, manager) = selfheal_state(5, 50).await;
+
+        let (_placeholder, durable) =
+            materialized_selfheal_session(&st, &mut rx, "req-doomed-bridge").await;
+
+        // THE DOOMED BRIDGE: swap the materialized session's live bridge for
+        // a stand-in task that never finishes on its own — a bridge
+        // provably ALIVE (so the pre-fix liveness check is fooled) yet
+        // doomed (its daemon is about to be lost). The drop-guard records
+        // the abort the restart owes the superseded task: a restart that
+        // merely dropped the handle would leak the still-draining task.
+        let doomed_aborted = Arc::new(AtomicBool::new(false));
+        struct AbortWitness(Arc<AtomicBool>);
+        impl Drop for AbortWitness {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let witness = doomed_aborted.clone();
+        {
+            let session_arc = st
+                .sessions
+                .lock()
+                .await
+                .get(&durable)
+                .cloned()
+                .expect("the materialized session is tracked under its durable id");
+            let mut session = session_arc.lock().await;
+            if let Some(old) = session.serve_bridge.take() {
+                old.abort();
+            }
+            session.serve_bridge = Some(tokio::spawn(async move {
+                let _abort_witness = AbortWitness(witness);
+                std::future::pending::<()>().await
+            }));
+        }
+
+        exited.store(true, Ordering::SeqCst); // daemon generation A dies
+
+        // The loss completes — the typed edge proves the watcher's Lost arm
+        // ran (lose_daemon cleared the running entry before the edge was
+        // fanned, and scheduled the re-warm).
+        let loss_frames = frames_until(&mut rx, |f| {
+            f["type"] == "freshAgent.event"
+                && f["event"]["code"] == "OPENCODE_DAEMON_LOST"
+                && f["sessionId"].as_str() == Some(durable.as_str())
+        })
+        .await;
+
+        exited.store(false, Ordering::SeqCst); // the re-warm's respawn now succeeds
+
+        // `DaemonSignal::Started` → the LEVEL-TRIGGERED revival pass runs
+        // while the doomed bridge task is provably STILL ALIVE. It must
+        // not be fooled by task liveness: the bridge is bound to the LOST
+        // daemon generation, so it restarts against the new daemon and
+        // pushes the snapshot-invalidating idle frame (the client's
+        // transcript refetch). On the pre-fix code this never arrives —
+        // the pass sees the unfinished task, answers Ok(None), and the
+        // session is left with NO bridge.
+        let revive_frames = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                && f["sessionId"].as_str() == Some(durable.as_str())
+        })
+        .await;
+
+        // The restart ABORTED the superseded draining task (bounded wait —
+        // the abort drop is scheduler-side).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !doomed_aborted.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the revival restart must abort the doomed draining bridge task"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The session now holds a NEW live bridge, bound to the respawned
+        // daemon.
+        assert!(
+            session_serve_bridge_alive(&st, &durable).await,
+            "the doomed bridge was replaced by a live bridge bound to the new daemon"
+        );
+        assert!(
+            manager.base_url().await.is_some(),
+            "the manager's backoff-guarded re-warm respawned the daemon"
+        );
+
+        // Exactly ONE recovery snapshot for the actually-restarted bridge
+        // (a later level-triggered pass must no-op against the now-current
+        // bridge — push only to actually-restarted bridges), and NO chime
+        // anywhere in the post-loss window.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut all = loss_frames;
+        all.extend(revive_frames);
+        all.extend(drain_frames(&mut rx));
+        let pushes = all
+            .iter()
+            .filter(|f| {
+                is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                    && f["sessionId"].as_str() == Some(durable.as_str())
+            })
+            .count();
+        assert_eq!(
+            pushes, 1,
+            "exactly ONE recovery snapshot for the restarted bridge: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .all(|f| f["event"]["type"] != "freshAgent.turn.complete"),
+            "a daemon loss is never a positive completion — no chime: {all:?}"
+        );
+    }
+
+    /// Bounded wait until the session's serve-SSE bridge reaches the wanted
+    /// liveness — the ep2-r2 transitional-window fixture's observable (the
+    /// bridge's death by channel-close and its rescue are both scheduler-side
+    /// events, so the fixture polls instead of racing them).
+    async fn await_bridge_liveness(
+        st: &FreshOpencodeState,
+        id: &str,
+        want_alive: bool,
+        what: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if session_serve_bridge_alive(st, id).await == want_alive {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for the {id} bridge to be {}: {what}",
+                if want_alive { "alive" } else { "dead" }
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// ep2-r2 fresheyes Major (the transitional-window dead bridge): the
+    /// generation-fenced bridge is installed BEFORE the forked child is
+    /// published in `sessions` or committed `Live` (materialization remains
+    /// `Starting`), so a daemon loss that captures the fresh bridge's sender
+    /// inside that window leaves the child with a dead bridge and NO
+    /// recovery trigger: B's one-shot `Started` revival pass either cannot
+    /// see the child (unpublished) or deliberately skips its transitional
+    /// ownership state, and the re-warm's fast path (B already running)
+    /// emits no second `Started`. The operation still answers success — a
+    /// pane with a permanently dead event bridge.
+    ///
+    /// The interleaving, forced deterministically through the REAL paths:
+    /// the child's binding-row write parks the fork between its map
+    /// publication and its `Live` commit (`arm_binding_stall`); while
+    /// parked, daemon A dies through the REAL watcher arm (the take sweeps
+    /// the child's just-subscribed sender — the fanned `Lost` closes the
+    /// bridge's channel and the task exits), B re-warms, and B's one-shot
+    /// `Started` revival pass runs: it rescues the PARENT (`Live`) — and,
+    /// because the pass visits the sorted durable ids ("ses_child" before
+    /// "ses_parent"), the parent's rescue PROVES the pass already visited
+    /// and SKIPPED the `Starting` child. Releasing the park lets the
+    /// commit land, and the operation must not answer success over the
+    /// dead bridge: the post-commit rescue tail restarts it against B and
+    /// pushes the client's recovery snapshot (exactly one; no chime
+    /// anywhere).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transitional_fork_child_survives_a_daemon_loss_in_its_starting_window() {
+        // The selfheal manager shape (flag-controlled daemon death,
+        // test-speed watch/backoff knobs) over a FORK-serving HTTP fake.
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(256);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let exited = Arc::new(AtomicBool::new(false));
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let deps = ServeDeps {
+            spawner: Arc::new(FlagExitSpawner {
+                exited: exited.clone(),
+                spawns: spawns.clone(),
+            }),
+            http: Arc::new(ForkFakeHttp::child_ok()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(20),
+            daemon_watch_interval: Duration::from_millis(10),
+            re_warm_backoff_initial_ms: 5,
+            re_warm_backoff_max_ms: 50,
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager.clone()).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
+        seed_live_fresh_owner(&registry, "ses_parent");
+        // Arm the runtime's daemon-loss watcher (production arms it at the
+        // first WS entry point; the fork lane does not, so arm it here). Its
+        // arming-time level pass bridges the bridgeless parent; drain that
+        // push so the frames below are only the machinery under test.
+        st.ensure_daemon_loss_watcher().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let _ = drain_frames(&mut rx);
+        assert!(
+            session_serve_bridge_alive(&st, "ses_parent").await,
+            "fixture: the arming-time pass bridged the parent"
+        );
+
+        // Park the fork between the child's map publication and its `Live`
+        // commit: the child's binding-row write stalls behind the release.
+        let stall = fake.arm_binding_stall("opencode", "ses_child");
+        let (sink, captured) = capturing_sink();
+
+        // The mid-fork mover: once the fork parks, drive the finding's
+        // exact interleaving through the REAL loss/re-warm/revival paths,
+        // prove the revival pass skipped the transitional child, then
+        // release the park.
+        let mover_state = st.clone();
+        let mover_manager = manager.clone();
+        let mover_exited = exited.clone();
+        let mover = tokio::spawn(async move {
+            stall
+                .entered
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("the fork parks between the child's publication and its Live commit");
+            // Daemon A dies. The loss completes: the take cleared the
+            // running slot (the sweep ran inside the same critical
+            // section)...
+            mover_exited.store(true, Ordering::SeqCst);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while mover_manager.base_url().await.is_some() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "A's loss must take the running entry within the budget"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // ...and the fanned `Lost` + dropped swept senders closed BOTH
+            // bridges' channels: the parent's A-era bridge and the parked
+            // child's (the loss captured the child's just-subscribed
+            // sender — the finding's premise).
+            await_bridge_liveness(
+                &mover_state,
+                "ses_parent",
+                false,
+                "A's loss drains the parent's A-era bridge",
+            )
+            .await;
+            await_bridge_liveness(
+                &mover_state,
+                "ses_child",
+                false,
+                "A's loss drains the parked child's bridge (its sender was swept)",
+            )
+            .await;
+            mover_exited.store(false, Ordering::SeqCst);
+            // B re-warms and its one-shot `Started` revival pass runs: the
+            // PARENT (Live) is rescued. The pass visits "ses_child" FIRST
+            // (sorted ids), so the parent's rescue proves the pass already
+            // visited — and skipped — the transitional child.
+            await_bridge_liveness(
+                &mover_state,
+                "ses_parent",
+                true,
+                "B's Started revival rescues the Live parent",
+            )
+            .await;
+            assert!(
+                !session_serve_bridge_alive(&mover_state, "ses_child").await,
+                "fixture: the Started revival deliberately skipped the Starting \
+                 child — the dead transitional bridge the tail must rescue"
+            );
+            stall.release.send(()).expect("release the parked fork");
+        });
+
+        let mut fork_request = fork_msg("ses_parent", "fork-req-trans", None);
+        (
+            fork_request.observed_epoch,
+            fork_request.observed_generation,
+        ) = fenced_observed(&registry, "ses_parent");
+        st.handle_fork(fork_request, None, sink).await;
+        mover.await.expect("the mover completed the interleaving");
+
+        // The operation SUCCEEDED — the finding's premise: a successful
+        // forked reply over the dead transitional bridge.
+        let captured = captured.lock().expect("captured mutex").clone();
+        assert_eq!(
+            captured.len(),
+            1,
+            "the fork answers exactly one frame: {captured:?}"
+        );
+        assert!(
+            matches!(captured[0], ServerMessage::FreshAgentForked { .. }),
+            "the forked reply landed: {captured:?}"
+        );
+        await_freshagent_live(&registry, "ses_child").await;
+
+        // THE BRIDGE: the pane must not dead-end — the child ends up with a
+        // LIVE bridge bound to the successor daemon (RED on HEAD: the
+        // skipped revival left the dead A-era task in place and nothing
+        // ever restarted it).
+        assert!(
+            session_serve_bridge_alive(&st, "ses_child").await,
+            "the fork must not answer success over a dead bridge — the \
+             transitional child's bridge was killed by the daemon loss and \
+             no revival trigger ever came (ep2-r2)"
+        );
+
+        // THE RECOVERY SNAPSHOT: the client's transcript-refetch push for
+        // the actually-restarted bridge.
+        let revive_frames = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                && f["sessionId"].as_str() == Some("ses_child")
+        })
+        .await;
+        let mut all = revive_frames;
+        all.extend(drain_frames(&mut rx));
+        let pushes = all
+            .iter()
+            .filter(|f| {
+                is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                    && f["sessionId"].as_str() == Some("ses_child")
+            })
+            .count();
+        assert_eq!(
+            pushes, 1,
+            "exactly ONE recovery snapshot for the rescued child: {all:?}"
+        );
+        let edges = all
+            .iter()
+            .filter(|f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.error"
+                    && f["event"]["code"] == "OPENCODE_DAEMON_LOST"
+                    && f["sessionId"].as_str() == Some("ses_child")
+            })
+            .count();
+        assert_eq!(
+            edges, 1,
+            "exactly ONE typed loss edge for the child: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .all(|f| f["event"]["type"] != "freshAgent.turn.complete"),
+            "a daemon loss is never a positive completion — no chime: {all:?}"
+        );
+        assert!(
+            manager.base_url().await.is_some(),
+            "fixture: the successor daemon B serves"
+        );
+        let _ = spawns;
+    }
+
+    /// ep2-r3 fresheyes Major (the rescue can resurrect a killed/handed-off
+    /// session): the post-commit rescue clones the session `Arc` out of the
+    /// map, releases the map lock, and takes the session lock WITHOUT
+    /// rechecking `killed`, map membership, or ownership — a kill/handoff
+    /// that completes in that window (killed flag set, every map key
+    /// removed, the coordinator's stop committed) leaves the rescue
+    /// holding a RETIRED session whose absent bridge it then "restarts": a
+    /// detached fresh-agent bridge for the killed session, an idle-snapshot
+    /// push over the retired session, and the operation answering SUCCESS
+    /// over it.
+    ///
+    /// The interleaving, forced deterministically through the `cfg(test)`
+    /// rescue stall: the fork child's rescue fires `entered` right after its
+    /// map-lookup clone and parks; while held, a REAL `freshAgent.kill` of
+    /// the child COMPLETES (killed flag, every map key, the coordinator's
+    /// Vacant commit — the ownership observation's refusal input); only
+    /// then is the rescue released. It must REFUSE — no bridge install, no
+    /// snapshot push — and the fork must answer its stale-commit
+    /// ownership-changed error frame, never `FreshAgentForked`. Pre-fix,
+    /// the released rescue installed a fresh bridge on the killed child
+    /// (its detached task kept broadcasting for the retired session) and
+    /// pushed the idle snapshot, and the fork answered success.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_landing_between_the_rescue_lookup_and_its_lock_never_resurrects_the_fork_child()
+    {
+        // The selfheal manager shape (the daemon never dies in this test —
+        // the KILL is the mover) over a FORK-serving HTTP fake.
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(256);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let exited = Arc::new(AtomicBool::new(false));
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let deps = ServeDeps {
+            spawner: Arc::new(FlagExitSpawner {
+                exited: exited.clone(),
+                spawns: spawns.clone(),
+            }),
+            http: Arc::new(ForkFakeHttp::child_ok()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(20),
+            daemon_watch_interval: Duration::from_millis(10),
+            re_warm_backoff_initial_ms: 60_000,
+            re_warm_backoff_max_ms: 120_000,
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager.clone()).await;
+        let mut st = FreshOpencodeState::new(fresh_agent);
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+        insert_fork_parent(&st, "ses_parent", Some("/parent/cwd"), None, None).await;
+        seed_live_fresh_owner(&registry, "ses_parent");
+
+        // Park the child's post-commit rescue between its map-lookup clone
+        // and its session-lock take.
+        let stall = st.arm_rescue_stall("ses_child");
+        let (sink, captured) = capturing_sink();
+        let st2 = st.clone();
+        let mut fork_request = fork_msg("ses_parent", "fork-ep2r3", None);
+        (
+            fork_request.observed_epoch,
+            fork_request.observed_generation,
+        ) = fenced_observed(&registry, "ses_parent");
+        let fork = tokio::spawn(async move { st2.handle_fork(fork_request, None, sink).await });
+
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the rescue parks between its map-lookup clone and its session-lock take");
+
+        // The concurrent kill, driven through the REAL path to completion:
+        // the killed flag, EVERY map key aliasing the child, the bridge
+        // abort, and the coordinator's Stopping→Vacant commit.
+        st.handle_kill(FreshAgentKill {
+            provider: AgentProvider::Opencode,
+            session_id: "ses_child".to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+            observed_epoch: None,
+            observed_generation: None,
+        })
+        .await;
+        assert!(
+            !st.has_live_session("ses_child").await,
+            "fixture: the kill removed every map key for the child"
+        );
+        assert!(
+            !matches!(
+                st.ownership_snapshot("opencode", "ses_child").state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            ),
+            "fixture: the coordinator no longer holds the child Live{{FreshAgent}}"
+        );
+
+        // Release the parked rescue: its `Arc` was cloned BEFORE the kill —
+        // only the re-checks (killed/map/ownership) can stop a resurrection.
+        stall.release.send(()).expect("release the parked rescue");
+        fork.await.expect("the fork settles");
+
+        // THE operation outcome: the stale-commit ownership-changed error
+        // frame — never a successful FreshAgentForked over the retired
+        // child (pre-fix: the fork answered success here).
+        let captured = captured.lock().expect("captured mutex").clone();
+        assert_eq!(
+            captured.len(),
+            1,
+            "the fork answers exactly one frame: {captured:?}"
+        );
+        match &captured[0] {
+            ServerMessage::FreshAgentForked { .. } => panic!(
+                "the fork answered success over a session the concurrent kill \
+                 retired — the rescue resurrected it (ep2-r3)"
+            ),
+            ServerMessage::FreshAgentEvent(event) => {
+                assert_eq!(
+                    event.event["code"], "INTERNAL_ERROR",
+                    "the refusal is the stale-commit error frame: {:?}",
+                    captured[0]
+                );
+                assert!(
+                    event.event["message"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("session ownership changed during fork"),
+                    "the stale-commit ownership-changed error frame: {:?}",
+                    captured[0]
+                );
+            }
+            other => panic!("unexpected fork answer: {other:?}"),
+        }
+
+        // NO bridge was installed for the retired child: a REAL dispatch
+        // through the manager's emitter map reaches no resurrected bridge —
+        // no freshAgent frame for the killed session (pre-fix: the detached
+        // bridge translated the dispatch and broadcast for it).
+        manager.dispatch_event(
+            freshell_opencode::events::parse_serve_event(&json!({
+                "type": "session.idle",
+                "properties": { "sessionID": "ses_child" }
+            }))
+            .expect("parseable serve event"),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let all = drain_frames(&mut rx);
+        assert!(
+            all.iter().all(
+                |f| !(is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                    && f["sessionId"].as_str() == Some("ses_child"))
+            ),
+            "no recovery-snapshot push for the retired child: {all:?}"
+        );
+        assert!(
+            !all.iter()
+                .any(|f| f["type"] == "freshAgent.event"
+                    && f["sessionId"].as_str() == Some("ses_child")),
+            "no resurrected bridge frame for the killed session: {all:?}"
+        );
+        // The coordinator's post-kill state stands — nothing re-registered
+        // the child.
+        assert!(
+            !matches!(
+                st.ownership_snapshot("opencode", "ses_child").state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            ),
+            "the kill's coordinator commit stands — the rescue never re-owns the child"
+        );
+        let _ = (exited, spawns);
+    }
+
+    /// The same interleaving on the RESUME leg, with the coordinator UNWIRED
+    /// — the killed-check floor: nothing but the session's `killed` flag (set
+    /// under the session lock by the kill's phase 3) and the map re-lookup
+    /// stand between the released rescue and a resurrection. The resume must
+    /// surface its typed ownership-changed error instead of handing back a
+    /// session the concurrent kill retired.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_landing_between_the_rescue_lookup_and_its_lock_fails_the_resume_typed() {
+        // The selfheal fixture answers the cold resume's GET /session/:id
+        // with a benign `{}` row; NO registry is wired (the unwired lane —
+        // the killed check is the only gate), and the daemon never dies.
+        let (st, mut rx, exited, spawns, manager) = selfheal_state(60_000, 120_000).await;
+        let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        // Park the rebuilt session's post-commit rescue between its
+        // map-lookup clone and its session-lock take.
+        let stall = st.arm_rescue_stall("ses_resume");
+        let st2 = st.clone();
+        let resume = tokio::spawn(async move {
+            st2.resume_durable_session("ses_resume", None, None, None, None)
+                .await
+        });
+
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the rescue parks between its map-lookup clone and its session-lock take");
+
+        // The concurrent kill, through the REAL path, to completion.
+        st.handle_kill(FreshAgentKill {
+            provider: AgentProvider::Opencode,
+            session_id: "ses_resume".to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+            observed_epoch: None,
+            observed_generation: None,
+        })
+        .await;
+        assert!(
+            !st.has_live_session("ses_resume").await,
+            "fixture: the kill removed the rebuilt session's map key"
+        );
+
+        // Release the parked rescue and settle the resume.
+        stall.release.send(()).expect("release the parked rescue");
+        let out = resume.await.expect("the resume settles");
+
+        // THE outcome: the typed ownership-changed refusal — never Ok over
+        // the retired session (pre-fix: the resume returned the killed
+        // session and the rescue had installed a fresh bridge on it).
+        match out {
+            Err(ResumeOpencodeError::Manager(freshell_opencode::ServeError::Transport(msg))) => {
+                assert!(
+                    msg.contains("ownership changed during resume"),
+                    "the typed refusal names the ownership change: {msg}"
+                );
+            }
+            Err(ResumeOpencodeError::Manager(err)) => {
+                panic!("the refusal must be the ownership-changed Transport error, got {err:?}")
+            }
+            Err(_) => {
+                panic!("the refusal must be a Manager error (NotFound/Reserved are wrong here)")
+            }
+            Ok(_) => panic!(
+                "the resume returned success over a session the concurrent kill \
+                 retired (ep2-r3)"
+            ),
+        }
+
+        // NO bridge install, NO snapshot push for the retired session.
+        manager.dispatch_event(
+            freshell_opencode::events::parse_serve_event(&json!({
+                "type": "session.idle",
+                "properties": { "sessionID": "ses_resume" }
+            }))
+            .expect("parseable serve event"),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let all = drain_frames(&mut rx);
+        assert!(
+            all.iter().all(
+                |f| !(is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                    && f["sessionId"].as_str() == Some("ses_resume"))
+            ),
+            "no recovery-snapshot push for the retired session: {all:?}"
+        );
+        assert!(
+            !all.iter().any(|f| f["type"] == "freshAgent.event"
+                && f["sessionId"].as_str() == Some("ses_resume")),
+            "no resurrected bridge frame for the killed session: {all:?}"
+        );
+        let _ = (exited, spawns);
+    }
+
+    // ── fresheyes ep2-r4: the handoff runner's post-commit bridge re-check ──
+
+    /// The ep2-r4 flavor-writer latch: the runner's OWN awaited flavor steps
+    /// are the deterministic interleaving points (existing injection seams —
+    /// no `cfg(test)` production gates). `stage` parks the runner INSIDE the
+    /// Handoff window (before the `Live` commit — the pre-commit
+    /// daemon-loss test's hold); the staged handle's `commit` parks the
+    /// runner AFTER the commit (the post-commit kill test's hold). An
+    /// unwired latch is a plain immediate `Ok` — the happy-path writer.
+    #[derive(Default)]
+    struct ParkingFlavorWriter {
+        stage_entered: StdMutex<Option<std::sync::mpsc::Sender<()>>>,
+        stage_release: StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        commit_entered: StdMutex<Option<std::sync::mpsc::Sender<()>>>,
+        commit_release: StdMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    /// The staged flavor handle [`ParkingFlavorWriter`] hands the runner:
+    /// `commit()` fires `entered` and parks on `release` when armed.
+    struct ParkingStagedFlavor {
+        entered: Option<std::sync::mpsc::Sender<()>>,
+        release: Option<tokio::sync::oneshot::Receiver<()>>,
+    }
+
+    impl crate::session_handoff::StagedFlavor for ParkingStagedFlavor {
+        fn commit(
+            self: Box<Self>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+        {
+            let Self { entered, release } = *self;
+            Box::pin(async move {
+                if let Some(entered) = entered {
+                    let _ = entered.send(());
+                }
+                if let Some(release) = release {
+                    let _ = release.await;
+                }
+                Ok(())
+            })
+        }
+    }
+
+    impl crate::session_handoff::FlavorWrite for ParkingFlavorWriter {
+        fn stage(
+            &self,
+            _provider: &str,
+            _session_id: &str,
+            _flavor: &str,
+        ) -> crate::session_handoff::StagedFlavorFuture {
+            let stage_entered = self.stage_entered.lock().expect("writer latch").take();
+            let stage_release = self.stage_release.lock().expect("writer latch").take();
+            let commit_entered = self.commit_entered.lock().expect("writer latch").take();
+            let commit_release = self.commit_release.lock().expect("writer latch").take();
+            Box::pin(async move {
+                if let Some(entered) = stage_entered {
+                    let _ = entered.send(());
+                }
+                if let Some(release) = stage_release {
+                    let _ = release.await;
+                }
+                Ok(Some(Box::new(ParkingStagedFlavor {
+                    entered: commit_entered,
+                    release: commit_release,
+                })
+                    as Box<dyn crate::session_handoff::StagedFlavor>))
+            })
+        }
+    }
+
+    /// The ep2-r4 fixture: the selfheal manager shape (flag-controlled
+    /// daemon death, test-speed watch/backoff knobs) wired into a FULL
+    /// [`crate::session_handoff::SessionHandoffRunner`] — the finding lives
+    /// in the RUNNER's commit path (`start_target`'s under-ticket
+    /// continuation → the awaited flavor write → the single `Live`
+    /// commit), so the tests drive the real runner over the real
+    /// shared-serve machinery. The runner holds clones of the same states
+    /// the lane uses (the broadcast bus, the coordinator, the shared
+    /// manager).
+    async fn handoff_selfheal_rig(
+        backoff_initial_ms: u64,
+        backoff_max_ms: u64,
+        writer: crate::session_handoff::FlavorWriter,
+    ) -> (
+        FreshOpencodeState,
+        Arc<crate::session_handoff::SessionHandoffRunner>,
+        Arc<freshell_ownership::RuntimeOwnershipRegistry>,
+        tokio::sync::broadcast::Receiver<String>,
+        Arc<AtomicBool>,
+        OpencodeServeManager,
+    ) {
+        let (tx, rx) = tokio::sync::broadcast::channel::<String>(256);
+        let broadcast_tx = Arc::new(tx);
+        let auth_token = Arc::new("handoff-ep2r4-tok".to_string());
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        let terminal_registry =
+            freshell_terminal::TerminalRegistry::new().with_ownership(Arc::clone(&registry));
+        let fresh_agent = FreshAgentState::new(Arc::clone(&auth_token), Arc::clone(&broadcast_tx))
+            .with_ownership(Arc::clone(&registry))
+            .with_terminal_registry(terminal_registry.clone());
+        let exited = Arc::new(AtomicBool::new(false));
+        let spawns = Arc::new(AtomicUsize::new(0));
+        let deps = ServeDeps {
+            spawner: Arc::new(FlagExitSpawner {
+                exited: exited.clone(),
+                spawns: spawns.clone(),
+            }),
+            http: Arc::new(FakeHttp {
+                next_session: AtomicUsize::new(0),
+            }),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(20),
+            daemon_watch_interval: Duration::from_millis(10),
+            re_warm_backoff_initial_ms: backoff_initial_ms,
+            re_warm_backoff_max_ms: backoff_max_ms,
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager.clone()).await;
+        let mut st = FreshOpencodeState::new(fresh_agent.clone());
+        st.set_ownership(Arc::clone(&registry));
+        // Production arms the daemon-loss watcher at the first opencode WS
+        // entry point; the handoff lane does not, so arm it here (the fork
+        // fixture's precedent) — the typed loss edge and the `Started`
+        // revival pass are the real machinery the finding is about.
+        st.ensure_daemon_loss_watcher().await;
+        let mut fresh_claude = crate::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+        fresh_claude.set_ownership(Arc::clone(&registry));
+        let mut fresh_codex = crate::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            json!({ "freshAgent": { "enabled": true } }),
+        );
+        fresh_codex.set_ownership(Arc::clone(&registry));
+        let runner = crate::session_handoff::SessionHandoffRunner::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            Arc::clone(&registry),
+            terminal_registry,
+            fresh_codex,
+            fresh_claude,
+            st.clone(),
+            fresh_agent.clone(),
+            // A FreshAgent-target handoff never consults the CLI specs
+            // (validate_handoff_target's terminal arm only).
+            Arc::new(Vec::new()),
+        )
+        .with_flavor_writer(Some(writer));
+        (st, Arc::new(runner), registry, rx, exited, manager)
+    }
+
+    /// A `switch` handoff moving `durable` to the freshopencode lane (the
+    /// finding's target arm — the under-ticket continuation).
+    fn freshopencode_handoff_request(durable: &str) -> crate::session_handoff::HandoffRequest {
+        crate::session_handoff::HandoffRequest {
+            action: crate::session_handoff::HandoffAction::Switch,
+            provider: "opencode".to_string(),
+            session_id: durable.to_string(),
+            target_kind: freshell_ownership::RuntimeOwnerKind::FreshAgent,
+            session_type: Some("freshopencode".to_string()),
+            mode: None,
+            cwd: Some(std::env::temp_dir().to_string_lossy().to_string()),
+            tab_id: None,
+            pane_id: None,
+            observed_epoch: None,
+            observed_generation: None,
+            device_id: Some("test-device-ep2r4".to_string()),
+        }
+    }
+
+    /// fresheyes ep2-r4 Major (daemon loss in the handoff pre-commit
+    /// window): the under-ticket continuation installs its
+    /// generation-fenced bridge and runs its transitional rescue BEFORE the
+    /// runner's single `Live` commit; between the two the runner still
+    /// awaits the staged flavor write while the coordinator key remains
+    /// `Handoff`. A daemon loss there kills the fresh bridge with every
+    /// recovery trigger spent — the successor's one-shot `Started` revival
+    /// pass correctly skips the transitional owner, the `Live` commit emits
+    /// no new daemon signal, and the finished rescue is never rerun — so
+    /// the handoff answered plain success over an A-generation dead bridge.
+    ///
+    /// The interleaving, forced deterministically through the REAL paths:
+    /// the runner parks inside the flavor `stage` (its own awaited step
+    /// inside the Handoff window); while parked, daemon A dies and B
+    /// re-warms through the REAL loss/re-warm machinery (the fixture
+    /// proves B serves while the bridge stays dead — the revival pass
+    /// skipped the Handoff owner); releasing the park lets the commit
+    /// land, and the handoff must NOT leave a dead A-generation bridge:
+    /// the commit's re-check recovers it against B (a B-stamped live
+    /// bridge + exactly one idle snapshot push) or surfaces the typed
+    /// loss — never plain success over a dead bridge.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn handoff_commit_recovers_daemon_loss_in_the_pre_commit_window() {
+        let writer = Arc::new(ParkingFlavorWriter::default());
+        let (stage_entered_tx, stage_entered) = std::sync::mpsc::channel::<()>();
+        let (stage_release_tx, stage_release_rx) = tokio::sync::oneshot::channel::<()>();
+        writer
+            .stage_entered
+            .lock()
+            .expect("writer latch")
+            .replace(stage_entered_tx);
+        writer
+            .stage_release
+            .lock()
+            .expect("writer latch")
+            .replace(stage_release_rx);
+        let (st, runner, registry, mut rx, exited, manager) = handoff_selfheal_rig(
+            5,
+            50,
+            writer.clone() as crate::session_handoff::FlavorWriter,
+        )
+        .await;
+
+        // The prior: a committed TERMINAL owner (the terminal→freshopencode
+        // shape; the handoff's prior stop is the idempotent AlreadyGone
+        // against the nonexistent terminal row).
+        let durable = "ses_ep2r4_loss";
+        commit_terminal_owner(&registry, durable).await;
+
+        // The mover drives the finding's interleaving while the runner is
+        // parked inside the Handoff window.
+        let mover_state = st.clone();
+        let mover_manager = manager.clone();
+        let mover_exited = exited.clone();
+        let mover = tokio::spawn(async move {
+            stage_entered
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("the runner parks in the awaited flavor stage (inside the Handoff window)");
+            // The under-ticket rescue has COMPLETED (start_target returned
+            // before the runner reached the flavor write) — the loss below
+            // lands in the finding's exact window.
+            mover_exited.store(true, Ordering::SeqCst); // daemon A dies
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while mover_manager.base_url().await.is_some() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "A's loss must take the running entry within the budget"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // ...the take's sweep closed the target session's A-era bridge
+            // channel — the just-installed bridge is dead.
+            await_bridge_liveness(
+                &mover_state,
+                durable,
+                false,
+                "A's loss kills the target's just-installed bridge",
+            )
+            .await;
+            mover_exited.store(false, Ordering::SeqCst); // B re-warms
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while mover_manager.base_url().await.is_none() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "B's re-warm must respawn the daemon within the budget"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // B's one-shot `Started` revival pass has run — and correctly
+            // SKIPPED the transitional (Handoff) owner: the bridge stays
+            // dead while B serves, with no recovery trigger left (the
+            // finding's unrecovered state, observed by the fixture before
+            // the commit proceeds).
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !session_serve_bridge_alive(&mover_state, durable).await,
+                "fixture: the Started revival pass skipped the Handoff owner — \
+                 the dead A-era bridge with no recovery trigger (ep2-r4)"
+            );
+            stage_release_tx.send(()).expect("release the parked stage");
+        });
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(20),
+            runner
+                .spawn_handoff(freshopencode_handoff_request(durable))
+                .completion,
+        )
+        .await
+        .expect("the handoff completes within the budget")
+        .expect("the runner task lives to answer");
+        mover.await.expect("the mover completed the interleaving");
+
+        // The operation's answer: SUCCESS (the recovery leg — the happy
+        // contract, not the typed-loss leg).
+        assert_eq!(
+            resp["ok"],
+            json!(true),
+            "the handoff answers success: {resp:?}"
+        );
+        await_freshagent_live(&registry, durable).await;
+
+        // THE BRIDGE: the handoff must not leave a dead A-generation
+        // bridge. RED on HEAD: plain success over the dead bridge.
+        assert!(
+            session_serve_bridge_alive(&st, durable).await,
+            "the handoff must not answer success over a dead A-generation \
+             bridge — the pre-commit loss left every recovery trigger spent \
+             and the commit's re-check is the only one left (ep2-r4)"
+        );
+        // The recovered bridge is stamped to the CURRENT (successor) daemon
+        // generation — not the dead A era.
+        {
+            let session_arc = st
+                .sessions
+                .lock()
+                .await
+                .get(durable)
+                .cloned()
+                .expect("the handoff target session is registered");
+            let session = session_arc.lock().await;
+            assert_eq!(
+                session.serve_bridge_daemon,
+                manager.ownership_id().await,
+                "the recovered bridge is stamped to the successor daemon B"
+            );
+        }
+
+        // The frames: the commit's re-check pushed EXACTLY ONE recovery
+        // snapshot for the actually-restarted bridge (the revival pass
+        // pushed none — it skipped the Handoff owner), exactly ONE typed
+        // loss edge reached the materialized session, and NO chime
+        // anywhere (a daemon loss is never a positive completion).
+        let mut all = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                && f["sessionId"].as_str() == Some(durable)
+        })
+        .await;
+        all.extend(drain_frames(&mut rx));
+        let pushes = all
+            .iter()
+            .filter(|f| {
+                is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                    && f["sessionId"].as_str() == Some(durable)
+            })
+            .count();
+        assert_eq!(
+            pushes, 1,
+            "exactly ONE recovery snapshot for the restarted bridge: {all:?}"
+        );
+        let edges = all
+            .iter()
+            .filter(|f| {
+                f["type"] == "freshAgent.event"
+                    && f["event"]["type"] == "freshAgent.error"
+                    && f["event"]["code"] == "OPENCODE_DAEMON_LOST"
+                    && f["sessionId"].as_str() == Some(durable)
+            })
+            .count();
+        assert_eq!(
+            edges, 1,
+            "exactly ONE typed loss edge for the target session: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .all(|f| f["event"]["type"] != "freshAgent.turn.complete"),
+            "a daemon loss is never a positive completion — no chime: {all:?}"
+        );
+        assert!(
+            manager.base_url().await.is_some(),
+            "fixture: the successor daemon B serves"
+        );
+    }
+
+    /// The ep2-r4 REFUSAL leg (the ep2-r3 discipline applied to the
+    /// runner's commit): a kill completing between the runner's `Live`
+    /// commit and its answer must surface the typed ownership-changed
+    /// failure — never plain success over the retired session. The
+    /// deterministic hold is the runner's own awaited STAGED FLAVOR
+    /// COMMIT (post-commit, pre-answer): the mover completes a REAL
+    /// `freshAgent.kill` while the runner is parked there; the commit's
+    /// re-check then refuses (the kill's teardown owns the cleanup — no
+    /// bridge install, no snapshot push, no re-own). RED on HEAD: the
+    /// runner answered ok:true with nothing re-checking after the commit.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_kill_between_the_handoff_commit_and_its_answer_fails_the_handoff_typed() {
+        let writer = Arc::new(ParkingFlavorWriter::default());
+        let (commit_entered_tx, commit_entered) = std::sync::mpsc::channel::<()>();
+        let (commit_release_tx, commit_release_rx) = tokio::sync::oneshot::channel::<()>();
+        writer
+            .commit_entered
+            .lock()
+            .expect("writer latch")
+            .replace(commit_entered_tx);
+        writer
+            .commit_release
+            .lock()
+            .expect("writer latch")
+            .replace(commit_release_rx);
+        // The daemon never dies here (the KILL is the mover) — a far re-warm
+        // budget keeps the background machinery out of the window.
+        let (st, runner, registry, mut rx, exited, manager) = handoff_selfheal_rig(
+            60_000,
+            120_000,
+            writer.clone() as crate::session_handoff::FlavorWriter,
+        )
+        .await;
+
+        let durable = "ses_ep2r4_refused";
+        commit_terminal_owner(&registry, durable).await;
+
+        let mover_state = st.clone();
+        let mover_registry = registry.clone();
+        let mover = tokio::spawn(async move {
+            commit_entered
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("the runner parks in the staged flavor commit (after the Live commit)");
+            // Fixture honesty: the handoff's Live{FreshAgent} commit has
+            // landed (the parked staged commit is strictly post-commit).
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if matches!(
+                    mover_registry.observe("opencode", durable).state,
+                    freshell_ownership::OwnershipState::Live { owner, .. }
+                        if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                ) {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the handoff's Live{{FreshAgent}} commit never landed"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // The concurrent kill, driven through the REAL path to
+            // completion — the mover's teardown owns the cleanup.
+            mover_state
+                .handle_kill(FreshAgentKill {
+                    provider: AgentProvider::Opencode,
+                    session_id: durable.to_string(),
+                    session_type: SessionType::Freshopencode,
+                    cwd: None,
+                    observed_epoch: None,
+                    observed_generation: None,
+                })
+                .await;
+            assert!(
+                !mover_state.has_live_session(durable).await,
+                "fixture: the kill removed every map key for the target session"
+            );
+            assert!(
+                !matches!(
+                    mover_registry.observe("opencode", durable).state,
+                    freshell_ownership::OwnershipState::Live { owner, .. }
+                        if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                ),
+                "fixture: the coordinator no longer holds the session Live{{FreshAgent}}"
+            );
+            commit_release_tx
+                .send(())
+                .expect("release the staged commit");
+        });
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(20),
+            runner
+                .spawn_handoff(freshopencode_handoff_request(durable))
+                .completion,
+        )
+        .await
+        .expect("the handoff completes within the budget")
+        .expect("the runner task lives to answer");
+        mover.await.expect("the mover completed the interleaving");
+
+        // THE outcome: the typed ownership-changed failure — never plain
+        // success over the retired session (RED on HEAD: ok:true).
+        assert_ne!(
+            resp["ok"],
+            json!(true),
+            "the handoff must not answer success over a session a concurrent \
+             kill retired between the commit and the answer (ep2-r4): {resp:?}"
+        );
+        assert_eq!(
+            resp["error"]["code"],
+            json!("STALE_GENERATION"),
+            "the refusal is the typed ownership-changed failure: {resp:?}"
+        );
+        assert_eq!(
+            resp["error"]["retryable"],
+            json!(true),
+            "the refusal is the canonical retryable race outcome: {resp:?}"
+        );
+
+        // NO resurrection: the refusal never installs a bridge and never
+        // pushes a snapshot — the kill's teardown owns the cleanup.
+        assert!(
+            !st.has_live_session(durable).await,
+            "the refusal never resurrected the retired session"
+        );
+        manager.dispatch_event(
+            freshell_opencode::events::parse_serve_event(&json!({
+                "type": "session.idle",
+                "properties": { "sessionID": durable }
+            }))
+            .expect("parseable serve event"),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let all = drain_frames(&mut rx);
+        assert!(
+            all.iter().all(
+                |f| !(is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                    && f["sessionId"].as_str() == Some(durable))
+            ),
+            "no recovery-snapshot push for the retired session: {all:?}"
+        );
+        assert!(
+            !all.iter().any(
+                |f| f["type"] == "freshAgent.event" && f["sessionId"].as_str() == Some(durable)
+            ),
+            "no resurrected bridge frame for the killed session: {all:?}"
+        );
+        assert!(
+            all.iter()
+                .all(|f| f["event"]["type"] != "freshAgent.turn.complete"),
+            "no chime anywhere: {all:?}"
+        );
+        // The kill's coordinator commit stands — nothing re-owns the
+        // retired session.
+        assert!(
+            !matches!(
+                registry.observe("opencode", durable).state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            ),
+            "the kill's coordinator commit stands — the re-check never re-owns the session"
+        );
+        let _ = (exited, manager);
+    }
+
+    // ── fresheyes ep2-r5: the rescue is bound to the committed session
+    // instance and ownership fence, never to a same-key replacement ──
+
+    /// fresheyes ep2-r5 Major (the rescue adopts a same-key replacement
+    /// for the committed session): the post-commit rescue verified
+    /// whichever session currently occupies the durable id — not the
+    /// session INSTANCE and ownership GENERATION the caller committed. A
+    /// kill that removes the committed session followed by another
+    /// freshopencode resume under the SAME durable id leaves a brand-new
+    /// session object under the key, committed Live at a NEWER
+    /// generation; the rescue's by-id lookup obtained the replacement
+    /// `Arc`, the kind-only ownership check accepted the replacement's
+    /// era, and the rescue answered Healthy — after which the resume
+    /// handed back its own removed-and-killed `Arc` for the attach
+    /// caller to restart a bridge on.
+    ///
+    /// The interleaving, forced deterministically through the
+    /// `cfg(test)` PRE-LOOKUP rescue stall: the original resume's
+    /// post-commit rescue fires `entered` BEFORE its map re-lookup and
+    /// parks; while held, a REAL `freshAgent.kill` of the committed
+    /// session COMPLETES and a REAL replacement resume installs a
+    /// brand-new instance under the same key (asserted: a strictly newer
+    /// Live generation); only then is the rescue released — its
+    /// re-lookup now finds the REPLACEMENT. The resume must REFUSE —
+    /// the typed ownership-changed error, never `Ok` over the retired
+    /// instance — and the refusal must leave the replacement untouched
+    /// (its registration, bridge, and era stand; the mover's own
+    /// lifecycle owns the key now). Pre-fix, the rescue adopted the
+    /// same-kind replacement and the resume answered `Ok` with the
+    /// retired `Arc`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replacement_resume_under_the_killed_key_fails_the_original_resume_typed() {
+        // The selfheal fixture answers the cold resumes' GET /session/:id;
+        // the daemon never dies (the KILL+REPLACE is the mover). The
+        // coordinator IS wired — the committed-fence leg is half the
+        // finding, and the committed-instance leg must hold either way.
+        let (mut st, _rx, exited, spawns, _manager) = selfheal_state(60_000, 120_000).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+        let fake = Arc::new(crate::identity_sink::FakeIdentitySink::default());
+        st.set_identity_sink(fake.clone());
+
+        let durable = "ses_ep2r5_resume";
+        // Park the ORIGINAL resume's post-commit rescue BEFORE its map
+        // re-lookup — the exact window the finding names (the mover
+        // completes while the rescue is in flight).
+        let stall = st.arm_rescue_lookup_stall(durable);
+        let st2 = st.clone();
+        let original = tokio::spawn(async move {
+            st2.resume_durable_session(durable, None, None, None, None)
+                .await
+        });
+
+        stall
+            .entered
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the rescue parks before its map re-lookup");
+
+        // Fixture honesty: the parked rescue is strictly POST-COMMIT —
+        // the original resume's own Live commit has landed; record its
+        // era (the committed fence the rescue must still find).
+        let committed_generation = match registry.observe("opencode", durable) {
+            freshell_ownership::OwnershipSnapshot {
+                generation,
+                state: freshell_ownership::OwnershipState::Live { owner, .. },
+                ..
+            } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent => generation,
+            snap => panic!("the original resume committed Live: {snap:?}"),
+        };
+
+        // The mover, part 1: a REAL kill of the committed session, driven
+        // through the REAL path to completion (the durable close, every
+        // map key, the killed flag, the bridge abort, Stopping→Vacant).
+        st.handle_kill(FreshAgentKill {
+            provider: AgentProvider::Opencode,
+            session_id: durable.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+            observed_epoch: None,
+            observed_generation: None,
+        })
+        .await;
+        assert!(
+            !st.has_live_session(durable).await,
+            "fixture: the kill removed the committed session's map key"
+        );
+        assert!(
+            !matches!(
+                registry.observe("opencode", durable).state,
+                freshell_ownership::OwnershipState::Live { owner, .. }
+                    if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+            ),
+            "fixture: the kill vacated the coordinator key"
+        );
+
+        // The mover, part 2: a REAL replacement resume installs a
+        // BRAND-NEW instance under the SAME durable id and commits it
+        // Live at a strictly newer generation — the finding's same-key
+        // replacement.
+        let replacement = match st
+            .resume_durable_session(durable, None, None, None, None)
+            .await
+        {
+            Ok(arc) => arc,
+            Err(ResumeOpencodeError::Manager(err)) => panic!(
+                "fixture: the replacement resume commits a fresh instance under the vacated key: {err:?}"
+            ),
+            Err(ResumeOpencodeError::NotFound) => {
+                panic!("fixture: the replacement resume found no serve row")
+            }
+            Err(ResumeOpencodeError::Reserved) => {
+                panic!("fixture: the replacement resume hit a reserved key")
+            }
+        };
+        assert!(
+            st.has_live_session(durable).await,
+            "fixture: the replacement session is registered"
+        );
+        let replacement_generation = match registry.observe("opencode", durable) {
+            freshell_ownership::OwnershipSnapshot {
+                generation,
+                state: freshell_ownership::OwnershipState::Live { owner, .. },
+                ..
+            } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent => generation,
+            snap => panic!("the replacement resume committed Live: {snap:?}"),
+        };
+        assert!(
+            replacement_generation > committed_generation,
+            "the replacement's era is a strictly newer generation than the committed fence"
+        );
+        // The retired-vs-replacement identity is the RESCUE's job, not the
+        // fixture's; the replacement's own Arc is only fixture honesty.
+        let _ = replacement;
+
+        // Release the parked rescue: its re-lookup now finds the
+        // REPLACEMENT under the key. Only the committed-instance binding
+        // and the committed-fence check can refuse it.
+        stall.release.send(()).expect("release the parked rescue");
+        let out = original.await.expect("the original resume settles");
+
+        // THE outcome: the typed ownership-changed refusal — never Ok
+        // over the retired original instance (pre-fix: the rescue
+        // adopted the same-kind replacement, answered Healthy, and the
+        // resume returned its own removed-and-killed `Arc`).
+        match out {
+            Err(ResumeOpencodeError::Manager(freshell_opencode::ServeError::Transport(msg))) => {
+                assert!(
+                    msg.contains("ownership changed during resume"),
+                    "the typed refusal names the ownership change: {msg}"
+                );
+            }
+            Err(ResumeOpencodeError::Manager(err)) => {
+                panic!("the refusal must be the ownership-changed Transport error, got {err:?}")
+            }
+            Err(_) => {
+                panic!("the refusal must be a Manager error (NotFound/Reserved are wrong here)")
+            }
+            Ok(_) => panic!(
+                "the resume returned success over a session a concurrent kill retired and \
+                 a same-key replacement superseded (ep2-r5)"
+            ),
+        }
+
+        // The refusal never touched the replacement: its registration,
+        // live bridge, and committed era stand — the mover's lifecycle
+        // owns the key now, and the retired original's rescue installed
+        // nothing for it (the refusal returns before any restart; the
+        // kill's teardown owns the original's cleanup).
+        assert!(
+            st.has_live_session(durable).await,
+            "the replacement's registration stands"
+        );
+        assert!(
+            session_serve_bridge_alive(&st, durable).await,
+            "the replacement's bridge stands — the refusal never uninstalled it"
+        );
+        assert_eq!(
+            registry.observe("opencode", durable).generation,
+            replacement_generation,
+            "the refusal never re-owned or moved the replacement's era"
+        );
+        let _ = (exited, spawns, fake);
+    }
+
+    /// The ep2-r5 interleave on the HANDOFF runner's post-commit re-check
+    /// (the ep2-r4 tail's caller leg): the runner committed its
+    /// freshopencode target and parks in its own awaited STAGED FLAVOR
+    /// COMMIT (the ep2-r4 latch, strictly post-commit); while held, a
+    /// REAL kill retires the committed target and a REAL replacement
+    /// resume installs a brand-new instance under the SAME durable id
+    /// (Live at a strictly newer generation). The re-check's by-id
+    /// lookup then finds the replacement — the runner must surface the
+    /// typed ownership-changed failure, never answer success carrying
+    /// its obsolete generation, and never touch the replacement (the
+    /// mover's lifecycle owns the key). Pre-fix, the rescue adopted the
+    /// same-kind replacement and the handoff answered ok:true.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replacement_resume_under_the_killed_key_fails_the_handoff_typed() {
+        let writer = Arc::new(ParkingFlavorWriter::default());
+        let (commit_entered_tx, commit_entered) = std::sync::mpsc::channel::<()>();
+        let (commit_release_tx, commit_release_rx) = tokio::sync::oneshot::channel::<()>();
+        writer
+            .commit_entered
+            .lock()
+            .expect("writer latch")
+            .replace(commit_entered_tx);
+        writer
+            .commit_release
+            .lock()
+            .expect("writer latch")
+            .replace(commit_release_rx);
+        // The daemon never dies here (the KILL+REPLACE is the mover) — a
+        // far re-warm budget keeps the background machinery out of the
+        // window.
+        let (st, runner, registry, _rx, exited, manager) = handoff_selfheal_rig(
+            60_000,
+            120_000,
+            writer.clone() as crate::session_handoff::FlavorWriter,
+        )
+        .await;
+
+        let durable = "ses_ep2r5_handoff";
+        commit_terminal_owner(&registry, durable).await;
+
+        let mover_state = st.clone();
+        let mover_registry = registry.clone();
+        let mover = tokio::spawn(async move {
+            commit_entered
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .expect("the runner parks in the staged flavor commit (after the Live commit)");
+            // Fixture honesty: the handoff's Live{FreshAgent} commit has
+            // landed (the parked staged commit is strictly
+            // post-commit); record the committed era.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let committed_generation = loop {
+                match mover_registry.observe("opencode", durable) {
+                    freshell_ownership::OwnershipSnapshot {
+                        generation,
+                        state: freshell_ownership::OwnershipState::Live { owner, .. },
+                        ..
+                    } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent => {
+                        break generation
+                    }
+                    _ => {
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "the handoff's Live{{FreshAgent}} commit never landed"
+                        );
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            };
+            // The mover, part 1: a REAL kill of the committed target, to
+            // completion — the mover's teardown owns the cleanup.
+            mover_state
+                .handle_kill(FreshAgentKill {
+                    provider: AgentProvider::Opencode,
+                    session_id: durable.to_string(),
+                    session_type: SessionType::Freshopencode,
+                    cwd: None,
+                    observed_epoch: None,
+                    observed_generation: None,
+                })
+                .await;
+            assert!(
+                !mover_state.has_live_session(durable).await,
+                "fixture: the kill removed every map key for the committed target"
+            );
+            assert!(
+                !matches!(
+                    mover_registry.observe("opencode", durable).state,
+                    freshell_ownership::OwnershipState::Live { owner, .. }
+                        if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent
+                ),
+                "fixture: the kill vacated the coordinator key"
+            );
+            // The mover, part 2: a REAL replacement resume installs a
+            // BRAND-NEW instance under the SAME durable id, committed
+            // Live at a strictly newer generation.
+            let replacement = match mover_state
+                .resume_durable_session(durable, None, None, None, None)
+                .await
+            {
+                Ok(arc) => arc,
+                Err(ResumeOpencodeError::Manager(err)) => panic!(
+                    "fixture: the replacement resume commits a fresh instance under the vacated key: {err:?}"
+                ),
+                Err(ResumeOpencodeError::NotFound) => {
+                    panic!("fixture: the replacement resume found no serve row")
+                }
+                Err(ResumeOpencodeError::Reserved) => {
+                    panic!("fixture: the replacement resume hit a reserved key")
+                }
+            };
+            let replacement_generation = match mover_registry.observe("opencode", durable) {
+                freshell_ownership::OwnershipSnapshot {
+                    generation,
+                    state: freshell_ownership::OwnershipState::Live { owner, .. },
+                    ..
+                } if owner.kind == freshell_ownership::RuntimeOwnerKind::FreshAgent => generation,
+                snap => panic!("the replacement resume committed Live: {snap:?}"),
+            };
+            assert!(
+                replacement_generation > committed_generation,
+                "the replacement's era is a strictly newer generation than the handoff's commit"
+            );
+            let _ = replacement;
+            commit_release_tx
+                .send(())
+                .expect("release the staged commit");
+            (committed_generation, replacement_generation)
+        });
+
+        let resp = tokio::time::timeout(
+            Duration::from_secs(20),
+            runner
+                .spawn_handoff(freshopencode_handoff_request(durable))
+                .completion,
+        )
+        .await
+        .expect("the handoff completes within the budget")
+        .expect("the runner task lives to answer");
+        let (committed_generation, replacement_generation) =
+            mover.await.expect("the mover completed the interleaving");
+        assert!(
+            replacement_generation > committed_generation,
+            "fixture: the replacement superseded the handoff's committed era"
+        );
+
+        // THE outcome: the typed ownership-changed failure — never plain
+        // success carrying the runner's obsolete generation (pre-fix:
+        // the rescue adopted the same-key replacement and the handoff
+        // answered ok:true).
+        assert_ne!(
+            resp["ok"],
+            json!(true),
+            "the handoff must not answer success over a target a concurrent kill retired \
+             and a same-key replacement superseded (ep2-r5): {resp:?}"
+        );
+        assert_eq!(
+            resp["error"]["code"],
+            json!("STALE_GENERATION"),
+            "the refusal is the typed ownership-changed failure: {resp:?}"
+        );
+        assert_eq!(
+            resp["error"]["retryable"],
+            json!(true),
+            "the refusal is the canonical retryable race outcome: {resp:?}"
+        );
+
+        // The refusal never touched the replacement: its registration,
+        // live bridge, and committed era stand — the mover's lifecycle
+        // owns the key now, and the retired target's re-check installed
+        // nothing (the refusal returns before any restart; the kill's
+        // teardown owns the original's cleanup).
+        assert!(
+            st.has_live_session(durable).await,
+            "the replacement's registration stands"
+        );
+        assert!(
+            session_serve_bridge_alive(&st, durable).await,
+            "the replacement's bridge stands — the refusal never uninstalled it"
+        );
+        assert_eq!(
+            registry.observe("opencode", durable).generation,
+            replacement_generation,
+            "the refusal never re-owned or moved the replacement's era"
+        );
+        let _ = (exited, manager);
+    }
+
+    /// LB-05 (falsified → redesign): in the incident, the pane's fenced
+    /// attach was exercised 3× against the dead shared daemon and recovered
+    /// NOTHING, because the attach tail only re-subscribed the bridge —
+    /// nothing respawns the daemon for a map-hit. The fenced attach must be
+    /// a REAL recovery verb: `ensure_started` BEFORE the bridge restart, so
+    /// the map-hit attach respawns the daemon and re-bridges (mirroring
+    /// `resume_durable_session`'s map-miss behavior).
+    #[tokio::test]
+    async fn map_hit_fenced_attach_respawns_the_daemon_and_rebridges() {
+        // Backoff far beyond the test window: the background re-warm must NOT
+        // be the respawn this test credits — the ATTACH's own
+        // `ensure_started` is the recovery under proof.
+        let (mut st, mut rx, exited, spawns, manager) = selfheal_state(60_000, 120_000).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        let (_placeholder, durable) =
+            materialized_selfheal_session(&st, &mut rx, "req-attach-recover").await;
+        await_freshagent_live(&registry, &durable).await;
+        // The observed runtime-owner pair the fenced attach carries.
+        let before = registry.observe("opencode", &durable);
+
+        // The shared daemon dies; the session row PERSISTS (the map-hit
+        // shape). Bounded wait for the manager's watcher to clear the entry.
+        exited.store(true, Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if manager.base_url().await.is_none() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the daemon's running entry must clear after the exit"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let _ = drain_frames(&mut rx); // the loss edge (already fanned out) etc.
+        let spawns_before = spawns.load(Ordering::SeqCst);
+        // The respawn can now succeed (the flag-driven fixture's death flag
+        // clears, exactly like the crash-loop fixture in Task 3's tests).
+        exited.store(false, Ordering::SeqCst);
+
+        // THE MAP-HIT FENCED ATTACH — the incident's three wasted attempts,
+        // now the documented recovery verb.
+        st.handle_attach(FreshAgentAttach {
+            provider: AgentProvider::Opencode,
+            session_id: durable.clone(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+            observed_epoch: Some(before.epoch),
+            observed_generation: Some(before.generation),
+            resume_session_id: None,
+            session_ref: None,
+        })
+        .await;
+
+        assert!(
+            spawns.load(Ordering::SeqCst) > spawns_before,
+            "a map-hit attach against a daemon-absent manager must respawn the \
+             shared daemon (observed {} spawns; {} before the attach)",
+            spawns.load(Ordering::SeqCst),
+            spawns_before
+        );
+        assert!(
+            session_serve_bridge_alive(&st, &durable).await,
+            "the attach must re-bridge the session"
+        );
+        let frames = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                && f["sessionId"].as_str() == Some(durable.as_str())
+        })
+        .await;
+        assert!(
+            !frames.is_empty(),
+            "the attach tail's snapshot push must arrive: {frames:?}"
+        );
+    }
+
+    /// Plan-review round 3 (the ownership-coordinator gate): a session
+    /// killed/retired or handed to a terminal owner between the loss and the
+    /// respawn must NOT be revived — the revival pass re-looks-up the map at
+    /// revival time (a retired session's keys are gone) and observes the
+    /// CANONICAL ownership state fresh (a terminal owner or any lifecycle
+    /// transition owns the window; only Live{FreshAgent} sessions — this
+    /// runtime's own — revive).
+    #[tokio::test]
+    async fn revival_skips_sessions_handed_off_or_removed_after_the_loss() {
+        let (mut st, mut rx, exited, _spawns, _manager) = selfheal_state(5, 50).await;
+        let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        st.set_ownership(Arc::clone(&registry));
+
+        let (_p_keeps, keeps) = materialized_selfheal_session(&st, &mut rx, "req-keeps").await;
+        let (p_gone, gone) = materialized_selfheal_session(&st, &mut rx, "req-gone").await;
+        let (_p_term, term) = materialized_selfheal_session(&st, &mut rx, "req-term").await;
+        for durable in [&keeps, &gone, &term] {
+            await_freshagent_live(&registry, durable).await;
+        }
+
+        // While the daemon is down (modeled pre-loss here), session B is
+        // retired from the map AND its key completes a terminal handoff (the
+        // concurrent-handoff shape); session C STAYS mapped but its key is
+        // terminal-owned (the committed-handoff window).
+        {
+            let mut map = st.sessions.lock().await;
+            map.remove(&p_gone);
+            map.remove(&gone);
+        }
+        commit_terminal_owner(&registry, &gone).await;
+        commit_terminal_owner(&registry, &term).await;
+        let _ = drain_frames(&mut rx);
+
+        exited.store(true, Ordering::SeqCst); // the daemon dies (bridges die with it)
+                                              // Deterministic anchor: the fan-out reaches the LAST mapped session
+                                              // (BTreeSet order — keeps, then term), so term's edge proves the
+                                              // whole fan-out ran.
+        let loss_frames = frames_until(&mut rx, |f| {
+            f["type"] == "freshAgent.event"
+                && f["event"]["code"] == "OPENCODE_DAEMON_LOST"
+                && f["sessionId"].as_str() == Some(term.as_str())
+        })
+        .await;
+
+        exited.store(false, Ordering::SeqCst); // the re-warm's respawn now succeeds
+
+        // `Started` → the revival pass: keeps IS revived...
+        let revive_frames = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+                && f["sessionId"].as_str() == Some(keeps.as_str())
+        })
+        .await;
+
+        // ...and the pass has had every opportunity to (wrongly) touch the
+        // retired and terminal-owned sessions — settle, then audit the whole
+        // post-loss window.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut all = loss_frames;
+        all.extend(revive_frames);
+        all.extend(drain_frames(&mut rx));
+
+        assert!(
+            session_serve_bridge_alive(&st, &keeps).await,
+            "the healthy fresh-agent session revives"
+        );
+        assert!(
+            !session_serve_bridge_alive(&st, &gone).await,
+            "the retired session must NOT be revived"
+        );
+        assert!(
+            !session_serve_bridge_alive(&st, &term).await,
+            "the terminal-owned session must NOT be revived"
+        );
+        let gone_snapshots = all
+            .iter()
+            .filter(|f| {
+                is_event(f, "freshAgent.session.snapshot", None)
+                    && f["sessionId"].as_str() == Some(gone.as_str())
+            })
+            .count();
+        assert_eq!(
+            gone_snapshots, 0,
+            "no snapshot push for the retired session: {all:?}"
+        );
+        let term_snapshots = all
+            .iter()
+            .filter(|f| {
+                is_event(f, "freshAgent.session.snapshot", None)
+                    && f["sessionId"].as_str() == Some(term.as_str())
+            })
+            .count();
+        assert_eq!(
+            term_snapshots, 0,
+            "no snapshot push for the terminal-owned session: {all:?}"
+        );
     }
 }

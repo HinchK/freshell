@@ -304,6 +304,11 @@ function stripTransientSessionFields(content: any): any {
     // scrubbed from persisted layouts on the next wholesale flush.
     showThinking: _legacyShowThinking,
     showTools: _legacyShowTools,
+    // kata b8ke: the typed failure surfaces are volatile — the launch
+    // failure card and the handoff-error banner re-derive from the live
+    // server state after a reload, never from a persisted snapshot.
+    launchFailure: _launchFailure,
+    handoffError: _handoffError,
     ...rest
   } = content
 

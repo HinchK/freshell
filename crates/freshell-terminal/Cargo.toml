@@ -27,6 +27,10 @@ indexmap = "2"
 # (`crates/freshell-server/src/logging.rs`) -- this crate stays tokio-free
 # (see module docs) and only emits events, never installs its own subscriber.
 tracing = "0.1"
+# kata b8ke Task 4: the release-side coordinator integration (fenced
+# release/force-release on exit/kill/confirmed-kill). A leaf, std-sync-only
+# crate — keeps this crate tokio-free.
+freshell-ownership = { path = "../freshell-ownership" }
 
 [target.'cfg(unix)'.dependencies]
 # SAFE-11/TERM-22: `PtyTerminal::kill` additionally SIGKILLs the whole process

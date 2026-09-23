@@ -26,8 +26,17 @@
 //!
 //! ## Scope
 //!
-//! All three providers are served: **freshcodex/codex** and **freshopencode/opencode** ask
-//! their live runtime slices, while **freshclaude/claude** and **kilroy/claude** are a
+//! All three providers are served: **freshcodex/codex** asks its live runtime
+//! slice — SIDE-EFFECT-FREE (kata b8ke Task 5): a thread this process tracks
+//! serves from the live runtime, an untracked one answers the EMPTY snapshot
+//! (with the additive owner-state fields), and a session another runtime owns
+//! or a transition holds answers the typed 409 envelope — never a spawn or a
+//! resume; **freshopencode/opencode** (b8ke delta review F4) is the same
+//! side-effect-free contract against the shared `opencode serve` daemon: the
+//! daemon is consulted only when ALREADY running — daemon-absent GETs answer
+//! the typed ownership refusals or the EMPTY-FROM-DISK snapshot and never
+//! spawn (cold resume only via the explicit lifecycle); while
+//! **freshclaude/claude** and **kilroy/claude** are a
 //! disk+env adapter ([`crate::claude_snapshot::get_claude_snapshot`]) that reads the CLI's
 //! own transcript store directly (`<claude_home>/projects/*/<threadId>.jsonl`) — no sidecar
 //! required, so snapshots survive a server restart. When the session is LIVE, the route
@@ -124,6 +133,30 @@ async fn get_snapshot(
             Err(CodexSnapshotError::Protocol(message)) => {
                 fail(StatusCode::INTERNAL_SERVER_ERROR, message)
             }
+            // kata b8ke Task 5: the typed ownership refusals — a session
+            // another runtime owns or a transition holds answers the 409
+            // envelope (the `fail_json_restore_unavailable` shape).
+            Err(
+                typed @ (CodexSnapshotError::ReservedByOwner { .. }
+                | CodexSnapshotError::HandoffInProgress { .. }),
+            ) => {
+                let (owner_kind, generation) = match &typed {
+                    CodexSnapshotError::ReservedByOwner {
+                        owner_kind,
+                        generation,
+                    } => (Some(*owner_kind), *generation),
+                    CodexSnapshotError::HandoffInProgress { generation } => (None, *generation),
+                    _ => unreachable!("the match above names only the typed refusals"),
+                };
+                snapshot_error_response(&thread_id, owner_kind, generation)
+            }
+            // Defensive depth: `get_snapshot` already folds this into its
+            // `Ok` (the empty snapshot), so this arm is unreachable today —
+            // but the route's contract for it stays the same 200 empty
+            // snapshot if it ever propagates.
+            Err(CodexSnapshotError::UntrackedReadonly { ownership }) => {
+                Json(state.codex.empty_readonly_snapshot(&thread_id, &ownership)).into_response()
+            }
         },
         ("freshopencode", "opencode") => {
             match state
@@ -139,6 +172,25 @@ async fn get_snapshot(
                 ),
                 Err(OpencodeSnapshotError::Serve(err)) => {
                     fail(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+                }
+                // b8ke delta review F4: the typed ownership refusals ride the
+                // daemon-absent path — the same 409 envelope the codex arm
+                // serves (never a spawn, never a fake snapshot).
+                Err(
+                    typed @ (OpencodeSnapshotError::ReservedByOwner { .. }
+                    | OpencodeSnapshotError::HandoffInProgress { .. }),
+                ) => {
+                    let (owner_kind, generation) = match &typed {
+                        OpencodeSnapshotError::ReservedByOwner {
+                            owner_kind,
+                            generation,
+                        } => (Some(*owner_kind), *generation),
+                        OpencodeSnapshotError::HandoffInProgress { generation } => {
+                            (None, *generation)
+                        }
+                        _ => unreachable!("the match above names only the typed refusals"),
+                    };
+                    snapshot_error_response(&thread_id, owner_kind, generation)
                 }
             }
         }
@@ -212,6 +264,37 @@ fn fail(status: StatusCode, message: String) -> Response {
 
 fn fail_with_code(status: StatusCode, message: String, code: &str) -> Response {
     (status, Json(json!({ "error": message, "code": code }))).into_response()
+}
+
+/// kata b8ke Task 5: the typed 409 envelope for a snapshot GET against a
+/// session another runtime owns or a transition holds — the
+/// `fail_json_restore_unavailable` shape (`terminal_tabs.rs`): the frozen
+/// "still running on the server." message text (client regexes and muscle
+/// memory depend on it) with the additive `ownerKind`/`ownerGeneration`
+/// fields riding the same rule (omitted when the transition names no
+/// committed owner — the `terminal_owner_fields_from_outcome` discipline).
+/// b8ke delta review F4: shared by the codex and opencode arms.
+fn snapshot_error_response(
+    thread_id: &str,
+    owner_kind: Option<freshell_ownership::RuntimeOwnerKind>,
+    generation: u64,
+) -> Response {
+    let mut body = json!({
+        "status": "error",
+        "code": "RESTORE_UNAVAILABLE",
+        "message": format!("Session {thread_id} is still running on the server."),
+    });
+    if let Some(owner_kind) = owner_kind {
+        body["ownerKind"] = json!(match owner_kind {
+            freshell_ownership::RuntimeOwnerKind::Terminal => "terminal",
+            freshell_ownership::RuntimeOwnerKind::FreshAgent => "fresh-agent",
+        });
+    }
+    // A refusal always names its fence-relevant generation (a transition
+    // names no committed owner identity — only its generation is
+    // truthfully known).
+    body["ownerGeneration"] = json!(generation);
+    (StatusCode::CONFLICT, Json(body)).into_response()
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -762,52 +845,40 @@ mod tests {
         );
     }
 
+    /// kata b8ke Task 5 (round-2 review — intended behavior change): an
+    /// unknown codex thread answers 200 with the SIDE-EFFECT-FREE empty
+    /// snapshot (owner state vacant) — never the removed cold-start, which
+    /// with no reachable `CODEX_CMD` used to surface as a generic 500. The
+    /// bogus-binary setup is retained deliberately: if the GET ever regresses
+    /// to spawning, this test fails again (coverage purpose preserved,
+    /// expectation inverted).
     #[tokio::test]
-    async fn unknown_codex_thread_is_404_with_lost_session_code() {
-        // `get_snapshot` now attempts ensure-runtime-on-demand for a thread outside the live
-        // map (see `codex::snapshot_runtime_for`), which spawns a `CODEX_CMD` subprocess --
-        // force a definitely-nonexistent binary (shared `ENV_LOCK` so this can't race
-        // against `codex.rs`'s own `CODEX_CMD`-mutating tests in the same process) so this
-        // test deterministically exercises the "app-server unreachable" -> non-404 path is
-        // NOT what's under test here; this test wants a genuine "no such thread" 404, which
-        // requires the spawn to succeed. Since only `codex.rs`'s fake-app-server fixture can
-        // provide that, and sharing it across modules is out of scope for this test, assert
-        // the REALISTIC outcome instead: with no real codex binary reachable, the request
-        // fails, but never with a 200 (masking a nonexistent thread as found).
+    async fn unknown_codex_thread_serves_the_side_effect_free_empty_snapshot() {
         let _guard = crate::codex::tests::ENV_LOCK.lock().await;
         std::env::set_var(
             "CODEX_CMD",
             "/definitely/not/a/real/codex/binary-xyz-does-not-exist",
         );
         std::env::remove_var("FAKE_CODEX_APP_SERVER_BEHAVIOR");
-        let resp = get_snapshot(
-            State(snapshot_state()),
-            Path((
-                "freshcodex".to_string(),
-                "codex".to_string(),
-                "does-not-exist".to_string(),
-            )),
-            Query(HashMap::new()),
-            headers_with_token("tok"),
-        )
-        .await;
-        // With no real codex binary reachable, ensure-runtime-on-demand's spawn fails before
-        // it can even ask the (nonexistent) app-server whether the thread exists -- a
-        // genuine infra error, not "this thread doesn't exist" (see
-        // `codex::tests::get_snapshot_ensure_runtime_resumes_a_thread_not_in_the_live_map`
-        // for the real "successfully resumes an unknown-but-real thread" proof, and
-        // `codex::tests::get_snapshot_with_no_codex_binary_available_is_an_app_server_error`
-        // for this exact scenario at the store level). Critically, it must never be 200.
-        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
-        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert!(
-            value["code"].is_null(),
-            "generic 500 has no code, matching sendFreshAgentError's fallback"
-        );
+        let (status, body) = get_json("freshcodex", "codex", "does-not-exist").await;
         std::env::remove_var("CODEX_CMD");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an untracked thread serves the empty snapshot, not an error: {body}"
+        );
+        assert_eq!(body["sessionType"], json!("freshcodex"));
+        assert_eq!(body["threadId"], json!("does-not-exist"));
+        assert_eq!(body["turns"], json!([]));
+        assert_eq!(
+            body["extensions"]["codex"]["ownerKind"],
+            json!("vacant"),
+            "the additive owner-state fields name the vacant key: {body}"
+        );
+        assert!(
+            body.get("code").is_none(),
+            "a 200 snapshot body carries no error code: {body}"
+        );
     }
 
     #[tokio::test]
@@ -985,5 +1056,218 @@ mod tests {
         assert_eq!(value["turns"][0]["items"][0]["text"], json!("hi"));
         assert_eq!(value["turns"][1]["error"]["name"], json!("UnknownError"));
         assert_eq!(value["turns"][1]["error"]["message"], json!("boom"));
+    }
+
+    /// b8ke delta review F4: the opencode snapshot GET is side-effect-free —
+    /// a COLD GET (manager cell empty, shared serve absent) NEVER spawns
+    /// the daemon: 200 with the empty-from-disk snapshot (the additive
+    /// owner-state fields naming the vacant key), the manager cell still
+    /// absent, and `OPENCODE_CMD` never consulted (the marker script proves
+    /// a spawn was never attempted — a pre-fix spawn touches the marker and
+    /// the exited process fails health, surfacing the 500 instead). Cold
+    /// resume happens only through the explicit lifecycle commands.
+    #[tokio::test]
+    async fn opencode_cold_get_never_spawns_and_serves_the_empty_disk_snapshot() {
+        let _guard = crate::OPENCODE_ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("marker-opencode");
+        let marker = dir.path().join("spawned.marker");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch {}\nexit 0\n", marker.display()),
+        )
+        .expect("write marker opencode script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod marker opencode script");
+        }
+        std::env::set_var("OPENCODE_CMD", &script);
+        let opencode = opencode_state();
+        assert!(
+            !opencode.opencode_manager_present_for_test().await,
+            "the manager cell is absent BEFORE the cold GET"
+        );
+
+        let state = SnapshotState::new(
+            Arc::new("tok".to_string()),
+            codex_state(),
+            opencode.clone(),
+            claude_state(),
+        );
+        let resp = get_snapshot(
+            State(state),
+            Path((
+                "freshopencode".to_string(),
+                "opencode".to_string(),
+                "ses_coldget".to_string(),
+            )),
+            Query(HashMap::new()),
+            headers_with_token("tok"),
+        )
+        .await;
+        std::env::remove_var("OPENCODE_CMD");
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a cold GET serves the empty-from-disk snapshot, never a spawn"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["sessionType"], json!("freshopencode"));
+        assert_eq!(value["threadId"], json!("ses_coldget"));
+        assert_eq!(value["turns"], json!([]), "empty rows: {value}");
+        assert_eq!(
+            value["extensions"]["opencode"]["ownerKind"],
+            json!("vacant"),
+            "the additive owner-state fields name the vacant key: {value}"
+        );
+        assert!(
+            value["extensions"]["opencode"]["ownerEpoch"].is_u64()
+                && value["extensions"]["opencode"]["ownerGeneration"].is_u64(),
+            "the owner-state fence pair rides the empty snapshot: {value}"
+        );
+        assert!(
+            !opencode.opencode_manager_present_for_test().await,
+            "the manager cell stays absent AFTER the cold GET — the GET never created it"
+        );
+        assert!(
+            !marker.exists(),
+            "the shared serve was never spawned (no marker touched)"
+        );
+    }
+
+    /// b8ke delta review F4: the coordinator refusals ride the daemon-absent
+    /// path (the codex Task-5 contract) — a key a TERMINAL owns answers the
+    /// typed 409 (`RESTORE_UNAVAILABLE` with the owner fields), and a key a
+    /// lifecycle transition holds answers the typed 409 too; neither ever
+    /// consults (let alone spawns) the shared serve.
+    #[tokio::test]
+    async fn opencode_cold_get_owned_or_transitioning_answers_the_typed_409() {
+        let _guard = crate::OPENCODE_ENV_LOCK.lock().await;
+        // Pin the serve command to a would-never-start script so a pre-fix
+        // run fails fast and deterministically instead of consulting the
+        // ambient `opencode` binary.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("no-opencode");
+        std::fs::write(&script, "#!/bin/sh\nexit 1\n").expect("write no-opencode script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&script, perms).expect("chmod no-opencode script");
+        }
+        std::env::set_var("OPENCODE_CMD", &script);
+        let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+        // Live{Terminal} for one key (begin_start + commit_live).
+        let granted = ownership.begin_start(
+            "opencode",
+            "ses_owned",
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "owner-op",
+            None,
+            "test",
+            0,
+        );
+        let freshell_ownership::BeginOutcome::Granted { generation } = granted else {
+            panic!("the terminal owner must be granted its start");
+        };
+        assert_eq!(
+            ownership.commit_live(
+                "opencode",
+                "ses_owned",
+                "owner-op",
+                generation,
+                freshell_ownership::OwnerIdentity {
+                    kind: freshell_ownership::RuntimeOwnerKind::Terminal,
+                    terminal_id: Some("t-owned".to_string()),
+                    live_session_key: None,
+                    pid: None,
+                    ownership_id: None,
+                },
+            ),
+            freshell_ownership::CommitOutcome::Committed,
+            "the terminal owner must commit Live"
+        );
+        // A transition holds a second key.
+        assert!(matches!(
+            ownership.begin_handoff(
+                "opencode",
+                "ses_transition",
+                freshell_ownership::RuntimeOwnerKind::FreshAgent,
+                "transition-op",
+                None,
+                "test",
+                0,
+            ),
+            freshell_ownership::BeginOutcome::Granted { .. }
+        ));
+        std::env::remove_var("OPENCODE_CMD");
+
+        let opencode = FreshAgentState::new(
+            Arc::new("tok".to_string()),
+            Arc::new(tokio::sync::broadcast::channel::<String>(64).0),
+        )
+        .with_ownership(ownership);
+        assert!(
+            !opencode.opencode_manager_present_for_test().await,
+            "the manager cell is absent — the refusal arms are cold"
+        );
+        let state = SnapshotState::new(
+            Arc::new("tok".to_string()),
+            codex_state(),
+            opencode.clone(),
+            claude_state(),
+        );
+        for (sid, want_owner_kind) in [("ses_owned", Some("terminal")), ("ses_transition", None)] {
+            let resp = get_snapshot(
+                State(state.clone()),
+                Path((
+                    "freshopencode".to_string(),
+                    "opencode".to_string(),
+                    sid.to_string(),
+                )),
+                Query(HashMap::new()),
+                headers_with_token("tok"),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::CONFLICT,
+                "{sid} answers the typed 409"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["code"], json!("RESTORE_UNAVAILABLE"), "{value}");
+            assert!(
+                value["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("still running on the server.")),
+                "the frozen refusal text: {value}"
+            );
+            assert!(
+                value["ownerGeneration"].as_u64().is_some(),
+                "the owner generation is named: {value}"
+            );
+            match want_owner_kind {
+                Some(kind) => assert_eq!(value["ownerKind"], json!(kind), "{value}"),
+                None => assert!(
+                    value.get("ownerKind").is_none(),
+                    "a transition names no committed owner: {value}"
+                ),
+            }
+        }
+        assert!(
+            !opencode.opencode_manager_present_for_test().await,
+            "the refusal arms never created the manager cell"
+        );
     }
 }

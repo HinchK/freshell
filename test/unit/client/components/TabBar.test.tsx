@@ -10,6 +10,8 @@ import panesReducer from '@/store/panesSlice'
 import repoIconsReducer from '@/store/repoIconsSlice'
 import settingsReducer, { defaultSettings, updateSettingsLocal } from '@/store/settingsSlice'
 import terminalMetaReducer from '@/store/terminalMetaSlice'
+import freshAgentReducer, { applyRuntimeOwner } from '@/store/freshAgentSlice'
+import { selectPaneOwnerFence } from '@/store/selectors/runtimeOwner'
 import turnCompletionReducer from '@/store/turnCompletionSlice'
 import { terminalDetachMiddleware } from '@/store/terminalDetachMiddleware'
 import type { Tab } from '@/store/types'
@@ -226,6 +228,7 @@ function createStore(
       settings: settingsReducer,
       terminalMeta: terminalMetaReducer,
       turnCompletion: turnCompletionReducer,
+      freshAgent: freshAgentReducer,
     },
     middleware: (getDefaultMiddleware) => getDefaultMiddleware().concat(terminalDetachMiddleware),
     preloadedState: {
@@ -791,6 +794,118 @@ describe('TabBar', () => {
       })
     })
 
+    // b8ke ext r20 F2: the shift-close kill of a session-backed pane
+    // carries the session's observed (epoch, generation) pair on the
+    // wire — a reconnect-queued stale kill is typed-refused by the
+    // server instead of killing a newer owner.
+    it('shift+click kill of a session-backed pane carries the observed owner fence (b8ke ext r20 F2)', async () => {
+      const tab = createTab({
+        id: 'tab-1',
+        title: 'Tab 1',
+      })
+
+      const store = createStore(
+        { tabs: [tab], activeTabId: 'tab-1' },
+        {},
+        {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'codex',
+                shell: 'system',
+                status: 'running',
+                createRequestId: 'req-pane-1',
+                terminalId: 'term-codex-9',
+                sessionRef: { provider: 'codex', sessionId: 'codex-fence-ses' },
+              },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+        },
+      )
+      // The runtimeOwners record: (epoch 12, generation 34) — the pair
+      // the shift-close kill must carry.
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'codex',
+        sessionId: 'codex-fence-ses',
+        epoch: 12,
+        generation: 34,
+        ownerKind: 'terminal',
+        operationId: 'handoff-1',
+        transition: 'handoff-committed',
+      }))
+
+      renderWithStore(<TabBar />, store)
+
+      const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
+      fireEvent.click(closeButton, { shiftKey: true })
+
+      expect(mockSend).toHaveBeenCalledWith(
+        expect.objectContaining({
+          type: 'terminal.kill',
+          terminalId: 'term-codex-9',
+          createRequestId: 'req-pane-1',
+          requestId: expect.any(String),
+          observedEpoch: 12,
+          observedGeneration: 34,
+        }),
+      )
+    })
+
+    // b8ke ext r20 F2: a pane with NO owner record (or no sessionRef)
+    // legitimately sends the kill without the pair.
+    it('shift+click kill of a session-backed pane with NO owner record sends no pair (b8ke ext r20 F2)', async () => {
+      const tab = createTab({
+        id: 'tab-1',
+        title: 'Tab 1',
+      })
+
+      const store = createStore(
+        { tabs: [tab], activeTabId: 'tab-1' },
+        {},
+        {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'codex',
+                shell: 'system',
+                status: 'running',
+                createRequestId: 'req-pane-1',
+                terminalId: 'term-codex-10',
+                sessionRef: { provider: 'codex', sessionId: 'codex-no-record' },
+              },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+        },
+      )
+
+      renderWithStore(<TabBar />, store)
+
+      const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
+      fireEvent.click(closeButton, { shiftKey: true })
+
+      const kills = mockSend.mock.calls
+        .map(([msg]) => msg as Record<string, unknown>)
+        .filter((m) => m.type === 'terminal.kill')
+      expect(kills).toHaveLength(1)
+      expect(kills[0]).toMatchObject({
+        type: 'terminal.kill',
+        terminalId: 'term-codex-10',
+        createRequestId: 'req-pane-1',
+      })
+      expect(kills[0]).not.toHaveProperty('observedEpoch')
+      expect(kills[0]).not.toHaveProperty('observedGeneration')
+    })
+
+
     it('plain close sends exactly one terminal.detach per terminal', async () => {
       const tab = createTab({
         id: 'tab-1',
@@ -900,6 +1015,104 @@ describe('TabBar', () => {
         ['tab-1'],
         'an unacknowledged close is not a close: the tab stays',
       )
+    })
+
+    // b8ke ext r20 F2: the queued-stale-kill-across-reconnect discipline.
+    // The kill is decided against the session's observed (epoch,
+    // generation) pair; while it sits queued/in-flight another device
+    // advances the session; the server's stale-claim TYPED refusal
+    // surfaces as terminal.killed{success:false} — the ack resolves
+    // not-ok, the close gate never closes the tab, and the newer
+    // owner's record survives (the refused kill never folds a death).
+    it('a reconnect-queued stale-fence kill is typed-refused and the newer owner survives (b8ke ext r20 F2)', async () => {
+      const tab = createTab({
+        id: 'tab-1',
+        title: 'Tab 1',
+      })
+
+      const store = createStore(
+        { tabs: [tab], activeTabId: 'tab-1' },
+        {},
+        {
+          layouts: {
+            'tab-1': {
+              type: 'leaf',
+              id: 'pane-1',
+              content: {
+                kind: 'terminal',
+                mode: 'codex',
+                shell: 'system',
+                status: 'running',
+                createRequestId: 'req-pane-1',
+                terminalId: 'term-stale-1',
+                sessionRef: { provider: 'codex', sessionId: 'codex-stale-ses' },
+              },
+            },
+          },
+          activePane: { 'tab-1': 'pane-1' },
+        },
+      )
+      // The record the shift-close observed at decision time: (12, 34).
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'codex',
+        sessionId: 'codex-stale-ses',
+        epoch: 12,
+        generation: 34,
+        ownerKind: 'terminal',
+        operationId: 'handoff-1',
+        transition: 'handoff-committed',
+      }))
+
+      renderWithStore(<TabBar />, store)
+
+      const closeButton = screen.getByTitle('Close (Shift+Click to kill)')
+      fireEvent.click(closeButton, { shiftKey: true })
+
+      // The queued kill carries the pair observed at decision time.
+      const killMsg = mockSend.mock.calls
+        .map(([msg]) => msg as Record<string, unknown>)
+        .find((msg) => msg?.type === 'terminal.kill')
+      expect(killMsg).toMatchObject({
+        type: 'terminal.kill',
+        terminalId: 'term-stale-1',
+        observedEpoch: 12,
+        observedGeneration: 34,
+      })
+
+      // While the kill sits queued, ANOTHER device advances the session
+      // through a handoff — the reconnect fold refreshes the record.
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'codex',
+        sessionId: 'codex-stale-ses',
+        epoch: 12,
+        generation: 35,
+        ownerKind: 'terminal',
+        operationId: 'handoff-2',
+        transition: 'handoff-committed',
+      }))
+
+      // The server refuses the stale pair typed — nothing is killed.
+      emitWsMessage({
+        type: 'terminal.killed',
+        requestId: killMsg?.requestId as string,
+        terminalId: 'term-stale-1',
+        success: false,
+        error: 'ownership moved to a newer runtime; refresh and retry',
+      })
+      await new Promise((resolve) => setTimeout(resolve, 0))
+
+      // The typed refusal is not a close: the tab survives…
+      expect(store.getState().tabs.tabs.map((t) => t.id)).toEqual(
+        ['tab-1'],
+        'a stale-fence-refused kill never closes the tab — the newer owner lives',
+      )
+      // …and the newer owner's record is untouched by the refused kill
+      // (the canonical fence selector reads the record the pane sees).
+      expect(selectPaneOwnerFence(store.getState(), {
+        sessionRef: { provider: 'codex', sessionId: 'codex-stale-ses' },
+      })).toEqual({ epoch: 12, generation: 35 })
     })
 
     it('shift close sends terminal.kill and no terminal.detach', () => {

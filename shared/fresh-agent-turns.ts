@@ -12,6 +12,44 @@ export function freshAgentTurnText(turn: Pick<FreshAgentTurn, 'summary' | 'items
   return textItems.length > 0 ? text : turn.summary
 }
 
+/**
+ * Leading display text of a turn: the FIRST text item's text when one exists,
+ * else the summary. The opencode-pty plugin injects its notification blocks as
+ * the leading content of a user-role message, in both shapes.
+ */
+function leadingFreshAgentTurnText(turn: Pick<FreshAgentTurn, 'summary' | 'items'>): string {
+  const firstText = turn.items.find(
+    (item): item is Extract<FreshAgentTurn['items'][number], { kind: 'text' }> => item.kind === 'text',
+  )
+  return (firstText?.text ?? turn.summary ?? '').trim()
+}
+
+const PTY_NOTIFICATION_TURN_PREFIXES = ['<pty_exited>', '<pty_waited>', '<pty_wait_timeout>'] as const
+
+function isPtyNotificationTurn(turn: Pick<FreshAgentTurn, 'role' | 'summary' | 'items'>): boolean {
+  if (turn.role !== 'user') return false
+  const leading = leadingFreshAgentTurnText(turn)
+  return PTY_NOTIFICATION_TURN_PREFIXES.some((prefix) => leading.startsWith(prefix))
+}
+
+/**
+ * Display-only: opencode-pty plugin notification turns (machine-injected
+ * user-role messages whose leading text is a `<pty_exited>` / `<pty_waited>` /
+ * `<pty_wait_timeout>` block) present as agent text in the transcript. The
+ * wire snapshot and store turns are never mutated — non-matching turns keep
+ * their identity and the input array is returned unchanged when nothing
+ * matches, so memoized consumers stay referentially stable.
+ */
+export function reclassifyPtyNotificationTurns(turns: FreshAgentTurn[]): FreshAgentTurn[] {
+  let changed = false
+  const mapped = turns.map((turn) => {
+    if (!isPtyNotificationTurn(turn)) return turn
+    changed = true
+    return { ...turn, role: 'assistant' as const }
+  })
+  return changed ? mapped : turns
+}
+
 function normalizeTurnRole(role: unknown): string | undefined {
   return typeof role === 'string' ? role.trim().toLowerCase() : undefined
 }

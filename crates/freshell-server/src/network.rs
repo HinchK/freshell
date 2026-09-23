@@ -2670,27 +2670,39 @@ mod tests {
         }
         // Rollback proof: the wildcard listener must be GONE, loopback must
         // still serve, and neither BindState nor settings claim 0.0.0.0.
-        // Wildcard-gone detector: a PLAIN (no SO_REUSEPORT) bind of
-        // 127.0.0.2:port fails while any 0.0.0.0:port listener survives
-        // (wildcard conflicts with every specific address; sharing would need
-        // reuseport on BOTH) and succeeds against the rolled-back 127.0.0.1
-        // listener (two DIFFERENT specific addresses never conflict).
         //
-        // Both socket-facing detector checks are Env, NOT Product, because
-        // they have a MEASURED environmental failure mode on this WSL2 host:
-        // pre-hardening (~1/10 full parallel-suite runs) a detector
-        // bind/connect on the just-swapped port misbehaved while diagnostics
-        // confirmed the 500, the rollback, and a truthful 127.0.0.1 BindState
-        // were all correct. A REAL rollback regression fails them
-        // deterministically on every fresh-port attempt and so still fails
-        // the test.
-        if std::net::TcpListener::bind(("127.0.0.2", port)).is_err() {
-            return Err(ScenarioError::Env(
-                "listener left on 0.0.0.0 after failed persist (no rollback), \
-                 or a transient detector-bind artifact"
-                    .into(),
-            ));
+        // Wildcard-gone detector (NET-02, deflake 2026-09-20): read the
+        // PRODUCT'S OWN truth — the rebind controller's recorded bound
+        // address — instead of probing the kernel namespace with a plain
+        // 127.0.0.2:port bind. `serve_on` records an address only AFTER the
+        // new bind and only after the previous accept loop's close barrier,
+        // so `current_bind_addr() == (127.0.0.1, port)` proves the rolled-
+        // back loopback listener is the one live listener — the wildcard is
+        // provably closed. The old kernel probe (a plain bind of
+        // 127.0.0.2:port failing while any 0.0.0.0:port listener survives)
+        // conflated OUR listener with ANY sibling's: under the full
+        // parallel suite the kernel reassigned the just-released port to
+        // other tests' wildcard listeners often enough to burn all five
+        // retry attempts (the 2026-09-19 base gate, 5/5). Product truth is
+        // an in-memory read with zero environmental exposure — a REAL
+        // rollback regression fails it deterministically on every attempt,
+        // so the check is Product (fail-fast), no longer Env.
+        let live_addr = state.rebind.current_bind_addr();
+        if live_addr
+            != Some(std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port,
+            ))
+        {
+            return Err(ScenarioError::Product(format!(
+                "rollback left the rebind controller on {live_addr:?}, not loopback:{port}"
+            )));
         }
+        // Loopback-serving probe: a real connect against our own just-bound
+        // listener. Kept Env: the documented WSL2 transient (a detector
+        // connect on the just-swapped port misbehaving ~1/10 under full
+        // parallel-suite load) is genuinely environmental, and a REAL
+        // serving regression still fails every fresh-port attempt.
         if tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .is_err()

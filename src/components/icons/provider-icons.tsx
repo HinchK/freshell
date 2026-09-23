@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react'
 import type { SVGProps } from 'react'
 import type { CodingCliProviderName } from '@/lib/coding-cli-types'
 
@@ -97,16 +98,85 @@ export function AmplifierIcon(props: IconProps) {
   )
 }
 
-export function FreshclaudeIcon(props: IconProps) {
+// Fresh* agent icons — the 14-lobe star ring family. Every fresh agent keeps
+// its source CLI mark, shrunk to fit, framed by the same ring in the same
+// 24-unit box the plain CLI icons fill (the ring's outer disc, radius 11.8,
+// matches the marks' native reach, so fresh and CLI icons read as one
+// size). The ring is a solid disc with a 14-lobe star-shaped window cut out
+// of it (one evenodd path): smooth outer contour, scalloped inner contour —
+// the "double outline" look. Monochrome (currentColor), no knockout
+// machinery, legible at every rendered size. Each mark shrinks about the
+// box center with ≥ 1 unit of clearance to the window's valley extent
+// (radius 9.0) — the transforms below compose the shrink with each mark's
+// native fit-the-box transform.
+
+// Ring geometry: disc radius 11.8; star window with 14 lobes, valleys on
+// radius 9.0, lobe apexes on radius ~10.2 (quadratic controls on ~11.63).
+const FRESH_RING_PATH =
+  'M12 0.2A11.8 11.8 0 1 1 11.99 0.2Z M12.000 3.000Q14.587 0.666 15.905 3.891Q19.249 2.911 19.036 6.389Q22.474 6.956 20.774 9.997Q23.626 12.000 20.774 14.003Q22.474 17.044 19.036 17.611Q19.249 21.089 15.905 20.109Q14.587 23.334 12.000 21.000Q9.413 23.334 8.095 20.109Q4.751 21.089 4.964 17.611Q1.526 17.044 3.226 14.003Q0.374 12.000 3.226 9.997Q1.526 6.956 4.964 6.389Q4.751 2.911 8.095 3.891Q9.413 0.666 12.000 3.000Z'
+
+const CLAUDE_MARK_PATH = 'M616.9,649.5h-209.7c0,0,0,104.7,0,104.7h-56.6c0,0,.2-104.5.2-104.5h-48.6s.2,104.5.2,104.5h-56.7c0,0,.2-104.4.2-104.4l-48.6-.7v-96.4c.1,0-104.8,0-104.8,0v-104.9s104.9,0,104.9,0v-201.6c0,0,628.9,0,628.9,0v201.6c0,0,104.9,0,104.9,0v104.9s-104.9,0-104.9,0v96.6c.1,0-56.5.4-56.5.4l.2,104.5h-48.6s.2-104.6.2-104.6h-56.6s.2,104.6.2,104.6h-48.6s.2-104.6.2-104.6ZM351.1,447.5l-.5-96.4h-48.4c0,0,0,96.6,0,96.6l48.8-.2ZM722,447.7l-.4-96.7h-56.5c0,0,0,96.8,0,96.8h56.9Z'
+
+const CODEX_MARK_PATH = 'M14.949 6.547a3.94 3.94 0 0 0-.348-3.273 4.11 4.11 0 0 0-4.4-1.934A4.1 4.1 0 0 0 8.423.2 4.15 4.15 0 0 0 6.305.086a4.1 4.1 0 0 0-1.891.948 4.04 4.04 0 0 0-1.158 1.753 4.1 4.1 0 0 0-1.563.679A4 4 0 0 0 .554 4.72a3.99 3.99 0 0 0 .502 4.731 3.94 3.94 0 0 0 .346 3.274 4.11 4.11 0 0 0 4.402 1.933c.382.425.852.764 1.377.995.526.231 1.095.35 1.67.346 1.78.002 3.358-1.132 3.901-2.804a4.1 4.1 0 0 0 1.563-.68 4 4 0 0 0 1.14-1.253 3.99 3.99 0 0 0-.506-4.716m-6.097 8.406a3.05 3.05 0 0 1-1.945-.694l.096-.054 3.23-1.838a.53.53 0 0 0 .265-.455v-4.49l1.366.778q.02.011.025.035v3.722c-.003 1.653-1.361 2.992-3.037 2.996m-6.53-2.75a2.95 2.95 0 0 1-.36-2.01l.095.057L5.29 12.09a.53.53 0 0 0 .527 0l3.949-2.246v1.555a.05.05 0 0 1-.022.041L6.473 13.3c-1.454.826-3.311.335-4.15-1.098m-.85-6.94A3.02 3.02 0 0 1 3.07 3.949v3.785a.51.51 0 0 0 .262.451l3.93 2.237-1.366.779a.05.05 0 0 1-.048 0L2.585 9.342a2.98 2.98 0 0 1-1.113-4.094zm11.216 2.571L8.747 5.576l1.362-.776a.05.05 0 0 1 .048 0l3.265 1.86a3 3 0 0 1 1.173 1.207 2.96 2.96 0 0 1-.27 3.2 3.05 3.05 0 0 1-1.36.997V8.279a.52.52 0 0 0-.276-.445m1.36-2.015-.097-.057-3.226-1.855a.53.53 0 0 0-.53 0L6.249 6.153V4.598a.04.04 0 0 1 .019-.04L9.533 2.7a3.07 3.07 0 0 1 3.257.139c.474.325.843.778 1.066 1.303.223.526.289 1.103.191 1.664zM5.503 8.575 4.139 7.8a.05.05 0 0 1-.026-.037V4.049c0-.57.166-1.127.476-1.607s.752-.864 1.275-1.105a3.08 3.08 0 0 1 3.234.41l-.096.054-3.23 1.838a.53.53 0 0 0-.265.455zm.742-1.577 1.758-1 1.762 1v2l-1.755 1-1.762-1z'
+
+const OPENCODE_MARK_PATHS = [
+  'M520,180h200v300h-240V180h40ZM540,300v120h120v-180h-120v60Z',
+  'M660,300v120h-120v-120h120Z',
+] as const
+
+/**
+ * Shared fresh* icon body: `mark` is the untouched source mark, stamped at
+ * `markTransform` (the shrink-about-center composition that fits it inside
+ * the star ring's window). The ring is a single evenodd path — no masks, no
+ * useId-scoped ids — so simultaneous renders (tab bar, picker, headers, the
+ * deck serializer) all serialize and paint identically.
+ */
+function FreshAgentMarkIcon({ mark, markTransform, ...props }: IconProps & { mark: ReactNode; markTransform: string }) {
   return (
     <svg
       xmlns="http://www.w3.org/2000/svg"
-      viewBox="0 0 1024 1024"
-      fill="currentColor"
+      viewBox="0 0 24 24"
+      fill="none"
       {...props}
     >
-      <path d="M853.1,283.1c94.2,0,170.6,76.4,170.6,170.6s-76.4,170.6-170.6,170.6v-341.3h0ZM170.6,283.1C76.4,283.1,0,359.5,0,453.8s76.4,170.6,170.6,170.6v-341.3h0ZM853.1,624.3H170.6c0-188.5,152.8-341.3,341.3-341.3s341.3,152.8,341.3,341.3h-.1ZM410.8,496.4c0-23.6-19-42.6-42.6-42.6s-42.6,19-42.6,42.6,19,42.6,42.6,42.6,42.6-19,42.6-42.6h0ZM698.2,496.4c0-23.6-19-42.6-42.6-42.6s-42.6,19-42.6,42.6,19,42.6,42.6,42.6,42.6-19,42.6-42.6h0ZM234.6,624.3c-35.4,0-64,28.7-64,64s28.7,64,64,64v-127.9h0ZM368.2,624.3c-35.4,0-64,28.7-64,64s28.7,64,64,64v-127.9h0ZM789.1,752.3c35.4,0,64-28.7,64-64s-28.7-64-64-64v127.9h0ZM655.5,752.3c35.4,0,64-28.7,64-64s-28.7-64-64-64v127.9h0Z" />
+      <path fill="currentColor" fillRule="evenodd" d={FRESH_RING_PATH} />
+      <g transform={markTransform}>{mark}</g>
     </svg>
+  )
+}
+
+export function FreshclaudeIcon(props: IconProps) {
+  return (
+    <FreshAgentMarkIcon
+      mark={<path fill="currentColor" d={CLAUDE_MARK_PATH} />}
+      markTransform="translate(2.42302 2.64068) scale(0.0187102)"
+      {...props}
+    />
+  )
+}
+
+export function FreshcodexIcon(props: IconProps) {
+  return (
+    <FreshAgentMarkIcon
+      mark={<path fill="currentColor" d={CODEX_MARK_PATH} />}
+      markTransform="translate(4.33839 4.30011) scale(0.956901)"
+      {...props}
+    />
+  )
+}
+
+export function FreshopencodeIcon(props: IconProps) {
+  return (
+    <FreshAgentMarkIcon
+      mark={
+        <>
+          <path fill="currentColor" d={OPENCODE_MARK_PATHS[0]} />
+          <path fill="currentColor" fillOpacity="0.5" d={OPENCODE_MARK_PATHS[1]} />
+        </>
+      }
+      markTransform="translate(-12.4595 -1.4514) scale(0.0407692)"
+      {...props}
+    />
   )
 }
 

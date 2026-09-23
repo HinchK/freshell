@@ -183,6 +183,9 @@ export function buildSessionItems(
   const runningSessionMap = new Map<string, RunningSessionInfo>()
   const tabSessionMap = new Map<string, { hasTab: boolean }>()
   const terminalPaneTitles = collectTerminalPaneTitles(tabs, panes)
+  const terminalById = new Map(
+    (terminals || []).map((terminal) => [terminal.terminalId, terminal]),
+  )
 
   /**
    * Unified agent names (Task 5): a scoped session's canonical name from the
@@ -286,7 +289,27 @@ export function buildSessionItems(
         sessionId: session.sessionId,
         provider,
         sessionType: session.sessionType || provider,
-        title: scopedRowTitle ?? (session.title || session.sessionId.slice(0, 8)),
+        // Unified agent names (Task 5): a scoped row displays its canonical
+        // session name (scopedRowTitle above) over every native fallback.
+        // Below that, a title-less RUNNING row (a real session whose
+        // transcript has not yet yielded a title — server placeholder rows
+        // carry the provider display name) keeps a meaningful label instead
+        // of an id prefix, composing the SAME name order the client-side
+        // fallback row uses below (:529): the pane title, then the
+        // terminal's registry title, then getProviderLabel — so the label
+        // is stable when the server row replaces the client's fallback row
+        // for the same terminal. getProviderLabel without extension data
+        // renders Opencode/Codex/Claude, and only as the LAST rung (no
+        // local pane/terminal info). hasTitle stays !!session.title — this
+        // is a display fallback, not a session title; later title-carrying
+        // fetches still override it.
+        title: scopedRowTitle
+          ?? session.title
+          ?? ((session.isRunning && session.runningTerminalId)
+            ? (terminalPaneTitles.get(session.runningTerminalId)?.title?.trim()
+              || terminalById.get(session.runningTerminalId)?.title?.trim()
+              || getProviderLabel(provider))
+            : session.sessionId.slice(0, 8)),
         hasTitle,
         subtitle: getProjectName(effectivePath),
         projectPath: effectivePath,

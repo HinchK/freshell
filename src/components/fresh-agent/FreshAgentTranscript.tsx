@@ -21,9 +21,11 @@ import {
   turnPlainText,
 } from './FreshAgentTurnActions'
 import { FreshAgentActionSheet } from './FreshAgentActionSheet'
+import { FreshAgentTranscriptMinimap } from './FreshAgentTranscriptMinimap'
+import { deriveGlomTarget, measureTranscriptUserTurns, type TranscriptMeasurement } from './shared/transcript-measurement'
 import { registerFreshAgentTurnItems } from '@/lib/pane-action-registry'
 import { buildLongPressHandlers, useCoarsePointer } from '@/lib/pointer'
-import { getFreshAgentDisplayTurnKey, turnSummaryIsAuthored } from '@shared/fresh-agent-turns'
+import { getFreshAgentDisplayTurnKey, reclassifyPtyNotificationTurns, turnSummaryIsAuthored } from '@shared/fresh-agent-turns'
 
 function getTurnLabel(turn: FreshAgentTurn, agentLabel?: string): string {
   switch (turn.role) {
@@ -1013,6 +1015,10 @@ export type FreshAgentTranscriptProps = {
   /** "Expand tools": the activity strip's starting state. */
   expandTools?: boolean
   showTimecodes?: boolean
+  /** "Show transcript minimap" (local setting, default on): a LIVE gate —
+   *  false unmounts the rail and its measurement work; the glom chip's shared
+   *  sweep is unaffected. */
+  showTranscriptMinimap?: boolean
   isStreaming?: boolean
   onForkFromTurn?: (turnId: string) => void
   onRewindToTurn?: (turn: FreshAgentTurn) => void
@@ -1035,6 +1041,9 @@ export type FreshAgentTranscriptProps = {
    * restore) re-collapses the disclosure — the toggle never leaks across
    * conversations. Omitted in isolation/tests (the state keys on null). */
   sessionId?: string
+  /** Keep the transcript mounted while a reveal refresh is pending, but pause
+   * measurement and scroll bookkeeping until the new snapshot is committed. */
+  presentationPaused?: boolean
 }
 
 export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, FreshAgentTranscriptProps>(function FreshAgentTranscript({
@@ -1046,6 +1055,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   expandThinking = false,
   expandTools = false,
   showTimecodes,
+  showTranscriptMinimap = true,
   isStreaming = false,
   onForkFromTurn,
   onRewindToTurn,
@@ -1057,12 +1067,13 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   onRedoToTurn,
   redoableTurnIds,
   sessionId,
+  presentationPaused = false,
 }, ref) {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
   const [atBottom, setAtBottom] = useState(true)
   const [newMessages, setNewMessages] = useState(0)
   const [sheetTurn, setSheetTurn] = useState<FreshAgentTurn | null>(null)
-  const [glomTarget, setGlomTarget] = useState<{ index: number; text: string } | null>(null)
+  const [transcriptMeasurement, setTranscriptMeasurement] = useState<TranscriptMeasurement | null>(null)
   // Rolled-back section lifecycle: historical (non-restorable) markers render
   // behind a quiet disclosure line. The toggle is ephemeral view state SCOPED
   // TO THE CONVERSATION — a different sessionId (a new conversation started
@@ -1095,7 +1106,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   const historicalSteps = historicalMarkers.filter((t) => t.role === 'user').length
   const resolvedShowTimecodes = showTimecodes ?? showModel
   const displayTurns = useMemo(() => (
-    coalesceSyntheticToolResultTurns(turns)
+    coalesceSyntheticToolResultTurns(reclassifyPtyNotificationTurns(turns))
   ), [turns])
   const { layouts: turnLayouts, lineEndIndex, tail, tailCaption } = useMemo(
     () => buildTranscriptLayout(displayTurns),
@@ -1128,30 +1139,18 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
     }).join('|')
   ), [displayTurns])
 
-  const recomputeGlom = useCallback(() => {
-    const scroller = scrollerRef.current
-    if (!scroller) {
-      setGlomTarget(null)
-      return
-    }
-    const scrollerTop = scroller.getBoundingClientRect().top
-    const userTurnEls = scroller.querySelectorAll<HTMLElement>('[data-turn-role="user"]')
-    let target: { index: number; text: string } | null = null
-    userTurnEls.forEach((el) => {
-      if (el.getBoundingClientRect().top < scrollerTop) {
-        const indexAttr = el.getAttribute('data-turn-index')
-        if (indexAttr == null) return
-        const index = Number(indexAttr)
-        if (Number.isNaN(index)) return
-        const turn = displayTurns[index]
-        if (!turn) return
-        const text = turnPlainText(turn)
-        if (!text) return
-        target = { index, text }
-      }
-    })
-    setGlomTarget(target)
+  // ONE shared landmark sweep per trigger (scroll + transcriptSignature). The
+  // result feeds BOTH the glom chip (derived below) and the minimap rail
+  // (passed down as a prop), so a scroll event scans the user-turn articles
+  // exactly once. Synchronous on purpose (jsdom act() gate).
+  const sweepTranscript = useCallback(() => {
+    setTranscriptMeasurement(measureTranscriptUserTurns(scrollerRef.current, displayTurns))
   }, [displayTurns])
+
+  const glomTarget = useMemo(
+    () => deriveGlomTarget(transcriptMeasurement),
+    [transcriptMeasurement],
+  )
 
   const handleGlomClick = useCallback(() => {
     if (!glomTarget) return
@@ -1228,6 +1227,7 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
   }), [])
 
   useLayoutEffect(() => {
+    if (presentationPaused) return
     const node = scrollerRef.current
     if (!node) return
     if (atBottom) {
@@ -1236,11 +1236,12 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
     } else {
       setNewMessages((count) => count + 1)
     }
-  }, [atBottom, transcriptSignature])
+  }, [atBottom, presentationPaused, transcriptSignature])
 
   useEffect(() => {
-    recomputeGlom()
-  }, [recomputeGlom, transcriptSignature])
+    if (presentationPaused) return
+    sweepTranscript()
+  }, [presentationPaused, sweepTranscript, transcriptSignature])
 
   // Shared row markup for BOTH rolled-back presentations (the e2e locates rows
   // via div.flex.items-start). The redo button branch is gated on the row's
@@ -1274,9 +1275,10 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
         className="fresh-agent-transcript-scroll flex h-full flex-col gap-0 overflow-x-hidden overflow-y-auto overscroll-contain px-3 py-3"
         data-context="fresh-agent-transcript"
         onScroll={(event) => {
+          if (presentationPaused) return
           const node = event.currentTarget
           setAtBottom(computeAtBottom(node))
-          recomputeGlom()
+          sweepTranscript()
         }}
       >
         {displayTurns.map((turn, index) => {
@@ -1385,6 +1387,14 @@ export const FreshAgentTranscript = forwardRef<FreshAgentTranscriptHandle, Fresh
           <ChevronDown className="h-3 w-3" />
           {newMessages > 0 ? `${newMessages} new` : 'Bottom'}
         </button>
+      ) : null}
+      {showTranscriptMinimap && !presentationPaused ? (
+        <FreshAgentTranscriptMinimap
+          scrollerRef={scrollerRef}
+          measurement={transcriptMeasurement}
+          onRemeasure={sweepTranscript}
+          transcriptSignature={transcriptSignature}
+        />
       ) : null}
     </div>
   )

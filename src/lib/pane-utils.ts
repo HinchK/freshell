@@ -1,4 +1,5 @@
 import type { PaneContent, PaneNode, PaneRefreshTarget } from '@/store/paneTypes'
+import type { SessionLocator } from '@shared/ws-protocol'
 
 export interface PaneEntry {
   paneId: string
@@ -50,14 +51,21 @@ export function collectTerminalIds(node: PaneNode): string[] {
  */
 export function collectTerminalCloseTargets(
   node: PaneNode,
-): Array<{ terminalId: string; createRequestId: string | null }> {
+): Array<{ terminalId: string; createRequestId: string | null; sessionRef?: SessionLocator }> {
   const seen = new Set<string>()
-  const out: Array<{ terminalId: string; createRequestId: string | null }> = []
+  const out: Array<{ terminalId: string; createRequestId: string | null; sessionRef?: SessionLocator }> = []
   const walk = (n: PaneNode): void => {
     if (n.type === 'leaf') {
       if (n.content.kind === 'terminal' && n.content.terminalId && !seen.has(n.content.terminalId)) {
         seen.add(n.content.terminalId)
-        out.push({ terminalId: n.content.terminalId, createRequestId: n.content.createRequestId ?? null })
+        out.push({
+          terminalId: n.content.terminalId,
+          createRequestId: n.content.createRequestId ?? null,
+          // b8ke ext r20 F2: the close target carries the pane's
+          // sessionRef so the kill sender can resolve the observed owner
+          // fence (additive — the existing fields are unchanged).
+          ...(n.content.sessionRef ? { sessionRef: n.content.sessionRef } : {}),
+        })
       }
       return
     }

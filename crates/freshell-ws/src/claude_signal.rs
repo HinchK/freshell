@@ -305,10 +305,68 @@ async fn apply_claude_signal(state: &WsState, sig: &ClaudeSignal) -> SignalDispo
         return SignalDisposition::Acted;
     }
     let previous = current.session_id.clone();
+    // b8ke ext r14 F1/F2: the signal rebind acquires its coordinator
+    // authority FIRST (fail-closed: a refusal mutates NO identity home —
+    // the file is consumed as acted, the next SessionStart retries) and
+    // holds it across the identity homes' writes; the commit is the
+    // atomic move (new Live + old Aliased in ONE lock scope, the retained
+    // claim rekeyed — never both keys naming the writer).
+    let Some(authority) = crate::identity_ownership::coordinator_begin_identity(
+        state,
+        "claude",
+        &sig.terminal_id,
+        &sig.session_id,
+        previous.as_deref(),
+    )
+    .await
+    else {
+        return SignalDisposition::Acted;
+    };
     tracing::info!(terminal_id = %sig.terminal_id, new = %sig.session_id,
         source = ?sig.source, "claude_rebind: SessionStart reported a new session id");
-    // Same pinned order as the codex tail: identity -> meta -> ledger
-    // (awaited) -> associated THEN meta.updated.
+    // Same pinned order as the codex tail, with the b8ke ext r39 F2
+    // reorder: durable ledger (awaited) -> identity -> meta -> activity
+    // hub -> associated. The binding write GATES THE INSTALL/ANNOUNCE —
+    // on failure NOTHING installs or announces (the identity homes keep
+    // the consistent prior state) and the held authority COMMITS (the
+    // live CLI process is the new session's writer — never a
+    // Vacant-with-live-writer; a failed ticket would let a later
+    // lifecycle command start a second writer beside it). Pre-r39 the
+    // upsert/meta/hub/associated broadcast all landed BEFORE the
+    // awaited binding write and the failure unwound to a Vacant key
+    // while the registries and clients still identified the terminal as
+    // the session writer.
+    let binding_ok = crate::pane_ledger::ledger_resolve_identity(
+        state,
+        &sig.terminal_id,
+        "claude",
+        &sig.session_id,
+        current.cwd.as_deref(),
+    )
+    .await;
+    if !binding_ok {
+        tracing::warn!(target: "freshell_ws::claude_signal",
+            terminal_id = %sig.terminal_id, session_id = %sig.session_id,
+            event = "claude_signal.binding_failed",
+            outcome = "committed_owner_kept",
+            failure_reason = "DURABLE_BINDING_WRITE_FAILED",
+            "claude_signal_binding_failed: the durable binding write failed — \
+             nothing installed/announced; the held authority commits so the \
+             live CLI writer stays the named owner (never a \
+             Vacant-with-live-writer); the next SessionStart signal re-adopts \
+             and retries the binding"
+        );
+        crate::identity_ownership::coordinator_commit_identity(
+            state,
+            authority,
+            "claude",
+            &sig.terminal_id,
+            &sig.session_id,
+            previous.as_deref(),
+        )
+        .await;
+        return SignalDisposition::Acted;
+    }
     state.identity.upsert(
         &sig.terminal_id,
         Some("claude"),
@@ -398,22 +456,23 @@ async fn apply_claude_signal(state: &WsState, sig: &ClaudeSignal) -> SignalDispo
     if let Some(hub) = state.activity.as_ref() {
         hub.bind_claude_session(&sig.terminal_id, &sig.session_id);
     }
-    crate::pane_ledger::ledger_resolve_identity(
-        state,
-        &sig.terminal_id,
-        "claude",
-        &sig.session_id,
-        current.cwd.as_deref(),
-    )
-    .await;
     crate::codex_identity::broadcast_terminal_session_associated(
         state,
         "claude",
         &sig.terminal_id,
         &sig.session_id,
         current.cwd.clone(),
-        previous,
+        previous.clone(),
     );
+    crate::identity_ownership::coordinator_commit_identity(
+        state,
+        authority,
+        "claude",
+        &sig.terminal_id,
+        &sig.session_id,
+        previous.as_deref(),
+    )
+    .await;
     SignalDisposition::Acted
 }
 
@@ -443,11 +502,11 @@ mod tests {
         // `JustOne` rebuilder computes interest from the REGISTERING
         // thread's default subscriber -- none here would cache
         // `Interest::never` globally and silently swallow the warn that
-        // drain_warns_on_rejected_files asserts on. Holding a capture
-        // guard (the opencode lane's idiom: every test that can hit a
-        // capture-asserted callsite holds one) makes registration always
-        // see a live subscriber.
-        let (_events, _guard) = crate::invariants::capture::capture();
+        // drain_warns_on_rejected_files asserts on. Installing the
+        // process-global capture (kata 59nb: one global subscriber; every
+        // thread's events land in the shared vec) makes registration always
+        // see a live subscriber, whichever thread registers first.
+        let _ = crate::invariants::capture::capture();
         let dir = tempfile::tempdir().unwrap();
         write_file(
             dir.path(),
@@ -605,7 +664,7 @@ mod tests {
 
     #[test]
     fn drain_warns_on_rejected_files() {
-        let (events, _guard) = crate::invariants::capture::capture();
+        let events = crate::invariants::capture::capture();
         let dir = tempfile::tempdir().unwrap();
         write_file(dir.path(), "junk__1.json", "not json");
         let watcher = ClaudeSignalWatcher::new(dir.path().to_path_buf());
@@ -615,12 +674,24 @@ mod tests {
             !dir.path().join("junk__1.json").exists(),
             "malformed files stay single-shot (consumed)"
         );
-        let events = events.lock().unwrap();
-        assert!(
+        // Collect-then-assert (never hold the shared vec's guard across an
+        // assert); the path filter scopes the presence check to THIS test's
+        // junk file — the vec carries every test's events (kata 59nb).
+        let want_path = format!("{}", dir.path().join("junk__1.json").display());
+        let hits: Vec<crate::invariants::capture::CapturedEvent> = {
+            let events = events.lock().unwrap_or_else(|p| p.into_inner());
             events
                 .iter()
-                .any(|e| e.message.contains("claude_signal_rejected")),
-            "parse rejects must be warn-logged for detectability (A8)"
+                .filter(|e| {
+                    e.message.contains("claude_signal_rejected")
+                        && e.fields.get("path").map(String::as_str) == Some(want_path.as_str())
+                })
+                .cloned()
+                .collect()
+        };
+        assert!(
+            !hits.is_empty(),
+            "parse rejects must be warn-logged for detectability (A8); got: {hits:?}"
         );
     }
 }

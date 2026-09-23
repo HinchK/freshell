@@ -1,6 +1,7 @@
 import type { AppDispatch } from '@/store/store'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
 import type { SessionRef } from '@shared/session-contract'
+import type { ReadyMessage, SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import { createLogger } from '@/lib/client-logger'
 import { consumeCancelledCreate, consumeCreateRoute, rememberCreateRoute } from '@/lib/create-cancellation'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
@@ -8,11 +9,13 @@ import { KILL_FAILED_MESSAGE } from '@/lib/kill-ack'
 import { materializeFreshAgentSession as materializeFreshAgentPaneSession } from '@/store/panesSlice'
 import { applyFreshAgentCompletion, applyFreshAgentWaiting } from '@/store/turnCompletionThunks'
 import { revokeFreshAgentAttention } from '@/store/turnCompletionAttention'
+import type { ObservedOwnerFence } from '@/store/selectors/runtimeOwner'
 import {
   addAssistantMessage,
   addPermissionRequest,
   addQuestionRequest,
   appendStreamDelta,
+  applyRuntimeOwner,
   clearPendingCreateFailure,
   createFailed,
   markSessionLost,
@@ -21,6 +24,7 @@ import {
   removeQuestion,
   removeSession,
   registerPendingCreate,
+  resetRuntimeOwners,
   sessionError,
   sessionCreated,
   sessionExited,
@@ -49,6 +53,13 @@ type FreshAgentCreateFailedMessage = {
   code: string
   message: string
   retryable?: boolean
+  /** kata b8ke: ownership-conflict refusals only — the owning kind, its
+   *  generation, and the emitting server's boot epoch (Task 2 added the
+   *  fields server-side; the fold PRESERVES them so the typed-conflict
+   *  recovery UI can refresh its observed fence from the refusal itself). */
+  ownerKind?: 'terminal' | 'fresh-agent'
+  ownerGeneration?: number
+  ownerEpoch?: number
 }
 
 type FreshAgentSessionMaterializedMessage = {
@@ -66,6 +77,12 @@ type FreshAgentKilledMessage = {
   sessionType: FreshAgentSessionType
   provider: FreshAgentRuntimeProvider
   success: boolean
+  /** b8ke focused FR9: the typed refusal code when success is false (e.g.
+   *  INVALID_FENCE for a half-sent observed fence pair) — additive and
+   *  optional (legacy servers never send it). */
+  code?: string
+  /** The typed refusal's human-readable message (rides with code). */
+  message?: string
 }
 
 type FreshAgentClientMessage =
@@ -97,17 +114,23 @@ function foldFreshAgentKilled(
   dispatch: AppDispatch,
   locator: { sessionId: string; sessionType: FreshAgentSessionType; provider: FreshAgentRuntimeProvider },
   success: boolean | undefined,
+  code?: string,
+  message?: string,
 ): void {
   if (success === false) {
     log.warn('freshAgent.killed reported success:false — the close was not durably recorded; the session may still be running on the server', {
       sessionId: locator.sessionId,
       sessionType: locator.sessionType,
       provider: locator.provider,
+      code: code ?? 'KILL_FAILED',
     })
     dispatch(sessionError({
       ...locator,
-      code: 'KILL_FAILED',
-      message: KILL_FAILED_MESSAGE, // one copy for both writers (see kill-ack.ts)
+      // b8ke focused FR9: a typed refusal code from the server (e.g.
+      // INVALID_FENCE) reduces HERE — only the code-less legacy shape keeps
+      // the generic KILL_FAILED default.
+      code: code ?? 'KILL_FAILED',
+      message: message ?? KILL_FAILED_MESSAGE, // one copy for both writers (see kill-ack.ts)
     }))
     return
   }
@@ -144,7 +167,12 @@ export function registerFreshAgentCreate(
   dispatch(clearPendingCreateFailure({ requestId }))
 }
 
-export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<string, unknown>, ws?: FreshAgentMessageSink): boolean {
+export function handleFreshAgentMessage(
+  dispatch: AppDispatch,
+  msg: Record<string, unknown>,
+  ws?: FreshAgentMessageSink,
+  getOwnerFence?: (provider: string, sessionId: string) => ObservedOwnerFence | undefined,
+): boolean {
   switch (msg.type) {
     case 'freshAgent.created': {
       const created = msg as FreshAgentCreatedMessage
@@ -152,12 +180,19 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
       const route = consumeCreateRoute(created.requestId)
       if (consumeCancelledCreate(created.requestId)) {
         if (provider) {
+          // kata b8ke (round-3 F6): the cleanup kill is a lifecycle
+          // producer — it carries the observed (epoch, generation) fence so
+          // a stale callback can never issue an unfenced kill (no known
+          // record means legacy-unfenced; the server falls back to its
+          // retained stamp).
+          const fence = getOwnerFence?.(provider, created.sessionId)
           ws?.send({
             type: 'freshAgent.kill',
             sessionId: created.sessionId,
             sessionType: created.sessionType,
             provider,
             ...(route?.cwd ? { cwd: route.cwd } : {}),
+            ...(fence ? { observedEpoch: fence.epoch, observedGeneration: fence.generation } : {}),
           })
         }
         return true
@@ -186,6 +221,9 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
         code: failed.code,
         message: failed.message,
         retryable: failed.retryable,
+        ...(failed.ownerKind !== undefined ? { ownerKind: failed.ownerKind } : {}),
+        ...(failed.ownerGeneration !== undefined ? { ownerGeneration: failed.ownerGeneration } : {}),
+        ...(failed.ownerEpoch !== undefined ? { ownerEpoch: failed.ownerEpoch } : {}),
       }))
       return true
     }
@@ -216,13 +254,81 @@ export function handleFreshAgentMessage(dispatch: AppDispatch, msg: Record<strin
         sessionId: killed.sessionId,
         sessionType: killed.sessionType,
         provider: killed.provider,
-      }, killed.success)
+      }, killed.success, killed.code, killed.message)
       return true
     }
     case 'freshAgent.event':
       return handleFreshAgentTransportEvent(dispatch, msg as FreshAgentEventMessage)
     default:
       return false
+  }
+}
+
+/**
+ * kata b8ke: fold ONE `session.runtimeOwner` broadcast frame into the
+ * runtimeOwners store (the App message-chain case — session.runtimeOwner
+ * is not a freshAgent.* frame, so it is folded explicitly ahead of the
+ * handleFreshAgentMessage catch-all). The reducer is epoch-aware
+ * generation-monotonic, so interleaved broadcast/replay folding is safe.
+ */
+export function foldSessionRuntimeOwnerFrame(
+  dispatch: AppDispatch,
+  msg: SessionRuntimeOwnerMessage,
+): void {
+  dispatch(applyRuntimeOwner(msg))
+}
+
+/**
+ * kata b8ke (reconnect owner discovery, round-1 T1 rec A4): the App ready
+ * fold. Resets the client's runtime-owner state FIRST (round-2 review: the
+ * owner/generation state is server-authoritative per connection lifetime —
+ * a restarted server's newer generations must never be ignored in favor
+ * of stale pre-reconnect records), THEN folds every ready.runtimeOwners
+ * entry. App calls this BEFORE the pane-reconcile request is built and
+ * sent, so a device that missed the handoff broadcast (offline during
+ * handoff, lag-4008, page reload) converges on its very first
+ * post-reconnect reconcile.
+ *
+ * b8ke focused round-3 R3-5: a FENCED replay record folds truthfully —
+ * the typed recovery state (handoff-failed + the typed reason, plus the
+ * fenced marker the divergence/recovery UI derives from) — never a false
+ * "handoff-committed" owner.
+ *
+ * b8ke focused round-4 R4-6: an IN-PROGRESS lifecycle replay
+ * (state 'starting' | 'handoff' | 'stopping') folds as the transition
+ * state ('handoff-started' — the existing Task 8 semantics: no attach
+ * action, no polling resume), never as committed live ownership.
+ */
+export function foldReadyRuntimeOwners(
+  dispatch: AppDispatch,
+  owners: ReadyMessage['runtimeOwners'],
+): void {
+  dispatch(resetRuntimeOwners())
+  for (const owner of owners ?? []) {
+    const fenced = owner.state === 'fenced'
+    const inProgress = owner.state === 'starting'
+      || owner.state === 'handoff'
+      || owner.state === 'stopping'
+    dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: owner.provider,
+      sessionId: owner.sessionId,
+      epoch: owner.epoch,
+      generation: owner.generation,
+      ownerKind: owner.ownerKind,
+      ...(owner.terminalId !== undefined ? { terminalId: owner.terminalId } : {}),
+      ...(owner.aliasOf !== undefined ? { aliasOf: owner.aliasOf } : {}),
+      operationId: 'ready-replay',
+      transition: fenced
+        ? 'handoff-failed'
+        : inProgress
+          ? 'handoff-started'
+          : owner.ownerKind === 'vacant' ? 'released' : 'handoff-committed',
+      ...(fenced ? {
+        reason: owner.reason ?? 'fenced',
+        fenced: true,
+      } : {}),
+    }))
   }
 }
 
@@ -414,7 +520,13 @@ export function handleFreshAgentTransportEvent(dispatch: AppDispatch, msg: Fresh
       }
       return true
     case 'freshAgent.killed':
-      foldFreshAgentKilled(dispatch, locator, event.success as boolean | undefined)
+      foldFreshAgentKilled(
+        dispatch,
+        locator,
+        event.success as boolean | undefined,
+        event.code as string | undefined,
+        event.message as string | undefined,
+      )
       return true
     default:
       return false

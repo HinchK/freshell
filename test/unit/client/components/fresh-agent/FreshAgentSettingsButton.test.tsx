@@ -198,6 +198,10 @@ function renderButton(store: ReturnType<typeof createStore>) {
   )
 }
 
+async function findPortaledPopover() {
+  return screen.findByRole('dialog', { name: 'Agent settings' })
+}
+
 beforeEach(() => {
   saveServerSettingsPatchSpy.mockClear()
   wsSendSpy.mockClear()
@@ -728,6 +732,37 @@ describe('FreshAgentSettingsButton', () => {
     // rendered inline inside it is clipped to a sliver of the header stripe.
     // The popover must escape the header (portal to document.body).
     expect(dialog.closest('.pane-header')).toBeNull()
+  })
+
+  it('anchors the popover to the gear glyph, not the button box', async () => {
+    const store = createStore()
+    seedPane(store, {
+      sessionType: 'freshopencode',
+      provider: 'opencode',
+      model: 'opencode-go/glm-5.2',
+    })
+
+    renderButton(store)
+    const gearButton = screen.getByTitle('Agent settings')
+    const glyph = gearButton.querySelector('svg')
+    expect(glyph).not.toBeNull()
+    const glyphRect = {
+      top: 10, bottom: 30, left: 90, right: 100, width: 10, height: 20, x: 90, y: 10,
+      toJSON: () => ({}),
+    } as DOMRect
+    vi.spyOn(glyph as SVGElement, 'getBoundingClientRect').mockReturnValue(glyphRect)
+    fireEvent.click(gearButton)
+
+    const popover = await findPortaledPopover()
+    expect(popover.style.top).toBe('34px')
+    expect(popover.style.right).toBe(`${Math.max(8, window.innerWidth - 100)}px`)
+
+    const settingsRoot = gearButton.parentElement
+    expect(settingsRoot?.className).toContain('h-full')
+    expect(gearButton.className).toContain('h-full')
+    expect(gearButton.className).toContain('aspect-square')
+    expect(glyph?.getAttribute('class') ?? '').toContain('h-5 w-5')
+    expect(glyph?.getAttribute('class') ?? '').toContain('sm:h-3')
   })
 
   it('shows the create-only hint under the model list, Thinking select, and permission mode when the thread snapshot advertises create-only scopes', async () => {

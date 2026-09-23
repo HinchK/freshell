@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import { resolveSessionTypeConfig, buildResumeContent, getPairedSessionTypeTarget } from '@/lib/session-type-utils'
-import { CodexIcon } from '@/components/icons/provider-icons'
+import { FreshcodexIcon } from '@/components/icons/provider-icons'
 
 describe('resolveSessionTypeConfig', () => {
   it('returns claude config for "claude"', () => {
@@ -21,10 +21,10 @@ describe('resolveSessionTypeConfig', () => {
     expect(config.icon).toBeDefined()
   })
 
-  it('returns the registry-backed Codex icon for "freshcodex"', () => {
+  it('returns the registry-backed Freshcodex icon for "freshcodex"', () => {
     const config = resolveSessionTypeConfig('freshcodex')
     expect(config.label).toBe('Freshcodex')
-    expect(config.icon).toBe(CodexIcon)
+    expect(config.icon).toBe(FreshcodexIcon)
   })
 
   it('returns kilroy config for "kilroy"', () => {
@@ -257,8 +257,17 @@ describe('getPairedSessionTypeTarget', () => {
     })
   })
 
-  it('does not expose hidden or unsupported session types', () => {
-    expect(getPairedSessionTypeTarget('kilroy')).toBeNull()
+  it('does not expose unsupported session types (kilroy pairs with the Claude CLI — kata b8ke round-2 R2-10)', () => {
+    // kilroy is a hidden flavor, not a public type — but it rides the claude
+    // lane, so a kilroy pane DOES offer the Claude CLI reopen (the runtime
+    // provider, never a public fresh-agent target, is what pairs).
+    expect(getPairedSessionTypeTarget('kilroy')).toMatchObject({
+      sourceSessionType: 'kilroy',
+      targetSessionType: 'claude',
+      runtimeProvider: 'claude',
+      targetKind: 'terminal',
+      metadataSessionType: 'kilroy',
+    })
     expect(getPairedSessionTypeTarget('shell')).toBeNull()
     expect(getPairedSessionTypeTarget(undefined)).toBeNull()
   })

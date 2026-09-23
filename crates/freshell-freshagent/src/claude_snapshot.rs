@@ -2017,6 +2017,8 @@ mod tests {
             provider: freshell_protocol::AgentProvider::Claude,
             request_id: "r".into(),
             cwd: None,
+            observed_epoch: None,
+            observed_generation: None,
         }
     }
 

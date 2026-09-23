@@ -816,7 +816,7 @@ describe('crossTabSync', () => {
 
     store.dispatch(setLocalSettings(resolveLocalSettings({
       theme: 'dark',
-    })))
+    }, { floatingActionButtonDefault: true })))
 
     window.dispatchEvent(new StorageEvent('storage', {
       key: BROWSER_PREFERENCES_STORAGE_KEY,

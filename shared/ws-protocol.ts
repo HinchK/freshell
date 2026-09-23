@@ -38,6 +38,7 @@ export const ErrorCode = z.enum([
   'FRESH_AGENT_LOST_SESSION',
   'FRESH_AGENT_CREATE_FAILED',
   'RECONCILE_NOT_NEGOTIATED',
+  'SESSION_MISSING',
 ])
 
 export type ErrorCode = z.infer<typeof ErrorCode>
@@ -484,6 +485,12 @@ export const TerminalCreateSchema = z.object({
    * Independent of createRequestId/terminalId/sessionRef; creation retries
    * re-send the same handle. Additive optional — old servers strip it. */
   namingHandle: z.string().min(1).optional(),
+  /** kata b8ke delayed-request fence: the (epoch, generation) pair the
+   *  client observed when it decided to act. A pair sent together is the
+   *  fence (the server stale-rejects pre-restart epochs and superseded
+   *  generations); neither-sent is legacy-unfenced. */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
 }).strict()
 
 export const TerminalCodexCandidatePersistedSchema = z.object({
@@ -529,6 +536,12 @@ export const TerminalAttachSchema = z.object({
    * attribution advances to the attach's true tab and assertion time under
    * the existing full-triple advance rule. Additive optional. */
   tabId: z.string().min(1).optional(),
+  /** b8ke ext r8 F2: the attach's observed ownership fence —
+   *  terminal.attach participates in the coordinator (a queued
+   *  cross-device attach is generation-fenced server-side). Additive
+   *  optional. */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
   intent: TerminalAttachIntentSchema,
   priority: TerminalAttachPrioritySchema.optional(),
   cols: z.number().int().min(2).max(1000),
@@ -664,6 +677,16 @@ export const TerminalKillSchema = z.object({
    * servers (accept-and-strip inbound).
    */
   createRequestId: z.string().min(1).optional(),
+  /**
+   * kata b8ke delayed-request fence (Task 4): the (epoch, generation) pair
+   * the client observed when it decided to kill — feeds the fenced stop
+   * claim (a delayed kill naming superseded ownership is typed-refused
+   * instead of killing the wrong runtime). A pair sent together is the
+   * fence; neither-sent is legacy-unfenced (the server falls back to the
+   * retained stamp). Additive optional; WS_PROTOCOL_VERSION stays put.
+   */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
 })
 
 export const CodexActivityListSchema = z.object({
@@ -785,6 +808,11 @@ export const FreshAgentCreateSchema = z.object({
   /** Unified agent names (Task 1): the pane's pre-durable naming handle — see
    * `terminal.create.namingHandle`. Additive optional. */
   namingHandle: z.string().min(1).optional(),
+  /** kata b8ke delayed-request fence: the (epoch, generation) pair the
+   *  client observed when it decided to act. A pair sent together is the
+   *  fence; neither-sent is legacy-unfenced. */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
 })
 
 export const FreshAgentAttachSchema = z.object({
@@ -796,6 +824,11 @@ export const FreshAgentAttachSchema = z.object({
   resumeSessionId: z.string().optional(),
   cwd: z.string().optional(),
   sessionRef: SessionLocatorSchema.optional(),
+  /** kata b8ke delayed-request fence: attach can cold-resume an untracked
+   *  session (registering a runtime), so it carries the observed
+   *  (epoch, generation) pair. */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
 })
 
 export const FreshAgentSendSchema = z.object({
@@ -804,6 +837,11 @@ export const FreshAgentSendSchema = z.object({
   sessionId: z.string().min(1),
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
+  /** b8ke ext r8 F5: the send's delayed-request fence (crashed-session
+   *  recovery re-claims carry it, so a stale queued send is typed-refused,
+   *  never an unfenced recreation). */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
   cwd: z.string().optional(),
   text: z.string().min(1),
   settings: z.object({
@@ -861,6 +899,12 @@ export const FreshAgentCompactSchema = z.object({
   provider: z.enum(['claude', 'codex', 'opencode']),
   cwd: z.string().optional(),
   instructions: z.string().trim().min(1).optional(),
+  /** b8ke ext r21 F2: the delayed-request fence (additive; the pair rides
+   *  the coordinator's generation discipline so a queued compact/undo/redo/
+   *  fork landing after a crash + generation advance is typed-refused,
+   *  never an unfenced recreation). */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
 })
 
 export const FreshAgentApprovalRespondSchema = z.object({
@@ -889,6 +933,10 @@ export const FreshAgentKillSchema = z.object({
   sessionType: z.enum(['freshclaude', 'freshcodex', 'kilroy', 'freshopencode']),
   provider: z.enum(['claude', 'codex', 'opencode']),
   cwd: z.string().optional(),
+  /** kata b8ke delayed-request fence: kill feeds the fenced stop claim, so
+   *  it carries the observed (epoch, generation) pair. */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
 })
 
 export const FreshAgentForkSchema = z.object({
@@ -903,6 +951,12 @@ export const FreshAgentForkSchema = z.object({
    * row's provenance stamps from the forking connection, `deviceId:tabId`.
    * Non-strict schema — tolerated by older servers. */
   tabId: z.string().min(1).optional(),
+  /** b8ke ext r21 F2: the delayed-request fence (additive; the pair rides
+   *  the coordinator's generation discipline so a queued compact/undo/redo/
+   *  fork landing after a crash + generation advance is typed-refused,
+   *  never an unfenced recreation). */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
 })
 
 const freshAgentRollbackShape = {
@@ -913,6 +967,12 @@ const freshAgentRollbackShape = {
   cwd: z.string().optional(),
   mode: z.enum(['step', 'toTurn']).optional(),
   turnId: z.string().min(1).optional(),
+  /** b8ke ext r21 F2: the delayed-request fence (additive; the pair rides
+   *  the coordinator's generation discipline so a queued undo/redo landing
+   *  after a crash + generation advance is typed-refused, never an
+   *  unfenced recreation). */
+  observedEpoch: z.number().int().nonnegative().optional(),
+  observedGeneration: z.number().int().nonnegative().optional(),
 } as const
 
 /** kata 1wxv: conversation rollback. mode absent => 'step'. turnId required by the SERVER for 'toTurn'. */
@@ -1099,6 +1159,40 @@ export type ReadyMessage = {
   buildId?: string
   /** Present iff the client's hello opted in via capabilities.paneReconcileV1. */
   capabilities?: ReadyCapabilities
+  /** kata b8ke: current runtime-owner state for every recorded
+   *  (provider, sessionId) — replayed so a device that missed a handoff
+   *  broadcast (offline, lag-4008, reload) learns the authoritative owner
+   *  from the handshake alone. Omitted from the wire when empty. */
+  runtimeOwners?: Array<{
+    provider: string
+    sessionId: string
+    /** The emitting server's boot epoch — the client resets its generation
+     *  state on epoch change instead of ignoring newer generations. */
+    epoch: number
+    generation: number
+    ownerKind: 'terminal' | 'fresh-agent' | 'vacant'
+    /** b8ke: the record's truthful state. 'live' — the named owner is the
+     *  committed live owner (a vacant key's ownerKind carries its own
+     *  truth). 'fenced' — a fenced record's ownerKind names the FENCED
+     *  PRIOR (not a live owner); the client folds the typed recovery
+     *  state (handoff-failed + reason), never a committed owner. R4-6:
+     *  'starting' | 'handoff' | 'stopping' — in-progress lifecycle
+     *  transitions (the client folds them as handoff-in-progress, never
+     *  as committed ownership). Omitted by pre-R3-5 servers (fold as
+     *  live). */
+    state?: 'live' | 'fenced' | 'starting' | 'handoff' | 'stopping'
+    /** The typed fence reason (fenced records only):
+     *  'watcher-failed' | 'platform-limited'. */
+    reason?: string
+    terminalId?: string
+    /** b8ke focused episode-2 post-cap F5 (wire-additive): for an ALIASED
+     *  (re-keyed) key, the CANONICAL id the server resolved. The record's
+     *  ownerKind/state/generation are the CANONICAL record's truth, so a
+     *  cross-device pane holding the PRE-REKEY id folds the authoritative
+     *  owner state (never a permanent "vacant") and `aliasOf` carries the
+     *  navigation to the canonical key. */
+    aliasOf?: string
+  }>
 }
 
 export type PongMessage = {
@@ -1119,6 +1213,13 @@ export type ErrorMessage = {
   retryAfterMs?: number
   /** RESTORE_UNAVAILABLE only (D7): the live terminal that owns the refused session, so the create-error fold can reattach instead of dead-ending. Additive; omitted everywhere else. */
   liveTerminalId?: string
+  /** kata b8ke: ownership-conflict refusals only — the owning kind, its
+   *  generation, and the emitting server's boot epoch, so the client can
+   *  refresh its observed fence from the refusal itself. Additive; omitted
+   *  everywhere else (the terminal lane's refusal surface). */
+  ownerKind?: 'terminal' | 'fresh-agent'
+  ownerGeneration?: number
+  ownerEpoch?: number
   timestamp: string
 }
 
@@ -1584,12 +1685,61 @@ export type SdkRestoreFailureCode =
 
 export type FreshAgentServerMessage =
   | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string }; sessionName?: SessionNameRecord; nameRef?: SessionNameRef }
-  | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean }
+  | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean
+      /** kata b8ke: ownership-conflict refusals only — the owning kind, its
+       *  generation, and the emitting server's boot epoch, so the client
+       *  can refresh its observed fence from the refusal itself. Additive;
+       *  omitted everywhere else (the fresh-agent lane's refusal surface). */
+      ownerKind?: 'terminal' | 'fresh-agent'
+      ownerGeneration?: number
+      ownerEpoch?: number }
   | { type: 'freshAgent.send.accepted'; requestId: string; sessionId: string; sessionType: string; provider: string; submittedTurnId?: string; cwd?: string }
   | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
   | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string }; sessionName?: SessionNameRecord; nameRef?: SessionNameRef }
   | { type: 'freshAgent.forked'; requestId?: string; parentSessionId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
   | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean }
+
+/**
+ * kata b8ke: one server-authoritative runtime owner per canonical
+ * (provider, sessionId), shared by the terminal lane and every Fresh Agent
+ * provider. Broadcast at every ownership transition (handoff
+ * started/committed/failed, release) so every device holding a matching
+ * sessionRef pane converges on the same owner — clients fold these
+ * reactively (like `freshAgent.turn.complete`), nothing awaits an answer,
+ * so the protocol version stays 10. `epoch` is the emitting server's boot
+ * epoch: fenced comparisons use (epoch, generation), and a client that sees
+ * a different epoch resets its generation state instead of ignoring newer
+ * generations.
+ */
+export type SessionRuntimeOwnerMessage = {
+  type: 'session.runtimeOwner'
+  provider: string
+  sessionId: string
+  /** The emitting server's boot epoch. */
+  epoch: number
+  generation: number
+  ownerKind: 'terminal' | 'fresh-agent' | 'vacant'
+  previousKind?: 'terminal' | 'fresh-agent'
+  /** The owning terminal runtime (terminal-owner frames only). */
+  terminalId?: string
+  /** The coordinator operation that produced this transition. */
+  operationId: string
+  transition: 'handoff-started' | 'handoff-committed' | 'handoff-failed' | 'released'
+  /** Machine-readable failure reason (handoff-failed frames). */
+  reason?: string
+  /** b8ke R3-5: true on the ready-replay fold of a FENCED record (the
+   *  named owner is the fenced prior, not a live owner). b8ke R4-5: the
+   *  fenced reap/stop FAILURE broadcasts also set it — an online
+   *  old-kind pane keeps the typed recovery state (no polling
+   *  resumption) after the fenced failure frame. */
+  fenced?: boolean
+  /** b8ke focused episode-2 post-cap F5 (wire-additive): the CANONICAL id
+   *  this frame's sessionId was re-keyed to. The rekey transition emits a
+   *  mirror frame under the OLD key carrying the resolved owner state, so
+   *  a device holding the pre-rekey id folds the canonical owner (never a
+   *  permanent "vacant") and can navigate to the canonical key. */
+  aliasOf?: string
+}
 
 // -- Extensions --
 
@@ -1702,6 +1852,7 @@ export type ServerMessage =
   | CodingCliStderrMessage
   | CodingCliKilledMessage
   | FreshAgentServerMessage
+  | SessionRuntimeOwnerMessage
   | ExtensionRegistryMessage
   | ExtensionServerStartingMessage
   | ExtensionServerReadyMessage

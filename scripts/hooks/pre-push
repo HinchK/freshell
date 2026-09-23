@@ -1,7 +1,6 @@
-#!/usr/bin/env bash
 # Freshell pre-push gate — the cheap local checks (cargo fmt, tsc typecheck,
-# cargo clippy), filtered by what the push actually changes.
-# See docs/development/pre-push-gate.md.
+# cargo clippy) plus a targeted cargo test lane for rust changes, filtered by
+# what the push actually changes. See docs/development/pre-push-gate.md.
 #
 # Bypass (emergencies only): git push --no-verify
 # Disable for one push:       FRESHELL_PREPUSH=0 git push ...
@@ -12,6 +11,17 @@ if [ "${FRESHELL_PREPUSH:-1}" = "0" ]; then
   echo "pre-push: FRESHELL_PREPUSH=0 — gate disabled for this push" >&2
   exit 0
 fi
+
+# git exports GIT_DIR/GIT_PREFIX (the pushing worktree's gitdir) into this
+# hook. If they leak into the lane processes, every test-side `git` child
+# resolves against the SHARED repository instead of the test's own tempdir:
+# a `git init` inside a freshell-server test re-initialized the main
+# checkout's config (observed writing core.bare=true and colliding on
+# config.lock), and test add/commit landed on the main HEAD. The hook's own
+# git calls use cwd discovery (equivalent in a worktree), so strip the
+# overrides before anything runs.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX \
+  GIT_CONFIG_PARAMETERS GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
 
 ZERO=0000000000000000000000000000000000000000
 changed=""
@@ -39,12 +49,55 @@ if [ "$full_gate" = 1 ]; then
   run_rust=1
   run_ts=1
 elif [ -n "$changed" ]; then
-  printf '%s' "$changed" | grep -Eq '\.rs$|Cargo\.(toml|lock)$|rust-toolchain' && run_rust=1
+  printf '%s' "$changed" | grep -Eq '\.rs$|Cargo\.(toml|lock)$|rust-toolchain|^\.cargo/|^test/fixtures/' && run_rust=1
   printf '%s' "$changed" | grep -Eq '\.(ts|tsx)$|package(-lock)?\.json$|tsconfig' && run_ts=1
 fi
 
+# The plan script lives next to this hook (the main checkout's copy —
+# core.hooksPath points here, so even worktrees at older commits run the
+# current routing logic), while cargo itself runs in the pushing worktree.
+HOOK_DIR=$(cd "$(dirname "$0")" && pwd)
+TSX=""
+if [ -x node_modules/.bin/tsx ]; then
+  TSX="node_modules/.bin/tsx"
+elif [ -x "$HOOK_DIR/../../node_modules/.bin/tsx" ]; then
+  TSX="$HOOK_DIR/../../node_modules/.bin/tsx"
+else
+  # Fresh worktrees often lack node_modules; the owning checkout (the one
+  # whose .git dir this worktree shares) has it. Derive the owning root
+  # from the git common dir so worktree pushes still get the full gate.
+  common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+  if [ -n "$common_dir" ] && [ -d "$common_dir" ]; then
+    owning_root="${common_dir%/.git}"
+    if [ "$owning_root" != "$common_dir" ] && [ -x "$owning_root/node_modules/.bin/tsx" ]; then
+      TSX="$owning_root/node_modules/.bin/tsx"
+    fi
+  fi
+fi
+
+# Targeted cargo-test plan: computed only when the rust gate fired, so
+# rust-less pushes pay nothing. Modes: skip | packages | workspace
+# | unavailable (no tsx) | unknown (plan computation failed).
+test_mode="skip"
+test_pkgs=""
+if [ "$run_rust" = 1 ]; then
+  if [ "$full_gate" = 1 ]; then
+    test_mode="workspace"
+  elif [ -n "$TSX" ]; then
+    plan_out=$(printf '%s' "$changed" | "$TSX" "$HOOK_DIR/rust-test-targets.ts")
+    case "$plan_out" in
+      skip) test_mode="skip" ;;
+      workspace) test_mode="workspace" ;;
+      packages\ *) test_mode="packages"; test_pkgs="${plan_out#packages }" ;;
+      *) test_mode="unknown" ;;
+    esac
+  else
+    test_mode="unavailable"
+  fi
+fi
+
 if [ "${FRESHELL_PREPUSH_DEBUG:-0}" = "1" ]; then
-  echo "pre-push[debug]: full_gate=$full_gate run_rust=$run_rust run_ts=$run_ts" >&2
+  echo "pre-push[debug]: full_gate=$full_gate run_rust=$run_rust run_ts=$run_ts test_mode=$test_mode test_pkgs=$test_pkgs" >&2
   printf '%s' "$changed" | sed 's/^/  changed: /' >&2
   exit 0
 fi
@@ -72,6 +125,33 @@ if [ "$run_rust" = 1 ]; then
     echo "pre-push: rust gate — cargo clippy --workspace (a few minutes warm; longer cold)" >&2
     cargo clippy --workspace --exclude freshell-tauri --all-targets -- -D warnings \
       || fail "cargo clippy --workspace --all-targets -- -D warnings"
+
+    # Targeted cargo test lane — the check that PR #795 slipped past: the
+    # author's push contained 11 failing freshagent unit tests, but nothing
+    # between commit and main ran cargo test. Runs the changed crates plus
+    # their workspace dependents; workspace-wide when the change is
+    # root-level (Cargo.lock, toolchain) or the base is unknown.
+    case "$test_mode" in
+      unavailable)
+        echo "pre-push: node_modules missing (no tsx) — SKIPPING rust test lane (npm install to enforce)" >&2
+        ;;
+      unknown)
+        fail "rust test plan could not be computed (scripts/hooks/rust-test-targets.ts)"
+        ;;
+      workspace)
+        echo "pre-push: rust gate — cargo test --workspace --exclude freshell-tauri (the long one)" >&2
+        cargo test --workspace --exclude freshell-tauri --locked \
+          || fail "cargo test --workspace --exclude freshell-tauri --locked"
+        ;;
+      packages)
+        pkgs_args=""
+        for p in $test_pkgs; do pkgs_args="$pkgs_args -p $p"; done
+        echo "pre-push: rust gate — targeted cargo test:$pkgs_args" >&2
+        cargo test --locked $pkgs_args || fail "cargo test$pkgs_args"
+        ;;
+      skip)
+        ;;
+    esac
   else
     echo "pre-push: cargo not on PATH (~/.cargo/bin tried) — SKIPPING rust gate" >&2
   fi

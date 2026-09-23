@@ -145,11 +145,11 @@ export default function PaneHeader({
         e.stopPropagation()
         onRefresh()
       }}
-      className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity sm:h-4 sm:w-4"
+      className="inline-flex h-full aspect-square shrink-0 items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity"
       title="Refresh pane"
       aria-label="Refresh pane"
     >
-      <RefreshCw className="h-[18px] w-[18px] sm:h-3 sm:w-3" />
+      <RefreshCw className="h-5 w-5 sm:h-3 sm:w-3" />
     </button>
   ) : null
 
@@ -163,7 +163,7 @@ export default function PaneHeader({
   return (
     <div
       className={cn(
-        'pane-header flex h-[2.625rem] shrink-0 items-center border-b border-border text-sm sm:h-7',
+        'pane-header flex h-11 shrink-0 items-center border-b border-border text-sm sm:h-7',
         isFreshAgentPane ? 'pane-header--fresh-agent gap-1.5 px-1.5' : 'gap-2 px-2',
         needsAttention
           ? 'bg-emerald-50 border-l-2 border-l-emerald-500 dark:bg-emerald-900/30'
@@ -177,14 +177,14 @@ export default function PaneHeader({
       aria-label={`Pane: ${title}`}
     >
       {!isFreshAgentPane && repoIconInfo ? (
-        <RepoIcon info={repoIconInfo} className="h-3.5 w-3.5 shrink-0" />
+        <RepoIcon info={repoIconInfo} className="h-4 w-4 shrink-0 sm:h-3.5 sm:w-3.5" />
       ) : null}
 
       {!isFreshAgentPane ? (
         <PaneIcon
           content={content}
           className={cn(
-            'h-3.5 w-3.5 shrink-0',
+            'h-4 w-4 shrink-0 sm:h-3.5 sm:w-3.5',
             busy && status === 'running' ? 'text-blue-500' : getTerminalStatusIconClassName(status),
           )}
         />
@@ -197,7 +197,7 @@ export default function PaneHeader({
               title={freshAgentRepoNameKnown ? `Repo: ${freshAgentRepoIconInfo.repoName}` : freshAgentRepoIconInfo.repoKey}
               className="inline-flex shrink-0"
             >
-              <RepoIcon info={freshAgentRepoIconInfo} className="h-3.5 w-3.5" />
+              <RepoIcon info={freshAgentRepoIconInfo} className="h-4 w-4 sm:h-3.5 sm:w-3.5" />
             </span>
           ) : null}
           <span
@@ -207,7 +207,7 @@ export default function PaneHeader({
             <PaneIcon
               content={content}
               className={cn(
-                'h-3.5 w-3.5',
+                'h-4 w-4 sm:h-3.5 sm:w-3.5',
                 busy && status === 'running' ? 'text-blue-500' : 'text-muted-foreground',
               )}
             />
@@ -257,13 +257,10 @@ export default function PaneHeader({
         )}
       </div>
 
-      <div className={cn(
-        'pane-header-actions ml-auto flex h-full shrink-0 items-center',
-        isFreshAgentPane ? 'gap-1.5' : 'gap-2',
-      )}>
+      <div className="pane-header-actions ml-auto flex h-full shrink-0 items-center gap-0">
         {!isFreshAgentPane && metaLabel && (
           <span
-            className="max-w-[18rem] truncate text-xs text-muted-foreground text-right"
+            className="mr-2 max-w-[18rem] truncate text-xs text-muted-foreground text-right"
             title={metaTooltip || metaLabel}
           >
             {metaLabel}
@@ -276,18 +273,18 @@ export default function PaneHeader({
               e.stopPropagation()
               onSearch()
             }}
-            className="inline-flex h-6 w-6 items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity sm:h-4 sm:w-4"
+            className="inline-flex h-full aspect-square items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity"
             title="Search in terminal"
             aria-label="Search in terminal"
           >
-            <Search className="h-[18px] w-[18px] sm:h-3 sm:w-3" />
+            <Search className="h-5 w-5 sm:h-3 sm:w-3" />
           </button>
         )}
 
         {!isFreshAgentPane ? refreshButton : null}
 
         {isFreshAgentPane ? (
-          <div className="pane-header-fresh-agent-optional-action">
+          <div className="pane-header-fresh-agent-optional-action flex h-full">
             <FreshAgentSettingsButton
               tabId={tabId}
               paneId={paneId}
@@ -297,7 +294,7 @@ export default function PaneHeader({
         ) : null}
 
         {isFreshAgentPane && refreshButton ? (
-          <div className="pane-header-fresh-agent-optional-action">
+          <div className="pane-header-fresh-agent-optional-action flex h-full">
             {refreshButton}
           </div>
         ) : null}
@@ -309,15 +306,15 @@ export default function PaneHeader({
               onToggleZoom()
             }}
             className={cn(
-              'inline-flex h-6 w-6 shrink-0 items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity sm:h-4 sm:w-4',
+              'inline-flex h-full aspect-square shrink-0 items-center justify-center rounded opacity-60 hover:opacity-100 transition-opacity',
               isFreshAgentPane && 'pane-header-fresh-agent-optional-action',
             )}
             title={isZoomed ? 'Restore pane' : 'Maximize pane'}
             aria-label={isZoomed ? 'Restore pane' : 'Maximize pane'}
           >
             {isZoomed
-              ? <Minimize2 className="h-[18px] w-[18px] sm:h-3 sm:w-3" />
-              : <Maximize2 className="h-[18px] w-[18px] sm:h-3 sm:w-3" />}
+              ? <Minimize2 className="h-5 w-5 sm:h-3 sm:w-3" />
+              : <Maximize2 className="h-5 w-5 sm:h-3 sm:w-3" />}
           </button>
         )}
 
@@ -327,11 +324,11 @@ export default function PaneHeader({
             e.stopPropagation()
             onClose()
           }}
-          className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded opacity-60 hover:opacity-100 hover:bg-background/50 transition-opacity sm:h-4 sm:w-4"
+          className="inline-flex h-full aspect-square shrink-0 items-center justify-center rounded opacity-60 hover:opacity-100 hover:bg-background/50 transition-opacity"
           title="Close pane"
           aria-label="Close pane"
         >
-          <X className="h-[18px] w-[18px] sm:h-3 sm:w-3" />
+          <X className="h-5 w-5 sm:h-3 sm:w-3" />
         </button>
       </div>
     </div>

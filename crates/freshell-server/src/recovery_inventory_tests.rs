@@ -120,6 +120,8 @@ fn binding_row_at(
         retired_reason,
         superseded_by,
         pane_kind: None,
+        owner_epoch: None,
+        owner_generation: None,
         model: None,
         sandbox: None,
         permission_mode: None,
@@ -191,6 +193,9 @@ fn closes_with(
                     provider: p.to_string(),
                     session_id: s.to_string(),
                     at_ms: 5_000,
+                    // b8ke focused ep5 r5 F2: every ordinary close keeps the
+                    // identity-wide fence (no transition scope).
+                    scope: None,
                 })
                 .collect(),
         }],
@@ -2583,6 +2588,8 @@ fn ledger_row_after_writes(steps: &[(ProvenancePolicy<'static>, i64)]) -> Bindin
                 origin_create_request_id: None,
                 provenance: *provenance,
                 now_ms: *now_ms,
+                observed_epoch: None,
+                observed_generation: None,
             })
             .unwrap_or_else(|e| panic!("fixture write {i} failed: {e}"));
     }
@@ -2948,6 +2955,8 @@ fn ledger_row_from_marker_resolution(
             origin_create_request_id: None,
             provenance: ProvenancePolicy::Inherit,
             now_ms: resolve_ms,
+            observed_epoch: None,
+            observed_generation: None,
         })
         .expect("marker resolution write");
     // The returned row is a memory clone; the tempdir may drop with the fn.
@@ -3120,6 +3129,10 @@ fn fresh_agent_create_completed_after_the_pane_closed_is_never_offered() {
                 asserted_at: 900_000,
             }),
             now_ms: 930_000,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
         })
         .expect("late landing binding write");
     let row = ledger.load_binding("opencode", "S1").expect("row written");
@@ -3179,6 +3192,10 @@ fn fresh_agent_create_asserted_inside_the_kill_window_stays_offered_despite_a_la
                 asserted_at: 999_000,
             }),
             now_ms: 1_500_000,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
         })
         .expect("late landing binding write");
     let row = ledger.load_binding("opencode", "S1").expect("row written");
@@ -3229,6 +3246,8 @@ fn terminal_post_spawn_write_completed_after_the_pane_closed_is_never_offered() 
                 asserted_at: 900_000,
             }),
             now_ms: 930_000,
+            observed_epoch: None,
+            observed_generation: None,
         })
         .expect("post-spawn binding write");
     let row = ledger.load_binding("claude", "S1").expect("row written");
@@ -3286,6 +3305,8 @@ fn supersession_after_the_freeze_judges_on_the_parents_assertion_time() {
                 asserted_at: 900_000,
             }),
             now_ms: 900_000,
+            observed_epoch: None,
+            observed_generation: None,
         })
         .expect("parent binding write");
     ledger
@@ -3302,6 +3323,10 @@ fn supersession_after_the_freeze_judges_on_the_parents_assertion_time() {
             supersedes: Some("parent-id"),
             provenance: ProvenancePolicy::Inherit,
             now_ms: 1_500_000,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
         })
         .expect("fork child binding write");
     let child = ledger.load_binding("codex", "child-id").expect("child row");

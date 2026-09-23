@@ -419,9 +419,31 @@ function serverProjectDirectory() {
   }
 }
 
+// Mode-scoped launch-seeding directory (kata mv9m). The two launch shapes that
+// reach seedServerDatabase differ in BOTH argv and cwd:
+//   - a serve launch is `opencode serve [--pure] --hostname H --port P`
+//     spawned with cwd: None (crates/freshell-opencode/src/serve.rs:742), so
+//     process.cwd() would be the Rust server's cwd, not the project root —
+//     serverProjectDirectory() instead returns the parent of dataHome (the
+//     server's project root for seeding purposes; the fake's cwd is only
+//     the fallback when that realpath fails), which keeps the 504b5122a
+//     serve-lane contract.
+//   - a terminal-PTY launch is `opencode [--model M] --hostname H --port N
+//     [--session <id>]` (crates/freshell-platform/src/cli_launch.rs
+//     settings_args/resume_args; base_args is empty) spawned IN the pane cwd,
+//     so process.cwd() IS the pane cwd — the pre-504b5122a contract the
+//     exact-cwd OpencodeLocator bind requires (row_is_candidate refuses any
+//     row whose normalized cwd differs from the pane cwd,
+//     crates/freshell-sessions/src/opencode_locator.rs).
+// FAKE_OPENCODE_PROJECT_CWD explicitly overrides both modes.
+function launchProjectDirectory() {
+  if (process.env.FAKE_OPENCODE_PROJECT_CWD) return process.env.FAKE_OPENCODE_PROJECT_CWD
+  return argv[0] === 'serve' ? serverProjectDirectory() : process.cwd()
+}
+
 function seedServerDatabase(rootSessionId, childSessionId) {
   const now = Date.now()
-  const directory = serverProjectDirectory()
+  const directory = launchProjectDirectory()
   const db = openDatabase()
   try {
     ensureSchema(db)
@@ -657,6 +679,34 @@ appendAudit({
   sessionArg,
   dbPath,
 })
+
+// Daemon-death self-heal e2e (plan Task 7, the 2026-09-20 incident class):
+// scripted UNREQUESTED daemon death by SELF-exit. Armed ONLY for the managed
+// fresh-agent serve daemon (`opencode serve --hostname H --port P` — argv[0]
+// === 'serve' and never '--pure', so the catalog probe's short-lived
+// `serve --pure` sidecars are excluded). When FAKE_OPENCODE_SELF_EXIT_MARKER
+// names a file that APPEARS, this daemon consumes the marker (one-shot, the
+// same gate-file precedent as FAKE_OPENCODE_TUI_PARITY_CHILD_EVENT_GATE) and
+// exits ON ITS OWN via process.exit — the spec never signals any PID
+// (PROCESS-KILL SAFETY: creating/writing the marker file is the test's only
+// death-triggering action). The respawned daemon re-arms the poll, but the
+// marker is already consumed, so it stays up. With the env unset (every other
+// spec) none of this code runs.
+const selfExitMarkerPath = process.env.FAKE_OPENCODE_SELF_EXIT_MARKER
+if (selfExitMarkerPath && command === 'serve' && !argv.includes('--pure')) {
+  const selfExitInterval = setInterval(() => {
+    if (!fs.existsSync(selfExitMarkerPath)) return
+    clearInterval(selfExitInterval)
+    try {
+      fs.rmSync(selfExitMarkerPath, { force: true })
+    } catch {
+      // ignore
+    }
+    appendAudit({ event: 'self_exit', rootSessionId, childSessionId })
+    process.exit(1)
+  }, 50)
+  selfExitInterval.unref?.()
+}
 
 process.stdout.write(`fake opencode ready root=${rootSessionId} child=${childSessionId}\n`)
 process.stdin.setEncoding('utf8')

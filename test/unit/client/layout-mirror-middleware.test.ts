@@ -3,6 +3,7 @@ import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, { addTab, setTabNameSource } from '../../../src/store/tabsSlice'
 import panesReducer, { initLayout, mergePaneContent, updatePaneTitle } from '../../../src/store/panesSlice'
 import { layoutMirrorMiddleware } from '../../../src/store/layoutMirrorMiddleware'
+import { handleUiCommand } from '../../../src/lib/ui-commands'
 
 const { mockSend } = vi.hoisted(() => ({
   mockSend: vi.fn(),
@@ -170,6 +171,42 @@ describe('layoutMirrorMiddleware', () => {
         }),
       },
     }))
+
+    vi.useRealTimers()
+  })
+
+  // kata b8ke Task 10: the server's `ui.command { layout.resync }`
+  // handshake (respawn/attach missed this client's pane in every synced
+  // layout) makes the mirror re-send the CURRENT layout even though nothing
+  // changed — the dedupe gate is bypassed and the send is immediate (the
+  // server polls a bounded window, so a debounced send could miss it).
+  it('re-sends an unchanged layout immediately on the layout.resync ui.command', () => {
+    mockSend.mockClear()
+    vi.useFakeTimers()
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer },
+      middleware: (g) => g().concat(layoutMirrorMiddleware),
+    })
+
+    store.dispatch(addTab({ id: 'tab-resync', title: 'alpha' }))
+    vi.runOnlyPendingTimers()
+    expect(mockSend).toHaveBeenCalledTimes(1)
+
+    // The server's handshake arrives; the layout is UNCHANGED but the
+    // mirror must re-send it anyway — synchronously, no debounce tick.
+    mockSend.mockClear()
+    handleUiCommand(
+      { type: 'ui.command', command: 'layout.resync' },
+      (action: unknown) => { store.dispatch(action as never) },
+    )
+    expect(mockSend).toHaveBeenCalledTimes(1)
+    expect(mockSend).toHaveBeenLastCalledWith(expect.objectContaining({
+      type: 'ui.layout.sync',
+      activeTabId: 'tab-resync',
+    }))
+    // No pending debounce remains to double-send later.
+    vi.advanceTimersByTime(5000)
+    expect(mockSend).toHaveBeenCalledTimes(1)
 
     vi.useRealTimers()
   })

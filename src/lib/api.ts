@@ -28,6 +28,7 @@ import {
   type TerminalDirectoryQuery,
   type TerminalSearchQuery,
 } from '@shared/read-models'
+import { z } from 'zod'
 
 /**
  * An HTTP response was received but carried an error status (4xx/5xx). This is a
@@ -657,6 +658,161 @@ export async function setSessionMetadata(
     sessionType,
     sessionTypeSource: options.sessionTypeSource ?? 'explicit',
   })
+}
+
+/**
+ * kata b8ke (Task 6's REST contract): the typed result of
+ * `POST /api/sessions/handoff`. Success commits the new owner (terminal or
+ * fresh-agent); failure carries the typed recoverable code. The server
+ * answers typed failures with 409/400/401 — the SAME body rides the
+ * ApiError, so `requestSessionHandoff` surfaces it as the failure arm
+ * instead of throwing.
+ */
+export const SessionHandoffErrorCodeSchema = z.enum([
+  'HANDOFF_IN_PROGRESS',
+  'REAP_TIMEOUT',
+  'TARGET_SPAWN_FAILED',
+  'STALE_GENERATION',
+  'SESSION_NOT_FOUND',
+  'BAD_REQUEST',
+  'UNAUTHORIZED',
+  /** b8ke R4-4: an ordinary retry against a PlatformLimited fence — the
+   *  acknowledged force-clear is the only recovery. */
+  'PLATFORM_LIMITED_FENCED',
+  'SESSION_FENCED',
+  /** b8ke delta round-3 F4: the INITIAL reap-time platform-limited
+   *  failure (session_handoff.rs emits it when the prior's confirmed
+   *  reap cannot verify the descendant tree on this platform) — the
+   *  fence it leaves behind is recoverable through the acknowledged
+   *  force-clear, so the frame must PARSE (pre-fix the schema rejected
+   *  the code, requestSessionHandoff rethrew, and the caller converted
+   *  it to generic HANDOFF_REQUEST_FAILED — the Banner's Force-clear
+   *  action was unreachable through the real API path). */
+  'PLATFORM_LIMITED',
+  /** b8ke stabilization: the capability preflight refused before entering
+   * Handoff, so the existing owner is still live and there is no stale fence
+   * for the operator to clear. */
+  'PLATFORM_LIMITED_PRECHECK',
+  /** b8ke delta round-3 F5: an ordinary retry against a StaleStart
+   *  fence (the unconfirmed stale-start residue) — the acknowledged
+   *  force-clear accepts StaleStart with the same typed risk. */
+  'STALE_START_FENCED',
+  /** b8ke e3r3 F5: the in-window durable flavor write failed (both
+   *  runtimes reaped; the typed recoverable result must reach the
+   *  caller). */
+  'SESSION_METADATA_WRITE_FAILED',
+  /** b8ke e3r3 F3: an ordinary retry against a StaleStop fence (the
+   *  stale-Stopping watchdog's unconfirmed residue). */
+  'STALE_STOP_FENCED',
+  /** b8ke ext r28 F2: an ordinary (unacknowledged) retry against a
+   *  CLEARED-UNVERIFIED key — the r16-F4 clear's typed refusal (the
+   *  clear is not permission to start a writer; the acknowledged-risk
+   *  arm is the only start). */
+  'CLEARED_UNVERIFIED_FENCED',
+  /** b8ke ext r34 F3: the typed 400 for a half-supplied observed (epoch,
+   *  generation) fence pair (session_handoff.rs's wire_fence refusal).
+   *  Current browser callers always send both fields together, but the
+   *  typed REST/client contract must parse the server's documented
+   *  response instead of converting it to a generic
+   *  HANDOFF_REQUEST_FAILED ("could not reach the server") for malformed
+   *  callers. */
+  'INVALID_FENCE',
+])
+export type SessionHandoffErrorCode = z.infer<typeof SessionHandoffErrorCodeSchema>
+
+const SessionHandoffOwnerSchema = z.union([
+  z.object({
+    kind: z.literal('terminal'),
+    terminalId: z.string(),
+    mode: z.string(),
+  }),
+  z.object({
+    kind: z.literal('fresh-agent'),
+    sessionId: z.string(),
+    sessionType: z.string(),
+    provider: z.string(),
+  }),
+])
+
+const SessionHandoffFailureSchema = z.object({
+  ok: z.literal(false),
+  error: z.object({
+    code: SessionHandoffErrorCodeSchema,
+    message: z.string(),
+    retryable: z.boolean(),
+    ownerKind: z.enum(['terminal', 'fresh-agent']).optional(),
+    ownerGeneration: z.number().int().nonnegative().optional(),
+  }),
+})
+
+export const SessionHandoffResultSchema = z.union([
+  z.object({
+    ok: z.literal(true),
+    operationId: z.string(),
+    generation: z.number().int().nonnegative(),
+    owner: SessionHandoffOwnerSchema,
+  }),
+  // b8ke focused round-4 R4-4 + ext r12 F1: the acknowledged
+  // force-clear's TYPED answer — the fence was cleared (the key sits in
+  // the typed cleared-unverified state) but NO handoff ran and no owner
+  // is committed. The answer carries NO retry instruction: the clear
+  // STOPS at the clear (the client surfaces the cleared state with an
+  // explicit user action to re-initiate the handoff, which then goes
+  // through the coordinator fresh, as any new request would).
+  z.object({
+    ok: z.literal(true),
+    /** b8ke ext r28 F2: the reason-typed cleared label. The r25 server
+     *  change made the acknowledged force-clear accept the STALE-reason
+     *  fences alongside PlatformLimited, so the server emits all three;
+     *  the enum stays closed (a server that ever emits an unexpected
+     *  label fails the parse loudly). */
+    cleared: z.enum(['platform-limited-fence', 'stale-start-fence', 'stale-stop-fence']),
+    operationId: z.string(),
+    generation: z.number().int().nonnegative(),
+    // Older servers omitted this field. Absence is deliberately treated as
+    // unconfirmed so the client never infers process death from compatibility.
+    shutdownConfirmed: z.boolean().default(false),
+  }),
+  SessionHandoffFailureSchema,
+])
+export type SessionHandoffResult = z.infer<typeof SessionHandoffResultSchema>
+
+export type SessionHandoffRequestBody = {
+  action?: 'switch' | 'clear-stale-bookkeeping' | 'stop-and-reopen'
+  provider: string
+  sessionId: string
+  targetKind: 'terminal' | 'fresh-agent'
+  /** fresh-agent target: freshcodex | freshopencode | freshclaude | kilroy. */
+  sessionType?: string
+  /** terminal target CLI mode. */
+  mode?: string
+  cwd?: string
+  tabId?: string
+  paneId?: string
+  /** The observed (epoch, generation) fence pair — sent together or not at all. */
+  observedEpoch?: number
+  observedGeneration?: number
+  deviceId?: string
+  /** Deprecated compatibility alias. The server accepts it only when no
+   *  explicit action is supplied, mapping `true` to clear-only. */
+  acknowledgePlatformLimitedRisk?: boolean
+}
+
+export async function requestSessionHandoff(
+  body: SessionHandoffRequestBody,
+): Promise<SessionHandoffResult> {
+  let raw: unknown
+  try {
+    raw = await api.post('/api/sessions/handoff', body)
+  } catch (err) {
+    // Typed failures arrive as non-2xx statuses carrying the SAME typed
+    // body — surface them as the failure arm; anything else rethrows.
+    const details = err instanceof ApiError ? err.details : undefined
+    const failure = SessionHandoffFailureSchema.safeParse(details)
+    if (failure.success) return failure.data
+    throw err
+  }
+  return SessionHandoffResultSchema.parse(raw)
 }
 
 export async function fetchSidebarSessionsSnapshot(options: {

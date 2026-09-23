@@ -559,6 +559,8 @@ mod tests {
                     create_request_id: None,
                     origin_create_request_id: None,
                     provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
+                    observed_epoch: None,
+                    observed_generation: None,
                     now_ms,
                 })
                 .expect("ledger bind");
@@ -751,6 +753,8 @@ mod tests {
                 create_request_id: Some("cr-never"),
                 origin_create_request_id: None,
                 provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
+                observed_epoch: None,
+                observed_generation: None,
                 now_ms: 1_000,
             })
             .expect("record binding");
@@ -778,6 +782,8 @@ mod tests {
                 create_request_id: Some("cr-gone2"),
                 origin_create_request_id: None,
                 provenance: crate::pane_ledger::ProvenancePolicy::Inherit,
+                observed_epoch: None,
+                observed_generation: None,
                 now_ms: 1_000,
             })
             .expect("record binding");

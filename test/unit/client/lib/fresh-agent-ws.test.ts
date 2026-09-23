@@ -3,8 +3,15 @@ import { configureStore } from '@reduxjs/toolkit'
 import freshAgentReducer, { materializeSession } from '@/store/freshAgentSlice'
 import panesReducer, { initLayout, materializeFreshAgentSession, type PanesState } from '@/store/panesSlice'
 import turnCompletionReducer, { markPaneAttention, markTabAttention } from '@/store/turnCompletionSlice'
-import { handleFreshAgentMessage, registerFreshAgentCreate } from '@/lib/fresh-agent-ws'
+import {
+  foldReadyRuntimeOwners,
+  foldSessionRuntimeOwnerFrame,
+  handleFreshAgentMessage,
+  registerFreshAgentCreate,
+} from '@/lib/fresh-agent-ws'
+import { ReadyMessageSchema } from '@/lib/ready-message-schema'
 import { cancelCreate, _resetCancelledCreates } from '@/lib/create-cancellation'
+import type { SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 
 function createFreshAgentStore() {
@@ -888,5 +895,357 @@ describe('rollback folds (kata 1wxv)', () => {
     })).toBe(true)
 
     expect(actionTypes).toEqual([])
+  })
+})
+
+describe('runtime-owner folds (kata b8ke)', () => {
+  beforeEach(() => {
+    _resetCancelledCreates()
+  })
+
+  function ownerFrame(overrides: Partial<SessionRuntimeOwnerMessage> = {}): SessionRuntimeOwnerMessage {
+    return {
+      type: 'session.runtimeOwner',
+      provider: 'codex',
+      sessionId: 'sid-own-1',
+      epoch: 7,
+      generation: 3,
+      ownerKind: 'terminal',
+      operationId: 'handoff-1',
+      transition: 'handoff-committed',
+      ...overrides,
+    }
+  }
+
+  it('session.runtimeOwner frames dispatch applyRuntimeOwner (the App fold path)', () => {
+    const store = createFreshAgentStore()
+    foldSessionRuntimeOwnerFrame(store.dispatch, ownerFrame({
+      terminalId: 't-9',
+      generation: 4,
+    }))
+    expect(store.getState().freshAgent.runtimeOwners['codex:sid-own-1']).toMatchObject({
+      ownerKind: 'terminal',
+      terminalId: 't-9',
+      epoch: 7,
+      generation: 4,
+      transition: 'handoff-committed',
+    })
+  })
+
+  it('ready frame carrying runtimeOwners resets then folds — stale pre-ready records are GONE', () => {
+    const store = createFreshAgentStore()
+    // Stale pre-reconnect records: a newer-epoch replay must replace the
+    // replayed key, and the reset must drop keys the server no longer tracks.
+    foldSessionRuntimeOwnerFrame(store.dispatch, ownerFrame({
+      sessionId: 'sid-r',
+      epoch: 6,
+      generation: 10,
+    }))
+    foldSessionRuntimeOwnerFrame(store.dispatch, ownerFrame({
+      sessionId: 'sid-stale-other',
+      epoch: 6,
+      generation: 4,
+    }))
+    foldReadyRuntimeOwners(store.dispatch, [
+      { provider: 'codex', sessionId: 'sid-r', epoch: 9, generation: 2, ownerKind: 'terminal', terminalId: 't-3' },
+    ])
+    const owners = store.getState().freshAgent.runtimeOwners
+    expect(owners['codex:sid-r']).toMatchObject({
+      epoch: 9,
+      generation: 2,
+      terminalId: 't-3',
+      ownerKind: 'terminal',
+    })
+    expect(owners['codex:sid-stale-other']).toBeUndefined()
+    expect(Object.keys(owners)).toEqual(['codex:sid-r'])
+  })
+
+  // b8ke focused round-3 R3-5: a reconnecting device after
+  // PLATFORM_LIMITED/WATCHER_FAILED must fold the FENCED truth — a fenced
+  // replay record is the typed recovery state (handoff-failed + the typed
+  // reason), never a false committed owner.
+  it('a fenced replay record folds as the typed recovery state, never handoff-committed', () => {
+    const store = createFreshAgentStore()
+    foldReadyRuntimeOwners(store.dispatch, [
+      {
+        provider: 'claude',
+        sessionId: 'sid-fenced',
+        epoch: 3,
+        generation: 5,
+        ownerKind: 'terminal',
+        state: 'fenced',
+        reason: 'platform-limited',
+      },
+      {
+        provider: 'codex',
+        sessionId: 'sid-live',
+        epoch: 3,
+        generation: 2,
+        ownerKind: 'fresh-agent',
+        state: 'live',
+      },
+    ])
+    const owners = store.getState().freshAgent.runtimeOwners
+    expect(owners['claude:sid-fenced']).toMatchObject({
+      ownerKind: 'terminal',
+      transition: 'handoff-failed',
+      reason: 'platform-limited',
+      fenced: true,
+      epoch: 3,
+      generation: 5,
+    })
+    // A live record still folds as committed (the pre-existing behavior).
+    expect(owners['codex:sid-live']).toMatchObject({
+      ownerKind: 'fresh-agent',
+      transition: 'handoff-committed',
+    })
+    expect(owners['codex:sid-live'].fenced).toBeUndefined()
+  })
+
+  it('a ready fold with no replay entries still resets (empty owner map)', () => {
+    const store = createFreshAgentStore()
+    foldSessionRuntimeOwnerFrame(store.dispatch, ownerFrame({ sessionId: 'sid-gone' }))
+    foldReadyRuntimeOwners(store.dispatch, undefined)
+    expect(store.getState().freshAgent.runtimeOwners).toEqual({})
+  })
+
+  // b8ke focused round-4 R4-1: the tests must exercise the PARSER
+  // BOUNDARY — the App path is
+  // `ReadyMessageSchema.safeParse(frame)` then
+  // `foldReadyRuntimeOwners(dispatch, parsed.data.runtimeOwners)`. Zod
+  // strips undeclared object properties, so a parser that does not
+  // declare the replay's `state`/`reason` silently folds every fenced
+  // replay as handoff-committed (the pre-fix defect these tests pin).
+  describe('ready replay folds THROUGH the parser (kata b8ke R4-1/R4-6)', () => {
+    function parseReadyRuntimeOwners(raw: unknown) {
+      const parsed = ReadyMessageSchema.safeParse(raw)
+      expect(parsed.success).toBe(true)
+      return parsed.success ? parsed.data.runtimeOwners : undefined
+    }
+
+    function readyFrame(runtimeOwners: unknown[]): unknown {
+      return {
+        type: 'ready',
+        timestamp: new Date().toISOString(),
+        serverInstanceId: 'srv-1',
+        bootId: 'boot-1',
+        runtimeOwners,
+      }
+    }
+
+    // b8ke focused episode-2 post-cap F5: an ALIASED (re-keyed) replay
+    // record carries the CANONICAL record's resolved truth + `aliasOf`
+    // through the parser — a cross-device pane holding the PRE-REKEY id
+    // folds the authoritative owner state (never a permanent "vacant")
+    // and the record names the canonical id for navigation.
+    it('an aliased replay record keeps aliasOf through the parser and folds the canonical owner truth', () => {
+      const store = createFreshAgentStore()
+      const owners = parseReadyRuntimeOwners(readyFrame([
+        {
+          provider: 'claude',
+          sessionId: 'sid-pre-rekey',
+          epoch: 3,
+          generation: 11,
+          ownerKind: 'fresh-agent',
+          state: 'live',
+          aliasOf: 'sid-canonical',
+        },
+      ]))
+      foldReadyRuntimeOwners(store.dispatch, owners)
+      const record = store.getState().freshAgent.runtimeOwners['claude:sid-pre-rekey']
+      expect(record).toMatchObject({
+        // The CANONICAL record's truth — the old key is never vacant.
+        ownerKind: 'fresh-agent',
+        transition: 'handoff-committed',
+        epoch: 3,
+        generation: 11,
+        aliasOf: 'sid-canonical',
+      })
+    })
+
+    // The live broadcast fold carries aliasOf too (the rekey transition's
+    // OLD-key mirror frame — an ONLINE old-key pane converges, not just a
+    // reconnecting one).
+    it('the rekey old-key mirror broadcast folds the canonical owner state with aliasOf', () => {
+      const store = createFreshAgentStore()
+      foldSessionRuntimeOwnerFrame(store.dispatch, ownerFrame({
+        provider: 'claude',
+        sessionId: 'sid-pre-rekey',
+        ownerKind: 'fresh-agent',
+        generation: 12,
+        operationId: 'rekey-op-1',
+        transition: 'handoff-committed',
+        aliasOf: 'sid-canonical',
+      }))
+      expect(store.getState().freshAgent.runtimeOwners['claude:sid-pre-rekey']).toMatchObject({
+        ownerKind: 'fresh-agent',
+        generation: 12,
+        aliasOf: 'sid-canonical',
+      })
+    })
+
+    it('a fenced replay record keeps state/reason through the parser — typed recovery, never committed', () => {
+      const store = createFreshAgentStore()
+      const owners = parseReadyRuntimeOwners(readyFrame([
+        {
+          provider: 'claude',
+          sessionId: 'sid-fenced',
+          epoch: 3,
+          generation: 5,
+          ownerKind: 'terminal',
+          state: 'fenced',
+          reason: 'platform-limited',
+        },
+      ]))
+      foldReadyRuntimeOwners(store.dispatch, owners)
+      expect(store.getState().freshAgent.runtimeOwners['claude:sid-fenced']).toMatchObject({
+        ownerKind: 'terminal',
+        transition: 'handoff-failed',
+        reason: 'platform-limited',
+        fenced: true,
+        epoch: 3,
+        generation: 5,
+      })
+    })
+
+    it('in-progress lifecycle replays (starting/handoff/stopping) fold as the transition state, never committed-live', () => {
+      const store = createFreshAgentStore()
+      const owners = parseReadyRuntimeOwners(readyFrame([
+        {
+          provider: 'codex', sessionId: 'sid-starting', epoch: 2, generation: 4,
+          ownerKind: 'fresh-agent', state: 'starting',
+        },
+        {
+          provider: 'codex', sessionId: 'sid-handoff', epoch: 2, generation: 7,
+          ownerKind: 'terminal', state: 'handoff',
+        },
+        {
+          provider: 'codex', sessionId: 'sid-stopping', epoch: 2, generation: 9,
+          ownerKind: 'terminal', state: 'stopping',
+        },
+      ]))
+      foldReadyRuntimeOwners(store.dispatch, owners)
+      const owners_ = store.getState().freshAgent.runtimeOwners
+      // R4-6: reconnecting during Starting/Handoff/Stopping shows the
+      // transition (handoff-started — the Task 8 in-progress semantics),
+      // never a committed live owner.
+      expect(owners_['codex:sid-starting']).toMatchObject({
+        ownerKind: 'fresh-agent',
+        transition: 'handoff-started',
+      })
+      expect(owners_['codex:sid-handoff']).toMatchObject({
+        ownerKind: 'terminal',
+        transition: 'handoff-started',
+      })
+      expect(owners_['codex:sid-stopping']).toMatchObject({
+        ownerKind: 'terminal',
+        transition: 'handoff-started',
+      })
+      for (const key of ['codex:sid-starting', 'codex:sid-handoff', 'codex:sid-stopping']) {
+        expect(owners_[key].fenced).toBeUndefined()
+      }
+    })
+
+    it('live and vacant replays keep their existing folds through the parser', () => {
+      const store = createFreshAgentStore()
+      const owners = parseReadyRuntimeOwners(readyFrame([
+        {
+          provider: 'codex', sessionId: 'sid-live', epoch: 3, generation: 2,
+          ownerKind: 'fresh-agent', state: 'live', terminalId: 't-1',
+        },
+        {
+          provider: 'codex', sessionId: 'sid-vacant', epoch: 3, generation: 8,
+          ownerKind: 'vacant',
+        },
+      ]))
+      foldReadyRuntimeOwners(store.dispatch, owners)
+      const owners_ = store.getState().freshAgent.runtimeOwners
+      expect(owners_['codex:sid-live']).toMatchObject({
+        ownerKind: 'fresh-agent',
+        transition: 'handoff-committed',
+        terminalId: 't-1',
+      })
+      expect(owners_['codex:sid-vacant']).toMatchObject({
+        ownerKind: 'vacant',
+        transition: 'released',
+      })
+    })
+  })
+
+  it('freshAgent.create.failed owner fields are preserved in the fold (typed conflict → recovery UI)', () => {
+    const store = createFreshAgentStore()
+    registerFreshAgentCreate(store.dispatch, 'req-owner-conflict', {
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    })
+    const handled = handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.create.failed',
+      requestId: 'req-owner-conflict',
+      code: 'SESSION_OWNED_BY_TERMINAL',
+      message: 'the session is owned by a terminal runtime',
+      retryable: false,
+      ownerKind: 'terminal',
+      ownerGeneration: 6,
+      ownerEpoch: 2,
+    })
+    expect(handled).toBe(true)
+    expect(store.getState().freshAgent.pendingCreateFailures['req-owner-conflict']).toMatchObject({
+      code: 'SESSION_OWNED_BY_TERMINAL',
+      message: 'the session is owned by a terminal runtime',
+      retryable: false,
+      ownerKind: 'terminal',
+      ownerGeneration: 6,
+      ownerEpoch: 2,
+    })
+  })
+
+  it('the cancelled-create cleanup kill carries the observed ownership fence', () => {
+    const store = createFreshAgentStore()
+    const ws = { send: vi.fn() }
+    registerFreshAgentCreate(store.dispatch, 'req-orphan-fence', {
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    })
+    cancelCreate('req-orphan-fence')
+    const handled = handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.created',
+      requestId: 'req-orphan-fence',
+      sessionId: 'thread-orphan-fence',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    }, ws, (provider, sessionId) => (
+      provider === 'codex' && sessionId === 'thread-orphan-fence'
+        ? { epoch: 4, generation: 9 }
+        : undefined
+    ))
+    expect(handled).toBe(true)
+    expect(ws.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'freshAgent.kill',
+      sessionId: 'thread-orphan-fence',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      observedEpoch: 4,
+      observedGeneration: 9,
+    }))
+  })
+
+  it('the cancelled-create cleanup kill stays legacy-unfenced when no owner record is known', () => {
+    const store = createFreshAgentStore()
+    const ws = { send: vi.fn() }
+    registerFreshAgentCreate(store.dispatch, 'req-orphan-plain', {
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    })
+    cancelCreate('req-orphan-plain')
+    handleFreshAgentMessage(store.dispatch, {
+      type: 'freshAgent.created',
+      requestId: 'req-orphan-plain',
+      sessionId: 'thread-orphan-plain',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+    }, ws, () => undefined)
+    const sent = ws.send.mock.calls[0][0] as Record<string, unknown>
+    expect(sent.observedEpoch).toBeUndefined()
+    expect(sent.observedGeneration).toBeUndefined()
   })
 })

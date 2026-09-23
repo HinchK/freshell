@@ -83,6 +83,9 @@ pub struct OpencodeSessionRow {
     pub created_at: Option<i64>,
     pub last_activity_at: Option<i64>,
     pub project_path: Option<String>,
+    /// 3-views marker flag: the real inline EXISTS value on the candidate
+    /// path; a literal-0 placeholder on the listing path, which fills
+    /// markers from the provider's row-stamped cache instead.
     pub has_three_views_marker: Option<i64>,
     /// Raw `session.model` JSON text (`{"id","providerID","variant"}`),
     /// `NULL` on older schemas without the column.
@@ -94,6 +97,12 @@ pub struct OpencodeSessionRow {
 pub struct OpencodeListingResult {
     pub rows: Vec<OpencodeSessionRow>,
     pub schema_missing_parent_id: bool,
+    /// Marker-table census: which optional marker tables exist, so the
+    /// listing path can assemble per-session marker probes with only the
+    /// arms that exist (the candidate path keeps its inline EXISTS arms
+    /// and ignores the census).
+    pub has_part_table: bool,
+    pub has_message_table: bool,
 }
 
 /// A mapped session (subset of `CodingCliSession` the opencode direct-lister produces).
@@ -260,28 +269,36 @@ fn to_opt_i64(v: &SqlValue) -> Option<i64> {
 
 /// `runOpencodeListingQuery(dbPath, markerPattern)`.
 ///
-/// Inspects whether `session` exposes `parent_id`, builds the 3-views marker check from
-/// whichever of `part`/`message` exist (degrading to unmarked if neither exists, instead
-/// of throwing `no such table`), runs the root-session listing, and returns raw rows.
+/// Inspects whether `session` exposes `parent_id`, reports the marker-table
+/// census (which of `part`/`message` exist), and runs the root-session
+/// listing. The marker column is a literal-0 placeholder: the listing path
+/// fills real markers per row from the provider's row-stamped cache
+/// (`probe_session_marker`), probing only stamp-moved and NULL-stamp rows —
+/// the inline EXISTS arms measured at ~99.7% of the live listing cost
+/// (freshopencode re-list storm fix:
+/// docs/plans/2026-09-17-freshopencode-relist-storm.md).
 pub fn run_opencode_listing_query(
     conn: &Connection,
     marker_pattern: &str,
 ) -> rusqlite::Result<OpencodeListingResult> {
-    run_opencode_query_inner(conn, marker_pattern, None, None)
+    run_opencode_query_inner(conn, marker_pattern, None, None, false)
 }
 
 /// `opencode_locator`'s bounded row-diff read
 /// (`docs/plans/2026-07-18-opencode-terminal-restore-spec.md` §5, Slice A): the SAME
 /// root-session listing as [`run_opencode_listing_query`], additionally bounded to
 /// `s.time_created >= floor_ms` with a `LIMIT` — avoids scanning the full (potentially
-/// multi-GB, WAL-mode) `session` table on every locator poll tick.
+/// multi-GB, WAL-mode) `session` table on every locator poll tick. Keeps the
+/// inline 3-views marker EXISTS arms (byte-identical locator behavior):
+/// this path is bounded (floor + LIMIT) and throttled, so it never needs
+/// the row-stamped marker cache.
 pub fn run_opencode_candidate_query(
     conn: &Connection,
     marker_pattern: &str,
     floor_ms: i64,
     limit: i64,
 ) -> rusqlite::Result<OpencodeListingResult> {
-    run_opencode_query_inner(conn, marker_pattern, Some(floor_ms), Some(limit))
+    run_opencode_query_inner(conn, marker_pattern, Some(floor_ms), Some(limit), true)
 }
 
 /// Bounded per-session lookup: the first text part of the earliest
@@ -524,11 +541,152 @@ fn last_step_finish_usage_for_session(
     }
 }
 
+/// Cache-or-walk wrapper around [`last_step_finish_usage_for_session`]:
+/// consults the row-stamped cache first; only a stamp change (or a NULL
+/// stamp, which can never be validated) executes the walk. `None` results
+/// are cached like any other — a walk that legitimately found nothing
+/// should not re-run per re-list (the pathological 64-probe-cap session is
+/// exactly the one this must not re-walk on every WAL move). A poisoned
+/// lock recovers rather than breaking the listing (degrade discipline).
+fn cached_or_walked_usage(
+    cache: &std::sync::Mutex<std::collections::HashMap<String, CachedUsage>>,
+    walk_count: &std::sync::atomic::AtomicU64,
+    conn: &Connection,
+    session_id: &str,
+    stamp: Option<i64>,
+) -> Option<OpencodeStepUsage> {
+    let Some(stamp) = stamp else {
+        // NULL time_updated: never cacheable — no stamp to validate
+        // against. Always walk, exactly as the pre-cache code did.
+        walk_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        return last_step_finish_usage_for_session(conn, session_id);
+    };
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(hit) = cache.get(session_id) {
+        if hit.stamp == stamp {
+            return hit.usage.clone();
+        }
+    }
+    walk_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let usage = last_step_finish_usage_for_session(conn, session_id);
+    cache.insert(
+        session_id.to_string(),
+        CachedUsage {
+            stamp,
+            usage: usage.clone(),
+        },
+    );
+    usage
+}
+
+/// Standalone per-session 3-views marker probe — the SAME two EXISTS
+/// predicates the inline marker_expr used, with only the arms whose
+/// tables exist; zero arms return 0 without querying (the old inline
+/// literal-0 degrade, preserved).
+fn probe_session_marker(
+    conn: &Connection,
+    has_part_table: bool,
+    has_message_table: bool,
+    marker_pattern: &str,
+    session_id: &str,
+) -> i64 {
+    let mut arms: Vec<&str> = Vec::new();
+    if has_part_table {
+        arms.push("EXISTS (SELECT 1 FROM part pa WHERE pa.session_id = ?1 AND pa.data LIKE ?2)");
+    }
+    if has_message_table {
+        arms.push("EXISTS (SELECT 1 FROM message m WHERE m.session_id = ?1 AND m.data LIKE ?2)");
+    }
+    if arms.is_empty() {
+        return 0;
+    }
+    let sql = format!("SELECT {}", arms.join(" OR "));
+    match conn.query_row(&sql, rusqlite::params![session_id, marker_pattern], |row| {
+        row.get::<_, i64>(0)
+    }) {
+        Ok(v) => v,
+        Err(e) => {
+            // Degrade discipline: a failed probe serves unmarked (0) with
+            // observability and never breaks the listing.
+            tracing::debug!(
+                session_id,
+                error = %e,
+                "opencode marker probe failed; serving unmarked (degrade discipline)"
+            );
+            0
+        }
+    }
+}
+
+/// Cache-or-probe wrapper around [`probe_session_marker`], mirroring
+/// [`cached_or_walked_usage`]: consults the row-stamped cache first; only
+/// a stamp change (or a NULL stamp, which can never be validated) executes
+/// the probe. A schema with no marker tables skips both cache and probe —
+/// the old inline literal-0 degrade, preserved. A poisoned lock recovers
+/// rather than breaking the listing (degrade discipline).
+///
+/// 8 arguments (`clippy::too_many_arguments`): every one is a distinct,
+/// independently-owned input — the two cache/counter seams (mirroring
+/// `cached_or_walked_usage`'s explicitness), the shared connection, the
+/// two census flags, the marker pattern, and the row's id/stamp. The
+/// `registry.rs` precedent.
+#[allow(clippy::too_many_arguments)]
+fn cached_or_probed_marker(
+    cache: &std::sync::Mutex<std::collections::HashMap<String, CachedMarker>>,
+    probe_count: &std::sync::atomic::AtomicU64,
+    conn: &Connection,
+    has_part_table: bool,
+    has_message_table: bool,
+    marker_pattern: &str,
+    session_id: &str,
+    stamp: Option<i64>,
+) -> i64 {
+    if !has_part_table && !has_message_table {
+        // Degraded schema: neither marker table exists — the old inline
+        // marker_expr was the literal 0 with zero marker SQL. No probe,
+        // no cache entry, no counter movement.
+        return 0;
+    }
+    let Some(stamp) = stamp else {
+        // NULL time_updated: never cacheable — no stamp to validate
+        // against. Always probe, exactly as the pre-cache code did.
+        probe_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        return probe_session_marker(
+            conn,
+            has_part_table,
+            has_message_table,
+            marker_pattern,
+            session_id,
+        );
+    };
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(hit) = cache.get(session_id) {
+        if hit.stamp == stamp {
+            return hit.marker;
+        }
+    }
+    probe_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let marker = probe_session_marker(
+        conn,
+        has_part_table,
+        has_message_table,
+        marker_pattern,
+        session_id,
+    );
+    cache.insert(session_id.to_string(), CachedMarker { stamp, marker });
+    marker
+}
+
 fn run_opencode_query_inner(
     conn: &Connection,
     marker_pattern: &str,
     floor_ms: Option<i64>,
     limit: Option<i64>,
+    inline_marker: bool,
 ) -> rusqlite::Result<OpencodeListingResult> {
     conn.busy_timeout(std::time::Duration::from_millis(
         OPENCODE_DB_BUSY_TIMEOUT_MS,
@@ -567,22 +725,35 @@ fn run_opencode_query_inner(
         set
     };
 
-    let mut marker_clauses: Vec<&str> = Vec::new();
-    let mut marker_params: Vec<String> = Vec::new();
-    if table_names.contains("part") {
-        marker_clauses
-            .push("EXISTS (SELECT 1 FROM part pa WHERE pa.session_id = s.id AND pa.data LIKE ?)");
-        marker_params.push(marker_pattern.to_string());
-    }
-    if table_names.contains("message") {
-        marker_clauses
-            .push("EXISTS (SELECT 1 FROM message m WHERE m.session_id = s.id AND m.data LIKE ?)");
-        marker_params.push(marker_pattern.to_string());
-    }
-    let marker_expr = if marker_clauses.is_empty() {
-        "0".to_string()
+    let has_part_table = table_names.contains("part");
+    let has_message_table = table_names.contains("message");
+    // The listing path (inline_marker = false) fills markers per row from
+    // the provider's row-stamped cache instead: its SELECT carries the
+    // literal-0 placeholder (positional layout and row-mapping indices
+    // untouched) with zero marker SQL. The candidate path
+    // (inline_marker = true) keeps the inline EXISTS arms byte-identical.
+    let (marker_expr, marker_params) = if inline_marker {
+        let mut marker_clauses: Vec<&str> = Vec::new();
+        let mut marker_params: Vec<String> = Vec::new();
+        if has_part_table {
+            marker_clauses.push(
+                "EXISTS (SELECT 1 FROM part pa WHERE pa.session_id = s.id AND pa.data LIKE ?)",
+            );
+            marker_params.push(marker_pattern.to_string());
+        }
+        if has_message_table {
+            marker_clauses.push(
+                "EXISTS (SELECT 1 FROM message m WHERE m.session_id = s.id AND m.data LIKE ?)",
+            );
+            marker_params.push(marker_pattern.to_string());
+        }
+        if marker_clauses.is_empty() {
+            ("0".to_string(), marker_params)
+        } else {
+            (format!("({})", marker_clauses.join(" OR ")), marker_params)
+        }
     } else {
-        format!("({})", marker_clauses.join(" OR "))
+        ("0".to_string(), Vec::new())
     };
 
     // Schema tolerance (the parent_id discipline): older opencode schemas
@@ -654,24 +825,85 @@ fn run_opencode_query_inner(
     Ok(OpencodeListingResult {
         rows,
         schema_missing_parent_id: !has_parent_id,
+        has_part_table,
+        has_message_table,
     })
+}
+
+/// One cached usage-walk result, keyed by session id and validated by the
+/// session row's `time_updated` stamp (the listing already SELECTs it as
+/// `lastActivityAt`). `usage: None` is a legitimate cached value — a walk
+/// that found no step-finish, a capped miss, or a transient-error degrade
+/// — the stamp, not the value, decides freshness (freshopencode re-list
+/// storm fix: docs/plans/2026-09-17-freshopencode-relist-storm.md).
+#[derive(Debug, Clone)]
+struct CachedUsage {
+    stamp: i64,
+    usage: Option<OpencodeStepUsage>,
+}
+
+/// One cached 3-views marker result, keyed by session id and validated by
+/// the session row's `time_updated` stamp — the same regime as the usage
+/// cache. `marker` is the raw 0/1 the inline EXISTS arms would have
+/// produced; a schema with no marker tables yields 0 with no probe (the
+/// old inline literal-0 degrade, preserved).
+#[derive(Debug, Clone)]
+struct CachedMarker {
+    stamp: i64,
+    marker: i64,
 }
 
 /// The read-only opencode provider (path derivation + direct listing).
 pub struct OpencodeProvider {
     home_dir: PathBuf,
+    /// Row-stamped usage-walk cache: every dirty-mark/WAL-move re-list
+    /// re-runs the whole listing (the pinned trigger contract), but the
+    /// per-session usage walk only re-executes for rows whose
+    /// `time_updated` moved. Pruned to the listed id-set at the end of
+    /// each successful listing, so the map stays O(live sessions).
+    usage_cache: std::sync::Mutex<std::collections::HashMap<String, CachedUsage>>,
+    /// Counts actual usage-walk executions (cache misses) — test/diagnostic
+    /// hook mirroring `OpencodeLocator::db_scan_count`
+    /// (crates/freshell-sessions/src/opencode_locator.rs:172-177).
+    usage_walks: std::sync::atomic::AtomicU64,
+    /// Row-stamped marker cache: the same regime for the 3-views marker
+    /// EXISTS probes (measured at ~99.7% of the live listing cost) — only
+    /// stamp-moved, new, and NULL-stamp rows re-probe. Pruned with the
+    /// usage cache to the listed id-set.
+    marker_cache: std::sync::Mutex<std::collections::HashMap<String, CachedMarker>>,
+    /// Counts actual marker-probe executions (cache misses) — test/
+    /// diagnostic hook mirroring `usage_walks`.
+    marker_probes: std::sync::atomic::AtomicU64,
 }
 
 impl OpencodeProvider {
     pub fn new(home_dir: impl Into<PathBuf>) -> Self {
         Self {
             home_dir: home_dir.into(),
+            usage_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            usage_walks: std::sync::atomic::AtomicU64::new(0),
+            marker_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            marker_probes: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// `getDatabasePath` — `<homeDir>/opencode.db`.
     pub fn database_path(&self) -> PathBuf {
         self.home_dir.join("opencode.db")
+    }
+
+    /// How many usage walks have actually executed (cache misses) so far —
+    /// test/diagnostic hook mirroring `OpencodeLocator::db_scan_count`:
+    /// proves unchanged session rows skip the walk across re-lists.
+    pub fn usage_walk_count(&self) -> u64 {
+        self.usage_walks.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many marker probes have actually executed (cache misses) so
+    /// far — test/diagnostic hook mirroring `usage_walk_count`: proves
+    /// unchanged session rows skip the marker probe across re-lists.
+    pub fn marker_probe_count(&self) -> u64 {
+        self.marker_probes.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// `getWatchedDatabasePaths` — `[db, db-wal]`.
@@ -757,7 +989,20 @@ impl OpencodeProvider {
             // when the DB already stores `p.worktree` (the common case) the result is the
             // worktree verbatim, which is what we return here.
             let project_path = meaningful_worktree(row.project_path).unwrap_or_else(|| cwd.clone());
-            let is_three_views = row.has_three_views_marker == Some(1);
+            // The listing SELECT's marker column is the literal-0
+            // placeholder — the real marker comes from the row-stamped
+            // cache, probing only stamp-moved/new/NULL-stamp rows.
+            let has_three_views_marker = cached_or_probed_marker(
+                &self.marker_cache,
+                &self.marker_probes,
+                &conn,
+                result.has_part_table,
+                result.has_message_table,
+                THREE_VIEWS_MARKER_SQL_PATTERN,
+                &row.session_id,
+                row.last_activity_at,
+            );
+            let is_three_views = has_three_views_marker == 1;
             // Bounded first-message extraction: ONLY for sessions that still
             // need naming (empty/placeholder title). Named sessions surface
             // opencode's own title (provider-generated) and never need the
@@ -776,9 +1021,16 @@ impl OpencodeProvider {
             let model = row.model.as_deref().and_then(opencode_model_composite);
             // Bounded usage lookup, gated on a resolvable model: usage
             // without a model can never produce meter fields (limits are
-            // resolved per model), so those sessions skip the query.
+            // resolved per model), so those sessions skip the query. The
+            // row-stamped cache serves unchanged rows without re-walking.
             let last_usage = if model.is_some() {
-                last_step_finish_usage_for_session(&conn, &row.session_id)
+                cached_or_walked_usage(
+                    &self.usage_cache,
+                    &self.usage_walks,
+                    &conn,
+                    &row.session_id,
+                    row.last_activity_at,
+                )
             } else {
                 None
             };
@@ -795,6 +1047,22 @@ impl OpencodeProvider {
                 model,
                 last_usage,
             });
+        }
+
+        // Prune the caches to the listed id-set: sessions that left the
+        // listing (archived, deleted) drop their cached walk/probe so a
+        // later re-entry re-executes even under an unchanged stamp.
+        {
+            let listed: std::collections::HashSet<&str> =
+                sessions.iter().map(|s| s.session_id.as_str()).collect();
+            self.usage_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|id, _| listed.contains(id.as_str()));
+            self.marker_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|id, _| listed.contains(id.as_str()));
         }
 
         Ok(OpencodeListing { sessions, degrade })

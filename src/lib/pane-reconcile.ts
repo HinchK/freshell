@@ -38,6 +38,7 @@ import {
   setReconcileWarming,
 } from '@/store/panesSlice'
 import { clearSessionLost } from '@/store/freshAgentSlice'
+import type { PaneOwnerDivergence } from '@/store/selectors/runtimeOwner'
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 
 /** Protocol cap on request size (mirrors PaneReconcileRequestSchema). */
@@ -282,9 +283,13 @@ function deadSessionTitle(pane: ReconcilePane): string {
  * Fold one fresh-agent verdict. Routing mirrors the terminal arms:
  * attach → applyFreshAgentReconcileAttach (skipped without a sessionRef —
  * malformed, the reducer would no-op); respawn/fresh →
- * resetFreshAgentPaneForReconcileCreate; dead_session → batched entry +
- * loud per-pane restoreError; invalid → restoreError + notice; error →
- * warming batch or restoreError. Returns true iff the verdict was folded.
+ * resetFreshAgentPaneForReconcileCreate (SKIPPED while the pane's canonical
+ * session diverges — kata b8ke T1 rec A5: a terminal-owned session must not
+ * re-arm a stale-kind freshAgent.create after reconnect; the pane keeps its
+ * identity and renders the divergence state instead); dead_session →
+ * batched entry + loud per-pane restoreError; invalid → restoreError +
+ * notice; error → warming batch or restoreError. Returns true iff the
+ * verdict was folded.
  */
 function foldFreshAgentVerdict(
   dispatch: AppDispatch,
@@ -294,6 +299,7 @@ function foldFreshAgentVerdict(
   deadEntries: DeadSessionEntry[],
   warmingRefs: Array<{ tabId: string; paneId: string }>,
   outcome: FoldOutcome,
+  getOwnerDivergence?: (pane: ReconcilePane) => PaneOwnerDivergence | null,
 ): boolean {
   const { tabId, paneId } = paneRefFromOwnKey(pane.paneKey)
 
@@ -320,25 +326,34 @@ function foldFreshAgentVerdict(
       outcome.attached++
       return true
     }
-    case 'respawn': {
-      dispatch(resetFreshAgentPaneForReconcileCreate({
-        tabId,
-        paneId,
-        intent: 'respawn',
-        sessionRef: verdict.sessionRef,
-        corrected: verdict.corrected,
-      }))
-      outcome.respawned++
-      return true
-    }
+    case 'respawn':
     case 'fresh': {
+      // kata b8ke (T1 rec A5): a divergent owner (the canonical session is
+      // owned by the other kind) must NOT re-arm a stale-kind
+      // freshAgent.create after reconnect — the pane keeps its identity and
+      // renders the divergence card instead. Key on the canonical session
+      // (the pane's sessionRef — the request's promoted claim).
+      if (getOwnerDivergence?.(pane)) {
+        // Handled WITHOUT the reset: the caller's onVerdictFolded fires, so
+        // the held create is retracted (ws.cancelCreate) rather than flushed
+        // at the RECONCILE_VERDICT_WAIT_MS bound; App's post-fold
+        // clearAllReconcilePendingPanes releases the pane's pending flag.
+        if (verdict.verdict === 'respawn') outcome.respawned++
+        else outcome.fresh++
+        return true
+      }
       dispatch(resetFreshAgentPaneForReconcileCreate({
         tabId,
         paneId,
-        intent: 'fresh',
-        reason: verdict.reason,
+        intent: verdict.verdict,
+        // Field parity with the pre-merge arms: respawn carried
+        // sessionRef+corrected, fresh carried only reason.
+        ...(verdict.verdict === 'respawn'
+          ? { sessionRef: verdict.sessionRef, corrected: verdict.corrected }
+          : { reason: verdict.reason }),
       }))
-      outcome.fresh++
+      if (verdict.verdict === 'respawn') outcome.respawned++
+      else outcome.fresh++
       return true
     }
     case 'dead_session': {
@@ -407,12 +422,22 @@ function foldFreshAgentVerdict(
  * pane (all kinds) with that pane's createRequestId, so callers can retract
  * a held/queued create at the sender. Skipped verdicts (malformed attach)
  * and cardinality violations never fire it.
+ *
+ * `getOwnerDivergence` (kata b8ke): an optional store-backed divergence
+ * probe consulted by the fresh-agent respawn/fresh arms — a pane whose
+ * canonical session is owned by the other kind keeps its identity instead
+ * of re-arming a stale-kind create. App wires it to
+ * selectPaneOwnerDivergence(appStore.getState(), ...); the module stays
+ * store-agnostic like its `dispatch` param.
  */
 export function foldVerdicts(
   dispatch: AppDispatch,
   request: PaneReconcileRequest,
   result: PaneReconcileResultMessage,
-  opts?: { onVerdictFolded?: (createRequestId: string) => void },
+  opts?: {
+    onVerdictFolded?: (createRequestId: string) => void
+    getOwnerDivergence?: (pane: ReconcilePane) => PaneOwnerDivergence | null
+  },
 ): FoldOutcome {
   const outcome: FoldOutcome = {
     attached: 0,
@@ -443,7 +468,7 @@ export function foldVerdicts(
     const verdict = result.verdicts[i]
 
     if (pane.kind === 'fresh-agent') {
-      const folded = foldFreshAgentVerdict(dispatch, pane, verdict, result, deadEntries, warmingRefs, outcome)
+      const folded = foldFreshAgentVerdict(dispatch, pane, verdict, result, deadEntries, warmingRefs, outcome, opts?.getOwnerDivergence)
       if (folded) opts?.onVerdictFolded?.(pane.createRequestId)
       continue
     }

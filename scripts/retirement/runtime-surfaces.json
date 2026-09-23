@@ -17,6 +17,11 @@
       "role": "release-job"
     },
     {
+      "id": "workflow-rust-tests",
+      "path": ".github/workflows/rust-tests.yml",
+      "role": "test-gate"
+    },
+    {
       "id": "electron-builder-config",
       "path": "config/electron-builder.yml",
       "role": "packaging-config"

@@ -396,6 +396,67 @@ async fn rebind_fanout(
     cwd: Option<&str>,
     previous: Option<String>,
 ) {
+    // b8ke ext r14 F1/F2: the signal rebind acquires its coordinator
+    // authority FIRST (fail-closed: a refusal mutates NO identity home)
+    // and holds it across the identity homes' writes; the commit is the
+    // ATOMIC move (the new key commits Live while the old key's Live
+    // record becomes Aliased in ONE lock scope, the retained claim
+    // rekeyed — never both keys naming the writer). A binding failure
+    // unwinds the held authority with NO committed owner.
+    let Some(authority) = crate::identity_ownership::coordinator_begin_identity(
+        state,
+        "opencode",
+        &sig.terminal_id,
+        &sig.session_id,
+        previous.as_deref(),
+    )
+    .await
+    else {
+        return;
+    };
+    // b8ke ext r39 F2: the binding write GATES THE INSTALL/ANNOUNCE — it
+    // runs FIRST (before the identity homes, the registry meta, the
+    // resume-target classification, the association broadcast, and the
+    // activity hub), so a failure installs and announces NOTHING (the
+    // identity homes keep the consistent prior state) and the held
+    // authority COMMITS (the live CLI process is the new session's
+    // writer — never a Vacant-with-live-writer; a failed ticket would
+    // let a later lifecycle command start a second writer beside it).
+    // Pre-r39 the homes/classification/broadcast/hub all landed BEFORE
+    // the awaited binding write and the failure unwound to a Vacant key
+    // while the registries and clients still identified the terminal as
+    // the session writer.
+    let binding_ok = crate::pane_ledger::ledger_resolve_identity(
+        state,
+        &sig.terminal_id,
+        "opencode",
+        &sig.session_id,
+        cwd,
+    )
+    .await;
+    if !binding_ok {
+        tracing::warn!(target: "freshell_ws::opencode_signal",
+            terminal_id = %sig.terminal_id, session_id = %sig.session_id,
+            event = "opencode_signal.binding_failed",
+            outcome = "committed_owner_kept",
+            failure_reason = "DURABLE_BINDING_WRITE_FAILED",
+            "opencode_signal_binding_failed: the durable binding write failed — \
+             nothing installed/announced; the held authority commits so the \
+             live CLI writer stays the named owner (never a \
+             Vacant-with-live-writer); the next SessionStart signal re-adopts \
+             and retries the binding"
+        );
+        crate::identity_ownership::coordinator_commit_identity(
+            state,
+            authority,
+            "opencode",
+            &sig.terminal_id,
+            &sig.session_id,
+            previous.as_deref(),
+        )
+        .await;
+        return;
+    }
     state.identity.upsert(
         &sig.terminal_id,
         Some("opencode"),
@@ -419,21 +480,13 @@ async fn rebind_fanout(
         "opencode",
         Some(&sig.session_id),
     );
-    crate::pane_ledger::ledger_resolve_identity(
-        state,
-        &sig.terminal_id,
-        "opencode",
-        &sig.session_id,
-        cwd,
-    )
-    .await;
     crate::codex_identity::broadcast_terminal_session_associated(
         state,
         "opencode",
         &sig.terminal_id,
         &sig.session_id,
         cwd.map(str::to_string),
-        previous,
+        previous.clone(),
     );
     // Task 10: feed the identity proof into the activity hub — the in-TUI
     // session-switch (and first-bind) signal rebinds the tracker's owned
@@ -443,6 +496,15 @@ async fn rebind_fanout(
     if let Some(hub) = &state.activity {
         hub.bind_opencode_session(&sig.terminal_id, &sig.session_id);
     }
+    crate::identity_ownership::coordinator_commit_identity(
+        state,
+        authority,
+        "opencode",
+        &sig.terminal_id,
+        &sig.session_id,
+        previous.as_deref(),
+    )
+    .await;
 }
 
 /// Outcome of applying one signal: `Acted` (rebind done), `Retain` (might
@@ -702,7 +764,7 @@ mod tests {
 
     #[test]
     fn hello_files_never_hit_the_reject_warn_lane() {
-        let (events, _guard) = crate::invariants::capture::capture();
+        let events = crate::invariants::capture::capture();
         let dir = tempfile::tempdir().unwrap();
         write_signal(
             dir.path(),
@@ -712,12 +774,28 @@ mod tests {
         let watcher = OpencodeSignalWatcher::new(dir.path().to_path_buf());
         let outcome = watcher.drain();
         assert_eq!(outcome.hellos, vec!["term-h".to_string()]);
-        let events = events.lock().unwrap();
-        assert!(
-            !events
+        // Collect-then-assert; the negative check is scoped to THIS test's
+        // tempdir by the emission's path field — the shared vec carries every
+        // test's rejects (kata 59nb), so an unscoped negative would count
+        // other tests' legitimate rejects against this one.
+        let want_dir_prefix = format!("{}", dir.path().display());
+        let hits: Vec<crate::invariants::capture::CapturedEvent> = {
+            let events = events.lock().unwrap_or_else(|p| p.into_inner());
+            events
                 .iter()
-                .any(|e| e.message.contains("opencode_signal_rejected")),
-            "a hello must not be warn-logged as a reject"
+                .filter(|e| {
+                    e.message.contains("opencode_signal_rejected")
+                        && e.fields
+                            .get("path")
+                            .map(String::as_str)
+                            .is_some_and(|p| p.starts_with(&want_dir_prefix))
+                })
+                .cloned()
+                .collect()
+        };
+        assert!(
+            hits.is_empty(),
+            "a hello must not be warn-logged as a reject; got: {hits:?}"
         );
     }
 
@@ -760,30 +838,39 @@ mod tests {
 
     #[test]
     fn warns_once_for_an_opencode_pane_past_grace_with_no_hello() {
-        let (events, _guard) = crate::invariants::capture::capture();
+        let events = crate::invariants::capture::capture();
         let mut tracker = HelloTracker::default();
-        let rows = vec![probe_row("term-1", "opencode", 0)];
+        let rows = vec![probe_row("term-hb-once", "opencode", 0)];
         let now = OPENCODE_HELLO_GRACE_MS + 1;
         warn_opencode_panes_without_hello(&rows, &mut tracker, false, now);
         warn_opencode_panes_without_hello(&rows, &mut tracker, false, now + 10_000);
-        let events = events.lock().unwrap();
-        let warns: Vec<_> = events
-            .iter()
-            .filter(|e| e.message.contains("opencode_rebind_heartbeat_missing"))
-            .collect();
+        // Collect-then-assert; the terminal_id filter scopes the exact-1 to
+        // THIS test's pane (the id is per-binary-unique — kata 59nb — since
+        // the shared vec never forgets and siblings warn for their own ids).
+        let warns: Vec<crate::invariants::capture::CapturedEvent> = {
+            let events = events.lock().unwrap_or_else(|p| p.into_inner());
+            events
+                .iter()
+                .filter(|e| {
+                    e.message.contains("opencode_rebind_heartbeat_missing")
+                        && e.fields.get("terminal_id").map(String::as_str) == Some("term-hb-once")
+                })
+                .cloned()
+                .collect()
+        };
         assert_eq!(warns.len(), 1, "once per terminal, ever: {warns:?}");
     }
 
     #[test]
     fn no_warn_when_hello_seen_young_non_opencode_or_injection_disabled() {
-        let (events, _guard) = crate::invariants::capture::capture();
+        let events = crate::invariants::capture::capture();
         let now = OPENCODE_HELLO_GRACE_MS + 1;
 
         // hello seen
         let mut tracker = HelloTracker::default();
-        tracker.seen.insert("term-1".to_string());
+        tracker.seen.insert("term-hello".to_string());
         warn_opencode_panes_without_hello(
-            &[probe_row("term-1", "opencode", 0)],
+            &[probe_row("term-hello", "opencode", 0)],
             &mut tracker,
             false,
             now,
@@ -792,7 +879,7 @@ mod tests {
         // young pane (inside grace)
         let mut tracker = HelloTracker::default();
         warn_opencode_panes_without_hello(
-            &[probe_row("term-2", "opencode", now - 1_000)],
+            &[probe_row("term-young", "opencode", now - 1_000)],
             &mut tracker,
             false,
             now,
@@ -801,7 +888,7 @@ mod tests {
         // non-opencode pane
         let mut tracker = HelloTracker::default();
         warn_opencode_panes_without_hello(
-            &[probe_row("term-3", "codex", 0)],
+            &[probe_row("term-nonoc", "codex", 0)],
             &mut tracker,
             false,
             now,
@@ -810,18 +897,35 @@ mod tests {
         // injection deliberately skipped (kill switch / user OPENCODE_TUI_CONFIG)
         let mut tracker = HelloTracker::default();
         warn_opencode_panes_without_hello(
-            &[probe_row("term-4", "opencode", 0)],
+            &[probe_row("term-injdis", "opencode", 0)],
             &mut tracker,
             true,
             now,
         );
 
-        let events = events.lock().unwrap();
-        assert!(
-            !events
+        // Collect-then-assert; the negative check is scoped to THIS test's
+        // four per-test-unique terminal ids (kata 59nb) so sibling tests'
+        // legitimate heartbeat warnings cannot be miscounted here.
+        let hits: Vec<crate::invariants::capture::CapturedEvent> = {
+            let events = events.lock().unwrap_or_else(|p| p.into_inner());
+            events
                 .iter()
-                .any(|e| e.message.contains("opencode_rebind_heartbeat_missing")),
-            "no warn in any suppressed case"
+                .filter(|e| {
+                    e.message.contains("opencode_rebind_heartbeat_missing")
+                        && e.fields
+                            .get("terminal_id")
+                            .map(String::as_str)
+                            .is_some_and(|id| {
+                                ["term-hello", "term-young", "term-nonoc", "term-injdis"]
+                                    .contains(&id)
+                            })
+                })
+                .cloned()
+                .collect()
+        };
+        assert!(
+            hits.is_empty(),
+            "no warn in any suppressed case; got: {hits:?}"
         );
     }
 

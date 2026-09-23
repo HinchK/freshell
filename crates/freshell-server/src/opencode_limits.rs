@@ -204,9 +204,11 @@ async fn refresh_once(
         // config edit) — nudge a re-list so already-listed opencode rows
         // pick the new limits up without waiting for an unrelated opencode
         // DB write (DirectEntry rows are change-token/dirty-gated only).
-        // The forced re-list counts as changed and advances the change
-        // generation, so `subscribe_changes` consumers broadcast and idle
-        // sessions' meters light up.
+        // The direct arm counts a re-list as changed only when its
+        // published items differ — this nudge's own re-list still advances
+        // the change generation (new limits change token_usage), so
+        // `subscribe_changes` consumers broadcast and idle sessions' meters
+        // light up.
         session_index.mark_provider_dirty("opencode");
     }
 }

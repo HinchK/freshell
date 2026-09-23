@@ -61,6 +61,16 @@ IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NA
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+# kata e83z: non-TTY stdin is the agent case (bash -c, tool harnesses, CI).
+# The identity preflight below is the guaranteed fail-fast leg; this export is
+# defense-in-depth — verified in gcloud's CanPrompt() source to be honored as
+# the --quiet equivalent even where auto-detection does not apply. Humans at
+# a real terminal keep interactive reauth (the export is deliberately withheld
+# on TTY stdin).
+if [ ! -t 0 ]; then
+  export CLOUDSDK_CORE_DISABLE_PROMPTS=1
+fi
+
 # Shared gcloud identity ladder (gcloud-robot). Sourcing only defines
 # functions — no side effects, no output — so help and local lanes stay
 # gcloud-free and silent.
@@ -145,6 +155,18 @@ account_flag() {
   fi
 }
 
+# kata e83z: cheap live-credential check at lane start — fails in seconds,
+# before any build/submit work, when the resolved identity cannot mint a token.
+# The error names the resolved identity and its source so the failure path is
+# as attributable as the success path.
+identity_preflight() {
+  if ! gcloud auth print-access-token $(account_flag) >/dev/null 2>&1; then
+    echo "[e2e-cloud] ERROR: identity preflight failed for ${GCP_ACCOUNT:-(ambient gcloud)} (source: ${FRESHELL_GCP_IDENTITY_SOURCE:-unresolved}) - gcloud auth print-access-token could not mint a token." >&2
+    echo "[e2e-cloud] Fix the credential/identity (docs/development/gcloud-robot.md) and re-run the lane." >&2
+    exit 1
+  fi
+}
+
 usage() {
   cat <<'EOF'
 Usage: scripts/e2e-cloud.sh [subcommand] [flags] [playwright-args...]
@@ -188,9 +210,13 @@ Environment:
 Identity (cloud lanes only — details: docs/development/gcloud-robot.md):
   Cloud subcommands resolve a gcloud identity lazily, in this order:
   --account= > FRESHELL_GCP_ACCOUNT > GCLOUD_IDENT > gcloud-robot probe
-  (needs GCLOUD_ROBOT_HOME, the installed gcloud-robot skill directory)
+  (via GCLOUD_ROBOT_HOME, or the first well-known gcloud-robot skill
+  install: ~/.codex/skills/gcloud-robot, ~/.claude/skills/gcloud-robot,
+  ~/code/skill-gcloud-robot/gcloud-robot)
   > ambient gcloud (one quiet stderr note). GCLOUD_ROBOT_REQUIRE=1 fails
-  closed with guidance instead of the ambient fallback.
+  closed with guidance instead of the ambient fallback. Non-TTY (agent)
+  invocations disable gcloud prompts and preflight the credential, so a
+  dead identity fails in seconds instead of hanging.
 
 Cloud job lifecycle: each cloud run creates its OWN unique job
 (<prefix>-<commit>[-dirty]-<random>), executes it, and deletes it
@@ -243,6 +269,7 @@ cmd_build() {
   # never at script top — help and local-only paths must keep working with
   # zero GCP tooling. Probe = the lane's gating permission.
   freshell_resolve_cloud_identity "cloudbuild.builds.create"
+  identity_preflight
 
   # Content-addressed tag (see image_tag_for_head): the only tag `run` pins.
   local tag remote_base build_commit
@@ -252,6 +279,15 @@ cmd_build() {
   if ! [[ "$build_commit" =~ ^[0-9a-f]{40}$ ]]; then
     echo "[e2e-cloud] ERROR: HEAD is not a lowercase 40-hex commit: $build_commit" >&2
     exit 1
+  fi
+
+  # kata e83z (delta review F2): a direct `build` computes the same `-dirty`
+  # sentinel tag the run lane warns about — surface it loudly HERE too, so
+  # the direct build path leads its build work with the same WARNING shape
+  # (cmd_run's own WARNING stays put; its rebuild path re-enters here and the
+  # first occurrence is what the ordering checks pin).
+  if [[ "$tag" == *-dirty ]]; then
+    echo "[e2e-cloud] WARNING: dirty worktree - image tag ${tag} is not content-addressed; this build bakes the uncommitted tree and the result is not reusable."
   fi
 
   if $local_build; then
@@ -306,6 +342,7 @@ cmd_push() {
   # A standalone `push` reaches gcloud without passing through cmd_build;
   # resolve idempotently (free when cmd_build already did).
   freshell_resolve_cloud_identity "cloudbuild.builds.create"
+  identity_preflight
 
   # Ensure the Artifact Registry repo exists
   if ! gcloud artifacts repositories describe $(gcloud_artifacts_flags) "$GCP_REPO" &>/dev/null; then
@@ -447,18 +484,27 @@ cmd_run() {
   done
 
   # Resolve backend: explicit flags override env var; env var defaults to local.
+  # backend_source records HOW the lane was chosen (flag / env / default) —
+  # the banner prints the RESOLVED lane and its selection source, never the
+  # raw env value, which misleads when a flag overrides it.
+  local backend_source="default"
   if $cloud_mode; then
     local_mode=false
+    backend_source="flag --cloud"
   elif $local_mode; then
-    : # local_mode already true
+    backend_source="flag --local"
   elif [ "${FRESHELL_E2E_BACKEND:-local}" = "cloud" ]; then
     cloud_mode=true
+    backend_source="env FRESHELL_E2E_BACKEND=cloud"
   else
     local_mode=true
+    if [ -n "${FRESHELL_E2E_BACKEND:-}" ]; then
+      backend_source="env FRESHELL_E2E_BACKEND=$FRESHELL_E2E_BACKEND"
+    fi
   fi
 
   if $local_mode; then
-    echo "[e2e-cloud] Running locally..."
+    echo "[e2e-cloud] Running locally... (config: test/e2e-browser/playwright.config.ts; CLOUD_SKIP_SPECS does not apply on this lane; backend=local; source: ${backend_source})"
     cd "$ROOT"
     exec npx playwright test \
       --config test/e2e-browser/playwright.config.ts \
@@ -470,6 +516,7 @@ cmd_run() {
   # so the local lane stays free of GCP tooling and of the ladder's
   # stderr note.
   freshell_resolve_cloud_identity "run.jobs.run"
+  identity_preflight
 
   # Recompute the remote ref with potentially overridden GCP settings —
   # COMMIT-ADDRESSED, never mutable :latest (see image_tag_for_head): the
@@ -478,6 +525,16 @@ cmd_run() {
   local image_tag
   image_tag="$(image_tag_for_head)"
   IMAGE_REMOTE="${GCP_REGION}-docker.pkg.dev/${GCP_PROJECT}/${GCP_REPO}/${IMAGE_NAME}:${image_tag}"
+
+  # kata e83z: lead the lane output with identity attribution and loud
+  # dirty-tree state, BEFORE the image-lookup/rebuild decision below — the
+  # decision can run a ~13-minute build, and these lines must not trail it.
+  # The mid-run dirty line inside the decision block and the `Running on
+  # Cloud Run Jobs...` block below keep their existing positions.
+  if [[ "$image_tag" == *-dirty ]]; then
+    echo "[e2e-cloud] WARNING: dirty worktree - image tag ${image_tag} is not content-addressed; this run cold-rebuilds the image (~13 min) and the result is not reusable."
+  fi
+  echo "[e2e-cloud] Identity: ${GCP_ACCOUNT:-(ambient gcloud)} (source: ${FRESHELL_GCP_IDENTITY_SOURCE:-unresolved})"
 
   # Cloud mode
   if $force_build; then
@@ -513,6 +570,7 @@ cmd_run() {
   echo "[e2e-cloud]   Shards:  $shards"
   echo "[e2e-cloud]   Timeout: $timeout"
   echo "[e2e-cloud]   Args:    ${pw_args[*]}"
+  echo "[e2e-cloud]   Config:  test/e2e-browser/playwright.cloud.config.ts (CLOUD_SKIP_SPECS testIgnore + CLOUD_SKIP_TITLES grepInvert apply on this lane)"
 
   # Build a YAML env-vars file for this run's Cloud Run Job.
   # We use --env-vars-file (YAML) instead of --set-env-vars because
@@ -814,6 +872,7 @@ cmd_logs() {
   # logs is a cloud-only lane (executions list + logs read); resolve after
   # parsing so an explicit pin short-circuits the ladder.
   freshell_resolve_cloud_identity "run.jobs.run"
+  identity_preflight
 
   local execution_id
   execution_id=$(gcloud run jobs executions list $(gcloud_flags) \

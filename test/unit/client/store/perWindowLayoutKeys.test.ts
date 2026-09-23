@@ -65,6 +65,7 @@ async function bootFreshModules(): Promise<void> {
 
 describe('per-window layout keys', () => {
   beforeEach(() => {
+    vi.resetModules()
     localStorage.clear()
     sessionStorage.clear()
     // The prune sweep (e3r1 finding 5) runs at every migration boot with the

@@ -24,6 +24,7 @@ import {
   repairCodexIdentityMismatch,
   resetPaneForReconcileCreate,
   setPaneCrashTrace,
+  setPaneLaunchFailure,
   clearPaneCrashTrace,
   splitPane,
   updatePaneContent,
@@ -31,6 +32,13 @@ import {
 } from '@/store/panesSlice'
 import { buildReconcileRequestForPanes, foldVerdicts } from '@/lib/pane-reconcile'
 import type { PaneReconcileRequest } from '@shared/ws-protocol'
+import {
+  derivePaneOwnerDivergence,
+  deriveTerminalOwnerConvergence,
+  resolveCanonicalPaneSession,
+  selectPaneOwnerFence,
+  selectSessionRuntimeOwner,
+} from '@/store/selectors/runtimeOwner'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
 import { recordPaneTabActivity } from '@/store/tabRecencySlice'
 import { updateSettingsLocal } from '@/store/settingsSlice'
@@ -49,12 +57,16 @@ import {
   selectResumeCycles,
 } from '@/store/terminalLifecycleSlice'
 import { TerminalExitBanner } from '@/components/TerminalExitBanner'
+import { TerminalLaunchFailureCard } from '@/components/TerminalLaunchFailureCard'
+import { FencedOwnerRecoveryActions, SessionHandoffErrorBanner } from '@/components/SessionHandoffErrorBanner'
+import { buildResumeContent, freshSessionTypeForPaneFlavor } from '@/lib/session-type-utils'
+import type { LaunchFailure } from '@/store/paneTypes'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { focusNextTerminalSearchMatch, focusPreviousTerminalSearchMatch, loadTerminalSearch } from '@/store/terminalDirectoryThunks'
 import { isFatalConnectionErrorCode } from '@/store/connectionSlice'
 import { flushPersistedLayoutNow } from '@/store/persistControl'
 import { getWsClient, RECONCILE_VERDICT_WAIT_MS } from '@/lib/ws-client'
-import { sendTerminalKill } from '@/lib/terminal-kill'
+import { resolveTerminalKillFence, sendTerminalKill } from '@/lib/terminal-kill'
 import { getTerminalTheme } from '@/lib/terminal-themes'
 import {
   buildCodexIdentityMismatchRepairContent,
@@ -780,6 +792,97 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   const isTerminal = paneContent.kind === 'terminal'
   const terminalContent = isTerminal ? paneContent : null
 
+  // kata b8ke (round-1 review: convergence is bidirectional): a TERMINAL
+  // pane observing a FRESH-AGENT owner for its canonical session — the
+  // session was handed to a fresh-agent runtime and this pane's terminal was
+  // reaped by the handoff. Subscribe to the record (a stable store
+  // reference) and derive the divergence locally (the FreshAgentView
+  // contract, mirrored); while divergent the pane stops treating its dead
+  // terminal as live (no attach / auto-reattach attempts) and Task 9's
+  // terminal-side recovery card renders with the direct "Open as Fresh
+  // Agent here" action.
+  const terminalRuntimeOwner = useAppSelector((s) => {
+    // b8ke ext r7 F3: the pane's identity resolves through the stored
+    // rekey alias chain to the CANONICAL key (the same resolver the
+    // Fresh Agent panes use) — a terminal pane holding the pre-rekey
+    // sessionRef observes the canonical record's CURRENT state, never the
+    // old key's frozen mirror (pre-r7 a later canonical-only transition
+    // left the pane on the stale mirror's owner state).
+    if (!terminalContent?.sessionRef) return undefined
+    const canonical = resolveCanonicalPaneSession(s, terminalContent)
+    return canonical
+      ? selectSessionRuntimeOwner(s, canonical.provider, canonical.sessionId)
+      : undefined
+  })
+  const freshAgentOwnerDivergence = derivePaneOwnerDivergence(terminalRuntimeOwner, 'terminal')
+  const freshAgentOwnerDivergenceRef = useRef(freshAgentOwnerDivergence)
+  freshAgentOwnerDivergenceRef.current = freshAgentOwnerDivergence
+
+  // b8ke ext r11 F2: the SAME-KIND TERMINAL convergence — a handoff
+  // committed a NEW terminal owner for this pane's canonical session while
+  // this pane's own runtime is dead or absent (the prior-reap exited it
+  // and the exit cleared the stored terminal id). Pre-r11 the committed
+  // broadcast produced NOTHING here: the same-kind early-return is null,
+  // so a terminal pane on another device stayed exited after a
+  // Fresh Agent → CLI handoff with no automatic attachment. The gate is
+  // the pane's OWN terminal: dead/absent converges (adopt-and-attach the
+  // authoritative runtime); still-RUNNING never steals the pane off its
+  // live terminal. The cross-kind divergence owns the pane when a
+  // fresh-agent runtime holds the session instead.
+  // The gate is the pane's DEAD state (status exited — the exit cleared
+  // the stored terminal id): a CREATING pane legitimately holds no terminal
+  // id yet and the ordinary lifecycle flow owns it; a RUNNING pane is never
+  // stolen off its own live terminal.
+  const ownTerminalDeadOrAbsent = isTerminal && terminalContent?.status === 'exited'
+  const terminalOwnerConvergence = ownTerminalDeadOrAbsent
+    && freshAgentOwnerDivergence === null
+    ? deriveTerminalOwnerConvergence(terminalRuntimeOwner, terminalContent?.terminalId)
+    : null
+  const terminalOwnerConvergenceRef = useRef(terminalOwnerConvergence)
+  terminalOwnerConvergenceRef.current = terminalOwnerConvergence
+  const terminalConvergenceAdoptedRef = useRef<string | null>(null)
+
+  // b8ke ext r11 F2: the convergence effect — the committed same-kind
+  // owner broadcast drives the pane onto the new authoritative terminal.
+  // The dependencies carry the OWNER GENERATION and the owner TERMINAL ID
+  // (the reviewer's exact lifecycle-effect gap: pre-r11 the broadcast
+  // changed neither the pane's terminal id nor any lifecycle dep, so a
+  // terminal pane on another device stayed exited). One adoption per
+  // owner terminal id: the fold points the pane at the live terminal
+  // (terminalId + status running + the reconcileEpoch bump — the
+  // lifecycle effect's ONLY re-fire signal), which re-fires the attach
+  // branch onto the new runtime. If the adopted handle dies in the race,
+  // the ordinary INVALID_TERMINAL_ID reconnect owns the recovery — never
+  // a loop.
+  const terminalOwnerConvergenceTarget = terminalOwnerConvergence?.terminalId
+  const terminalOwnerConvergenceGeneration = terminalOwnerConvergence?.generation
+  useEffect(() => {
+    if (!isTerminal) return
+    if (!terminalOwnerConvergenceTarget) return
+    if (terminalConvergenceAdoptedRef.current === terminalOwnerConvergenceTarget) return
+    terminalConvergenceAdoptedRef.current = terminalOwnerConvergenceTarget
+    log.info('converging onto the committed same-kind terminal owner', {
+      paneId,
+      terminalId: terminalOwnerConvergenceTarget,
+      ownerGeneration: terminalOwnerConvergenceGeneration,
+    })
+    dispatch(applyReattachToLiveTerminal({
+      tabId,
+      paneId,
+      terminalId: terminalOwnerConvergenceTarget,
+    }))
+  }, [
+    isTerminal,
+    paneId,
+    tabId,
+    dispatch,
+    // The owner generation + terminal id ARE the trigger: a NEW committed
+    // owner (a fresh generation naming a fresh terminal) re-converges the
+    // pane; a same-id re-broadcast never double-adopts.
+    terminalOwnerConvergenceTarget,
+    terminalOwnerConvergenceGeneration,
+  ])
+
   // Register live terminal text reader for Stream Deck previews (classic tile style)
   useTerminalTextRegistration(terminalContent?.terminalId, termRef)
 
@@ -805,6 +908,29 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // Refs for terminal lifecycle (only meaningful if isTerminal)
   // CRITICAL: Use refs to avoid callback/effect dependency on changing content
   const requestIdRef = useRef<string>(terminalContent?.createRequestId || '')
+  // b8ke ext r35 F1: the PER-REQUEST observed-fence capture — the pair the
+  // request's FIRST send observed, REUSED by every automatic resend of the
+  // SAME request id (rate-limit backoff, launch-interrupted, the
+  // SESSION_RESERVED bounded re-drive, the INVALID_TERMINAL_ID pump). An
+  // automatic retry must never silently substitute a current fence for the
+  // original observation (pre-r35 every sendCreate re-read the record: a
+  // gen-5 request refused after another device advanced the record to
+  // gen 9 was resent with the refreshed gen-9 pair — and since failed
+  // creates leave the server's dedupe state and a gen-9 Vacant grants a
+  // gen-9 claim, the old request recreated a terminal the newer lifecycle
+  // had explicitly stopped). The ORIGINAL pair flows either way honestly:
+  // still current → the retry proceeds; stale → the server refuses it
+  // typed (the delayed-request safety net) and the recovery state
+  // surfaces. The capture key includes the pane's reconcileEpoch — the
+  // failure card's user-initiated Retry launch (resetPaneForReconcileCreate)
+  // bumps the epoch as its ONLY re-fire signal, so that NEW lifecycle
+  // decision captures a FRESH fence while every automatic retry (no bump)
+  // reuses the original pair.
+  const requestFenceRef = useRef<{
+    requestId: string
+    reconcileEpoch: number | undefined
+    fence: ReturnType<typeof selectPaneOwnerFence>
+  } | null>(null)
   const terminalIdRef = useRef<string | undefined>(terminalContent?.terminalId)
   const seqStateRef = useRef<AttachSeqState>(createAttachSeqState())
   const parserAppliedSeqRef = useRef(0)
@@ -2844,6 +2970,21 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     opts?: AttachTerminalOptions,
   ) => {
     if (suppressNetworkEffects) return
+    // kata b8ke (round-1 review — convergence is bidirectional): while the
+    // canonical session's runtime owner is a FRESH-AGENT runtime, this pane's
+    // terminal was reaped by the handoff — stop treating it as live. The
+    // single choke point covers every attach path (mount, transport
+    // reconnect, hydration pump grants, refresh attaches); same-mode
+    // multi-device attachment is untouched (a terminal owner never
+    // diverges a terminal pane).
+    if (freshAgentOwnerDivergenceRef.current !== null) {
+      log.debug('attach gate declined: the session is owned by a fresh-agent runtime', {
+        terminalId: tid,
+        paneId: paneIdRef.current,
+        intent,
+      })
+      return
+    }
     // Never attach a terminal the layouts no longer reference: the layout-diff
     // middleware can only release subscriptions it saw acquired. Covers the
     // close-during-create race and stale deferred re-attach timers.
@@ -3032,6 +3173,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       sinceSeq,
       attachRequestId,
       priority: opts?.priority ?? 'foreground',
+      // b8ke ext r8 F2: the attach carries the pane's observed ownership
+      // fence — terminal.attach participates in the coordinator (a queued
+      // cross-device attach is generation-fenced server-side).
+      ownerFence: selectPaneOwnerFence(appStore.getState(), contentRef.current ?? {}) ?? undefined,
       ...(opts?.maxReplayBytes ? { maxReplayBytes: opts.maxReplayBytes } : {}),
       ...(claimSurfaceReset ? { surfaceReset: true } : {}),
     }))
@@ -3360,6 +3505,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         mode,
         recoveryIntent,
       })
+      // kata b8ke (round-2 review): the delayed-request fence — the observed
+      // (epoch, generation) pair read from the runtime-owner record at the
+      // request's FIRST send, so every automatic resend of the SAME request
+      // id carries the SAME original pair. b8ke ext r35 F1: the capture is
+      // PER-REQUEST — an automatic re-drive must never carry a refreshed
+      // fence over the original observation (the reviewer's class: a
+      // silently-substituted current fence defeats the server's
+      // stale-generation safety net and can recreate what a newer lifecycle
+      // stopped). Read once per request id, sent on every send.
+      let ownerFence: ReturnType<typeof selectPaneOwnerFence>
+      const reconcileEpoch = contentRef.current?.reconcileEpoch
+      if (
+        requestFenceRef.current?.requestId === requestId
+        && requestFenceRef.current.reconcileEpoch === reconcileEpoch
+      ) {
+        ownerFence = requestFenceRef.current.fence
+      } else {
+        ownerFence = selectPaneOwnerFence(appStore.getState(), contentRef.current ?? {})
+        requestFenceRef.current = { requestId, reconcileEpoch, fence: ownerFence }
+      }
       ws.send({
         type: 'terminal.create',
         requestId,
@@ -3369,6 +3534,7 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         ...(!recoveryIntent && createSessionState.sessionRef ? { sessionRef: createSessionState.sessionRef } : {}),
         ...(!recoveryIntent && createSessionState.codexDurability ? { codexDurability: createSessionState.codexDurability } : {}),
         ...(!recoveryIntent && createSessionState.liveTerminal ? { liveTerminal: createSessionState.liveTerminal } : {}),
+        ...(ownerFence ? { observedEpoch: ownerFence.epoch, observedGeneration: ownerFence.generation } : {}),
         tabId,
         paneId: paneIdRef.current,
         ...(restore ? { restore: true } : {}),
@@ -3475,7 +3641,16 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       lastSentViewportRef.current = null
       applySeqState(createAttachSeqState())
       writeLocalXtermNotice(term, '\r\n[Restarting OpenCode session because the saved terminal replay is no longer available]\r\n')
-      sendTerminalKill(terminalId)
+      // b8ke ext r20 F2: the replacement kill carries the session's
+      // observed (epoch, generation) pair — a reconnect-queued stale
+      // kill is typed-refused instead of killing a newer owner.
+      sendTerminalKill(
+        terminalId,
+        resolveTerminalKillFence(appStore, {
+          provider: sessionRef?.provider,
+          sessionRef: sessionRef ?? undefined,
+        }),
+      )
       return true
     }
 
@@ -4550,6 +4725,9 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             serverInstanceId: serverInstanceIdRef.current,
             streamId: undefined,
             status: 'running',
+            // kata b8ke: the create anchored — any typed launch failure is
+            // resolved (the card must not outlive its recovery).
+            launchFailure: undefined,
             ...(createdCwd && !contentRef.current?.initialCwd ? { initialCwd: createdCwd } : {}),
             // Resume-validation: the notice names a stale resume id the server
             // dropped — clear the persisted refs so codex/opencode gate-fired
@@ -5015,6 +5193,24 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         }
 
         if (msg.type === 'error' && msg.code === 'SESSION_RESERVED' && reqId && msg.requestId === reqId) {
+          // kata b8ke: a TYPED refusal (the coordinator named the owner via
+          // the additive fields) also folds the recoverable launch-failure
+          // card — the user sees the in-flight state with a manual Retry
+          // while the automatic bounded re-drive keeps running underneath.
+          // The untyped legacy shape keeps its notice-only behavior.
+          if (msg.ownerKind !== undefined) {
+            dispatch(setPaneLaunchFailure({
+              tabId,
+              paneId: paneIdRef.current,
+              failure: {
+                code: 'SESSION_RESERVED',
+                message: msg.message || 'Another session start for this conversation is in flight.',
+                retryable: true,
+                ...(msg.ownerKind !== undefined ? { ownerKind: msg.ownerKind } : {}),
+                ...(typeof msg.ownerGeneration === 'number' ? { ownerGeneration: msg.ownerGeneration } : {}),
+              },
+            }))
+          }
           // Another create holds this sessionRef's lease. Re-drive the SAME
           // terminal.create after the server's hint (floored), bounded by a
           // wall-clock window; on exhaustion, auto-resolve via a single-pane
@@ -5024,6 +5220,29 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         }
 
         if (msg.type === 'error' && msg.requestId === reqId) {
+          // b8ke ext r16 F3: the TYPED missing-session refusal — the
+          // durable session is gone, NOTHING was started (no automatic
+          // substitution). The pane lands the typed recoverable missing
+          // state; the card's explicit "Start fresh" action is the ONLY
+          // new-session path (operator-initiated, clearly a new
+          // conversation — never a resume).
+          if (msg.code === 'SESSION_MISSING') {
+            launchAttemptRef.current = null
+            clearRateLimitRetry()
+            setIsAttaching(false)
+            dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
+            updateContent({
+              status: 'error',
+              streamId: undefined,
+              launchFailure: {
+                code: 'SESSION_MISSING',
+                message: msg.message || `The durable session is gone. No replacement was started.`,
+                retryable: false,
+              },
+            })
+            writeLocalXtermNotice(term, `\r\n[Resume failed] ${msg.message || msg.code}\r\n`)
+            return
+          }
           // D7-refusal revival (reconnect-revive Task 7): the create was
           // refused because the session is STILL RUNNING under the named
           // terminal — reattach the pane to it instead of dead-ending on
@@ -5039,6 +5258,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
             && typeof reqId === 'string'
             && typeof msg.liveTerminalId === 'string'
             && reviveAttemptedRef.current !== reqId
+            // kata b8ke: never revive onto a live handle whose session a
+            // fresh-agent runtime now owns — the handoff reaped this pane's
+            // kind; the divergence state (Task 9's card) owns the recovery.
+            && freshAgentOwnerDivergenceRef.current === null
           ) {
             reviveAttemptedRef.current = reqId
             dispatch(applyReattachToLiveTerminal({
@@ -5062,9 +5285,26 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           clearRateLimitRetry()
           setIsAttaching(false)
           dispatch(clearPaneRuntimeActivity({ paneId: paneIdRef.current }))
+          // kata b8ke: a TYPED refusal (the additive owner fields on
+          // RESTORE_UNAVAILABLE and friends) folds the recoverable
+          // launch-failure state IN ADDITION to the frozen xterm notice —
+          // the card carries the attach/retry/open-as-fresh-agent actions.
+          // Rides the same updateContent (the ref-based merge would
+          // otherwise clobber it).
+          const typedLaunchFailure: LaunchFailure | undefined = msg.ownerKind !== undefined || typeof msg.ownerGeneration === 'number'
+            ? {
+              code: msg.code === 'RESTORE_UNAVAILABLE' ? 'RESTORE_UNAVAILABLE' : 'LAUNCH_FAILED',
+              message: msg.message || msg.code || 'The launch was refused.',
+              retryable: true,
+              ...(msg.ownerKind !== undefined ? { ownerKind: msg.ownerKind } : {}),
+              ...(typeof msg.ownerGeneration === 'number' ? { ownerGeneration: msg.ownerGeneration } : {}),
+              ...(typeof msg.liveTerminalId === 'string' ? { terminalId: msg.liveTerminalId } : {}),
+            }
+            : undefined
           updateContent({
             status: 'error',
             streamId: undefined,
+            ...(typedLaunchFailure ? { launchFailure: typedLaunchFailure } : {}),
             ...(launchAttempt?.recoveryIntent
               ? { restoreError: buildRestoreError('dead_live_handle') }
               : {}),
@@ -5495,7 +5735,12 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
         // branch. A died-before-attach target heals through the ordinary
         // INVALID_TERMINAL_ID reconnect (dead-live-handle recovery or a
         // resume create).
-        const reattachTarget = consumeRecoveredLiveTerminalTarget(tabId, paneIdRef.current)
+        // kata b8ke: while the session is owned by a fresh-agent runtime the
+        // reattach target is NOT consumed — the terminal was reaped by the
+        // handoff (the target stays armed for a later non-divergent run).
+        const reattachTarget = freshAgentOwnerDivergenceRef.current === null
+          ? consumeRecoveredLiveTerminalTarget(tabId, paneIdRef.current)
+          : null
         if (reattachTarget) {
           dispatch(applyReattachToLiveTerminal({
             tabId,
@@ -5662,6 +5907,84 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     isAgentPane && (activeNotice || terminalContent.crashTrace || settledDead)
   )
 
+  // ── kata b8ke: typed recovery surfaces ──
+  // The reverse-direction divergence card (round-1 review: terminal panes
+  // converge too): the canonical session's runtime owner is a FRESH-AGENT
+  // runtime — this pane's terminal was reaped by the handoff. Handoff-started
+  // is NOT a live target (round-3 F15): the open action renders only on the
+  // committed owner event.
+  const freshOwnerDivergenceCommitted = freshAgentOwnerDivergence?.ownerKind === 'fresh-agent'
+    && freshAgentOwnerDivergence.transition === 'handoff-committed'
+
+  const openAsFreshAgentHere = () => {
+    const sessionRef = terminalContent.sessionRef
+    if (!sessionRef) return
+    const sessionType = freshSessionTypeForPaneFlavor(tab, terminalContent)
+    if (!sessionType) return
+    const providerSettings = appStore.getState().settings.settings.freshAgent?.providers?.[sessionType]
+    // b8ke ext r16 F5: the action resolves the CANONICAL key through the
+    // alias chain (the same resolver the owner selection uses) before
+    // issuing the lifecycle start — a cross-device pane retaining the
+    // pre-rekey reference would otherwise start the lifecycle on the
+    // retired key, which the coordinator refuses with REKEYED_ALIAS_KEY
+    // (the direct-attach action could never attach to the canonical owner
+    // it just displayed).
+    const state = appStore.getState()
+    const canonical = resolveCanonicalPaneSession(state, terminalContent)
+    const sessionId = canonical?.sessionId ?? sessionRef.sessionId
+    dispatch(updatePaneContent({
+      tabId,
+      paneId,
+      content: buildResumeContent({
+        sessionType,
+        sessionId,
+        cwd: terminalContent.initialCwd,
+        ...(providerSettings ? { freshAgentProviderSettings: providerSettings } : {}),
+      }),
+    }))
+  }
+
+  // The typed launch-failure card: rendered only while NOT divergent — the
+  // live owner record (the divergence card) is the authoritative surface
+  // when both would show.
+  const typedLaunchFailure = freshAgentOwnerDivergence === null
+    ? terminalContent.launchFailure
+    : undefined
+
+  const retryLaunch = () => {
+    // The Relaunch discipline: a reconcile-driven respawn create re-fires
+    // the lifecycle effect (the reconcileEpoch bump is its ONLY re-fire
+    // signal — createRequestId is preserved, never re-minted).
+    dispatch(resetPaneForReconcileCreate({
+      tabId,
+      paneId,
+      intent: 'respawn',
+      sessionRef: terminalContent.sessionRef,
+    }))
+  }
+
+  const attachToNamedTerminal = () => {
+    const terminalId = terminalContent.launchFailure?.terminalId
+    if (!terminalId) return
+    dispatch(applyReattachToLiveTerminal({ tabId, paneId, terminalId }))
+  }
+
+  // b8ke ext r16 F3: the typed missing state's explicit START-FRESH
+  // action — the ONLY new-session path (operator-initiated, clearly a NEW
+  // conversation, never a resume). The stale sessionRef is cleared (a
+  // fresh create spawns identity-less) and the reconcileEpoch bump
+  // re-fires the lifecycle effect into a genuinely new create.
+  const startFreshConversation = () => {
+    dispatch(resetPaneForReconcileCreate({
+      tabId,
+      paneId,
+      // 'fresh' clears sessionRef/resumeSessionId/codexDurability — a
+      // genuinely new identity-less conversation.
+      intent: 'fresh',
+      reason: 'session_missing',
+    }))
+  }
+
   return (
     <div
       ref={wrapperRef}
@@ -5687,6 +6010,87 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           className="pointer-events-none absolute inset-x-0 top-0 z-10 bg-amber-100/90 px-3 py-1 text-xs text-amber-900 dark:bg-amber-900/80 dark:text-amber-100"
         >
           {freshByRaceNotice}
+        </div>
+      ) : null}
+      {freshAgentOwnerDivergence?.fencedReason !== undefined ? (
+        <div
+          role="alert"
+          data-testid="terminal-owner-fenced-card"
+          aria-label="Session blocked pending recovery"
+          className="pointer-events-auto absolute inset-x-0 top-0 z-20 m-2 flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
+        >
+          <span>
+            {`This conversation is blocked pending recovery (${freshAgentOwnerDivergence.fencedReason}).`}
+          </span>
+          {/* b8ke ext r28 F2: the direct recovery actions — the same
+           * acknowledged force-clear / acknowledged-start set the Fresh
+           * Agent card renders (never a passive card). */}
+          <FencedOwnerRecoveryActions
+            fencedReason={freshAgentOwnerDivergence.fencedReason}
+            appStore={appStore}
+            tabId={tabId}
+            paneId={paneId}
+          />
+        </div>
+      ) : freshAgentOwnerDivergence?.ownerKind === 'fresh-agent' ? (
+        <div
+          role="alert"
+          data-testid="terminal-owner-divergence-card"
+          aria-label="Session open as a Fresh Agent pane on another device"
+          className="pointer-events-auto absolute inset-x-0 top-0 z-20 m-2 flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
+        >
+          <span>
+            {freshOwnerDivergenceCommitted
+              ? 'This conversation is open as a Fresh Agent pane on another device.'
+              : 'This conversation is being reopened as a Fresh Agent pane elsewhere…'}
+          </span>
+          {freshOwnerDivergenceCommitted && terminalContent.sessionRef ? (
+            <button
+              type="button"
+              className="shrink-0 rounded border border-border/70 px-2 py-1 text-xs"
+              aria-label="Open as Fresh Agent here"
+              onClick={openAsFreshAgentHere}
+            >
+              Open as Fresh Agent here
+            </button>
+          ) : null}
+        </div>
+      ) : freshAgentOwnerDivergence?.inProgress ? (
+        // b8ke focused round-5 R5-3: a SAME-KIND in-progress lifecycle
+        // transition (the ready-replay fold of starting/handoff/stopping,
+        // or a live handoff-started broadcast naming this pane's kind) is
+        // transition-blocked: the pane shows the transition state and
+        // suspends its normal attach/polling until it settles.
+        <div
+          role="alert"
+          data-testid="terminal-owner-transition-card"
+          aria-label="Session transition in progress"
+          className="pointer-events-auto absolute inset-x-0 top-0 z-20 m-2 flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 px-3 py-2 text-sm"
+        >
+          <span>This conversation is being reopened elsewhere…</span>
+        </div>
+      ) : null}
+      {typedLaunchFailure ? (
+        <TerminalLaunchFailureCard
+          failure={typedLaunchFailure}
+          onRetry={retryLaunch}
+          onAttach={typedLaunchFailure.terminalId !== undefined ? attachToNamedTerminal : undefined}
+          onOpenFresh={typedLaunchFailure.ownerKind === 'fresh-agent' && terminalContent.sessionRef
+            ? openAsFreshAgentHere
+            : undefined}
+          onStartFresh={typedLaunchFailure.code === 'SESSION_MISSING'
+            ? startFreshConversation
+            : undefined}
+        />
+      ) : null}
+      {terminalContent.handoffError ? (
+        <div className="pointer-events-auto absolute inset-x-0 bottom-14 z-20 mx-2">
+          <SessionHandoffErrorBanner
+            error={terminalContent.handoffError}
+            appStore={appStore}
+            tabId={tabId}
+            paneId={paneId}
+          />
         </div>
       ) : null}
       {isMobile && (

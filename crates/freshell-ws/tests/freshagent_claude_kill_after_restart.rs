@@ -171,6 +171,9 @@ impl PaneIdentitySink for TestLedgerSink {
                     effort: upsert.settings.effort.as_deref(),
                     supersedes: upsert.supersedes.as_deref(),
                     provenance: freshell_ws::pane_ledger::ProvenancePolicy::Inherit,
+                    observed_epoch: None,
+                    observed_generation: None,
+                    authoritative: upsert.authoritative,
                     now_ms: now,
                 };
                 ledger.record_fresh_agent_binding(&w)?;
@@ -206,6 +209,24 @@ impl PaneIdentitySink for TestLedgerSink {
             tokio::task::spawn_blocking(move || {
                 let payload = serde_json::to_value(&record).map_err(std::io::Error::other)?;
                 ledger.record_rollback_row(&p, &s, &payload, TestLedgerSink::now_ms())
+            })
+            .await
+            .map_err(std::io::Error::other)?
+        })
+    }
+    fn repair_failed_transition(
+        &self,
+        provider: &str,
+        session_id: &str,
+        epoch: u64,
+        generation: u64,
+    ) -> SinkWrite {
+        let ledger = self.ledger.clone();
+        let (p, s) = (provider.to_string(), session_id.to_string());
+        let now = Self::now_ms();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                ledger.repair_failed_transition_binding(&p, &s, epoch, generation, now)
             })
             .await
             .map_err(std::io::Error::other)?
@@ -404,6 +425,8 @@ fn new_generation(
 fn create_msg_resume(request_id: &str, durable: &str) -> FreshAgentCreate {
     FreshAgentCreate {
         naming_handle: None,
+        observed_epoch: None,
+        observed_generation: None,
         request_id: request_id.to_string(),
         session_type: SessionType::Freshclaude,
         provider: Some(AgentProvider::Claude),
@@ -426,6 +449,8 @@ fn create_msg_resume(request_id: &str, durable: &str) -> FreshAgentCreate {
 
 fn attach_msg(seat: &str, durable: &str) -> FreshAgentAttach {
     FreshAgentAttach {
+        observed_epoch: None,
+        observed_generation: None,
         provider: AgentProvider::Claude,
         session_id: seat.to_string(),
         session_type: SessionType::Freshclaude,
@@ -440,6 +465,8 @@ fn attach_msg(seat: &str, durable: &str) -> FreshAgentAttach {
 
 fn kill_msg(session_id: &str) -> FreshAgentKill {
     FreshAgentKill {
+        observed_epoch: None,
+        observed_generation: None,
         provider: AgentProvider::Claude,
         session_id: session_id.to_string(),
         session_type: SessionType::Freshclaude,

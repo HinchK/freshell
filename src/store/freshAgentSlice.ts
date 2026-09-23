@@ -5,6 +5,7 @@ import {
   type FreshAgentSessionType,
 } from '@shared/fresh-agent'
 import type { FreshAgentSnapshot } from '@shared/fresh-agent-contract'
+import type { SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import type {
   FreshAgentContentBlock,
   FreshAgentPermissionRequest,
@@ -36,6 +37,7 @@ const initialState: FreshAgentState = {
   pendingCreates: {},
   pendingCreateFailures: {},
   availableModels: [],
+  runtimeOwners: {},
 }
 
 function sessionKey(locator: FreshAgentSessionPayload): string {
@@ -526,6 +528,9 @@ const freshAgentSlice = createSlice({
         code: action.payload.code,
         message: action.payload.message,
         retryable: action.payload.retryable,
+        ...(action.payload.ownerKind !== undefined ? { ownerKind: action.payload.ownerKind } : {}),
+        ...(action.payload.ownerGeneration !== undefined ? { ownerGeneration: action.payload.ownerGeneration } : {}),
+        ...(action.payload.ownerEpoch !== undefined ? { ownerEpoch: action.payload.ownerEpoch } : {}),
       }
     },
 
@@ -657,6 +662,81 @@ const freshAgentSlice = createSlice({
       if (!key) return
       writeSessionStatus(state.sessions[key], 'exited')
     },
+
+    /**
+     * kata b8ke: fold one `session.runtimeOwner` broadcast (or ready-replay
+     * entry) into the per-(provider, sessionId) owner record. Epoch-aware
+     * monotonic fold (round-2 review): within the SAME epoch, older
+     * generations are ignored — but a frame from a DIFFERENT epoch always
+     * wins (a restarted server's generation 1 beats a pre-restart 10).
+     * Same-epoch/same-generation frames are ALWAYS applied — the corrective
+     * handoff-failed/released frames arrive at the same generation as the
+     * transition they supersede, and the fold never drops them.
+     */
+    applyRuntimeOwner(state, action: PayloadAction<SessionRuntimeOwnerMessage>) {
+      const f = action.payload
+      const key = `${f.provider}:${f.sessionId}`
+      const existing = state.runtimeOwners[key]
+      if (existing && existing.epoch === f.epoch && f.generation < existing.generation) return
+      state.runtimeOwners[key] = {
+        provider: f.provider,
+        sessionId: f.sessionId,
+        epoch: f.epoch,
+        generation: f.generation,
+        ownerKind: f.ownerKind,
+        ...(f.previousKind !== undefined ? { previousKind: f.previousKind } : {}),
+        ...(f.terminalId !== undefined ? { terminalId: f.terminalId } : {}),
+        transition: f.transition,
+        ...(f.reason !== undefined ? { reason: f.reason } : {}),
+        ...(f.fenced !== undefined ? { fenced: f.fenced } : {}),
+        ...(f.aliasOf !== undefined ? { aliasOf: f.aliasOf } : {}),
+        updatedAt: Date.now(),
+      }
+    },
+
+    /**
+     * 2026-09-20 incident (Task 5): refresh the observed owner fence from a
+     * typed refusal itself — the REST snapshot 409 RESTORE_UNAVAILABLE always
+     * names the coordinator's CURRENT generation, which may be newer than
+     * the client's record (the pane loaded while the server was restarting
+     * and the record fold lagged). The refusal carries no epoch, so the
+     * existing record's epoch is PRESERVED (the record's epoch comes from
+     * the server's own runtime-owner broadcasts); only the generation
+     * advances. The fold is ADVANCE-ONLY (Task 5 review M1), matching the
+     * applyRuntimeOwner invariant: a newer broadcast (e.g. gen 3) may fold
+     * between the server minting the refusal (gen 2) and the client
+     * processing it — regressing to the refusal's older generation would
+     * send a stale fence the wired server refuses with FENCE_REQUIRED. An
+     * absent record is left absent: minting one would fabricate an epoch
+     * the client never observed — the recovery attach then goes out
+     * unfenced, the wired server refuses it typed, and the pane surfaces
+     * that honestly instead of the store lying about the boot epoch.
+     */
+    applyRefusalFence(state, action: PayloadAction<{
+      provider: string
+      sessionId: string
+      ownerKind: 'terminal' | 'fresh-agent'
+      ownerGeneration: number
+    }>) {
+      const refusal = action.payload
+      const key = `${refusal.provider}:${refusal.sessionId}`
+      const existing = state.runtimeOwners[key]
+      if (!existing) return
+      if (refusal.ownerGeneration < existing.generation) return
+      existing.generation = refusal.ownerGeneration
+      existing.updatedAt = Date.now()
+    },
+
+    /**
+     * kata b8ke (round-2 review): the ready handler dispatches this BEFORE
+     * folding the ready.runtimeOwners replay — the client resets its
+     * owner/generation state on every (re)connect so a restarted server's
+     * newer generations are never ignored in favor of stale pre-reconnect
+     * records.
+     */
+    resetRuntimeOwners(state) {
+      state.runtimeOwners = {}
+    },
   },
 })
 
@@ -666,6 +746,8 @@ export const {
   addQuestionRequest,
   addUserMessage,
   appendStreamDelta,
+  applyRuntimeOwner,
+  applyRefusalFence,
   clearPendingCreate,
   clearPendingCreateFailure,
   clearPendingCreateFailureForSession,
@@ -681,6 +763,7 @@ export const {
   removePermission,
   removeQuestion,
   removeSession,
+  resetRuntimeOwners,
   restoreRetryRequested,
   sessionCreated,
   sessionError,
@@ -697,5 +780,7 @@ export const {
   turnBodyReceived,
   turnResult,
 } = freshAgentSlice.actions
+
+export type { RuntimeOwnerRecord } from './freshAgentTypes'
 
 export default freshAgentSlice.reducer

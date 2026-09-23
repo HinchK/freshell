@@ -64,7 +64,12 @@ export function gateRollbackCommand(input: {
   return { kind: 'send' }
 }
 
-/** Builds the frozen contract-v8 rollback frame. `mode` absent means 'step'. */
+/** Builds the frozen contract-v8 rollback frame. `mode` absent means 'step'.
+ *
+ * b8ke ext r21 F2: the delayed-request fence — the observed (epoch,
+ * generation) pair rides the frame (the r8 F5 send/attach discipline), so
+ * a reconnect-replayed stale undo/redo landing after a crash + generation
+ * advance is typed-refused server-side, never an unfenced recreation. */
 export function buildRollbackFrame(input: {
   direction: 'undo' | 'redo'
   requestId: string
@@ -74,6 +79,8 @@ export function buildRollbackFrame(input: {
   cwd?: string
   mode?: 'step' | 'toTurn'
   turnId?: string
+  observedEpoch?: number
+  observedGeneration?: number
 }): Record<string, unknown> {
   return {
     type: input.direction === 'undo' ? 'freshAgent.undo' : 'freshAgent.redo',
@@ -84,6 +91,9 @@ export function buildRollbackFrame(input: {
     ...(input.cwd ? { cwd: input.cwd } : {}),
     ...(input.mode ? { mode: input.mode } : {}),
     ...(input.turnId ? { turnId: input.turnId } : {}),
+    ...(input.observedEpoch !== undefined && input.observedGeneration !== undefined
+      ? { observedEpoch: input.observedEpoch, observedGeneration: input.observedGeneration }
+      : {}),
   }
 }
 

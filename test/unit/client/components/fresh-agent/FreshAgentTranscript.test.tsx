@@ -3221,3 +3221,112 @@ describe('FreshAgentTranscript task delegation + retry folding', () => {
     })
   })
 })
+
+describe('PTY notification display role (opencode-pty plugin turns)', () => {
+  afterEach(() => cleanup())
+
+  const PTY_BLOCK = '<pty_exited>\nID: pty_d75e6fa9\nExit Code: 0\nTimed Out: no\nOutput Lines: 5\nLast Line: SYNC_EXIT=0\n</pty_exited>\n\nUse pty_read to check the full output.'
+
+  it('renders a <pty_exited> user-role turn as agent text, never You', () => {
+    const { container } = render(
+      <FreshAgentTranscript
+        turns={[
+          { id: 'u1', turnId: 'u1', role: 'user', summary: 'please run the gate', items: [{ id: 'u1-i', kind: 'text', text: 'please run the gate' }] },
+          { id: 'pty1', turnId: 'pty1', role: 'user', summary: PTY_BLOCK, items: [{ id: 'pty1-i', kind: 'text', text: PTY_BLOCK }] },
+          { id: 'a1', turnId: 'a1', role: 'assistant', summary: 'gate done', items: [{ id: 'a1-i', kind: 'text', text: 'gate done' }] },
+        ]}
+      />,
+    )
+
+    // The real human prompt is still user text: exactly one user article.
+    expect(screen.getByText('You')).toBeInTheDocument()
+    expect(container.querySelectorAll('article[data-turn-role="user"]')).toHaveLength(1)
+
+    // The PTY notification renders as agent text: assistant article, no You
+    // header inside it, and an Assistant header (preceded by a user turn).
+    // exact:false because the block renders as markdown paragraphs whose text
+    // is 'Last Line: SYNC_EXIT=0', not the bare token.
+    const ptyArticle = screen.getByText('SYNC_EXIT=0', { exact: false }).closest('article')
+    expect(ptyArticle).not.toBeNull()
+    expect(ptyArticle?.getAttribute('data-turn-role')).toBe('assistant')
+    expect(within(ptyArticle as HTMLElement).queryByText('You')).not.toBeInTheDocument()
+    expect(within(ptyArticle as HTMLElement).getByText('Assistant')).toBeInTheDocument()
+  })
+
+  it('renders <pty_exited> turn text through the markdown path, not as literal user text', () => {
+    const text = '<pty_exited>\n**sync finished**\n</pty_exited>'
+    const { container } = render(
+      <FreshAgentTranscript
+        turns={[{ id: 'pty1', turnId: 'pty1', role: 'user', summary: text, items: [{ id: 'pty1-i', kind: 'text', text }] }]}
+      />,
+    )
+
+    // markdown={!isUser}: the reclassified turn's **…** renders as <strong>.
+    expect(container.querySelector('article[data-turn-role="assistant"] strong')).not.toBeNull()
+  })
+
+  it('folds a <pty_exited> turn as a continuation of a preceding assistant turn', () => {
+    const { container } = render(
+      <FreshAgentTranscript
+        agentLabel="Freshopencode"
+        turns={[
+          { id: 'a1', turnId: 'a1', role: 'assistant', summary: 'first answer', items: [{ id: 'a1-i', kind: 'text', text: 'first answer' }] },
+          { id: 'pty1', turnId: 'pty1', role: 'user', summary: PTY_BLOCK, items: [{ id: 'pty1-i', kind: 'text', text: PTY_BLOCK }] },
+        ]}
+      />,
+    )
+
+    // One speaker header for the whole assistant run; no You anywhere; both
+    // articles carry the assistant role.
+    expect(screen.getAllByText('Freshopencode')).toHaveLength(1)
+    expect(screen.queryByText('You')).not.toBeInTheDocument()
+    expect(container.querySelectorAll('article[data-turn-role="assistant"]')).toHaveLength(2)
+  })
+
+  it('gives a <pty_exited> turn the same toolbar affordances as any assistant turn (no Rewind button)', () => {
+    // Agent-text parity pin: the hover toolbar's 'Rewind code to here' button
+    // renders only for user-role turns. After reclassification the PTY turn
+    // gets the identical (absent) toolbar affordance as any assistant turn.
+    // The context menu / touch action sheet keep their disabled Undo/Rewind
+    // entries for the reclassified turn — unchanged by design, exactly as for
+    // every other assistant turn; that surface is out of scope.
+    const onRewind = vi.fn()
+    render(
+      <FreshAgentTranscript
+        canFork={false}
+        onRewindToTurn={onRewind}
+        turns={[
+          { id: 'u1', turnId: 'u1', role: 'user', summary: 'run the gate', items: [{ id: 'u1-i', kind: 'text', text: 'run the gate' }] },
+          { id: 'pty1', turnId: 'pty1', role: 'user', summary: PTY_BLOCK, items: [{ id: 'pty1-i', kind: 'text', text: PTY_BLOCK }] },
+          { id: 'a1', turnId: 'a1', role: 'assistant', summary: 'done', items: [{ id: 'a1-i', kind: 'text', text: 'done' }] },
+        ]}
+      />,
+    )
+
+    const rewindButtons = screen.getAllByRole('button', { name: 'Rewind code to here' })
+    expect(rewindButtons).toHaveLength(1)
+    fireEvent.click(rewindButtons[0])
+    expect(onRewind).toHaveBeenCalledWith(expect.objectContaining({ id: 'u1', role: 'user' }))
+  })
+
+  it('counts a rolled-back <pty_exited> marker row as a user step (raw rule: the classifier never feeds the stepper)', () => {
+    // Constraint guard, not new behavior: rolledBackTurns is a raw prop that
+    // never passes through the displayTurns memo. A <pty_exited> marker row
+    // MUST still count toward the step label pinned to the server's
+    // rollback.undoneDepth (see the rolled-back section tests at :2891).
+    render(
+      <FreshAgentTranscript
+        turns={[{ id: 'u1', turnId: 'u1', role: 'user', summary: 'live prompt', items: [{ id: 'u1-i', kind: 'text', text: 'live prompt' }] }]}
+        rolledBackTurns={[
+          { id: 'u2', turnId: 'u2', role: 'user', summary: 'second prompt', items: [{ id: 'u2-i', kind: 'text', text: 'second prompt' }], rolledBack: true, restorable: true },
+          { id: 'a2', turnId: 'a2', role: 'assistant', summary: 'second answer', items: [{ id: 'a2-i', kind: 'text', text: 'second answer' }], rolledBack: true, restorable: true },
+          { id: 'pty1', turnId: 'pty1', role: 'user', summary: PTY_BLOCK, items: [{ id: 'pty1-i', kind: 'text', text: PTY_BLOCK }], rolledBack: true, restorable: true },
+        ]}
+      />,
+    )
+
+    // Two USER-role marker rows (real prompt + PTY notification) => (2), not (1):
+    // routing marker rows through the classifier would break the sum-to-undoneDepth pin.
+    expect(screen.getByText('Rolled back (2) — gone from the conversation; redo to restore.')).toBeInTheDocument()
+  })
+})

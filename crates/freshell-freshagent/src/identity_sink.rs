@@ -190,6 +190,24 @@ pub struct FreshAgentBindingUpsert {
     /// atomic apply/preserve/clear merge lives in `freshell-ws`'s pane
     /// ledger).
     pub provenance: ProvenanceUpdate,
+    /// b8ke ext r22 F2: the operation's observed (epoch, generation) pair —
+    /// the DELAYED-WRITE FENCE. The durable-row write path refuses typed on
+    /// a stale pair, so a delayed pre-teardown write can never overwrite a
+    /// newer owner's recovery row. `None` = legacy-unfenced (accepted).
+    pub observed_epoch: Option<u64>,
+    pub observed_generation: Option<u64>,
+    /// b8ke focused ep5 r2 F1: the HANDOFF RUNNER'S OWN authoritative
+    /// target binding — set ONLY where the pair is runner-supplied (the
+    /// r27-F2 under-ticket continuation shapes: the handoff's commit
+    /// context threads its own generation into the target's row write).
+    /// Over a terminal-bound row the ledger accepts an authoritative
+    /// PAIRED write over the row's UNSTAMPED shape (the normal
+    /// production terminal row — ordinary WS/REST/MCP terminal binding
+    /// writes stamp nothing), while every non-authoritative lane write
+    /// (the post-send refresh, the settings refresh, crash respawns)
+    /// still proves strictly-newer or refuses. NEVER set this on a lane
+    /// refresh.
+    pub authoritative: bool,
     pub settings: FreshAgentSettings,
 }
 
@@ -381,6 +399,24 @@ pub trait PaneIdentitySink: Send + Sync {
     /// never by writing a fabricated empty record. Idempotent: deleting an
     /// absent row succeeds (the ledger's `delete_rollback_row` discipline).
     fn delete_rollback(&self, provider: &str, session_id: &str) -> SinkWrite;
+    /// b8ke focused ep5 r4 F1: the FAILED-TRANSITION REPAIR — the handoff
+    /// abort / typed-failure cleanup's ONE ledger act after reaping an
+    /// uncommitted fresh-agent target: the durable kill-tombstone carrier
+    /// (fencing any late binding write from the failed transition — an
+    /// orphaned `spawn_blocking` closure whose ownership consult passed
+    /// before the cancel) plus the conditional retire of the transition's
+    /// own orphaned authoritative row (Bound fresh-agent stamped at
+    /// exactly the transition's (epoch, generation) pair). Idempotent.
+    /// Never called on a SUCCESSFUL transition (the committed target's
+    /// row is legitimate); a later legitimate claim clears the tombstone
+    /// through its `commit_claim`, so the fence never wedges the session.
+    fn repair_failed_transition(
+        &self,
+        provider: &str,
+        session_id: &str,
+        epoch: u64,
+        generation: u64,
+    ) -> SinkWrite;
     /// Task 3 lineage lookup: resolve a CREATE requestId to the durable
     /// session id recorded on the newest matching binding row (the pane-ledger
     /// `lookup_by_create_request_id` rule: Bound or GcExpired, newest by
@@ -621,6 +657,11 @@ pub(crate) struct FakeIdentitySink {
     /// close is ONE envelope over the whole identity set (never multi-pass
     /// partials over a session whose later close could fail).
     pub retire_batches: std::sync::Mutex<RetireBatchLog>,
+    /// b8ke focused ep5 r4 F1: every `repair_failed_transition` call, in
+    /// order — `(provider, sessionId, epoch, generation)`. The runner's
+    /// abort/failure-path tests assert the failed transition's cleanup
+    /// fires the repair with the transition's OWN (epoch, generation).
+    pub repairs: std::sync::Mutex<Vec<(String, String, u64, u64)>>,
     /// Focused-ep5-r1 Finding 2 (round-4 amended): the fake mirror of the
     /// ledger's kill tombstones, stamped by `kill_clock` — a deterministic
     /// monotone counter standing in for the real ledger's wall-clock
@@ -692,6 +733,9 @@ pub(crate) struct FakeIdentitySink {
     /// Retire-on-kill round 6 (focused-ep5-r5 Finding 1) test hook — see
     /// [`Self::arm_retire_stall`].
     retire_stall: std::sync::Mutex<Option<RetireStallGate>>,
+    /// kata b8ke Task 3 review M-1 test hook — see
+    /// [`Self::arm_binding_stall`].
+    binding_stall: std::sync::Mutex<Option<BindingStallGate>>,
     /// Focused-ep5-r5 Finding 2: the fake mirror of the ledger's durable
     /// alias tombstones — (provider, placeholder) -> [(durable, at_ms)],
     /// written by `record_alias_tombstone`, consulted by
@@ -711,7 +755,20 @@ pub(crate) struct FakeIdentitySink {
     /// the fake after the caller's await was cancelled (set by
     /// [`Self::arm_orphan_binding_gate`]).
     self_weak: std::sync::Mutex<std::sync::Weak<FakeIdentitySink>>,
+    /// b8ke ext r29 F3: the last binding write's observed (epoch,
+    /// generation) pair per identity — the positive assertion surface for
+    /// "the lane carries the delayed-write fence" (pre-r29 every lane
+    /// wrote (None, None) here on its refreshes).
+    pub binding_pairs: std::sync::Mutex<ObservedBindingPairMap>,
 }
+
+/// b8ke ext r29 F3: the observed (epoch, generation) pair a binding write
+/// carried, keyed by (provider, session id) — the delayed-write fence's
+/// lane-level assertion surface (the factored value type keeps the fake's
+/// field off clippy's type_complexity lint).
+#[cfg(test)]
+pub(crate) type ObservedBindingPairMap =
+    std::collections::HashMap<(String, String), (Option<u64>, Option<u64>)>;
 
 /// Retire-on-kill round 3: the fake's ROW-STATE model (the in-memory twin
 /// of the real ledger's `state`/`retired_reason` columns), so kill/claim
@@ -842,6 +899,36 @@ pub(crate) struct RetireStallHandles {
     pub release: tokio::sync::oneshot::Sender<()>,
 }
 
+/// kata b8ke Task 3 review M-1 test hook: the armed binding stall's state.
+/// The write's mutations (the `bindings` log, the row-state flip) land
+/// EAGERLY at call time — exactly like the real ledger's
+/// `record_binding`, which records the row durably inside the call — and
+/// only the returned FUTURE parks behind the test's release, so a lane
+/// that awaits its binding write between a coordinator claim and a
+/// commit (the opencode fork's child registration) sits deterministically
+/// in that window while the test moves the coordinator underneath it.
+#[cfg(test)]
+struct BindingStallGate {
+    /// The (provider, session_id) key this gate intercepts.
+    key: (String, String),
+    /// Signaled when the stalled `record_binding` was INVOKED (its
+    /// mutations already applied — the row is on record and only the
+    /// answer stalls).
+    entered_tx: std::sync::mpsc::Sender<()>,
+    /// The test's release: the returned future resolves only after this.
+    release_rx: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+/// kata b8ke Task 3 review M-1 test hook: the handles
+/// [`FakeIdentitySink::arm_binding_stall`] hands the test. `entered`
+/// fires when the stalled write's mutations LANDED (row recorded, answer
+/// parked); `release` lets the stalled answer resolve.
+#[cfg(test)]
+pub(crate) struct BindingStallHandles {
+    pub entered: std::sync::mpsc::Receiver<()>,
+    pub release: tokio::sync::oneshot::Sender<()>,
+}
+
 #[cfg(test)]
 impl FakeIdentitySink {
     #[allow(dead_code)] // used by identity-event tasks (Tasks 4-10 tests)
@@ -875,6 +962,10 @@ impl FakeIdentitySink {
             resolves_pending: None,
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: s,
         });
     }
@@ -1051,6 +1142,32 @@ impl FakeIdentitySink {
             release: release_tx,
         }
     }
+    /// kata b8ke Task 3 review M-1 test hook: arm the BINDING stall for
+    /// one identity key. The next `record_binding` for exactly that key
+    /// applies its mutations INLINE (the row lands, exactly like the real
+    /// ledger's `record_binding`) and then parks the returned future
+    /// behind the test's release — so a lane that awaits its binding
+    /// write between a coordinator claim and a commit (the opencode
+    /// fork's child registration) sits deterministically in that window
+    /// while the test moves the coordinator. One-shot: later binding
+    /// writes proceed inline.
+    pub(crate) fn arm_binding_stall(
+        self: &std::sync::Arc<Self>,
+        provider: &str,
+        session_id: &str,
+    ) -> BindingStallHandles {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.binding_stall.lock().unwrap() = Some(BindingStallGate {
+            key: (provider.into(), session_id.into()),
+            entered_tx,
+            release_rx: std::sync::Mutex::new(Some(release_rx)),
+        });
+        BindingStallHandles {
+            entered: entered_rx,
+            release: release_tx,
+        }
+    }
     /// The shared claim-commit decide+apply (the direct path AND the claim
     /// gate's + stall's tasks): EXACTLY `PaneLedger::commit_claim`'s
     /// conditional-transition contract against the fake's state. Refusal
@@ -1126,6 +1243,12 @@ impl FakeIdentitySink {
     #[cfg(test)]
     fn apply_binding_mutations(&self, upsert: FreshAgentBindingUpsert) {
         let key = (upsert.provider.clone(), upsert.session_id.clone());
+        // b8ke ext r29 F3: the write's observed pair — recorded for the
+        // lane-level fence assertions (see [`Self::binding_pairs`]).
+        self.binding_pairs.lock().unwrap().insert(
+            key.clone(),
+            (upsert.observed_epoch, upsert.observed_generation),
+        );
         // Retire-on-kill round 3 row-state mirror: the ledger's fresh-agent
         // upsert is unconditionally Bound — a landed write resurrects the row.
         self.states
@@ -1258,6 +1381,27 @@ impl PaneIdentitySink for FakeIdentitySink {
                 });
                 return Box::pin(std::future::ready(Ok(())));
             }
+            let stall_arm = {
+                let gate = self.binding_stall.lock().unwrap();
+                gate.as_ref().and_then(|g| {
+                    if g.key == (upsert.provider.clone(), upsert.session_id.clone()) {
+                        let release_rx = g.release_rx.lock().unwrap().take();
+                        release_rx.map(|rx| (g.entered_tx.clone(), rx))
+                    } else {
+                        None
+                    }
+                })
+            };
+            if let Some((entered_tx, release_rx)) = stall_arm {
+                // One-shot: disarm so later writes for the key apply inline.
+                *self.binding_stall.lock().unwrap() = None;
+                self.apply_binding(upsert);
+                let _ = entered_tx.send(());
+                return Box::pin(async move {
+                    let _ = release_rx.await;
+                    Ok(())
+                });
+            }
             self.apply_binding(upsert);
         }
         self.write_result()
@@ -1332,6 +1476,19 @@ impl PaneIdentitySink for FakeIdentitySink {
                 .unwrap()
                 .remove(&(provider.into(), session_id.into()));
         }
+        self.write_result()
+    }
+    fn repair_failed_transition(
+        &self,
+        provider: &str,
+        session_id: &str,
+        epoch: u64,
+        generation: u64,
+    ) -> SinkWrite {
+        self.repairs
+            .lock()
+            .unwrap()
+            .push((provider.into(), session_id.into(), epoch, generation));
         self.write_result()
     }
     fn retire_closed(&self, provider: &str, session_id: &str) -> SinkCloseWrite {
@@ -1782,6 +1939,10 @@ mod tests {
             resolves_pending: Some("freshopencode-r1".into()),
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings {
                 model: Some("m".into()),
                 sandbox: None,
@@ -1821,6 +1982,10 @@ mod tests {
             resolves_pending: Some("freshopencode-cr-blank".into()),
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -1864,6 +2029,10 @@ mod tests {
             resolves_pending: Some("freshopencode-cr-1".into()),
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2004,6 +2173,10 @@ mod tests {
                 tab_key: Some("device-1:tab-1".into()),
                 asserted_at: 111,
             }),
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2030,6 +2203,10 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2046,6 +2223,10 @@ mod tests {
                 client_instance_id: Some("client-2".into()),
                 ..Default::default()
             }),
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2082,6 +2263,10 @@ mod tests {
                 tab_key: Some("device-3:tab-3".into()),
                 asserted_at: 50,
             }),
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2103,6 +2288,10 @@ mod tests {
                 tab_key: Some("device-4:tab-4".into()),
                 asserted_at: 222,
             }),
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2121,6 +2310,10 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2150,6 +2343,10 @@ mod tests {
                 tab_key: Some("device-1:tab-1".into()),
                 asserted_at: 222,
             }),
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2165,6 +2362,10 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: ProvenanceUpdate::Clear,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2184,6 +2385,10 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2208,6 +2413,10 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         };
         fake.retire_closed("claude", "durable-m")
@@ -2317,6 +2526,10 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         })
         .await
@@ -2349,6 +2562,10 @@ mod tests {
             resolves_pending: None,
             supersedes: None,
             provenance: ProvenanceUpdate::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             settings: FreshAgentSettings::default(),
         };
         // Arm + invoke + KILL + release: suppressed.
@@ -2383,6 +2600,10 @@ mod tests {
             name_transition: None,
             provider: "claude".into(),
             session_id: "durable-h".into(),
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             ..upsert()
         })
         .await

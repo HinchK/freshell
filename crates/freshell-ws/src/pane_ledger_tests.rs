@@ -88,6 +88,8 @@ fn write_with_policy(
         create_request_id: Some("req-1"),
         origin_create_request_id: None,
         provenance,
+        observed_epoch: None,
+        observed_generation: None,
         now_ms,
     }
 }
@@ -159,8 +161,776 @@ fn fa_write<'a>(provider: &'a str, session_id: &'a str, now_ms: i64) -> FreshAge
         effort: None,
         supersedes: None,
         provenance: ProvenancePolicy::Inherit,
+        observed_epoch: None,
+        observed_generation: None,
+
+        authoritative: false,
         now_ms,
     }
+}
+
+/// b8ke ext r22 F2: a fenced FreshAgentBindingWrite helper (the observed pair).
+fn fa_write_fenced<'a>(
+    provider: &'a str,
+    session_id: &'a str,
+    now_ms: i64,
+    epoch: u64,
+    generation: u64,
+) -> FreshAgentBindingWrite<'a> {
+    FreshAgentBindingWrite {
+        provider,
+        session_id,
+        mode: provider,
+        cwd: Some("/tmp/proj"),
+        create_request_id: None,
+        model: Some("test-model"),
+        sandbox: None,
+        permission_mode: None,
+        effort: None,
+        supersedes: None,
+        provenance: ProvenancePolicy::Inherit,
+        observed_epoch: Some(epoch),
+        observed_generation: Some(generation),
+
+        authoritative: false,
+        now_ms,
+    }
+}
+
+/// b8ke focused ep5 r2 F1: the HANDOFF RUNNER'S OWN authoritative target
+/// binding — the r27-F2 under-ticket write shape (the pair is the
+/// runner's supplied handoff generation; the marker is set at exactly
+/// the three under-ticket write sites, never on a lane write).
+fn fa_write_target<'a>(
+    provider: &'a str,
+    session_id: &'a str,
+    now_ms: i64,
+    epoch: u64,
+    generation: u64,
+) -> FreshAgentBindingWrite<'a> {
+    FreshAgentBindingWrite {
+        provider,
+        session_id,
+        mode: provider,
+        cwd: Some("/tmp/proj"),
+        create_request_id: None,
+        model: Some("test-model"),
+        sandbox: None,
+        permission_mode: None,
+        effort: None,
+        supersedes: None,
+        provenance: ProvenancePolicy::Inherit,
+        observed_epoch: Some(epoch),
+        observed_generation: Some(generation),
+        authoritative: true,
+        now_ms,
+    }
+}
+
+/// b8ke ext r22 F2 (a): the DELAYED-WRITE FENCE — the terminal's commit
+/// stamped the row with the post-handoff pair (stamp_owner_pair); the old
+/// agent's delayed binding write arrives carrying the PRE-handoff pair →
+/// REFUSED typed, and the terminal's recovery row survives untouched.
+#[test]
+fn a_stale_pair_fresh_agent_binding_write_is_refused_and_the_terminal_row_survives() {
+    let root = temp_root("r22-f2-stale-pair");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // The fresh create's row (the pre-handoff pair: epoch 7, generation 5).
+    ledger
+        .record_fresh_agent_binding(&fa_write_fenced("codex", "ses-r22", 1_000, 7, 5))
+        .expect("the fresh create's binding writes");
+
+    // The handoff completes: the terminal identity commit stamps the row
+    // with the post-handoff pair (epoch 7, generation 6).
+    ledger
+        .stamp_owner_pair("codex", "ses-r22", 7, 6)
+        .expect("the commit-side stamp");
+
+    // THE DELAYED WRITE: the old agent's in-flight write carries the
+    // PRE-handoff pair — refused typed.
+    let result =
+        ledger.record_fresh_agent_binding(&fa_write_fenced("codex", "ses-r22", 1_200, 7, 5));
+    let err = result.expect_err("the stale-pair write is refused typed");
+    assert!(
+        err.to_string().contains("STALE_BINDING_PAIR"),
+        "the refusal is typed: {err}"
+    );
+
+    // The row survives — the pre-handoff fresh-agent row is intact (the
+    // stamp is the terminal's; a newer-pair write still proceeds (c)).
+    let row = ledger
+        .load_binding("codex", "ses-r22")
+        .expect("the row survives the refused write");
+    assert_eq!(row.owner_epoch, Some(7));
+    assert_eq!(row.owner_generation, Some(6));
+    assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+
+    // The CURRENT-pair write (the newer pair) proceeds — the fence only
+    // refuses the OLDER pair (c).
+    ledger
+        .record_fresh_agent_binding(&fa_write_fenced("codex", "ses-r22", 1_300, 7, 6))
+        .expect("the current-pair write proceeds");
+    // A NEWER-pair write also proceeds (the fence advances).
+    ledger
+        .record_fresh_agent_binding(&fa_write_fenced("codex", "ses-r22", 1_400, 7, 8))
+        .expect("the newer-pair write proceeds");
+    let row = ledger.load_binding("codex", "ses-r22").expect("the row");
+    assert_eq!(row.owner_generation, Some(8));
+}
+
+/// b8ke ext r22 F2: the TERMINAL write path shares the fence — a
+/// stale-pair BindingWrite on the terminal rows' path is refused the same
+/// way, and the legacy-unfenced write (None pair) proceeds (the pre-r22
+/// behavior; the row's prior stamp is preserved).
+#[test]
+fn the_terminal_write_path_shares_the_stale_pair_fence() {
+    let root = temp_root("r22-f2-terminal-fence");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // Seed a terminal row stamped (epoch 3, generation 9).
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "claude",
+            session_id: "ses-terminal-r22",
+            terminal_id: "t-r22",
+            mode: "claude",
+            cwd: Some("/w"),
+            create_request_id: Some("req-t"),
+            origin_create_request_id: None,
+            provenance: ProvenancePolicy::Inherit,
+            observed_epoch: Some(3),
+            observed_generation: Some(9),
+            now_ms: 1_000,
+        })
+        .expect("the seeded terminal row");
+    // The stale-pair terminal write is refused typed.
+    let result = ledger.record_binding(&BindingWrite {
+        provider: "claude",
+        session_id: "ses-terminal-r22",
+        terminal_id: "t-r22-late",
+        mode: "claude",
+        cwd: Some("/w"),
+        create_request_id: Some("req-t-late"),
+        origin_create_request_id: None,
+        provenance: ProvenancePolicy::Inherit,
+        observed_epoch: Some(3),
+        observed_generation: Some(8),
+        now_ms: 1_100,
+    });
+    let err = result.expect_err("the stale terminal write is refused");
+    assert!(err.to_string().contains("STALE_BINDING_PAIR"), "{err}");
+    // The row survived: the original terminal's identity.
+    let row = ledger
+        .load_binding("claude", "ses-terminal-r22")
+        .expect("the row");
+    assert_eq!(row.live_terminal_id.as_deref(), Some("t-r22"));
+    assert_eq!(row.owner_generation, Some(9));
+
+    // The legacy-unfenced write (None pair) PROCEEDS and the row's prior
+    // stamp is... the terminal path's write carries the pair it has (None —
+    // pre-r22 rows degrade to unfenced).
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "claude",
+            session_id: "ses-terminal-r22",
+            terminal_id: "t-r22-now",
+            mode: "claude",
+            cwd: Some("/w"),
+            create_request_id: Some("req-t-now"),
+            origin_create_request_id: None,
+            provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+            now_ms: 1_200,
+        })
+        .expect("the legacy-unfenced write proceeds");
+}
+
+/// b8ke ext r29 F3: the composed DELAYED-REFRESH shape — after a handoff
+/// reaps the codex runtime and binds a terminal under a NEWER generation,
+/// the row is the terminal's authoritative recovery binding (a REAL
+/// terminal row: live_terminal_id set, pane_kind terminal/None, the
+/// post-handoff pair stamped). The post-send settings refresh — now
+/// carrying the operation's PRE-handoff observed pair — lands late and is
+/// REFUSED typed by the delayed-write fence; the terminal's recovery row
+/// survives byte-for-byte.
+#[test]
+fn a_fenced_late_refresh_after_a_terminal_handoff_is_refused_and_the_terminal_recovery_row_survives(
+) {
+    let root = temp_root("r29-f3-fenced-late-refresh");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // The fresh create's row (the pre-handoff pair: epoch 9, generation 4).
+    ledger
+        .record_fresh_agent_binding(&fa_write_fenced("codex", "ses-r29-f3", 1_000, 9, 4))
+        .expect("the fresh create's binding writes");
+
+    // The handoff completes: the terminal identity commit REBINDS the row
+    // as the terminal's recovery binding, stamped with the post-handoff
+    // pair (epoch 9, generation 5) — the exact shape
+    // `record_binding`'s terminal lane leaves.
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "codex",
+            session_id: "ses-r29-f3",
+            terminal_id: "t-r29-f3",
+            mode: "freshcodex",
+            cwd: Some("/w"),
+            create_request_id: Some("req-t-r29"),
+            origin_create_request_id: None,
+            provenance: ProvenancePolicy::Inherit,
+            observed_epoch: Some(9),
+            observed_generation: Some(5),
+            now_ms: 1_100,
+        })
+        .expect("the handoff's terminal row writes");
+
+    // THE DELAYED REFRESH: the post-send settings refresh carrying the
+    // PRE-handoff pair — refused typed.
+    let result =
+        ledger.record_fresh_agent_binding(&fa_write_fenced("codex", "ses-r29-f3", 1_200, 9, 4));
+    let err = result.expect_err("the late fenced refresh is refused typed");
+    assert!(
+        err.to_string().contains("STALE_BINDING_PAIR"),
+        "the refusal is typed: {err}"
+    );
+
+    // The terminal's authoritative recovery row survives untouched.
+    let row = ledger
+        .load_binding("codex", "ses-r29-f3")
+        .expect("the row survives the refused refresh");
+    assert_eq!(row.live_terminal_id.as_deref(), Some("t-r29-f3"));
+    assert_eq!(row.pane_kind, None, "the row stays the terminal's: {row:?}");
+    assert_eq!(row.owner_epoch, Some(9));
+    assert_eq!(row.owner_generation, Some(5));
+    assert_eq!(row.create_request_id.as_deref(), Some("req-t-r29"));
+}
+
+/// b8ke focused ep5 r1 F2: the SAME-GENERATION TRAP the review named — a
+/// terminal binding written at the handoff/target generation while a
+/// delayed fresh-agent refresh carries that SAME generation is "not
+/// older" and passed both ext-r29 fences (the stale-pair check refuses
+/// only older pairs; the backstop refused only fully-unfenced writes),
+/// so the late refresh rewrote the terminal's authoritative recovery
+/// row. The terminal-row guard now requires a STRICTLY NEWER pair —
+/// every legitimate reclaim advances the generation, so the equal-pair
+/// shape refuses typed and the terminal row survives.
+#[test]
+fn a_paired_fresh_agent_write_at_the_terminal_rows_own_generation_never_passes_as_not_older() {
+    let root = temp_root("ep5-r2-same-generation-trap");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // The committed handoff's terminal binding, stamped at (3, 9).
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "codex",
+            session_id: "ses-ep5-trap",
+            terminal_id: "t-ep5-trap",
+            mode: "freshcodex",
+            cwd: Some("/w"),
+            create_request_id: Some("req-t-trap"),
+            origin_create_request_id: None,
+            provenance: ProvenancePolicy::Inherit,
+            observed_epoch: Some(3),
+            observed_generation: Some(9),
+            now_ms: 1_000,
+        })
+        .expect("the terminal row");
+
+    // THE TRAP: the late fresh-agent refresh carrying the terminal row's
+    // OWN generation — refused typed (never "not older").
+    let result =
+        ledger.record_fresh_agent_binding(&fa_write_fenced("codex", "ses-ep5-trap", 1_200, 3, 9));
+    let err = result.expect_err("the equal-pair write over a terminal row is refused");
+    assert!(
+        err.to_string().contains("NOT_NEWER_BINDING_OVER_TERMINAL"),
+        "the refusal is typed: {err}"
+    );
+
+    // The terminal's recovery row survives untouched.
+    let row = ledger
+        .load_binding("codex", "ses-ep5-trap")
+        .expect("the row survives");
+    assert_eq!(row.live_terminal_id.as_deref(), Some("t-ep5-trap"));
+    assert_eq!(row.pane_kind, None, "the row stays the terminal's: {row:?}");
+    assert_eq!(row.owner_epoch, Some(3));
+    assert_eq!(row.owner_generation, Some(9));
+
+    // A NON-AUTHORITATIVE paired write over an UNSTAMPED terminal row (a
+    // pre-r22 legacy row — the normal production shape for ordinary
+    // WS/REST/MCP terminal bindings) still refuses — the stale lane
+    // refresh cannot prove newer against a row with no baseline. (The
+    // runner's own authoritative target binding over this shape is the
+    // ep5-r2 landing test below.)
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "codex",
+            session_id: "ses-ep5-unstamped",
+            terminal_id: "t-ep5-unstamped",
+            mode: "freshcodex",
+            cwd: Some("/w"),
+            create_request_id: Some("req-t-unstamped"),
+            origin_create_request_id: None,
+            provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+            now_ms: 1_100,
+        })
+        .expect("the unstamped terminal row");
+    let result = ledger.record_fresh_agent_binding(&fa_write_fenced(
+        "codex",
+        "ses-ep5-unstamped",
+        1_300,
+        3,
+        12,
+    ));
+    let err = result.expect_err("a paired write over an unstamped terminal row refuses");
+    assert!(
+        err.to_string().contains("NOT_NEWER_BINDING_OVER_TERMINAL"),
+        "the refusal is typed: {err}"
+    );
+
+    // The strictly-NEWER reclaim still proceeds (the legitimate
+    // terminal→fresh-agent handoff's own write, one generation ahead).
+    ledger
+        .record_fresh_agent_binding(&fa_write_fenced("codex", "ses-ep5-trap", 1_400, 3, 10))
+        .expect("the strictly-newer reclaim proceeds");
+    let row = ledger
+        .load_binding("codex", "ses-ep5-trap")
+        .expect("the reclaimed row");
+    assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+    assert_eq!(row.owner_generation, Some(10));
+}
+
+/// b8ke focused ep5 r2 F1: the REAL terminal→fresh-agent handoff over
+/// the NORMAL UNSTAMPED terminal row — the ep5-r1 guard refused the
+/// runner's own target binding here (write_pair = Some, row_pair = None
+/// → NOT_NEWER), tearing the requested handoff's target down for
+/// commonly created browser, REST, and MCP sessions (ordinary terminal
+/// binding writes stamp nothing; the handoff kills the terminal directly
+/// and the exit hook leaves its row Bound with live_terminal_id). The
+/// target's AUTHORITATIVE-marked paired write (the r27-F2 under-ticket
+/// shape: the runner-supplied handoff generation) now LANDS — the
+/// recovery row becomes the fresh-agent target's.
+#[test]
+fn a_handoff_targets_authoritative_binding_lands_over_the_normal_unstamped_terminal_row() {
+    let root = temp_root("ep5-r2-handoff-over-unstamped");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // The normal production terminal row: Bound, live_terminal_id set,
+    // NO ownership stamp (an ordinary WS/REST/MCP terminal binding).
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "claude",
+            session_id: "ses-ep5-r2-target",
+            terminal_id: "t-ep5-r2",
+            mode: "claude",
+            cwd: Some("/w"),
+            create_request_id: Some("req-t-ep5-r2"),
+            origin_create_request_id: None,
+            provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+            now_ms: 1_000,
+        })
+        .expect("the unstamped terminal row");
+
+    // THE HANDOFF: the runner reaped the terminal, committed Live{FreshAgent}
+    // at the handoff generation, and the target's authoritative binding
+    // write carries that generation — it LANDS over the unstamped row.
+    ledger
+        .record_fresh_agent_binding(&fa_write_target("claude", "ses-ep5-r2-target", 1_200, 7, 4))
+        .expect("the authoritative target binding lands over the unstamped row");
+
+    // The recovery row is now the fresh-agent target's.
+    let row = ledger
+        .load_binding("claude", "ses-ep5-r2-target")
+        .expect("the row");
+    assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+    assert_eq!(
+        row.live_terminal_id, None,
+        "the terminal's binding is superseded: {row:?}"
+    );
+    assert_eq!(row.owner_epoch, Some(7));
+    assert_eq!(row.owner_generation, Some(4));
+    assert_eq!(row.state, RowState::Bound);
+}
+
+/// b8ke focused ep5 r2 F1: the authoritative marker relaxes ONLY the
+/// unstamped shape — over a STAMPED terminal row the arithmetic binds
+/// marked writes too (an equal-pair authoritative write refuses), so a
+/// DELAYED authoritative target write can never clobber a LATER
+/// handoff's stamped row, and the ep5-r1 equal-pair trap stays closed
+/// for every write.
+#[test]
+fn an_authoritative_write_over_a_stamped_row_still_proves_strictly_newer() {
+    let root = temp_root("ep5-r2-authoritative-over-stamped");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // A STAMPED terminal row (a prior handoff's terminal-side commit).
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "codex",
+            session_id: "ses-ep5-r2-stamped",
+            terminal_id: "t-ep5-r2-stamped",
+            mode: "freshcodex",
+            cwd: Some("/w"),
+            create_request_id: Some("req-t-ep5-r2-s"),
+            origin_create_request_id: None,
+            provenance: ProvenancePolicy::Inherit,
+            observed_epoch: Some(3),
+            observed_generation: Some(9),
+            now_ms: 1_000,
+        })
+        .expect("the stamped terminal row");
+
+    // The EQUAL-pair authoritative write — refused typed (strictly-newer
+    // arithmetic binds marked writes over stamped rows).
+    let result = ledger.record_fresh_agent_binding(&fa_write_target(
+        "codex",
+        "ses-ep5-r2-stamped",
+        1_100,
+        3,
+        9,
+    ));
+    let err = result.expect_err("the equal-pair authoritative write refuses");
+    assert!(
+        err.to_string().contains("NOT_NEWER_BINDING_OVER_TERMINAL"),
+        "the refusal is typed: {err}"
+    );
+
+    // The strictly-newer authoritative write lands.
+    ledger
+        .record_fresh_agent_binding(&fa_write_target(
+            "codex",
+            "ses-ep5-r2-stamped",
+            1_200,
+            3,
+            10,
+        ))
+        .expect("the strictly-newer authoritative write lands");
+    let row = ledger
+        .load_binding("codex", "ses-ep5-r2-stamped")
+        .expect("the row");
+    assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+    assert_eq!(row.owner_generation, Some(10));
+}
+
+// ── kata b8ke focused ep5 r4 F1: the FAILED-TRANSITION REPAIR — the
+// abort/typed-failure cleanup's ledger act. Two halves under one guard:
+// the durable tombstone fence (suppressing the failed transition's late
+// orphaned writes, whichever arrival order) and the conditional retire
+// of the transition's OWN orphaned row (Bound fresh-agent stamped at
+// exactly the transition's pair). ─────────────────────────────────────
+
+/// The repair's REVERT half: the orphaned product (the failed
+/// transition's own authoritative write, landed) retires typed
+/// `FailedTransition`, and the durable fence is fed.
+#[test]
+fn the_failed_transition_repair_retires_the_transitions_own_orphaned_row() {
+    let root = temp_root("ep5-r4-repair-retires-orphan");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    const EPOCH: u64 = 3;
+    // The orphaned write landed: a Bound fresh-agent row stamped at the
+    // failed transition's (epoch, generation) pair.
+    ledger
+        .record_fresh_agent_binding(&fa_write_target("codex", "ses-ep5-r4-a", 1_000, EPOCH, 8))
+        .expect("the orphaned authoritative write landed");
+    assert_eq!(
+        ledger
+            .load_binding("codex", "ses-ep5-r4-a")
+            .expect("the row")
+            .state,
+        RowState::Bound
+    );
+
+    ledger
+        .repair_failed_transition_binding("codex", "ses-ep5-r4-a", EPOCH, 8, 1_100)
+        .expect("the repair lands");
+
+    let row = ledger
+        .load_binding("codex", "ses-ep5-r4-a")
+        .expect("the row survives, retired");
+    assert_eq!(row.state, RowState::Retired);
+    assert_eq!(row.retired_reason, Some(RetiredReason::FailedTransition));
+    assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+    // The durable fence is fed: the tombstone index answers.
+    assert!(
+        ledger.kill_tombstone_at("codex", "ses-ep5-r4-a").is_some(),
+        "the repair fed the kill-tombstone fence"
+    );
+    // Idempotent: a retried repair re-derives the same state.
+    ledger
+        .repair_failed_transition_binding("codex", "ses-ep5-r4-a", EPOCH, 8, 1_200)
+        .expect("the retried repair is idempotent");
+    let row = ledger.load_binding("codex", "ses-ep5-r4-a").expect("row");
+    assert_eq!(row.state, RowState::Retired);
+}
+
+/// The repair never demotes a row the failed transition did not own: the
+/// restored terminal's ordinary recovery row, and a LATER transition's
+/// fresh-agent row (a newer pair), both stand exactly as they were.
+#[test]
+fn the_failed_transition_repair_leaves_innocent_rows_untouched() {
+    let root = temp_root("ep5-r4-repair-innocent-rows");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    const EPOCH: u64 = 3;
+    // The ordinary terminal recovery row (unstamped).
+    ledger
+        .record_binding(&write("codex", "ses-ep5-r4-b", "t-ep5-r4-b", 1_000))
+        .expect("the terminal row");
+    // A LATER transition's fresh-agent row (a NEWER pair).
+    ledger
+        .record_fresh_agent_binding(&fa_write_target("codex", "ses-ep5-r4-c", 1_000, EPOCH, 11))
+        .expect("the later transition's row");
+
+    // The FAILED transition's repair names (EPOCH, 8) — neither row
+    // matches the orphan profile.
+    ledger
+        .repair_failed_transition_binding("codex", "ses-ep5-r4-b", EPOCH, 8, 1_100)
+        .expect("the repair lands (fence only)");
+    ledger
+        .repair_failed_transition_binding("codex", "ses-ep5-r4-c", EPOCH, 8, 1_100)
+        .expect("the repair lands (fence only)");
+
+    let term = ledger
+        .load_binding("codex", "ses-ep5-r4-b")
+        .expect("the terminal row");
+    assert_eq!(term.state, RowState::Bound, "the terminal row stands");
+    assert_eq!(term.live_terminal_id.as_deref(), Some("t-ep5-r4-b"));
+    assert_eq!(term.retired_reason, None);
+    let later = ledger
+        .load_binding("codex", "ses-ep5-r4-c")
+        .expect("the later transition's row");
+    assert_eq!(
+        later.state,
+        RowState::Bound,
+        "the later transition's row stands"
+    );
+    assert_eq!(later.owner_generation, Some(11));
+    assert_eq!(later.retired_reason, None);
+    // The fences for both identities are still fed (the fence half is
+    // NOT conditional — it must suppress the failed transition's late
+    // writes regardless of what the row held).
+    assert!(ledger.kill_tombstone_at("codex", "ses-ep5-r4-b").is_some());
+    assert!(ledger.kill_tombstone_at("codex", "ses-ep5-r4-c").is_some());
+
+    // b8ke focused ep5 r5 F2 — EXTENDED PAST THE REPAIR (the reviewer's
+    // next-write demand): the failed transition was ALREADY SUPERSEDED —
+    // ses-ep5-r4-c is a LATER committed owner's row (generation 11), and
+    // the repair (the stale cleanup of the (EPOCH, 8) transition) fired
+    // AFTER that row existed. The NEWER OWNER'S NEXT LEGITIMATE REFRESH —
+    // a binding write carrying its own strictly-newer pair — must STILL
+    // LAND (pre-r5 the identity-wide tombstone timestamped its kill after
+    // the newer row: the refresh classified Dominant, was suppressed, and
+    // the remnant force-retire corrupted the row as Closed).
+    ledger
+        .record_fresh_agent_binding(&fa_write_target("codex", "ses-ep5-r4-c", 1_200, EPOCH, 11))
+        .expect(
+            "the newer owner's next refresh lands — the scoped fence \
+                 is invisible to its strictly-newer pair",
+        );
+    let later = ledger
+        .load_binding("codex", "ses-ep5-r4-c")
+        .expect("the newer owner's row");
+    assert_eq!(
+        later.state,
+        RowState::Bound,
+        "the newer owner's refresh was never suppressed/force-retired: {later:?}"
+    );
+    assert_eq!(
+        later.retired_reason, None,
+        "never Retired/Closed: {later:?}"
+    );
+
+    // ...while the FAILED TRANSITION'S OWN LATE WRITE still refuses —
+    // over the NEWER-STAMPED row the r22 stale-pair fence is the first
+    // line (its (EPOCH, 8) pair is strictly older than the row's 11),
+    // and over every less-stamped shape the scoped tombstone suppresses
+    // it (the r4 fence test). Either way: never a landing.
+    let err = ledger
+        .record_fresh_agent_binding(&fa_write_target("codex", "ses-ep5-r4-c", 1_300, EPOCH, 8))
+        .expect_err("the failed transition's own late write never lands");
+    assert!(
+        err.to_string().contains("STALE_BINDING_PAIR"),
+        "the typed refusal over the newer row: {err}"
+    );
+    let later = ledger
+        .load_binding("codex", "ses-ep5-r4-c")
+        .expect("the row");
+    assert_eq!(
+        later.state,
+        RowState::Bound,
+        "the refused late write changed nothing: {later:?}"
+    );
+    assert_eq!(later.owner_generation, Some(11));
+}
+
+/// The repair's FENCE half, in the validated-then-canceled ordering: a
+/// late authoritative write whose bridge consult passed BEFORE the
+/// cancel (its pair is the failed transition's own) is suppressed
+/// wholesale at the ledger's tombstone consult — no Bound row is
+/// created, whichever arrival order the late mutation takes.
+#[test]
+fn the_failed_transition_repair_fence_suppresses_the_late_orphaned_write() {
+    let root = temp_root("ep5-r4-repair-fence-late-write");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    const EPOCH: u64 = 3;
+    // The ordinary terminal recovery row — the row the late mutation
+    // would corrupt.
+    ledger
+        .record_binding(&write("codex", "ses-ep5-r4-d", "t-ep5-r4-d", 1_000))
+        .expect("the terminal row");
+
+    // The cleanup lands the repair (the transition at (EPOCH, 8) failed)
+    // BEFORE the orphaned closure's mutation arrives.
+    ledger
+        .repair_failed_transition_binding("codex", "ses-ep5-r4-d", EPOCH, 8, 1_100)
+        .expect("the repair lands");
+
+    // THE LATE MUTATION: the failed transition's own authoritative write
+    // (its consult passed pre-cancel — at the ledger it faces only the
+    // tombstone). Suppressed wholesale — Ok, and NEVER a fresh-agent row.
+    // The still-Bound terminal row the fence dominates converges Retired
+    // by the EXISTING remnant discipline (the envelope's close evidence
+    // outranks a Bound row predating it — the same self-heal a kill-lane
+    // crash remnant gets), with the terminal's IDENTITY preserved in the
+    // row and a later ordinary attach re-minting it Bound.
+    ledger
+        .record_fresh_agent_binding(&fa_write_target("codex", "ses-ep5-r4-d", 1_200, EPOCH, 8))
+        .expect("the suppressed write answers Ok (suppression, not error)");
+    let row = ledger
+        .load_binding("codex", "ses-ep5-r4-d")
+        .expect("the row");
+    assert_eq!(
+        row.pane_kind, None,
+        "the suppressed write never landed — never fresh-agent: {row:?}"
+    );
+    assert_eq!(
+        row.live_terminal_id.as_deref(),
+        Some("t-ep5-r4-d"),
+        "the terminal's identity survives the remnant convergence: {row:?}"
+    );
+    assert_eq!(row.state, RowState::Retired);
+    assert_eq!(row.retired_reason, Some(RetiredReason::Closed));
+}
+
+/// The fence never wedges the session: a LATER legitimate claim clears
+/// the tombstone (the `commit_claim` machinery the resume lanes run),
+/// and the new transition's strictly-newer authoritative write lands.
+#[test]
+fn a_later_claim_clears_the_repair_fence_and_the_newer_authoritative_write_lands() {
+    let root = temp_root("ep5-r4-repair-fence-claim-clears");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    const EPOCH: u64 = 3;
+    ledger
+        .record_binding(&write("codex", "ses-ep5-r4-e", "t-ep5-r4-e", 1_000))
+        .expect("the terminal row");
+    ledger
+        .repair_failed_transition_binding("codex", "ses-ep5-r4-e", EPOCH, 8, 1_100)
+        .expect("the failed transition's repair");
+    assert!(ledger.kill_tombstone_at("codex", "ses-ep5-r4-e").is_some());
+
+    // The later legitimate claim's commit clears the tombstone (the same
+    // clear the killed-session re-attach machinery performs).
+    ledger
+        .clear_kill_tombstone("codex", "ses-ep5-r4-e")
+        .expect("the claim's commit clears the fence");
+    assert!(ledger.kill_tombstone_at("codex", "ses-ep5-r4-e").is_none());
+
+    // The new transition's authoritative write (a NEWER generation)
+    // lands — the r2 exception's success arm, unfenced by the repair.
+    ledger
+        .record_fresh_agent_binding(&fa_write_target("codex", "ses-ep5-r4-e", 1_300, EPOCH, 9))
+        .expect("the later handoff's authoritative write lands");
+    let row = ledger
+        .load_binding("codex", "ses-ep5-r4-e")
+        .expect("the row");
+    assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+    assert_eq!(row.owner_generation, Some(9));
+}
+
+/// b8ke ext r29 F3: the UNFENCED-CLOBBER backstop — a fully-unfenced
+/// fresh-agent binding write (no observed pair, the legacy shape every
+/// not-yet-fenced lane sends) can never clobber a live terminal's
+/// recovery row. Pre-r29 the stale-pair fence only fired on a CARRIED
+/// pair, so the unfenced delayed refresh was ACCEPTED and rewrote the
+/// terminal's row as pane_kind fresh-agent with no live_terminal_id while
+/// preserving the newer stamp — the corruption was invisible to the
+/// fence.
+#[test]
+fn an_unfenced_fresh_agent_binding_write_never_clobbers_a_terminal_bound_row() {
+    let root = temp_root("r29-f3-unfenced-clobber");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // Seed the terminal-bound row exactly as a committed handoff leaves it.
+    ledger
+        .record_binding(&BindingWrite {
+            provider: "codex",
+            session_id: "ses-r29-unfenced",
+            terminal_id: "t-r29-unfenced",
+            mode: "freshcodex",
+            cwd: Some("/w"),
+            create_request_id: Some("req-t-unfenced"),
+            origin_create_request_id: None,
+            provenance: ProvenancePolicy::Inherit,
+            observed_epoch: Some(3),
+            observed_generation: Some(7),
+            now_ms: 1_000,
+        })
+        .expect("the seeded terminal row");
+
+    // THE UNFENCED DELAYED WRITE — refused typed by the backstop.
+    let result = ledger.record_fresh_agent_binding(&fa_write("codex", "ses-r29-unfenced", 1_200));
+    let err = result.expect_err("the unfenced clobber is refused typed");
+    assert!(
+        err.to_string().contains("UNFENCED_BINDING_OVER_TERMINAL"),
+        "the refusal is typed: {err}"
+    );
+
+    // The terminal's recovery row survives untouched.
+    let row = ledger
+        .load_binding("codex", "ses-r29-unfenced")
+        .expect("the row survives the refused write");
+    assert_eq!(row.live_terminal_id.as_deref(), Some("t-r29-unfenced"));
+    assert_eq!(row.pane_kind, None, "the row stays the terminal's: {row:?}");
+    assert_eq!(row.owner_epoch, Some(3));
+    assert_eq!(row.owner_generation, Some(7));
+
+    // The backstop never over-blocks: an unfenced write onto a row with NO
+    // terminal binding (the ordinary fresh-agent row) still proceeds (the
+    // pre-r29 behavior for every legitimate unfenced lane).
+    ledger
+        .record_fresh_agent_binding(&fa_write("codex", "ses-r29-plain", 1_300))
+        .expect("an unfenced write over a non-terminal row proceeds");
+    let row = ledger
+        .load_binding("codex", "ses-r29-plain")
+        .expect("the fresh row");
+    assert_eq!(row.pane_kind.as_deref(), Some("fresh-agent"));
+    assert_eq!(row.live_terminal_id, None);
+}
+
+/// b8ke ext r22 F2: stamp_owner_pair is MONOTONIC — an older pair never
+/// regresses the row's baseline; a missing row is a no-op.
+#[test]
+fn stamp_owner_pair_is_monotonic_and_a_missing_row_is_a_noop() {
+    let root = temp_root("r22-f2-stamp-monotonic");
+    let ledger = PaneLedger::new(Some(root.clone()));
+    // A missing row: a no-op (the binding writes own creation).
+    ledger
+        .stamp_owner_pair("codex", "ses-absent", 5, 1)
+        .expect("the missing-row stamp is a no-op");
+    assert!(ledger.load_binding("codex", "ses-absent").is_none());
+
+    // The row + the advancing stamp.
+    ledger
+        .record_fresh_agent_binding(&fa_write_fenced("codex", "ses-mono", 1_000, 5, 1))
+        .expect("the row");
+    ledger
+        .stamp_owner_pair("codex", "ses-mono", 5, 3)
+        .expect("the advancing stamp");
+    let row = ledger.load_binding("codex", "ses-mono").expect("the row");
+    assert_eq!(row.owner_generation, Some(3));
+    // An OLDER pair never regresses.
+    ledger
+        .stamp_owner_pair("codex", "ses-mono", 5, 2)
+        .expect("the regressive stamp is accepted (a no-op)");
+    let row = ledger.load_binding("codex", "ses-mono").expect("the row");
+    assert_eq!(row.owner_generation, Some(3), "the stamp never regresses");
 }
 
 /// `fa_write` variant with connection-supplied stamps asserted (`Replace`),
@@ -205,6 +975,10 @@ fn fa_write_provenance_at<'a>(
             tab_key,
             asserted_at,
         }),
+        observed_epoch: None,
+        observed_generation: None,
+
+        authoritative: false,
         ..fa_write(provider, session_id, now_ms)
     }
 }
@@ -400,6 +1174,10 @@ fn fresh_agent_clear_rebind_erases_stamps_and_never_inherits_the_parent() {
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             provenance: ProvenancePolicy::Clear,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             ..fa_write("claude", "sess-1", 2_000)
         })
         .unwrap();
@@ -424,6 +1202,10 @@ fn fresh_agent_clear_rebind_erases_stamps_and_never_inherits_the_parent() {
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             supersedes: Some("sess-1"),
             provenance: ProvenancePolicy::Clear,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             ..fa_write("claude", "sess-2", 3_000)
         })
         .unwrap();
@@ -455,6 +1237,10 @@ fn fresh_agent_clear_rebind_erases_stamps_and_never_inherits_the_parent() {
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             supersedes: Some("sess-3"),
             provenance: ProvenancePolicy::Clear,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             ..fa_write("claude", "sess-4", 5_000)
         })
         .unwrap();
@@ -538,6 +1324,10 @@ fn fresh_agent_supersession_inherits_provenance_from_the_retired_parent() {
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             supersedes: Some("parent-id"),
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             ..fa_write("claude", "child-id", 2_000)
         })
         .unwrap();
@@ -1152,6 +1942,10 @@ fn fresh_agent_supersession_inherits_the_parents_assertion_time() {
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             supersedes: Some("parent-id"),
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             ..fa_write("claude", "child-id", 5_000)
         })
         .unwrap();
@@ -1350,6 +2144,10 @@ fn fresh_agent_out_of_order_replace_keeps_the_newer_attribution() {
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             model: Some("m-late"),
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             ..fa_write_provenance_at(
                 "opencode",
                 "ses_1",
@@ -1480,6 +2278,10 @@ fn fresh_agent_legacy_reassert_missing_tab_never_touches_the_attribution() {
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             model: Some("m-legacy"),
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             ..fa_write_provenance_at(
                 "codex",
                 "ses_1",
@@ -1612,6 +2414,10 @@ fn fresh_agent_legacy_create_and_fork_attach_their_provenance_without_a_tab() {
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             supersedes: Some("ses_parent"),
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             ..fa_write_provenance_at(
                 "claude",
                 "ses_child",
@@ -1807,6 +2613,10 @@ fn fresh_agent_clear_raises_the_attribution_floor_against_delayed_pre_clear_asse
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             provenance: ProvenancePolicy::Clear,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             ..fa_write("opencode", "ses_1", 5_000)
         })
         .unwrap();
@@ -1822,6 +2632,10 @@ fn fresh_agent_clear_raises_the_attribution_floor_against_delayed_pre_clear_asse
     ledger
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             model: Some("m-stale"),
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             ..fa_write_provenance_at(
                 "opencode",
                 "ses_1",
@@ -2018,6 +2832,10 @@ fn disabled_ledger_refuses_the_rollback_row_write_with_a_loud_error() {
             effort: None,
             supersedes: None,
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             now_ms: 1,
         })
         .expect("binding writes keep their silent-no-op policy on a disabled ledger");
@@ -2085,95 +2903,6 @@ fn index_loads_existing_rows_at_construction() {
     assert!(gen2.ever_bound("claude", "sess-a"));
     assert_eq!(gen2.list_bindings().len(), 1);
     std::fs::remove_dir_all(&root).ok();
-}
-
-// ── tracing capture for the lock test's failure classification (delta-r2 M2) ──
-//
-// Adapted from the LogCapture/Visitor pattern in
-// tests/pane_reconcile_freshagent.rs (~:761-845). Thread-local capture is
-// sufficient HERE (no tokio involved): `new_locked` logs
-// `pane_ledger_lock_unavailable` SYNCHRONOUSLY on the construction thread
-// (pane_ledger.rs:248-254), and the `#[test]` body IS the construction
-// thread, so a `tracing::subscriber::set_default` guard scopes the capture
-// layer to exactly this thread. cfg(unix): the only consumer is the
-// cfg(unix) lock test below.
-#[cfg(unix)]
-mod lock_log_capture {
-    use std::sync::{Arc, Mutex};
-
-    use tracing::field::{Field, Visit};
-    use tracing::{Event, Subscriber};
-    use tracing_subscriber::layer::{Context, SubscriberExt};
-    use tracing_subscriber::Layer;
-
-    #[derive(Debug, Clone, Default)]
-    pub struct CapturedEvent {
-        pub message: String,
-        /// The event's OWN fields (the lock-unavailable log records root +
-        /// error on the event; no span merge needed).
-        pub fields: std::collections::BTreeMap<String, String>,
-    }
-
-    #[derive(Default)]
-    struct CapVisitor {
-        message: String,
-        fields: std::collections::BTreeMap<String, String>,
-    }
-
-    impl Visit for CapVisitor {
-        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-            let rendered = format!("{value:?}");
-            if field.name() == "message" {
-                self.message = rendered;
-            } else {
-                self.fields.insert(field.name().to_string(), rendered);
-            }
-        }
-        fn record_str(&mut self, field: &Field, value: &str) {
-            if field.name() == "message" {
-                self.message = value.to_string();
-            } else {
-                self.fields
-                    .insert(field.name().to_string(), value.to_string());
-            }
-        }
-    }
-
-    struct LogCapture {
-        events: Arc<Mutex<Vec<CapturedEvent>>>,
-    }
-
-    impl<S> Layer<S> for LogCapture
-    where
-        S: Subscriber,
-    {
-        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-            let mut visitor = CapVisitor::default();
-            event.record(&mut visitor);
-            self.events
-                .lock()
-                .expect("capture lock")
-                .push(CapturedEvent {
-                    message: visitor.message,
-                    fields: visitor.fields,
-                });
-        }
-    }
-
-    /// Install the thread-local capture layer; the returned guard restores the
-    /// previous default dispatcher on drop.
-    pub fn lock_failure_capture() -> (
-        Arc<Mutex<Vec<CapturedEvent>>>,
-        tracing::subscriber::DefaultGuard,
-    ) {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let layer = LogCapture {
-            events: Arc::clone(&events),
-        };
-        let subscriber = tracing_subscriber::registry().with(layer);
-        let guard = tracing::subscriber::set_default(subscriber);
-        (events, guard)
-    }
 }
 
 #[cfg(unix)]
@@ -2279,7 +3008,7 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
     //    H2).
     // The loser-construction property above and the on-disk probe stay
     // one-shot and untouched.
-    let (events, _trace_guard) = lock_log_capture::lock_failure_capture();
+    let events = crate::invariants::capture::capture();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     // libc supplies EWOULDBLOCK's portable errno value (11 on Linux, 35 on
     // macOS), so the marker is derived from the compiled constant, not a literal.
@@ -2288,7 +3017,7 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
     // assertion (a bare `next` binding would trip the repo's -D warnings gate);
     // the name documents that the loop value is the third construction.
     let _next = loop {
-        let seen_before = events.lock().expect("capture lock").len();
+        let seen_before = events.lock().unwrap_or_else(|p| p.into_inner()).len();
         let candidate = PaneLedger::new_locked(Some(root.clone()));
         if candidate.ever_bound("claude", "s1") {
             break candidate;
@@ -2318,14 +3047,19 @@ fn new_locked_degrades_to_disabled_when_another_holder_exists() {
         // DISABLED via the construction scan fault
         // (`pane_ledger_scan_unavailable`) while HOLDING the flock; that shape
         // must be named with its captured fields, never fall through to the
-        // generic not-captured branch.
+        // generic not-captured branch. The root filter scopes the find to THIS
+        // test's store: the capture vec is shared binary-wide (kata 59nb), so
+        // sibling lock/scan failures from other roots must not be
+        // misclassified here.
         let captured = {
-            let log = events.lock().expect("capture lock");
+            let log = events.lock().unwrap_or_else(|p| p.into_inner());
             log[seen_before..]
                 .iter()
                 .find(|e| {
-                    e.message.contains("pane_ledger_lock_unavailable")
-                        || e.message.contains("pane_ledger_scan_unavailable")
+                    (e.message.contains("pane_ledger_lock_unavailable")
+                        || e.message.contains("pane_ledger_scan_unavailable"))
+                        && e.fields.get("root").map(String::as_str)
+                            == Some(&root.display().to_string())
                 })
                 .cloned()
         };
@@ -3019,6 +3753,8 @@ fn resolve_pending_records_the_markers_origin_create_request_id() {
         .resolve_pending(&BindingWrite {
             create_request_id: None, // the conn-less lane's deliberate None
             origin_create_request_id: None,
+            observed_epoch: None,
+            observed_generation: None,
             ..write("codex", "th-1", "t1", 2_000)
         })
         .unwrap();
@@ -3085,6 +3821,8 @@ fn a_crid_less_rebind_preserves_the_rows_origin_lineage() {
         .resolve_pending(&BindingWrite {
             create_request_id: None,
             origin_create_request_id: None,
+            observed_epoch: None,
+            observed_generation: None,
             ..write("codex", "th-1", "t1", 2_000)
         })
         .unwrap();
@@ -3095,6 +3833,8 @@ fn a_crid_less_rebind_preserves_the_rows_origin_lineage() {
         .resolve_pending(&BindingWrite {
             create_request_id: None,
             origin_create_request_id: None,
+            observed_epoch: None,
+            observed_generation: None,
             ..write("codex", "th-1", "t1", 3_000)
         })
         .unwrap();
@@ -3131,6 +3871,8 @@ fn note_pane_reattach_rekeys_the_origin_lineage_wholesale() {
         .resolve_pending(&BindingWrite {
             create_request_id: None,
             origin_create_request_id: None,
+            observed_epoch: None,
+            observed_generation: None,
             ..write("codex", "th-1", "t1", 2_000)
         })
         .unwrap();
@@ -3671,6 +4413,8 @@ fn crash_mid_supersession_two_bound_rows_repaired_by_updated_at_tiebreak() {
             retired_reason: None,
             superseded_by: None,
             pane_kind: None,
+            owner_epoch: None,
+            owner_generation: None,
             model: None,
             sandbox: None,
             permission_mode: None,
@@ -3793,6 +4537,10 @@ fn fresh_agent_binding_roundtrips_settings_and_pane_kind() {
             effort: Some("high"),
             supersedes: None,
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             now_ms: 1_000,
         })
         .unwrap();
@@ -3823,6 +4571,10 @@ fn fresh_agent_binding_upsert_preserves_created_at_and_refreshes_settings() {
         effort: Some("low"),
         supersedes: None,
         provenance: ProvenancePolicy::Inherit,
+        observed_epoch: None,
+        observed_generation: None,
+
+        authoritative: false,
         now_ms: 1_000,
     };
     ledger.record_fresh_agent_binding(&base).unwrap();
@@ -3831,6 +4583,10 @@ fn fresh_agent_binding_upsert_preserves_created_at_and_refreshes_settings() {
             model: Some("m2"),
             effort: None,
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             now_ms: 2_000,
             ..base
         })
@@ -3864,6 +4620,10 @@ fn supersedes_retires_the_old_row_and_links_the_chain() {
         effort: None,
         supersedes: None,
         provenance: ProvenancePolicy::Inherit,
+        observed_epoch: None,
+        observed_generation: None,
+
+        authoritative: false,
         now_ms: 1_000,
     };
     ledger.record_fresh_agent_binding(&base).unwrap();
@@ -3872,6 +4632,10 @@ fn supersedes_retires_the_old_row_and_links_the_chain() {
             session_id: "new-thread",
             supersedes: Some("old-thread"),
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             now_ms: 2_000,
             ..base
         })
@@ -3921,6 +4685,10 @@ fn fresh_agent_upsert_preserves_advisory_create_request_id_when_absent() {
         effort: None,
         supersedes: None,
         provenance: ProvenancePolicy::Inherit,
+        observed_epoch: None,
+        observed_generation: None,
+
+        authoritative: false,
         now_ms: 1_000,
     };
     ledger.record_fresh_agent_binding(&base).unwrap();
@@ -3928,6 +4696,10 @@ fn fresh_agent_upsert_preserves_advisory_create_request_id_when_absent() {
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             create_request_id: None,
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             now_ms: 2_000,
             ..base
         })
@@ -3961,6 +4733,10 @@ fn fresh_agent_settings_recorded_keys_off_settings_bearing_rows() {
         effort: None,
         supersedes: None,
         provenance: ProvenancePolicy::Inherit,
+        observed_epoch: None,
+        observed_generation: None,
+
+        authoritative: false,
         now_ms: 1_000,
     };
     // A cwd-only snapshot counts as settings-bearing (real creates always
@@ -3972,6 +4748,10 @@ fn fresh_agent_settings_recorded_keys_off_settings_bearing_rows() {
         .record_fresh_agent_binding(&FreshAgentBindingWrite {
             session_id: "ses_lineage",
             cwd: None,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             ..base
         })
         .unwrap();
@@ -4003,6 +4783,10 @@ fn supersedes_of_a_missing_old_row_is_a_silent_noop() {
             effort: None,
             supersedes: Some("never-existed"),
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
+
+            authoritative: false,
             now_ms: 1_000,
         })
         .expect("missing old row is a silent no-op, not an error");
@@ -5516,6 +6300,8 @@ fn a_close_pane_records_the_close_under_the_pane_identity_and_survives_a_restart
     ledger
         .record_binding(&BindingWrite {
             create_request_id: Some("cr-close-1"),
+            observed_epoch: None,
+            observed_generation: None,
             ..write("codex", "sess-pc", "term-pc", 1_000)
         })
         .unwrap();
@@ -6608,6 +7394,8 @@ fn a_detach_close_records_the_pane_close_without_retiring_or_fencing_anything() 
             create_request_id: Some("req-det"),
             origin_create_request_id: None,
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: 1_000,
         })
         .unwrap();
@@ -6730,6 +7518,8 @@ fn a_fully_aged_detach_close_survives_while_a_row_carries_its_create_request_id(
             create_request_id: Some("req-kept"),
             origin_create_request_id: None,
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: 1_000,
         })
         .unwrap();
@@ -6805,6 +7595,8 @@ fn a_tab_close_journals_one_batch_envelope_covering_the_whole_pane_set() {
                 create_request_id: Some(crid),
                 origin_create_request_id: None,
                 provenance: ProvenancePolicy::Inherit,
+                observed_epoch: None,
+                observed_generation: None,
                 now_ms: 1_000,
             })
             .unwrap();
@@ -7135,6 +7927,8 @@ fn a_fully_aged_detach_close_survives_while_a_row_carries_only_its_origin_lineag
             create_request_id: None, // the deliberate conn-less lane shape
             origin_create_request_id: Some("req-origin"),
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: 1_000,
         })
         .unwrap();
@@ -7182,6 +7976,8 @@ fn a_fully_aged_detach_close_survives_while_a_lineage_less_row_names_its_termina
             create_request_id: None,
             origin_create_request_id: None,
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: 1_000,
         })
         .unwrap();
@@ -7197,6 +7993,8 @@ fn a_fully_aged_detach_close_survives_while_a_lineage_less_row_names_its_termina
             create_request_id: Some("req-survivor"),
             origin_create_request_id: None,
             provenance: ProvenancePolicy::Inherit,
+            observed_epoch: None,
+            observed_generation: None,
             now_ms: 1_000,
         })
         .unwrap();
@@ -7260,6 +8058,8 @@ fn close_record_covers_row_is_the_shared_recovery_predicate() {
             retired_reason: None,
             superseded_by: None,
             pane_kind: None,
+            owner_epoch: None,
+            owner_generation: None,
             model: None,
             sandbox: None,
             permission_mode: None,
@@ -7960,24 +8760,48 @@ fn load_index_dir_io_errors_disable_the_ledger_loudly() {
     let root = temp_root("load-loud-dir");
     std::fs::write(root.join("bindings"), b"not a dir").unwrap();
     std::fs::write(root.join("pending"), b"not a dir").unwrap();
-    let (events, guard) = crate::invariants::capture::capture();
+    // 59nb worst-case order: force the shared callsite's FIRST execution to
+    // happen on a subscriber-less thread AFTER capture() and BEFORE the
+    // guarded emission below — the exact interleave that poisons tracing-core's
+    // process-global Interest cache under the old thread-local capture.
+    let poison_root = temp_root("load-loud-dir-poisoner");
+    std::fs::write(poison_root.join("bindings"), b"not a dir").unwrap();
+    std::fs::write(poison_root.join("pending"), b"not a dir").unwrap();
+    let events = crate::invariants::capture::capture();
+    std::thread::spawn(move || {
+        // clone: `PaneLedger::new(root: Option<PathBuf>)` (pane_ledger.rs:1491)
+        // takes ownership — without the clone, `remove_dir_all(&poison_root)`
+        // would borrow a moved value (E0382), and Step 2's red would be a
+        // compile error instead of the diagnosed mechanism.
+        let _poisoned = PaneLedger::new(Some(poison_root.clone()));
+        std::fs::remove_dir_all(&poison_root).ok();
+    })
+    .join()
+    .unwrap();
     let ledger = PaneLedger::new(Some(root.clone()));
-    drop(guard);
-    let events = events.lock().unwrap();
-    let hits: Vec<_> = events
-        .iter()
-        .filter(|e| {
-            e.target == "freshell_ws::pane_ledger"
-                && e.message.contains("pane_ledger_scan_unavailable")
-        })
-        .collect();
+    // Collect-then-assert (never hold the shared vec's guard across an
+    // assert): a panic under the guard would poison the lock for every
+    // other test in the binary. The root filter scopes the assertion to
+    // THIS test's store — the poisoner's own emission (and any sibling
+    // test's) lands in the shared vec with its own root and is excluded.
+    let hits: Vec<crate::invariants::capture::CapturedEvent> = {
+        let events = events.lock().unwrap_or_else(|p| p.into_inner());
+        events
+            .iter()
+            .filter(|e| {
+                e.target == "freshell_ws::pane_ledger"
+                    && e.message.contains("pane_ledger_scan_unavailable")
+                    && e.fields.get("root").map(String::as_str) == Some(&root.display().to_string())
+            })
+            .cloned()
+            .collect()
+    };
     assert_eq!(
         hits.len(),
         1,
-        "exactly one constructor ERROR for the scan fault; got: {events:?}"
+        "exactly one constructor ERROR for the scan fault; got: {hits:?}"
     );
     assert!(hits[0].fields.contains_key("root"));
-    drop(events);
     assert!(
         !ledger.is_enabled(),
         "a store that exists but cannot be read comes up DISABLED, never blind"
@@ -7998,22 +8822,11 @@ fn load_index_row_io_errors_are_loud_per_row() {
     // owns loudness) — this test must NOT flip that: only Io arms the event.
     let root = temp_root("load-loud-row");
     std::fs::create_dir_all(root.join("bindings").join("claude").join("ghost.json")).unwrap();
-    let (events, guard) = crate::invariants::capture::capture();
+    let events = crate::invariants::capture::capture();
     let ledger = PaneLedger::new(Some(root.clone()));
-    drop(guard);
-    let events = events.lock().unwrap();
-    let hits: Vec<_> = events
-        .iter()
-        .filter(|e| {
-            e.target == "freshell_ws::pane_ledger"
-                && e.message.contains("pane_ledger_load_index_row_unreadable")
-        })
-        .collect();
-    assert_eq!(
-        hits.len(),
-        1,
-        "one ERROR for the unreadable row; got: {events:?}"
-    );
+    // Collect-then-assert (never hold the shared vec's guard across an
+    // assert); the path filter scopes the exact-1 to THIS test's unreadable
+    // row (the shared vec carries every test's events).
     let want_path = format!(
         "{}",
         root.join("bindings")
@@ -8021,8 +8834,23 @@ fn load_index_row_io_errors_are_loud_per_row() {
             .join("ghost.json")
             .display()
     );
-    assert_eq!(hits[0].fields.get("path"), Some(&want_path));
-    drop(events);
+    let hits: Vec<crate::invariants::capture::CapturedEvent> = {
+        let events = events.lock().unwrap_or_else(|p| p.into_inner());
+        events
+            .iter()
+            .filter(|e| {
+                e.target == "freshell_ws::pane_ledger"
+                    && e.message.contains("pane_ledger_load_index_row_unreadable")
+                    && e.fields.get("path").map(String::as_str) == Some(want_path.as_str())
+            })
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        hits.len(),
+        1,
+        "one ERROR for the unreadable row; got: {hits:?}"
+    );
     assert!(ledger.list_bindings().is_empty());
     std::fs::remove_dir_all(&root).ok();
 }

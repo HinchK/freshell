@@ -755,7 +755,7 @@ describe('PaneHeader', () => {
       const agentIconSvg = agentIcon.querySelector('[data-testid="pane-icon"]')
       expect(agentIconSvg).not.toBeNull()
       expect(agentIconSvg?.getAttribute('class')).toContain('text-blue-500')
-      expect(agentIconSvg?.getAttribute('class')).toContain('h-3.5 w-3.5')
+      expect(agentIconSvg?.getAttribute('class')).toContain('h-4 w-4 sm:h-3.5 sm:w-3.5')
     })
   })
 
@@ -779,7 +779,7 @@ describe('PaneHeader', () => {
         </Provider>,
       )
       expect(screen.getByTestId('repo-icon')).toBeTruthy()
-      expect(screen.getByTestId('repo-icon').getAttribute('class') || '').toContain('h-3.5 w-3.5')
+      expect(screen.getByTestId('repo-icon').getAttribute('class') || '').toContain('h-4 w-4 shrink-0 sm:h-3.5 sm:w-3.5')
     })
 
     it('renders no repo icon for plain shell panes', () => {
@@ -1405,6 +1405,72 @@ describe('PaneHeader', () => {
 
       fireEvent.click(screen.getByTitle('Maximize pane'))
       expect(onToggleZoom).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('pane header hit zones', () => {
+    const freshAgentPaneContent = {
+      kind: 'fresh-agent',
+      sessionType: 'freshcodex',
+      provider: 'codex',
+      sessionId: 'fresh-session-1',
+      createRequestId: 'fresh-req-1',
+      status: 'running',
+    } as PaneContent
+
+    function renderPaneHeader(props: { metaLabel?: string; content?: PaneContent } = {}) {
+      render(
+        <PaneHeader
+          title="My Terminal"
+          status="running"
+          isActive={true}
+          onClose={vi.fn()}
+          content={makeTerminalContent()}
+          {...props}
+        />
+      )
+    }
+
+    it('renders full-height square zone classes with zero gap and mobile-only size increase', () => {
+      renderPaneHeader()
+      const header = screen.getByRole('banner')
+      expect(header.className).toContain('h-11')
+      expect(header.className).toContain('sm:h-7')
+      expect(header.className).toContain('text-sm')
+
+      const close = screen.getByTitle('Close pane')
+      expect(close.className).toContain('h-full')
+      expect(close.className).toContain('aspect-square')
+      expect(close.className).not.toContain('sm:h-4')
+      expect(close.className).not.toContain('sm:w-4')
+
+      const actions = header.querySelector('.pane-header-actions')
+      expect(actions?.className).toContain('gap-0')
+    })
+
+    it('keeps desktop glyph and icon classes untouched', () => {
+      renderPaneHeader()
+      const close = screen.getByTitle('Close pane')
+      const closeSvg = close.querySelector('svg')
+      expect(closeSvg?.getAttribute('class') ?? '').toContain('sm:h-3')
+      expect(closeSvg?.getAttribute('class') ?? '').toContain('h-5 w-5')
+    })
+
+    it('keeps an explicit meta margin next to the zero-gap actions', () => {
+      renderPaneHeader({ metaLabel: 'bash 5.2' })
+      const meta = screen.getByText('bash 5.2')
+      expect(meta.className).toContain('mr-2')
+      expect(meta.className).toContain('text-xs')
+    })
+
+    it('gives fresh-agent action wrappers the full-height chain', () => {
+      renderPaneHeader({ content: freshAgentPaneContent })
+      const header = screen.getByRole('banner')
+      const wrappers = header.querySelectorAll('.pane-header-fresh-agent-optional-action')
+      expect(wrappers.length).toBeGreaterThanOrEqual(1)
+      for (const w of wrappers) {
+        expect(w.className).toContain('h-full')
+      }
     })
   })
 

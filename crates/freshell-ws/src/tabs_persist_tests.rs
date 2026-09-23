@@ -1214,18 +1214,41 @@ fn every_supported_pane_kind_passes_semantic_generation_validation() {
 fn oversize_drop_returns_skipped_and_fires_invariant_alarm() {
     // Campaign fail-loud: an oversize drop must be an ERROR-class invariant
     // alarm and an honest non-Persisted outcome — never a silent WARN + Ok.
-    let (events, _guard) = crate::invariants::capture::capture();
+    let events = crate::invariants::capture::capture();
     let dir = tempfile::tempdir().unwrap();
     let big = "x".repeat(MAX_SNAPSHOT_BYTES + 10);
-    let mut rec = open_record("dev:t1", "big", 1);
+    let mut rec = open_record("dev-oversize:t1", "big", 1);
     rec["blob"] = json!(big);
-    let outcome = persist_generation(dir.path(), "srv-1", "dev", "Dev", "c1", 1, &[rec], 1000);
+    let outcome = persist_generation(
+        dir.path(),
+        "srv-1",
+        "dev-oversize",
+        "Dev",
+        "c1",
+        1,
+        &[rec],
+        1000,
+    );
     assert_eq!(outcome, PersistOutcome::Skipped { reason: "oversize" });
-    let events = events.lock().unwrap();
+    // Collect-then-assert (never hold the shared vec's guard across an
+    // assert); the device_id filter scopes the presence check to THIS test —
+    // the vec carries every test's events, and `device_id` is this
+    // emission's per-test-unique field (kata 59nb).
+    let hits: Vec<crate::invariants::capture::CapturedEvent> = {
+        let events = events.lock().unwrap_or_else(|p| p.into_inner());
+        events
+            .iter()
+            .filter(|e| {
+                e.target == "freshell_ws::invariants"
+                    && e.message.contains("tabs_snapshot_dropped_oversize")
+                    && e.fields.get("device_id").map(String::as_str) == Some("dev-oversize")
+            })
+            .cloned()
+            .collect()
+    };
     assert!(
-        events.iter().any(|e| e.target == "freshell_ws::invariants"
-            && e.message.contains("tabs_snapshot_dropped_oversize")),
-        "oversize drop must fire the invariant alarm, got: {events:?}"
+        !hits.is_empty(),
+        "oversize drop must fire the invariant alarm, got: {hits:?}"
     );
 }
 
@@ -1267,7 +1290,7 @@ fn corrupt_device_dir_is_exempt_from_cap_eviction() {
     // Fail-loud: a dir with >=1 unreadable file is forensic evidence and must
     // NEVER be the eviction victim. The oldest CLEAN dir evicts instead.
     // (Old scoring gave an all-corrupt dir capturedAt=0 -> evicted FIRST.)
-    let (events, _guard) = crate::invariants::capture::capture();
+    let events = crate::invariants::capture::capture();
     let dir = tempfile::tempdir().unwrap();
     for n in 0..MAX_SNAPSHOT_DEVICES {
         let dev = format!("dev-{n:03}");
@@ -1305,12 +1328,29 @@ fn corrupt_device_dir_is_exempt_from_cap_eviction() {
         device_dir_for(dir.path(), "dev-new").unwrap().exists(),
         "the new write must land"
     );
-    let events = events.lock().unwrap();
+    // Collect-then-assert (never hold the shared vec's guard across an
+    // assert); the path filter scopes the presence check to THIS test's
+    // tempdir — the vec carries every test's events (kata 59nb).
+    let want_dir_prefix = format!("{}", dir.path().display());
+    let hits: Vec<crate::invariants::capture::CapturedEvent> = {
+        let events = events.lock().unwrap_or_else(|p| p.into_inner());
+        events
+            .iter()
+            .filter(|e| {
+                e.target == "freshell_ws::invariants"
+                    && e.message
+                        .contains("tabs_snapshot_corrupt_dir_exempt_from_eviction")
+                    && e.fields
+                        .get("path")
+                        .map(String::as_str)
+                        .is_some_and(|p| p.starts_with(&want_dir_prefix))
+            })
+            .cloned()
+            .collect()
+    };
     assert!(
-        events.iter().any(|e| e.target == "freshell_ws::invariants"
-            && e.message
-                .contains("tabs_snapshot_corrupt_dir_exempt_from_eviction")),
-        "exempting a corrupt dir must be loud, got: {events:?}"
+        !hits.is_empty(),
+        "exempting a corrupt dir must be loud, got: {hits:?}"
     );
 }
 
@@ -1318,7 +1358,7 @@ fn corrupt_device_dir_is_exempt_from_cap_eviction() {
 fn cap_unenforceable_fails_the_write_and_preserves_all_evidence() {
     // When every candidate holds unreadable files, refuse to evict: fail the
     // incoming write loudly rather than destroy evidence.
-    let (events, _guard) = crate::invariants::capture::capture();
+    let events = crate::invariants::capture::capture();
     let dir = tempfile::tempdir().unwrap();
     for n in 0..MAX_SNAPSHOT_DEVICES {
         let dev = format!("dev-{n:03}");
@@ -1359,13 +1399,26 @@ fn cap_unenforceable_fails_the_write_and_preserves_all_evidence() {
         surviving, MAX_SNAPSHOT_DEVICES,
         "no corrupt dir may be destroyed"
     );
-    let events = events.lock().unwrap();
-    assert!(
+    // Collect-then-assert (never hold the shared vec's guard across an
+    // assert). The filter MUST key on the cap-unenforceable message + its
+    // `root` field (the emission carries root + corrupt_exempt, NO path):
+    // this test ALSO emits tabs_snapshot_corrupt_dir_exempt_from_eviction
+    // (with path) for every corrupt device dir under its tempdir — filtering
+    // on that message+path would keep the test green while silently dropping
+    // the cap-alarm check it exists to make (kata 59nb consumer audit).
+    let want_root = format!("{}", dir.path().display());
+    let hits: Vec<crate::invariants::capture::CapturedEvent> = {
+        let events = events.lock().unwrap_or_else(|p| p.into_inner());
         events
             .iter()
-            .any(|e| e.message.contains("tabs_snapshot_device_cap_unenforceable")),
-        "must alarm loudly: {events:?}"
-    );
+            .filter(|e| {
+                e.message.contains("tabs_snapshot_device_cap_unenforceable")
+                    && e.fields.get("root").map(String::as_str) == Some(want_root.as_str())
+            })
+            .cloned()
+            .collect()
+    };
+    assert!(!hits.is_empty(), "must alarm loudly: {hits:?}");
 }
 
 #[test]
@@ -1373,7 +1426,7 @@ fn mixed_device_id_dir_is_a_loud_error_not_first_file_wins() {
     // Defect 3: identity used to come from whatever *.json read_dir returned
     // first — nondeterministic for a half-migrated/hand-edited dir. Now every
     // generation must agree, or the read fails loudly.
-    let (events, _guard) = crate::invariants::capture::capture();
+    let events = crate::invariants::capture::capture();
     let dir = tempfile::tempdir().unwrap();
     put(
         dir.path(),
@@ -1408,11 +1461,28 @@ fn mixed_device_id_dir_is_a_loud_error_not_first_file_wins() {
             .contains("tabs_snapshot_device_identity_conflict"),
         "{err}"
     );
-    let events = events.lock().unwrap();
+    // Collect-then-assert (never hold the shared vec's guard across an
+    // assert); the `dir` field filter scopes the presence check to THIS
+    // test's device dir under its tempdir (kata 59nb).
+    let want_dir_prefix = format!("{}", dir.path().display());
+    let hits: Vec<crate::invariants::capture::CapturedEvent> = {
+        let events = events.lock().unwrap_or_else(|p| p.into_inner());
+        events
+            .iter()
+            .filter(|e| {
+                e.target == "freshell_ws::invariants"
+                    && e.message.contains("tabs_snapshot_device_identity_conflict")
+                    && e.fields
+                        .get("dir")
+                        .map(String::as_str)
+                        .is_some_and(|d| d.starts_with(&want_dir_prefix))
+            })
+            .cloned()
+            .collect()
+    };
     assert!(
-        events.iter().any(|e| e.target == "freshell_ws::invariants"
-            && e.message.contains("tabs_snapshot_device_identity_conflict")),
-        "identity conflict must alarm loudly: {events:?}"
+        !hits.is_empty(),
+        "identity conflict must alarm loudly: {hits:?}"
     );
 }
 

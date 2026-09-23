@@ -13,6 +13,7 @@ use freshell_codex::sidecar_store::{
     CodexSidecarStore, IdentityVerdict, SidecarLane, SidecarRecordState,
 };
 use serde_json::{json, Value};
+use tokio::io::AsyncReadExt;
 
 use crate::codex::tests::ENV_LOCK;
 // `scrub_sidecar_record` and `enrich_record_session_id` are exercised indirectly
@@ -95,6 +96,8 @@ async fn create_tracked_session_with_resume(
     st.handle_create(
         FreshAgentCreate {
             naming_handle: None,
+            observed_epoch: None,
+            observed_generation: None,
             request_id: request_id.to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
             provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -224,6 +227,8 @@ async fn failed_spawn_leaves_no_record() {
     st.handle_create(
         FreshAgentCreate {
             naming_handle: None,
+            observed_epoch: None,
+            observed_generation: None,
             request_id: "req-wfah-t2-fail".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
             provider: Some(freshell_protocol::AgentProvider::Codex),
@@ -271,7 +276,7 @@ async fn failed_spawn_leaves_no_record() {
 async fn build_recorded_watch(
     ownership_id: &str,
 ) -> (
-    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<crate::session_handoff::StopResult>,
     tokio::sync::oneshot::Sender<()>,
     u32,
 ) {
@@ -289,6 +294,8 @@ async fn build_recorded_watch(
         Arc::new(AtomicBool::new(false)),
         Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
         crate::codex::QuietDeadman::new_shared(),
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        None,
     );
     (watcher, kill_tx, pid)
 }
@@ -301,7 +308,11 @@ async fn requested_kill_arm_removes_the_record() {
     assert_eq!(guard.records().len(), 1, "recorded before the kill");
 
     kill_tx.send(()).expect("kill channel open");
-    watcher.await.expect("watcher completes");
+    let result = watcher.await.expect("watcher completes");
+    assert!(
+        matches!(result, crate::session_handoff::StopResult::Reaped),
+        "a requested dead child should expose a confirmed reap: {result:?}"
+    );
 
     assert!(
         guard.records().is_empty(),
@@ -339,8 +350,14 @@ async fn unrequested_exit_arm_removes_the_record() {
         exited.clone(),
         Arc::new(crate::session_lease::FreshAgentSessionLeases::new()),
         crate::codex::QuietDeadman::new_shared(),
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        None,
     );
-    watcher.await.expect("watcher completes");
+    let result = watcher.await.expect("watcher completes");
+    assert!(
+        matches!(result, crate::session_handoff::StopResult::Reaped),
+        "an unrequested dead child should expose a confirmed reap: {result:?}"
+    );
 
     assert!(
         guard.records().is_empty(),
@@ -366,6 +383,8 @@ async fn handle_kill_leaves_no_record() {
         session_id,
         session_type: freshell_protocol::SessionType::Freshcodex,
         cwd: None,
+        observed_epoch: None,
+        observed_generation: None,
     })
     .await;
 
@@ -373,6 +392,182 @@ async fn handle_kill_leaves_no_record() {
         guard.records().is_empty(),
         "freshAgent.kill reaps through the watcher, which scrubs"
     );
+}
+
+/// Task 3/F2 acceptance fixture: the app-server owns a real durable writer child, the writer
+/// exposes a readiness witness and a loopback port, and its repeated writes prove that the
+/// sidecar lifecycle is guarding a writer tree rather than only a direct `sleep` child.
+#[tokio::test]
+async fn durable_writer_fixture_exposes_live_witness_and_is_reaped_with_the_sidecar() {
+    let _env = ENV_LOCK.lock().await;
+    std::env::set_var("CODEX_CMD", fake_codex_cmd());
+    let guard = TrackingStoreGuard::install();
+    let dir = tempfile::tempdir().expect("fixture witness directory");
+    let output_path = dir.path().join("session.jsonl");
+    let ready_path = dir.path().join("writer.ready");
+    let port_path = dir.path().join("writer.port");
+    let pid_path = dir.path().join("writer.pid");
+    std::env::set_var(
+        "FAKE_CODEX_APP_SERVER_BEHAVIOR",
+        serde_json::to_string(&json!({
+            "spawnDurableWriter": true,
+            "durableWriterPath": output_path,
+            "durableWriterReadyPath": ready_path,
+            "durableWriterPortPath": port_path,
+            "durableWriterPidPath": pid_path,
+            "durableWriterIntervalMs": 20,
+            "durableWriterIgnoresSigterm": true,
+            "wrapperLeavesDurableWriterOnSigterm": true,
+        }))
+        .expect("fixture behavior json"),
+    );
+    let (mut st, mut rx) = tracking_state();
+    let registry = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    st.set_ownership(Arc::clone(&registry));
+
+    let session_id = create_tracked_session(&st, &mut rx, "req-wfah-durable-writer").await;
+    for _ in 0..100 {
+        if ready_path.exists() && port_path.exists() && pid_path.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(ready_path.exists(), "writer readiness witness must land");
+    let port: u16 = std::fs::read_to_string(&port_path)
+        .expect("writer port witness")
+        .trim()
+        .parse()
+        .expect("numeric loopback port");
+    let mut socket = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .expect("durable writer loopback port remains reachable");
+    let mut response = Vec::new();
+    socket
+        .read_to_end(&mut response)
+        .await
+        .expect("read writer response");
+    assert!(String::from_utf8_lossy(&response).contains("durable writer"));
+    let initial_lines = std::fs::read_to_string(&output_path)
+        .expect("durable writer output")
+        .lines()
+        .count();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let later_lines = std::fs::read_to_string(&output_path)
+        .expect("durable writer output after interval")
+        .lines()
+        .count();
+    assert!(later_lines > initial_lines, "writer must append repeatedly");
+    let writer_pid: u32 = std::fs::read_to_string(&pid_path)
+        .expect("writer pid witness")
+        .trim()
+        .parse()
+        .expect("numeric writer pid");
+    assert!(
+        std::path::Path::new(&format!("/proc/{writer_pid}")).exists(),
+        "the durable writer is a child distinct from the app-server"
+    );
+
+    st.handle_kill(freshell_protocol::FreshAgentKill {
+        provider: freshell_protocol::AgentProvider::Codex,
+        session_id,
+        session_type: freshell_protocol::SessionType::Freshcodex,
+        cwd: None,
+        observed_epoch: None,
+        observed_generation: None,
+    })
+    .await;
+
+    assert!(
+        !std::path::Path::new(&format!("/proc/{writer_pid}")).exists(),
+        "the owned writer child must be reaped with the app-server"
+    );
+    assert!(
+        guard.records().is_empty(),
+        "all owned writer records are scrubbed"
+    );
+}
+
+/// The same fixture can model the failure that makes descendant confirmation necessary: the
+/// app-server exits directly while its tagged writer remains alive and keeps appending. This
+/// is deliberately a fixture-level check; the preceding test drives the real lane teardown
+/// that must reap the writer before releasing ownership.
+#[tokio::test]
+async fn durable_writer_fixture_survives_direct_app_server_exit() {
+    let _env = ENV_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("fixture witness directory");
+    let output_path = dir.path().join("session.jsonl");
+    let ready_path = dir.path().join("writer.ready");
+    let port_path = dir.path().join("writer.port");
+    let pid_path = dir.path().join("writer.pid");
+    let behavior = serde_json::to_string(&json!({
+        "spawnDurableWriter": true,
+        "durableWriterPath": output_path,
+        "durableWriterReadyPath": ready_path,
+        "durableWriterPortPath": port_path,
+        "durableWriterPidPath": pid_path,
+        "durableWriterIntervalMs": 20,
+        "durableWriterIgnoresSigterm": true,
+        "wrapperLeavesDurableWriterOnSigterm": true,
+    }))
+    .expect("fixture behavior json");
+    let fixture_path = fake_codex_cmd()
+        .strip_prefix("node ")
+        .expect("fake Codex command uses node")
+        .to_string();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve port");
+    let port = listener.local_addr().expect("reserved address").port();
+    drop(listener);
+    let mut server = tokio::process::Command::new("node")
+        .arg(fixture_path)
+        .args(["--listen", &format!("ws://127.0.0.1:{port}")])
+        .env("FAKE_CODEX_APP_SERVER_BEHAVIOR", behavior)
+        .env("FRESHELL_CODEX_SIDECAR_ID", "fixture-durable-writer")
+        .spawn()
+        .expect("spawn fixture app-server");
+
+    for _ in 0..100 {
+        if ready_path.exists() && port_path.exists() && pid_path.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let writer_pid: u32 = std::fs::read_to_string(&pid_path)
+        .expect("writer pid witness")
+        .trim()
+        .parse()
+        .expect("numeric writer pid");
+    assert!(
+        std::path::Path::new(&format!("/proc/{writer_pid}")).exists(),
+        "writer must be live before the app-server exits"
+    );
+    let before = std::fs::read_to_string(&output_path)
+        .expect("writer output")
+        .lines()
+        .count();
+
+    server.start_kill().expect("kill app-server directly");
+    let _ = server.wait().await.expect("app-server wait");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert!(
+        std::path::Path::new(&format!("/proc/{writer_pid}")).exists(),
+        "the tagged durable writer must survive direct app-server exit"
+    );
+    let after = std::fs::read_to_string(&output_path)
+        .expect("writer output after app-server exit")
+        .lines()
+        .count();
+    assert!(after > before, "the surviving writer must keep appending");
+
+    // This test owns the fixture child directly, so clean it up by its exact pid.
+    unsafe {
+        libc::kill(writer_pid as i32, libc::SIGKILL);
+    }
+    for _ in 0..100 {
+        if !std::path::Path::new(&format!("/proc/{writer_pid}")).exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]
@@ -427,6 +622,8 @@ async fn create_bail_after_spawn_leaves_no_record() {
     st.handle_create(
         FreshAgentCreate {
             naming_handle: None,
+            observed_epoch: None,
+            observed_generation: None,
             request_id: "req-wfah-t3-bail".to_string(),
             session_type: freshell_protocol::SessionType::Freshcodex,
             provider: Some(freshell_protocol::AgentProvider::Codex),

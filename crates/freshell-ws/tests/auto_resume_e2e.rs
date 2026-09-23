@@ -15,6 +15,7 @@ mod common;
 use std::time::Duration;
 
 use common::next_frame_of_type;
+use freshell_ws::WsState;
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -36,20 +37,58 @@ fn counting_crashing_claude_spec(
     claude_spec(&script_path)
 }
 
-/// A claude-shaped CLI spec that crashes ONLY its first invocation (marker
-/// file absent), then survives (`exec sleep 30`) — the replacement generation
-/// stays live for the reconcile pin.
-fn crash_once_claude_spec(marker: &std::path::Path) -> freshell_platform::CliCommandSpec {
+/// A claude-shaped CLI spec that crashes ONLY its first invocation (the
+/// crash marker is absent), then survives (`exec sleep 30`) — the
+/// replacement generation stays live for the reconcile pin. Returns the
+/// spec plus the RELEASE marker path the caller writes to arm the
+/// first generation's deliberate crash.
+///
+/// FLAKE FIX (auto-resume base-gate RCA, 2026-09-19): the first
+/// generation does NOT crash until the test releases it — it polls the
+/// release marker, which the caller writes only AFTER the create's
+/// `terminal.created` reply is in. Pre-fix the shim died within
+/// milliseconds of the spawn, racing the create's post-spawn tail; when
+/// the death won that race, the b8ke ext r9 dead-PTY guard
+/// (`commit_session_ref_ownership`: "a dead runtime NEVER records
+/// Live") refused the create's winner commit and the create answered
+/// the typed lost-ownership error instead — the crash-once tests'
+/// `terminal.created` waits then consumed the error frame and burned
+/// their whole 30s frame budget (the origin/main base-gate flake,
+/// roughly 1-in-7 file runs under parallel load). Releasing on the
+/// settled reply makes the deliberate crash structurally POST-settle —
+/// no timing assumption anywhere (the codex sibling's fixed 1.2s sleep
+/// is the cruder precedent: it still bets on a wall-clock margin).
+fn crash_once_claude_spec(
+    marker: &std::path::Path,
+) -> (freshell_platform::CliCommandSpec, std::path::PathBuf) {
+    // The SCRIPT path is per-test too (derived from the marker name — the
+    // `crash_once_codex_spec` lesson): two tests in one binary share
+    // std::process::id(), and a shared script would pin BOTH servers'
+    // terminals to whichever marker lost the write race (a generation meant
+    // to crash takes the survivor branch, or vice versa).
+    let marker_tag = marker
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("marker path has a utf-8 file name");
     let script_path = std::env::temp_dir().join(format!(
-        "freshell-auto-resume-e2e-crash-once-shim-{}.sh",
+        "freshell-auto-resume-e2e-crash-once-shim-{marker_tag}-{}.sh",
+        std::process::id()
+    ));
+    let release = std::env::temp_dir().join(format!(
+        "freshell-auto-resume-e2e-crash-once-release-{marker_tag}-{}.txt",
         std::process::id()
     ));
     let script = format!(
-        "#!/bin/sh\nif [ -e \"{marker}\" ]; then exec sleep 30; fi\n: > \"{marker}\"\nexit 1\n",
-        marker = marker.display()
+        "#!/bin/sh\n\
+         if [ -e \"{marker}\" ]; then exec sleep 30; fi\n\
+         while [ ! -e \"{release}\" ]; do sleep 0.05; done\n\
+         : > \"{marker}\"\n\
+         exit 1\n",
+        marker = marker.display(),
+        release = release.display(),
     );
     write_executable(&script_path, &script);
-    claude_spec(&script_path)
+    (claude_spec(&script_path), release)
 }
 
 fn write_executable(path: &std::path::Path, script: &str) {
@@ -346,15 +385,18 @@ async fn reconcile_after_replacement_attaches_to_the_new_terminal() {
         std::process::id()
     ));
     let _ = std::fs::remove_file(&marker);
-    let (url, registry) = common::spawn_server_with_specs_and_auto_resume_hub(
-        vec![crash_once_claude_spec(&marker)],
-        vec![50, 100],
-    )
-    .await;
+    let (crash_spec, release_marker) = crash_once_claude_spec(&marker);
+    let _ = std::fs::remove_file(&release_marker);
+    let (url, registry) =
+        common::spawn_server_with_specs_and_auto_resume_hub(vec![crash_spec], vec![50, 100]).await;
     let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
 
     let create_request_id = "req-e2e-crash-once";
     let (old_tid, session_id) = create_claude_terminal(&mut ws, create_request_id).await;
+    // Arm the shim's deliberate crash: the create is settled (its
+    // `terminal.created` reply is in), so the death can no longer race the
+    // create's post-spawn tail (see `crash_once_claude_spec`).
+    std::fs::write(&release_marker, b"released\n").expect("write the crash release marker");
 
     // DEFLAKE: FRAME_BUDGET (30s) replaces the old 10s frame budget as a
     // per-stage budget (this wait gets its own fresh deadline — see the
@@ -423,6 +465,172 @@ async fn reconcile_after_replacement_attaches_to_the_new_terminal() {
         verdicts[0].get("corrected").is_none_or(|v| v.is_null()),
         "same-session replacement must not set corrected: {:?}",
         verdicts[0]
+    );
+
+    // Cleanup: reap the surviving replacement PTY.
+    registry.kill(&new_tid);
+}
+
+/// b8ke d4 F4: [`common::spawn_server_with_specs_and_auto_resume_hub`]'s
+/// shape PLUS the ONE runtime-ownership coordinator, wired exactly like
+/// `freshell-server/src/main.rs` (the registry's release side + WsState)
+/// BEFORE the hub is spawned — the shared builder pins `ownership: None`,
+/// under which the respawn's coordinator claim is `Unwired` (no ticket, no
+/// commit), so the dropped-ticket proof needs this local variant (the
+/// `rest_claude_identity.rs::spawn_merged_server` file-local-harness
+/// precedent).
+async fn spawn_server_with_hub_and_ownership(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+    delays: Vec<u64>,
+) -> (String, freshell_terminal::TerminalRegistry) {
+    let auth_token = Arc::new(common::AUTH_TOKEN.to_string());
+    let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
+    let settings =
+        Arc::new(serde_json::from_value(common::test_settings_value()).expect("valid settings"));
+    let ownership = Arc::new(freshell_ownership::RuntimeOwnershipRegistry::new());
+    let registry =
+        freshell_terminal::TerminalRegistry::new().with_ownership(Arc::clone(&ownership));
+    let (auto_resume_tx, auto_resume_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let state = WsState {
+        layout: Default::default(),
+        terminal_meta: Default::default(),
+        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
+        identity: freshell_ws::identity::TerminalIdentityRegistry::new(),
+        auth_token: Arc::clone(&auth_token),
+        server_instance_id: Arc::new("srv-test".to_string()),
+        boot_id: Arc::new("boot-test".to_string()),
+        settings,
+        handshake_settings: common::handshake_settings_lock(),
+        broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx,
+        auto_resume_cancels: Default::default(),
+        fresh_codex: freshell_freshagent::FreshCodexState::new(
+            Arc::clone(&auth_token),
+            Arc::clone(&broadcast_tx),
+            serde_json::json!({ "freshAgent": { "enabled": false } }),
+        ),
+        fresh_claude: freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx)),
+        fresh_opencode: freshell_freshagent::FreshOpencodeState::new(
+            freshell_freshagent::FreshAgentState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+            ),
+        ),
+        registry: registry.clone(),
+        tabs: freshell_ws::tabs::TabsRegistry::new(),
+        screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
+        subagent_interest: Default::default(),
+        host_stats: Default::default(),
+        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        cli_commands: Arc::new(cli_commands),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
+        ping_interval_ms: 30_000,
+        hello_timeout_ms: 5_000,
+        allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
+        ws_max_payload_bytes: 16 * 1024 * 1024,
+        term09: freshell_ws::backpressure::Term09Config::default(),
+        create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
+        spawn_gate: Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+        shutdown_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        config_fallback: None,
+        opencode_locator: None,
+        codex_locator: None,
+        activity: None,
+        session_existence: Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+        fresh_agent_respawn_counts: Default::default(),
+        ownership: Some(Arc::clone(&ownership)),
+    };
+
+    freshell_ws::auto_resume::spawn_auto_resume_hub_with_schedules(
+        state.clone(),
+        auto_resume_rx,
+        delays,
+        vec![25, 25],
+    );
+
+    let router = freshell_ws::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    (format!("ws://{addr}/ws"), registry)
+}
+
+/// b8ke d4 F4: a successful auto-resume respawn commits Live and must
+/// CONSUME its parked OperationTicket — the ticket's Drop must not emit
+/// `ownership.ticket.dropped_unarmed`/TICKET_DROPPED for the respawned
+/// session (pre-d4 the un-disarmed drop misclassified every successful
+/// respawn as an abandoned claim in the diagnostics). Asserted through the
+/// process-global capture (the hub polls on tokio workers, where a
+/// thread-local default is blind), filtered by the freshly-minted session
+/// id and the auto-resume operation id. Determinism: the hub emits
+/// `terminal.replaced` only AFTER `complete_claim` returned true, and the
+/// ticket drops inside `complete_claim` before it returns — so observing
+/// the frame means the drop already fired.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(unix)]
+async fn successful_auto_resume_respawn_does_not_drop_its_ticket_unarmed() {
+    let marker = std::env::temp_dir().join(format!(
+        "freshell-auto-resume-e2e-ticket-{}.marker",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let (crash_spec, release_marker) = crash_once_claude_spec(&marker);
+    let _ = std::fs::remove_file(&release_marker);
+    let (url, registry) = spawn_server_with_hub_and_ownership(vec![crash_spec], vec![50]).await;
+    let (mut ws, _inv) = common::connect_and_capture_inventory(&url).await;
+    let (events, start_index) = grace_event_capture();
+    let create_request_id = "req-e2e-ticket";
+    let (old_tid, session_id) = create_claude_terminal(&mut ws, create_request_id).await;
+    // Arm the shim's deliberate crash: the create is settled (its
+    // `terminal.created` reply is in), so the death can no longer race the
+    // create's post-spawn tail — the r9 dead-PTY commit guard that turned
+    // the raced death into a typed create error (see `crash_once_claude_spec`).
+    std::fs::write(&release_marker, b"released\n").expect("write the crash release marker");
+
+    // The crash-once generation crashes; the hub resumes it once — wait for
+    // the replacement frame (the settle point AFTER the respawn's
+    // complete_claim committed Live and dropped its ticket).
+    let replaced = wait_frame_matching(
+        &mut ws,
+        "terminal.replaced",
+        tokio::time::Instant::now() + common::FRAME_BUDGET,
+        |v| v["type"] == "terminal.replaced",
+    )
+    .await;
+    assert_eq!(replaced["oldTerminalId"], serde_json::json!(old_tid));
+    let new_tid = replaced["newTerminalId"]
+        .as_str()
+        .expect("newTerminalId")
+        .to_string();
+    assert_ne!(new_tid, old_tid);
+
+    // THE FIX'S ASSERTION: the respawn's Live commit consumed its parked
+    // claim — no dropped_unarmed names this session with an auto-resume
+    // operation id.
+    let events = events.lock().expect("capture lock").clone();
+    let dropped: Vec<_> = events[start_index.min(events.len())..]
+        .iter()
+        .filter(|e| {
+            e.fields.get("event").map(String::as_str) == Some("ownership.ticket.dropped_unarmed")
+                && e.fields.get("session_id").map(String::as_str) == Some(session_id.as_str())
+                && e.fields
+                    .get("operation_id")
+                    .is_some_and(|op| op.starts_with("auto-resume-"))
+        })
+        .collect();
+    assert!(
+        dropped.is_empty(),
+        "a successful auto-resume respawn must not classify its own ticket \
+         as abandoned: {dropped:?}"
     );
 
     // Cleanup: reap the surviving replacement PTY.

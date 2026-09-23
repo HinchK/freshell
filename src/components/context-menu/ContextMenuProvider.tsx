@@ -11,7 +11,6 @@ import {
   resetSplit,
   splitPane as splitPaneAction,
   swapSplit,
-  updatePaneContent,
   updatePaneTitleByTerminalId,
 } from '@/store/panesSlice'
 import { applySessionRenameCascade, clearSessionTitleOverride } from '@/store/titleSync'
@@ -21,15 +20,14 @@ import { isScopedSessionRow, selectSessionNameRecord } from '@/store/selectors/s
 import type { SessionNameRef } from '@shared/session-names'
 import { removeSessionFromProjects, setProjectExpanded } from '@/store/sessionsSlice'
 import { getWsClient } from '@/lib/ws-client'
-import { sendTerminalKillAndAwait, sendFreshAgentKillAndAwait } from '@/lib/kill-ack'
-import { api, setSessionMetadata } from '@/lib/api'
+import { api } from '@/lib/api'
 import { refreshActiveSessionWindow } from '@/store/sessionsThunks'
 import { getAuthToken } from '@/lib/auth'
 import { buildShareUrl } from '@/lib/utils'
 import { copyText } from '@/lib/clipboard'
 import { openExternalUrl } from '@/lib/open-url'
 import { triggerHapticFeedback } from '@/lib/mobile-haptics'
-import { collectPaneEntries, collectTerminalIds, findPaneContent } from '@/lib/pane-utils'
+import { collectPaneEntries, collectTerminalIds } from '@/lib/pane-utils'
 import { collectSessionRefsFromNode } from '@/lib/session-utils'
 import { getTabDisplayTitle } from '@/lib/tab-title'
 import { getBrowserActions, getEditorActions, getTerminalActions } from '@/lib/pane-action-registry'
@@ -42,11 +40,10 @@ import { mergeSessionMetadataByKey } from '@/lib/session-metadata'
 import { deriveTabRecencyAt } from '@/lib/tab-recency'
 import { hasWaitingPrompt, resolvePaneActivity } from '@/lib/pane-activity'
 import {
-  resolveReopenPaneSessionTarget,
   type ReopenPaneActivity,
   type ReopenPaneSessionTarget,
 } from '@/lib/session-flavor-reopen'
-import { getFreshOpenCodeRouteCwd } from '@/lib/fresh-opencode-route'
+import { runPaneSessionHandoff } from '@/lib/session-handoff'
 import { selectTabsRegistryGroups } from '@/store/selectors/tabsRegistrySelectors'
 import {
   jumpToRecord as jumpToRecordAction,
@@ -55,7 +52,6 @@ import {
   type TabsRegistryGroups,
 } from '@/lib/tab-registry-open'
 import type { RegistryPaneSnapshot, RegistryTabRecord } from '@/store/tabRegistryTypes'
-import { createLogger } from '@/lib/client-logger'
 import { ConfirmModal } from '@/components/ui/confirm-modal'
 import type { AppView } from '@/components/Sidebar'
 import type { CodingCliProviderName, CodingCliSession, ProjectGroup } from '@/store/types'
@@ -105,7 +101,6 @@ const EMPTY_TAB_REGISTRY_GROUPS: TabsRegistryGroups = {
   closed: [],
 }
 
-const log = createLogger('ContextMenuProvider')
 const KNOWN_CONTEXT_IDS = new Set(Object.values(ContextIds) as ContextId[])
 
 
@@ -175,18 +170,6 @@ function isFreshAgentLongPressOwnedTarget(el: HTMLElement | null): boolean {
 
 function resolveContextId(value: string | undefined): ContextId {
   return isKnownContextId(value) ? value : ContextIds.Global
-}
-
-function sameReopenTargetIdentity(
-  a: ReopenPaneSessionTarget,
-  b: ReopenPaneSessionTarget,
-): boolean {
-  return a.tabId === b.tabId
-    && a.paneId === b.paneId
-    && a.sourceSessionType === b.sourceSessionType
-    && a.targetSessionType === b.targetSessionType
-    && a.provider === b.provider
-    && a.sessionId === b.sessionId
 }
 
 export function ContextMenuProvider({
@@ -1044,157 +1027,21 @@ export function ContextMenuProvider({
   ])
 
   const reopenPaneAsSessionTargetAction = useCallback(async (clickedTarget: ReopenPaneSessionTarget) => {
-    const resolveCurrent = () => {
-      const state = appStore.getState()
-      const tab = state.tabs.tabs.find((item) => item.id === clickedTarget.tabId)
-      const layout = state.panes.layouts[clickedTarget.tabId]
-      const content = layout ? findPaneContent(layout, clickedTarget.paneId) : null
-      if (!tab || !content) return null
-
-      const activity = resolvePaneActivity({
-        paneId: clickedTarget.paneId,
-        content,
-        tabMode: tab.mode,
-        isOnlyPane: layout.type === 'leaf',
-        codexActivityByTerminalId: state.codexActivity?.byTerminalId ?? EMPTY_CODEX_ACTIVITY_BY_ID,
-        opencodeActivityByTerminalId: state.opencodeActivity?.byTerminalId ?? EMPTY_OPENCODE_ACTIVITY_BY_ID,
-        claudeActivityByTerminalId: state.claudeActivity?.byTerminalId ?? EMPTY_CLAUDE_ACTIVITY_BY_ID,
-        amplifierActivityByTerminalId: state.amplifierActivity?.byTerminalId ?? EMPTY_AMPLIFIER_ACTIVITY_BY_ID,
-        paneRuntimeActivityByPaneId: state.paneRuntimeActivity?.byPaneId ?? EMPTY_PANE_RUNTIME_ACTIVITY_BY_ID,
-        freshAgentSessions: state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS,
-      })
-      let hasWaitingItems = false
-      if (content.kind === 'fresh-agent' && content.sessionId) {
-        const sessionKey = makeFreshAgentSessionKey({
-          sessionType: content.sessionType,
-          provider: content.provider,
-          sessionId: content.sessionId,
-        })
-        hasWaitingItems = hasWaitingPrompt((state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS)[sessionKey])
-      }
-
-      const target = resolveReopenPaneSessionTarget({
-        tabId: clickedTarget.tabId,
-        paneId: clickedTarget.paneId,
-        content,
-        tab,
-        activity: {
-          isBusy: activity.isBusy,
-          ...(hasWaitingItems ? { hasWaitingItems } : {}),
-        },
-      })
-
-      if (!target) return null
-      return {
-        tab,
-        content,
-        target,
-        freshAgentSessions: state.freshAgent?.sessions ?? EMPTY_FRESH_AGENT_SESSIONS,
-        providerSettings: state.settings.settings.freshAgent?.providers?.[target.targetSessionType],
-      }
-    }
-
-    const current = resolveCurrent()
-    if (
-      !current
-      || current.target.disabled
-      || !sameReopenTargetIdentity(current.target, clickedTarget)
-    ) {
-      return
-    }
-
-    try {
-      await setSessionMetadata(
-        current.target.provider,
-        current.target.sessionId,
-        current.target.targetSessionType,
-        { sessionTypeSource: 'explicit' },
-      )
-    } catch (err) {
-      log.warn({
-        event: 'reopen_session_flavor_metadata_persist_failed',
-        provider: current.target.provider,
-        sessionId: current.target.sessionId,
-        targetSessionType: current.target.targetSessionType,
-        tabId: current.target.tabId,
-        paneId: current.target.paneId,
-        err,
-      })
-      return
-    }
-
-    const latest = resolveCurrent()
-    if (
-      !latest
-      || latest.target.disabled
-      || !sameReopenTargetIdentity(latest.target, clickedTarget)
-    ) {
-      return
-    }
-
-    const resolvedCwd = latest.target.cwd ?? getFreshOpenCodeRouteCwd(
-      latest.content,
-      {
-        freshAgentSessions: latest.freshAgentSessions,
-        sessionId: latest.target.sessionId,
-      },
-    )
-
-    // Focused-episode-6 round 2 (Findings 6+7): AWAIT the old session's
-    // durable close before starting its replacement conversation — a close
-    // the server cannot record durably is not a close, and swapping the pane
-    // content anyway would leave a live server session open on no tab. On
-    // failure the pane keeps its current conversation (the terminal pane's
-    // xterm notice / the fresh-agent session-error banner carries the reason).
-    if (latest.content.kind === 'terminal' && latest.content.terminalId) {
-      const ack = await sendTerminalKillAndAwait(latest.content.terminalId, {
-        createRequestId: latest.content.createRequestId ?? null,
-      })
-      if (!ack.ok) return
-    } else if (latest.content.kind === 'fresh-agent' && latest.content.sessionId) {
-      const cwd = getFreshOpenCodeRouteCwd(
-        latest.content,
-        {
-          freshAgentSessions: latest.freshAgentSessions,
-          sessionId: latest.content.sessionId,
-          fallbackCwd: resolvedCwd,
-        },
-      )
-      const ack = await sendFreshAgentKillAndAwait({
-        sessionId: latest.content.sessionId,
-        sessionType: latest.content.sessionType,
-        provider: latest.content.provider,
-        ...(cwd ? { cwd } : {}),
-      })
-      if (!ack.ok) return
-    }
-
-    dispatch(updatePaneContent({
-      tabId: latest.target.tabId,
-      paneId: latest.target.paneId,
-      content: buildResumeContent({
-        sessionType: latest.target.targetSessionType,
-        sessionId: latest.target.sessionId,
-        cwd: resolvedCwd,
-        freshAgentProviderSettings: latest.providerSettings,
-      }),
-    }))
-
-    const sessionMetadataByKey = mergeSessionMetadataByKey(
-      latest.tab.sessionMetadataByKey,
-      latest.target.provider,
-      latest.target.sessionId,
-      { sessionType: latest.target.targetSessionType },
-    )
-    if (sessionMetadataByKey !== latest.tab.sessionMetadataByKey) {
-      dispatch(updateTab({
-        id: latest.tab.id,
-        updates: { sessionMetadataByKey },
-      }))
-    }
+    // kata b8ke: ONE atomic server-side handoff replaces the
+    // client-orchestrated kill → swap sequence. The server enters Handoff
+    // (generation+1) under the coordinator lease, stops the prior runtime,
+    // awaits its confirmed reap, starts the target, and commits +
+    // broadcasts the new owner; the runner converts the pane locally only
+    // on success and folds the typed failure for the banner + Retry
+    // surface otherwise. The sessionId comes from the sessionRef-aware
+    // target — content.sessionId is NOT required.
+    await runPaneSessionHandoff(appStore, {
+      tabId: clickedTarget.tabId,
+      paneId: clickedTarget.paneId,
+      expected: clickedTarget,
+    })
   }, [
     appStore,
-    dispatch,
   ])
 
   const shouldUseNativeMenu = useCallback((targetEl: HTMLElement | null, contextId: string, contextEl: HTMLElement | null, evt: MouseEvent | KeyboardEvent) => {

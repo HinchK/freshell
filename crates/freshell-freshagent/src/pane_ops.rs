@@ -765,6 +765,36 @@ pub(crate) async fn navigate_pane(
 
 // ── POST /api/panes/:id/respawn ─────────────────────────────────────────
 
+/// kata b8ke Task 10 (round-1 review): the re-sync handshake's bounded
+/// window — 1.5s, above the layout mirror's 1s first-sync debounce (T6's
+/// quantified windows), polled at 100ms.
+const LAYOUT_RESYNC_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
+const LAYOUT_RESYNC_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The miss half of [`respawn_pane`]'s resolution (kata b8ke Task 10,
+/// round-1 review): broadcast `ui.command { command: "layout.resync" }`
+/// asking the owner client to re-send its layout (its mirror is change-
+/// gated and debounce-windowed, so a just-created pane may not have landed
+/// yet), then poll `LayoutStore::find_pane_tab` for a bounded window.
+/// Returns `Some(tab_id)` the moment the pane resolves, `None` on window
+/// expiry (the caller answers the typed `PANE_NOT_FOUND`).
+async fn try_layout_resync_then_find(state: &FreshAgentState, pane_id: &str) -> Option<String> {
+    state.broadcast(&ServerMessage::UiCommand(UiCommand {
+        command: "layout.resync".to_string(),
+        payload: None,
+    }));
+    let deadline = tokio::time::Instant::now() + LAYOUT_RESYNC_WINDOW;
+    loop {
+        tokio::time::sleep(LAYOUT_RESYNC_POLL).await;
+        if let Some(tab_id) = state.layout.find_pane_tab(pane_id) {
+            return Some(tab_id);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+    }
+}
+
 /// `POST /api/panes/:id/respawn` (`router.ts:1546-1617`): replace a pane's
 /// terminal in place with a freshly-spawned one (same `{mode?, shell?, cwd?,
 /// resumeSessionId?, sessionRef?}` body shape [`spawn_terminal_pane`]
@@ -780,6 +810,17 @@ pub(crate) async fn navigate_pane(
 /// "detach, don't kill." Broadcasts `ui.command{pane.attach}` (per the
 /// parity spec's route table), not `pane.split` -- respawn replaces content
 /// on an EXISTING pane, it does not mint a new one.
+///
+/// kata b8ke Task 10: pane resolution goes through the AUTHORITATIVE pane
+/// registry — `pane_tabs` FIRST (REST-minted panes), then the durable
+/// LayoutStore (`find_pane_tab`: browser-created/error panes that live only
+/// in layout syncs, retained across server restarts by disk persistence),
+/// then the re-sync handshake (round-1 review) before the typed
+/// `PANE_NOT_FOUND` 404. The spawn itself claims through the ONE ownership
+/// coordinator inside [`spawn_terminal_pane`] (Task 4's D8 rung — the
+/// body's `observedEpoch`/`observedGeneration` fence pair threads to the
+/// claim, so a stale request can never recreate old-generation ownership),
+/// producing the typed 409 owner-conflict envelopes.
 pub(crate) async fn respawn_pane(
     State(state): State<FreshAgentState>,
     Path(pane_id): Path<String>,
@@ -797,14 +838,31 @@ pub(crate) async fn respawn_pane(
         );
     }
 
-    let Some(tab_id) = state
+    let tab_id = state
         .pane_tabs
         .lock()
         .expect("pane_tabs mutex")
         .get(&pane_id)
         .cloned()
-    else {
-        return fail_json(StatusCode::NOT_FOUND, "pane not found".to_string());
+        .or_else(|| state.layout.find_pane_tab(&pane_id));
+    // Round-1 review: an authoritative registry misses only when no connected
+    // browser has synced the pane -- ask the owner client to re-sync before
+    // giving up (bounded window, above the mirror's debounce).
+    let tab_id = match tab_id {
+        Some(tab_id) => tab_id,
+        None => match try_layout_resync_then_find(&state, &pane_id).await {
+            Some(tab_id) => tab_id,
+            None => {
+                return crate::fail_json_code(
+                    StatusCode::NOT_FOUND,
+                    "PANE_NOT_FOUND",
+                    format!(
+                        "pane {pane_id} not found in the pane registry, any synced layout, \
+                         or the re-sync handshake"
+                    ),
+                );
+            }
+        },
     };
 
     let spawned = match spawn_terminal_pane(&state, &body, &tab_id, &pane_id).await {
@@ -827,6 +885,17 @@ pub(crate) async fn respawn_pane(
         .expect("content_panes mutex")
         .remove(&pane_id);
 
+    // b8ke ext r21 F1: the recovered content is written through the
+    // AUTHORITATIVE LayoutStore at the moment of the reply — the snapshot
+    // (and the persisted layout a restart would load) carries the respawn
+    // result even with NO connected browser to mirror the pane.attach
+    // broadcast back (pre-r21 the broadcast was the only write, so a
+    // headless REST/MCP recovery, reconnect, or restart re-exposed the
+    // stale browser/error/detached content).
+    state
+        .layout
+        .attach_pane_content(&tab_id, &pane_id, pane_content.clone());
+
     state.broadcast(&ServerMessage::UiCommand(UiCommand {
         command: "pane.attach".to_string(),
         payload: Some(json!({ "tabId": tab_id, "paneId": pane_id, "content": pane_content })),
@@ -835,41 +904,213 @@ pub(crate) async fn respawn_pane(
     ok_json(json!({ "terminalId": terminal_id }), "pane respawned")
 }
 
-// ── POST /api/panes/:id/attach (honest deferral) ────────────────────────
+// ── POST /api/panes/:id/attach ─────────────────────────────────────────
 
 /// `POST /api/panes/:id/attach` (`router.ts:1619-1652`): re-bind an EXISTING
-/// (already-running, e.g. previously-detached) terminal to a pane. Deferred:
-/// legacy's identity guard (`terminalMatchesExpectedSession`,
-/// `expectedPaneSessionRefForTerminal`) verifies the target terminal's
-/// ACTUAL durable Codex/session identity before allowing the bind, rejecting
-/// with 409 on a mismatch (parity spec `\u00a79` Risk 4: "Getting this wrong
-/// breaks Codex resume"). That actual-identity data lives in
-/// `TerminalIdentityRegistry`, which is `freshell-ws`-owned and unreachable
-/// from THIS crate without a circular dependency -- already documented at
-/// this exact boundary by `terminal_tabs.rs`'s `arm_locators_for_fresh_pane`
-/// doc comment. Implementing attach's re-bind mechanics while silently
-/// skipping the identity guard would ship a route that LOOKS like parity
-/// but can silently rebind a session-mismatched Codex terminal -- worse than
-/// an honest gap. Returns 400 naming exactly this instead.
+/// (already-running, e.g. previously-detached) terminal to a pane.
+///
+/// kata b8ke Task 10: implemented. The OLD deferral note ("the identity
+/// guard reads TerminalIdentityRegistry inside freshell-ws -- unreachable
+/// without a circular dependency") is resolved by the seams that now exist:
+/// the OWNERSHIP COORDINATOR (`FreshAgentState::ownership_snapshot`, the
+/// one server-wide authority kata b8ke Tasks 3-6 wired) answers who owns
+/// `(provider, sessionId)`, and the `SessionIdentityLookup` seam
+/// (`freshell-terminal`'s registry.rs, wired by `freshell-server::main`
+/// across the crate boundary exactly for this purpose) resolves the
+/// terminal id for a terminal-owned session. Design: the coordinator
+/// decides FIRST — a terminal-owned session resolves its terminal id
+/// (owner identity, else the seam) and broadcasts the reattach content
+/// (`ui.command{pane.attach}`, terminal content carrying `terminalId` +
+/// the additive `liveTerminal` handle); every other owner or in-flight
+/// transition answers the TYPED 409 with the coordinator's owner fields —
+/// never a blind rebind, never a bare "pane not found".
 pub(crate) async fn attach_pane(
     State(state): State<FreshAgentState>,
-    Path(_pane_id): Path<String>,
+    Path(pane_id): Path<String>,
     headers: HeaderMap,
+    Json(body): Json<Value>,
 ) -> Response {
     if !authorized(&headers, &state.auth_token) {
         return fail_json(StatusCode::UNAUTHORIZED, "unauthorized".to_string());
     }
-    fail_json(
-        StatusCode::BAD_REQUEST,
-        "pane attach is not implemented on this server: the Codex session-identity-mismatch \
-         guard this route requires (terminalMatchesExpectedSession) reads the target \
-         terminal's ACTUAL durable session identity, which lives in TerminalIdentityRegistry \
-         inside freshell-ws -- unreachable from this crate without a circular dependency \
-         (documented precedent: terminal_tabs.rs's arm_locators_for_fresh_pane). Implementing \
-         attach without that guard risks silently rebinding a session-mismatched Codex \
-         terminal (parity spec Risk 4). Deferred."
-            .to_string(),
-    )
+    // Body: { sessionRef: { provider, sessionId } } (typed 400 otherwise).
+    let Some(session_ref) = body
+        .get("sessionRef")
+        .cloned()
+        .and_then(|v| serde_json::from_value::<freshell_protocol::SessionLocator>(v).ok())
+    else {
+        return crate::fail_json_code(
+            StatusCode::BAD_REQUEST,
+            "BAD_REQUEST",
+            "body must carry sessionRef { provider, sessionId }".to_string(),
+        );
+    };
+
+    // The coordinator decides; the identity seam resolves the terminal.
+    // b8ke ext r7 F3: the caller's raw id resolves through the
+    // coordinator's ALIAS CHAIN first — a superseded (rekeyed) session
+    // follows the CANONICAL live owner (the old key is Aliased forever;
+    // observing it raw dead-ends on the alias state instead of attaching).
+    let canonical_session_id =
+        state.resolve_canonical_session(&session_ref.provider, &session_ref.session_id);
+    let session_ref = freshell_protocol::SessionLocator {
+        provider: session_ref.provider.clone(),
+        session_id: canonical_session_id,
+    };
+    let snapshot =
+        state.canonical_ownership_snapshot(&session_ref.provider, &session_ref.session_id);
+    match snapshot.state {
+        freshell_ownership::OwnershipState::Live {
+            ref owner,
+            generation: _,
+            ..
+        } if owner.kind == freshell_ownership::RuntimeOwnerKind::Terminal => {
+            let Some(terminal_id) = owner.terminal_id.clone().or_else(|| {
+                state.session_identity.as_ref().and_then(|lookup| {
+                    lookup.terminal_for_session(&session_ref.provider, &session_ref.session_id)
+                })
+            }) else {
+                return crate::fail_json_conflict_with_owner(
+                    "RESTORE_UNAVAILABLE",
+                    format!(
+                        "Session {} is terminal-owned but its terminal id is unresolvable.",
+                        session_ref.session_id
+                    ),
+                    None,
+                    None,
+                );
+            };
+            // The pane resolves through the same authoritative registry
+            // respawn uses (`pane_tabs` first, then the durable LayoutStore).
+            let Some(tab_id) = state
+                .pane_tabs
+                .lock()
+                .expect("pane_tabs mutex")
+                .get(&pane_id)
+                .cloned()
+                .or_else(|| state.layout.find_pane_tab(&pane_id))
+            else {
+                return crate::fail_json_code(
+                    StatusCode::NOT_FOUND,
+                    "PANE_NOT_FOUND",
+                    format!("pane {pane_id} not found in the pane registry or any synced layout"),
+                );
+            };
+            // b8ke ext r23 F3: the attach consumes the probe's STATUS —
+            // a dead or absent terminal row answers the typed
+            // RESTORE_UNAVAILABLE, never a successful attachment to a
+            // dead terminal (pre-r23 the attach defaulted the mode to
+            // "shell" and persisted/broadcast status "running" for a row
+            // that had already exited — the pane needed another repair
+            // cycle). The mode comes from the LIVE row only.
+            let probe = state
+                .terminal_registry
+                .as_ref()
+                .and_then(|registry| registry.probe(&terminal_id));
+            let mode = match &probe {
+                Some(row) if row.status == freshell_protocol::TerminalRunStatus::Running => {
+                    row.mode.clone()
+                }
+                Some(_) | None => {
+                    return crate::fail_json_conflict_with_owner(
+                        "RESTORE_UNAVAILABLE",
+                        format!(
+                            "Session {} is terminal-owned but the terminal has exited or its row is absent — \
+                             no live terminal to attach.",
+                            session_ref.session_id
+                        ),
+                        None,
+                        None,
+                    );
+                }
+            };
+            // b8ke ext r12 F2: the REST attach's REAL claim — the guard
+            // arms under the coordinator lock and is held ACROSS the pane
+            // resolution + the pane.attach broadcast, so a handoff/stop
+            // begin inside the window answers the typed Blocked outcome
+            // (the coordinator covers the attach through completion;
+            // pre-r12 the point-in-time snapshot closed no window — a
+            // handoff could commit between the snapshot and the
+            // broadcast, attaching a superseded runtime).
+            let attach_guard = match crate::ownership_lane::arm_attach_guard(
+                &state.ownership,
+                &session_ref.provider,
+                &session_ref.session_id,
+                &format!("rest-attach-{pane_id}"),
+                Some(snapshot.generation),
+                "rest/pane-attach",
+            ) {
+                crate::ownership_lane::LaneAttachGuard::Armed(guard) => Some(guard),
+                crate::ownership_lane::LaneAttachGuard::Unwired => None,
+                crate::ownership_lane::LaneAttachGuard::Refused => {
+                    return crate::fail_json_code(
+                        StatusCode::CONFLICT,
+                        "SESSION_RESERVED",
+                        "A lifecycle operation owns this session; retry after it settles"
+                            .to_string(),
+                    );
+                }
+            };
+            let content = json!({
+                "kind": "terminal",
+                "terminalId": terminal_id,
+                "mode": mode,
+                "sessionRef": {
+                    "provider": session_ref.provider,
+                    "sessionId": session_ref.session_id,
+                },
+                "liveTerminal": { "terminalId": terminal_id },
+                "status": "running",
+                "createRequestId": uuid::Uuid::new_v4().simple().to_string(),
+            });
+            // b8ke ext r21 F1: the re-bound content is written through the
+            // AUTHORITATIVE LayoutStore here too — the snapshot (and the
+            // persisted layout a restart would load) carries the attach
+            // result at the moment of the reply, no browser observer
+            // required.
+            state
+                .layout
+                .attach_pane_content(&tab_id, &pane_id, content.clone());
+            state.broadcast(&ServerMessage::UiCommand(UiCommand {
+                command: "pane.attach".to_string(),
+                payload: Some(json!({ "tabId": tab_id, "paneId": pane_id, "content": content })),
+            }));
+            drop(attach_guard);
+            ok_json(
+                json!({ "ok": true, "terminalId": terminal_id }),
+                "pane attached",
+            )
+        }
+        freshell_ownership::OwnershipState::Live { .. } => {
+            // A live fresh-agent owner: the typed 409 with the coordinator's
+            // owner fields (the same envelope every ownership-conflict door
+            // shares).
+            let owner_fields = state.ownership.as_ref().and_then(|ownership| {
+                crate::ownership_lane::terminal_owner_fields_from_snapshot(
+                    &ownership.observe(&session_ref.provider, &session_ref.session_id),
+                )
+            });
+            crate::fail_json_conflict_with_owner(
+                "RESTORE_UNAVAILABLE",
+                format!(
+                    "Session {} is still running on the server.",
+                    session_ref.session_id
+                ),
+                None,
+                owner_fields.as_ref(),
+            )
+        }
+        freshell_ownership::OwnershipState::Vacant => crate::fail_json_code(
+            StatusCode::CONFLICT,
+            "SESSION_NOT_OWNED",
+            "no live runtime owns this session; respawn instead".to_string(),
+        ),
+        _ => crate::fail_json_code(
+            StatusCode::CONFLICT,
+            "HANDOFF_IN_PROGRESS",
+            "a lifecycle operation is in flight for this session".to_string(),
+        ),
+    }
 }
 
 // ── POST /api/panes/:id/swap ────────────────────────────────────────────

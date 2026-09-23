@@ -2,7 +2,7 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState, type TouchEve
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import { setStatus, setError, setErrorCode, setServerInstanceId, setBootId, setServerRestarted, setLiveTerminalIds, setPlatform, setAvailableClis, setFeatureFlags } from '@/store/connectionSlice'
 import { resetCompletionDedupeBaselines } from '@/store/turnCompletionSlice'
-import { setLocalSettings, setServerConfigDir, setServerSettings } from '@/store/settingsSlice'
+import { setLocalSettings, setServerConfigDir, setServerSettings, localSettingsPlatformDefaults } from '@/store/settingsSlice'
 import {
   markWsSnapshotReceived,
   patchSessionRunningStateFromTerminalMeta,
@@ -28,7 +28,9 @@ import { fetchTerminalDirectoryWindow } from '@/store/terminalDirectoryThunks'
 import { createTerminalInvalidationHandler } from '@/lib/terminal-invalidation-handler'
 import { buildReconcileRequest, collectTerminalPaneTargets, foldVerdicts, RECONCILE_RESULT_WAIT_MS, setFreshAgentReconcileActive } from '@/lib/pane-reconcile'
 import { reassertAllOpenPanes } from '@/lib/kill-ack'
-import { PaneReconcileResultSchema, type PaneReconcileRequest, type HostStatsRefreshResponseMessage, type HostStatsSnapshotMessage } from '@shared/ws-protocol'
+import { foldReadyRuntimeOwners, foldSessionRuntimeOwnerFrame } from '@/lib/fresh-agent-ws'
+import { selectOwnerFence, selectPaneOwnerDivergence } from '@/store/selectors/runtimeOwner'
+import { PaneReconcileResultSchema, type PaneReconcileRequest, type HostStatsRefreshResponseMessage, type HostStatsSnapshotMessage, type SessionRuntimeOwnerMessage } from '@shared/ws-protocol'
 import { getShareAction, ensureShareUrlToken, isRemoteAccessEnabledStatus } from '@/lib/share-utils'
 import { getWsClient } from '@/lib/ws-client'
 import { collectSessionLocatorsFromTabs, getSessionsForHello } from '@/lib/session-utils'
@@ -120,7 +122,7 @@ import { handleFreshAgentMessage } from '@/lib/fresh-agent-ws'
 import { createLogger } from '@/lib/client-logger'
 import { hasDismissedAutoSetupWizard, markAutoSetupWizardDismissed } from '@/lib/setup-wizard-dismissal'
 import type { LocalSettingsPatch, ServerSettings } from '@shared/settings'
-import { z } from 'zod'
+import { ReadyMessageSchema as readyMessageSchema } from '@/lib/ready-message-schema'
 import { withChunkErrorRecovery } from '@/lib/import-retry'
 
 const log = createLogger('App')
@@ -195,23 +197,7 @@ function hasLoadedPlatformCapabilities(value: BootstrapPlatformInfo | null | und
   return 'availableClis' in value || 'featureFlags' in value
 }
 
-const ReadyMessageSchema = z.object({
-  type: z.literal('ready'),
-  timestamp: z.string(),
-  serverInstanceId: z.string().min(1),
-  bootId: z.string().min(1).optional(),
-  // The server's baked build identity (additive/optional — old servers omit
-  // it). Compared in checkServerBuildId below. Plain `z.string()` (NOT
-  // min(1)): a present-but-EMPTY buildId must reach the helper and no-op
-  // there, never fail the WHOLE ready frame and silently disable restart
-  // detection. Only a non-string TYPE can fail the frame, which no real
-  // server emits (the helper additionally treats "unknown" as a no-op).
-  buildId: z.string().optional(),
-  // Server capability ack (present iff our hello opted in). Deliberately a
-  // loose record: an unexpected capabilities shape must never fail the WHOLE
-  // ready frame and silently disable restart detection.
-  capabilities: z.record(z.string(), z.unknown()).optional(),
-})
+const ReadyMessageSchema = readyMessageSchema
 
 export default function App() {
   useThemeEffect()
@@ -675,8 +661,12 @@ export default function App() {
           if (!cancelled) {
             if (bootstrapData.legacyLocalSettingsSeed) {
               const currentPreferences = loadBrowserPreferencesRecord()
-              const currentLocalSettingsPatch = buildLocalSettingsPatch(appStore.getState().settings.localSettings)
               const currentPreferencesPatch = currentPreferences.settings ?? {}
+              const currentLocalSettingsPatch = buildLocalSettingsPatch(
+                appStore.getState().settings.localSettings,
+                localSettingsPlatformDefaults,
+                currentPreferencesPatch,
+              )
               const hasExistingLocalSettings =
                 Object.keys(currentPreferencesPatch).length > 0
                 || Object.keys(currentLocalSettingsPatch).length > 0
@@ -693,7 +683,7 @@ export default function App() {
                 : seedBrowserPreferencesSettingsIfEmpty(bootstrapData.legacyLocalSettingsSeed)
 
               if (JSON.stringify(currentPreferences.settings) !== JSON.stringify(nextPreferences.settings)) {
-                dispatch(setLocalSettings(resolveBrowserPreferenceSettings(nextPreferences)))
+                dispatch(setLocalSettings(resolveBrowserPreferenceSettings(nextPreferences, localSettingsPlatformDefaults)))
               }
             }
             if (bootstrapData.settings) {
@@ -1352,6 +1342,16 @@ export default function App() {
             if (serverRestarted || instanceChanged || firstReadyBaseline) {
               dispatch(resetCompletionDedupeBaselines())
             }
+            // kata b8ke (reconnect owner discovery, T1 rec A4): fold the
+            // server's owner replay BEFORE the reconcile request is built —
+            // the respawn fold (pane-reconcile) gates on this store state, so
+            // a device that missed the handoff broadcast (offline during
+            // handoff, lag-4008, page reload) converges on its very first
+            // post-reconnect reconcile. Round-2 review: the fold RESETS first
+            // — the client's owner/generation state is server-authoritative
+            // per connection lifetime; a restarted server's newer generations
+            // must never be ignored in favor of stale pre-reconnect records.
+            foldReadyRuntimeOwners(dispatch, ready.data.runtimeOwners)
             // pane.reconcile adoption: capability re-captured per connection,
             // and the request re-sent on EVERY ready — a result is not
             // guaranteed (deferral, drop, error frame), so reconnect covers
@@ -1494,6 +1494,15 @@ export default function App() {
           // by the view with the same requestId).
           const outcome = foldVerdicts(dispatch, pending, parsed.data, {
             onVerdictFolded: (createRequestId) => ws.cancelCreate(createRequestId),
+            // kata b8ke (T1 rec A5): the reconcile divergence gate — a
+            // terminal-owned session must not re-arm a stale-kind
+            // freshAgent.create after reconnect. Store-agnostic probe, wired
+            // here to the runtimeOwners state the ready fold just produced.
+            getOwnerDivergence: (pane) => selectPaneOwnerDivergence(appStore.getState(), {
+              paneKind: 'fresh-agent',
+              provider: pane.mode,
+              sessionRef: pane.sessionRef,
+            }),
           })
           // Fold reducers self-clear per-pane pending flags; these two catch
           // what they can't — skipped verdicts and cardinality-violation
@@ -1842,7 +1851,23 @@ export default function App() {
           }
         }
 
-        handleFreshAgentMessage(dispatch, msg as Record<string, unknown>, ws)
+        // kata b8ke: the runtime-owner broadcast fold. session.runtimeOwner
+        // is not a freshAgent.* frame — the explicit case ahead of the
+        // fresh-agent catch-all; nothing awaits an answer (reactive fold
+        // like freshAgent.turn.complete, protocol version stays put).
+        if (msg.type === 'session.runtimeOwner') {
+          foldSessionRuntimeOwnerFrame(dispatch, msg as SessionRuntimeOwnerMessage)
+        }
+
+        // Round-3 F6: the catch-all's lifecycle producers (the cancelled-
+        // create cleanup kill) read the observed ownership fence from the
+        // store so a stale callback can never issue an unfenced kill.
+        handleFreshAgentMessage(
+          dispatch,
+          msg as Record<string, unknown>,
+          ws,
+          (provider, sessionId) => selectOwnerFence(appStore.getState(), provider, sessionId),
+        )
       })
 
       cleanup = () => {
