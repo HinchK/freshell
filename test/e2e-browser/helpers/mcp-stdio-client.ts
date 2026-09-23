@@ -67,7 +67,7 @@ export function ensureMcpServerBuilt(root: string = REPO_ROOT): { path: string; 
     )
   }
   if (!fs.existsSync(bin)) {
-    throw new Error(`npm run build:tools completed but ${bin} is still missing.`)
+    throw new Error(`manager run build:tools completed but ${bin} is still missing.`)
   }
   return { path: bin, buildMs }
 }
