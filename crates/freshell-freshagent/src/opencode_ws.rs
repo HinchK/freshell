@@ -607,6 +607,17 @@ pub(crate) async fn settle_accepted_daemon_turn(
     }
 }
 
+/// The trust verdict for a delivered idle observation (the
+/// send-during-compact queue's interrupt-deferral release logic).
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum IdleVerdict {
+    /// The idle is evidence the interrupted turn ended.
+    Trusted,
+    /// A stale duplicate (delivery evidence absent, the live map busy).
+    NotTrusted,
+    /// The live poll could not answer — transient; retry, never conclude.
+    PollFailed,
+}
 impl FreshOpencodeState {
     /// b8ke e3 post-cap F2: test seam — retain a condemned-session
     /// witness (the kill path's retained accepted-daemon-turn evidence).
@@ -6865,7 +6876,68 @@ impl FreshOpencodeState {
     /// own settle tail owns the authoritative idle. When the latch was
     /// released the detached drain is armed — the parked messages
     /// deliver automatically, in FIFO order (self-gating otherwise).
-    async fn observe_daemon_idle(this: &Self, real_id: &str, session_id: &str) {
+    /// The live status-map poll (the missed-running fallback). Called
+    /// ONLY while the caller holds the session lock — the verdict is
+    /// used in the same critical section (focused episode 3 round 3,
+    /// Major 1: a check-to-use gap between an unlocked poll and the
+    /// decision would let the daemon-side state (or a session-state
+    /// transition) go stale in between; the sole bridge loop is blocked
+    /// inside this very call, so a running event could not update
+    /// `daemon_busy_after_idle` in time either. Tokio mutex guards are
+    /// designed to be held across awaits; the poll is one bounded
+    /// localhost request). Residual: the daemon's own status transition
+    /// window (dispatched-but-not-yet-busy) is shared with every other
+    /// status-poll consumer, including `await_idle` itself.
+    async fn poll_daemon_idle(
+        this: &Self,
+        session: &OpencodeSession,
+        real_id: &str,
+    ) -> IdleVerdict {
+        // The delivery-order fast path: a running delivered before this
+        // idle makes it trustworthy without a poll.
+        if session.daemon_busy_after_idle.load(Ordering::SeqCst) {
+            return IdleVerdict::Trusted;
+        }
+        // Focused episode 3 round 1: the identity's blind spot — the
+        // running can be GENUINELY missed (the SSE transport reconnects
+        // WITHOUT replaying missed events; a lagged broadcast drops
+        // them). The authoritative fallback: ask the daemon LIVE — its
+        // status map is current truth, not replayed history (the same
+        // fallback await_idle uses for missed SSE idles).
+        let route = session.cwd.clone();
+        match this
+            .fresh_agent
+            .ensure_manager()
+            .await
+            .get_session_status_map(&route)
+            .await
+        {
+            // Focused episode 3 round 2, Major 1: the CANONICAL
+            // classifier — "busy" AND "retry" both mean running
+            // (`is_running_status_type`; a retrying compact is NOT
+            // settled).
+            Ok(map) => {
+                if freshell_opencode::is_running_status_type(
+                    map.get(real_id).and_then(|status| status.get("type")),
+                ) {
+                    IdleVerdict::NotTrusted
+                } else {
+                    IdleVerdict::Trusted
+                }
+            }
+            Err(_) => IdleVerdict::PollFailed,
+        }
+    }
+
+    /// ONE locked critical section: the live poll + the release/record
+    /// decision + the (quiescence-gated) idle broadcast + the drain arm.
+    /// Shared by the bridge's idle observation and the poll-failure
+    /// retry ladder.
+    async fn conclude_idle_observation(
+        this: &Self,
+        real_id: &str,
+        session_id: &str,
+    ) -> IdleVerdict {
         let session_arc = {
             let guard = this.sessions.lock().await;
             guard.get(real_id).cloned()
@@ -6875,112 +6947,35 @@ impl FreshOpencodeState {
             // stateless commentary, broadcast as before.
             this.fresh_agent
                 .broadcast(&event_frame(real_id, snapshot_event(session_id, "idle")));
-            return;
+            return IdleVerdict::NotTrusted;
         };
-
-        // Pass 1 (locked read): is the delivery-order identity decidable?
-        // A running delivered before this idle (busy) makes the idle
-        // trustworthy immediately — no poll needed.
-        let busy_delivered = session_arc
-            .lock()
-            .await
-            .daemon_busy_after_idle
-            .load(Ordering::SeqCst);
-
-        // Focused episode 3 round 1: the identity's blind spot — the
-        // running can be GENUINELY missed: the SSE transport reconnects
-        // WITHOUT replaying missed events (transport.rs:162-215) and the
-        // bridge ignores RecvError::Lagged, so a reconnect or a lagged
-        // broadcast drops the busy event. An idle following no delivered
-        // running is then indistinguishable from a stale duplicate by
-        // delivery evidence alone — and rejecting the interrupted turn's
-        // REAL terminal idle strands the queue forever (the liveness
-        // defect this round found). The authoritative fallback: ask the
-        // daemon LIVE — its status map is current truth, not replayed
-        // history (the same fallback await_idle uses for missed SSE
-        // idles). A stale idle over a still-running compact polls BUSY;
-        // the missed-running terminal idle polls IDLE.
-        let daemon_idle = if busy_delivered {
-            true
-        } else {
-            let route = session_arc.lock().await.cwd.clone();
-            match this
-                .fresh_agent
-                .ensure_manager()
-                .await
-                .get_session_status_map(&route)
-                .await
-            {
-                // Focused episode 3 round 2, Major 1: the CANONICAL
-                // classifier — "busy" AND "retry" both mean running
-                // (`is_running_status_type`, events.rs:149-150, the same
-                // classifier the status-poll path uses). A retrying
-                // compact is NOT settled; only a status that is neither
-                // (or absent) authorizes the release.
-                Ok(map) => !freshell_opencode::is_running_status_type(
-                    map.get(real_id).and_then(|status| status.get("type")),
-                ),
-                // Conservative: a failed poll proves nothing — do not
-                // release or record on transport failure (the next idle
-                // observation re-tries).
-                Err(_) => false,
-            }
-        };
-
-        // Pass 2 (locked decision): the world may have moved during the
-        // poll — re-read everything under the session lock. The broadcast
-        // stays inside this critical section (the round-ep1 atomicity:
-        // a send registering either preceded the decision or follows the
-        // idle).
-        let released = {
-            let session = session_arc.lock().await;
-            let abort_in_flight_now = session.abort_in_flight.load(Ordering::SeqCst) > 0;
-            let busy_now = session.daemon_busy_after_idle.load(Ordering::SeqCst);
-            let trusted = busy_now || daemon_idle;
-            let (released, emit_idle) = if abort_in_flight_now {
-                // Delta-review round 6 (extension) Major 2: a
-                // session-scoped abort request is still in flight — its
-                // settlement owns BOTH the latch release AND the idle
-                // broadcast. Releasing here would dispatch a parked prompt
-                // into the abort's settlement window, and the daemon's
-                // late abort processing could cancel it after it left
-                // `pending_sends` (lost, no requeue, no correlated
-                // failure). Broadcasting here (focused episode 2 round 3,
-                // Major 1) is the same loss through the client's flush
-                // path. REMEMBER the idle for the settlement arm to
-                // consume (episode 2 round 1, Major 3); the broadcast is
-                // suppressed with the release.
-                // Focused episode 2 round 5, Major 2 + episode 3 round 1:
-                // an idle is evidence the interrupted turn ended ONLY if
-                // a running was delivered before it (the daemon's
-                // running->idle transition) OR the daemon's live status
-                // map says the session is idle NOW (the running was
-                // missed by reconnect/lag). A stale duplicate over a
-                // still-running compact matches neither: the delivery
-                // evidence is absent and the live map says busy. Record
-                // NOTHING then — the settlement cannot consume it, and
-                // the interrupted turn's own eventual idle releases
-                // through the counter-zero path below.
-                if trusted {
+        let session = session_arc.lock().await;
+        let abort_in_flight_now = session.abort_in_flight.load(Ordering::SeqCst) > 0;
+        let verdict = Self::poll_daemon_idle(this, &session, real_id).await;
+        let mut released = false;
+        match verdict {
+            IdleVerdict::Trusted => {
+                let busy_now = session.daemon_busy_after_idle.load(Ordering::SeqCst);
+                if abort_in_flight_now {
+                    // Delta-review round 6 (extension) Major 2: a
+                    // session-scoped abort request is still in flight —
+                    // its settlement owns BOTH the latch release AND the
+                    // idle broadcast. REMEMBER the idle for the
+                    // settlement arm to consume (episode 2 round 1,
+                    // Major 3); the broadcast is suppressed with the
+                    // release. Focused episode 2 round 5, Major 3: never
+                    // downgrade a strong proof here.
                     session.daemon_idle_seen.store(true, Ordering::SeqCst);
                     if busy_now {
-                        // The idle supersedes the running that preceded it.
                         session
                             .daemon_busy_after_idle
                             .store(false, Ordering::SeqCst);
                     }
-                    // Focused episode 2 round 5, Major 3: NEVER downgrade
-                    // a strong proof (a not-last sibling abort the daemon
-                    // ANSWERED) — the daemon's resulting idle arriving
-                    // after it must not erase it.
-                }
-                (false, false)
-            } else {
-                // Delta-review round 7 (extension): a failed abort has
-                // settled (the counter is zero) and the latch is armed —
-                // the same trust rule gates the release.
-                if trusted {
-                    let released = session.orphaned_daemon_turn.swap(false, Ordering::SeqCst);
+                } else {
+                    // Delta-review round 7 (extension): a failed abort has
+                    // settled (counter zero) and the latch is armed — the
+                    // same trust rule gates the release.
+                    released = session.orphaned_daemon_turn.swap(false, Ordering::SeqCst);
                     if released {
                         tracing::warn!(target: "freshell_freshagent::opencode",
                             session_id = %real_id,
@@ -6997,28 +6992,64 @@ impl FreshOpencodeState {
                         .map(|t| t.is_finished() && t.settling.load(Ordering::SeqCst))
                         .unwrap_or(true)
                         && session.pending_sends.is_empty();
-                    (released, quiescent)
-                } else {
-                    // A stale candidate: no delivered running and the
-                    // live map says busy — release nothing and wait for
-                    // the turn's own idle.
-                    (false, false)
+                    // Focused episode 3 round 2, Major 2: the emission
+                    // stays INSIDE the critical section (the
+                    // check-then-broadcast race).
+                    if quiescent {
+                        this.fresh_agent
+                            .broadcast(&event_frame(real_id, snapshot_event(session_id, "idle")));
+                    }
                 }
-            };
-            // Focused episode 3 round 2, Major 2: the emission stays
-            // INSIDE the critical section — outside it, a waiting
-            // handle_send could register + emit its running between the
-            // quiescence decision and this frame (the check-then-broadcast
-            // race the parent kept closed; the broadcast is a synchronous
-            // channel send, safe under the lock).
-            if emit_idle {
-                this.fresh_agent
-                    .broadcast(&event_frame(real_id, snapshot_event(session_id, "idle")));
             }
-            released
-        };
+            IdleVerdict::NotTrusted => {
+                // A stale candidate: the delivery evidence is absent and
+                // the live map says running — release nothing and wait
+                // for the turn's own idle.
+            }
+            IdleVerdict::PollFailed => {
+                // Focused episode 3 round 3, Major 2: a transient poll
+                // failure must NOT permanently consume a genuine terminal
+                // idle — the comment-era "the next idle observation will
+                // re-try" is invalid for a compact whose only idle edge
+                // already fired. The caller arms the bounded-backoff
+                // retry ladder; nothing is concluded in THIS call.
+            }
+        }
+        drop(session);
         if released {
             Self::drain_detached(this, real_id);
+        }
+        verdict
+    }
+
+    /// Focused episode 3 round 3, Major 2: a poll failure is transient —
+    /// retry the live check on a bounded backoff ladder. Every attempt
+    /// re-runs the same locked conclusion (a fresh poll under the lock);
+    /// a Trusted or NotTrusted answer concludes the ladder. On
+    /// exhaustion the deferral stays WARN-observable and recoverable
+    /// (the round-3 manual-recovery contract).
+    fn arm_status_poll_retry(this: &Self, real_id: &str, session_id: &str) {
+        let this = this.clone();
+        let real_id = real_id.to_string();
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            for attempt in 1..=8u32 {
+                tokio::time::sleep(Duration::from_millis(100u64 * attempt as u64)).await;
+                match Self::conclude_idle_observation(&this, &real_id, &session_id).await {
+                    IdleVerdict::PollFailed => continue,
+                    _ => return,
+                }
+            }
+            tracing::warn!(target: "freshell_freshagent::opencode",
+                session_id = %real_id,
+                "fresh_agent_interrupt_status_poll_retry_exhausted");
+        });
+    }
+
+    async fn observe_daemon_idle(this: &Self, real_id: &str, session_id: &str) {
+        let verdict = Self::conclude_idle_observation(this, real_id, session_id).await;
+        if matches!(verdict, IdleVerdict::PollFailed) {
+            Self::arm_status_poll_retry(this, real_id, session_id);
         }
     }
 }
@@ -13769,6 +13800,9 @@ mod tests {
         /// Focused episode 3 round 2: sessions whose status-map entry
         /// reports "retry" instead of "busy" (both are running).
         status_retry: StdMutex<std::collections::HashSet<String>>,
+        /// Focused episode 3 round 3: the remaining number of status-map
+        /// polls that fail with a transport error.
+        status_poll_failures: StdMutex<usize>,
     }
 
     impl CompactFakeHttp {
@@ -13797,6 +13831,7 @@ mod tests {
                 abort_refused: StdMutex::new(false),
                 abort_ambiguates: StdMutex::new(false),
                 status_retry: StdMutex::new(std::collections::HashSet::new()),
+                status_poll_failures: StdMutex::new(0),
             }
         }
 
@@ -13869,6 +13904,16 @@ mod tests {
         /// Focused episode 3 round 2: seed the session's status-map
         /// entry as RETRY (a retrying compact is RUNNING by the
         /// canonical classifier — busy AND retry).
+        /// Focused episode 3 round 3: the next N status-map polls fail
+        /// with a mid-exchange transport error (the transient poll
+        /// failure the retry ladder must survive).
+        fn arm_status_poll_failures(&self, n: usize) {
+            *self
+                .status_poll_failures
+                .lock()
+                .expect("status poll failures mutex") = n;
+        }
+
         fn arm_status_retry(&self, id: &str) {
             self.arm_status_busy(id, 1000);
             self.status_retry
@@ -14122,6 +14167,20 @@ mod tests {
                 });
             }
             if method == "GET" && req.url.contains("/session/status") {
+                {
+                    let mut failures = self
+                        .status_poll_failures
+                        .lock()
+                        .expect("status poll failures mutex");
+                    if *failures > 0 {
+                        *failures -= 1;
+                        return Box::pin(async move {
+                            Err(ServeHttpError::Ambiguous(
+                                "status poll failed by the test knob".to_string(),
+                            ))
+                        });
+                    }
+                }
                 let mut budgets = self.busy_budget.lock().expect("busy budget mutex");
                 let retry: Vec<String> = self
                     .status_retry
@@ -19469,6 +19528,68 @@ mod tests {
         let session_arc = st.sessions.lock().await.get("ses_q30").cloned().unwrap();
         let session = session_arc.lock().await;
         assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    /// Focused episode 3 round 3, Major 2: a TRANSIENT status-poll failure
+    /// must not permanently consume a genuine terminal idle — the
+    /// interrupted compact's only idle edge already fired, so no later
+    /// observation will re-try. The bounded-backoff retry ladder
+    /// re-polls; once the poll succeeds (the daemon idle) the release
+    /// and delivery happen WITHOUT any further idle event.
+    #[tokio::test]
+    async fn a_transient_status_poll_failure_does_not_strand_the_terminal_idle() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q31", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q31")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q31", "survives the poll failure")),
+        )
+        .await;
+
+        // The abort FAILS (answered 500) and settles — counter zero,
+        // latch armed.
+        http.arm_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q31".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort 500)");
+
+        // The compact's real terminal idle arrives with the running edge
+        // missed; the live poll FAILS transitively (one mid-exchange
+        // error). The retry ladder must re-poll and deliver WITHOUT any
+        // further idle event (the only idle edge already fired).
+        http.clear_status_busy("ses_q31");
+        http.arm_status_poll_failures(1);
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q31", "ses_q31").await;
+        await_prompt_posted(&http, "survives the poll failure").await;
+        let session_arc = st.sessions.lock().await.get("ses_q31").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(
+            !session.orphaned_daemon_turn.load(Ordering::SeqCst),
+            "the retry ladder concluded the terminal idle — no strand"
+        );
         assert!(session.pending_sends.is_empty());
     }
 
