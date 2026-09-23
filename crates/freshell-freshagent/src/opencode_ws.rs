@@ -424,6 +424,21 @@ struct OpencodeSession {
     /// never erased by an overlapping interrupt's arming (episode 2
     /// round 2, Major 3).
     daemon_idle_seen: Arc<AtomicBool>,
+    /// Focused episode 2 round 4, Major 3: the bridge delivered a
+    /// `running` snapshot AFTER the last recorded idle proof. A stale
+    /// idle from a PREVIOUS turn can be delivered during an abort
+    /// window (bridge lag: the interrupted turn's own `running` follows
+    /// it in stream order), so a `running` delivery after the proof
+    /// invalidates it — the daemon went busy with the interrupted turn
+    /// again. The weak-proof consume refuses while this is set; the
+    /// next idle observation clears it (fresh proof).
+    daemon_busy_after_idle: Arc<AtomicBool>,
+    /// Focused episode 2 round 4, Minor 1: the recorded proof came from
+    /// an ANSWERED abort (a not-last Ok sibling), not a mere idle
+    /// observation. A strong proof authorizes the release for
+    /// Undelivered too (that abort never reached the daemon — no
+    /// retro-hazard from it); a weak (idle-observed) proof does not.
+    daemon_proof_answered: Arc<AtomicBool>,
     /// PR-3: flipped `true` by the serve-stream bridge when it observes a `session.error`
     /// SSE event during the in-flight turn (`state.turnErrored`, adapter.ts:278-282,334-335).
     /// Reset to `false` at the top of every `handle_send`.
@@ -512,6 +527,8 @@ impl OpencodeSession {
             orphaned_daemon_turn: Arc::new(AtomicBool::new(false)),
             abort_in_flight: Arc::new(AtomicU32::new(0)),
             daemon_idle_seen: Arc::new(AtomicBool::new(false)),
+            daemon_busy_after_idle: Arc::new(AtomicBool::new(false)),
+            daemon_proof_answered: Arc::new(AtomicBool::new(false)),
             turn_errored: Arc::new(AtomicBool::new(false)),
             last_turn_complete_at: Arc::new(StdMutex::new(None)),
             serve_bridge: None,
@@ -2228,6 +2245,10 @@ impl FreshOpencodeState {
         // it was evidence FOR. (The interrupt ARMING never resets it: an
         // overlapping interrupt must not erase the open window's evidence.)
         session.daemon_idle_seen.store(false, Ordering::SeqCst);
+        session.daemon_proof_answered.store(false, Ordering::SeqCst);
+        session
+            .daemon_busy_after_idle
+            .store(false, Ordering::SeqCst);
         session.turn_task = Some(TurnTask {
             kind: TurnTaskKind::Send,
             handle: turn_task,
@@ -3921,15 +3942,7 @@ impl FreshOpencodeState {
             return;
         };
 
-        let (
-            real_id,
-            route,
-            turn_aborted,
-            daemon_turn_accepted,
-            orphaned_daemon_turn,
-            abort_in_flight,
-            daemon_idle_seen,
-        ) = {
+        let (real_id, route, turn_aborted, orphaned_daemon_turn, abort_in_flight) = {
             let mut session = session_arc.lock().await;
             session.turn_aborted.store(true, Ordering::SeqCst);
             // send-during-compact queue (delta-review round 3): arm the
@@ -3956,10 +3969,8 @@ impl FreshOpencodeState {
                 session.real_session_id.clone(),
                 session.cwd.clone(),
                 session.turn_aborted.clone(),
-                session.daemon_turn_accepted.clone(),
                 session.orphaned_daemon_turn.clone(),
                 session.abort_in_flight.clone(),
-                session.daemon_idle_seen.clone(),
             )
         };
 
@@ -3992,7 +4003,7 @@ impl FreshOpencodeState {
                 // can interleave between the counter decrement and the
                 // latch decision. (The broadcast inside the lock is the
                 // established atomicity pattern from the idle helper.)
-                let mut session = session_arc.lock().await;
+                let session = session_arc.lock().await;
                 // Delta-review round 6 (extension) Major 2 + focused
                 // episode 2 round 1: the RELEASE is owned by the LAST
                 // in-flight abort — every release action (broadcast,
@@ -4008,6 +4019,10 @@ impl FreshOpencodeState {
                     // with Undelivered / Http / Decode then delivers
                     // instead of stranding the window).
                     session.daemon_idle_seen.store(true, Ordering::SeqCst);
+                    session.daemon_proof_answered.store(true, Ordering::SeqCst);
+                    session
+                        .daemon_busy_after_idle
+                        .store(false, Ordering::SeqCst);
                     // Focused episode 2 round 2, Major 1: no idle
                     // broadcast either — the client would flush its
                     // composer queue into the sibling abort's
@@ -4027,6 +4042,7 @@ impl FreshOpencodeState {
                 // any orphan marker a previously failed interrupt armed.
                 session.orphaned_daemon_turn.store(false, Ordering::SeqCst);
                 let _ = session.daemon_idle_seen.swap(false, Ordering::SeqCst);
+                let _ = session.daemon_proof_answered.swap(false, Ordering::SeqCst);
                 drop(session);
                 // send-during-compact queue: an interrupted compact never
                 // runs its own settle tail (the TurnTask doc — an aborted
@@ -4041,7 +4057,7 @@ impl FreshOpencodeState {
                 // Same locked-critical-section discipline (episode 2
                 // round 3, Major 2): the deferral/release decision is
                 // atomic against idle observations.
-                let mut session = session_arc.lock().await;
+                let session = session_arc.lock().await;
                 let last = session.abort_in_flight.fetch_sub(1, Ordering::SeqCst) == 1;
                 // Delta-review round 6 (extension) Major 1: the no-writer
                 // failure flavor. A RequestTimeout already KILLED the
@@ -4053,7 +4069,22 @@ impl FreshOpencodeState {
                 // a connect-phase refusal proves only that the ABORT
                 // never reached the daemon; the accepted daemon-side
                 // turn may still be running.)
-                if matches!(serve_err, ServeError::RequestTimeout { .. }) {
+                if matches!(
+                    serve_err,
+                    ServeError::RequestTimeout { .. }
+                        | ServeError::ShuttingDown
+                        | ServeError::StartupAborted
+                        | ServeError::StartupFailed(_)
+                        | ServeError::ProcessExited { .. }
+                        | ServeError::PortAllocation(_)
+                        | ServeError::Spawn(_)
+                        | ServeError::NotHealthy { .. }
+                ) {
+                    // Focused episode 2 round 4, Minor 2: the startup-phase
+                    // failures join the timeout as no-writer flavors — they
+                    // can only occur while the manager has NO running
+                    // sidecar (after a prior discard), so no daemon-side
+                    // writer can exist.
                     session.orphaned_daemon_turn.store(false, Ordering::SeqCst);
                     turn_aborted.store(false, Ordering::SeqCst);
                     let queued_depth = session.pending_sends.len();
@@ -4069,6 +4100,14 @@ impl FreshOpencodeState {
                     // last abort settles) or fails with the normal typed
                     // send-failure path — it never strands silently.
                     if last {
+                        // Focused episode 2 round 4, Major 2: the LAST
+                        // no-writer settlement ALSO emits the idle
+                        // snapshot the window suppressed — with the typed
+                        // message still solely in the CLIENT's UX queue
+                        // the drain is a no-op, and without the frame the
+                        // client stays busy forever (it cannot flush, and
+                        // hidden panes do not poll).
+                        self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
                         Self::drain_detached(self, &real_id);
                     }
                     return;
@@ -4092,9 +4131,28 @@ impl FreshOpencodeState {
                 // the client saw the reset — and Undelivered says nothing
                 // about the still-running turn: both keep the pure
                 // round-3 deferral below.
-                if matches!(serve_err, ServeError::Http { .. } | ServeError::Decode(_))
-                    && session.daemon_idle_seen.swap(false, Ordering::SeqCst)
-                {
+                // Focused episode 2 round 4: the proof matrix. `seen`
+                // is any recorded proof; `answered` marks the STRONG
+                // proof (a not-last sibling abort the daemon ANSWERED —
+                // the session was provably settled) vs the WEAK proof
+                // (a bare idle observation); `busy` is the stale-proof
+                // guard (a running delivered after the proof — episode
+                // 2 round 4, Major 3). Flavors: the request-SETTLED
+                // ones (Http / Decode) accept weak-or-strong; Undelivered
+                // (that abort never reached the daemon — no retro-hazard
+                // from it, but it proves nothing about the turn) needs
+                // the STRONG proof (round 4, Minor 1); Transport never
+                // consumes (mid-exchange — the daemon may still
+                // retro-apply it, round 2, Major 2).
+                let seen = session.daemon_idle_seen.swap(false, Ordering::SeqCst);
+                let answered = session.daemon_proof_answered.swap(false, Ordering::SeqCst);
+                let busy = session.daemon_busy_after_idle.load(Ordering::SeqCst);
+                let flavor_allows = match &serve_err {
+                    ServeError::Http { .. } | ServeError::Decode(_) => true,
+                    ServeError::Undelivered(_) => answered,
+                    _ => false,
+                };
+                if seen && !busy && flavor_allows {
                     session.orphaned_daemon_turn.store(false, Ordering::SeqCst);
                     let queued_depth = session.pending_sends.len();
                     drop(session);
@@ -4102,6 +4160,13 @@ impl FreshOpencodeState {
                         session_id = %real_id,
                         queued_depth = queued_depth,
                         "fresh_agent_interrupt_orphan_released_by_observed_idle");
+                    // Focused episode 2 round 4, Major 2: the release
+                    // emits the idle snapshot the window suppressed —
+                    // with the typed message still solely in the
+                    // CLIENT's UX queue the drain is a no-op and the
+                    // client needs the frame to flush (hidden panes do
+                    // not poll).
+                    self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
                     Self::drain_detached(self, &real_id);
                     return;
                 }
@@ -4117,6 +4182,7 @@ impl FreshOpencodeState {
                 let queued_depth = session.pending_sends.len();
                 drop(session);
                 if !latch_armed {
+                    self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
                     Self::drain_detached(self, &real_id);
                     return;
                 }
@@ -4611,6 +4677,10 @@ impl FreshOpencodeState {
         // Focused episode 2 round 2, Major 3: same invalidation rule as
         // the send drive — a new compact turn resets the idle evidence.
         session.daemon_idle_seen.store(false, Ordering::SeqCst);
+        session.daemon_proof_answered.store(false, Ordering::SeqCst);
+        session
+            .daemon_busy_after_idle
+            .store(false, Ordering::SeqCst);
         session.turn_task = Some(TurnTask {
             kind: TurnTaskKind::Compact,
             handle: compact_task,
@@ -6696,6 +6766,18 @@ impl FreshOpencodeState {
                                     // the frame itself.
                                     continue;
                                 }
+                                if matches!(status, SnapshotStatus::Running) {
+                                    // Focused episode 2 round 4, Major 3: a
+                                    // running delivery after a recorded
+                                    // idle proof invalidates it (the
+                                    // interrupted turn's running follows a
+                                    // stale idle in stream order) — the
+                                    // busy guard blocks the weak-proof
+                                    // consume until the next fresh idle.
+                                    Self::observe_daemon_running(&this, &real_id, session_id).await;
+                                    // The helper broadcast the frame itself.
+                                    continue;
+                                }
                                 snapshot_event(session_id, status_str)
                             }
                             SdkProviderEvent::Changed { session_id, reason } => {
@@ -6729,6 +6811,28 @@ impl FreshOpencodeState {
         })
     }
 
+    /// Focused episode 2 round 4, Major 3: the serve bridge observed the
+    /// daemon report this session RUNNING. Two jobs under the session
+    /// lock: (1) record the busy edge — a running delivered AFTER a
+    /// recorded idle proof invalidates that proof (bridge lag can deliver
+    /// a stale idle from a previous turn during an abort window, and the
+    /// interrupted turn's own running follows it in stream order), so
+    /// `daemon_busy_after_idle` blocks the weak-proof consume until the
+    /// next fresh idle clears it; (2) broadcast the running snapshot (the
+    /// bridge's pre-existing behavior).
+    async fn observe_daemon_running(this: &Self, real_id: &str, session_id: &str) {
+        let session_arc = {
+            let guard = this.sessions.lock().await;
+            guard.get(real_id).cloned()
+        };
+        if let Some(session_arc) = session_arc {
+            let session = session_arc.lock().await;
+            session.daemon_busy_after_idle.store(true, Ordering::SeqCst);
+        }
+        this.fresh_agent
+            .broadcast(&event_frame(real_id, snapshot_event(session_id, "running")));
+    }
+
     /// Delta-review rounds 4+5: the serve bridge observed the daemon
     /// report this session IDLE. Two jobs, both under the session lock:
     /// (1) RELEASE the failed-interrupt deferral latch — the daemon's
@@ -6753,7 +6857,7 @@ impl FreshOpencodeState {
             guard.get(real_id).cloned()
         };
         let released = if let Some(session_arc) = session_arc {
-            let mut session = session_arc.lock().await;
+            let session = session_arc.lock().await;
             let abort_in_flight_now = session.abort_in_flight.load(Ordering::SeqCst) > 0;
             let released = if abort_in_flight_now {
                 // Delta-review round 6 (extension) Major 2: a
@@ -6775,6 +6879,13 @@ impl FreshOpencodeState {
                 // (episode 2 round 1, Major 3); the broadcast is
                 // suppressed with the release.
                 session.daemon_idle_seen.store(true, Ordering::SeqCst);
+                // A weak proof (an idle observation, not an answered
+                // abort); any running delivered after it sets the busy
+                // guard that invalidates it.
+                session.daemon_proof_answered.store(false, Ordering::SeqCst);
+                session
+                    .daemon_busy_after_idle
+                    .store(false, Ordering::SeqCst);
                 false
             } else {
                 let released = session.orphaned_daemon_turn.swap(false, Ordering::SeqCst);
@@ -13809,12 +13920,18 @@ mod tests {
                     let mut guard = self.abort_hangs.lock().expect("abort hangs mutex");
                     std::mem::take(&mut *guard)
                 };
-                let refused = *self.abort_refused.lock().expect("abort refused mutex");
+                // Read LIVE (at response time) so a parked abort can be
+                // released as Undelivered for one test while its sibling
+                // answered normally.
+                let refused = {
+                    let this: &CompactFakeHttp = self;
+                    move || *this.abort_refused.lock().expect("abort refused mutex")
+                };
                 let ambiguates = *self
                     .abort_ambiguates
                     .lock()
                     .expect("abort ambiguates mutex");
-                if refused {
+                if refused() {
                     return Box::pin(async move {
                         Err(ServeHttpError::Undelivered(
                             "abort refused at the connect phase by the test knob".to_string(),
@@ -13840,6 +13957,13 @@ mod tests {
                     if ambiguates {
                         return Err(ServeHttpError::Ambiguous(
                             "connection reset mid-exchange by the test knob".to_string(),
+                        ));
+                    }
+                    // The refused knob is also read LIVE: a parked abort
+                    // can be released as Undelivered.
+                    if refused() {
+                        return Err(ServeHttpError::Undelivered(
+                            "abort refused at release time by the test knob".to_string(),
                         ));
                     }
                     // The fail knob is read LIVE (at release time), not at
@@ -16760,7 +16884,7 @@ mod tests {
             !http
                 .recorded()
                 .iter()
-                .any(|r| r.url.contains("prompt_async") && r_body_contains(&r, "queued text")),
+                .any(|r| r.url.contains("prompt_async") && r_body_contains(r, "queued text")),
             "the queued send must NOT POST while the compact is in flight"
         );
 
@@ -16883,13 +17007,13 @@ mod tests {
         let prompt_gate = http.arm_prompt_gate();
 
         // TWO queued sends — FIFO order is the assertion target.
-        let _ = tokio::time::timeout(
+        tokio::time::timeout(
             std::time::Duration::from_secs(2),
             st.handle_send(send_msg("ses_q2", "first queued")),
         )
         .await
         .expect("queues inline");
-        let _ = tokio::time::timeout(
+        tokio::time::timeout(
             std::time::Duration::from_secs(2),
             st.handle_send(send_msg("ses_q2", "second queued")),
         )
@@ -16920,7 +17044,7 @@ mod tests {
             !http
                 .recorded()
                 .iter()
-                .any(|r| r.url.contains("prompt_async") && r_body_contains(&r, "second queued")),
+                .any(|r| r.url.contains("prompt_async") && r_body_contains(r, "second queued")),
             "one-at-a-time: the second queued send has not POSTed while the first is in flight"
         );
 
@@ -16939,11 +17063,11 @@ mod tests {
             .expect("summarize POST recorded");
         let first_ix = recorded
             .iter()
-            .position(|r| r.url.contains("prompt_async") && r_body_contains(&r, "first queued"))
+            .position(|r| r.url.contains("prompt_async") && r_body_contains(r, "first queued"))
             .expect("first queued send drained");
         let second_ix = recorded
             .iter()
-            .position(|r| r.url.contains("prompt_async") && r_body_contains(&r, "second queued"))
+            .position(|r| r.url.contains("prompt_async") && r_body_contains(r, "second queued"))
             .expect("second queued send drained");
         assert!(
             summarize_ix < first_ix,
@@ -17032,7 +17156,7 @@ mod tests {
                 .pending_sends
                 .push_back(send_msg("ses_q2b", "older entry"));
         }
-        let _ = tokio::time::timeout(
+        tokio::time::timeout(
             std::time::Duration::from_secs(2),
             st.handle_send(send_msg("ses_q2b", "newer entry")),
         )
@@ -17544,14 +17668,14 @@ mod tests {
             // quiescence decision — the send's running can only follow.
             let running_ix = pre
                 .iter()
-                .position(|f| running(f))
+                .position(running)
                 .expect("the send's running landed");
             assert!(
                 running_ix > 0,
                 "the helper's idle precedes the send's running — the emission is atomic with the decision"
             );
             assert!(
-                !pre.iter().skip(1).any(|f| idle(f)),
+                !pre.iter().skip(1).any(idle),
                 "no second idle may exist while the send is still parked"
             );
         } else {
@@ -17560,7 +17684,7 @@ mod tests {
                 "unexpected first frame — neither idle nor running"
             );
             assert!(
-                !pre.iter().any(|f| idle(f)),
+                !pre.iter().any(idle),
                 "sender-first means the helper observed the live send inside its critical section and SUPPRESSED — an idle while the send is still parked is a stale emission that raced the registration"
             );
         }
@@ -17577,7 +17701,7 @@ mod tests {
             late_idles, 0,
             "the settle idle is consumed exactly once — no late stale emissions"
         );
-        assert!(settle.iter().any(|f| idle(f)));
+        assert!(settle.iter().any(idle));
     }
 
     /// Delta-review round 6 (extension) Major 2: the daemon reporting idle
@@ -18559,8 +18683,24 @@ mod tests {
                 .await
             })
         };
-        // Let B's abort park on the gate before A's timeout fires.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Positive sync (focused episode 2 round 4, Minor 3): wait for
+        // B's abort POST to be recorded — B is parked on the gate and A's
+        // 150ms timeout cannot make A the last settlement.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let aborts = http
+                    .recorded()
+                    .iter()
+                    .filter(|r| r.method == "POST" && r.url.contains("/abort"))
+                    .count();
+                if aborts >= 2 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("both abort POSTs land within the budget");
         // A settles with the TIMEOUT (not the last — B is still parked):
         // the sidecar is discarded, the latch disarms, no drain yet.
         interrupt_a
@@ -18585,6 +18725,251 @@ mod tests {
             .expect("interrupt B answers within the budget");
         await_prompt_posted(&http, "survives the mixed window").await;
         let session_arc = st.sessions.lock().await.get("ses_q23").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    /// Focused episode 2 round 4, Major 2: the LAST no-writer settlement
+    /// (the abort timeout killed the sidecar) must emit the idle snapshot
+    /// the abort window suppressed — with the typed message still solely
+    /// in the CLIENT's UX queue the server drain is a no-op, and without
+    /// the frame the client stays busy forever (it cannot flush, and
+    /// hidden panes do not poll).
+    #[tokio::test]
+    async fn an_abort_timeout_still_emits_the_idle_snapshot() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, mut rx, _tx) = compact_state_gated_cfg(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+            Some(Duration::from_millis(150)),
+        )
+        .await;
+        insert_compact_session(&st, "ses_q24", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q24")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+
+        // NO queued server send: the typed message sits solely in the
+        // client's UX queue — the drain is a no-op and the idle frame is
+        // the only thing that lets the client recover.
+        http.arm_abort_hang();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q24".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers after the abort timeout");
+
+        let _ = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+        })
+        .await;
+        let session_arc = st.sessions.lock().await.get("ses_q24").cloned().unwrap();
+        assert!(!session_arc
+            .lock()
+            .await
+            .orphaned_daemon_turn
+            .load(Ordering::SeqCst));
+    }
+
+    /// Focused episode 2 round 4, Major 3: an idle delivered during an
+    /// abort window can be a STALE duplicate from the previous turn (the
+    /// interrupted turn's own `running` follows it in stream order). A
+    /// running delivery after the recorded proof invalidates it: the
+    /// failed-abort settlement must NOT consume the stale proof and
+    /// dispatch into the still-running daemon-side compact. The next
+    /// FRESH idle (the real end of the interrupted turn) releases.
+    #[tokio::test]
+    async fn a_stale_idle_then_running_does_not_release_on_the_failed_abort() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q25", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q25")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q25", "waits for a fresh idle")),
+        )
+        .await;
+
+        let abort_gate = http.arm_abort_gate();
+        http.arm_abort_fail();
+        let interrupt = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    st.handle_interrupt(FreshAgentInterrupt {
+                        provider: AgentProvider::Opencode,
+                        session_id: "ses_q25".to_string(),
+                        session_type: SessionType::Freshopencode,
+                        cwd: None,
+                    }),
+                )
+                .await
+            })
+        };
+        await_abort_posted(&http).await;
+
+        // The bridge delivers a STALE idle (from the previous turn)
+        // during the window — recorded as a weak proof — and THEN the
+        // interrupted turn's own running (stream order): the busy guard
+        // invalidates the proof.
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q25", "ses_q25").await;
+        FreshOpencodeState::observe_daemon_running(&st, "ses_q25", "ses_q25").await;
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "no dispatch before the abort settles"
+        );
+
+        // The abort settles 500 — the STALE proof must not be consumed
+        // (the busy guard holds): no dispatch into the possibly-live
+        // daemon-side compact.
+        abort_gate.notify_waiters();
+        interrupt
+            .await
+            .expect("interrupt task lives")
+            .expect("interrupt answers within the budget");
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "a stale idle followed by running is not proof the interrupted turn ended — the settlement must not consume it"
+        );
+        let session_arc = st.sessions.lock().await.get("ses_q25").cloned().unwrap();
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .orphaned_daemon_turn
+                .load(Ordering::SeqCst),
+            "the deferral holds until a FRESH idle"
+        );
+
+        // The interrupted turn REALLY ends — the fresh idle releases and
+        // delivers.
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q25", "ses_q25").await;
+        await_prompt_posted(&http, "waits for a fresh idle").await;
+        let session_arc = st.sessions.lock().await.get("ses_q25").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    /// Focused episode 2 round 4, Minor 1: an Undelivered LAST settlement
+    /// consumes the earlier sibling's ANSWERED-abort proof (the strong
+    /// proof) and delivers — that abort never reached the daemon, so no
+    /// retro-hazard, and the sibling's answer already settled the turn.
+    #[tokio::test]
+    async fn an_undelivered_last_settlement_consumes_the_earlier_answered_proof() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q26", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q26")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q26", "delivers on the strong proof")),
+        )
+        .await;
+
+        let abort_gate = http.arm_abort_gate();
+        let interrupt_a = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    st.handle_interrupt(FreshAgentInterrupt {
+                        provider: AgentProvider::Opencode,
+                        session_id: "ses_q26".to_string(),
+                        session_type: SessionType::Freshopencode,
+                        cwd: None,
+                    }),
+                )
+                .await
+            })
+        };
+        await_abort_posted(&http).await;
+        // B's abort answers 200 — NOT the last: records the STRONG proof.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q26".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt B answers (abort 200, not last)");
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "B's not-last settlement deferred the release to A — as designed"
+        );
+
+        // A's parked abort is released as Undelivered — the LAST
+        // settlement consumes the strong proof and delivers.
+        http.arm_abort_refused();
+        abort_gate.notify_waiters();
+        interrupt_a
+            .await
+            .expect("interrupt A task lives")
+            .expect("interrupt A answers within the budget");
+        await_prompt_posted(&http, "delivers on the strong proof").await;
+        let session_arc = st.sessions.lock().await.get("ses_q26").cloned().unwrap();
         let session = session_arc.lock().await;
         assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
         assert!(session.pending_sends.is_empty());
