@@ -167,21 +167,34 @@ fn stuck_detection_clears_on_meaningful_output() {
 }
 
 #[test]
-fn stuck_detection_clears_on_user_input() {
-    // EPISODE-3 FOCUSED-REVIEW AMENDMENT: this sketch asserted the WRONG
-    // contract — keystrokes refresh the reaper clock
-    // (`last_meaningful_activity_at`) only; the wedge clock advances
-    // exclusively via NoiseScanner-accepted output, so typing at a
-    // wedged pane does NOT un-wedge it. The implemented test is
-    // `stuck_detection_survives_user_input`; the assertions below are
-    // pre-implementation history. `input` returns `InputOutcome`
-    // (NOT a Result — do not unwrap).
+fn stuck_detection_survives_user_input() {
+    // EPISODE-3 FOCUSED-REVIEW AMENDMENT (r1): the original sketch
+    // asserted the WRONG contract — that a keystroke CLEARS the stuck
+    // flag. Keystrokes refresh the reaper's mixed clock
+    // (`last_meaningful_activity_at`) only; BOTH wedge clocks are
+    // output-only (`last_meaningful_output_at` advances exclusively via
+    // NoiseScanner-accepted output in `ingest`,
+    // `last_output_activity_at` via every output frame), so typing at /
+    // Ctrl+C-ing a genuinely wedged pane (the natural first response)
+    // neither clears nor postpones the stuck state — and a healthy
+    // engaged pane's keystroke echo arrives via `ingest` and keeps the
+    // clocks fresh through output anyway. `input` returns `InputOutcome`
+    // (NOT a Result — no unwrap).
     let reg = stuck_test_registry("opencode");
     flag_stuck_row(&reg);
-    let _ = reg.input("T", b"x"); // InputOutcome — assert the row-clock variant if desired
-    let cleared = reg.enforce_stuck_detection();
-    assert_eq!(cleared.len(), 1);
-    assert!(!cleared[0].stuck);
+    assert!(reg.input("T", b"x").found);
+    // The sweep must emit NO clear transition — the row still matches
+    // the wedge predicate (meaningful output stale, activity fresh).
+    assert!(reg.enforce_stuck_detection().is_empty(),
+            "typing at a wedged pane must not un-wedge it");
+    // And the flag SURVIVED: a fresh subscriber's attach-time stuck
+    // truth still reports stuck:true (the page_refresh probe shape).
+    let (sink, seen) = collector();
+    assert!(reg.attach("T", 1, sink, Some("att-surv".into()), 0, false, None, None)
+        .found);
+    let stuck = stuck_frames(&seen);
+    assert_eq!(stuck.len(), 1);
+    assert!(stuck[0].stuck, "the stuck flag survived the user input");
 }
 
 #[test]
@@ -297,21 +310,34 @@ pub struct StuckTransition {
     pub at: i64,
 }
 
-/// Flag/unflag agent-mode RUNNING terminals whose MEANINGFUL clock went stale
-/// past the stuck window WHILE raw output keeps flowing (the two-clock
-/// differential the User Request's load-bearing constraint itself names:
-/// "last_meaningful_activity_at stale while last_activity_at stays fresh").
-/// The activity-freshness conjunct is what separates a WEDGED repaint loop
+/// Flag/unflag agent-mode RUNNING terminals whose output-only MEANINGFUL
+/// clock went stale past the stuck window WHILE the output-only RAW
+/// output clock keeps flowing (the three-clock wedge differential — the
+/// User Request's load-bearing constraint names it in its original
+/// mixed-clock terms, "last_meaningful_activity_at stale while
+/// last_activity_at stays fresh"; the final contract reads the
+/// output-only twins so keystrokes and teardown grace can neither
+/// manufacture nor mask a wedge — see the amendment notes below). The
+/// activity-freshness conjunct is what separates a WEDGED repaint loop
 /// (the eternal spinner keeps painting — raw output fresh) from a pane
-/// sitting quietly at a prompt or mid-idle (both clocks equally stale — NOT
-/// the requested detection class, and flagging it would alter non-wedged
-/// panes). Emits transitions ONLY on state change (stuck:false→true and
-/// true→false); never kills, never emits a turn-complete, and unlike
-/// `enforce_idle_kills` does NOT exempt attached terminals — an attached
-/// wedged pane is the primary failure class this sweep exists for (see the
-/// 2026-09-18 opencode zombie RCA). A wedged pane whose output later FREEZES
-/// entirely stops matching (no longer a repaint loop) and the flag clears —
-/// an accepted safe-direction residual.
+/// sitting quietly at a prompt or mid-idle (both output clocks equally
+/// stale — NOT the requested detection class, and flagging it would
+/// alter non-wedged panes). The strict clock-ordering conjunct
+/// (`last_output_activity_at > last_meaningful_output_at`, episode-3 r3)
+/// closes the tiny-window merely-exists case: both output clocks init to
+/// the creation time, so under a configured window below
+/// `STUCK_ACTIVITY_FRESH_MS` a row that merely EXISTS past the window
+/// would otherwise satisfy staleness+freshness without ever having
+/// emitted — a wedge's repaint stream advances the raw clock STRICTLY
+/// past the frozen meaningful clock, while a merely-quiet row's output
+/// clocks stay equal. Emits transitions ONLY on state change
+/// (stuck:false→true and true→false); never kills, never emits a
+/// turn-complete, and unlike `enforce_idle_kills` does NOT exempt
+/// attached terminals — an attached wedged pane is the primary failure
+/// class this sweep exists for (see the 2026-09-18 opencode zombie RCA).
+/// A wedged pane whose output later FREEZES entirely stops matching (no
+/// longer a repaint loop) and the flag clears — an accepted
+/// safe-direction residual.
 pub fn enforce_stuck_detection(&self) -> Vec<StuckTransition> {
     let window = self.stuck_window_ms();
     if window <= 0 { return Vec::new(); }
@@ -320,8 +346,9 @@ pub fn enforce_stuck_detection(&self) -> Vec<StuckTransition> {
     // Walk rows with the same locking pattern enforce_idle_kills uses;
     // for each row:
     //   should = s.status == Running && is_agent_mode(&s.mode)
-    //            && (now - s.last_meaningful_activity_at) > window
-    //            && (now - s.last_activity_at) < STUCK_ACTIVITY_FRESH_MS;
+    //            && (now - s.last_meaningful_output_at) > window
+    //            && (now - s.last_output_activity_at) < STUCK_ACTIVITY_FRESH_MS
+    //            && s.last_output_activity_at > s.last_meaningful_output_at;
     //   match (s.stuck_since.is_some(), should) {
     //     (false, true) => { s.stuck_since = Some(now);
     //                       transitions.push(StuckTransition{ stuck: true, ..now }) }
@@ -343,7 +370,7 @@ with the freshness const next to the window consts:
 pub const STUCK_ACTIVITY_FRESH_MS: i64 = 300_000;
 ```
 
-Note `is_agent_mode` is a private fn in the same file — call it directly. Do NOT touch `enforce_idle_kills` or `idle_noise.rs`. The predicate is the WEDGE DIFFERENTIAL — output-meaningful staleness AND output-raw freshness together (the User Request's Explicit constraint names the differential signal; the round-1 review caught the staleness-only variant flagging prompt-idle panes, which would alter non-wedged panes). Deliberately NO busy/turn-in-flight gate (the zombie class attaches to aborted sessions with no reliable turn state; a busy gate would produce false negatives on exactly the target class). (Episode-3 focused-review amendment — final three-clock contract: the sweep flags when the output-only MEANINGFUL clock is past the window while the output-only RAW activity clock stays fresh — keystrokes and teardown grace touch neither. The staleness conjunct reads `last_meaningful_output_at` (advances exclusively via NoiseScanner-accepted output, so typing at / Ctrl+C-ing a genuinely wedged pane does not clear or postpone the stuck state); the freshness conjunct reads `last_output_activity_at` (refreshed by every output frame in `ingest` alone, never by keystrokes or the detach/socket-close grace bumps, so a keypress cannot manufacture the differential on a healthy quiet pane either — focused-e3r2 Finding 1).)
+Note `is_agent_mode` is a private fn in the same file — call it directly. Do NOT touch `enforce_idle_kills` or `idle_noise.rs`. The predicate is the WEDGE DIFFERENTIAL — output-meaningful staleness AND output-raw freshness together (the User Request's Explicit constraint names the differential signal; the round-1 review caught the staleness-only variant flagging prompt-idle panes, which would alter non-wedged panes). Deliberately NO busy/turn-in-flight gate (the zombie class attaches to aborted sessions with no reliable turn state; a busy gate would produce false negatives on exactly the target class). (Episode-3 focused-review amendment — final three-clock contract: the sweep flags when the output-only MEANINGFUL clock is past the window while the output-only RAW activity clock stays fresh — keystrokes and teardown grace touch neither. The staleness conjunct reads `last_meaningful_output_at` (advances exclusively via NoiseScanner-accepted output, so typing at / Ctrl+C-ing a genuinely wedged pane does not clear or postpone the stuck state); the freshness conjunct reads `last_output_activity_at` (refreshed by every output frame in `ingest` alone, never by keystrokes or the detach/socket-close grace bumps, so a keypress cannot manufacture the differential on a healthy quiet pane either — focused-e3r2 Finding 1). Episode-3 r3 adds the strict clock-ordering conjunct `last_output_activity_at > last_meaningful_output_at` (focused-e3r3 Finding 3): both output clocks init to the creation time, so without it a row that merely EXISTS past a window below `STUCK_ACTIVITY_FRESH_MS` flags without ever having emitted; a wedge's repaint stream advances the raw clock strictly past the frozen meaningful one, a merely-quiet row's stay equal.)
 
 - [ ] **Step 4: Run the focused test**
 
@@ -370,7 +397,7 @@ git add crates/freshell-terminal/src/registry.rs crates/freshell-terminal/src/id
 git commit -m "feat(terminal): registry stuck sweep flags agent panes past meaningful-idle window"
 ```
 
-**Episode-3 focused-review amendment:** the review loop corrected Task 1's input/clearing semantics after the sketches were written, in two rounds. Round 1 (staleness half): keystrokes refresh the reaper clock (`last_meaningful_activity_at`) only; the wedge staleness clock (`last_meaningful_output_at`, the round-4 output-only twin the implemented sweep reads) advances exclusively via NoiseScanner-accepted output in `ingest`, and typing at / Ctrl+C-ing a genuinely wedged pane does not un-wedge it (a healthy engaged pane's keystroke echo arrives via `ingest` and keeps the clocks fresh through output anyway). Round 2 (r2 — freshness half, focused-e3r2 Finding 1): the freshness conjunct reads a third clock, the output-only RAW `last_output_activity_at` (refreshed by every output frame in `ingest` alone), instead of the mixed `last_activity_at` — the mixed clock is refreshed by keystrokes too, so reading it let a single keypress manufacture the differential on a healthy quiet pane (both output clocks stale past the window; the keypress refreshes the mixed clock → false flag). Final three-clock contract: the sweep flags when the output-only MEANINGFUL clock is past the window while the output-only RAW activity clock stays fresh — keystrokes and teardown grace touch neither. The predicate note above and the `stuck_detection_clears_on_user_input` sketch's comment state the corrected contract; the implemented tests are `stuck_detection_survives_user_input` and `keypress_does_not_manufacture_wedge_freshness`, and the sketch's old name/assertions and the other code blocks (e.g. the `stuck_since` doc sketch's "cleared by the first meaningful activity", which reads "first meaningful output") remain pre-implementation history per this plan's rules.
+**Episode-3 focused-review amendment:** the review loop corrected Task 1's input/clearing semantics after the sketches were written, in two rounds. Round 1 (staleness half): keystrokes refresh the reaper clock (`last_meaningful_activity_at`) only; the wedge staleness clock (`last_meaningful_output_at`, the round-4 output-only twin the implemented sweep reads) advances exclusively via NoiseScanner-accepted output in `ingest`, and typing at / Ctrl+C-ing a genuinely wedged pane does not un-wedge it (a healthy engaged pane's keystroke echo arrives via `ingest` and keeps the clocks fresh through output anyway). Round 2 (r2 — freshness half, focused-e3r2 Finding 1): the freshness conjunct reads a third clock, the output-only RAW `last_output_activity_at` (refreshed by every output frame in `ingest` alone), instead of the mixed `last_activity_at` — the mixed clock is refreshed by keystrokes too, so reading it let a single keypress manufacture the differential on a healthy quiet pane (both output clocks stale past the window; the keypress refreshes the mixed clock → false flag). Final three-clock contract: the sweep flags when the output-only MEANINGFUL clock is past the window while the output-only RAW activity clock stays fresh — keystrokes and teardown grace touch neither. The predicate note above and the `stuck_detection_survives_user_input` sketch state the corrected contract; the implemented tests are `stuck_detection_survives_user_input` and `keypress_does_not_manufacture_wedge_freshness`, and the other code blocks (e.g. the `stuck_since` doc sketch's "cleared by the first meaningful activity", which reads "first meaningful output") remain pre-implementation history per this plan's rules. r3 remediation (focused-e3r3 Findings 2 and 3): the two executable sketch blocks are now ALIGNED to the final contract — the test sketch is renamed and re-asserted as `stuck_detection_survives_user_input` (typing must not un-wedge), and the predicate sketch reads the output-only clocks plus the r3 strict clock-ordering conjunct, pinned by `tiny_window_does_not_flag_a_merely_existing_row` — so executing the plan as written reproduces HEAD; only the non-executable prose sketches remain pre-implementation history.
 
 ---
 

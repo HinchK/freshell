@@ -1454,6 +1454,18 @@ impl TerminalRegistry {
     /// and teardown grace touch NEITHER output clock — only real PTY
     /// output can prove a pane is still repainting.
     ///
+    /// Episode-3 r3, Finding 3 (the tiny-window merely-exists case): the
+    /// predicate additionally requires STRICT clock ordering —
+    /// `last_output_activity_at > last_meaningful_output_at`. Both output
+    /// clocks init to the creation time, so under a configured window
+    /// smaller than [`STUCK_ACTIVITY_FRESH_MS`] a row that merely EXISTS
+    /// past the window satisfies the staleness+freshness conjuncts without
+    /// ever having emitted (its equal clocks are window-stale yet still
+    /// freshness-fresh) and would flag a never-wedged pane. A wedge's
+    /// repaint stream advances the raw clock STRICTLY past the frozen
+    /// meaningful clock; a merely-quiet row's output clocks stay equal —
+    /// the conjunct separates exactly those two classes and nothing else.
+    ///
     /// Callers drive the cadence externally exactly like `enforce_idle_kills`
     /// (this crate is deliberately tokio-free, so the periodic timer lives in
     /// `freshell-ws`).
@@ -1479,7 +1491,8 @@ impl TerminalRegistry {
                     let should = s.status == TerminalRunStatus::Running
                         && Self::is_agent_mode(&s.mode)
                         && now.saturating_sub(s.last_meaningful_output_at) > window
-                        && now.saturating_sub(s.last_output_activity_at) < STUCK_ACTIVITY_FRESH_MS;
+                        && now.saturating_sub(s.last_output_activity_at) < STUCK_ACTIVITY_FRESH_MS
+                        && s.last_output_activity_at > s.last_meaningful_output_at;
                     match (s.stuck_since.is_some(), should) {
                         (false, true) => {
                             s.stuck_since = Some(now);
@@ -6242,6 +6255,35 @@ mod tests {
         assert!(
             reg.enforce_stuck_detection().is_empty(),
             "a keypress must not manufacture wedge freshness on a quiet pane"
+        );
+    }
+
+    /// Episode-3 r3, Finding 3 (the tiny-window merely-exists false
+    /// positive): both output clocks init to the creation time, so with a
+    /// configured window BELOW `STUCK_ACTIVITY_FRESH_MS` a row that merely
+    /// EXISTS past the window satisfies the old two-conjunct predicate —
+    /// its equal clocks are (window+1) old, which is BOTH stale past a
+    /// tiny window AND "fresh" under the 5-minute freshness bound — and a
+    /// never-wedged pane flags. The fix's strict clock-ordering conjunct
+    /// (`last_output_activity_at > last_meaningful_output_at`) separates
+    /// the classes: a wedge's repaint stream advances the raw clock
+    /// STRICTLY past the frozen meaningful clock, while a merely-quiet
+    /// row's output clocks stay EQUAL.
+    #[test]
+    fn tiny_window_does_not_flag_a_merely_existing_row() {
+        let reg = stuck_test_registry("opencode");
+        // Precondition: the test window is genuinely below the freshness
+        // bound, so the merely-exists shape is reachable at all (read back
+        // through the setter, not asserted on the source constants).
+        assert!(reg.stuck_window_ms() < STUCK_ACTIVITY_FRESH_MS);
+        // A row that has NEVER emitted (no feed — `backdate_last_activity`
+        // is the only clock movement, and it stamps every activity clock
+        // equally): both output clocks sit at the same backdated instant.
+        reg.backdate_last_activity("T", now_ms() - (STUCK_TEST_WINDOW_MS + 1));
+        assert!(
+            reg.enforce_stuck_detection().is_empty(),
+            "a merely-existing row (equal output clocks, no repaint stream) \
+             must not flag under a window below the freshness bound"
         );
     }
 
