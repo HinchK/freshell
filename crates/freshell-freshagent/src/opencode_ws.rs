@@ -4088,11 +4088,31 @@ impl FreshOpencodeState {
                     session.orphaned_daemon_turn.store(false, Ordering::SeqCst);
                     turn_aborted.store(false, Ordering::SeqCst);
                     let queued_depth = session.pending_sends.len();
+                    if last {
+                        // Focused episode 2 round 4, Major 2 + round 5,
+                        // Major 1: the LAST no-writer settlement emits
+                        // the idle snapshot the window suppressed — with
+                        // the typed message still solely in the CLIENT's
+                        // UX queue the drain is a no-op, and without the
+                        // frame the client stays busy forever. The
+                        // broadcast is INSIDE the session lock (the Ok
+                        // arm's atomicity pattern): outside it, a new
+                        // interrupt could re-arm the window between the
+                        // release decision and the emission, and this
+                        // frame would flush the client into the new
+                        // abort's cancellation window.
+                        self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+                    }
                     drop(session);
+                    // Focused episode 2 round 5, Minor: the WARN covers
+                    // every no-writer flavor (timeout AND the startup
+                    // phases), so it names the state, not the timeout, and
+                    // carries the actual error for diagnosis.
                     tracing::warn!(target: "freshell_freshagent::opencode",
                         session_id = %real_id,
                         queued_depth = queued_depth,
-                        "fresh_agent_interrupt_abort_timeout_sidecar_discarded");
+                        error = %serve_err,
+                        "fresh_agent_interrupt_abort_no_writer");
                     // The drain too is owned by the LAST in-flight abort
                     // — a sibling abort still in flight could cancel a
                     // freshly dispatched prompt. The parked message then
@@ -4100,14 +4120,6 @@ impl FreshOpencodeState {
                     // last abort settles) or fails with the normal typed
                     // send-failure path — it never strands silently.
                     if last {
-                        // Focused episode 2 round 4, Major 2: the LAST
-                        // no-writer settlement ALSO emits the idle
-                        // snapshot the window suppressed — with the typed
-                        // message still solely in the CLIENT's UX queue
-                        // the drain is a no-op, and without the frame the
-                        // client stays busy forever (it cannot flush, and
-                        // hidden panes do not poll).
-                        self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
                         Self::drain_detached(self, &real_id);
                     }
                     return;
@@ -4155,18 +4167,18 @@ impl FreshOpencodeState {
                 if seen && !busy && flavor_allows {
                     session.orphaned_daemon_turn.store(false, Ordering::SeqCst);
                     let queued_depth = session.pending_sends.len();
+                    // Focused episode 2 round 4, Major 2 + round 5,
+                    // Major 1: the idle snapshot the window suppressed,
+                    // emitted INSIDE the session lock (the Ok arm's
+                    // atomicity pattern) — outside it, a new interrupt
+                    // could re-arm the window between the release
+                    // decision and the emission.
+                    self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
                     drop(session);
                     tracing::warn!(target: "freshell_freshagent::opencode",
                         session_id = %real_id,
                         queued_depth = queued_depth,
                         "fresh_agent_interrupt_orphan_released_by_observed_idle");
-                    // Focused episode 2 round 4, Major 2: the release
-                    // emits the idle snapshot the window suppressed —
-                    // with the typed message still solely in the
-                    // CLIENT's UX queue the drain is a no-op and the
-                    // client needs the frame to flush (hidden panes do
-                    // not poll).
-                    self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
                     Self::drain_detached(self, &real_id);
                     return;
                 }
@@ -4180,12 +4192,14 @@ impl FreshOpencodeState {
                 // timeout-then-transport ordering).
                 let latch_armed = session.orphaned_daemon_turn.load(Ordering::SeqCst);
                 let queued_depth = session.pending_sends.len();
-                drop(session);
                 if !latch_armed {
+                    // Same in-lock emission discipline (round 5, Major 1).
                     self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+                    drop(session);
                     Self::drain_detached(self, &real_id);
                     return;
                 }
+                drop(session);
                 // send-during-compact queue (delta-review round 3): the
                 // daemon-side turn may STILL be executing — the orphan
                 // marker (armed at the teardown start, above) STAYS
@@ -6878,14 +6892,29 @@ impl FreshOpencodeState {
                 // REMEMBER the idle for the settlement arm to consume
                 // (episode 2 round 1, Major 3); the broadcast is
                 // suppressed with the release.
-                session.daemon_idle_seen.store(true, Ordering::SeqCst);
-                // A weak proof (an idle observation, not an answered
-                // abort); any running delivered after it sets the busy
-                // guard that invalidates it.
-                session.daemon_proof_answered.store(false, Ordering::SeqCst);
-                session
-                    .daemon_busy_after_idle
-                    .store(false, Ordering::SeqCst);
+                // Focused episode 2 round 5, Major 2: DELIVERY-ORDER
+                // IDENTITY — an idle is evidence the interrupted turn
+                // ended ONLY if a running was already DELIVERED before
+                // it (the daemon's running→idle transition for that
+                // turn). An idle with NO prior running delivery may be a
+                // stale duplicate of the PREVIOUS turn (the interrupted
+                // turn's running is still queued behind it in stream
+                // order): record NOTHING — the settlement cannot consume
+                // it, and the interrupted turn's own eventual idle (which
+                // DOES follow its running) releases through the round-4
+                // path. This closes the settle-before-running-delivery
+                // interleaving.
+                if session.daemon_busy_after_idle.load(Ordering::SeqCst) {
+                    session.daemon_idle_seen.store(true, Ordering::SeqCst);
+                    // The idle supersedes the running that preceded it.
+                    session
+                        .daemon_busy_after_idle
+                        .store(false, Ordering::SeqCst);
+                    // Focused episode 2 round 5, Major 3: NEVER downgrade
+                    // a strong proof (a not-last sibling abort the daemon
+                    // ANSWERED) — the daemon's resulting idle arriving
+                    // after it must not erase it.
+                }
                 false
             } else {
                 let released = session.orphaned_daemon_turn.swap(false, Ordering::SeqCst);
@@ -17868,10 +17897,10 @@ mod tests {
         {
             let captured = events.lock().unwrap();
             assert!(
-                captured.iter().any(|e| e
-                    .message
-                    .contains("fresh_agent_interrupt_abort_timeout_sidecar_discarded")),
-                "the timeout's sidecar discard is WARN-observable"
+                captured
+                    .iter()
+                    .any(|e| e.message.contains("fresh_agent_interrupt_abort_no_writer")),
+                "the timeout's no-writer settlement is WARN-observable"
             );
         }
         let session_arc = st.sessions.lock().await.get("ses_q14").cloned().unwrap();
@@ -18113,8 +18142,12 @@ mod tests {
         };
         await_abort_posted(&http).await;
 
-        // The daemon reports idle DURING the abort window — deferred
-        // (Major 2) but REMEMBERED (this fix).
+        // The daemon reports the interrupted turn's RUNNING and then
+        // its idle DURING the abort window — the delivery-order identity
+        // (episode 2 round 5, Major 2): an idle is proof only when it
+        // FOLLOWS a delivered running. Deferred (episode 2 round 1,
+        // Major 2) but REMEMBERED (episode 2 round 1, Major 3).
+        FreshOpencodeState::observe_daemon_running(&st, "ses_q17", "ses_q17").await;
         FreshOpencodeState::observe_daemon_idle(&st, "ses_q17", "ses_q17").await;
         for _ in 0..25 {
             tokio::task::yield_now().await;
@@ -18401,7 +18434,10 @@ mod tests {
         };
         await_abort_posted(&http).await;
 
-        // The daemon idles during A's abort window — remembered.
+        // The daemon reports the interrupted turn's RUNNING and then
+        // idles during A's abort window — the delivery-order identity
+        // (round 5, Major 2) makes the idle proof; it is remembered.
+        FreshOpencodeState::observe_daemon_running(&st, "ses_q20", "ses_q20").await;
         FreshOpencodeState::observe_daemon_idle(&st, "ses_q20", "ses_q20").await;
         // B arms while A's abort is still in flight; B's abort answers 500
         // immediately (not the last — defers to A's settlement).
@@ -18835,9 +18871,11 @@ mod tests {
         await_abort_posted(&http).await;
 
         // The bridge delivers a STALE idle (from the previous turn)
-        // during the window — recorded as a weak proof — and THEN the
-        // interrupted turn's own running (stream order): the busy guard
-        // invalidates the proof.
+        // during the window and THEN the interrupted turn's own running
+        // (stream order). With the delivery-order identity (round 5,
+        // Major 2) the stale idle is NOT recorded at all — it follows no
+        // delivered running — so the 500 settlement finds no proof and
+        // the queue waits for the interrupted turn's own idle.
         FreshOpencodeState::observe_daemon_idle(&st, "ses_q25", "ses_q25").await;
         FreshOpencodeState::observe_daemon_running(&st, "ses_q25", "ses_q25").await;
         for _ in 0..25 {
@@ -18948,6 +18986,13 @@ mod tests {
         )
         .await
         .expect("interrupt B answers (abort 200, not last)");
+        // Focused episode 2 round 5, Major 3: the daemon's resulting
+        // idle arrives while A is still in flight — it must NOT erase
+        // (downgrade) B's strong proof. (Delivered after a running — the
+        // interrupted turn's — so it records the weak proof too; the
+        // strong marker survives.)
+        FreshOpencodeState::observe_daemon_running(&st, "ses_q26", "ses_q26").await;
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q26", "ses_q26").await;
         for _ in 0..25 {
             tokio::task::yield_now().await;
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -18970,6 +19015,102 @@ mod tests {
             .expect("interrupt A answers within the budget");
         await_prompt_posted(&http, "delivers on the strong proof").await;
         let session_arc = st.sessions.lock().await.get("ses_q26").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    /// Focused episode 2 round 5, Major 2: the settle-before-running
+    /// interleaving — a STALE idle (following no delivered running) is
+    /// recorded as nothing; the abort then settles Http-500 BEFORE the
+    /// bridge delivers the interrupted turn's running. The settlement
+    /// must NOT consume any proof (there is none); the queue waits for
+    /// the interrupted turn's OWN idle — which follows its running — to
+    /// release through the round-4 path. Pre-fix the stale idle was
+    /// recorded and consumed, dispatching into the still-running compact.
+    #[tokio::test]
+    async fn a_stale_idle_before_the_running_delivery_never_releases_on_the_failed_abort() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q27", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q27")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q27", "waits for the real idle")),
+        )
+        .await;
+
+        let abort_gate = http.arm_abort_gate();
+        http.arm_abort_fail();
+        let interrupt = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    st.handle_interrupt(FreshAgentInterrupt {
+                        provider: AgentProvider::Opencode,
+                        session_id: "ses_q27".to_string(),
+                        session_type: SessionType::Freshopencode,
+                        cwd: None,
+                    }),
+                )
+                .await
+            })
+        };
+        await_abort_posted(&http).await;
+
+        // The bridge delivers the STALE idle (from the previous turn —
+        // following NO delivered running): records NOTHING.
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q27", "ses_q27").await;
+
+        // The abort settles 500 BEFORE the interrupted turn's running is
+        // delivered — the settlement finds no proof and defers (the
+        // pre-fix code consumed the stale idle and dispatched into the
+        // still-running compact).
+        abort_gate.notify_waiters();
+        interrupt
+            .await
+            .expect("interrupt task lives")
+            .expect("interrupt answers within the budget");
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "a stale idle that follows no delivered running is not proof — the settlement must not consume it"
+        );
+        let session_arc = st.sessions.lock().await.get("ses_q27").cloned().unwrap();
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .orphaned_daemon_turn
+                .load(Ordering::SeqCst),
+            "the deferral holds until the interrupted turn's own idle"
+        );
+
+        // The interrupted turn's running and then its OWN idle arrive (the
+        // delivery-order identity): the round-4 release path delivers.
+        FreshOpencodeState::observe_daemon_running(&st, "ses_q27", "ses_q27").await;
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q27", "ses_q27").await;
+        await_prompt_posted(&http, "waits for the real idle").await;
+        let session_arc = st.sessions.lock().await.get("ses_q27").cloned().unwrap();
         let session = session_arc.lock().await;
         assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
         assert!(session.pending_sends.is_empty());
