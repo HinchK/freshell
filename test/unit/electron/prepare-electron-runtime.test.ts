@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto'
 import { chmodSync, mkdtempSync, mkdirSync, lstatSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 vi.mock('node:fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('node:fs')>()
@@ -111,6 +112,21 @@ function sidecarDeployFixture(destination: string): void {
   writeFileSync(path.join(destination, 'permission-channel.mjs'), 'export {}\n')
   writeFileSync(path.join(destination, 'session-settings.mjs'), 'export const configureSession = () => ({ staged: true })\n')
   writeFileSync(path.join(destination, 'model-catalog.mjs'), 'export const probeModelCatalog = () => [{ value: "staged-model" }]\n')
+  // Unified agent names (Task 3): the standalone session-names helper —
+  // one JSON line in, one structured line out. Executed below against a
+  // staged fake SDK to prove the staged copy RUNS, not just copies.
+  writeFileSync(path.join(destination, 'session-names.mjs'), [
+    "const sdk = await import(process.env.FRESHELL_CLAUDE_SDK_SESSION_NAMES_MODULE)",
+    "const { getSessionInfo } = sdk",
+    "import { createInterface } from 'node:readline'",
+    "const lines = createInterface({ input: process.stdin })",
+    "lines.once('line', async (line) => {",
+    "  const request = JSON.parse(line)",
+    "  const info = await getSessionInfo(request.sessionId, { dir: request.dir })",
+    "  process.stdout.write(JSON.stringify({ ok: true, op: request.op, staged: info.summary }) + '\\n')",
+    "  process.exit(0)",
+    "})",
+  ].join('\n') + '\n')
   writeFileSync(path.join(destination, 'package.json'), JSON.stringify({ name: 'freshell-claude-sidecar', version: '0.1.0', type: 'module' }))
   writeFileSync(path.join(destination, 'pnpm-lock.yaml'), "lockfileVersion: '10.0'\n")
   const sdkDir = path.join(destination, 'node_modules', '@anthropic-ai', 'claude-agent-sdk')
@@ -296,6 +312,35 @@ describe('prepare-electron-runtime staging', () => {
     })
     expect(readFileSync(path.join(outputRoot, 'claude-sidecar', 'session-settings.mjs'), 'utf8')).toContain('staged')
     expect(readFileSync(path.join(outputRoot, 'claude-sidecar', 'model-catalog.mjs'), 'utf8')).toContain('staged-model')
+    expect(receipt.files).toEqual(expect.arrayContaining([
+      'claude-sidecar/session-settings.mjs',
+      'claude-sidecar/session-names.mjs',
+      'claude-sidecar/model-catalog.mjs',
+    ]))
+    // Unified agent names (Task 3): the staged session-names helper EXECUTES
+    // from the staged runtime — one JSON line in, one structured line out,
+    // with the staged SDK boundary injected. (The fixture's fake SDK lives
+    // outside the required-file list's exhaustive naming only through the
+    // claude-sidecar recursive directory, which the allowlist already
+    // admits.)
+    // The staged helper's SDK boundary is injected from a test-local fake
+    // module written INTO the staged runtime (the production copy list stays
+    // exactly the sidecar's real files).
+    const stagedFakeSdk = path.join(outputRoot, 'node-client-runtime', '.staged-session-names-sdk.mjs')
+    writeFileSync(stagedFakeSdk, [
+      'export async function getSessionInfo(sessionId, options) {',
+      "  return { sessionId, summary: 'staged helper ran', customTitle: null }",
+      '}',
+    ].join('\n') + '\n')
+    const stagedHelper = execFileSync('node', [path.join(outputRoot, 'claude-sidecar', 'session-names.mjs')], {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        FRESHELL_CLAUDE_SDK_SESSION_NAMES_MODULE: pathToFileURL(stagedFakeSdk).href,
+      },
+      input: JSON.stringify({ op: 'read', sessionId: 'staged-session', dir: '/work/project' }) + '\n',
+    })
+    expect(JSON.parse(stagedHelper)).toEqual({ ok: true, op: 'read', staged: 'staged helper ran' })
     expect(readFileSync(path.join(outputRoot, 'mcp', 'server.js'), 'utf8')).toContain('modelcontextprotocol')
     expect(readFileSync(path.join(outputRoot, 'node-client-runtime', 'keys.js'), 'utf8')).toContain('export')
 

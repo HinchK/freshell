@@ -64,6 +64,17 @@ pub struct ParsedSessionMeta {
     /// `dir`/`first-message`-sourced override never clobbers a current
     /// provider-generated title.
     pub title_provider_generated: bool,
+    /// Unified agent names (Task 3): the native title observations RETAINED
+    /// SEPARATELY (claude only) — `custom-title` (a provider-native rename
+    /// record), `ai-title` (Claude's own generated title), `agent-name`, and
+    /// the generated `summary` title. Every one of them is an AUTOMATIC
+    /// observation to the naming pipeline (public native metadata carries no
+    /// reliable human provenance); the display `title`/`title_source`
+    /// behavior above is unchanged by their retention.
+    pub custom_title: Option<String>,
+    pub ai_title: Option<String>,
+    pub agent_name_title: Option<String>,
+    pub summary_title: Option<String>,
     pub summary: Option<String>,
     pub first_user_message: Option<String>,
     /// Mirror of Node's ParsedSessionTitleSource for the parsed (pre-override) title.

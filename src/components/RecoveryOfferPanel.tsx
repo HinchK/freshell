@@ -161,7 +161,13 @@ export function RecoveryOfferPanel(): JSX.Element | null {
     clearPendingOffer()
     const plans = buildRecoveryPlan(inventory)
     for (const plan of plans) {
-      dispatch(addTab({ id: plan.tabId, title: plan.title }))
+      dispatch(addTab({
+        id: plan.tabId,
+        title: plan.title,
+        // Unified agent names (Task 6): the restored tab keeps its stable
+        // naming-source relationship, remapped to the reminted pane ids.
+        ...(plan.nameSource ? { nameSource: plan.nameSource } : {}),
+      }))
       dispatch(restoreLayout({ tabId: plan.tabId, layout: plan.layout, paneTitles: plan.paneTitles }))
       // Focused-episode-6 round 5 (Finding F1): live terminal panes reattach
       // to their still-running terminals — arm the plan's one-shot

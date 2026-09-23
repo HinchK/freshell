@@ -12,6 +12,8 @@ import type { ClientExtensionEntry } from './extension-types.js'
 import type { ServerSettings } from './settings.js'
 import { LiveTerminalHandleSchema, SessionRefSchema, type RestoreError } from './session-contract.js'
 import { CodexDurabilityRefSchema, type CodexDurabilityRef } from './codex-durability.js'
+import type { SessionNameRecord, SessionNameRef, SessionNameUpdate } from './session-names.js'
+import { TabNameSourceSchema } from './session-names.js'
 
 // ──────────────────────────────────────────────────────────────
 // Shared enums and helpers
@@ -478,6 +480,11 @@ export const TerminalCreateSchema = z.object({
   recoveryIntent: z.literal('fresh_after_restore_unavailable').optional(),
   tabId: z.string().min(1).optional(),
   paneId: z.string().min(1).optional(),
+  /** Unified agent names (Task 1): the pane's pre-durable naming handle,
+   * minted per logical conversation before provider identity exists.
+   * Independent of createRequestId/terminalId/sessionRef; creation retries
+   * re-send the same handle. Additive optional — old servers strip it. */
+  namingHandle: z.string().min(1).optional(),
   /** kata b8ke delayed-request fence: the (epoch, generation) pair the
    *  client observed when it decided to act. A pair sent together is the
    *  fence (the server stale-rejects pre-restart epochs and superseded
@@ -721,6 +728,10 @@ export const UiLayoutSyncSchema = z.object({
     id: z.string(),
     title: z.string().optional(),
     fallbackSessionRef: SessionLocatorSchema.optional(),
+    /** Unified agent names (Task 6): the tab's stable naming-source
+     * relationship — a mirror of client `Tab.nameSource`. Absent until
+     * initial content or migration resolves ownership. Additive optional. */
+    nameSource: TabNameSourceSchema.optional(),
   })),
   activeTabId: z.string().nullable().optional(),
   layouts: z.record(z.string(), z.unknown()),
@@ -794,6 +805,9 @@ export const FreshAgentCreateSchema = z.object({
   /** D8: the creating tab's client-side id; the server composes the ledger row's
    * `tabKey` as `deviceId:tabId`. Non-strict schema — tolerated by older servers. */
   tabId: z.string().min(1).optional(),
+  /** Unified agent names (Task 1): the pane's pre-durable naming handle — see
+   * `terminal.create.namingHandle`. Additive optional. */
+  namingHandle: z.string().min(1).optional(),
   /** kata b8ke delayed-request fence: the (epoch, generation) pair the
    *  client observed when it decided to act. A pair sent together is the
    *  fence; neither-sent is legacy-unfenced. */
@@ -1222,6 +1236,13 @@ export type TerminalCreatedMessage = {
   restoreError?: RestoreError
   /** Resume-validation: operator-visible notice set when the server dropped a stale resume id and spawned fresh. The client writes it into the pane's xterm. Additive; Node never sets it. */
   notice?: string
+  /** Unified agent names (Task 1): canonical session-name projection for this
+   * terminal's naming ref (last-known; the `session.name.updated` broadcast is
+   * the live authority). Additive optional. */
+  sessionName?: SessionNameRecord
+  /** Unified agent names (Task 1): the naming identity this terminal's name
+   * resolves through (pending handle before durable materialization). */
+  nameRef?: SessionNameRef
 }
 
 export type TerminalAttachReadyMessage = {
@@ -1506,6 +1527,21 @@ export type SessionsChangedMessage = {
   revision: number
 }
 
+/**
+ * Unified agent names (Task 1): the canonical name broadcast. Published only
+ * after the server's `SessionNames` store successfully commits or adopts a
+ * document generation, in local generation order. The payload IS a
+ * `SessionNameUpdate` (record + documentGeneration + relevant pending→durable
+ * redirects + whether the accepted record changed); clients fold by record
+ * and redirect revision, never arrival time. `sessions.changed` remains the
+ * directory-invalidation signal and never orders names. Additive
+ * server→client only; WS_PROTOCOL_VERSION deliberately stays 10 (the client
+ * never gates on it — pre-frame servers simply never send it).
+ */
+export type SessionNameUpdatedMessage = SessionNameUpdate & {
+  type: 'session.name.updated'
+}
+
 // -- Settings --
 
 export type SettingsUpdatedMessage = {
@@ -1648,7 +1684,7 @@ export type SdkRestoreFailureCode =
   | 'RESTORE_STALE_REVISION'
 
 export type FreshAgentServerMessage =
-  | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
+  | { type: 'freshAgent.created'; requestId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string }; sessionName?: SessionNameRecord; nameRef?: SessionNameRef }
   | { type: 'freshAgent.create.failed'; requestId: string; code: string; message: string; retryable?: boolean
       /** kata b8ke: ownership-conflict refusals only — the owning kind, its
        *  generation, and the emitting server's boot epoch, so the client
@@ -1659,7 +1695,7 @@ export type FreshAgentServerMessage =
       ownerEpoch?: number }
   | { type: 'freshAgent.send.accepted'; requestId: string; sessionId: string; sessionType: string; provider: string; submittedTurnId?: string; cwd?: string }
   | { type: 'freshAgent.event'; sessionId: string; sessionType: string; provider: string; event: unknown }
-  | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string } }
+  | { type: 'freshAgent.session.materialized'; previousSessionId: string; sessionId: string; sessionType: string; provider: string; sessionRef?: { provider: string; sessionId: string }; sessionName?: SessionNameRecord; nameRef?: SessionNameRef }
   | { type: 'freshAgent.forked'; requestId?: string; parentSessionId: string; sessionId: string; sessionType: string; provider: string; runtimeProvider: string; sessionRef?: { provider: string; sessionId: string } }
   | { type: 'freshAgent.killed'; sessionId: string; sessionType: string; provider: string; success: boolean }
 
@@ -1751,6 +1787,10 @@ export type TerminalInventoryMessage = {
     codexDurability?: CodexDurabilityRef
     /** Server→client only, additive + optional: the terminal's resume target is an opencode subagent (child) session. */
     resumeTargetIsSubagent?: boolean
+    /** Unified agent names (Task 1): canonical session-name projection (last-known). Additive optional. */
+    sessionName?: SessionNameRecord
+    /** Unified agent names (Task 1): the naming identity this terminal's name resolves through. Additive optional. */
+    nameRef?: SessionNameRef
   }>
   terminalMeta: TerminalMetaRecord[]
 }
@@ -1796,6 +1836,7 @@ export type ServerMessage =
   | AmplifierActivityUpdatedMessage
   | TerminalTurnCompleteMessage
   | TerminalIdleMessage
+  | SessionNameUpdatedMessage
   | SessionsChangedMessage
   | SettingsUpdatedMessage
   | UiCommandMessage

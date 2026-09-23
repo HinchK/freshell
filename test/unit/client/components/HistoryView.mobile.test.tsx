@@ -1,9 +1,10 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, cleanup, fireEvent, screen, waitFor } from '@testing-library/react'
+import { render, cleanup, fireEvent, screen, waitFor, act } from '@testing-library/react'
 import { Provider } from 'react-redux'
 import { configureStore } from '@reduxjs/toolkit'
 import HistoryView from '@/components/HistoryView'
 import sessionsReducer from '@/store/sessionsSlice'
+import sessionNamesReducer, { receiveSessionNames } from '@/store/sessionNamesSlice'
 import tabsReducer from '@/store/tabsSlice'
 import panesReducer from '@/store/panesSlice'
 
@@ -37,6 +38,7 @@ function renderHistoryView(onOpenSession = vi.fn()) {
   const store = configureStore({
     reducer: {
       sessions: sessionsReducer,
+      sessionNames: sessionNamesReducer,
       tabs: tabsReducer,
       panes: panesReducer,
     },
@@ -60,6 +62,7 @@ function renderHistoryView(onOpenSession = vi.fn()) {
                 lastActivityAt: Date.now(),
                 title: 'Test Session',
                 summary: 'summary',
+                nameRef: { kind: 'session', provider: 'claude', sessionId: 'session-123' },
               },
             ],
           },
@@ -107,6 +110,44 @@ describe('HistoryView mobile behavior', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Open' }))
     expect(onOpenSession).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows a nonblocking native-sync status row in the mobile session details sheet', async () => {
+    ;(globalThis as any).setMobileForTest(true)
+    const { store } = renderHistoryView()
+
+    fireEvent.click(screen.getByRole('button', { name: /open session test session/i }))
+    expect(screen.getByText('Session details')).toBeInTheDocument()
+    // No writeback state yet: no status row.
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+
+    act(() => {
+      store.dispatch(receiveSessionNames([{
+        record: {
+          ref: { kind: 'session', provider: 'claude', sessionId: 'session-123' },
+          name: 'Test Session',
+          source: 'first_message',
+          revision: 1,
+        },
+        documentGeneration: 5,
+        redirects: [],
+        changed: true,
+        nativeSync: {
+          status: 'unsynced',
+          desiredRevision: 1,
+          locationRevision: 0,
+          reason: 'provider writeback timed out',
+        },
+      }]))
+    })
+
+    const status = await screen.findByRole('status')
+    expect(status).toHaveTextContent(/native sync: unsynced/i)
+    expect(status).toHaveTextContent(/provider writeback timed out/i)
+    // Nonblocking display only: no retry/reset/generate control appears.
+    expect(screen.queryByRole('button', { name: /retry/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /reset/i })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /generate/i })).not.toBeInTheDocument()
   })
 
   it('uses 44px touch targets for mobile session actions', () => {

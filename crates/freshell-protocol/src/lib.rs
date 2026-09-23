@@ -24,12 +24,16 @@
 
 pub mod client_messages;
 pub mod common;
+pub mod native_location;
 pub mod server_messages;
+pub mod session_names;
 pub mod settings;
 
 pub use client_messages::*;
 pub use common::*;
+pub use native_location::*;
 pub use server_messages::*;
+pub use session_names::*;
 pub use settings::*;
 
 /// The frozen WebSocket protocol version. Asserted equal to the committed

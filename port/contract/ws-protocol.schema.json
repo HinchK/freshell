@@ -842,6 +842,10 @@
               "default": "shell",
               "type": "string"
             },
+            "namingHandle": {
+              "minLength": 1,
+              "type": "string"
+            },
             "observedEpoch": {
               "maximum": 9007199254740991,
               "minimum": 0,
@@ -1539,6 +1543,41 @@
                   "id": {
                     "type": "string"
                   },
+                  "nameSource": {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "const": "session",
+                            "type": "string"
+                          },
+                          "paneId": {
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "paneId"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "const": "legacy",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
                   "title": {
                     "type": "string"
                   }
@@ -1785,6 +1824,10 @@
                   "type": "null"
                 }
               ]
+            },
+            "namingHandle": {
+              "minLength": 1,
+              "type": "string"
             },
             "observedEpoch": {
               "maximum": 9007199254740991,
@@ -3228,6 +3271,10 @@
                 }
               ]
             },
+            "namingHandle": {
+              "minLength": 1,
+              "type": "string"
+            },
             "observedEpoch": {
               "maximum": 9007199254740991,
               "minimum": 0,
@@ -4221,6 +4268,10 @@
               "type": "null"
             }
           ]
+        },
+        "namingHandle": {
+          "minLength": 1,
+          "type": "string"
         },
         "observedEpoch": {
           "maximum": 9007199254740991,
@@ -8224,6 +8275,10 @@
           "default": "shell",
           "type": "string"
         },
+        "namingHandle": {
+          "minLength": 1,
+          "type": "string"
+        },
         "observedEpoch": {
           "maximum": 9007199254740991,
           "minimum": 0,
@@ -9043,6 +9098,41 @@
               },
               "id": {
                 "type": "string"
+              },
+              "nameSource": {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "const": "session",
+                        "type": "string"
+                      },
+                      "paneId": {
+                        "minLength": 1,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "paneId"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "const": "legacy",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "type": "object"
+                  }
+                ]
               },
               "title": {
                 "type": "string"

@@ -122,6 +122,14 @@ pub enum ErrorCode {
 /// instead of carrying private duplicates.
 pub const LEGACY_RESUME_IDENTITY_REFUSAL: &str = "Restore requires sessionRef; resumeSessionId is a legacy field and cannot be used as restore identity.";
 
+/// The refusal text for a `freshAgent.create` arriving while the shared
+/// `settings.freshAgent.enabled` gate is off: the dispatch must ANSWER with
+/// `freshAgent.create.failed` (code `FRESH_AGENT_DISABLED`) instead of
+/// silently swallowing the frame — silence hangs every programmatic driver
+/// with zero attribution.
+pub const FRESH_AGENT_DISABLED_REFUSAL: &str =
+    "Fresh Agents are disabled in settings; enable Fresh Agents before creating agent sessions.";
+
 /// The coding-agent providers (`claude | codex | opencode | amplifier`).
 /// `amplifier` matches the legacy `TerminalTurnCompleteSchema.provider` enum
 /// (`shared/ws-protocol.ts:192`) — required by the TERM-16 turn-complete

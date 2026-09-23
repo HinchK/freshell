@@ -10,21 +10,26 @@ import { commitSessionWindowVisibleRefresh } from '@/store/sessionsSlice'
  * stores. The production registration has no other test — this file is it.
  * jsdom localStorage starts empty and the slices rehydrate at module eval,
  * so the store singleton must be imported before any storage seeding.
+ *
+ * Unified agent names (Task 5): the mirror serves the RETAINED legacy scope
+ * only — the fixture is a kilroy pane (out of scope); scoped agent panes are
+ * excluded (pinned in sessionTitleMirror.test.ts).
  */
 describe('production store session-title mirror registration', () => {
   it('mirrors a session-directory title through the production middleware chain', () => {
     const tabId = 'mirror-reg-tab'
     const paneId = 'mirror-reg-pane'
+    const sessionId = '11111111-2222-4333-8444-555555555555'
     store.dispatch(addTab({ id: tabId, title: 'Mirror registration' }))
     store.dispatch(initLayout({
       tabId,
       paneId,
       content: {
         kind: 'fresh-agent',
-        provider: 'opencode',
-        sessionId: 'mirror-reg-session',
-        sessionType: 'freshopencode',
-        sessionRef: { provider: 'opencode', sessionId: 'mirror-reg-session' },
+        provider: 'claude',
+        sessionId,
+        sessionType: 'kilroy',
+        sessionRef: { provider: 'claude', sessionId },
       },
     }))
     store.dispatch(commitSessionWindowVisibleRefresh({
@@ -32,8 +37,8 @@ describe('production store session-title mirror registration', () => {
       projects: [{
         projectPath: '/mirror-reg',
         sessions: [{
-          provider: 'opencode',
-          sessionId: 'mirror-reg-session',
+          provider: 'claude',
+          sessionId,
           projectPath: '/mirror-reg',
           lastActivityAt: 1_000,
           title: 'Registered mirror title',

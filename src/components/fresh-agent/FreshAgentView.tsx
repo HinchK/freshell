@@ -11,6 +11,7 @@ import {
 import { nanoid } from 'nanoid'
 import type { FreshAgentPaneContent } from '@/store/paneTypes'
 import type { PaneReconcileRequest } from '@shared/ws-protocol'
+import { isUnifiedAgentMode } from '@shared/session-names'
 import { useAppDispatch, useAppSelector, useAppStore } from '@/store/hooks'
 import type { AppStore } from '@/store/store'
 import { usePaneFocusAdoption } from '@/hooks/usePaneFocusAdoption'
@@ -1446,8 +1447,13 @@ export function FreshAgentView({
     previousSessionId: string | undefined,
     nextSessionId: string | undefined,
     provider: string,
+    sessionType?: string,
   ) => {
     if (!previousSessionId || !nextSessionId || previousSessionId === nextSessionId) return
+    // Unified agent names (Task 5): scoped fresh types never ran the local
+    // pending-title machinery (sendUserText skips it), so there is nothing to
+    // migrate — kilroy keeps the legacy behavior.
+    if (isUnifiedAgentMode(provider, sessionType)) return
     const firstMessage = pendingAutoTitleBySessionIdRef.current.get(previousSessionId)
     if (!firstMessage) return
     pendingAutoTitleBySessionIdRef.current.delete(previousSessionId)
@@ -1455,6 +1461,7 @@ export function FreshAgentView({
       tabId,
       paneId,
       provider,
+      sessionType,
       sessionId: nextSessionId,
       firstMessage,
     }))
@@ -1526,6 +1533,17 @@ export function FreshAgentView({
   ])
 
   const buildCreateMessage = useCallback((content: FreshAgentPaneContent, observedFence?: ObservedOwnerFence) => {
+    // Unified agent names (T6-R3 sender repair): a NEW scoped fresh
+    // conversation carries its pre-durable namingHandle on the create —
+    // minted before the send and persisted in the pane content, so the
+    // pane's rename capture resolves the PENDING record while no durable
+    // identity exists, and create retries re-send the SAME handle. A
+    // resume/switch create (a sessionRef) targets the durable record and
+    // deliberately sends no handle.
+    const namingHandle = !content.sessionRef && !content.resumeSessionId
+      && isUnifiedAgentMode(undefined, content.sessionType)
+      ? content.namingHandle ?? `nh-${nanoid()}`
+      : undefined
     return {
       type: 'freshAgent.create',
       requestId: content.createRequestId,
@@ -1542,6 +1560,7 @@ export function FreshAgentView({
       // D8 (restore-open-sessions-only): the server composes the ledger row's
       // tabKey as `deviceId:tabId` from the connection identity + this field.
       tabId,
+      ...(namingHandle ? { namingHandle } : {}),
       // kata b8ke delayed-request fence (round-2 review: the fence is the
       // (epoch, generation) PAIR from the runtime-owner record observed when
       // the create was decided). A pair sent together is the fence;
@@ -1619,6 +1638,12 @@ export function FreshAgentView({
           createError: undefined,
           status: 'creating',
           pendingLocalEcho: undefined,
+          // Unified agent names: a deliberate NEW conversation never
+          // inherits the previous conversation's pre-durable identity or
+          // canonical projection — the new conversation mints its own
+          // handle and gets its own name lifecycle.
+          namingHandle: undefined,
+          nameRef: undefined,
         },
       }))
     })()
@@ -1791,7 +1816,17 @@ export function FreshAgentView({
           sessionRef: current.sessionRef,
           cwd: current.initialCwd,
         })
-        sendFreshAgentMessage(buildCreateMessage(current, observedFence))
+        const createMessage = buildCreateMessage(current, observedFence)
+        if (createMessage.namingHandle && !current.namingHandle) {
+          // T6-R3 sender repair: persist the minted pre-durable handle BEFORE
+          // the send so create retries re-send the SAME handle.
+          dispatch(updatePaneContent({
+            tabId,
+            paneId,
+            content: { ...current, namingHandle: createMessage.namingHandle },
+          }))
+        }
+        sendFreshAgentMessage(createMessage)
       }
     }
 
@@ -2049,7 +2084,17 @@ export function FreshAgentView({
         releasePendingRebind()
         pendingRebindReleaseRef.current = release
       }
-      sendFreshAgentMessage(buildCreateMessage(current, observedFence))
+      const createMessage = buildCreateMessage(current, observedFence)
+      if (createMessage.namingHandle && !current.namingHandle) {
+        // T6-R3 sender repair: persist the minted pre-durable handle BEFORE
+        // the send so create retries re-send the SAME handle.
+        dispatch(updatePaneContent({
+          tabId,
+          paneId,
+          content: { ...current, namingHandle: createMessage.namingHandle },
+        }))
+      }
+      sendFreshAgentMessage(createMessage)
     }
     if (hiddenRef.current) {
       getRebindQueue().enqueue({
@@ -2336,7 +2381,7 @@ export function FreshAgentView({
           sessionType: message.sessionType,
           sessionRef,
         })
-        migratePendingAutoTitle(current.sessionId, message.sessionId, message.provider)
+        migratePendingAutoTitle(current.sessionId, message.sessionId, message.provider, message.sessionType)
         requestSnapshotRefresh('materialized')
         dispatch(updatePaneContent({
           tabId,
@@ -2722,7 +2767,7 @@ export function FreshAgentView({
       const nextSessionRef = snapshotSessionRef ?? fresh.sessionRef
       const nextResumeSessionId = snapshotSessionRef?.sessionId ?? fresh.resumeSessionId ?? sessionId
       if (snapshotSessionRef) {
-        migratePendingAutoTitle(fresh.sessionId, snapshotSessionRef.sessionId, provider)
+        migratePendingAutoTitle(fresh.sessionId, snapshotSessionRef.sessionId, provider, requestSessionType)
       }
       const hasBlockingLocalEchoForSession = hasUnresolvedLocalEchoForSessionRef.current
       const sessionStatus = nextStatus === 'create-failed' ? null : nextStatus
@@ -3271,14 +3316,23 @@ export function FreshAgentView({
     if (isFirstMessage) {
       autoTitleFreshBoundaryRef.current = false
       autoTitleSentRef.current = true
-      pendingAutoTitleBySessionIdRef.current.set(current.sessionId, text)
-      dispatch(finalizeCodingAgentSessionName({
-        tabId,
-        paneId,
-        provider: current.provider,
-        sessionId: current.sessionId,
-        firstMessage: text,
-      }))
+      // Unified agent names (Task 5): scoped fresh types (freshclaude,
+      // freshcodex, freshopencode) never trigger client-side generation —
+      // the server's input-activity pipeline owns their fallback and AI
+      // naming, and the accepted name arrives through the canonical
+      // session.name.updated push. Kilroy keeps the legacy first-message
+      // finalize.
+      if (!isUnifiedAgentMode(current.provider, current.sessionType)) {
+        pendingAutoTitleBySessionIdRef.current.set(current.sessionId, text)
+        dispatch(finalizeCodingAgentSessionName({
+          tabId,
+          paneId,
+          provider: current.provider,
+          sessionType: current.sessionType,
+          sessionId: current.sessionId,
+          firstMessage: text,
+        }))
+      }
     }
     const nextLocalEcho: LocalEcho = {
       text,

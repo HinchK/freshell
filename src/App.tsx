@@ -42,6 +42,10 @@ import {
   seedBrowserPreferencesSettingsIfEmpty,
 } from '@/lib/browser-preferences'
 import { handleUiCommand } from '@/lib/ui-commands'
+import { bootstrapSessionNames, collectSessionNameRefs, uncachedSessionNameRefs } from '@/lib/session-names'
+import { sessionNameRefKey } from '@shared/session-names'
+import { receiveSessionNames, receiveSessionNameProjections } from '@/store/sessionNamesSlice'
+import { parseSessionNameUpdate } from '@/lib/session-names'
 import { getAuthToken } from '@/lib/auth'
 import { installTestHarness } from '@/lib/test-harness'
 import { checkServerBuildId } from '@/lib/server-build-check'
@@ -1205,6 +1209,56 @@ export default function App() {
         ),
       })
 
+      // Unified agent names (Task 5): the ready/reconnect batch bootstrap —
+      // collects every naming ref the client currently knows and reads them
+      // in 100-ref chunks from the server's canonical store. A fresh page's
+      // ready fires BEFORE its own state hydration (layout restore, sessions
+      // fetch, terminal inventory), so refs those carry land AFTER the batch
+      // read — the watcher below re-reads them once they become collectible
+      // (each ref attempted at most once per session, uncached-set guarded).
+      const attemptedNameRefKeys = new Set<string>()
+      const bootstrapSessionNamesNow = () => {
+        const refs = collectSessionNameRefs(appStore.getState())
+        for (const ref of refs) attemptedNameRefKeys.add(sessionNameRefKey(ref))
+        return bootstrapSessionNames(refs)
+      }
+      let pendingNameRefBootstrapTimer: ReturnType<typeof setTimeout> | undefined
+      let lastNameRefBootstrapRunMs = 0
+      const NAME_REF_BOOTSTRAP_MIN_INTERVAL_MS = 2_000
+      const runUncachedSessionNameRefBootstrap = () => {
+        pendingNameRefBootstrapTimer = undefined
+        lastNameRefBootstrapRunMs = Date.now()
+        const state = appStore.getState() as Parameters<typeof uncachedSessionNameRefs>[0]
+        const attemptedSizeBefore = attemptedNameRefKeys.size
+        const refs = uncachedSessionNameRefs(state, attemptedNameRefKeys)
+        const markedThisRun = Array.from(attemptedNameRefKeys).slice(attemptedSizeBefore)
+        if (refs.length === 0) return
+        void bootstrapSessionNames(refs)
+          .then((updates) => {
+            if (updates.length > 0) dispatch(receiveSessionNames(updates))
+          })
+          .catch((error: unknown) => {
+            log.warn('session name bootstrap failed', error)
+            // A failed read (the reconnect burst's 429s exhausting the
+            // retry budget, a network blip) must not strand the ref as
+            // attempted forever: clear THIS run's marks so the next state
+            // change re-reads them (cached refs re-skip on their own).
+            for (const key of markedThisRun) attemptedNameRefKeys.delete(key)
+          })
+      }
+      const watchUncachedSessionNameRefs = () => {
+        // A fresh page's post-ready projections land with the layout
+        // restore / sessions fetch / inventory fold. Re-read the refs they
+        // carry once the cache still lacks them — at most once per ref per
+        // session, at a storm-safe cadence (terminal output dispatches
+        // constantly; a pure trailing debounce would starve).
+        if (pendingNameRefBootstrapTimer !== undefined) return
+        const sinceLastRun = Date.now() - lastNameRefBootstrapRunMs
+        const waitMs = Math.max(0, NAME_REF_BOOTSTRAP_MIN_INTERVAL_MS - sinceLastRun)
+        pendingNameRefBootstrapTimer = setTimeout(runUncachedSessionNameRefBootstrap, waitMs)
+      }
+      const unsubscribeNameRefWatch = appStore.subscribe(watchUncachedSessionNameRefs)
+
       const unsubscribe = ws.onMessage((msg) => {
         if (!msg?.type) return
         if (msg.type === 'ready') {
@@ -1379,7 +1433,40 @@ export default function App() {
             dispatch(hostStatsSubscribedSet(true))
           }
           lastSessionsRevision = -1
+          // Unified agent names (Task 5): reconnect batch bootstrap — every
+          // naming ref this client knows about (open panes, directory rows,
+          // background terminals), independent of a mounted composer/history
+          // page. The fold is by revision: a fresh browser converges from an
+          // empty cache, a reconnect keeps its last-known projections and
+          // only applies newer records.
+          void bootstrapSessionNamesNow().then((updates) => {
+            if (updates.length > 0) dispatch(receiveSessionNames(updates))
+          }).catch((error: unknown) => log.warn('session name bootstrap failed', error))
           void recoverMissingStartupState()
+        }
+        // Unified agent names (Task 5): the canonical name broadcast.
+        // Folded at the connection layer, never inside a mounted view — a
+        // background pane, hidden tab, or unopened session converges too.
+        if (msg.type === 'session.name.updated') {
+          const update = parseSessionNameUpdate(msg)
+          if (update) {
+            dispatch(receiveSessionNames([update]))
+          }
+        }
+        // Unified agent names (Task 5): bare last-known record projections
+        // riding on creation/materialization frames (runtime-ID projections
+        // still point at pending handles until verified materialization).
+        if (
+          (msg.type === 'terminal.created'
+            || msg.type === 'freshAgent.created'
+            || msg.type === 'freshAgent.session.materialized')
+          && (msg as { nameRef?: unknown }).nameRef
+          && (msg as { sessionName?: unknown }).sessionName
+        ) {
+          dispatch(receiveSessionNameProjections([{
+            ref: (msg as { nameRef: unknown }).nameRef,
+            record: (msg as { sessionName: unknown }).sessionName,
+          }] as Parameters<typeof receiveSessionNameProjections>[0]))
         }
         if (msg.type === 'pane.reconcile.result') {
           const pending = pendingReconcileRef.current
@@ -1548,6 +1635,22 @@ export default function App() {
             remove: removedTerminalMetaIds,
           }))
           foldTerminalInventoryTitles(appStore, msg.terminals)
+          // Unified agent names (Task 5): inventory rows carry last-known
+          // canonical records — fold them into the sessionNames cache (the
+          // ingest middleware also sees the terminal-directory slice, but
+          // the boot frame reaches App directly).
+          {
+            const projections: Array<{ ref: unknown; record: unknown }> = []
+            for (const terminal of terminals) {
+              const row = terminal as { nameRef?: unknown; sessionName?: unknown }
+              if (row.nameRef && row.sessionName) {
+                projections.push({ ref: row.nameRef, record: row.sessionName })
+              }
+            }
+            if (projections.length > 0) {
+              dispatch(receiveSessionNameProjections(projections as Parameters<typeof receiveSessionNameProjections>[0]))
+            }
+          }
           // fetchTerminalDirectoryWindow still re-throws on failure, so contain its
           // rejection. queueActiveSessionWindowRefresh resolves even on failure.
           void appStore.dispatch(fetchTerminalDirectoryWindow({
@@ -1771,6 +1874,8 @@ export default function App() {
         terminalInvalidationHandler.dispose()
         stopWsDisconnectSync?.()
         unsubscribe()
+        unsubscribeNameRefWatch()
+        if (pendingNameRefBootstrapTimer !== undefined) clearTimeout(pendingNameRefBootstrapTimer)
       }
       if (cleanedUp) cleanup()
 

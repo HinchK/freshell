@@ -8,6 +8,7 @@ import type { RestoreError, CrashTrace } from '@shared/session-contract'
 import type { CodexDurabilityRef } from '@shared/codex-durability'
 import type { FreshAgentRuntimeProvider, FreshAgentSessionType } from '@shared/fresh-agent'
 import type { FreshAgentStyle } from '@shared/settings'
+import type { SessionNameRef } from '@shared/session-names'
 
 export type SessionLocator = SharedSessionLocator
 
@@ -186,6 +187,21 @@ export type TerminalPaneContent = {
   /** znhn item 1: persisted deliberately — do NOT add to
    * stripTransientSessionFields. Absent on old layouts = no trace. */
   crashTrace?: CrashTrace
+  /**
+   * Unified agent names (Task 1): the canonical naming identity this pane's
+   * name resolves through — a pending handle while provider identity is
+   * absent, the durable provider/session ref once bound. Persisted with pane
+   * content so a restored pane keeps its name binding.
+   */
+  nameRef?: SessionNameRef
+  /**
+   * Unified agent names (Task 1): the pre-durable naming handle minted per
+   * logical conversation before provider identity exists. Independent of
+   * createRequestId, terminalId and sessionRef; creation/recovery retries
+   * preserve it, a deliberate new conversation mints another. Persisted with
+   * pane content.
+   */
+  namingHandle?: string
   /** kata b8ke: typed recoverable launch failure (VOLATILE — never persisted). */
   launchFailure?: LaunchFailure
   /** kata b8ke: the reopen handoff's typed failure — the pane was KEPT (VOLATILE — never persisted). */
@@ -315,6 +331,18 @@ export type FreshAgentPaneContent = {
   pendingReconcile?: 'respawn' | 'fresh'
   /** VOLATILE fold counter — re-fires FreshAgentView's create effect on same-createRequestId folds. */
   reconcileEpoch?: number
+  /**
+   * Unified agent names (Task 1): canonical naming identity for this pane's
+   * conversation (pending handle until durable materialization binds it).
+   * Persisted with pane content.
+   */
+  nameRef?: SessionNameRef
+  /**
+   * Unified agent names (Task 1): the pre-durable naming handle for this
+   * logical conversation; preserved across creation retries, refresh and
+   * recovery remints. Persisted with pane content.
+   */
+  namingHandle?: string
   /** kata b8ke: the reopen handoff's typed failure — the pane was KEPT (VOLATILE — never persisted). */
   handoffError?: HandoffError
 }

@@ -424,6 +424,7 @@ fn new_generation(
 
 fn create_msg_resume(request_id: &str, durable: &str) -> FreshAgentCreate {
     FreshAgentCreate {
+        naming_handle: None,
         observed_epoch: None,
         observed_generation: None,
         request_id: request_id.to_string(),

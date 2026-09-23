@@ -3,7 +3,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. Each entry is a JSON Schema for one server→client message shape, keyed by its `type` discriminant and synthesized from the ServerMessage union via the TypeScript type checker. Opaque values (unknown / index signatures / any) are intentionally permissive — see nondeterministic-fields.md. The wire contract is frozen for the Rust port.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "messageCount": 65,
+  "messageCount": 66,
   "messages": {
     "amplifier.activity.list.response": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -930,6 +930,53 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "nameRef": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "pending",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "const": "session",
+                  "type": "string"
+                },
+                "provider": {
+                  "enum": [
+                    "codex",
+                    "claude",
+                    "opencode"
+                  ],
+                  "type": "string"
+                },
+                "sessionId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "provider",
+                "sessionId"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "provider": {
           "type": "string"
         },
@@ -941,6 +988,92 @@
         },
         "sessionId": {
           "type": "string"
+        },
+        "sessionName": {
+          "additionalProperties": false,
+          "properties": {
+            "legacyOrigin": {
+              "const": "unknown",
+              "type": "string"
+            },
+            "manualRevision": {
+              "type": "number"
+            },
+            "name": {
+              "type": "string"
+            },
+            "ref": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "kind": {
+                      "const": "pending",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "kind"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "const": "session",
+                      "type": "string"
+                    },
+                    "provider": {
+                      "enum": [
+                        "codex",
+                        "claude",
+                        "opencode"
+                      ],
+                      "type": "string"
+                    },
+                    "sessionId": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "provider",
+                    "sessionId"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "renamedAt": {
+              "type": "number"
+            },
+            "revision": {
+              "type": "number"
+            },
+            "source": {
+              "enum": [
+                "manual",
+                "legacy_protected",
+                "freshell_ai",
+                "provider_ai",
+                "first_message",
+                "directory"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "ref",
+            "revision",
+            "source"
+          ],
+          "type": "object"
         },
         "sessionRef": {
           "additionalProperties": false,
@@ -1127,6 +1260,53 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
+        "nameRef": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "pending",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "const": "session",
+                  "type": "string"
+                },
+                "provider": {
+                  "enum": [
+                    "codex",
+                    "claude",
+                    "opencode"
+                  ],
+                  "type": "string"
+                },
+                "sessionId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "provider",
+                "sessionId"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "previousSessionId": {
           "type": "string"
         },
@@ -1135,6 +1315,92 @@
         },
         "sessionId": {
           "type": "string"
+        },
+        "sessionName": {
+          "additionalProperties": false,
+          "properties": {
+            "legacyOrigin": {
+              "const": "unknown",
+              "type": "string"
+            },
+            "manualRevision": {
+              "type": "number"
+            },
+            "name": {
+              "type": "string"
+            },
+            "ref": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "kind": {
+                      "const": "pending",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "kind"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "const": "session",
+                      "type": "string"
+                    },
+                    "provider": {
+                      "enum": [
+                        "codex",
+                        "claude",
+                        "opencode"
+                      ],
+                      "type": "string"
+                    },
+                    "sessionId": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "provider",
+                    "sessionId"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "renamedAt": {
+              "type": "number"
+            },
+            "revision": {
+              "type": "number"
+            },
+            "source": {
+              "enum": [
+                "manual",
+                "legacy_protected",
+                "freshell_ai",
+                "provider_ai",
+                "first_message",
+                "directory"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "ref",
+            "revision",
+            "source"
+          ],
+          "type": "object"
         },
         "sessionRef": {
           "additionalProperties": false,
@@ -2740,6 +3006,259 @@
       ],
       "type": "object"
     },
+    "session.name.updated": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "changed": {
+          "type": "boolean"
+        },
+        "documentGeneration": {
+          "type": "number"
+        },
+        "nativeSync": {
+          "additionalProperties": false,
+          "properties": {
+            "desiredRevision": {
+              "type": "number"
+            },
+            "locationRevision": {
+              "type": "number"
+            },
+            "observedCurrent": {
+              "type": "boolean"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "status": {
+              "enum": [
+                "pending",
+                "synced",
+                "unsynced",
+                "unsupported"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "desiredRevision",
+            "locationRevision",
+            "status"
+          ],
+          "type": "object"
+        },
+        "record": {
+          "additionalProperties": false,
+          "properties": {
+            "legacyOrigin": {
+              "const": "unknown",
+              "type": "string"
+            },
+            "manualRevision": {
+              "type": "number"
+            },
+            "name": {
+              "type": "string"
+            },
+            "ref": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "kind": {
+                      "const": "pending",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "kind"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "const": "session",
+                      "type": "string"
+                    },
+                    "provider": {
+                      "enum": [
+                        "codex",
+                        "claude",
+                        "opencode"
+                      ],
+                      "type": "string"
+                    },
+                    "sessionId": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "provider",
+                    "sessionId"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "renamedAt": {
+              "type": "number"
+            },
+            "revision": {
+              "type": "number"
+            },
+            "source": {
+              "enum": [
+                "manual",
+                "legacy_protected",
+                "freshell_ai",
+                "provider_ai",
+                "first_message",
+                "directory"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "ref",
+            "revision",
+            "source"
+          ],
+          "type": "object"
+        },
+        "redirects": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "from": {
+                "anyOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "kind": {
+                        "const": "pending",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "kind"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "const": "session",
+                        "type": "string"
+                      },
+                      "provider": {
+                        "enum": [
+                          "codex",
+                          "claude",
+                          "opencode"
+                        ],
+                        "type": "string"
+                      },
+                      "sessionId": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "provider",
+                      "sessionId"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
+              "revision": {
+                "type": "number"
+              },
+              "to": {
+                "anyOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "kind": {
+                        "const": "pending",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "kind"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "const": "session",
+                        "type": "string"
+                      },
+                      "provider": {
+                        "enum": [
+                          "codex",
+                          "claude",
+                          "opencode"
+                        ],
+                        "type": "string"
+                      },
+                      "sessionId": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "provider",
+                      "sessionId"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "from",
+              "revision",
+              "to"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "type": {
+          "const": "session.name.updated",
+          "type": "string"
+        }
+      },
+      "required": [
+        "changed",
+        "documentGeneration",
+        "record",
+        "redirects",
+        "type"
+      ],
+      "type": "object"
+    },
     "session.repair.activity": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
@@ -3620,6 +4139,53 @@
         "cwd": {
           "type": "string"
         },
+        "nameRef": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "kind": {
+                  "const": "pending",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "kind"
+              ],
+              "type": "object"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "const": "session",
+                  "type": "string"
+                },
+                "provider": {
+                  "enum": [
+                    "codex",
+                    "claude",
+                    "opencode"
+                  ],
+                  "type": "string"
+                },
+                "sessionId": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "provider",
+                "sessionId"
+              ],
+              "type": "object"
+            }
+          ]
+        },
         "notice": {
           "type": "string"
         },
@@ -3647,6 +4213,92 @@
           "required": [
             "code",
             "reason"
+          ],
+          "type": "object"
+        },
+        "sessionName": {
+          "additionalProperties": false,
+          "properties": {
+            "legacyOrigin": {
+              "const": "unknown",
+              "type": "string"
+            },
+            "manualRevision": {
+              "type": "number"
+            },
+            "name": {
+              "type": "string"
+            },
+            "ref": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "kind": {
+                      "const": "pending",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "kind"
+                  ],
+                  "type": "object"
+                },
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "kind": {
+                      "const": "session",
+                      "type": "string"
+                    },
+                    "provider": {
+                      "enum": [
+                        "codex",
+                        "claude",
+                        "opencode"
+                      ],
+                      "type": "string"
+                    },
+                    "sessionId": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "kind",
+                    "provider",
+                    "sessionId"
+                  ],
+                  "type": "object"
+                }
+              ]
+            },
+            "renamedAt": {
+              "type": "number"
+            },
+            "revision": {
+              "type": "number"
+            },
+            "source": {
+              "enum": [
+                "manual",
+                "legacy_protected",
+                "freshell_ai",
+                "provider_ai",
+                "first_message",
+                "directory"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "ref",
+            "revision",
+            "source"
           ],
           "type": "object"
         },
@@ -3994,6 +4646,53 @@
               "mode": {
                 "type": "string"
               },
+              "nameRef": {
+                "anyOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "kind": {
+                        "const": "pending",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "id",
+                      "kind"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "const": "session",
+                        "type": "string"
+                      },
+                      "provider": {
+                        "enum": [
+                          "codex",
+                          "claude",
+                          "opencode"
+                        ],
+                        "type": "string"
+                      },
+                      "sessionId": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "provider",
+                      "sessionId"
+                    ],
+                    "type": "object"
+                  }
+                ]
+              },
               "resumeTargetIsSubagent": {
                 "type": "boolean"
               },
@@ -4003,6 +4702,92 @@
                   "recovering"
                 ],
                 "type": "string"
+              },
+              "sessionName": {
+                "additionalProperties": false,
+                "properties": {
+                  "legacyOrigin": {
+                    "const": "unknown",
+                    "type": "string"
+                  },
+                  "manualRevision": {
+                    "type": "number"
+                  },
+                  "name": {
+                    "type": "string"
+                  },
+                  "ref": {
+                    "anyOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "kind": {
+                            "const": "pending",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "kind"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "const": "session",
+                            "type": "string"
+                          },
+                          "provider": {
+                            "enum": [
+                              "codex",
+                              "claude",
+                              "opencode"
+                            ],
+                            "type": "string"
+                          },
+                          "sessionId": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "provider",
+                          "sessionId"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
+                  "renamedAt": {
+                    "type": "number"
+                  },
+                  "revision": {
+                    "type": "number"
+                  },
+                  "source": {
+                    "enum": [
+                      "manual",
+                      "legacy_protected",
+                      "freshell_ai",
+                      "provider_ai",
+                      "first_message",
+                      "directory"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "name",
+                  "ref",
+                  "revision",
+                  "source"
+                ],
+                "type": "object"
               },
               "sessionRef": {
                 "additionalProperties": false,

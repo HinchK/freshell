@@ -2,7 +2,7 @@
 # ops-style suites (process kills, config corruption, restart storms) and
 # agent verification runs. See docs/development/test-sandbox.md.
 #
-# Base image decision: node:22-bookworm, not mcr.microsoft.com/playwright:*.
+# Base image decision: node:22-trixie, not mcr.microsoft.com/playwright:*.
 # Rationale: the repo pins Node via .nvmrc/engines (>=22.5.0); the official
 # Playwright image bundles whatever Node version Microsoft chose for that
 # release, which is not guaranteed to satisfy our engines requirement. It is
@@ -10,7 +10,13 @@
 # curl step) and Playwright's own `playwright install --with-deps` (which
 # installs exactly the system libraries its pinned browser build needs) than
 # to reverse-engineer what a third-party base image ships.
-FROM node:22-bookworm
+#
+# Debian generation: TRIXIE (Debian 13, glibc 2.41), not bookworm (glibc
+# 2.36). The packaged freshell-server binary this sandbox must run (the
+# native agent-verification smoke stages the real electron-runtime build)
+# needs glibc >= 2.38 — bookworm's loader rejected it with
+# `/lib/x86_64-linux-gnu/libc.so.6: version GLIBC_2.38 not found`.
+FROM node:22-trixie
 
 ENV DEBIAN_FRONTEND=noninteractive \
     RUSTUP_HOME=/usr/local/rustup \
@@ -63,7 +69,7 @@ ENV npm_config_store_dir=/home/sandbox/.local/share/pnpm/store
 # args by scripts/sandbox-build.sh) so files written through the bind-mounted
 # repo keep sane host-side ownership instead of ending up root-owned.
 #
-# node:22-bookworm already ships a "node" user at UID/GID 1000 (the single-
+# node:22-trixie already ships a "node" user at UID/GID 1000 (the single-
 # user Linux/WSL default, and this operator's UID too) — useradd would fail
 # with "UID already in use" in that common case. So: if the requested UID is
 # already taken, rename that existing user to "sandbox" instead of creating a
@@ -85,7 +91,15 @@ RUN if getent passwd "${UID}" >/dev/null 2>&1; then \
 # a browser version is known (that happens per-run from package.json at
 # runtime), so we only pre-install the OS libraries here as a cache-friendly
 # base layer; browser binaries are fetched into a cache volume on first use.
-RUN npx --yes playwright@1.52.0 install-deps chromium || true
+#
+# The pinned version must track package-lock.json's resolved @playwright/test
+# (1.58.2 today): each Playwright release hardcodes the browser build + its
+# distro package list, and the list is DISTRO-AWARE — an older Playwright
+# (1.52) does not know Debian trixie and its install-deps FAILS here. The
+# `|| true` that used to guard this step silently shipped a browser-less
+# image on the bookworm->trixie rebase (libnspr4.so missing at launch);
+# a failed dependency install must fail the BUILD loudly instead.
+RUN npx --yes playwright@1.58.2 install-deps chromium
 
 COPY --chmod=755 entrypoint.sh /usr/local/bin/sandbox-entrypoint.sh
 

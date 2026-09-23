@@ -77,7 +77,7 @@ it.each(['--resume', '--resumeSessionId'])('resumes an OpenCode agent with %s an
   expect(result.code).toBe(0)
   expect(result.requests).toEqual([{
     url: '/api/tabs',
-    body: { agent: 'opencode', sessionRef: { provider: 'opencode', sessionId: 'ses_existing' } },
+    body: { agent: 'opencode', nameIntent: 'automatic', sessionRef: { provider: 'opencode', sessionId: 'ses_existing' } },
   }])
 })
 

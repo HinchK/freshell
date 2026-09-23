@@ -267,3 +267,222 @@ async fn shell_terminal_frames_never_carry_session_ref() {
 
     registry.kill(&terminal_id);
 }
+
+// ── unified agent names (Task 2): the naming projection on the same frames ──
+
+/// A fresh scoped create admits its PRE-DURABLE naming handle: the
+/// server-minted `nh-<uuid>` rides `terminal.created` as the pending
+/// `nameRef` with the directory-basename fallback record, the reconnect
+/// inventory row carries the SAME binding, and a shell create is never
+/// stamped. (The preallocated claude `--session-id` is prospective — the
+/// verified-bind lanes transfer the handle onto the durable record at
+/// materialization.)
+#[tokio::test]
+async fn scoped_claude_create_frames_carry_the_pending_naming_projection() {
+    let (url, registry, _sink) = spawn_server_with_specs_and_naming(vec![
+        sleeper_cli_spec("amplifier"),
+        sleeper_cli_spec("claude"),
+    ])
+    .await;
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.create",
+            "requestId": "req-naming-fresh-1",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send terminal.create");
+
+    let created = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    let name_ref = created["nameRef"].clone();
+    assert_eq!(
+        name_ref["kind"],
+        serde_json::json!("pending"),
+        "a fresh scoped create names through its pre-durable handle: {created}"
+    );
+    let handle = name_ref["id"].as_str().expect("pending handle id");
+    assert!(
+        handle.starts_with("nh-"),
+        "the server-minted handle shape: {created}"
+    );
+    assert!(
+        created["sessionName"]["name"]
+            .as_str()
+            .is_some_and(|n| !n.is_empty()),
+        "the fallback record rides the frame: {created}"
+    );
+    assert_eq!(
+        created["sessionName"]["ref"], name_ref,
+        "the record identifies the same ref: {created}"
+    );
+
+    // A shell create is NEVER stamped (out of naming scope).
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.create",
+            "requestId": "req-naming-shell-1",
+            "mode": "shell",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send terminal.create");
+    let shell_created = next_frame_of_type(&mut ws, "terminal.created").await;
+    assert!(
+        shell_created.get("nameRef").is_none() && shell_created.get("sessionName").is_none(),
+        "a shell terminal.created must not carry naming fields: {shell_created}"
+    );
+
+    // A SECOND connection's handshake inventory row carries the SAME pending
+    // binding (the registry row's display cache).
+    let (_ws2, inventory) = connect_and_capture_inventory(&url).await;
+    let row = inventory["terminals"]
+        .as_array()
+        .expect("terminals array")
+        .iter()
+        .find(|t| t["terminalId"] == serde_json::json!(terminal_id))
+        .cloned()
+        .unwrap_or_else(|| panic!("inventory must list {terminal_id}: {inventory}"));
+    assert_eq!(
+        row["nameRef"], name_ref,
+        "the inventory row carries the same pending binding: {row}"
+    );
+    assert_eq!(
+        row["sessionName"]["name"], created["sessionName"]["name"],
+        "the inventory row carries the same fallback record: {row}"
+    );
+
+    registry.kill(&terminal_id);
+    if let Some(shell_id) = shell_created["terminalId"].as_str() {
+        registry.kill(shell_id);
+    }
+}
+
+/// A RESUME create (client-sent sessionRef) targets the DURABLE session's
+/// OWN record — never a fresh pending admission: the pre-seeded record's
+/// name and durable ref ride `terminal.created`, and the reconnect
+/// inventory row carries the same binding.
+#[tokio::test]
+async fn scoped_claude_resume_create_frames_carry_the_durable_naming_projection() {
+    const RESUME_ID: &str = "44444444-5555-4666-8777-888899990000";
+    let (url, registry, sink) = spawn_server_with_specs_and_naming(vec![
+        sleeper_cli_spec("amplifier"),
+        sleeper_cli_spec("claude"),
+    ])
+    .await;
+
+    // The durable record the resumed session already has (admitted + bound
+    // through the same store-lane the create flow uses).
+    use freshell_freshagent::naming::{
+        BindNameInput, PendingNameInput, RenameNameInput, SessionNaming,
+    };
+    use freshell_protocol::native_location::{
+        NativeAcquisition, NativeEvidenceKind, NativeLocation, NativePersistence,
+    };
+    use freshell_protocol::session_names::{NameIntent, NamedProvider, SessionNameRef};
+    sink.ensure_pending(PendingNameInput {
+        handle: "nh-resume-1".into(),
+        provider: NamedProvider::Claude,
+        cwd: None,
+    })
+    .await
+    .expect("seed admission");
+    sink.bind_pending(BindNameInput {
+        pending: SessionNameRef::Pending {
+            id: "nh-resume-1".into(),
+        },
+        target: SessionNameRef::Session {
+            provider: NamedProvider::Claude,
+            session_id: RESUME_ID.into(),
+        },
+        acquisition: NativeAcquisition {
+            location: NativeLocation::Claude {
+                config_root: "/h/.claude".into(),
+                transcript_path: Some(format!("/h/.claude/projects/-p/{RESUME_ID}.jsonl")),
+                project_directory_key: None,
+                transcript_cwd: None,
+                effective_project_key_override: None,
+            },
+            evidence: NativeEvidenceKind::SelectedTranscript,
+            persistence: NativePersistence::Verified,
+        },
+    })
+    .await
+    .expect("seed bind");
+    sink.rename(RenameNameInput {
+        target: SessionNameRef::Session {
+            provider: NamedProvider::Claude,
+            session_id: RESUME_ID.into(),
+        },
+        name: "Preexisting Name".into(),
+        intent: NameIntent::User,
+        if_revision: None,
+    })
+    .await
+    .expect("seed rename");
+
+    let (mut ws, _inventory) = connect_and_capture_inventory(&url).await;
+    ws.send(WsMessage::Text(
+        serde_json::json!({
+            "type": "terminal.create",
+            "requestId": "req-naming-resume-1",
+            "mode": "claude",
+            "shell": "system",
+            "cwd": std::env::temp_dir().to_string_lossy(),
+            "restore": true,
+            "sessionRef": { "provider": "claude", "sessionId": RESUME_ID },
+        })
+        .to_string(),
+    ))
+    .await
+    .expect("send terminal.create");
+
+    let created = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"]
+        .as_str()
+        .expect("terminalId")
+        .to_string();
+    assert_eq!(
+        created["nameRef"],
+        serde_json::json!({ "kind": "session", "provider": "claude", "sessionId": RESUME_ID }),
+        "a resume create names through the durable session's own record: {created}"
+    );
+    assert_eq!(
+        created["sessionName"]["name"],
+        serde_json::json!("Preexisting Name"),
+        "the durable record's accepted name rides the frame: {created}"
+    );
+
+    let (_ws2, inventory) = connect_and_capture_inventory(&url).await;
+    let row = inventory["terminals"]
+        .as_array()
+        .expect("terminals array")
+        .iter()
+        .find(|t| t["terminalId"] == serde_json::json!(terminal_id))
+        .cloned()
+        .unwrap_or_else(|| panic!("inventory must list {terminal_id}: {inventory}"));
+    assert_eq!(
+        row["nameRef"],
+        serde_json::json!({ "kind": "session", "provider": "claude", "sessionId": RESUME_ID }),
+        "the inventory row carries the durable binding: {row}"
+    );
+    assert_eq!(
+        row["sessionName"]["name"],
+        serde_json::json!("Preexisting Name"),
+        "the inventory row carries the accepted record: {row}"
+    );
+
+    registry.kill(&terminal_id);
+}

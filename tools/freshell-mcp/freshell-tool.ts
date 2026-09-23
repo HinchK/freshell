@@ -417,6 +417,20 @@ class MissingParamError extends Error {
   }
 }
 
+/**
+ * Unified agent names (Task 5): the naming intent a create/rename action
+ * forwards. Omitted defaults to `automatic` — neither authentication nor an
+ * MCP tool call implies human intent; only an explicit `nameIntent: 'user'`
+ * (an operator-driven automation acting for a human) may claim it. An
+ * unknown value is a loud error: it never silently defaults.
+ */
+function resolveNameIntent(params: Record<string, unknown> | undefined): 'user' | 'automatic' {
+  const raw = params?.nameIntent
+  if (raw === undefined || raw === null || raw === '') return 'automatic'
+  if (raw === 'user' || raw === 'automatic') return raw
+  throw new Error("nameIntent must be 'user' or 'automatic'")
+}
+
 export async function executeAction(
   action: string,
   params?: Record<string, unknown>,
@@ -451,7 +465,7 @@ async function routeAction(
   switch (action) {
     // -- Tab actions --
     case 'new-tab': {
-      const { name, mode, shell, cwd, browser, editor, resume, resumeSessionId, sessionRef: explicitSessionRef, prompt, ...rest } = params || {}
+      const { name, nameIntent: _nameIntent, mode, shell, cwd, browser, editor, resume, resumeSessionId, sessionRef: explicitSessionRef, prompt, ...rest } = params || {}
       // `resumeSessionId` is accepted as an alias for the shorthand `resume` --
       // it's the exact field name the CLI sends and the server itself
       // returns/broadcasts on created panes, so agents naturally reach for it.
@@ -467,8 +481,10 @@ async function routeAction(
       const sessionRef = explicitSessionRef ?? (typeof resumeProvider === 'string' && resumeProvider !== 'codex' && typeof legacyResume === 'string'
         ? { provider: resumeProvider, sessionId: legacyResume }
         : undefined)
+      const nameIntent = resolveNameIntent(params)
       const tabResult = await c.post('/api/tabs', {
         name,
+        nameIntent,
         mode,
         shell,
         cwd,
@@ -506,12 +522,13 @@ async function routeAction(
     }
     case 'rename-tab': {
       const name = requireParam(params, 'name')
+      const nameIntent = resolveNameIntent(params)
       const target = typeof params?.target === 'string' && params.target.trim().length > 0
         ? params.target
         : undefined
       const { tab } = await resolveTabTarget(target)
       if (!tab) return { error: target ? `Tab '${target}' not found` : 'No active tab found', hint: "Run action 'list-tabs' to see available tabs." }
-      return c.patch(`/api/tabs/${encodeURIComponent(tab.id)}`, { name })
+      return c.patch(`/api/tabs/${encodeURIComponent(tab.id)}`, { name, nameIntent })
     }
     case 'has-tab': {
       const target = requireParam(params, 'target')
@@ -553,12 +570,13 @@ async function routeAction(
     }
     case 'rename-pane': {
       const name = requireParam(params, 'name')
+      const nameIntent = resolveNameIntent(params)
       const target = typeof params?.target === 'string' && params.target.trim().length > 0
         ? params.target
         : undefined
       const { pane } = await resolvePaneTarget(target)
       if (!pane) return { error: target ? `Pane '${target}' not found` : 'No active pane found', hint: "Run action 'list-panes' to see available panes." }
-      return c.patch(`/api/panes/${encodeURIComponent(pane.id)}`, { name })
+      return c.patch(`/api/panes/${encodeURIComponent(pane.id)}`, { name, nameIntent })
     }
     case 'kill-pane': {
       const target = requireParam(params, 'target')
