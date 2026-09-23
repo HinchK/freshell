@@ -450,7 +450,8 @@ mod tests {
     ];
 
     /// A real spinner-only unit (capture unit 1 — no bar cells; the
-    /// shortest unit class in the capture, 85 bytes).
+    /// shortest unit class in the capture, 87 UTF-8 bytes / 85 Unicode
+    /// characters — the braille glyph occupies three UTF-8 bytes).
     const OPENCODE_SPINNER_ONLY_UNIT: &str = "\x1b[?2026h\x1b[?25l\x1b[6;6H\x1b[38;2;128;128;128m\x1b[48;2;10;10;10m⠦\x1b[0m\x1b[0m\x1b[34;6H\x1b[?25h\x1b[?2026l";
 
     /// A real LATER repaint of the first composition (capture unit 19 —
