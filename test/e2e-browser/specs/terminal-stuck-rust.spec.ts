@@ -7,8 +7,9 @@
  * kill/restart actions).
  *
  * The fake `opencode` shim is WRITTEN BY THE SPEC into its throwaway shared
- * root (never a repo file) and emits the REAL animation shape Task 1's
- * classifier fixture pinned (crates/freshell-terminal/src/idle_noise.rs,
+ * root (never a repo file) and emits a SHAPE-faithful replica of the real
+ * animation Task 1's classifier fixture pinned byte-faithfully
+ * (crates/freshell-terminal/src/idle_noise.rs,
  * opencode_tui_gradient_bar_spinner_cycle_is_noise_after_first_sweep): per
  * repaint unit, cursor-hide + braille spinner cell / 8-cell gradient bar
  * sweep (14 distinct compositions cycling), ~10 units/s, ignoring stdin.
@@ -64,13 +65,19 @@ const STUCK_ADVANCE_MS = 5_000
 
 /**
  * The scratch fake `opencode` TUI (written into the rig's shared root and
- * pointed at by OPENCODE_CMD). Byte-faithful to Task 1's real-capture
- * fixture shapes: each unit hides the cursor, repaints the 8-cell gradient
- * bar (■ U+25A0 / ⬝ U+2B1D — the only significant chars) with per-cell SGR
- * colors, and parks the cursor; a braille spinner unit (zero significant
- * chars) rides the sweep. String.raw keeps every escape literal in the
- * written file; the shim source deliberately contains no template-literal
- * `${` interpolation of its own.
+ * pointed at by OPENCODE_CMD). SHAPE-faithful to the real capture's
+ * animation — cursor-hide + braille spinner cell / 8-cell gradient bar
+ * (■ U+25A0 / ⬝ U+2B1D — the only significant chars) with per-cell SGR
+ * colors, and a cursor park — but NOT byte-faithful: the shim emits a
+ * simplified synthetic cycle (its rest composition is all-bright and its
+ * reverse walk omits the ⬝■■■■■■⬝ transition), because the e2e's
+ * ring-warm needle logic depends on the currently-emitted shapes. The
+ * BYTE-FAITHFUL pin of the real capture units lives in the Rust fixture:
+ * crates/freshell-terminal/src/idle_noise.rs
+ * (opencode_tui_gradient_bar_spinner_cycle_is_noise_after_first_sweep).
+ * String.raw keeps every escape literal in the written file; the shim
+ * source deliberately contains no template-literal `${` interpolation of
+ * its own.
  *
  * Behavior selection via env (inherited through the server's PTY spawn):
  *   FAKE_OPENCODE_STUCK_MODE=meaningful — genuinely-new text lines every

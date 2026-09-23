@@ -216,8 +216,10 @@ struct TerminalShared {
     /// RETAINS the row and therefore the frozen mode state, which is exactly
     /// what an attach to an exited terminal must sync to render its tail).
     modes: ModeTracker,
-    /// Per-terminal repaint-noise fingerprinter feeding
-    /// `last_meaningful_activity_at` (DEV-0009). Independent of the barrier
+    /// Per-terminal repaint-noise fingerprinter feeding the DEV-0009
+    /// meaningful clocks (`last_meaningful_activity_at` for the idle reaper,
+    /// `last_meaningful_output_at` for the wedge-backstop stuck sweep).
+    /// Independent of the barrier
     /// scanner: separate state, separate concern (reaping, not batching).
     noise: NoiseScanner,
     /// Highest `seqEnd` produced (drives `attach.ready.headSeq`).
@@ -237,9 +239,21 @@ struct TerminalShared {
     /// `inventory()`/`DirectoryEntry` and spec-pinned to bump on EVERY
     /// output frame, terminal-core.md §1.3), repaint noise (spinner frames,
     /// ticking counters, status-bar redraws) does not refresh this.
-    /// Read by `enforce_idle_kills` (idle reaping) and
-    /// `enforce_stuck_detection` (the two-clock stuck differential).
+    /// Read by `enforce_idle_kills` (idle reaping) ONLY — the stuck sweep
+    /// reads the grace-immune [`TerminalShared::last_meaningful_output_at`].
+    /// The last-subscriber teardown grace bumps (`detach`,
+    /// `remove_connection`) deliberately refresh THIS clock so a freshly
+    /// backgrounded terminal gets a full idle threshold of reap grace.
     last_meaningful_activity_at: i64,
+    /// The wedge-backstop clock (delta-review round 4, Finding 1): last
+    /// MEANINGFUL PTY OUTPUT or user keystroke — refreshed ONLY by
+    /// genuinely-new content (the `noise.observe` arm in `ingest`) and
+    /// `input`. NEVER by the detach/socket-close grace bumps, because a
+    /// page refresh must not reset wedge detection: those grace bumps
+    /// exist for the idle reaper's threshold only, and a page refresh is
+    /// exactly what a user performs on a stuck UI. Read by
+    /// `enforce_stuck_detection` (the two-clock stuck differential).
+    last_meaningful_output_at: i64,
     /// Set (epoch ms) while `enforce_stuck_detection` flags this row stuck;
     /// cleared by the first meaningful activity. Surface-only state.
     stuck_since: Option<i64>,
@@ -1393,6 +1407,13 @@ impl TerminalRegistry {
     /// state, so a busy gate would produce false negatives on exactly the target
     /// class.
     ///
+    /// Delta-review round 4, Finding 1: the differential reads
+    /// `last_meaningful_output_at` — the OUTPUT-ONLY twin of the reaper's
+    /// `last_meaningful_activity_at` — so the last-subscriber teardown grace
+    /// bumps (detach / socket-close, which exist for the idle reaper's
+    /// threshold) can never reset wedge detection: a page refresh of a wedged
+    /// pane stays flagged.
+    ///
     /// Callers drive the cadence externally exactly like `enforce_idle_kills`
     /// (this crate is deliberately tokio-free, so the periodic timer lives in
     /// `freshell-ws`).
@@ -1417,7 +1438,7 @@ impl TerminalRegistry {
                     let mut s = handle.shared.lock().expect("terminal lock");
                     let should = s.status == TerminalRunStatus::Running
                         && Self::is_agent_mode(&s.mode)
-                        && now.saturating_sub(s.last_meaningful_activity_at) > window
+                        && now.saturating_sub(s.last_meaningful_output_at) > window
                         && now.saturating_sub(s.last_activity_at) < STUCK_ACTIVITY_FRESH_MS;
                     match (s.stuck_since.is_some(), should) {
                         (false, true) => {
@@ -1429,7 +1450,7 @@ impl TerminalRegistry {
                                     stuck: true,
                                     at: now,
                                 },
-                                now.saturating_sub(s.last_meaningful_activity_at),
+                                now.saturating_sub(s.last_meaningful_output_at),
                                 None,
                             ))
                         }
@@ -1441,12 +1462,12 @@ impl TerminalRegistry {
                             // predicate time under the row lock (the clocks
                             // and status may move on before the deferred
                             // log fires). Not-running takes priority:
-                            // `finish_pty_exit` refreshes both clocks while
-                            // leaving the status, so checking the clocks
-                            // first would mislabel a plain exit.
+                            // `finish_pty_exit` refreshes every activity
+                            // clock while leaving the status, so checking
+                            // the clocks first would mislabel a plain exit.
                             let cause = if s.status != TerminalRunStatus::Running {
                                 StuckClearCause::TerminalNotRunning
-                            } else if now.saturating_sub(s.last_meaningful_activity_at) <= window {
+                            } else if now.saturating_sub(s.last_meaningful_output_at) <= window {
                                 StuckClearCause::MeaningfulActivityResumed
                             } else if now.saturating_sub(s.last_activity_at)
                                 >= STUCK_ACTIVITY_FRESH_MS
@@ -1588,6 +1609,7 @@ impl TerminalRegistry {
             created_at: now,
             last_activity_at: now,
             last_meaningful_activity_at: now,
+            last_meaningful_output_at: now,
             stuck_since: None,
             cols: spec.cols,
             rows: spec.rows,
@@ -1998,6 +2020,10 @@ impl TerminalRegistry {
                 // DEV-0009: a freshly-detached terminal gets a full idle
                 // threshold of grace — its meaningful clock may have expired
                 // while a watcher was attached (attached => reaper-exempt).
+                // The wedge-backstop output clock
+                // (`last_meaningful_output_at`) is deliberately NOT bumped:
+                // the grace exists for the idle reaper's threshold only, and
+                // a detach-reopen must not reset stuck detection.
                 s.last_meaningful_activity_at = s.last_meaningful_activity_at.max(now_ms());
                 // The client explicitly released its LAST reference (the
                 // detach reconciler only sends `terminal.detach` when a
@@ -2034,7 +2060,9 @@ impl TerminalRegistry {
                 // The `.is_some()` gate is essential here: this sweep visits
                 // EVERY terminal, and an unconditional bump would reset the
                 // countdown of unrelated, already-detached terminals on
-                // every socket close.
+                // every socket close. As in `detach`, the wedge-backstop
+                // output clock is deliberately NOT bumped: a page refresh
+                // (socket drop + re-attach) must not reset stuck detection.
                 s.last_meaningful_activity_at = s.last_meaningful_activity_at.max(now_ms());
             }
         }
@@ -2061,8 +2089,12 @@ impl TerminalRegistry {
                     let mut s = handle.shared.lock().expect("terminal lock");
                     let now = now_ms();
                     s.last_activity_at = now;
-                    // User keystrokes are always meaningful (DEV-0009).
+                    // User keystrokes are always meaningful (DEV-0009) — for
+                    // BOTH the reaper clock and the wedge-backstop output
+                    // clock (typing into a wedged pane genuinely un-wedges
+                    // its stuck state).
                     s.last_meaningful_activity_at = now;
+                    s.last_meaningful_output_at = now;
                     (true, s.mode != "shell")
                 }
                 None => (false, false),
@@ -2334,7 +2366,11 @@ impl TerminalRegistry {
         s.status = TerminalRunStatus::Exited;
         s.exit_code = Some(exit_code);
         s.last_activity_at = now;
+        // Post-exit rows are not stuck-flaggable anyway (the predicate
+        // requires Running) — refresh every meaningful clock for
+        // consistency.
         s.last_meaningful_activity_at = now;
+        s.last_meaningful_output_at = now;
         let respawn_key = s.create_request_id.clone();
         let lifetime_ms = now.saturating_sub(s.created_at);
         let exit = ServerMessage::TerminalExit(TerminalExit {
@@ -2559,6 +2595,7 @@ impl TerminalRegistry {
             created_at,
             last_activity_at: created_at,
             last_meaningful_activity_at: created_at,
+            last_meaningful_output_at: created_at,
             stuck_since: None,
             cols: 120,
             rows: 30,
@@ -3679,9 +3716,12 @@ fn ingest(shared: &Arc<Mutex<TerminalShared>>, msg: ServerMessage) {
     // clock. Spinner repaints / ticking counters / status-bar redraws still
     // bump the wire-visible last_activity_at above (terminal-core.md §1.3
     // holds for every consumer except the reaper) but must not exempt a
-    // detached terminal from enforce_idle_kills forever.
+    // detached terminal from enforce_idle_kills forever. The same arm also
+    // refreshes the wedge-backstop output clock — genuine output is the
+    // only thing (besides `input`) that may un-wedge a stuck pane.
     if s.noise.observe(&frame.data) {
         s.last_meaningful_activity_at = s.last_activity_at;
+        s.last_meaningful_output_at = s.last_activity_at;
     }
 
     // Classify with the persistent per-terminal scanner (state persists across frames,
@@ -4359,14 +4399,17 @@ mod tests {
         }
 
         /// Test-only: force a terminal's `lastActivityAt` AND its DEV-0009
-        /// meaningful-activity reap clock to an arbitrary value so idle-kill
-        /// sweep tests don't need to sleep for real minutes.
+        /// meaningful-activity clocks (the reaper's
+        /// `last_meaningful_activity_at` AND the stuck sweep's
+        /// `last_meaningful_output_at`) to an arbitrary value so idle-kill
+        /// and stuck sweep tests don't need to sleep for real minutes.
         fn backdate_last_activity(&self, terminal_id: &str, last_activity_at: i64) {
             let inner = self.inner.lock().unwrap();
             let handle = inner.terminals.get(terminal_id).unwrap();
             let mut s = handle.shared.lock().unwrap();
             s.last_activity_at = last_activity_at;
             s.last_meaningful_activity_at = last_activity_at;
+            s.last_meaningful_output_at = last_activity_at;
         }
 
         /// Simulate the reader thread producing one frame (append + fan-out).
@@ -6226,6 +6269,58 @@ mod tests {
         assert!(reg.enforce_stuck_detection().is_empty());
         reg.set_stuck_window_ms(-1);
         assert!(reg.enforce_stuck_detection().is_empty());
+    }
+
+    /// Delta-review round 4, Finding 1 (Major): the last-subscriber teardown
+    /// grace bumps (`detach` / `remove_connection`) exist for the IDLE
+    /// REAPER's threshold only. A page refresh — a socket drop and re-attach,
+    /// exactly what a user does to a stuck UI — must NOT reset wedge
+    /// detection for another full window: the stuck sweep reads an
+    /// OUTPUT-ONLY meaningful clock that the grace bumps never touch.
+    #[test]
+    fn page_refresh_grace_does_not_reset_wedge_detection() {
+        // Arm A: explicit `detach` of the last subscriber (detach-reopen),
+        // driven exactly like `detach_grants_full_idle_threshold_of_grace`.
+        let reg = stuck_test_registry("opencode");
+        attach_test_subscriber(&reg); // conn 1
+        flag_stuck_row(&reg);
+        reg.detach("T", 1); // last-subscriber teardown: the grace bump fires
+                            // Re-attach a fresh subscriber (the reopen): the attach-time stuck
+                            // truth still reports stuck:true — the flag survived the teardown.
+        let (sink, seen) = collector();
+        assert!(
+            reg.attach("T", 2, sink, Some("a2".into()), 0, false, None, None)
+                .found
+        );
+        let stuck = stuck_frames(&seen);
+        assert_eq!(stuck.len(), 1);
+        assert!(stuck[0].stuck, "the flag survived the detach-reopen");
+        // The sweep after the reconnect must emit NO clear — a wedged row
+        // stays flagged instead of resetting detection for another window.
+        assert!(
+            reg.enforce_stuck_detection().is_empty(),
+            "the detach grace bump must not clear a wedged row's stuck flag"
+        );
+
+        // Arm B: socket-drop `remove_connection` (the page-refresh /
+        // transient-WS-drop path), driven exactly like
+        // `disconnect_grants_full_idle_threshold_of_grace`.
+        let reg = stuck_test_registry("opencode");
+        attach_test_subscriber(&reg); // conn 1
+        flag_stuck_row(&reg);
+        reg.remove_connection(1); // last-subscriber teardown: grace bump fires
+        let (sink, seen) = collector();
+        assert!(
+            reg.attach("T", 2, sink, Some("a2".into()), 0, false, None, None)
+                .found
+        );
+        let stuck = stuck_frames(&seen);
+        assert_eq!(stuck.len(), 1);
+        assert!(stuck[0].stuck, "the flag survived the socket drop");
+        assert!(
+            reg.enforce_stuck_detection().is_empty(),
+            "a page refresh must not reset wedge detection for another window"
+        );
     }
 
     // Wedge-backstop Task 3: the attach-time stuck-truth emission. A NEW

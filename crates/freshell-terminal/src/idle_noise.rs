@@ -383,60 +383,134 @@ mod tests {
         assert!(n.observe("line zero"));
     }
 
+    // ── Real-capture byte-faithful pin (delta-review round 4, Finding 2) ──
+    //
+    // Provenance: the 2026-09-20 capture of a genuinely-wedged opencode TUI
+    // pane (~/.local/share/opencode/tool-output/tool_0c12faaa00018kQAHrSI1ySuOc
+    // — a single JSON string literal, ~3.0 MB decoded, splitting into 18,471
+    // synchronized-update units on `\x1b[?2026h … \x1b[?2026l`).
+    //
+    // EMBEDDED VERBATIM below (exact capture bytes; ESC escaped as `\x1b`,
+    // glyphs kept literal):
+    //  * `OPENCODE_CENSUS_UNITS` — the first-occurrence unit of each of the
+    //    14 distinct bar compositions, in capture order: the forward
+    //    bright-segment walk, the all-dim rest `⬝⬝⬝⬝⬝⬝⬝⬝`, and the reverse
+    //    walk including the `⬝■■■■■■⬝` transition composition — the two
+    //    census members the pre-round-4 synthetic fixture got wrong (it
+    //    substituted an all-bright rest and dropped the reverse-sweep
+    //    composition). Each unit is one complete synchronized-update
+    //    repaint: cursor-hide, an optional braille spinner cell, the 8-cell
+    //    bar at row 38 painted PER-CELL with its own SGR colors, cursor
+    //    park.
+    //  * `OPENCODE_SPINNER_ONLY_UNIT` — a real spinner-only unit (no bar).
+    //  * `OPENCODE_SECOND_SWEEP_UNIT` — a real later repaint of the first
+    //    composition with the next sweep's drifted colors.
+    //
+    // Selection note: these are the FIRST occurrences (capture unit indices
+    // 0, 2, 3, 5, 6, 7, 9, 20, 21, 23, 25, 26, 27, 29; spinner-only unit 1;
+    // second sweep unit 19) — the shortest complete units that cover the
+    // whole census, chosen so the meaningful-first assertions in the test
+    // below correspond one-to-one with an independent reimplementation of
+    // `NoiseScanner` run over all 18,471 real units: 17 meaningful /
+    // 18,454 noise (the 14 composition firsts + 3 genuinely-new text
+    // frames), ring peak 17/32, zero evictions.
+
+    /// The 14-composition census cycle, first occurrences, verbatim (see
+    /// the provenance block above; entries are
+    /// (composition, exact capture unit bytes, capture unit index)).
+    const OPENCODE_CENSUS_UNITS: [(&str, &str); 14] = [
+        ("⬝⬝■■■■■■", // capture unit 0
+         "\x1b[?2026h\x1b[?25l\x1b[6;6H\x1b[38;2;128;128;128m\x1b[48;2;10;10;10m⠴\x1b[0m\x1b[38;4H\x1b[38;2;59;98;151m\x1b[48;2;10;10;10m⬝⬝\x1b[0m\x1b[38;6H\x1b[38;2;25;36;52m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;7H\x1b[38;2;33;50;75m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;8H\x1b[38;2;45;72;110m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;9H\x1b[38;2;63;105;163m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;10H\x1b[38;2;97;162;231m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;11H\x1b[38;2;92;156;245m\x1b[48;2;10;10;10m■\x1b[0m\x1b[0m\x1b[34;6H\x1b[?25h\x1b[?2026l"),
+        ("⬝⬝⬝■■■■■", // capture unit 2
+         "\x1b[?2026h\x1b[?25l\x1b[38;4H\x1b[38;2;55;91;140m\x1b[48;2;10;10;10m⬝⬝⬝\x1b[0m\x1b[38;7H\x1b[38;2;25;36;52m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;8H\x1b[38;2;33;50;75m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;9H\x1b[38;2;45;72;110m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;10H\x1b[38;2;63;105;163m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;11H\x1b[38;2;97;162;231m\x1b[48;2;10;10;10m■\x1b[0m\x1b[0m\x1b[34;6H\x1b[?25h\x1b[?2026l"),
+        ("⬝⬝⬝⬝■■■■", // capture unit 3
+         "\x1b[?2026h\x1b[?25l\x1b[38;4H\x1b[38;2;51;84;129m\x1b[48;2;10;10;10m⬝⬝⬝⬝\x1b[0m\x1b[38;8H\x1b[38;2;25;36;52m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;9H\x1b[38;2;33;50;75m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;10H\x1b[38;2;45;72;110m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;11H\x1b[38;2;63;105;163m\x1b[48;2;10;10;10m■\x1b[0m\x1b[0m\x1b[34;6H\x1b[?25h\x1b[?2026l"),
+        ("⬝⬝⬝⬝⬝■■■", // capture unit 5
+         "\x1b[?2026h\x1b[?25l\x1b[38;4H\x1b[38;2;48;77;118m\x1b[48;2;10;10;10m⬝⬝⬝⬝⬝\x1b[0m\x1b[38;9H\x1b[38;2;25;36;52m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;10H\x1b[38;2;33;50;75m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;11H\x1b[38;2;45;72;110m\x1b[48;2;10;10;10m■\x1b[0m\x1b[0m\x1b[34;6H\x1b[?25h\x1b[?2026l"),
+        ("⬝⬝⬝⬝⬝⬝■■", // capture unit 6
+         "\x1b[?2026h\x1b[?25l\x1b[6;6H\x1b[38;2;128;128;128m\x1b[48;2;10;10;10m⠇\x1b[0m\x1b[38;4H\x1b[38;2;44;70;107m\x1b[48;2;10;10;10m⬝⬝⬝⬝⬝⬝\x1b[0m\x1b[38;10H\x1b[38;2;25;36;52m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;11H\x1b[38;2;33;50;75m\x1b[48;2;10;10;10m■\x1b[0m\x1b[0m\x1b[34;6H\x1b[?25h\x1b[?2026l"),
+        ("⬝⬝⬝⬝⬝⬝⬝■", // capture unit 7
+         "\x1b[?2026h\x1b[?25l\x1b[38;4H\x1b[38;2;40;64;97m\x1b[48;2;10;10;10m⬝⬝⬝⬝⬝⬝⬝\x1b[0m\x1b[38;11H\x1b[38;2;25;36;52m\x1b[48;2;10;10;10m■\x1b[0m\x1b[0m\x1b[34;6H\x1b[?25h\x1b[?2026l"),
+        ("⬝⬝⬝⬝⬝⬝⬝⬝", // capture unit 9 (the all-dim rest)
+         "\x1b[?2026h\x1b[?25l\x1b[38;4H\x1b[38;2;36;57;86m\x1b[48;2;10;10;10m⬝⬝⬝⬝⬝⬝⬝⬝\x1b[0m\x1b[0m\x1b[34;6H\x1b[?25h\x1b[?2026l"),
+        ("⬝■■■■■■⬝", // capture unit 20 (the reverse-sweep transition)
+         "\x1b[?2026h\x1b[?25l\x1b[6;6H\x1b[38;2;128;128;128m\x1b[48;2;10;10;10m⠼\x1b[0m\x1b[38;4H\x1b[38;2;53;87;134m\x1b[48;2;10;10;10m⬝\x1b[0m\x1b[38;5H\x1b[38;2;92;156;245m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;6H\x1b[38;2;97;162;231m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;7H\x1b[38;2;63;105;163m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;8H\x1b[38;2;45;72;110m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;9H\x1b[38;2;33;50;75m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;10H\x1b[38;2;25;36;52m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;11H\x1b[38;2;53;87;134m\x1b[48;2;10;10;10m⬝\x1b[0m\x1b[0m\x1b[34;6H\x1b[?25h\x1b[?2026l"),
+        ("■■■■■■⬝⬝", // capture unit 21
+         "\x1b[?2026h\x1b[?25l\x1b[38;4H\x1b[38;2;92;156;245m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;5H\x1b[38;2;97;162;231m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;6H\x1b[38;2;63;105;163m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;7H\x1b[38;2;45;72;110m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;8H\x1b[38;2;33;50;75m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;9H\x1b[38;2;25;36;52m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;10H\x1b[38;2;59;98;151m\x1b[48;2;10;10;10m⬝⬝\x1b[0m\x1b[0m\x1b[34;6H\x1b[?25h\x1b[?2026l"),
+        ("■■■■■⬝⬝⬝", // capture unit 23
+         "\x1b[?2026h\x1b[?25l\x1b[38;4H\x1b[38;2;97;162;231m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;5H\x1b[38;2;63;105;163m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;6H\x1b[38;2;45;72;110m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;7H\x1b[38;2;33;50;75m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;8H\x1b[38;2;25;36;52m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;9H\x1b[38;2;58;95;147m\x1b[48;2;10;10;10m⬝⬝⬝\x1b[0m\x1b[0m\x1b[34;6H\x1b[?25h\x1b[?2026l"),
+        ("■■■■⬝⬝⬝⬝", // capture unit 25
+         "\x1b[?2026h\x1b[?25l\x1b[38;4H\x1b[38;2;63;105;163m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;5H\x1b[38;2;45;72;110m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;6H\x1b[38;2;33;50;75m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;7H\x1b[38;2;25;36;52m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;8H\x1b[38;2;57;94;145m\x1b[48;2;10;10;10m⬝⬝⬝⬝\x1b[0m\x1b[0m\x1b[34;6H\x1b[?25h\x1b[?2026l"),
+        ("■■■⬝⬝⬝⬝⬝", // capture unit 26
+         "\x1b[?2026h\x1b[?25l\x1b[6;6H\x1b[38;2;128;128;128m\x1b[48;2;10;10;10m⠧\x1b[0m\x1b[38;4H\x1b[38;2;45;72;110m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;5H\x1b[38;2;33;50;75m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;6H\x1b[38;2;25;36;52m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;7H\x1b[38;2;56;91;141m\x1b[48;2;10;10;10m⬝⬝⬝⬝⬝\x1b[0m\x1b[0m\x1b[34;6H\x1b[?25h\x1b[?2026l"),
+        ("■■⬝⬝⬝⬝⬝⬝", // capture unit 27
+         "\x1b[?2026h\x1b[?25l\x1b[38;4H\x1b[38;2;33;50;75m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;5H\x1b[38;2;25;36;52m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;6H\x1b[38;2;55;90;138m\x1b[48;2;10;10;10m⬝⬝⬝⬝⬝⬝\x1b[0m\x1b[0m\x1b[34;6H\x1b[?25h\x1b[?2026l"),
+        ("■⬝⬝⬝⬝⬝⬝⬝", // capture unit 29
+         "\x1b[?2026h\x1b[?25l\x1b[38;4H\x1b[38;2;25;36;52m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;5H\x1b[38;2;53;87;134m\x1b[48;2;10;10;10m⬝⬝⬝⬝⬝⬝⬝\x1b[0m\x1b[0m\x1b[34;6H\x1b[?25h\x1b[?2026l"),
+    ];
+
+    /// A real spinner-only unit (capture unit 1 — no bar cells; the
+    /// shortest unit class in the capture, 85 bytes).
+    const OPENCODE_SPINNER_ONLY_UNIT: &str = "\x1b[?2026h\x1b[?25l\x1b[6;6H\x1b[38;2;128;128;128m\x1b[48;2;10;10;10m⠦\x1b[0m\x1b[0m\x1b[34;6H\x1b[?25h\x1b[?2026l";
+
+    /// A real LATER repaint of the first composition (capture unit 19 —
+    /// the next sweep's drifted gradient colors over the same significant
+    /// content).
+    const OPENCODE_SECOND_SWEEP_UNIT: &str = "\x1b[?2026h\x1b[?25l\x1b[38;4H\x1b[38;2;48;77;118m\x1b[48;2;10;10;10m⬝⬝\x1b[0m\x1b[38;6H\x1b[38;2;92;156;245m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;7H\x1b[38;2;97;162;231m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;8H\x1b[38;2;63;105;163m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;9H\x1b[38;2;45;72;110m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;10H\x1b[38;2;33;50;75m\x1b[48;2;10;10;10m■\x1b[0m\x1b[38;11H\x1b[38;2;25;36;52m\x1b[48;2;10;10;10m■\x1b[0m\x1b[0m\x1b[34;6H\x1b[?25h\x1b[?2026l";
+
     #[test]
     fn opencode_tui_gradient_bar_spinner_cycle_is_noise_after_first_sweep() {
-        // REAL opencode TUI animation shape (capture of 2026-09-20, plan-frame-
-        // evidence.md §3.2): each repaint unit hides the cursor, repaints the
-        // 8-cell bar at row 38 cols 4-11 with per-cell SGR colors, and parks the
-        // cursor. ■ U+25A0 / ⬝ U+2B1D are NOT in the strip set — they are the
-        // only significant chars. The sweep walks 14 distinct compositions
-        // (bright-segment position 1..8, then the reverse fade), so after the
-        // first ~30 frames the ring holds every composition and all later
-        // frames classify as noise forever.
-        let dim = "\u{1b}[38;2;36;57;86m\u{1b}[48;2;10;10;10m";
-        let bright = "\u{1b}[38;2;92;156;245m\u{1b}[48;2;10;10;10m";
-        let park = "\u{1b}[0m\u{1b}[0m\u{1b}[34;6H\u{1b}[?25h";
-        let unit = |cells: &str| format!("\u{1b}[?25l\u{1b}[38;4H{cells}{park}");
-        // 14 compositions: n ⬝ then 8-n ■, then the reverse walk (per the capture
-        // census at plan-frame-evidence.md §3.2).
-        let compositions: Vec<String> = (0..8)
-            .map(|n| {
-                format!(
-                    "{dim}{}\u{1b}[0m{bright}{}",
-                    "⬝".repeat(n),
-                    "■".repeat(8 - n)
-                )
-            })
-            .chain((1..7).map(|n| {
-                format!(
-                    "{bright}{}\u{1b}[0m{dim}{}",
-                    "■".repeat(n),
-                    "⬝".repeat(8 - n)
-                )
-            }))
-            .map(|cells| unit(&cells))
-            .collect();
-        assert_eq!(compositions.len(), 14);
+        // Feeds the VERBATIM capture units (see the provenance block above
+        // the consts) plus the enumerated composition census. ■ U+25A0 /
+        // ⬝ U+2B1D are NOT in the strip set — they are each unit's only
+        // significant chars.
+        assert_eq!(
+            OPENCODE_CENSUS_UNITS.len(),
+            14,
+            "the capture's bar-composition census is exactly 14"
+        );
         let mut n = NoiseScanner::new();
-        // First sweep: each distinct composition is new content (fail-open).
-        for c in &compositions {
+        // First sweep: the first occurrence of each census composition is
+        // genuinely-new content (fail-open) — INCLUDING the all-dim rest
+        // and the ⬝■■■■■■⬝ reverse-sweep transition composition.
+        for (composition, unit) in OPENCODE_CENSUS_UNITS {
             assert!(
-                n.observe(c),
-                "first sweep composition must be meaningful (fail-open)"
+                n.observe(unit),
+                "first occurrence of composition {composition} must be meaningful (fail-open)"
             );
         }
-        // Spinner-only unit (braille glyph, zero significant chars) is noise even
-        // the first time — registry.rs:185-186 count==0 path.
-        assert!(!n.observe("\u{1b}[?25l\u{1b}[6;6H\u{1b}[38;2;128;128;128m\u{1b}[48;2;10;10;10m⠦\u{1b}[0m\u{1b}[0m\u{1b}[34;6H\u{1b}[?25h"));
-        // Many later sweeps — colors change each frame (new SGR params), the
-        // significant content does not — all noise.
-        for cycle in 0..20 {
-            for c in &compositions {
-                let recolored = c.replace("92;156;245", &format!("{};156;245", 92 - (cycle % 5)));
+        // Spinner-only unit: zero significant chars — noise even the first
+        // time (the count==0 path in `observe`).
+        assert!(
+            !n.observe(OPENCODE_SPINNER_ONLY_UNIT),
+            "spinner-only unit must be noise even when first"
+        );
+        // A real later repaint of an already-seen composition — the next
+        // sweep's drifted gradient colors, same significant content: noise.
+        assert!(
+            !n.observe(OPENCODE_SECOND_SWEEP_UNIT),
+            "a color-drifted later occurrence must be noise"
+        );
+        // Later sweeps: byte-identical replays are all noise (ring
+        // membership).
+        for (_, unit) in OPENCODE_CENSUS_UNITS {
+            assert!(!n.observe(unit), "later sweeps must be noise");
+        }
+        // Color-drifted later sweeps: the real capture repaints each sweep
+        // with shifted gradient colors — colors ride CSI sequences and
+        // must never change a fingerprint. Approximated here by shifting
+        // the pane-background `48;2;10;10;10` params (present in every
+        // embedded unit); the real drift itself is pinned above by
+        // OPENCODE_SECOND_SWEEP_UNIT.
+        for cycle in 0..3 {
+            let bg = format!("10;{};10", 11 + cycle);
+            for (_, unit) in OPENCODE_CENSUS_UNITS {
+                let recolored = unit.replace("10;10;10", &bg);
                 assert!(!n.observe(&recolored), "cycle {cycle} must be noise");
             }
         }
-        // Genuinely-new text still classifies as meaningful.
-        assert!(n.observe("\u{1b}[?25lquestion is moot. Run task 3 of 4 froze at 18:06:47Z"));
+        // Genuinely-new text still classifies as meaningful (the capture's
+        // own recovery moment, verbatim).
+        assert!(n.observe("\x1b[?25lquestion is moot. Run task 3 of 4 froze at 18:06:47Z"));
     }
 }
