@@ -810,12 +810,13 @@ async fn pane_rename_with_an_unknown_name_intent_is_rejected_loudly() {
         StatusCode::BAD_REQUEST,
         "a typoed nameIntent is rejected loudly, not silently defaulted: {body}"
     );
-    let renames = sink.renames.lock().unwrap();
-    assert!(
-        renames.is_empty(),
-        "no silent automatic rename reached the authority: {renames:?}"
-    );
-    drop(renames);
+    {
+        let renames = sink.renames.lock().unwrap();
+        assert!(
+            renames.is_empty(),
+            "no silent automatic rename reached the authority: {renames:?}"
+        );
+    }
 
     // The valid values and the omitted default still work (the gate must
     // not over-apply).

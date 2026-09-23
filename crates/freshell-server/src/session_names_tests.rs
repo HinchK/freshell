@@ -2787,10 +2787,9 @@ async fn sweep_hydration_and_tick_bind_coexist_idempotently() {
     // Non-vacuity: the absorb=false sweep pass created NO series — only the
     // accepted-input arm may create it.
     assert!(
-        read_raw_document(dir.path())
+        !read_raw_document(dir.path())
             .generation
-            .get(&arm_key)
-            .is_none(),
+            .contains_key(&arm_key),
         "the sweep pass alone must not arm generation"
     );
     let armed = store
@@ -2846,7 +2845,7 @@ async fn sweep_hydration_and_tick_bind_coexist_idempotently() {
         "the one armed series is unchanged by duplicate deliveries"
     );
     assert!(
-        raw.generation.get(&key).is_none(),
+        !raw.generation.contains_key(&key),
         "the manual winner's record carries no generation series"
     );
 }
