@@ -6578,7 +6578,7 @@ impl FreshOpencodeState {
             let guard = this.sessions.lock().await;
             guard.get(real_id).cloned()
         };
-        let (released, quiescent) = if let Some(session_arc) = session_arc {
+        let released = if let Some(session_arc) = session_arc {
             let mut session = session_arc.lock().await;
             let released = session.orphaned_daemon_turn.swap(false, Ordering::SeqCst);
             if released {
@@ -6592,16 +6592,31 @@ impl FreshOpencodeState {
                 .map(|t| t.is_finished() && t.settling.load(Ordering::SeqCst))
                 .unwrap_or(true)
                 && session.pending_sends.is_empty();
-            (released, quiescent)
+            // Focused-review episode 1 round 1: the quiescence decision
+            // and the idle emission are ONE critical section. Broadcasting
+            // after releasing the guard left a window where a waiting
+            // handle_send could register + emit its `running` before this
+            // helper's `idle` — the exact stale ordering this gate exists
+            // to prevent (the check-then-broadcast race). The broadcast is
+            // a synchronous channel send (never awaits), so holding the
+            // session mutex across it is safe, and a send registering
+            // either happened before this critical section (its running
+            // precedes our decision → we see the live task and suppress)
+            // or can only happen after (its running FOLLOWS our idle).
+            // Either order is correct; the interleaved stale idle is
+            // structurally impossible.
+            if quiescent {
+                this.fresh_agent
+                    .broadcast(&event_frame(real_id, snapshot_event(session_id, "idle")));
+            }
+            released
         } else {
             // No session record (e.g. raced a teardown): the frame is
             // stateless commentary, broadcast as before.
-            (false, true)
-        };
-        if quiescent {
             this.fresh_agent
                 .broadcast(&event_frame(real_id, snapshot_event(session_id, "idle")));
-        }
+            false
+        };
         if released {
             Self::drain_detached(this, real_id);
         }
@@ -17136,6 +17151,109 @@ mod tests {
         .await;
         let session_arc = st.sessions.lock().await.get("ses_q11").cloned().unwrap();
         assert!(session_arc.lock().await.pending_sends.is_empty());
+    }
+
+    /// Focused-review episode 1 round 1: the quiescence decision and the
+    /// idle emission are ONE critical section — the mutex-release
+    /// handoff race. A bridge idle observed on a quiescent session and
+    /// a concurrently-arriving send are serialized by the SESSION LOCK:
+    /// tokio's Mutex is fair (FIFO), so with the helper queued FIRST
+    /// and a handle_send queued SECOND behind a held lock, the helper
+    /// must emit its idle BEFORE the send registers/emits running —
+    /// never the stale interleaving this gate exists to prevent.
+    /// Multi-thread flavor: the woken send runs on another worker the
+    /// moment the lock handoff happens, so a broadcast-after-release
+    /// bug has real workers to lose against; with the fix the running
+    /// can only follow the idle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_bridge_idle_broadcast_is_atomic_with_send_registration() {
+        let (st, http, mut rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            None,
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q12", Some("prov/model")).await;
+        // Hold the session lock so both waiters queue in a known order.
+        let session_arc = st.sessions.lock().await.get("ses_q12").cloned().unwrap();
+        let _held = session_arc.lock().await;
+
+        let helper = {
+            let st = st.clone();
+            let id = "ses_q12".to_string();
+            tokio::spawn(async move {
+                FreshOpencodeState::observe_daemon_idle(&st, &id, &id).await;
+            })
+        };
+        // Yield so the helper parks on the session lock FIRST.
+        tokio::task::yield_now().await;
+        let sender = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                let _ = st
+                    .handle_send(send_msg("ses_q12", "the handoff send"))
+                    .await;
+            })
+        };
+        // Yield so the send parks SECOND (tokio Mutex grants FIFO).
+        tokio::task::yield_now().await;
+        // Release the held lock: the helper acquires, decides quiescent,
+        // and emits its idle INSIDE the critical section; only then may
+        // the send register + emit its running.
+        // Park the send's prompt POST (single-use gate): its settle
+        // idle cannot exist until released, so any idle observed while
+        // parked is a stale bridge emission racing the registration —
+        // the exact interleaving this critical section forbids.
+        let prompt_gate = http.arm_prompt_gate();
+        drop(_held);
+        let _ = sender.await;
+        await_prompt_posted(&http, "the handoff send").await;
+        let _ = helper.await;
+
+        let idle = |f: &Value| is_event(f, "freshAgent.session.snapshot", Some("idle"));
+        let running = |f: &Value| is_event(f, "freshAgent.session.snapshot", Some("running"));
+        let pre = drain_frames(&mut rx);
+        assert!(!pre.is_empty(), "the handoff produced frames");
+        if idle(&pre[0]) {
+            // Helper-first: the idle emission is atomic with the
+            // quiescence decision — the send's running can only follow.
+            let running_ix = pre
+                .iter()
+                .position(|f| running(f))
+                .expect("the send's running landed");
+            assert!(
+                running_ix > 0,
+                "the helper's idle precedes the send's running — the emission is atomic with the decision"
+            );
+            assert!(
+                !pre.iter().skip(1).any(|f| idle(f)),
+                "no second idle may exist while the send is still parked"
+            );
+        } else {
+            assert!(
+                running(&pre[0]),
+                "unexpected first frame — neither idle nor running"
+            );
+            assert!(
+                !pre.iter().any(|f| idle(f)),
+                "sender-first means the helper observed the live send inside its critical section and SUPPRESSED — an idle while the send is still parked is a stale emission that raced the registration"
+            );
+        }
+
+        // Release the POST: the send settles, exactly one settle idle.
+        prompt_gate.notify_waiters();
+        let settle = frames_until(&mut rx, |f| {
+            is_event(f, "freshAgent.session.snapshot", Some("idle"))
+        })
+        .await;
+        let remaining = drain_frames(&mut rx);
+        let late_idles = remaining.iter().filter(|f| idle(f)).count();
+        assert_eq!(
+            late_idles, 0,
+            "the settle idle is consumed exactly once — no late stale emissions"
+        );
+        assert!(settle.iter().any(|f| idle(f)));
     }
 
     /// Same rig with SummarizeOutcome::Answered500 + the gate (fixture
