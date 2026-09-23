@@ -6917,13 +6917,36 @@ impl FreshOpencodeState {
                 }
                 false
             } else {
-                let released = session.orphaned_daemon_turn.swap(false, Ordering::SeqCst);
-                if released {
-                    tracing::warn!(target: "freshell_freshagent::opencode",
-                        session_id = %real_id,
-                        "fresh_agent_interrupt_orphan_released_by_daemon_idle");
+                // Delta-review round 7 (extension): the same DELIVERY-
+                // ORDER IDENTITY here — a failed abort has settled (the
+                // counter is zero) and the latch is armed, so the NEXT
+                // delivered idle must still prove it belongs to the
+                // interrupted turn: an idle with no prior running
+                // delivery may be a stale duplicate of the PREVIOUS turn
+                // arriving on bridge lag after the settlement, and
+                // releasing on it would drain into a still-running
+                // compact. Only an idle that follows a delivered running
+                // (the daemon's running->idle transition for the
+                // interrupted turn) may release; the interrupted turn's
+                // own eventual idle does exactly that.
+                if session.daemon_busy_after_idle.load(Ordering::SeqCst) {
+                    let released = session.orphaned_daemon_turn.swap(false, Ordering::SeqCst);
+                    if released {
+                        tracing::warn!(target: "freshell_freshagent::opencode",
+                            session_id = %real_id,
+                            "fresh_agent_interrupt_orphan_released_by_daemon_idle");
+                    }
+                    // The idle supersedes the running that preceded it.
+                    session
+                        .daemon_busy_after_idle
+                        .store(false, Ordering::SeqCst);
+                    released
+                } else {
+                    // A stale candidate: no running was delivered before
+                    // this idle — release nothing and wait for the turn's
+                    // own idle.
+                    false
                 }
-                released
             };
             let quiescent = session
                 .turn_task
@@ -17468,7 +17491,9 @@ mod tests {
         }
 
         // The daemon-side compact eventually settles; the bridge observes
-        // the session's idle — the AUTOMATIC release + delivery:
+        // the interrupted turn's running and then its idle (the
+        // delivery-order identity) — the AUTOMATIC release + delivery:
+        FreshOpencodeState::observe_daemon_running(&st, "ses_q9", "ses_q9").await;
         FreshOpencodeState::observe_daemon_idle(&st, "ses_q9", "ses_q9").await;
         await_prompt_posted(&http, "first auto").await;
         await_prompt_posted(&http, "second auto").await;
@@ -17986,8 +18011,10 @@ mod tests {
             "the deferral latch stays armed"
         );
 
-        // The daemon later reports idle — the PROVEN quiesce releases +
-        // delivers (round-4 semantics).
+        // The daemon later reports the interrupted turn's running and
+        // then its idle (the delivery-order identity) — the PROVEN quiesce
+        // releases + delivers (round-4 semantics).
+        FreshOpencodeState::observe_daemon_running(&st, "ses_q15", "ses_q15").await;
         FreshOpencodeState::observe_daemon_idle(&st, "ses_q15", "ses_q15").await;
         await_prompt_posted(&http, "waits out the refusal").await;
         let session_arc = st.sessions.lock().await.get("ses_q15").cloned().unwrap();
@@ -18372,8 +18399,11 @@ mod tests {
             "the deferral latch stays armed after the Transport settlement"
         );
 
-        // A LATER daemon idle (the abort long settled, the daemon truly
-        // quiesced) is the proven release: deliver.
+        // A LATER daemon idle — following the interrupted turn's
+        // running (the delivery-order identity), with the abort long
+        // settled and the daemon truly quiesced — is the proven release:
+        // deliver.
+        FreshOpencodeState::observe_daemon_running(&st, "ses_q19", "ses_q19").await;
         FreshOpencodeState::observe_daemon_idle(&st, "ses_q19", "ses_q19").await;
         await_prompt_posted(&http, "waits out the ambiguity").await;
         let session_arc = st.sessions.lock().await.get("ses_q19").cloned().unwrap();
@@ -18919,8 +18949,8 @@ mod tests {
             "the deferral holds until a FRESH idle"
         );
 
-        // The interrupted turn REALLY ends — the fresh idle releases and
-        // delivers.
+        // The interrupted turn REALLY ends — the fresh idle (following
+        // its running) releases and delivers.
         FreshOpencodeState::observe_daemon_idle(&st, "ses_q25", "ses_q25").await;
         await_prompt_posted(&http, "waits for a fresh idle").await;
         let session_arc = st.sessions.lock().await.get("ses_q25").cloned().unwrap();
@@ -19111,6 +19141,100 @@ mod tests {
         FreshOpencodeState::observe_daemon_idle(&st, "ses_q27", "ses_q27").await;
         await_prompt_posted(&http, "waits for the real idle").await;
         let session_arc = st.sessions.lock().await.get("ses_q27").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    /// Delta-review round 7 (extension): the post-settlement stale-idle
+    /// race in the round-4 release path — a failed abort settles (the
+    /// counter is zero, the latch armed), and the NEXT delivered idle
+    /// must still prove it belongs to the interrupted turn. With normal
+    /// bridge lag the stale previous-turn idle can arrive AFTER the
+    /// settlement, following no delivered running: the old code
+    /// released on it and drained into the still-running compact. The
+    /// delivery-order identity now applies here too — only an idle that
+    /// follows a delivered running may release; the interrupted turn's
+    /// own idle (which follows its running) delivers.
+    #[tokio::test]
+    async fn a_stale_idle_after_a_failed_abort_settlement_does_not_release() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q28", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q28")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q28", "waits out the bridge lag")),
+        )
+        .await;
+
+        // The abort FAILS (answered 500) and settles — counter zero,
+        // latch armed, the queue deferred.
+        http.arm_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q28".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort 500)");
+        let session_arc = st.sessions.lock().await.get("ses_q28").cloned().unwrap();
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .orphaned_daemon_turn
+                .load(Ordering::SeqCst),
+            "the failed abort defers the queue"
+        );
+
+        // A STALE idle (from the previous turn) arrives after the
+        // settlement, following NO delivered running: it must NOT
+        // release — the compact may still be running.
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q28", "ses_q28").await;
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "a stale idle arriving after the settlement follows no running — it must not release the queue"
+        );
+        let session_arc = st.sessions.lock().await.get("ses_q28").cloned().unwrap();
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .orphaned_daemon_turn
+                .load(Ordering::SeqCst),
+            "the deferral holds"
+        );
+
+        // The interrupted turn's OWN idle — following its delivered
+        // running — is the proven release: deliver.
+        FreshOpencodeState::observe_daemon_running(&st, "ses_q28", "ses_q28").await;
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q28", "ses_q28").await;
+        await_prompt_posted(&http, "waits out the bridge lag").await;
+        let session_arc = st.sessions.lock().await.get("ses_q28").cloned().unwrap();
         let session = session_arc.lock().await;
         assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
         assert!(session.pending_sends.is_empty());
