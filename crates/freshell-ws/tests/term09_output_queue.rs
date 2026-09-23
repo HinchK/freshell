@@ -874,7 +874,17 @@ async fn eviction_and_supersede_without_sends_still_close() {
     // observed here is the monitor's, not the send timeout's.
     let term09 = Term09Config {
         queue_max_bytes: 8 * 1024 * 1024,
-        catastrophic_buffered_bytes: 1024 * 1024,
+        // 32 KiB, not the earlier 1 MiB: premise-neutral (the eviction floor
+        // stays at the 8 MiB queue cap, far above this, so "bytes shrink via
+        // eviction while over threshold" is preserved) but it shrinks the
+        // load-sensitive step — the post-supersede-discard refill — 32x.
+        // Under concurrent full-suite gates the flood shell's production
+        // rate collapses, and a 1 MiB refill (≈10k flood lines) can take
+        // many minutes-to-forever: the monitor honestly has not seen
+        // over-threshold yet. 32 KiB (≈350 lines) keeps the window
+        // observable on a contended box; the observation loop below is
+        // production-progress-driven, so the two together are load-immune.
+        catastrophic_buffered_bytes: 32 * 1024,
         catastrophic_stall_ms: 2_000,
     };
     let url = spawn_server(term09).await;
@@ -894,7 +904,7 @@ async fn eviction_and_supersede_without_sends_still_close() {
     // ~60 MB keeps production alive for several seconds past the mid-stall
     // supersede below (the queue must refill after the discard).
     let flood = flood_command(600_000, marker);
-    let started = tokio::time::Instant::now();
+
     creator
         .send(WsMessage::Text(
             serde_json::json!({
@@ -933,35 +943,27 @@ async fn eviction_and_supersede_without_sends_still_close() {
     // (exactly one ws.terminal_stream.catastrophic_close event); a write-
     // timeout or keepalive close would produce none.
     //
-    // The observation is PROGRESS-BASED, per the standing test discipline
-    // that wall-clock budgets must never fail working code: a prior fixed
-    // 60 s total window still blew out under 3x box oversubscription. The
-    // monitor's decision is observable through the capture layer, so the
-    // wait tracks it: poll for the decision event while reading the
-    // socket. The only fixed bounds are true-stall caps — 300 s if the
-    // monitor NEVER decides (a dead monitor under any load), 120 s if a
-    // decided close is never delivered to this now-reading client (a
-    // wedged teardown). A slow box delays the decision AND the close; it
-    // can never trip either stall cap.
-    let decision_deadline = started + Duration::from_secs(300);
+    // The observation is PROGRESS-BASED (standing test discipline: a
+    // wall-clock budget must never fail working code). This test's waits
+    // starved out three times under concurrent full-suite gates before the
+    // design converged: a fixed 60 s window (twice), then a 300 s
+    // decision cap whose real victim was the FLOOD — under extreme
+    // starvation the shell's production rate collapses and the
+    // post-discard refill (which must re-cross the injected threshold)
+    // had not happened yet, so the monitor was honestly still waiting
+    // (not dead). The threshold injection is therefore sized for the
+    // contended-box reality (32 KiB re-crosses at even ~1% of focused
+    // production rate), and the wait below tracks the monitor's own
+    // decision record in the capture. The only fixed bound before the
+    // decision is a true-stall cap: 300 s with no decision event at all —
+    // a dead monitor or a flood starved below ~100 B/s of production, at
+    // which point no gate finishes anyway. A slow-but-producing box can
+    // never trip it. After the decision, a 120 s delivery cap catches a
+    // wedged teardown.
+    let decision_deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     let mut decided_at: Option<tokio::time::Instant> = None;
     loop {
         let now = tokio::time::Instant::now();
-        match decided_at {
-            None => assert!(
-                now < decision_deadline,
-                "the catastrophic monitor never decided on a zero-send stuck \
-                 connection — a dead monitor (progress-based wait saw no \
-                 ws.terminal_stream.catastrophic_close event in the capture \
-                 within 300 s)"
-            ),
-            Some(at) => assert!(
-                at.elapsed() < Duration::from_secs(120),
-                "the monitor decided but its close was never delivered to the \
-                 now-reading client within 120 s — a wedged teardown, not a \
-                 slow box"
-            ),
-        }
         if decided_at.is_none()
             && events
                 .lock()
@@ -970,6 +972,21 @@ async fn eviction_and_supersede_without_sends_still_close() {
                 .any(|e| e.message == "ws.terminal_stream.catastrophic_close")
         {
             decided_at = Some(now);
+        }
+        if let Some(at) = decided_at {
+            assert!(
+                at.elapsed() < Duration::from_secs(120),
+                "the monitor decided but its close was never delivered to the \
+                 now-reading client within 120 s — a wedged teardown, not a \
+                 slow box"
+            );
+        } else {
+            assert!(
+                now < decision_deadline,
+                "no monitor decision in the capture within 300 s — a dead \
+                 monitor or a flood starved below ~100 B/s of production (a \
+                 slow-but-producing box can never trip this)"
+            );
         }
         let tick = if decided_at.is_some() {
             Duration::from_millis(50)
@@ -1033,7 +1050,7 @@ async fn eviction_and_supersede_without_sends_still_close() {
     );
     assert_eq!(
         close.fields.get("threshold").map(String::as_str),
-        Some("1048576"),
+        Some("32768"),
         "the injected threshold is reported"
     );
     let pending: usize = close
@@ -1043,7 +1060,7 @@ async fn eviction_and_supersede_without_sends_still_close() {
         .parse()
         .expect("pending_bytes renders as a plain integer");
     assert!(
-        pending > 1024 * 1024,
+        pending > 32 * 1024,
         "the monitor only fires over-threshold: {close:?}"
     );
 }
