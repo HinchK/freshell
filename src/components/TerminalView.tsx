@@ -3804,9 +3804,10 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       }
 
       // b8ke fence-heal (Task 7 follow-up): the recovery-create lane shared
-      // by the INVALID_TERMINAL_ID reconnect recovery and the
-      // pane-terminal-scoped refused-arm refusal routing (the cross-device
-      // kill shape): mint a NEW createRequestId
+      // by the INVALID_TERMINAL_ID reconnect recovery (focused review 1
+      // removed the pane-terminal-scoped refused-arm routing — a refused
+      // attach/kill never auto-relaunches the killed session): mint a NEW
+      // createRequestId
       // (the r35 NEXT-decision fresh capture at send time), mark it restore
       // (the rate-limit exemption), clear the dead terminal's handles, and
       // let the lifecycle effect's createRequestId dependency re-fire the
@@ -5299,35 +5300,30 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           && hasRefusalFencePair(msg)
         ) {
           foldRefusalFence(msg)
-          // b8ke fence-heal (Task 7 follow-up): the fold heals the store the
-          // NEXT decision reads — but nothing re-drives the pane's attach
-          // after a refused attach: the pane's one-shot attach can race the
-          // owner-frame fold (the cross-device kill's terminal.meta
-          // retirement broadcast re-fires the attach lifecycle BEFORE the
-          // vacant frame folds) and then wedge "Recovering terminal output"
-          // behind the single refused attempt. The stale-observed-generation
-          // arm bumps the pane's reconcileEpoch — the lifecycle effect's
-          // ONLY re-fire signal — so the attach re-drives with the healed
-          // pair at send time (the r35 NEXT-decision re-capture). The
-          // refused/foreign-owner arm instead routes the VACANT record
-          // shape (the durable stop's released record — the cross-device
-          // kill) to the existing recovery-create lane (the resume), which
-          // re-captures the healed fence at send time; in-flight/foreign-
-          // live records keep the R5-3 transition-blocking discipline (no
-          // attach storm, no lifecycle-start suppression bypass).
+          // b8ke fence-heal (Task 7 follow-up, focused review 1): the fold
+          // heals the store the NEXT decision reads — but nothing re-drives
+          // the pane's attach after a refused attach: the pane's one-shot
+          // attach can race the owner-frame fold (the cross-device kill's
+          // terminal.meta retirement broadcast re-fires the attach lifecycle
+          // BEFORE the vacant frame folds) and then wedge "Recovering
+          // terminal output" behind the single refused attempt. The
+          // stale-observed-generation arm bumps the pane's reconcileEpoch —
+          // the lifecycle effect's ONLY re-fire signal — so the attach
+          // re-drives with the healed pair at send time (the r35
+          // NEXT-decision re-capture; it re-attaches the pane to a LIVE
+          // terminal under a newer generation — the sanctioned next-attempt
+          // self-heal, never a relaunch). The refused/foreign-owner arm
+          // does NOTHING else automatically (focused review 1): the record
+          // can read VACANT while the exit fan is still in flight
+          // (terminal-exit, vacant-owner, and refusal frames use
+          // independently scheduled delivery paths), so an automatic
+          // recovery-create here RELAUNCHED the killed session. The refusal
+          // folds the fresh pair only; the exit fold lands the honest
+          // exited state with the user-driven recovery affordance, and the
+          // user's own reopen converges without a reload (the folds make
+          // the attempt born fresh).
           if ((msg.message ?? '').startsWith(STALE_REFUSAL_MESSAGE_PREFIX)) {
             dispatch(bumpPaneReconcileEpoch({ tabId, paneId }))
-          } else {
-            const canonical = resolveCanonicalPaneSession(
-              appStore.getState(),
-              contentRef.current ?? {},
-            )
-            const record = canonical
-              ? selectSessionRuntimeOwner(appStore.getState(), canonical.provider, canonical.sessionId)
-              : undefined
-            if (record?.ownerKind === 'vacant') {
-              resumeRecoveryCreate(tid)
-            }
           }
           return
         }

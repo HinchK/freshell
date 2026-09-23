@@ -3894,17 +3894,25 @@ describe('TerminalView lifecycle updates', () => {
       })
     })
 
-    // b8ke fence-heal (Task 7 follow-up): the refused/foreign-owner arm of
-    // the pane-terminal-scoped typed refusal (the cross-device kill's
-    // vacant-key adopt refusal — "A lifecycle operation is in flight for
-    // this session; retry after it settles.") previously had NO consumer:
-    // the pane's one-shot attach wedged "Recovering terminal output" behind
-    // the single refused attempt (and bumping on this arm storms
-    // attach→refuse→bump at ~300Hz). The branch now routes the VACANT
-    // record shape to the existing recovery-create lane (the resume), which
-    // re-captures the healed fence at send time; in-flight/foreign-live
-    // records keep the R5-3 transition-blocking discipline.
-    it('a pane-terminal-scoped refused-arm refusal with a vacant record routes to the recovery-create (fix b)', async () => {
+    // b8ke fence-heal (Task 7 follow-up, focused review 1): the
+    // refused/foreign-owner arm of the pane-terminal-scoped typed refusal
+    // (the cross-device kill's vacant-key adopt refusal — "A lifecycle
+    // operation is in flight for this session; retry after it settles.")
+    // must NEVER auto-relaunch the killed session. Terminal-exit,
+    // vacant-owner, and refusal frames use independently scheduled
+    // delivery paths, so the vacant frame + the refused attach can land
+    // while terminalIdRef still names the killed terminal — the pre-fix
+    // arm read the folded VACANT record and routed to the recovery-create,
+    // relaunching the killed session automatically. The NEW contract: the
+    // refusal folds the fresh pair (merge-only) and does NOTHING else
+    // automatically; the exit fold lands the honest exited state with the
+    // user-driven recovery affordance (the preserved sessionRef keeps the
+    // sidebar reopen available), and the user's own reopen converges
+    // without a reload (the folds make the attempt born fresh). The
+    // stale-arm re-drive stays pinned by its own test above (it re-attaches
+    // a LIVE terminal under a newer generation — the sanctioned
+    // next-attempt self-heal, never a relaunch).
+    it('a pane-terminal-scoped refused-arm refusal with a vacant record never auto-creates — the pane converges to exited (focused review 1)', async () => {
       const { store } = setupTypedPane({
         content: { status: 'running', terminalId: 't-attach-b8ke' },
         seed: (seededStore) => {
@@ -3923,9 +3931,13 @@ describe('TerminalView lifecycle updates', () => {
         expect(messageHandler).not.toBeNull()
         expect(sentMessages().filter((m: any) => m.type === 'terminal.attach').length).toBeGreaterThan(0)
       })
+      const attachesBefore = sentMessages().filter((m: any) => m.type === 'terminal.attach').length
 
       // The refused-arm typed refusal: no requestId, the pane's own
-      // terminalId, the pair, the in-flight copy.
+      // terminalId, the pair, the in-flight copy. This lands BEFORE the
+      // exit fan — terminalIdRef still names the killed terminal (the
+      // review's exact hazardous ordering; the pre-fix arm auto-created
+      // right here).
       act(() => {
         messageHandler!({
           type: 'error',
@@ -3939,22 +3951,48 @@ describe('TerminalView lifecycle updates', () => {
       })
 
       // The fold landed on the pane's owner record (merge-only: the vacant
-      // owner identity is preserved).
+      // owner identity is preserved) — the fresh pair is folded into
+      // runtimeOwners for the user's NEXT attempt.
       const folded = store.getState().freshAgent.runtimeOwners[`codex:${TYPED_SESSION_ID}`]
       expect(folded.generation).toBe(2)
       expect(folded.ownerKind).toBe('vacant')
 
-      // THE CONTRACT: the recovery-create fires — a NEW terminal.create
-      // with the pane's sessionRef (the resume), NOT an attach storm.
+      // THE CONTRACT (bounded negative): NO terminal.create fires — the
+      // killed session never relaunches automatically. Let any wrong-side
+      // re-drive flush inside the bounded window, then pin the zero.
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, RESERVE_RETRY_FLOOR_MS + 100))
+      })
+      expect(sentMessages().filter((m: any) => m.type === 'terminal.create')).toHaveLength(0)
+
+      // The exit fan lands AFTER the refusal (the kill's independently
+      // scheduled delivery) — the pane converges to its honest exited
+      // state; the recovery affordance is the user's path.
+      act(() => {
+        messageHandler!({ type: 'terminal.exit', terminalId: 't-attach-b8ke', exitCode: 0 })
+      })
       await waitFor(() => {
-        expect(sentMessages().filter((m: any) => m.type === 'terminal.create').length).toBeGreaterThan(0)
+        const leaf = store.getState().panes.layouts['tab-b8ke']
+        expect(leaf?.type === 'leaf' && leaf.content.kind === 'terminal'
+          ? leaf.content.status : undefined).toBe('exited')
       })
-      const createCall = [...sentMessages()]
-        .reverse()
-        .find((m: any) => m.type === 'terminal.create')!
-      expect(createCall).toMatchObject({
-        sessionRef: { provider: 'codex', sessionId: TYPED_SESSION_ID },
+      const leaf = store.getState().panes.layouts['tab-b8ke']
+      expect(leaf?.type === 'leaf' && leaf.content.kind === 'terminal'
+        ? leaf.content.terminalId : undefined).toBeUndefined()
+      // The pane KEEPS its durable sessionRef — the sidebar reopen (the
+      // user's recovery path) stays available without a reload.
+      expect(leaf?.type === 'leaf' && leaf.content.kind === 'terminal'
+        ? leaf.content.sessionRef : undefined)
+        .toEqual({ provider: 'codex', sessionId: TYPED_SESSION_ID })
+
+      // Still nothing relaunched — the pane stays honestly exited until the
+      // user acts (no attach storm either: the refused arm re-drives
+      // nothing).
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, RESERVE_RETRY_FLOOR_MS + 100))
       })
+      expect(sentMessages().filter((m: any) => m.type === 'terminal.create')).toHaveLength(0)
+      expect(sentMessages().filter((m: any) => m.type === 'terminal.attach').length).toBe(attachesBefore)
     })
 
     // b8ke fence-heal fast path (plan-review round 1, finding 4): a
