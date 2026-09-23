@@ -897,28 +897,33 @@ impl RestOwnershipClaim {
     }
 }
 
-/// b8ke fence-heal (plan Task 3 / delta round-4 F3): the REST rung's
-/// commit-to-Live owner-frame construction — the in-crate mirror of
-/// freshell-ws's `broadcast_owner_frame` terminal-Live shape (this crate
-/// cannot call the freshell-ws helper). PURE in the SUPPLIED pair (the
-/// r32 F2 discipline): the caller passes the claim ticket's OWN
-/// (epoch, generation), captured BEFORE the consuming commit — never a
-/// re-observed current generation (`ownership.observe`, the shape the
-/// WS side's `broadcast_owner_frame_if_authoritative` was rejected
-/// for). `None` only on serialization failure (the caller drops the
-/// frame silently, same as the WS lane's `unwrap_or_default`).
+/// b8ke fence-heal (plan Task 3 / delta round-4 F3, focused review 2
+/// rework): the REST rung's commit-to-Live owner-frame construction — the
+/// in-crate mirror of freshell-ws's `broadcast_owner_frame` terminal-Live
+/// shape (this crate cannot call the freshell-ws helper). Takes the
+/// ownership registry so the emission is welded to the REAL coordinator
+/// identity (the frame's epoch) AND so the re-observation hazard is
+/// genuinely inside the tested unit: a regression that consulted
+/// `ownership.observe(...).generation` here would fold the registry's
+/// CURRENT generation over the transition's own committed pair — the exact
+/// r32 F2 violation. The generation is the caller-supplied COMMITTED pair
+/// (the claim ticket's own pair, captured BEFORE the consuming commit —
+/// never a re-observed current generation, the shape the WS side's
+/// `broadcast_owner_frame_if_authoritative` was rejected for). `None` only
+/// on serialization failure (the caller drops the frame silently, same as
+/// the WS lane's `unwrap_or_default`).
 fn rest_terminal_owner_frame(
+    ownership: &freshell_ownership::RuntimeOwnershipRegistry,
     locator: &SessionLocator,
     terminal_id: &str,
     operation_id: &str,
     generation: u64,
-    epoch: u64,
 ) -> Option<String> {
     serde_json::to_string(&ServerMessage::SessionRuntimeOwner(
         freshell_protocol::SessionRuntimeOwner {
             provider: locator.provider.clone(),
             session_id: locator.session_id.clone(),
-            epoch,
+            epoch: ownership.boot_epoch(),
             generation,
             owner_kind: "terminal".into(),
             previous_kind: None,
@@ -3185,20 +3190,21 @@ async fn settle_gated_create(inputs: GatedSettleInputs) -> Result<TerminalSpawnR
                     // rest_terminal_owner_frame — the pure in-crate
                     // mirror of broadcast_owner_frame's terminal-Live
                     // shape (this crate cannot call the freshell-ws
-                    // helper; delta round-4 F3 extracted the literal so
-                    // the supplied-pair contract is pinned by its own
-                    // emission-time discriminator test). The claim
-                    // mint implies the coordinator is wired.
+                    // helper; delta round-4 F3 + focused review 2 weld
+                    // the registry into the seam so the supplied-pair
+                    // contract is pinned against a re-observing
+                    // implementation by its own discriminator test).
+                    // `owner_operation_id`/`owner_generation` are the
+                    // claim ticket's OWN pair, captured above BEFORE the
+                    // consuming commit — never a re-observed current
+                    // generation. The claim mint implies the coordinator
+                    // is wired.
                     if let Some(frame) = rest_terminal_owner_frame(
+                        state.ownership.as_ref().expect("coordinator wired"),
                         &claim_locator,
                         &terminal_id,
                         &owner_operation_id,
                         owner_generation,
-                        state
-                            .ownership
-                            .as_ref()
-                            .expect("coordinator wired")
-                            .boot_epoch(),
                     ) {
                         let _ = state.broadcast_tx.send(frame);
                     }
@@ -8336,26 +8342,47 @@ if (args.includes('app-server')) {{
         ));
     }
 
-    /// b8ke fence-heal (delta round-4 F3): the emission-time committed-pair
-    /// discriminator for the REST owner frame — the in-crate mirror of the
-    /// WS-side
+    /// b8ke fence-heal (delta round-4 F3, focused review 2 rework): the
+    /// emission-time committed-pair discriminator for the REST owner
+    /// frame — the in-crate mirror of the WS-side
     /// `a_broadcast_owner_frame_carries_the_committed_pair_not_the_current_generation`
-    /// (identity_ownership.rs). The REST rung's frame construction lives in
-    /// [`rest_terminal_owner_frame`], a PURE function of the SUPPLIED pair:
-    /// an implementation that consulted the registry's current generation
-    /// (the forbidden r32 F2 re-observation — the exact shape the WS side's
-    /// `broadcast_owner_frame_if_authoritative` was rejected for) would
-    /// serialize the OBSERVED generation here, not the committed one. The
-    /// end-to-end settle path cannot build this divergence deterministically
-    /// (no transition can land between the commit and the same-handler-turn
-    /// broadcast), so the discrimination lives HERE.
+    /// (identity_ownership.rs). The seam takes the REAL ownership registry
+    /// (the epoch source, and the re-observation hazard surface), so the
+    /// fixture's divergent observed generation is genuinely consultable: a
+    /// regression that built the frame from `ownership.observe(...).generation`
+    /// would emit the registry's CURRENT generation and fail the pinned
+    /// supplied pair.
+    ///
+    /// Why the discrimination lives HERE, not in the end-to-end settle
+    /// test (the reviewer's preferred interleave is genuinely not stageable
+    /// through the REST handler's public surface): a transition that moves
+    /// the observed generation between the claim and the commit turns the
+    /// commit stale (`commit_live`'s `generation != record.generation`
+    /// invariant, freshell-ownership/src/lib.rs) — the rung takes the
+    /// stale-teardown path and NEVER broadcasts, so there is no frame to
+    /// assert; and between the consuming commit and the frame construction
+    /// there is no await point (the same synchronous handler turn), so no
+    /// task can interleave a transition into the window. The committed pair
+    /// and an emission-time observe() are therefore value-identical in
+    /// every deterministically reachable REST-settle state — the
+    /// end-to-end test cannot discriminate the regression; this seam test
+    /// can and does.
+    ///
+    /// The fixture stages the divergence through PUBLIC registry
+    /// transitions only: a REAL claim granted at generation 1 commits Live
+    /// (the pair the rung captures from its ticket), then a LATER
+    /// lifecycle — the durable-stop release and a second begin — advances
+    /// the observed generation. The frame must carry the FIRST
+    /// transition's own committed pair, never the post-hoc observed one
+    /// (the r32 F2 hazard: a re-observing emission would let an older
+    /// transition's frame claim the newer lifecycle's generation).
     #[test]
     fn rest_terminal_owner_frame_carries_the_supplied_pair_not_the_observed_generation() {
-        // Wire a LIVE record with a known observed generation that
-        // deliberately DIFFERS from the caller-supplied pair (the
-        // begin/commit fixtures from the REST adopt-gap tests).
         let ownership = freshell_ownership::RuntimeOwnershipRegistry::new();
         let sid = format!("rest-frame-f3-{}", Uuid::new_v4());
+
+        // The rung's own claim: a real begin grant — the committed pair the
+        // emission must carry.
         let freshell_ownership::BeginOutcome::Granted { generation } = ownership.begin_start(
             "codex",
             &sid,
@@ -8375,43 +8402,79 @@ if (args.includes('app-server')) {{
             ownership_id: None,
         };
         assert_eq!(
-            ownership.commit_live("codex", &sid, "op-rest-frame-f3", generation, runtime),
+            ownership.commit_live(
+                "codex",
+                &sid,
+                "op-rest-frame-f3",
+                generation,
+                runtime.clone(),
+            ),
             freshell_ownership::CommitOutcome::Committed
         );
+        let committed_generation = generation;
+
+        // The LATER lifecycle (public transitions): the durable stop
+        // releases the Live owner, then a second begin advances the record
+        // — the registry's observed generation now genuinely DIVERGES from
+        // the first transition's committed pair.
+        assert!(ownership.release(
+            "codex",
+            &sid,
+            &freshell_ownership::ReleaseClaim {
+                operation_id: "op-rest-frame-f3".into(),
+                generation,
+                runtime: Some(runtime),
+            },
+            "test/rest-frame-f3",
+        ));
+        let freshell_ownership::BeginOutcome::Granted {
+            generation: later_generation,
+        } = ownership.begin_start(
+            "codex",
+            &sid,
+            freshell_ownership::RuntimeOwnerKind::Terminal,
+            "op-rest-frame-f3-later",
+            None,
+            "test",
+            1_000,
+        )
+        else {
+            panic!("expected Granted for the later lifecycle")
+        };
+        assert!(later_generation > committed_generation);
         assert_eq!(
             ownership.observe("codex", &sid).generation,
-            generation,
-            "fixture: the registry holds a LIVE record with a known observed generation"
+            later_generation,
+            "fixture: the registry's observed generation genuinely diverges from \
+             the committed pair"
         );
 
-        // THE CONTRACT: the frame serializes the SUPPLIED (epoch,
-        // generation) pair, never the registry's current observation.
-        let supplied_generation = generation + 7;
-        let supplied_epoch = ownership.boot_epoch();
+        // THE CONTRACT: the frame serializes the SUPPLIED committed pair —
+        // never the registry's current observation.
         let locator = SessionLocator {
             provider: "codex".into(),
             session_id: sid.clone(),
         };
         let frame = rest_terminal_owner_frame(
+            &ownership,
             &locator,
             "t-rest-frame-f3-supplied",
             "op-rest-frame-f3",
-            supplied_generation,
-            supplied_epoch,
+            committed_generation,
         )
         .expect("serialized frame");
         let value: Value = serde_json::from_str(&frame).expect("json frame");
         assert_eq!(value["type"], "session.runtimeOwner");
         assert_eq!(
             value["generation"],
-            json!(supplied_generation),
+            json!(committed_generation),
             "the REST owner frame carries the SUPPLIED committed pair's generation, \
-             never the re-observed current generation: {value}"
+             never the re-observed current generation ({later_generation}): {value}"
         );
         assert_eq!(
             value["epoch"],
-            json!(supplied_epoch),
-            "the REST owner frame carries the SUPPLIED pair's epoch: {value}"
+            json!(ownership.boot_epoch()),
+            "the REST owner frame carries the emitting coordinator's boot epoch: {value}"
         );
         assert_eq!(value["provider"], json!("codex"));
         assert_eq!(value["sessionId"], json!(sid));
@@ -8430,6 +8493,16 @@ if (args.includes('app-server')) {{
     /// freshell-ws helper. Pre-Task-3 the REST settle committed Live with
     /// NO broadcast, so clients never learned the REST-created terminal's
     /// fence until an unrelated transition or a reload supplied one.
+    ///
+    /// Focused review 2 note: this end-to-end run CANNOT stage the
+    /// divergent interleave (a later transition moving the observed
+    /// generation between the claim and the emission) — such a transition
+    /// turns the consuming commit stale (the `commit_live`
+    /// stale-generation invariant), so the rung tears down and never
+    /// broadcasts, and the commit-to-broadcast window is synchronous
+    /// (no await point). The re-observation discrimination therefore lives
+    /// in the seam's own registry-wired unit test,
+    /// `rest_terminal_owner_frame_carries_the_supplied_pair_not_the_observed_generation`.
     #[tokio::test]
     async fn a_rest_rung_commit_broadcasts_its_committed_owner_pair() {
         let _ = isolate_amplifier_home();
