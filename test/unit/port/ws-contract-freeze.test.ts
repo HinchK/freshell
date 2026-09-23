@@ -32,6 +32,7 @@ const ZOD_BACKED_SERVER_MESSAGES = [
   'pane.reconcile.result',
   'terminal.idle',
   'terminal.meta.updated',
+  'terminal.stuck',
   'terminal.turn.complete',
 ].sort()
 

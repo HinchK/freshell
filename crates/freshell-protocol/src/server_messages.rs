@@ -174,6 +174,16 @@ pub enum ServerMessage {
     TerminalStatus(TerminalStatus),
     #[serde(rename = "terminal.stream.changed")]
     TerminalStreamChanged(TerminalStreamChanged),
+    // Wedge-backstop addition; joined the frozen inventory
+    // (SERVER_MESSAGE_TYPES + regenerated contract) in this change:
+    // the terminal-mode stuck edge — `{ terminalId, at, stuck }`, emitted ONCE
+    // per stuck/unstuck transition by the stuck monitor, and once to a
+    // freshly attaching subscriber while the row is flagged. The
+    // terminal-mode analogue of freshcodex's `freshAgent.status:"stuck"` —
+    // never a `terminal.turn.complete` fabrication. See
+    // [`TerminalStuck`] and `spawn_stuck_monitor`.
+    #[serde(rename = "terminal.stuck")]
+    TerminalStuck(TerminalStuck),
     #[serde(rename = "terminal.title.updated")]
     TerminalTitleUpdated(TerminalTitleUpdated),
     #[serde(rename = "terminal.turn.complete")]
@@ -186,7 +196,7 @@ pub enum ServerMessage {
 
 /// The exact `type` discriminants of every server→client message, in the frozen
 /// inventory's order. This is the T0 conformance checklist.
-pub const SERVER_MESSAGE_TYPES: [&str; 66] = [
+pub const SERVER_MESSAGE_TYPES: [&str; 67] = [
     "amplifier.activity.list.response",
     "amplifier.activity.updated",
     "claude.activity.list.response",
@@ -249,6 +259,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 66] = [
     "terminal.session.associated",
     "terminal.status",
     "terminal.stream.changed",
+    "terminal.stuck",
     "terminal.title.updated",
     "terminal.turn.complete",
     "terminals.changed",
@@ -535,6 +546,17 @@ pub struct TerminalIdle {
     pub terminal_id: String,
     pub at: i64,
     pub reason: TerminalIdleReason,
+}
+
+/// `terminal.stuck` — the agent-pane wedged flag (surface-only; the client
+/// renders the "Agent appears stuck" card from it and offers kill/restart).
+/// Pinned wire contract: `port/contract/ws-server-messages.schema.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalStuck {
+    pub terminal_id: String,
+    pub at: i64,
+    pub stuck: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

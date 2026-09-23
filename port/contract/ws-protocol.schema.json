@@ -2,7 +2,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
-  "schemaCount": 83,
+  "schemaCount": 84,
   "schemas": {
     "AmplifierActivityListResponseSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1323,6 +1323,9 @@
               "maximum": 9007199254740991,
               "minimum": 0,
               "type": "integer"
+            },
+            "reason": {
+              "type": "string"
             },
             "requestId": {
               "minLength": 1,
@@ -8505,6 +8508,9 @@
           "minimum": 0,
           "type": "integer"
         },
+        "reason": {
+          "type": "string"
+        },
         "requestId": {
           "minLength": 1,
           "type": "string"
@@ -8789,6 +8795,35 @@
         "terminalId",
         "cols",
         "rows"
+      ],
+      "type": "object"
+    },
+    "TerminalStuckSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stuck": {
+          "type": "boolean"
+        },
+        "terminalId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.stuck",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "terminalId",
+        "at",
+        "stuck"
       ],
       "type": "object"
     },

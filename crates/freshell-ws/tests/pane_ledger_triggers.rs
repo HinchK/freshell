@@ -7,7 +7,7 @@ mod common;
 
 use common::{
     connect_and_capture_inventory, connect_and_capture_inventory_with_identity, next_frame_of_type,
-    sleeper_cli_spec, spawn_server_with_ledger,
+    sleeper_cli_spec, spawn_server_with_ledger, spawn_server_with_ledger_and_state,
 };
 use freshell_ws::pane_ledger::{PaneLedger, RetiredReason, RowState};
 use futures_util::{SinkExt, StreamExt};
@@ -1804,4 +1804,233 @@ fn shared_sleeper_cli_spec_paths_are_unique_per_call() {
         "same-name specs from common::sleeper_cli_spec must not share a script path -- \
          a shared path lets a later write race an earlier spawn's execve (ETXTBSY)"
     );
+}
+
+// ── Wedge-backstop Task 3: the terminal.kill `reason` discriminator ──────
+//
+// The "Agent appears stuck" card's restart/start-fresh actions kill the
+// wedged terminal with reason:"stuck-recovery" and then respawn the pane's
+// session via restore:create. Today EVERY client kill is the DURABLE
+// pane-close primitive (the unconditional `ledger.close_pane` envelope +
+// the identity retirement/tombstone consult that makes recovery suppress
+// the session as deliberately closed — recovery_inventory's
+// apply_kill_tombstone_dominance), which would kill the respawn the flow
+// exists to enable. The branch: reason == "stuck-recovery" runs the
+// PROCESS-ONLY kill (fenced stop + PTY kill + row removal + the correlated
+// `terminal.killed` ack, all unchanged) and SKIPS the durable close so the
+// session stays resumable. Any other reason (or none) keeps today's full
+// pane-close semantics byte-for-byte.
+
+/// reason:"stuck-recovery" ⇒ the kill is process-only: the row is gone and
+/// the correlated ack still fires, but NO close-envelope journal record
+/// exists (server index AND a fresh disk reader), no kill tombstone lands,
+/// the binding row still stands Bound, and the session identity remains
+/// resolvable — the follow-up restore:create respawn is not suppressed.
+#[tokio::test(flavor = "multi_thread")]
+async fn stuck_recovery_kill_leaves_the_session_resumable() {
+    let dir = unique_ledger_dir("stuck-recovery-kill");
+    let (url, registry, server_ledger, state) =
+        spawn_server_with_ledger_and_state(vec![sleeper_cli_spec("claude")], &dir).await;
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+
+    // A fresh claude pane: the create pre-allocates the session identity
+    // (in-memory identity upsert + the durable Bound binding row).
+    let create = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-stuck-recovery",
+        "mode": "claude",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+    });
+    ws.send(WsMessage::Text(create.to_string())).await.unwrap();
+    let created = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    let session_id = created["sessionRef"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        server_ledger
+            .load_binding("claude", &session_id)
+            .expect("precondition: the prealloc wrote the binding row")
+            .state,
+        RowState::Bound
+    );
+
+    // THE stuck-recovery kill: the wire reason parses (Task 2's schema) and
+    // the handler must treat it as a process-only kill.
+    let kill = serde_json::json!({
+        "type": "terminal.kill",
+        "terminalId": terminal_id,
+        "requestId": "req-kill-stuck-recovery",
+        "reason": "stuck-recovery",
+    });
+    ws.send(WsMessage::Text(kill.to_string())).await.unwrap();
+    let killed = next_frame_of_type(&mut ws, "terminal.killed").await;
+    assert_eq!(killed["requestId"], "req-kill-stuck-recovery");
+    assert_eq!(
+        killed["success"], true,
+        "the correlated terminal.killed{{success:true}} ack still fires: {killed}"
+    );
+
+    // (1) The registry row is gone (the PTY kill + row removal ran).
+    wait_for(
+        || registry.probe(&terminal_id).is_none(),
+        "registry row removed by the stuck-recovery kill",
+    );
+
+    // (2) NO durable close envelope: no pane close record (journal), no
+    // kill tombstone, and the binding row still stands Bound — the durable
+    // identity retirement never ran. A fresh disk reader agrees.
+    assert!(
+        server_ledger
+            .pane_close_for_terminal(&terminal_id)
+            .is_none(),
+        "stuck-recovery must NOT write the durable pane-close envelope"
+    );
+    let disk = PaneLedger::new(Some(dir.clone()));
+    assert!(
+        disk.list_pane_closes().is_empty(),
+        "no pane close record on disk"
+    );
+    assert!(
+        disk.kill_tombstone_at("claude", &session_id).is_none(),
+        "no durable kill tombstone — recovery will not suppress this session"
+    );
+    assert_eq!(
+        server_ledger
+            .load_binding("claude", &session_id)
+            .expect("the binding row survives the process-only kill")
+            .state,
+        RowState::Bound,
+        "the durable identity retirement was skipped: the session stays resumable"
+    );
+
+    // (3) The session identity is still resolvable (session_ref_for answers
+    // even past an in-memory retire) — the restore:create respawn the
+    // client dispatches next is not suppressed.
+    assert!(
+        state.identity.session_ref_for(&terminal_id).is_some(),
+        "session_ref_for must still answer after a stuck-recovery kill"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// WITHOUT the stuck-recovery reason — absent, or any other value — the
+/// kill keeps today's full durable close semantics byte-for-byte: the
+/// envelope IS written (keyed by the pane's createRequestId), the binding
+/// row retires Closed, and the kill tombstone lands. Guards the branch
+/// against swallowing the legacy path.
+#[tokio::test(flavor = "multi_thread")]
+async fn pane_close_kill_keeps_the_full_durable_close() {
+    let dir = unique_ledger_dir("pane-close-kill");
+    let (url, _registry, server_ledger) =
+        spawn_server_with_ledger(vec![sleeper_cli_spec("claude")], &dir).await;
+    let (mut ws, _inv) = connect_and_capture_inventory(&url).await;
+
+    let create = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-pane-close-kill",
+        "mode": "claude",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+    });
+    ws.send(WsMessage::Text(create.to_string())).await.unwrap();
+    let created = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id = created["terminalId"].as_str().unwrap().to_string();
+    let session_id = created["sessionRef"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Arm 1 — reason ABSENT: the default full close.
+    let kill = serde_json::json!({
+        "type": "terminal.kill",
+        "terminalId": terminal_id,
+        "requestId": "req-kill-plain",
+    });
+    ws.send(WsMessage::Text(kill.to_string())).await.unwrap();
+    let killed = next_frame_of_type(&mut ws, "terminal.killed").await;
+    assert_eq!(
+        killed["success"], true,
+        "the plain kill still succeeds: {killed}"
+    );
+    wait_for(
+        || {
+            server_ledger
+                .pane_close_for_terminal(&terminal_id)
+                .is_some()
+        },
+        "the absent-reason kill writes the pane close record",
+    );
+    let record = server_ledger
+        .pane_close_for_terminal(&terminal_id)
+        .expect("close record");
+    assert_eq!(
+        record.create_request_id.as_deref(),
+        Some("req-pane-close-kill"),
+        "the envelope keys by the pane's createRequestId"
+    );
+    wait_for(
+        || {
+            server_ledger
+                .load_binding("claude", &session_id)
+                .is_some_and(|r| {
+                    r.state == RowState::Retired && r.retired_reason == Some(RetiredReason::Closed)
+                })
+        },
+        "the absent-reason kill retires the binding row Closed",
+    );
+    let disk = PaneLedger::new(Some(dir.clone()));
+    assert!(
+        disk.kill_tombstone_at("claude", &session_id).is_some(),
+        "the durable kill tombstone lands"
+    );
+
+    // Arm 2 — an OTHER reason value: byte-for-byte the same full close.
+    let create2 = serde_json::json!({
+        "type": "terminal.create",
+        "requestId": "req-pane-close-kill-2",
+        "mode": "claude",
+        "shell": "system",
+        "cwd": std::env::temp_dir().to_string_lossy(),
+    });
+    ws.send(WsMessage::Text(create2.to_string())).await.unwrap();
+    let created2 = next_frame_of_type(&mut ws, "terminal.created").await;
+    let terminal_id2 = created2["terminalId"].as_str().unwrap().to_string();
+    let session_id2 = created2["sessionRef"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let kill2 = serde_json::json!({
+        "type": "terminal.kill",
+        "terminalId": terminal_id2,
+        "requestId": "req-kill-other-reason",
+        "reason": "user-close",
+    });
+    ws.send(WsMessage::Text(kill2.to_string())).await.unwrap();
+    let killed2 = next_frame_of_type(&mut ws, "terminal.killed").await;
+    assert_eq!(
+        killed2["success"], true,
+        "the other-reason kill still succeeds: {killed2}"
+    );
+    wait_for(
+        || {
+            server_ledger
+                .load_binding("claude", &session_id2)
+                .is_some_and(|r| {
+                    r.state == RowState::Retired && r.retired_reason == Some(RetiredReason::Closed)
+                })
+        },
+        "an other-reason kill keeps the full durable close",
+    );
+    assert!(
+        server_ledger
+            .pane_close_for_terminal(&terminal_id2)
+            .is_some(),
+        "the other-reason kill writes the close record too"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
 }

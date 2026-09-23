@@ -1,9 +1,11 @@
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import { TerminalStuckSchema } from '@shared/ws-protocol'
 import { collectPaneEntries } from '@/lib/pane-utils'
 import { resolveFreshAgentSessionKey } from '@/lib/pane-activity'
 import type { FreshAgentPaneContent, PaneNode } from './paneTypes'
 import { selectTabPaneByTerminalId } from './selectors/paneTerminalSelectors'
 import { recordTerminalIdle, recordTurnComplete } from './turnCompletionSlice'
+import { clearTerminalStuck, recordTerminalStuck } from './terminalLifecycleSlice'
 import type { AppDispatch, RootState } from './store'
 
 export type ApplyServerIdlePayload = {
@@ -32,6 +34,45 @@ export function applyServerIdle(payload: ApplyServerIdlePayload) {
       at: payload.at,
       reason: payload.reason,
     }))
+  }
+}
+
+export type ApplyTerminalStuckPayload = {
+  type: 'terminal.stuck'
+  terminalId: string
+  at: number
+  stuck: boolean
+}
+
+/**
+ * Server-authoritative wedged-agent flag (`terminal.stuck`) for terminal-mode
+ * agent panes — the terminal-mode twin of freshcodex's `freshAgent.status:
+ * 'stuck'` deadman. Parses the frame with TerminalStuckSchema, resolves the
+ * owning tab/pane by terminalId (the applyServerIdle precedent), and folds
+ * the flag into terminalLifecycleSlice keyed by paneId. NEVER dispatches a
+ * turnCompletion/* action: the stuck card is surface-only — a wedged pane
+ * must not fabricate a completion edge (green/sound), mirroring the
+ * freshcodex deadman contract.
+ */
+export function applyTerminalStuck(payload: ApplyTerminalStuckPayload) {
+  return (dispatch: AppDispatch, getState: () => RootState): void => {
+    const parsed = TerminalStuckSchema.safeParse(payload)
+    if (!parsed.success) return
+    const { terminalId, at, stuck } = parsed.data
+
+    const state = getState()
+    const location = selectTabPaneByTerminalId(state, terminalId)
+    if (!location) return
+
+    if (stuck) {
+      dispatch(recordTerminalStuck({
+        paneId: location.paneId,
+        terminalId,
+        at,
+      }))
+    } else {
+      dispatch(clearTerminalStuck({ paneId: location.paneId }))
+    }
   }
 }
 

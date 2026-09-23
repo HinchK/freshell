@@ -532,6 +532,69 @@ pub fn spawn_idle_monitor(
     });
 }
 
+/// Serialize one `terminal.stuck` transition frame and broadcast it. The
+/// PURE, unit-testable seam of the wedged-agent-pane backstop
+/// (wedge-backstop Task 3): the wedged row state — meaningful clock stale
+/// past the window WHILE raw output stays fresh — is only constructible
+/// through the registry crate's in-file test helpers, so cross-crate tests
+/// drive THIS function with constructed transitions while Task 1's in-file
+/// suite pins the sweep that produces them. Pre-serializes exactly like
+/// every other broadcast bus frame (a `String` per message).
+pub fn broadcast_stuck_frame(
+    transition: &freshell_terminal::StuckTransition,
+    broadcast_tx: &tokio::sync::broadcast::Sender<String>,
+) {
+    let msg = freshell_protocol::ServerMessage::TerminalStuck(freshell_protocol::TerminalStuck {
+        terminal_id: transition.terminal_id.clone(),
+        at: transition.at,
+        stuck: transition.stuck,
+    });
+    if let Ok(json) = serde_json::to_string(&msg) {
+        let _ = broadcast_tx.send(json);
+    }
+}
+
+/// Start the wedged-agent-pane monitor (wedge-backstop Task 3): the
+/// terminal-mode analogue of the freshcodex quiet deadman — a periodic
+/// [`TerminalRegistry::enforce_stuck_detection`] sweep whose transitions
+/// broadcast `terminal.stuck` to every authenticated client (the pane then
+/// renders the "Agent appears stuck" card with kill/restart actions). Same
+/// cadence contract as [`spawn_idle_monitor`] (30s production / 250ms under
+/// the test clock); lives here, not `freshell-terminal`, for the same
+/// tokio-free-registry reason as the idle monitor. Surface-only: nothing is
+/// killed here — the deadman contract (no fabricated turn-complete, no
+/// auto-kill, non-wedged panes untouched) is the sweep's, pinned by Task 1's
+/// suite; the composition is three lines whose components are each pinned
+/// (the sweep in-file, the frame by the ws tests, the end-to-end flag by the
+/// e2e).
+pub fn spawn_stuck_monitor(
+    registry: freshell_terminal::TerminalRegistry,
+    broadcast_tx: std::sync::Arc<tokio::sync::broadcast::Sender<String>>,
+    sweep_interval: std::time::Duration,
+) {
+    spawn_periodic(sweep_interval, move || {
+        for transition in registry.enforce_stuck_detection() {
+            broadcast_stuck_frame(&transition, &broadcast_tx);
+        }
+    });
+}
+
+/// `FRESHELL_TERMINAL_STUCK_WINDOW_MS` override for the stuck window
+/// (wedge-backstop Task 3): any parseable integer is used AS-IS — 0 or
+/// negative DISABLES detection, mirroring `auto_kill_idle_minutes`' disable
+/// semantics (the registry sweep's `window <= 0` guard) — and only
+/// unset/unparseable values fall back to
+/// [`freshell_terminal::DEFAULT_STUCK_WINDOW_MS`]. Mirrors the freshcodex
+/// `FRESHELL_FRESHCODEX_QUIET_WINDOW_MS` env contract shape (codex.rs)
+/// with the disable sentinels deliberately passed through rather than
+/// filtered.
+pub fn stuck_window_ms_from_env() -> i64 {
+    std::env::var("FRESHELL_TERMINAL_STUCK_WINDOW_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok())
+        .unwrap_or(freshell_terminal::DEFAULT_STUCK_WINDOW_MS)
+}
+
 /// Build the ordered connect-handshake the original emits on a clean isolated
 /// boot. The `bootId` is shared by value between `ready` and `terminal.inventory`
 /// so both normalize to the same placeholder (the cross-message invariant).

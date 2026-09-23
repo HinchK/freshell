@@ -24,11 +24,25 @@ export interface PaneLifecycleEntry {
   settle?: { resumeCycles?: number }
 }
 
-interface TerminalLifecycleState {
-  byPaneId: Record<string, PaneLifecycleEntry>
+/** Wedge-backstop (LB-8): the per-pane wedged-agent flag folded from
+ * `terminal.stuck`. The flagged terminalId is stored WITH the entry —
+ * terminalId churn happens exactly on kill/respawn/replacement, which is
+ * when a prior flag is stale. */
+export interface TerminalStuckEntry {
+  at: number
+  terminalId: string
 }
 
-const initialState: TerminalLifecycleState = { byPaneId: {} }
+interface TerminalLifecycleState {
+  byPaneId: Record<string, PaneLifecycleEntry>
+  /** Wedge-backstop: keyed by paneId (the exit handler clears
+   * paneContent.terminalId, so an exited pane has no terminal id to key
+   * by — same reasoning as byPaneId). NOT persisted (this slice is never
+   * in the persist allowlist). */
+  stuckAtByPaneId: Record<string, TerminalStuckEntry>
+}
+
+const initialState: TerminalLifecycleState = { byPaneId: {}, stuckAtByPaneId: {} }
 
 const entry = (state: TerminalLifecycleState, paneId: string) =>
   (state.byPaneId[paneId] ??= {})
@@ -56,6 +70,9 @@ const slice = createSlice({
       // an earlier breaker settle's resumeCycles, or the alert would read
       // "crashed N times — auto-resume paused" on a non-breaker crash.
       delete e.settle
+      // Wedge-backstop belt (LB-8): the process died — its stuck flag
+      // cannot outlive it.
+      delete state.stuckAtByPaneId?.[a.payload.paneId]
     },
     recordAutoResumeRecovering(state, a: PayloadAction<{ paneId: string; attempt: number; maxAttempts: number; exitCode: number; at: number }>) {
       const { paneId, ...n } = a.payload
@@ -71,6 +88,14 @@ const slice = createSlice({
       // Stale-settle leak fix (validated A15, pairs with recordTerminalExit).
       delete e.settle
       e.lastTerminalId = newTerminalId
+      // Wedge-backstop belt (LB-8), keyed on newTerminalId: a replacement
+      // terminal supersedes the pane's runtime, so a stuck entry for the OLD
+      // terminal cannot survive it. A (defensive) replacement naming the
+      // flagged terminal itself keeps the flag — never flag-swallowing.
+      const stuck = state.stuckAtByPaneId?.[paneId]
+      if (stuck !== undefined && stuck.terminalId !== newTerminalId) {
+        delete state.stuckAtByPaneId?.[paneId]
+      }
     },
     // Settle frame (terminal.status status:'exited') — the deterministic
     // replacement for the old 30s TTL guess (znhn item 3).
@@ -107,6 +132,30 @@ const slice = createSlice({
     },
     clearTerminalLifecycle(state, a: PayloadAction<{ paneId: string }>) {
       delete state.byPaneId[a.payload.paneId]
+      // Wedge-backstop belt (LB-8): relaunch/respawn discards the pane's
+      // stale presentation state — the stuck flag included.
+      delete state.stuckAtByPaneId?.[a.payload.paneId]
+    },
+    // ── Wedge-backstop stuck entries (LB-8) ──
+    // Folded from the server-authoritative `terminal.stuck` broadcast via
+    // applyTerminalStuck (turnCompletionThunks.ts). Surface-only state: it
+    // renders the "Agent appears stuck" card and NEVER feeds the
+    // turn-completion pipeline.
+    recordTerminalStuck(state, a: PayloadAction<{ paneId: string; terminalId: string; at: number }>) {
+      // `??=` defends the pre-existing partial test stores that materialize
+      // this slice WITHOUT the newer stuck key (the selector-tolerance
+      // convention documented below).
+      const stuck = (state.stuckAtByPaneId ??= {})
+      stuck[a.payload.paneId] = { at: a.payload.at, terminalId: a.payload.terminalId }
+    },
+    clearTerminalStuck(state, a: PayloadAction<{ paneId: string }>) {
+      delete state.stuckAtByPaneId?.[a.payload.paneId]
+    },
+    clearTerminalStuckIfOtherTerminal(state, a: PayloadAction<{ paneId: string; terminalId: string }>) {
+      const stuck = state.stuckAtByPaneId?.[a.payload.paneId]
+      if (stuck !== undefined && stuck.terminalId !== a.payload.terminalId) {
+        delete state.stuckAtByPaneId?.[a.payload.paneId]
+      }
     },
   },
 })
@@ -114,6 +163,7 @@ const slice = createSlice({
 export const {
   recordTerminalExit, recordAutoResumeRecovering, foldTerminalReplacement,
   recordAutoResumeSettled, clearRecoveringNotices, clearTerminalLifecycle,
+  recordTerminalStuck, clearTerminalStuck, clearTerminalStuckIfOtherTerminal,
 } = slice.actions
 export default slice.reducer
 
@@ -137,3 +187,10 @@ export const selectActiveNotice = (root: { terminalLifecycle?: TerminalLifecycle
   selectActiveNoticeFrom(root.terminalLifecycle, paneId)
 export const selectResumeCycles = (root: { terminalLifecycle?: TerminalLifecycleState }, paneId: string) =>
   root.terminalLifecycle?.byPaneId[paneId]?.settle?.resumeCycles
+// Wedge-backstop: the pane's wedged-agent flag (undefined = not flagged).
+// `?.` on the stuck map mirrors the slice-level tolerance for partial test
+// stores materialized before the key existed.
+export const selectStuckEntryFrom = (s: TerminalLifecycleState | undefined, paneId: string) =>
+  s?.stuckAtByPaneId?.[paneId]
+export const selectStuckEntry = (root: { terminalLifecycle?: TerminalLifecycleState }, paneId: string) =>
+  selectStuckEntryFrom(root.terminalLifecycle, paneId)
