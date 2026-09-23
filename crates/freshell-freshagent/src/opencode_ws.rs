@@ -9673,6 +9673,28 @@ mod tests {
             Some("ses_1"),
             "fixture: the send materialized the durable id (and committed Live{{FreshAgent}})"
         );
+        // The materialize spawn's ownership commit (Live{FreshAgent} on the
+        // durable key) lands asynchronously AFTER the durable id itself;
+        // on a contended 2-core CI runner the test can outrun it (observed
+        // twice on CI: begin_handoff met a not-yet-Live key and the fixture
+        // assert panicked — never on the 96-core dev box). Poll the
+        // registry until the committed precondition is observable instead
+        // of assuming the spawn completed; the bound trips only if the
+        // commit never lands at all.
+        let mut commit_polls = 0u32;
+        loop {
+            let snap = registry.observe("opencode", "ses_1");
+            if matches!(snap.state, freshell_ownership::OwnershipState::Live { .. }) {
+                break;
+            }
+            commit_polls += 1;
+            assert!(
+                commit_polls < 10_000,
+                "fixture: the materialize spawn never committed Live{{FreshAgent}} \
+                 ownership for ses_1: {snap:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
         // The refusal precondition: a handoff owns the durable key's
         // transition, so the kill's fenced stop is typed-blocked.
         let freshell_ownership::BeginOutcome::Granted { .. } = registry.begin_handoff(
