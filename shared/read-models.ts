@@ -1,5 +1,6 @@
 import { z } from 'zod'
 import type { LocalSettingsPatch, ServerSettings } from './settings.js'
+import { SessionNameRefSchema } from './session-names.js'
 import { TokenSummarySchema } from './ws-protocol.js'
 
 export const MAX_BOOTSTRAP_PAYLOAD_BYTES = 12 * 1024
@@ -83,6 +84,16 @@ export const SessionDirectoryItemSchema = z.object({
   titleOverridden: z.boolean().optional(),
   providerTitle: z.string().optional(),
   titleOverrideSource: z.enum(['user', 'ai', 'first-message', 'legacy', 'dir']).optional(),
+  /**
+   * Unified agent names (Task 2 projection): the canonical naming identity
+   * for this row's session (pending handle before durable identity exists)
+   * and the durable record's CURRENT name — merged by the server onto every
+   * directory row additively. The client's sidebar rows forward both so a
+   * fresh second client can bootstrap its sessionNames cache from them
+   * (its ready-time batch read races its own state hydration).
+   */
+  nameRef: SessionNameRefSchema.optional(),
+  sessionName: z.string().optional(),
 })
 
 /**

@@ -522,7 +522,16 @@ enum SignalDisposition {
 /// One signal through the ladder. Returns the file's disposition: `Acted`
 /// and `Discard` delete the file; `Retain` keeps it for a later sweep.
 async fn apply_opencode_signal(state: &WsState, sig: &OpencodeSignal) -> SignalDisposition {
-    let Some(current) = state.identity.get(&sig.terminal_id) else {
+    // A naming-admission-only row (provider absent — `admit_create_naming`
+    // seeds the pre-durable pending binding before any provider identity
+    // exists) is NOT a foreign-provider row: the pane simply has no identity
+    // yet, so the signal takes the same first-bind arbitration as a pane
+    // with no row at all.
+    let current = match state.identity.get(&sig.terminal_id) {
+        Some(row) if row.provider.is_some() => Some(row),
+        _ => None,
+    };
+    let Some(current) = current else {
         // (0a) D1.2 first-bind arbitration — the registry's per-terminal
         // identity probe carries exactly the fields the arbitration needs
         // (mode / status / resume_session_id / cwd).

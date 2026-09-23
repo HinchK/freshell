@@ -1,6 +1,8 @@
 import { updateTab } from '@/store/tabsSlice'
 import { reconcileTerminalSessionRefByTerminalId } from '@/store/panesSlice'
 import { updateSessionActivity } from '@/store/sessionActivitySlice'
+import { receiveSessionNames } from '@/store/sessionNamesSlice'
+import { bootstrapSessionNames } from '@/lib/session-names'
 import {
   buildTerminalDurableSessionRefUpdate,
   flushPersistedLayoutNow,
@@ -243,6 +245,28 @@ export function reconcileTerminalSessionAssociation({
   if (!matchedAnyPane) return 'ignored'
 
   dispatch(reconcileTerminalSessionRefByTerminalId({ terminalId, sessionRef }))
+
+  // Unified agent names (Task 5): the accepted rebind also moves the pane's
+  // NAMING binding — the display selector resolves through the pane content's
+  // current sessionRef, which the fold above just updated. Fetch the new
+  // session's canonical record immediately (stale-input protection: a record
+  // the client never held can otherwise wait for the next push/bootstrap).
+  // The fold is by revision, so this is idempotent with the live broadcast.
+  if (
+    sessionRef.provider === 'claude'
+    || sessionRef.provider === 'codex'
+    || sessionRef.provider === 'opencode'
+  ) {
+    void bootstrapSessionNames([{
+      kind: 'session',
+      provider: sessionRef.provider,
+      sessionId: sessionRef.sessionId,
+    }])
+      .then((updates) => {
+        if (updates.length > 0) dispatch(receiveSessionNames(updates))
+      })
+      .catch(() => { /* the session.name.updated push converges this later */ })
+  }
 
   for (const { tabId, content } of matchedSinglePaneTabs) {
     const tab = state.tabs.tabs.find((candidate) => candidate.id === tabId)

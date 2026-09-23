@@ -17,11 +17,11 @@ const params = (required: readonly string[] = [], optional: readonly string[] = 
 
 /** The closed Rust client contract: 33 canonical actions and 14 tmux aliases. */
 export const ACTION_CAPABILITIES: readonly ActionCapability[] = [
-  { action: 'new-tab', aliases: ['new-window', 'new-session'], supported: true, params: params([], ['name', 'mode', 'shell', 'cwd', 'browser', 'editor', 'hostStats', 'resume', 'resumeSessionId', 'sessionRef', 'prompt', 'agent', 'model', 'effort']) },
+  { action: 'new-tab', aliases: ['new-window', 'new-session'], supported: true, params: params([], ['name', 'nameIntent', 'mode', 'shell', 'cwd', 'browser', 'editor', 'hostStats', 'resume', 'resumeSessionId', 'sessionRef', 'prompt', 'agent', 'model', 'effort']) },
   { action: 'list-tabs', aliases: ['list-windows'], supported: true, params: noParams },
   { action: 'select-tab', aliases: ['select-window'], supported: true, params: params(['target']) },
   { action: 'kill-tab', aliases: ['kill-window'], supported: true, params: params(['target']) },
-  { action: 'rename-tab', aliases: ['rename-window'], supported: true, params: params(['name'], ['target']) },
+  { action: 'rename-tab', aliases: ['rename-window'], supported: true, params: params(['name'], ['target', 'nameIntent']) },
   { action: 'next-tab', aliases: ['next-window'], supported: true, params: noParams },
   { action: 'prev-tab', aliases: ['previous-window', 'prev-window'], supported: true, params: noParams },
   { action: 'split-pane', aliases: ['split-window'], supported: true, params: params([], ['target', 'direction', 'mode', 'shell', 'cwd', 'browser', 'editor', 'hostStats', 'resume', 'sessionRef']) },
@@ -30,7 +30,7 @@ export const ACTION_CAPABILITIES: readonly ActionCapability[] = [
   { action: 'has-tab', supported: true, params: params(['target']) },
   { action: 'list-panes', supported: true, params: params([], ['target']) },
   { action: 'select-pane', supported: true, params: params(['target']) },
-  { action: 'rename-pane', supported: true, params: params(['name'], ['target']) },
+  { action: 'rename-pane', supported: true, params: params(['name'], ['target', 'nameIntent']) },
   { action: 'kill-pane', supported: true, params: params(['target']) },
   { action: 'resize-pane', supported: true, params: params(['target'], ['x', 'y', 'sizes']) },
   { action: 'swap-pane', supported: true, params: params(['target', 'with']) },

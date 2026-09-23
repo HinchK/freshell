@@ -1249,6 +1249,42 @@ const server = http.createServer(async (req, res) => {
       return
     }
 
+    // Unified agent names (Task 8): the real serve's title metadata surface —
+    // PATCH /session/:id {title} updates the row, answers the refreshed row,
+    // and emits the writer's `session.updated` event carrying BOTH the
+    // `sessionID` and `info.id` (the server's event parser's fallback key).
+    if (action === '' && req.method === 'PATCH') {
+      const body = parseJsonText(await readRequestBody(req)) || {}
+      const title = typeof body.title === 'string' ? body.title.trim() : ''
+      if (title.length === 0) {
+        sendJson(res, 400, { error: 'a title rename requires a non-empty title', sessionId })
+        return
+      }
+      const db = openDatabase()
+      try {
+        ensureSchema(db)
+        db.prepare('UPDATE session SET title = ?, time_updated = ? WHERE id = ?')
+          .run(title, Date.now(), sessionId)
+        session = sessionRow(db, sessionId)
+      } finally {
+        db.close()
+      }
+      appendAudit({
+        event: 'session_patch_title',
+        sessionId,
+        title,
+        routeDirectory: directory,
+        directory: session.directory,
+      })
+      const info = readSessionInfo(session)
+      broadcastServeEvent({
+        type: 'session.updated',
+        properties: { sessionID: sessionId, info },
+      })
+      sendJson(res, 200, info)
+      return
+    }
+
     if (action === 'prompt_async' && req.method === 'POST') {
       const body = parseJsonText(await readRequestBody(req)) || {}
       const parts = Array.isArray(body.parts) ? body.parts : []

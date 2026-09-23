@@ -329,6 +329,22 @@ struct TerminalShared {
     /// Starts `true` (a never-attached row keeps legacy fast-reap
     /// eligibility); any successful attach flips it `false`.
     released_by_client: bool,
+    /// Unified agent names (Task 2): the naming identity this terminal's
+    /// saved name resolves through (pending handle before verified
+    /// materialization, durable provider/session ref after). Retained on
+    /// the registry row so every inventory/projection reader can carry it
+    /// without a round-trip through the identity registry. `None` for
+    /// terminals outside the six unified modes.
+    name_ref: Option<freshell_protocol::session_names::SessionNameRef>,
+    /// Unified agent names: the pre-durable naming handle retained beside
+    /// `name_ref` (the durability-driven bind lanes read it after a
+    /// restart-remint of the createRequestId).
+    naming_handle: Option<String>,
+    /// Unified agent names: the last-known canonical name record (a display
+    /// cache ONLY — never an accepted name input; the `session.name.updated`
+    /// broadcast and store reads are the authority). Updated by the naming
+    /// publisher on every committed change and at scoped create.
+    session_name: Option<freshell_protocol::session_names::SessionNameRecord>,
 }
 
 impl TerminalShared {
@@ -360,6 +376,8 @@ impl TerminalShared {
             description: self.description.clone(),
             runtime_status: None,
             session_ref: None,
+            session_name: self.session_name.clone(),
+            name_ref: self.name_ref.clone(),
         }
     }
 }
@@ -406,6 +424,17 @@ pub struct DirectoryEntry {
     /// `record.buffer.snapshot()` — both sides are byte-capped rings, so this is
     /// the same tail the original's `lastEmittedLine` reads).
     pub snapshot: String,
+    /// Unified agent names (Task 2): the terminal's naming binding (pending
+    /// handle before verified materialization, durable provider/session ref
+    /// after) — additive on the `/api/terminals` row so readers carry the
+    /// same identity the rename routes target. `None` for terminals outside
+    /// the six unified modes.
+    pub name_ref: Option<freshell_protocol::session_names::SessionNameRef>,
+    /// Unified agent names: the last-known canonical name record (a display
+    /// cache only — the store and its `session.name.updated` broadcasts are
+    /// the authority). `None` until the naming publisher or a scoped create
+    /// stamps it.
+    pub session_name: Option<freshell_protocol::session_names::SessionNameRecord>,
 }
 
 /// The registry's control handle for one terminal: the shared stream state plus the
@@ -1677,6 +1706,9 @@ impl TerminalRegistry {
             create_request_id: create_request_id.map(str::to_string),
             subscribers: HashMap::new(),
             released_by_client: true,
+            name_ref: None,
+            naming_handle: None,
+            session_name: None,
         }));
 
         // The reader thread invokes this for every framed terminal.output: append to
@@ -2598,10 +2630,147 @@ impl TerminalRegistry {
         shared.map(|s| s.lock().expect("terminal lock").title.clone())
     }
 
+    /// Single-id read of a terminal's launch MODE — the same field the
+    /// create path stamps onto the record (`"shell"`, a scoped CLI mode, or
+    /// a fresh session type); `None` for an unknown terminal id. Added for
+    /// the auto-title sweep's kilroy-only discrimination (unified agent
+    /// names Task 4, review I3): a metadata-typed kilroy session whose live
+    /// matches hold no scoped mode keeps the legacy ladder, while a live
+    /// scoped-mode terminal means the durable session is also open through
+    /// a supported mode (the singular-record rule).
+    pub fn mode_of(&self, terminal_id: &str) -> Option<String> {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
+        };
+        shared.map(|s| s.lock().expect("terminal lock").mode.clone())
+    }
+
     /// `registry.updateDescription()` — the PATCH write-through for
     /// `descriptionOverride` (`terminals-router.ts:304`).
     pub fn update_description(&self, terminal_id: &str, description: &str) {
         self.set_meta(terminal_id, None, Some(description.to_string()), None, None);
+    }
+
+    // ── Unified agent names (Task 2): naming metadata/accessors ────────────
+
+    /// Unified agent names: write a terminal's naming binding (each
+    /// `Option`-write argument keeps its current value when `None` — a
+    /// binding advances, never erases). The registry row RETAINS
+    /// `nameRef`/`namingHandle` so inventory/projection readers carry them
+    /// without a round-trip; the existing session ownership logic is
+    /// untouched.
+    pub fn set_naming(
+        &self,
+        terminal_id: &str,
+        name_ref: Option<freshell_protocol::session_names::SessionNameRef>,
+        naming_handle: Option<String>,
+    ) {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
+        };
+        if let Some(shared) = shared {
+            let mut s = shared.lock().expect("terminal lock");
+            if let Some(reference) = name_ref {
+                s.name_ref = Some(reference);
+            }
+            if let Some(handle) = naming_handle {
+                s.naming_handle = Some(handle);
+            }
+        }
+    }
+
+    /// Unified agent names: refresh the terminal's last-known canonical name
+    /// projection (display cache only — never an accepted name input). The
+    /// naming publisher calls this on every committed change; it also
+    /// write-throughs the display title so the terminal presents the accepted
+    /// name (the title string is a cache, per the rename-scope contract).
+    pub fn update_session_name(
+        &self,
+        terminal_id: &str,
+        record: &freshell_protocol::session_names::SessionNameRecord,
+    ) {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
+        };
+        if let Some(shared) = shared {
+            let mut s = shared.lock().expect("terminal lock");
+            s.session_name = Some(record.clone());
+            s.title = record.name.clone();
+        }
+    }
+
+    /// Unified agent names: the terminal's last-known canonical name record
+    /// (display cache), if any.
+    pub fn session_name_of(
+        &self,
+        terminal_id: &str,
+    ) -> Option<freshell_protocol::session_names::SessionNameRecord> {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
+        };
+        shared.and_then(|s| s.lock().expect("terminal lock").session_name.clone())
+    }
+
+    /// Unified agent names: the naming identity this terminal's name
+    /// resolves through, if any.
+    pub fn name_ref_of(
+        &self,
+        terminal_id: &str,
+    ) -> Option<freshell_protocol::session_names::SessionNameRef> {
+        let shared = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .get(terminal_id)
+                .map(|h| Arc::clone(&h.shared))
+        };
+        shared.and_then(|s| s.lock().expect("terminal lock").name_ref.clone())
+    }
+
+    /// Unified agent names: every terminal row currently bound to `name_ref`
+    /// (live OR exited — the display cache follows the binding, not the
+    /// process). The naming publisher uses this to refresh caches after a
+    /// committed change.
+    pub fn terminals_bound_to(
+        &self,
+        name_ref: &freshell_protocol::session_names::SessionNameRef,
+    ) -> Vec<String> {
+        let shareds: Vec<Arc<Mutex<TerminalShared>>> = {
+            let inner = self.inner.lock().expect("registry lock");
+            inner
+                .terminals
+                .values()
+                .map(|h| Arc::clone(&h.shared))
+                .collect()
+        };
+        shareds
+            .into_iter()
+            .filter(|shared| {
+                shared
+                    .lock()
+                    .expect("terminal lock")
+                    .name_ref
+                    .as_ref()
+                    .is_some_and(|bound| bound == name_ref)
+            })
+            .map(|shared| shared.lock().expect("terminal lock").terminal_id.clone())
+            .collect()
     }
 
     /// `registry.list()` as consumed by the `/api/terminals` directory
@@ -2634,6 +2803,8 @@ impl TerminalRegistry {
                     has_clients: !s.subscribers.is_empty(),
                     cwd: s.cwd.clone(),
                     snapshot: s.replay.iter().map(|f| f.output.data.as_str()).collect(),
+                    name_ref: s.name_ref.clone(),
+                    session_name: s.session_name.clone(),
                 }
             })
             .collect()
@@ -2681,6 +2852,9 @@ impl TerminalRegistry {
             create_request_id,
             subscribers: HashMap::new(),
             released_by_client: true,
+            name_ref: None,
+            naming_handle: None,
+            session_name: None,
         }));
         {
             let mut inner = self.inner.lock().expect("registry lock");

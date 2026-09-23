@@ -90,6 +90,10 @@ function writeArtifact(
   writeFileSync(path.join(root, 'claude-sidecar', 'package.json'), JSON.stringify({ name: 'freshell-claude-sidecar', version: '0.1.0' }))
   writeFileSync(path.join(root, 'claude-sidecar', 'permission-channel.mjs'), 'export {}\n')
   writeFileSync(path.join(root, 'claude-sidecar', 'session-settings.mjs'), 'export const configureSession = () => ({})\n')
+  // The runtime allowlist requires the session-names helper (the unified
+  // naming writeback's sidecar entry) — the artifact contract includes it,
+  // so the fixture must write it like every other required file.
+  writeFileSync(path.join(root, 'claude-sidecar', 'session-names.mjs'), 'export {}\n')
   writeFileSync(path.join(root, 'claude-sidecar', 'model-catalog.mjs'), 'export const probeModelCatalog = () => []\n')
   writeFileSync(path.join(root, 'claude-sidecar', 'node_modules', '@anthropic-ai', 'claude-agent-sdk', 'package.json'), '{}')
   mkdirSync(path.join(root, 'mcp', 'node_modules', '@modelcontextprotocol', 'sdk'), { recursive: true })

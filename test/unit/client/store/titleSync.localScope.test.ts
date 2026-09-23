@@ -2,8 +2,14 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { configureStore } from '@reduxjs/toolkit'
 import tabsReducer, { addTab } from '@/store/tabsSlice'
 import panesReducer, { initLayout, splitPane } from '@/store/panesSlice'
+import sessionNamesReducer, { receiveSessionNames } from '@/store/sessionNamesSlice'
 import type { PaneContent, PaneNode } from '@/store/paneTypes'
 import { applyPaneRename, applyTabRename } from '@/store/titleSync'
+import {
+  selectPaneDisplayName,
+  selectTabDisplayName,
+} from '@/store/selectors/sessionNameSelectors'
+import type { SessionNameUpdate } from '@shared/session-names'
 
 vi.mock('nanoid', () => { let n = 0; return { nanoid: vi.fn(() => `pane-${++n}`) } })
 
@@ -97,5 +103,42 @@ describe('pane/tab rename local scope (b5fb)', () => {
     store.dispatch(applyPaneRename({ tabId, paneId, title: 'My Shell' }))
     expect(store.getState().panes.paneTitles[tabId][paneId]).toBe('My Shell')
     expect(apiMocks.patch).not.toHaveBeenCalled()
+  })
+
+  /**
+   * Unified agent names (Task 5): the local rename thunks remain the LEGACY
+   * organization path — a scoped agent pane/tab displays its canonical
+   * session name regardless of them, and their sticky flags can never
+   * override a cached canonical record. (The scoped RENAME path itself —
+   * captured target, user intent, canonical fold — is pinned in
+   * UnifiedAgentRename.test.tsx.)
+   */
+  it('a scoped pane/tab ignores the legacy local renames for display: the canonical name wins over the sticky flag', () => {
+    const sessionRef = { kind: 'session' as const, provider: 'claude' as const, sessionId: 'scoped-sess' }
+    const store = configureStore({
+      reducer: { tabs: tabsReducer, panes: panesReducer, sessionNames: sessionNamesReducer },
+    })
+    store.dispatch(receiveSessionNames([{
+      record: { ref: sessionRef, name: 'Canonical name', source: 'freshell_ai', revision: 3 },
+      documentGeneration: 30,
+      redirects: [],
+      changed: true,
+    } satisfies SessionNameUpdate]))
+    store.dispatch(addTab({ title: 'x', mode: 'claude' }))
+    const tabId = store.getState().tabs.tabs[0].id
+    store.dispatch(initLayout({
+      tabId,
+      content: { kind: 'terminal', mode: 'claude', terminalId: 'term-9', sessionRef: { provider: 'claude', sessionId: 'scoped-sess' } },
+    }))
+    const paneId = (store.getState().panes.layouts[tabId] as Extract<PaneNode, { type: 'leaf' }>).id
+
+    // Legacy local renames still write their fields...
+    store.dispatch(applyPaneRename({ tabId, paneId, title: 'Local organization label' }) as never)
+    store.dispatch(applyTabRename({ tabId, title: 'Local tab label' }) as never)
+    expect(store.getState().panes.paneTitleSetByUser[tabId][paneId]).toBe(true)
+
+    // ...but a scoped surface never displays them: the canonical name wins.
+    expect(selectPaneDisplayName(store.getState(), tabId, paneId)).toBe('Canonical name')
+    expect(selectTabDisplayName(store.getState(), tabId)).toBe('Canonical name')
   })
 })

@@ -972,6 +972,10 @@ mod tests {
             notice: None,
             restore_error: None,
             session_ref: None,
+            // Unified agent names: the settle frame is a wire-shape fixture;
+            // replayed frames carry their original projection.
+            session_name: None,
+            name_ref: None,
         })
     }
 }

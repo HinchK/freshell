@@ -68,6 +68,60 @@ pub fn locate_transcript(session_id: &str) -> Option<PathBuf> {
         .find_map(|root| find_transcript(root, session_id))
 }
 
+/// Unified agent names (Task 2): a located transcript PLUS the routing
+/// evidence the naming store retains with the record — the SELECTED root
+/// the transcript was found under (never an ambient default) and the
+/// transcript's original cwd.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectedTranscript {
+    /// The config root the transcript was located under (the store-root
+    /// candidate that matched — `CLAUDE_CONFIG_DIR` > `CLAUDE_HOME` >
+    /// platform home `.claude`).
+    pub config_root: PathBuf,
+    /// The transcript file's absolute path.
+    pub transcript_path: PathBuf,
+    /// The session's ORIGINAL cwd (first non-empty `cwd` in the transcript,
+    /// bounded read) — the native location's routing input.
+    pub transcript_cwd: Option<String>,
+}
+
+/// Unified agent names (Task 2): locate a transcript and answer its
+/// SELECTED root + original cwd — the exact evidence a verified claude
+/// naming acquisition carries. Uses the same ordered candidates and
+/// traversal as [`locate_transcript`] (one definition of "the transcript
+/// exists"), plus the PLATFORM home fallback: on native Windows a missing
+/// `HOME` still resolves through `%USERPROFILE%\.claude` (the real CLI's
+/// home), so a session created by the Windows CLI is verifiable from the
+/// service host. `None` when the transcript cannot be located anywhere.
+pub fn locate_transcript_selected(session_id: &str) -> Option<SelectedTranscript> {
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut candidates = claude_home_candidates();
+    // Platform home fallback (native Windows): `HOME` is frequently absent
+    // for a service host; the CLI resolves `~` through USERPROFILE there.
+    #[cfg(windows)]
+    if !candidates.iter().any(|root| root.ends_with(".claude")) {
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            if !profile.is_empty() {
+                let root = PathBuf::from(profile).join(".claude");
+                if !candidates.contains(&root) {
+                    candidates.push(root);
+                }
+            }
+        }
+    }
+    for root in candidates {
+        if let Some(path) = find_transcript(&root, session_id) {
+            let transcript_cwd = transcript_cwd_bounded(&path);
+            return Some(SelectedTranscript {
+                config_root: root,
+                transcript_path: path,
+                transcript_cwd,
+            });
+        }
+    }
+    None
+}
+
 /// The session's ORIGINAL cwd: first non-empty `cwd` field among the transcript's
 /// lines (100% of real user/assistant lines carry it -- ledger A5 census). Needed
 /// because the CLI's resume lookup is scoped to the original cwd's project slug
@@ -1660,6 +1714,52 @@ mod tests {
             }
             other => panic!("expected Io (cannot-check must not deny), got {other:?}"),
         }
+    }
+
+    /// Unified agent names (Task 2 review, M3): `locate_transcript_selected`
+    /// — the verified-evidence source for every claude bind (tick, signal
+    /// lane, fresh init) — answers the SELECTED config root, the transcript
+    /// path, and the transcript's ORIGINAL cwd for a transcript planted
+    /// under the `CLAUDE_CONFIG_DIR` candidate, and agrees with
+    /// [`locate_transcript`] on the same ordered candidates (one definition
+    /// of "the transcript exists"). Env vars are process-global — serialize
+    /// under the shared claude env lock.
+    #[tokio::test]
+    async fn locate_transcript_selected_answers_root_path_and_cwd_under_config_dir() {
+        let _guard = crate::claude::tests::CLAUDE_ENV_LOCK.lock().await;
+        let _restore = EnvVarsRestore::remove_all(&["CLAUDE_CONFIG_DIR", "CLAUDE_HOME", "HOME"]);
+        let store = temp_home();
+        std::env::set_var("CLAUDE_CONFIG_DIR", store.path());
+        let id = "66666666-6666-4666-8666-666666666666";
+        let dir = store.path().join("projects").join("-selected-proj");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("{id}.jsonl"));
+        std::fs::write(
+            &file,
+            "{\"type\":\"user\",\"cwd\":\"/orig/cwd\",\"message\":\"hi\"}\n",
+        )
+        .unwrap();
+
+        let selected = locate_transcript_selected(id).expect("the planted transcript locates");
+        // The SELECTED root is the candidate that matched — never an ambient
+        // default — and the routing evidence answers with it.
+        assert_eq!(
+            selected.config_root,
+            store.path(),
+            "the selected config root must be the CLAUDE_CONFIG_DIR candidate"
+        );
+        assert_eq!(selected.transcript_path, file);
+        assert_eq!(
+            selected.transcript_cwd.as_deref(),
+            Some("/orig/cwd"),
+            "the transcript's original cwd is the routing input"
+        );
+        // Ordering parity: the same ordered candidates, so the same file.
+        assert_eq!(locate_transcript(id), Some(file));
+        // A miss everywhere answers None for BOTH locators.
+        let absent = "77777777-7777-4777-8777-777777777777";
+        assert!(locate_transcript_selected(absent).is_none());
+        assert!(locate_transcript(absent).is_none());
     }
 
     // ── kata 1wxv Task 4: resume-point math + real-uuid turn ids ────────────

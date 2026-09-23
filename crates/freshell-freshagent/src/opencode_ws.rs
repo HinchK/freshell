@@ -150,6 +150,13 @@ pub struct FreshOpencodeState {
     /// its only wait point is the per-session mutex, so a send issued mid-rollback
     /// blocks behind it, then proceeds and destroys redo (no circular wait).
     rollback_in_flight: crate::InFlightRegistry,
+    /// Unified agent names (Task 2): the injected naming authority — same
+    /// set-once/shared model as [`Self::identity_sink`]. Wired by
+    /// `freshell-server::main`; unwired = scoped naming fails unavailable.
+    /// The placeholder→handle stash lives on the shared
+    /// [`Self::fresh_agent`] so the REST spawn pipeline and this WS slice
+    /// resolve the SAME handle for `freshopencode-<createRequestId>`.
+    naming: crate::naming::NamingSink,
     /// b8ke focused round-2 review R2-1: the CONDEMNED-SESSION record —
     /// the canonical real `ses_*` id → the daemon-side quiescence identity
     /// (the accepted-turn flag + the session's route) every
@@ -614,6 +621,7 @@ impl FreshOpencodeState {
             terminal_liveness: Arc::new(|_, _| false),
             fork_in_flight: crate::InFlightRegistry::new(),
             rollback_in_flight: crate::InFlightRegistry::new(),
+            naming: crate::naming::NamingSink::default(),
             condemned_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             daemon_loss_watcher: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
@@ -836,6 +844,131 @@ impl FreshOpencodeState {
         self.identity_sink.get().cloned()
     }
 
+    /// Unified agent names (Task 2): wire the naming authority (set-once;
+    /// later calls are no-ops). `freshell-server::main` injects the ONE
+    /// local store participant.
+    pub fn set_session_naming(
+        &self,
+        sink: std::sync::Arc<dyn crate::naming::SessionNaming>,
+    ) -> bool {
+        self.naming.set(sink)
+    }
+
+    /// Unified agent names: the wired naming authority, if any.
+    pub(crate) fn naming(&self) -> Option<std::sync::Arc<dyn crate::naming::SessionNaming>> {
+        self.naming.get()
+    }
+
+    /// Unified agent names (Task 2): the materialization lane's pending bind.
+    /// An opencode session's SQLite row exists from the moment `opencode serve`
+    /// creates it (zero-message persistence), so materialization IS verified
+    /// durability: the stashed pre-durable handle transfers onto the durable
+    /// `ses_*` id BEFORE the materialized frame publishes the identity.
+    /// Idempotent (the store answers an already-bound handle with a Read) and
+    /// never a lane blocker (a failure retains the handle for the tick's
+    /// retry). Answers the accepted projection for the frame.
+    async fn bind_naming_handle_at_materialization(
+        &self,
+        placeholder: &str,
+        real_id: &str,
+        cwd: Option<&str>,
+    ) -> Option<(
+        freshell_protocol::session_names::SessionNameRef,
+        freshell_protocol::session_names::SessionNameRecord,
+    )> {
+        let handle = self.fresh_agent.peek_naming_handle(placeholder)?;
+        let sink = self.naming()?;
+        let pending =
+            freshell_protocol::session_names::SessionNameRef::Pending { id: handle.clone() };
+        let target = freshell_protocol::session_names::SessionNameRef::Session {
+            provider: freshell_protocol::session_names::NamedProvider::Opencode,
+            session_id: real_id.to_string(),
+        };
+        let acquisition = freshell_protocol::native_location::NativeAcquisition {
+            location: freshell_protocol::native_location::NativeLocation::Opencode {
+                database_path: freshell_sessions::parse::default_opencode_data_home()
+                    .join("opencode.db")
+                    .display()
+                    .to_string(),
+                native_session_id: Some(real_id.to_string()),
+                original_directory: cwd.map(str::to_string),
+                owned_local_endpoint: None,
+            },
+            evidence: freshell_protocol::native_location::NativeEvidenceKind::PersistedMetadata,
+            persistence: freshell_protocol::native_location::NativePersistence::Verified,
+        };
+        let update = match sink
+            .bind_pending(crate::naming::BindNameInput {
+                pending: pending.clone(),
+                target: target.clone(),
+                acquisition,
+            })
+            .await
+        {
+            Ok(update) => update,
+            Err(error) => {
+                // T1-N3 enrichment: a bind conflict's relevant "current" is
+                // the record the handle is ACTUALLY bound to — resolve it
+                // through the store's redirect and log that record.
+                if let crate::naming::NameError::Conflict { .. } = &error {
+                    if let Ok(updates) = sink.get(vec![pending.clone()]).await {
+                        for update in updates {
+                            if let Some(redirect) = update.redirects.first() {
+                                tracing::warn!(
+                                    target: "freshell_server::session_names",
+                                    op = "bind_pending",
+                                    name_ref = %crate::naming::name_ref_debug_key(&pending),
+                                    bound_to = %crate::naming::name_ref_debug_key(&redirect.to),
+                                    revision = update.record.revision,
+                                    class = %error.code(),
+                                    "session_names.bind_conflict: {}",
+                                    error
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    crate::naming::log_name_error("bind_pending", &pending, &error);
+                }
+                return None;
+            }
+        };
+        if update.record.name_ref == target {
+            self.fresh_agent.take_naming_handle(placeholder);
+        }
+        Some((update.record.name_ref.clone(), update.record))
+    }
+
+    /// Unified agent names (Task 2): the current frame projection for an
+    /// already-created session — the stashed handle's record (the dedup
+    /// replay arm), else the durable record when one exists.
+    async fn created_projection_for(
+        &self,
+        session_id: &str,
+    ) -> Option<(
+        freshell_protocol::session_names::SessionNameRef,
+        freshell_protocol::session_names::SessionNameRecord,
+    )> {
+        let sink = self.naming();
+        let stashed = self.fresh_agent.peek_naming_handle(session_id);
+        if let Some(handle) = stashed {
+            let pending = freshell_protocol::session_names::SessionNameRef::Pending { id: handle };
+            if let Some(sink) = &sink {
+                if let Ok(updates) = sink.get(vec![pending.clone()]).await {
+                    if let Some(update) = updates.into_iter().next() {
+                        return Some((update.record.name_ref.clone(), update.record));
+                    }
+                }
+            }
+        }
+        crate::naming::session_projection(
+            &sink,
+            freshell_protocol::session_names::NamedProvider::Opencode,
+            session_id,
+        )
+        .await
+    }
+
     /// Broadcast a `freshAgent.error` alarm/degradation frame (Task 8 consumes this
     /// too). Same envelope contract as codex.rs's helper (verified against
     /// `fresh-agent-ws.ts:182-193`): `{ "type": "freshAgent.event", "sessionId",
@@ -1026,6 +1159,11 @@ impl FreshOpencodeState {
         // (`real_session_id`) that had already happened since the first create.
         let _dedup_guard = match self.create_dedup.acquire_or_replay(&request_id).await {
             FreshAgentCreateOutcome::Replay(cached) => {
+                // Unified agent names: the replay re-answers with the SAME
+                // naming projection the original create acknowledged.
+                let projection = self.created_projection_for(&cached.placeholder_id).await;
+                let name_ref = projection.as_ref().map(|(r, _)| r.clone());
+                let session_name = projection.map(|(_, record)| record);
                 self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
                     provider: PROVIDER.to_string(),
                     request_id,
@@ -1036,6 +1174,8 @@ impl FreshOpencodeState {
                         provider: PROVIDER.to_string(),
                         session_id: cached.placeholder_id,
                     }),
+                    name_ref,
+                    session_name,
                 }));
                 return;
             }
@@ -1104,6 +1244,34 @@ impl FreshOpencodeState {
             }
         }
 
+        // Unified agent names (Task 2): admit the pre-durable handle BEFORE
+        // acknowledging creation (idempotent — creation/recovery retries
+        // re-ensure the same handle). A create without a handle proceeds
+        // unnamed.
+        let naming_projection = match msg.naming_handle.as_deref() {
+            Some(handle) if !handle.trim().is_empty() => {
+                let handle = handle.trim().to_string();
+                let sink = self.naming();
+                match crate::naming::admit_pending_projection(
+                    &sink,
+                    &handle,
+                    freshell_protocol::session_names::NamedProvider::Opencode,
+                    msg.cwd.as_deref(),
+                )
+                .await
+                {
+                    Some(projection) => {
+                        self.fresh_agent.stash_naming_handle(&placeholder, &handle);
+                        Some(projection)
+                    }
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        let name_ref = naming_projection.as_ref().map(|(r, _)| r.clone());
+        let session_name = naming_projection.map(|(_, record)| record);
+
         self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
             provider: PROVIDER.to_string(),
             request_id,
@@ -1114,6 +1282,8 @@ impl FreshOpencodeState {
                 provider: PROVIDER.to_string(),
                 session_id: placeholder,
             }),
+            name_ref,
+            session_name,
         }));
     }
 
@@ -1459,6 +1629,8 @@ impl FreshOpencodeState {
                 create_request_id: None,
                 resolves_pending: None,
                 supersedes: None,
+                // Unified agent names: no naming fact on this ledger edge.
+                name_transition: None,
                 provenance: match pre_park_provenance.clone() {
                     Some(parked) => crate::identity_sink::ProvenanceUpdate::Replace(parked),
                     None => crate::identity_sink::ProvenanceUpdate::Inherit,
@@ -1482,6 +1654,8 @@ impl FreshOpencodeState {
                     create_request_id: None,
                     resolves_pending: None,
                     supersedes: None,
+                    // Unified agent names: no naming fact on this ledger edge.
+                    name_transition: None,
                     provenance: crate::identity_sink::ProvenanceUpdate::Replace(p),
                     // b8ke ext r27 F1: the refresh write carries the SAME
                     // observed pair (it can land after a turnover's
@@ -1561,6 +1735,12 @@ impl FreshOpencodeState {
             )
             .await;
 
+        // Unified agent names: a resumed pane names through the durable
+        // session's own record (never a fresh pending handle — resume of an
+        // established identity never aliases durable keys).
+        let projection = self.created_projection_for(&durable_id).await;
+        let name_ref = projection.as_ref().map(|(r, _)| r.clone());
+        let session_name = projection.map(|(_, record)| record);
         self.broadcast(&ServerMessage::FreshAgentCreated(FreshAgentCreated {
             provider: PROVIDER.to_string(),
             request_id,
@@ -1571,6 +1751,8 @@ impl FreshOpencodeState {
                 provider: PROVIDER.to_string(),
                 session_id: durable_id,
             }),
+            name_ref,
+            session_name,
         }));
     }
 
@@ -1975,6 +2157,30 @@ impl FreshOpencodeState {
                         .map(str::to_string),
                     resolves_pending: Some(session.placeholder_id.clone()),
                     supersedes: None,
+                    // Unified agent names (Task 4, T2-M5 wired): the
+                    // materialization's DECLARED classification — the same
+                    // InitialMaterialization the dedicated bind lane below
+                    // folds through the shared classification-driven fold
+                    // (opencode persistence is verified at materialization).
+                    name_transition: Some(crate::naming::NameTransition::binding(
+                        crate::naming::NameTransitionReason::InitialMaterialization,
+                        freshell_protocol::native_location::NativeAcquisition {
+                            location: freshell_protocol::native_location::NativeLocation::Opencode {
+                                database_path: freshell_sessions::parse::default_opencode_data_home()
+                                    .join("opencode.db")
+                                    .display()
+                                    .to_string(),
+                                native_session_id: Some(durable_id.clone()),
+                                original_directory: session.cwd.clone(),
+                                owned_local_endpoint: None,
+                            },
+                            evidence:
+                                freshell_protocol::native_location::NativeEvidenceKind::PersistedMetadata,
+                            persistence:
+                                freshell_protocol::native_location::NativePersistence::Verified,
+                        },
+                        session.placeholder_id.clone(),
+                    )),
                     provenance: session.provenance.clone().into(),
                     observed_epoch: None,
                     observed_generation: None,
@@ -2011,9 +2217,29 @@ impl FreshOpencodeState {
                 return;
             }
 
+            // Unified agent names (Task 2): commit the pending→durable name
+            // transfer BEFORE the materialized frame publishes the identity
+            // (opencode persistence is verified at materialization — the
+            // SQLite row exists). A missing/unwired handle leaves the frame
+            // projection-less (a neutral fallback), never blocks the send.
+            let naming_projection = self
+                .bind_naming_handle_at_materialization(
+                    &session.placeholder_id,
+                    &durable_id,
+                    session.cwd.as_deref(),
+                )
+                .await;
+            let name_ref = naming_projection.as_ref().map(|(r, _)| r.clone());
+            let session_name = naming_projection.map(|(_, record)| record);
+
             // `freshAgent.session.materialized` (ws-handler.ts:3477-3484): placeholder ->
             // durable, emitted EXACTLY ONCE (a later send never re-enters this branch).
-            self.broadcast(&materialized_frame(&session.placeholder_id, &durable_id));
+            self.broadcast(&materialized_frame(
+                &session.placeholder_id,
+                &durable_id,
+                name_ref,
+                session_name,
+            ));
 
             // PR-3: `bindServeStream(state)` (adapter.ts:349) -- start the persistent
             // serve-SSE bridge ONCE, right after materialization. A later send never
@@ -2082,6 +2308,8 @@ impl FreshOpencodeState {
                     create_request_id: None,
                     resolves_pending: None,
                     supersedes: None,
+                    // Unified agent names: no naming fact on this ledger edge.
+                    name_transition: None,
                     provenance: session.provenance.clone().into(),
                     observed_epoch: None,
                     observed_generation: None,
@@ -2114,6 +2342,36 @@ impl FreshOpencodeState {
         let real_id = acked_session_id.clone();
         let route = session.cwd.clone();
         let text = msg.text.clone();
+
+        // Unified agent names (Task 4): the shared accepted-input callback —
+        // the turn was accepted for submission, so the user input is
+        // ACCEPTED. The naming target is the stashed pre-durable handle
+        // (freshopencode-<createRequestId>, still pending until the
+        // materialization bind consumes it), else the durable `ses_*` id. A
+        // failed feed never blocks the turn.
+        let naming_target = self
+            .fresh_agent
+            .peek_naming_handle(&session.placeholder_id)
+            .map(|handle| freshell_protocol::session_names::SessionNameRef::Pending { id: handle })
+            .or_else(|| {
+                session.real_session_id.clone().map(|ses_id| {
+                    freshell_protocol::session_names::SessionNameRef::Session {
+                        provider: freshell_protocol::session_names::NamedProvider::Opencode,
+                        session_id: ses_id,
+                    }
+                })
+            });
+        if let Some(target) = naming_target {
+            crate::naming::report_accepted_input(
+                &self.naming(),
+                &target,
+                SESSION_TYPE,
+                request_id.as_deref().unwrap_or(""),
+                &msg.text,
+                route.as_deref(),
+            )
+            .await;
+        }
 
         // `freshAgent.send.accepted` (ws-handler.ts:3487-3495) — broadcast immediately,
         // mirroring the codex slice's ack timing. The turn itself runs in a detached
@@ -2269,6 +2527,8 @@ impl FreshOpencodeState {
                     create_request_id: None,
                     resolves_pending: None,
                     supersedes: None,
+                    // Unified agent names: no naming fact on this ledger edge.
+                    name_transition: None,
                     provenance: provenance.into(),
                     observed_epoch: None,
                     observed_generation: None,
@@ -4547,6 +4807,10 @@ impl FreshOpencodeState {
         // claim typed.
         if let Err(e) = self
             .record_binding_row(crate::identity_sink::FreshAgentBindingUpsert {
+                // Unified agent names: no naming fact on this ledger edge
+                // (the fork's naming classification is driven by its
+                // dedicated lane).
+                name_transition: None,
                 provider: PROVIDER.into(),
                 session_id: child.id.clone(),
                 mode: SESSION_TYPE.into(),
@@ -5720,7 +5984,17 @@ impl FreshOpencodeState {
         // (materialize-on-send) -- the client fold updates slice AND pane content.
         if let Some(real_id) = real_session_id.as_ref() {
             if real_id != &msg.session_id {
-                self.broadcast(&materialized_frame(&msg.session_id, real_id));
+                // Unified agent names: the durable session's current
+                // projection rides the re-key frame.
+                let projection = self.created_projection_for(real_id).await;
+                let name_ref = projection.as_ref().map(|(r, _)| r.clone());
+                let session_name = projection.map(|(_, record)| record);
+                self.broadcast(&materialized_frame(
+                    &msg.session_id,
+                    real_id,
+                    name_ref,
+                    session_name,
+                ));
             }
         }
 
@@ -6142,6 +6416,8 @@ impl FreshOpencodeState {
                     create_request_id: None,
                     resolves_pending: None,
                     supersedes: None,
+                    // Unified agent names: no naming fact on this ledger edge.
+                    name_transition: None,
                     provenance,
                     observed_epoch: binding_epoch,
                     observed_generation: binding_generation,
@@ -6244,6 +6520,7 @@ impl FreshOpencodeState {
         turn_errored: Arc<AtomicBool>,
     ) -> tokio::task::JoinHandle<()> {
         let fresh_agent = self.fresh_agent.clone();
+        let state = self.clone();
         let mut rx = manager.subscribe(&real_id);
         tokio::spawn(async move {
             loop {
@@ -6277,6 +6554,27 @@ impl FreshOpencodeState {
                                 // send task's completion gating once idle resolves.
                                 turn_errored.store(true, Ordering::SeqCst);
                                 error_event(session_id, message)
+                            }
+                            SdkProviderEvent::TitleObserved { session_id, title } => {
+                                // Unified agent names (Task 3): a native title
+                                // observation is automatic provider metadata —
+                                // folded at the store's current location
+                                // revision, never promoted to manual, and
+                                // never a wire frame of its own.
+                                let sink = state.naming();
+                                let _ = crate::naming::observe_native_live(
+                                    &sink,
+                                    freshell_protocol::session_names::SessionNameRef::Session {
+                                        provider:
+                                            freshell_protocol::session_names::NamedProvider::Opencode,
+                                        session_id: session_id.clone(),
+                                    },
+                                    title,
+                                    crate::naming::NativeNameOrigin::Snapshot,
+                                    None,
+                                )
+                                .await;
+                                continue;
                             }
                         };
                         fresh_agent.broadcast(&event_frame(&real_id, inner));
@@ -7050,7 +7348,12 @@ fn settle_turn_outcome(
 /// re-key frame. Shared by the materialize-on-send path and the tracked attach arm
 /// (Task 5: re-key a placeholder-addressed pane BEFORE its real-id-stamped ack
 /// snapshot, so the pane can correlate the ack it is about to receive).
-fn materialized_frame(previous_session_id: &str, real_id: &str) -> ServerMessage {
+fn materialized_frame(
+    previous_session_id: &str,
+    real_id: &str,
+    name_ref: Option<freshell_protocol::session_names::SessionNameRef>,
+    session_name: Option<freshell_protocol::session_names::SessionNameRecord>,
+) -> ServerMessage {
     ServerMessage::FreshAgentSessionMaterialized(FreshAgentSessionMaterialized {
         previous_session_id: previous_session_id.to_string(),
         provider: PROVIDER.to_string(),
@@ -7060,6 +7363,10 @@ fn materialized_frame(previous_session_id: &str, real_id: &str) -> ServerMessage
             provider: PROVIDER.to_string(),
             session_id: real_id.to_string(),
         }),
+        // Unified agent names: the post-transfer canonical projection — the
+        // bind commits BEFORE this frame publishes the identity.
+        name_ref,
+        session_name,
     })
 }
 
@@ -7617,6 +7924,7 @@ mod tests {
 
     fn create_msg(request_id: &str) -> FreshAgentCreate {
         FreshAgentCreate {
+            naming_handle: None,
             observed_epoch: None,
             observed_generation: None,
             request_id: request_id.to_string(),
@@ -7874,6 +8182,70 @@ mod tests {
             Some(real_session_id),
             "a duplicate create must NOT reset the already-materialized session's \
              real_session_id back to None"
+        );
+    }
+
+    /// Unified agent names (Task 8 — the T2-M3/T4-M3 per-runtime lane pin):
+    /// the shared accepted-input callback — an accepted freshopencode send
+    /// feeds the naming authority ONE activity carrying the prompt text. The
+    /// materialization bind consumes the stashed handle BEFORE the feed, so
+    /// the first send's activity target is the pane's DURABLE `ses_*` id (the
+    /// correct fallback — a wrong stash key or a missed fallback would redden
+    /// this pin).
+    #[tokio::test]
+    async fn send_feeds_the_naming_authority_once_with_the_accepted_text() {
+        let (st, killed) = state().await;
+        let _ = &killed;
+        let sink = crate::naming::test_support::RecordingSink::new();
+        st.set_session_naming(sink.clone());
+
+        let mut create = create_msg("req-opencode-naming-send");
+        create.naming_handle = Some("handle-opencode-naming-send".to_string());
+        st.handle_create(create, None).await;
+        let placeholder = "freshopencode-req-opencode-naming-send";
+        st.handle_send(send_msg(placeholder, "Fix the sardine crash"))
+            .await;
+
+        // The feed fires once the turn was accepted; poll the sink bounded.
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if !sink.activities.lock().unwrap().is_empty() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("the accepted send feeds the naming authority");
+        let sessions = st.sessions.lock().await;
+        let session_arc = sessions
+            .get(placeholder)
+            .expect("placeholder session tracked after create")
+            .clone();
+        drop(sessions);
+        let durable_id = session_arc
+            .lock()
+            .await
+            .real_session_id
+            .clone()
+            .expect("send must have materialized a durable session");
+        let activities = sink.activities.lock().unwrap();
+        assert_eq!(activities.len(), 1, "{activities:?}");
+        assert_eq!(
+            activities[0].target,
+            freshell_protocol::session_names::SessionNameRef::Session {
+                provider: freshell_protocol::session_names::NamedProvider::Opencode,
+                session_id: durable_id.clone(),
+            }
+        );
+        assert_eq!(activities[0].mode, "freshopencode");
+        assert_eq!(
+            activities[0].first_user_message.as_deref(),
+            Some("Fix the sardine crash")
+        );
+        assert_eq!(
+            activities[0].reason,
+            crate::naming::NameActivityReason::AcceptedUserMessage
         );
     }
 
@@ -11699,6 +12071,8 @@ mod tests {
             create_request_id: Some("cr-lineage".into()),
             resolves_pending: Some("freshopencode-cr-lineage".into()),
             supersedes: None,
+            // Unified agent names: no naming fact on this ledger edge.
+            name_transition: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
@@ -11758,6 +12132,8 @@ mod tests {
             create_request_id: Some("cr-lineage-killed".into()),
             resolves_pending: Some("freshopencode-cr-lineage-killed".into()),
             supersedes: None,
+            // Unified agent names: no naming fact on this ledger edge.
+            name_transition: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
@@ -12593,6 +12969,8 @@ mod tests {
             create_request_id: Some("cr-lineage".into()),
             resolves_pending: Some("freshopencode-cr-lineage".into()),
             supersedes: None,
+            // Unified agent names: no naming fact on this ledger edge.
+            name_transition: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
                 client_instance_id: Some("client-old".into()),
                 device_id: Some("device-old".into()),
@@ -12861,6 +13239,8 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
+            // Unified agent names: no naming fact on this ledger edge.
+            name_transition: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
                 client_instance_id: Some("client-row".into()),
                 device_id: Some("device-row".into()),
@@ -12965,6 +13345,8 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
+            // Unified agent names: no naming fact on this ledger edge.
+            name_transition: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Inherit,
             observed_epoch: None,
             observed_generation: None,
@@ -13118,6 +13500,8 @@ mod tests {
             create_request_id: None,
             resolves_pending: None,
             supersedes: None,
+            // Unified agent names: no naming fact on this ledger edge.
+            name_transition: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
                 client_instance_id: Some("client-row".into()),
                 device_id: Some("device-row".into()),
@@ -13205,6 +13589,8 @@ mod tests {
             create_request_id: Some("cr-row".into()),
             resolves_pending: None,
             supersedes: None,
+            // Unified agent names: no naming fact on this ledger edge.
+            name_transition: None,
             provenance: crate::identity_sink::ProvenanceUpdate::Replace(crate::BindProvenance {
                 client_instance_id: Some("client-row".into()),
                 device_id: Some("device-row".into()),

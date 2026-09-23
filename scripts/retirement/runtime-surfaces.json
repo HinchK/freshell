@@ -308,6 +308,12 @@
       "listener": "non-backend"
     },
     {
+      "id": "listener-native-session-names-runner",
+      "path": "scripts/testing/native-session-names.mjs",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
       "id": "scripts-verify-container-layout",
       "path": "scripts/verify-container-layout.sh",
       "role": "container-layout-verifier"
@@ -355,6 +361,11 @@
       "listener": "non-backend"
     },
     {
+      "id": "fixture-fake-codex-terminal",
+      "path": "test/e2e-browser/fixtures/fake-codex-terminal.mjs",
+      "role": "provider-fixture"
+    },
+    {
       "id": "fixture-fake-gemini",
       "path": "test/e2e-browser/fixtures/providers/fake-gemini.mjs",
       "role": "provider-fixture"
@@ -371,6 +382,11 @@
       "listener": "non-backend"
     },
     {
+      "id": "fixture-fake-opencode-terminal",
+      "path": "test/e2e-browser/fixtures/fake-opencode-terminal.mjs",
+      "role": "provider-fixture"
+    },
+    {
       "id": "listener-echo-fixture",
       "path": "test/e2e-browser/helpers/echo-ws-fixture.ts",
       "role": "non-backend-listener",
@@ -385,6 +401,12 @@
     {
       "id": "listener-fake-ai",
       "path": "test/e2e-browser/helpers/harness-06/fake-ai.ts",
+      "role": "non-backend-listener",
+      "listener": "non-backend"
+    },
+    {
+      "id": "listener-unified-agent-names-fake-gemini",
+      "path": "test/e2e-browser/helpers/unified-agent-names.ts",
       "role": "non-backend-listener",
       "listener": "non-backend"
     },
@@ -496,6 +518,12 @@
     {
       "id": "assertion-test-cli-action-capabilities",
       "path": "test/unit/cli/action-capabilities.test.ts",
+      "role": "test-listener-assertion",
+      "listener": "assertion-only"
+    },
+    {
+      "id": "assertion-test-cli-commands",
+      "path": "test/unit/cli/commands.test.ts",
       "role": "test-listener-assertion",
       "listener": "assertion-only"
     },

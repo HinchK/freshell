@@ -643,6 +643,77 @@ describe('visible-first read-model helpers', () => {
     expect(plain).not.toHaveProperty('titleOverrideSource')
   })
 
+  it('forwards the unified-names projection (nameRef + sessionName) from a raw page item into grouped sidebar window sessions', async () => {
+    // Unified agent names (Task 2): the server merges the canonical
+    // record's ref + current name onto every directory row additively.
+    // The sidebar mapper's allowlist must forward both — a fresh second
+    // client's redux cache bootstraps FROM these refs (its ready-time
+    // batch read races its own state hydration), and dropping the ref
+    // strands the cache cold for sessions it never renamed live.
+    mockFetch.mockResolvedValueOnce(mockJson({
+      items: [{
+        sessionId: 'session-named',
+        provider: 'claude',
+        projectPath: '/tmp/project-alpha',
+        title: 'Provider title',
+        isRunning: false,
+        lastActivityAt: 1_000,
+        nameRef: { kind: 'session', provider: 'claude', sessionId: 'session-named' },
+        sessionName: 'Pre-restart pending name',
+      }, {
+        sessionId: 'session-plain',
+        provider: 'claude',
+        projectPath: '/tmp/project-alpha',
+        title: 'Plain title',
+        isRunning: false,
+        lastActivityAt: 900,
+      }],
+      nextCursor: null,
+      revision: 1,
+    }))
+
+    const response = await fetchSidebarSessionsSnapshot()
+
+    const sessions = response.projects[0]?.sessions ?? []
+    expect(sessions[0]).toMatchObject({
+      sessionId: 'session-named',
+      nameRef: { kind: 'session', provider: 'claude', sessionId: 'session-named' },
+      sessionName: 'Pre-restart pending name',
+    })
+    const plain = sessions.find((s: { sessionId: string }) => s.sessionId === 'session-plain')
+    expect(plain).toBeTruthy()
+    expect(plain).not.toHaveProperty('nameRef')
+    expect(plain).not.toHaveProperty('sessionName')
+  })
+
+  it('retries a rate-limited sidebar snapshot fetch (the post-restart boot burst) and still returns the page', async () => {
+    // A fresh page's boot burst (settings, sessions, terminal directory,
+    // the naming bootstrap) races the ONE shared rate-limit bucket right
+    // after a server restart: a 429 on the SIDEBAR snapshot left the
+    // sidebar permanently empty (the fetch had no retry and nothing
+    // re-triggers it until the next invalidation). Retry it, bounded.
+    mockFetch
+      .mockResolvedValueOnce(mockJsonResponse(429, { error: 'rate limited' }))
+      .mockResolvedValueOnce(mockJson({
+        items: [{
+          sessionId: 'session-boot',
+          provider: 'claude',
+          projectPath: '/tmp/project-alpha',
+          title: 'Boot name',
+          isRunning: false,
+          lastActivityAt: 1_000,
+        }],
+        nextCursor: null,
+        revision: 1,
+      }))
+
+    const response = await fetchSidebarSessionsSnapshot()
+
+    expect(mockFetch).toHaveBeenCalledTimes(2)
+    const sessions = response.projects[0]?.sessions ?? []
+    expect(sessions[0]).toMatchObject({ sessionId: 'session-boot', title: 'Boot name' })
+  })
+
   it('forwards title-override provenance from a raw page item into search results', async () => {
     // b5fb: searchSessions' results map is the second b5fb allowlist site —
     // same pin as the sidebar mapper, one layer up (query page → SearchResponse).

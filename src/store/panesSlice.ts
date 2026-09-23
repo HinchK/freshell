@@ -25,7 +25,7 @@ import {
 import { derivePaneTitle } from '@/lib/derivePaneTitle'
 import { matchesDerivedPaneTitle } from '@/lib/pane-title'
 import { isValidClaudeSessionId } from '@/lib/claude-session-id'
-import { buildPaneRefreshTarget, paneContentMatchesSessionRef, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
+import { buildPaneRefreshTarget, paneRefreshTargetMatchesContent } from '@/lib/pane-utils'
 import { loadPersistedPanes, loadPersistedTabs } from './persistMiddleware.js'
 import { hasPaneTreeShape, isWellFormedPaneTree } from './paneTreeValidation.js'
 import { mergeHydratedPaneMetadata, mergeCrossWindowPaneTitles, paneTitleMetadataEquals, type HydratePanesMeta } from './hydrate-pane-metadata-merge.js'
@@ -35,6 +35,7 @@ import { sanitizeRestoreError, sanitizeCrashTrace, sanitizeSessionRef, type Rest
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { migrateLegacyFreshAgentContent, migrateLegacyFreshAgentDurableState, preservedDurableFreshAgentIdentity } from '@shared/fresh-agent'
 import { normalizeFreshAgentStyleOverride } from '@shared/settings'
+import { parsePaneNamingIdentityInput } from '@/lib/tab-name-source'
 
 
 const log = createLogger('PanesSlice')
@@ -63,6 +64,12 @@ function normalizePaneContent(
   options?: { inheritCreateRequestId?: boolean },
 ): PaneContent {
   const input = migrateLegacyFreshAgentContent(rawInput as Record<string, unknown>) as LivePaneContentInput | PaneContent
+  // Unified agent names (Task 1/6): the pane's naming identity — a parsed
+  // `nameRef` and a non-empty `namingHandle` — must survive this whitelist
+  // on create/reconcile/restore/cold adoption even when transient runtime
+  // ids (sessionId/terminalId) are stripped elsewhere. The shared parse
+  // point is `parsePaneNamingIdentityInput` (one algorithm, every surface).
+  const paneNamingIdentity = parsePaneNamingIdentityInput(input as { nameRef?: unknown; namingHandle?: unknown })
   if (input.kind === 'terminal') {
     const mode = typeof input.mode === 'string' ? input.mode : 'shell'
     const previousCreateRequestId =
@@ -106,6 +113,9 @@ function normalizePaneContent(
         ? input.pendingReconcile
         : undefined,
       reconcileEpoch: typeof input.reconcileEpoch === 'number' ? input.reconcileEpoch : undefined,
+      // Unified agent names (Task 6): the naming identity rides the
+      // whitelist — see the paneNamingIdentity derivation above.
+      ...paneNamingIdentity,
       // znhn item 1: the persistent crash trace must survive the hydrate
       // normalize (this function is a whitelist — without this line the
       // "survives reload" property silently dies here even though the
@@ -213,6 +223,9 @@ function normalizePaneContent(
             ? { pendingReconcile: input.pendingReconcile }
             : {}),
           ...(typeof input.reconcileEpoch === 'number' ? { reconcileEpoch: input.reconcileEpoch } : {}),
+          // Unified agent names (Task 6): the naming identity rides the
+          // whitelist on every fresh-agent fold path.
+          ...paneNamingIdentity,
           ...(freshHandoffError ? { handoffError: freshHandoffError } : {}),
         }
       }
@@ -292,6 +305,9 @@ function normalizePaneContent(
         ? { pendingReconcile: input.pendingReconcile }
         : {}),
       ...(typeof input.reconcileEpoch === 'number' ? { reconcileEpoch: input.reconcileEpoch } : {}),
+      // Unified agent names (Task 6): the naming identity rides the
+      // whitelist on every fresh-agent fold path.
+      ...paneNamingIdentity,
       ...(freshHandoffError ? { handoffError: freshHandoffError } : {}),
     }
   }
@@ -1255,9 +1271,13 @@ export const panesSlice = createSlice({
       action: PayloadAction<{
         tabId: string
         newContent: PaneContentInput
+        /** Unified agent names (Task 6): an explicit new pane id lets
+         * copy/recovery callers build the old→new pane-ID map they remap the
+         * tab's nameSource through. Absent ⇒ minted as before. */
+        newPaneId?: string
       }>
     ) => {
-      const { tabId, newContent } = action.payload
+      const { tabId, newContent, newPaneId: providedPaneId } = action.payload
       const root = state.layouts[tabId]
       if (!root) return
       if (refuseMutationWhileClosing(state, tabId, 'addPane')) return
@@ -1270,7 +1290,7 @@ export const panesSlice = createSlice({
       if (!activeLeaf) return
 
       // Create new leaf
-      const newPaneId = nanoid()
+      const newPaneId = providedPaneId ?? nanoid()
       const normalizedContent = normalizePaneContent(newContent)
       const newLeaf: PaneNode = {
         type: 'leaf',
@@ -2062,6 +2082,45 @@ export const panesSlice = createSlice({
       state.paneTitleSetByUser = merged.paneTitleSetByUser
     },
 
+    // Unified agent names (Task 7): stamp the derived legacy-pending naming
+    // handles onto the hydrated panes they were derived from — the pane's
+    // pre-durable identity so its migrated name follows the pane (and, once
+    // sender-stamping lands, its later create/bind). Idempotent: a pane
+    // that already holds a namingHandle, a durable sessionRef, or a
+    // canonical nameRef is never overwritten; the assignment's
+    // createRequestId must match, so a reminted pane never adopts a stale
+    // handle.
+    stampLegacyMigrationHandles: (
+      state,
+      action: PayloadAction<
+        Array<{
+          storageKey: string
+          windowId: string | null
+          tabId: string
+          paneId: string
+          createRequestId: string
+          namingHandle: string
+        }>
+      >,
+    ) => {
+      for (const assignment of action.payload) {
+        const layout = state.layouts[assignment.tabId]
+        const findPane = (node: PaneNode | undefined): PaneContent | undefined => {
+          if (!node) return undefined
+          if (node.type === 'leaf') {
+            return node.id === assignment.paneId ? node.content : undefined
+          }
+          return findPane(node.children[0]) ?? findPane(node.children[1])
+        }
+        const content = findPane(layout)
+        if (!content) continue
+        if (content.kind !== 'terminal' && content.kind !== 'fresh-agent') continue
+        if (content.createRequestId !== assignment.createRequestId) continue
+        if (content.sessionRef || content.nameRef || content.namingHandle) continue
+        content.namingHandle = assignment.namingHandle
+      }
+    },
+
     updatePaneTitle: (
       state,
       action: PayloadAction<{ tabId: string; paneId: string; title: string; setByUser?: boolean }>
@@ -2128,37 +2187,6 @@ export const panesSlice = createSlice({
       for (const tabId of Object.keys(state.layouts)) {
         for (const leaf of collectLeaves(state.layouts[tabId])) {
           if (leaf.content.kind !== 'terminal' || leaf.content.terminalId !== terminalId) continue
-          const paneId = leaf.id
-          if (setByUser === false && state.paneTitleSetByUser?.[tabId]?.[paneId]) {
-            continue
-          }
-          if (!state.paneTitles[tabId]) state.paneTitles[tabId] = {}
-          state.paneTitles[tabId][paneId] = title
-          if (setByUser !== false) {
-            // Mark as user-set so programmatic updates don't overwrite it
-            if (!state.paneTitleSetByUser) state.paneTitleSetByUser = {}
-            if (!state.paneTitleSetByUser[tabId]) state.paneTitleSetByUser[tabId] = {}
-            state.paneTitleSetByUser[tabId][paneId] = true
-          }
-        }
-      }
-    },
-
-    /**
-     * Walk all tabs' pane trees and update the title for any pane bound to
-     * the given provider:sessionId — fresh-agent panes by provider/sessionId,
-     * terminal panes by sessionRef. Used when a session rename must mirror
-     * into pane titles even when no terminal cascade exists (SDK panes,
-     * exited coding-CLI terminals).
-     */
-    updatePaneTitleBySessionRef: (
-      state,
-      action: PayloadAction<{ provider: string; sessionId: string; title: string; setByUser?: boolean }>
-    ) => {
-      const { provider, sessionId, title, setByUser } = action.payload
-      for (const tabId of Object.keys(state.layouts)) {
-        for (const leaf of collectLeaves(state.layouts[tabId])) {
-          if (!paneContentMatchesSessionRef(leaf.content, provider, sessionId)) continue
           const paneId = leaf.id
           if (setByUser === false && state.paneTitleSetByUser?.[tabId]?.[paneId]) {
             continue
@@ -2754,9 +2782,9 @@ export const {
   clearPaneClosing,
   hydratePanes,
   hydratePaneTitles,
+  stampLegacyMigrationHandles,
   updatePaneTitle,
   updatePaneTitleByTerminalId,
-  updatePaneTitleBySessionRef,
   reconcileTerminalSessionRefByTerminalId,
   requestPaneRename,
   clearPaneRenameRequest,
