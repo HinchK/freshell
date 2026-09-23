@@ -150,7 +150,11 @@ describe('verify-electron-artifact', () => {
 
   it('rejects a receipt recorded for a different platform', () => {
     const root = artifactRoot()
-    writeArtifact(root, nativePlatform, { platform: 'win32' })
+    // The mismatched platform must differ from the HOST platform on every
+    // runner: hardcoding 'win32' only mismatches on POSIX hosts, and the
+    // verifier correctly accepts a matching receipt on a Windows runner.
+    const otherPlatform = nativePlatform === 'win32' ? 'linux' : 'win32'
+    writeArtifact(root, nativePlatform, { platform: otherPlatform })
 
     expect(() => verifyElectronArtifact(root, nativePlatform, { probe: refusingProbe() })).toThrow(/receipt platform/)
   })

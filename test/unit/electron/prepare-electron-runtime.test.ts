@@ -547,16 +547,18 @@ describe('prepare-electron-runtime staging', () => {
       [fixture.serverBinary, path.join(outputRoot, 'bin', getRuntimeBinaryName(nativePlatform()))],
       [fixture.nodeBinary, path.join(outputRoot, 'node', 'bin', getNodeBinaryName(nativePlatform()))],
     ]) {
-      // Windows does not retain POSIX executable bits. Verify the permission
-      // operation on every host (it runs against the staging tree before
-      // publish) and its filesystem effect on POSIX hosts.
+      // POSIX exec bits only apply to POSIX targets. The stager deliberately
+      // skips the permission operation for win32 targets (Windows executability
+      // comes from the .exe extension; the filesystem does not retain the
+      // bit), so a win32 host staging a win32 runtime must show NO operation,
+      // while POSIX hosts show the operation AND its filesystem effect.
       const expectedMode = (statSync(source).mode & 0o777) | 0o111
       const stagedBinary = path.join(`${outputRoot}.staging`, path.relative(outputRoot, binary))
       expect(
         vi.mocked(chmodSync).mock.calls.some(([target, mode]) =>
           (target === binary || target === stagedBinary) && mode === expectedMode),
-      ).toBe(true)
-      if (process.platform !== 'win32') expect(statSync(binary).mode & 0o111).not.toBe(0)
+      ).toBe(nativePlatform() !== 'win32')
+      if (nativePlatform() !== 'win32') expect(statSync(binary).mode & 0o111).not.toBe(0)
     }
   })
 
