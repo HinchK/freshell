@@ -6870,10 +6870,68 @@ impl FreshOpencodeState {
             let guard = this.sessions.lock().await;
             guard.get(real_id).cloned()
         };
-        let released = if let Some(session_arc) = session_arc {
+        let Some(session_arc) = session_arc else {
+            // No session record (e.g. raced a teardown): the frame is
+            // stateless commentary, broadcast as before.
+            this.fresh_agent
+                .broadcast(&event_frame(real_id, snapshot_event(session_id, "idle")));
+            return;
+        };
+
+        // Pass 1 (locked read): is the delivery-order identity decidable?
+        // A running delivered before this idle (busy) makes the idle
+        // trustworthy immediately — no poll needed.
+        let busy_delivered = session_arc
+            .lock()
+            .await
+            .daemon_busy_after_idle
+            .load(Ordering::SeqCst);
+
+        // Focused episode 3 round 1: the identity's blind spot — the
+        // running can be GENUINELY missed: the SSE transport reconnects
+        // WITHOUT replaying missed events (transport.rs:162-215) and the
+        // bridge ignores RecvError::Lagged, so a reconnect or a lagged
+        // broadcast drops the busy event. An idle following no delivered
+        // running is then indistinguishable from a stale duplicate by
+        // delivery evidence alone — and rejecting the interrupted turn's
+        // REAL terminal idle strands the queue forever (the liveness
+        // defect this round found). The authoritative fallback: ask the
+        // daemon LIVE — its status map is current truth, not replayed
+        // history (the same fallback await_idle uses for missed SSE
+        // idles). A stale idle over a still-running compact polls BUSY;
+        // the missed-running terminal idle polls IDLE.
+        let daemon_idle = if busy_delivered {
+            true
+        } else {
+            let route = session_arc.lock().await.cwd.clone();
+            match this
+                .fresh_agent
+                .ensure_manager()
+                .await
+                .get_session_status_map(&route)
+                .await
+            {
+                Ok(map) => !map
+                    .get(real_id)
+                    .is_some_and(|status| status["type"] == "busy"),
+                // Conservative: a failed poll proves nothing — do not
+                // release or record on transport failure (the next idle
+                // observation re-tries).
+                Err(_) => false,
+            }
+        };
+
+        // Pass 2 (locked decision): the world may have moved during the
+        // poll — re-read everything under the session lock. The broadcast
+        // stays inside this critical section (the round-ep1 atomicity:
+        // a send registering either preceded the decision or follows the
+        // idle).
+        let (released, emit_idle) = {
             let session = session_arc.lock().await;
             let abort_in_flight_now = session.abort_in_flight.load(Ordering::SeqCst) > 0;
-            let released = if abort_in_flight_now {
+            let busy_now = session.daemon_busy_after_idle.load(Ordering::SeqCst);
+            let trusted = busy_now || daemon_idle;
+            let (released, emit_idle) = if abort_in_flight_now {
                 // Delta-review round 6 (extension) Major 2: a
                 // session-scoped abort request is still in flight — its
                 // settlement owns BOTH the latch release AND the idle
@@ -6883,102 +6941,70 @@ impl FreshOpencodeState {
                 // `pending_sends` (lost, no requeue, no correlated
                 // failure). Broadcasting here (focused episode 2 round 3,
                 // Major 1) is the same loss through the client's flush
-                // path: with the message still in the CLIENT's UX queue
-                // the server queue is EMPTY, the interrupt removed the
-                // turn task, so this observation is "quiescent" — the
-                // idle would flush the client queue straight into
-                // handle_send's direct path (which never consults
-                // abort_in_flight) while the abort is unsettled.
-                // REMEMBER the idle for the settlement arm to consume
-                // (episode 2 round 1, Major 3); the broadcast is
+                // path. REMEMBER the idle for the settlement arm to
+                // consume (episode 2 round 1, Major 3); the broadcast is
                 // suppressed with the release.
-                // Focused episode 2 round 5, Major 2: DELIVERY-ORDER
-                // IDENTITY — an idle is evidence the interrupted turn
-                // ended ONLY if a running was already DELIVERED before
-                // it (the daemon's running→idle transition for that
-                // turn). An idle with NO prior running delivery may be a
-                // stale duplicate of the PREVIOUS turn (the interrupted
-                // turn's running is still queued behind it in stream
-                // order): record NOTHING — the settlement cannot consume
-                // it, and the interrupted turn's own eventual idle (which
-                // DOES follow its running) releases through the round-4
-                // path. This closes the settle-before-running-delivery
-                // interleaving.
-                if session.daemon_busy_after_idle.load(Ordering::SeqCst) {
+                // Focused episode 2 round 5, Major 2 + episode 3 round 1:
+                // an idle is evidence the interrupted turn ended ONLY if
+                // a running was delivered before it (the daemon's
+                // running->idle transition) OR the daemon's live status
+                // map says the session is idle NOW (the running was
+                // missed by reconnect/lag). A stale duplicate over a
+                // still-running compact matches neither: the delivery
+                // evidence is absent and the live map says busy. Record
+                // NOTHING then — the settlement cannot consume it, and
+                // the interrupted turn's own eventual idle releases
+                // through the counter-zero path below.
+                if trusted {
                     session.daemon_idle_seen.store(true, Ordering::SeqCst);
-                    // The idle supersedes the running that preceded it.
-                    session
-                        .daemon_busy_after_idle
-                        .store(false, Ordering::SeqCst);
+                    if busy_now {
+                        // The idle supersedes the running that preceded it.
+                        session
+                            .daemon_busy_after_idle
+                            .store(false, Ordering::SeqCst);
+                    }
                     // Focused episode 2 round 5, Major 3: NEVER downgrade
                     // a strong proof (a not-last sibling abort the daemon
                     // ANSWERED) — the daemon's resulting idle arriving
                     // after it must not erase it.
                 }
-                false
+                (false, false)
             } else {
-                // Delta-review round 7 (extension): the same DELIVERY-
-                // ORDER IDENTITY here — a failed abort has settled (the
-                // counter is zero) and the latch is armed, so the NEXT
-                // delivered idle must still prove it belongs to the
-                // interrupted turn: an idle with no prior running
-                // delivery may be a stale duplicate of the PREVIOUS turn
-                // arriving on bridge lag after the settlement, and
-                // releasing on it would drain into a still-running
-                // compact. Only an idle that follows a delivered running
-                // (the daemon's running->idle transition for the
-                // interrupted turn) may release; the interrupted turn's
-                // own eventual idle does exactly that.
-                if session.daemon_busy_after_idle.load(Ordering::SeqCst) {
+                // Delta-review round 7 (extension): a failed abort has
+                // settled (the counter is zero) and the latch is armed —
+                // the same trust rule gates the release.
+                if trusted {
                     let released = session.orphaned_daemon_turn.swap(false, Ordering::SeqCst);
                     if released {
                         tracing::warn!(target: "freshell_freshagent::opencode",
                             session_id = %real_id,
                             "fresh_agent_interrupt_orphan_released_by_daemon_idle");
                     }
-                    // The idle supersedes the running that preceded it.
-                    session
-                        .daemon_busy_after_idle
-                        .store(false, Ordering::SeqCst);
-                    released
+                    if busy_now {
+                        session
+                            .daemon_busy_after_idle
+                            .store(false, Ordering::SeqCst);
+                    }
+                    let quiescent = session
+                        .turn_task
+                        .as_ref()
+                        .map(|t| t.is_finished() && t.settling.load(Ordering::SeqCst))
+                        .unwrap_or(true)
+                        && session.pending_sends.is_empty();
+                    (released, quiescent)
                 } else {
-                    // A stale candidate: no running was delivered before
-                    // this idle — release nothing and wait for the turn's
-                    // own idle.
-                    false
+                    // A stale candidate: no delivered running and the
+                    // live map says busy — release nothing and wait for
+                    // the turn's own idle.
+                    (false, false)
                 }
             };
-            let quiescent = session
-                .turn_task
-                .as_ref()
-                .map(|t| t.is_finished() && t.settling.load(Ordering::SeqCst))
-                .unwrap_or(true)
-                && session.pending_sends.is_empty();
-            // Focused-review episode 1 round 1: the quiescence decision
-            // and the idle emission are ONE critical section. Broadcasting
-            // after releasing the guard left a window where a waiting
-            // handle_send could register + emit its `running` before this
-            // helper's `idle` — the exact stale ordering this gate exists
-            // to prevent (the check-then-broadcast race). The broadcast is
-            // a synchronous channel send (never awaits), so holding the
-            // session mutex across it is safe, and a send registering
-            // either happened before this critical section (its running
-            // precedes our decision → we see the live task and suppress)
-            // or can only happen after (its running FOLLOWS our idle).
-            // Either order is correct; the interleaved stale idle is
-            // structurally impossible.
-            if quiescent && !abort_in_flight_now {
-                this.fresh_agent
-                    .broadcast(&event_frame(real_id, snapshot_event(session_id, "idle")));
-            }
-            released
-        } else {
-            // No session record (e.g. raced a teardown): the frame is
-            // stateless commentary, broadcast as before.
+            (released, emit_idle)
+        };
+        if emit_idle {
             this.fresh_agent
                 .broadcast(&event_frame(real_id, snapshot_event(session_id, "idle")));
-            false
-        };
+        }
         if released {
             Self::drain_detached(this, real_id);
         }
@@ -13804,6 +13830,26 @@ mod tests {
                 .expect("abort ambiguates mutex") = true;
         }
 
+        /// Focused episode 3 round 1: seed the session's live status-map
+        /// budget so the daemon polls report BUSY (the compact still
+        /// running) — the stale-idle tests' fiction must satisfy the
+        /// authoritative poll.
+        /// Model the daemon's status-map flip to idle when the turn ends
+        /// (the aborted drive never consumed its busy budget).
+        fn clear_status_busy(&self, id: &str) {
+            self.busy_budget
+                .lock()
+                .expect("busy budget mutex")
+                .remove(id);
+        }
+
+        fn arm_status_busy(&self, id: &str, budget: usize) {
+            self.busy_budget
+                .lock()
+                .expect("busy budget mutex")
+                .insert(id.to_string(), budget);
+        }
+
         fn summarize_requests(&self) -> Vec<RecordedRequest> {
             self.recorded()
                 .into_iter()
@@ -18902,10 +18948,9 @@ mod tests {
 
         // The bridge delivers a STALE idle (from the previous turn)
         // during the window and THEN the interrupted turn's own running
-        // (stream order). With the delivery-order identity (round 5,
-        // Major 2) the stale idle is NOT recorded at all — it follows no
-        // delivered running — so the 500 settlement finds no proof and
-        // the queue waits for the interrupted turn's own idle.
+        // (stream order). The stale idle follows no delivered running
+        // and the live status map says busy — it records nothing.
+        http.arm_status_busy("ses_q25", 1000);
         FreshOpencodeState::observe_daemon_idle(&st, "ses_q25", "ses_q25").await;
         FreshOpencodeState::observe_daemon_running(&st, "ses_q25", "ses_q25").await;
         for _ in 0..25 {
@@ -19102,7 +19147,9 @@ mod tests {
         await_abort_posted(&http).await;
 
         // The bridge delivers the STALE idle (from the previous turn —
-        // following NO delivered running): records NOTHING.
+        // following NO delivered running, and the live status map says
+        // busy because the compact still runs): records NOTHING.
+        http.arm_status_busy("ses_q27", 1000);
         FreshOpencodeState::observe_daemon_idle(&st, "ses_q27", "ses_q27").await;
 
         // The abort settles 500 BEFORE the interrupted turn's running is
@@ -19206,7 +19253,9 @@ mod tests {
 
         // A STALE idle (from the previous turn) arrives after the
         // settlement, following NO delivered running: it must NOT
-        // release — the compact may still be running.
+        // release — the compact may still be running (the live status
+        // map says busy).
+        http.arm_status_busy("ses_q28", 1000);
         FreshOpencodeState::observe_daemon_idle(&st, "ses_q28", "ses_q28").await;
         for _ in 0..25 {
             tokio::task::yield_now().await;
@@ -19237,6 +19286,71 @@ mod tests {
         let session_arc = st.sessions.lock().await.get("ses_q28").cloned().unwrap();
         let session = session_arc.lock().await;
         assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    /// Focused episode 3 round 1: the identity's blind spot — the
+    /// running edge can be GENUINELY missed (the SSE transport reconnects
+    /// without replaying missed events; a lagged broadcast drops them).
+    /// When the interrupted turn's REAL terminal idle arrives after a
+    /// failed abort settled, with no running ever delivered, the
+    /// delivery-order identity alone would reject it and strand the
+    /// queue forever. The authoritative fallback: the daemon's LIVE
+    /// status map says the session is idle NOW — the release proceeds.
+    #[tokio::test]
+    async fn a_missed_running_edge_does_not_strand_the_real_terminal_idle() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q29", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q29")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q29", "survives the reconnect")),
+        )
+        .await;
+
+        // The abort FAILS (answered 500) and settles — counter zero,
+        // latch armed, the queue deferred.
+        http.arm_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q29".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort 500)");
+
+        // The compact's running was LOST (a reconnect or lag — never
+        // delivered), but its REAL terminal idle arrives: no running
+        // preceded it, and the daemon's LIVE status map says idle (the
+        // daemon-side turn ended; the aborted local drive never consumed
+        // the seeded busy budget) — the poll fallback authorizes the
+        // release and the queue delivers.
+        http.clear_status_busy("ses_q29");
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q29", "ses_q29").await;
+        await_prompt_posted(&http, "survives the reconnect").await;
+        let session_arc = st.sessions.lock().await.get("ses_q29").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(
+            !session.orphaned_daemon_turn.load(Ordering::SeqCst),
+            "the missed-running terminal idle releases — no strand"
+        );
         assert!(session.pending_sends.is_empty());
     }
 
