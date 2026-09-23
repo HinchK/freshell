@@ -11882,6 +11882,35 @@ mod paced_exit_race_tests {
                 .head_seq
         }
 
+        /// The ring head once in-flight PTY chunks have landed. A small
+        /// write can split across PTY read chunks — a marker's trailing
+        /// bytes may land as a separate ring frame microseconds after the
+        /// marker text first appears (observed on 2-core CI runners,
+        /// never on the 96-core dev box) — so frame counts are only
+        /// stable once the ring is quiet. Progress-based: the quiet
+        /// clock resets on every observed head advance, and the fixed
+        /// bound trips only on a dead PTY, never a slow one.
+        async fn settled_head(&self) -> i64 {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut last = self.head();
+            let mut quiet_since = tokio::time::Instant::now();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                let now = self.head();
+                if now != last {
+                    last = now;
+                    quiet_since = tokio::time::Instant::now();
+                } else if quiet_since.elapsed() >= std::time::Duration::from_millis(25) {
+                    return now;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the ring head never settled — a dead PTY (the quiet window \
+                     resets on every advance, so this trips only on a dead one)"
+                );
+            }
+        }
+
         /// Assert NO terminal.exit is delivered while an exit page sits
         /// uncredited — the invariant-2 hold, over a deterministic window.
         async fn assert_exit_held(&self) {
@@ -12137,8 +12166,11 @@ mod paced_exit_race_tests {
     /// staging concurrently with the decision's use of its read; never
     /// a sleep-based race). The racing credit is the one whose drive
     /// reaches the attach target — with budget 0 (one frame per page)
-    /// and one pad step (2 frames: echo + output) the walk is exactly
-    /// countable, so the racing credit is named, not probed.
+    /// the walk is countable, so the racing credit is named, not probed.
+    /// Absolute frame counts are deliberately NOT pinned: a small write
+    /// can split across PTY read chunks on slow runners (a marker's
+    /// trailing bytes landing as a separate ring frame microseconds
+    /// later), so the walk pins head PROGRESSION via settled reads.
     ///
     /// PRE-FIX (RED): the arm's read went stale (check-then-act) — the
     /// handler sees `exit_head == None`, `uncredited_exit_page()` is
@@ -12158,31 +12190,36 @@ mod paced_exit_race_tests {
     async fn credit_path_exit_staged_inside_the_window_extends_the_credited_phase() {
         let mut harness = RaceHarness::new_quiet("creditrace", 1, "FINAL-CREDRACE");
         harness.wait_ready().await;
-        assert_eq!(
-            harness.head(),
-            1,
-            "the ECHO-OFF banner is the ring's frame 1"
+        let banner_head = harness.settled_head().await;
+        assert!(
+            banner_head >= 1,
+            "the ECHO-OFF banner is in the ring before any step"
         );
-        // Seed the replay window: one pad step = exactly ONE frame
-        // (echo off), so the attach target is frame 2 and the first
-        // page (one frame per page) leaves frame 2 for the racing
+        // Seed the replay window: one pad step lands the pad marker (the
+        // harness script keeps echo off). Transport may split a step's
+        // bytes across ring frames on slow runners, so the walk pins head
+        // PROGRESSION with settled reads, not absolute frame counts; the
+        // first page (one frame per page) leaves the rest for the racing
         // credit's drive.
         harness.step("pad", "PAD-STEP-0").await;
-        let target = harness.head();
-        assert_eq!(target, 2, "one pad step adds exactly one frame (echo off)");
+        let target = harness.settled_head().await;
+        assert!(
+            target > banner_head,
+            "the pad step advanced the ring past the banner (echo off)"
+        );
         let start = harness.attach_paced(0);
         assert_eq!(
             start.session.page_end, 1,
             "budget 0: the first page is exactly frame 1"
         );
         harness.start_session(start, 0);
-        // The "final output": one more frame past the attach target —
-        // the exit will freeze THIS head.
+        // The "final output": frames past the attach target — the exit
+        // will freeze THIS (settled) head.
         harness.step("go", "FINAL-CREDRACE").await;
-        let exit_head = harness.head();
-        assert_eq!(
-            exit_head, 3,
-            "the final-marker step adds exactly one frame past the target"
+        let exit_head = harness.settled_head().await;
+        assert!(
+            exit_head > target,
+            "the final-marker step advanced the head past the attach target"
         );
         let exit_code = 0;
         // THE RACING CREDIT: acknowledges frame 1 — its drive produces
@@ -12397,16 +12434,16 @@ mod paced_exit_race_tests {
     async fn post_transfer_staged_exit_is_the_drains_documented_tail_content() {
         let mut harness = RaceHarness::new_quiet("boundary", 1, "FINAL-BOUNDARY");
         harness.wait_ready().await;
-        assert_eq!(
-            harness.head(),
-            1,
-            "the ECHO-OFF banner is the ring's frame 1"
+        let banner_head = harness.settled_head().await;
+        assert!(
+            banner_head >= 1,
+            "the ECHO-OFF banner is in the ring before any step"
         );
         harness.step("pad", "PAD-STEP-0").await;
-        assert_eq!(
-            harness.head(),
-            2,
-            "one pad step adds exactly one frame (echo off)"
+        let target = harness.settled_head().await;
+        assert!(
+            target > banner_head,
+            "the pad step advanced the ring past the banner (echo off)"
         );
         let start = harness.attach_paced(0);
         assert_eq!(
@@ -12414,20 +12451,35 @@ mod paced_exit_race_tests {
             "budget 0: the first page is exactly frame 1"
         );
         harness.start_session(start, 0);
-        // The tail the drain will page: one frame past the attach
+        // The tail the drain will page: frames past the attach
         // target, ingested BEFORE the transferring credit (the drain's
         // fixed target captures it at its start).
         harness.step("go", "FINAL-BOUNDARY").await;
-        let head_at_transfer = harness.head();
-        assert_eq!(
-            head_at_transfer, 3,
-            "the final-marker step adds exactly one frame past the target"
+        let head_at_transfer = harness.settled_head().await;
+        assert!(
+            head_at_transfer > target,
+            "the final-marker step advanced the head past the attach target"
         );
-        // The transferring credit: its drive reaches the attach target
-        // with NO exit staged — the disposition atomically confirms
-        // that under its lock hold and transfers. No hook is armed:
-        // nothing stages concurrently here.
-        harness.credit(1);
+        // The transferring credits: their drives walk the pages up to
+        // the attach target with NO exit staged — the disposition
+        // atomically confirms that under its lock hold and transfers.
+        // No hook is armed: nothing stages concurrently here. (On a
+        // fast box the first credit is the transferring one; transport
+        // frame-splitting on slow runners may add intermediate pages,
+        // so credit until the drive reaches the target. Every call is
+        // synchronous — the current-thread runtime cannot yield between
+        // the transferring credit and the strictly-post-transfer
+        // staging below.)
+        let mut transfer_steps = 0;
+        loop {
+            if harness.try_session().is_none() {
+                break;
+            }
+            let consumed = harness.session().page_end;
+            harness.credit(consumed);
+            transfer_steps += 1;
+            assert!(transfer_steps < 10_000, "the transfer walk must converge");
+        }
         assert!(
             harness.try_session().is_none(),
             "the credited phase completed and the session moved to the drain"
