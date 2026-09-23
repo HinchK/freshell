@@ -864,6 +864,47 @@ cold-index, and sub-root permission tests;
   NOT self-approved). Task 24 references this entry.
 - status: accepted (KEPT divergence)
 
+### DEV-0021 — cwd-scoped session matching resolves each unique cwd once per registry (Node: per-call realpath, uncached)
+
+- objective_defect: none — KEPT port-side TRIGGER divergence (cwd-canonicalize-lag run). Node's
+  `findTerminalsBySession`/`matchesScopedSessionCwd` (`terminal-registry.ts:414-447`, `:4538`)
+  eagerly computes its cwd normalization (`normalizeScopedSessionCwd`, realpath with lexical
+  fallback) on EVERY lookup for every session of every provider — including non-cwd-scoped
+  providers, whose result it then never reads. The Rust port carried that schedule verbatim
+  (`find_all_by_session` in `crates/freshell-ws/src/identity.rs`), canonicalizing every session's
+  cwd on every ~5s auto-title pass; on WSL2 9P-mounted, cloud-sync-backed cwds (`/mnt/d` +
+  DriveFS) each resolution stalled the tokio async runtime 0.4-2s (kernel D-state in
+  readlink→v9fs), flipping the host-stats FRESHELL tile to `lagging` — the production defect
+  this divergence exists to remove.
+- original_behavior: per-lookup, per-session realpath for every provider (result unused for
+  non-claude providers).
+- port_behavior: resolution is claude-LAZY (computed only when `isCwdScopedSessionMode` is
+  true — claude only) and routed through the per-registry `cwd_memo`
+  (`TerminalIdentityRegistry`, identity.rs): each distinct raw cwd string resolves ONCE per
+  registry lifetime, with the canonicalize outside the memo lock.
+- fingerprint: T1 / resolution schedule only — matching results are identical on both backends
+  for every input that does not retarget a symlink between two lookups of differently-spelled
+  paths; the only observable divergence is fewer/later on-disk resolutions.
+- cost_and_residual: per-raw-key memo values are stable across symlink retargets (the first
+  resolution serves forever for that spelling); sides spelled differently (link vs target) can
+  diverge from eager-canonicalize after a retarget — a permanent match miss for that pair until
+  the raw strings change, accepted over reintroducing the per-sweep 9P stall. First resolution
+  of a never-seen claude cwd still pays one canonicalize (once per registry lifetime).
+- pinning_test: `crates/freshell-ws/src/identity.rs` inline tests
+  (`memoized_cwd_resolution_resolves_a_symlink_once_then_serves_retargets_from_the_memo`,
+  `find_all_by_session_canonicalizes_through_real_symlinks_for_claude`,
+  `find_all_by_session_leaves_the_memo_untouched_for_non_scoped_providers`,
+  `find_all_by_session_treats_an_empty_session_cwd_as_absent_for_scoping`) plus the
+  `crates/freshell-server/src/auto_title_sweep.rs` sweep-level pins
+  (`sweep_cwd_discriminates_between_two_live_claude_terminals`,
+  `sweep_matches_a_claude_terminal_through_real_symlinked_cwds`,
+  `sweep_stays_cwd_blind_for_codex_sessions_with_real_cwds`).
+- adjudicated_by: the-usual cwd-canonicalize-lag run — plan Fresh Eyes round 1 and the
+  whole-branch review both verified matching semantics unchanged against base; the divergence is
+  also documented in the registry field's rustdoc and `normalize_scoped_cwd`'s rustdoc
+  (identity.rs).
+- status: accepted (KEPT divergence)
+
 ## E2E-discovered intentional divergences (EDEV-xx)
 
 **Scope — READ THIS FIRST.** This section is DELIBERATELY SEPARATE from the DEV-NNNN
