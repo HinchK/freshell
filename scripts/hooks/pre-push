@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # Freshell pre-push gate — the cheap local checks (cargo fmt, tsc typecheck,
 # cargo clippy) plus a targeted cargo test lane for rust changes, filtered by
 # what the push actually changes. See docs/development/pre-push-gate.md.
