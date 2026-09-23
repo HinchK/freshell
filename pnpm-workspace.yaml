@@ -10,3 +10,8 @@ managePackageManagerVersions: false
 allowBuilds:
   electron: true
   esbuild: true
+  # fsevents (darwin-only, optional) is deliberately NOT allow-listed: its
+  # install script stays blocked with a warning, and macOS Electron builds
+  # pass without it (PR #820 CI: macos-latest and macos-15-intel green).
+  # If a macOS issue ever traces to the missing native binding, allow it
+  # here as a deliberate decision.
