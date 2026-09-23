@@ -36,7 +36,12 @@ jobs:
           # changed is not proof of fixture compatibility. Scoped to the
           # root and workspace members — the independent demo locks are
           # not part of the workspace dependency tree.
-          if git diff --name-only "origin/${{ github.base_ref }}...${{ github.sha }}" \
+          # `github.base_ref` exists only for pull_request events; manual
+          # dispatch (the event-routing escape hatch) compares against the
+          # default branch instead.
+          BASE="${{ github.base_ref }}"
+          [ -n "$BASE" ] || BASE="main"
+          if git diff --name-only "origin/$BASE...${{ github.sha }}" \
             | grep -Eq '\.rs$|(^|/)Cargo\.(toml|lock)$|^rust-toolchain|^\.cargo/|^test/fixtures/|^(pnpm-lock\.yaml|pnpm-workspace\.yaml|package(-lock)?\.json|\.npmrc)$|^(crates|packages)/.*package(-lock)?\.json$|^packages/'; then
             echo "rust=true" >> "$GITHUB_OUTPUT"
           else
