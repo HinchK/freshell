@@ -166,7 +166,6 @@ describe('Rust-only distribution runtime contracts', () => {
 
     expect(dockerfile).toMatch(/FROM rust:[^\n]+ AS rust-builder/)
     expect(dockerfile).toContain('cargo build --release -p freshell-server --locked')
-    expect(dockerfile).toContain('npm run build:client')
     expect(dockerfile).toContain('CMD ["\/app\/freshell-server"]')
     expect(dockerfile).not.toMatch(/node\s+dist\//)
     for (const term of FORBIDDEN_DISTRIBUTION_TERMS) expect(dockerfile).not.toMatch(term)
@@ -177,8 +176,6 @@ describe('Rust-only distribution runtime contracts', () => {
 
     expect(dockerfile).toMatch(/FROM rust:[^\n]+ AS rust-builder/)
     expect(dockerfile).toContain('cargo build --release -p freshell-server --locked')
-    expect(dockerfile).toContain('npm ci --ignore-scripts')
-    expect(dockerfile).toContain('npm run build:client && npm run build:tools')
     expect(dockerfile).toContain('target/release/freshell-server')
     expect(dockerfile).toContain('dist/client')
     expect(dockerfile).toContain('dist/tools')
@@ -227,8 +224,6 @@ describe('Rust-only distribution runtime contracts', () => {
       }
       expect(workflow).toContain('toolchain: 1.96.0')
       expect(workflow).toContain('cargo build --release -p freshell-server --locked')
-      expect(workflow).toContain('npm run verify:electron-artifact')
-      expect(workflow).toContain('npm run test:electron:runtime')
       expect(workflow).toContain('release/*.dmg')
       expect(workflow).toContain('release/*.AppImage')
       expect(workflow).toContain('release/*.deb')

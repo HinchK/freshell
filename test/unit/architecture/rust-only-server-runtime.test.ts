@@ -49,6 +49,48 @@ function packageScriptsWithRustRequirements(overrides: Record<string, string> = 
   return { ...REQUIRED_RUST_SCRIPT_COMMANDS, ...overrides }
 }
 
+type BuildComposition = {
+  label: string
+  scripts: Record<string, string>
+  packageJsonFields?: Record<string, unknown>
+  treeFiles?: Record<string, string>
+}
+
+const PNPM_ERA_RUST_SCRIPT_COMMANDS: Record<string, string> = {
+  start: 'cross-env NODE_ENV=production tsx scripts/start-rust-server.ts target/release/freshell-server',
+  dev: 'cargo run -p freshell-server --locked',
+  'dev:server': 'cargo run -p freshell-server --locked',
+  build: 'pnpm run build:client && pnpm run build:tools && pnpm run build:rust',
+  'test:source-runtime': 'tsx scripts/testing/run-source-runtime-tests.ts',
+}
+
+const BUILD_COMPOSITIONS: BuildComposition[] = [
+  { label: 'npm-era composition', scripts: REQUIRED_RUST_SCRIPT_COMMANDS },
+  {
+    label: 'pnpm-era composition',
+    scripts: PNPM_ERA_RUST_SCRIPT_COMMANDS,
+    packageJsonFields: { packageManager: 'pnpm@10.34.5' },
+    treeFiles: {
+      'pnpm-workspace.yaml': [
+        'packages:',
+        '  - crates/freshell-claude-sidecar',
+        '  - packages/freshell-mcp-runtime',
+        '',
+      ].join('\n'),
+    },
+  },
+]
+
+function compositionPackageJson(
+  composition: BuildComposition,
+  overrides: Record<string, string> = {},
+): string {
+  return JSON.stringify({
+    ...(composition.packageJsonFields ?? {}),
+    scripts: { ...composition.scripts, ...overrides },
+  })
+}
+
 const tempRoots: string[] = []
 
 async function createSyntheticRoot(
@@ -141,48 +183,52 @@ describe('runtime boundary analyzer', () => {
     expect(result.unexpectedNodeBackend).toEqual(['scripts/bundled-node/new-owner.ts'])
   })
 
-  it('checks package launch behavior without hashing unrelated script text', async () => {
-    const root = await createSyntheticRoot(
-      [{
-        id: 'package-scripts',
-        path: 'package.json:scripts',
-        role: 'package-commands',
-        entries: [...REQUIRED_RUST_SCRIPT_NAMES, 'lint'],
-      }],
-      {
-        'package.json': JSON.stringify({
-          scripts: packageScriptsWithRustRequirements({ lint: 'eslint src --ext .ts' }),
-        }),
-      },
-    )
+  it.each(BUILD_COMPOSITIONS)(
+    'checks package launch behavior without hashing unrelated script text: $label',
+    async (composition) => {
+      const root = await createSyntheticRoot(
+        [{
+          id: 'package-scripts',
+          path: 'package.json:scripts',
+          role: 'package-commands',
+          entries: [...REQUIRED_RUST_SCRIPT_NAMES, 'lint'],
+        }],
+        {
+          ...(composition.treeFiles ?? {}),
+          'package.json': compositionPackageJson(composition, { lint: 'eslint src --ext .ts' }),
+        },
+      )
 
-    const result = await analyzeRuntimeBoundary(root)
+      const result = await analyzeRuntimeBoundary(root)
 
-    expect(result.manifestDrift).toEqual([])
-  })
+      expect(result.manifestDrift).toEqual([])
+    },
+  )
 
-  it('reports a package start command that falls back to the retired Node backend', async () => {
-    const root = await createSyntheticRoot(
-      [{
-        id: 'package-scripts',
-        path: 'package.json:scripts',
-        role: 'package-commands',
-        entries: REQUIRED_RUST_SCRIPT_NAMES,
-      }],
-      {
-        'package.json': JSON.stringify({
-          scripts: packageScriptsWithRustRequirements({ start: 'cross-env node server/index.js' }),
-        }),
-      },
-    )
+  it.each(BUILD_COMPOSITIONS)(
+    'reports a $label start command that falls back to the retired Node backend',
+    async (composition) => {
+      const root = await createSyntheticRoot(
+        [{
+          id: 'package-scripts',
+          path: 'package.json:scripts',
+          role: 'package-commands',
+          entries: REQUIRED_RUST_SCRIPT_NAMES,
+        }],
+        {
+          ...(composition.treeFiles ?? {}),
+          'package.json': compositionPackageJson(composition, { start: 'cross-env node server/index.js' }),
+        },
+      )
 
-    const result = await analyzeRuntimeBoundary(root)
+      const result = await analyzeRuntimeBoundary(root)
 
-    expect(result.manifestDrift).toEqual(expect.arrayContaining([
-      'invalid package script behavior: start',
-      'retired Node backend command: package.json:scripts.start',
+      expect(result.manifestDrift).toEqual(expect.arrayContaining([
+        'invalid package script behavior: start',
+        'retired Node backend command: package.json:scripts.start',
       ]))
-  })
+    },
+  )
 
   it.each([
     'node server/index.js',
@@ -269,30 +315,36 @@ describe('runtime boundary analyzer', () => {
     )
   })
 
-  it('requires every Rust script name in both the manifest and package.json', async () => {
-    const missingNames = ['start', 'test:source-runtime']
-    const entries = REQUIRED_RUST_SCRIPT_NAMES.filter((name) => !missingNames.includes(name))
-    const scripts = packageScriptsWithRustRequirements()
-    for (const missingName of missingNames) delete scripts[missingName]
-    const root = await createSyntheticRoot(
-      [{
-        id: 'package-scripts',
-        path: 'package.json:scripts',
-        role: 'package-commands',
-        entries,
-      }],
-      { 'package.json': JSON.stringify({ scripts }) },
-    )
+  it.each(BUILD_COMPOSITIONS)(
+    'requires every Rust script name in both the manifest and package.json: $label',
+    async (composition) => {
+      const missingNames = ['start', 'test:source-runtime']
+      const entries = REQUIRED_RUST_SCRIPT_NAMES.filter((name) => !missingNames.includes(name))
+      const scripts = { ...composition.scripts }
+      for (const missingName of missingNames) delete scripts[missingName]
+      const root = await createSyntheticRoot(
+        [{
+          id: 'package-scripts',
+          path: 'package.json:scripts',
+          role: 'package-commands',
+          entries,
+        }],
+        {
+          ...(composition.treeFiles ?? {}),
+          'package.json': compositionPackageJson({ ...composition, scripts }),
+        },
+      )
 
-    const result = await analyzeRuntimeBoundary(root)
+      const result = await analyzeRuntimeBoundary(root)
 
-    expect(result.manifestDrift).toEqual(expect.arrayContaining([
-      ...missingNames.flatMap((missingName) => [
-        `manifest missing required package script: ${missingName}`,
-        `invalid package script behavior: ${missingName}`,
-      ]),
-    ]))
-  })
+      expect(result.manifestDrift).toEqual(expect.arrayContaining([
+        ...missingNames.flatMap((missingName) => [
+          `manifest missing required package script: ${missingName}`,
+          `invalid package script behavior: ${missingName}`,
+        ]),
+      ]))
+    },
+  )
 
   it('rejects an unlisted Node listener in an e2e helper regardless of its filename', async () => {
     const root = await createSyntheticRoot(

@@ -67,6 +67,10 @@ fi
 if [[ "$*" == *"executions list"* ]]; then echo "test-exec-123"; exit 0; fi
 if [[ "$*" == *"logs read"* ]]; then echo "Test Files  1 passed (1)"; exit 0; fi
 if [[ "$*" == *"logging read"* ]]; then
+  # One zero-retry completion receipt per task, as Cloud Logging would return
+  # for the single-task execution this stub reports above. Without this
+  # branch the e2e wrapper's structured-receipt reconciliation fails closed
+  # before the exec-id-parse behavior under test ever runs.
   printf '[{"jsonPayload":{"event":"e2e_playwright_task_complete","execution":"test-exec-123","taskIndex":0,"taskCount":1,"recoveredRetryCount":0}}]\n'
   exit 0
 fi

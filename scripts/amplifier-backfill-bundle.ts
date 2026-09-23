@@ -13,8 +13,8 @@
  * matrices mirrored with this file's resolveActiveBundle); this script
  * heals the existing corpus once.
  *
- * Run with: npx tsx scripts/amplifier-backfill-bundle.ts            # dry run (default)
- *           npx tsx scripts/amplifier-backfill-bundle.ts --apply    # write changes
+ * Run with: pnpm exec tsx scripts/amplifier-backfill-bundle.ts            # dry run (default)
+ *           pnpm exec tsx scripts/amplifier-backfill-bundle.ts --apply    # write changes
  *
  * Safety (layered — the spec's original two guards were empirically shown
  * to miss live sessions: interactive CLI processes carry no session id in
@@ -201,7 +201,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
   const unknown = argv.filter((a) => !['--apply', '--dry-run'].includes(a))
   if (unknown.length > 0) {
     console.error(
-      'Usage: npx tsx scripts/amplifier-backfill-bundle.ts [--dry-run (default) | --apply]',
+      'Usage: pnpm exec tsx scripts/amplifier-backfill-bundle.ts [--dry-run (default) | --apply]',
     )
     process.exit(1)
   }

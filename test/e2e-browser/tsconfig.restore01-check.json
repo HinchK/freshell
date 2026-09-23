@@ -1,5 +1,5 @@
 {
-  "//": "RESTORE-01 item-scoped typecheck gate (same pattern as tsconfig.browser01-check.json / tsconfig.term04-check.json). The repo-owned typecheck configs deliberately exclude test/, so this gives the recovery auto-decline helper + its adopting specs an executable gate: run `npx tsc -p test/e2e-browser/tsconfig.restore01-check.json`, then require zero error lines attributable to the files RESTORE-01 created or edited. Errors in pre-existing dependency files reproduce identically on the base commit and are out of scope.",
+  "//": "RESTORE-01 item-scoped typecheck gate (same pattern as tsconfig.browser01-check.json / tsconfig.term04-check.json). The repo-owned typecheck configs deliberately exclude test/, so this gives the recovery auto-decline helper + its adopting specs an executable gate: run `pnpm exec tsc -p test/e2e-browser/tsconfig.restore01-check.json`, then require zero error lines attributable to the files RESTORE-01 created or edited. Errors in pre-existing dependency files reproduce identically on the base commit and are out of scope.",
   "extends": "../../tsconfig.json",
   "compilerOptions": {
     "noEmit": true,

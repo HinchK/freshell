@@ -288,7 +288,7 @@ account (export it). All skill scripts are invoked via
    re-verify and re-smoke. Only after the probes AND the smoke pass is the
    repo "provisioned and verified".
 
-4. Done. `npm run test:cloud` / `npm run test:e2e:cloud` now select the robot
+4. Done. `pnpm run test:cloud` / `pnpm run test:e2e:cloud` now select the robot
    automatically wherever its key is activated; no `.env` or repo config
    exists for this (`.env.example` is server-runtime config and deliberately
    carries no cloud-lane knobs).

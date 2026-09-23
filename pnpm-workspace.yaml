@@ -1,0 +1,12 @@
+packages:
+  - crates/freshell-claude-sidecar
+  - packages/freshell-mcp-runtime
+nodeLinker: isolated
+injectWorkspacePackages: true
+enablePrePostScripts: true
+resolvePeersFromWorkspaceRoot: false
+packageManagerStrictVersion: true
+managePackageManagerVersions: false
+allowBuilds:
+  electron: true
+  esbuild: true

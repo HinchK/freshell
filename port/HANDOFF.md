@@ -1,5 +1,12 @@
 # HANDOFF v3 — freshell Rust + Tauri Port
 
+> **Historical campaign handoff.** This handoff drives the Rust/Tauri port
+> campaign on its npm-era branch (`feat/rust-tauri-port`); its recipes,
+> environment evidence, and `npm`/`npx` commands are the campaign record,
+> preserved verbatim. The Rust server is now the product baseline on `main`,
+> which uses pnpm — current development runbooks live in the repo-root
+> `AGENTS.md` and `docs/development/`.
+
 **Updated 2026-07-11 on `SurfaceBookPro9`, branch `feat/rust-tauri-port`, from
 setup-handoff commit `c8240743`.**
 **This document REPLACES all earlier handoffs. This is the only handoff.**

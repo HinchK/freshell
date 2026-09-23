@@ -31,7 +31,7 @@
 // Gates mirror amplifier-launch-smoke.test.ts: on-PATH probe (top-level
 // await), FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1, provider key for the
 // turn-making test. Opt-in run:
-//   FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- \
+//   FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 pnpm run test:vitest \
 //     run test/integration/real/amplifier-stub-adoption-contract.test.ts \
 //     --config config/vitest/vitest.config.ts
 //

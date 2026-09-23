@@ -8,7 +8,10 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { ensureAuthTokenFile } from '../../../scripts/bootstrap-env.js'
-import { resolveNpmCommand } from '../../../scripts/testing/coordinator-upstream.js'
+import {
+  detectProjectManager,
+  resolveManagerCommand,
+} from '../../../scripts/lib/package-manager.js'
 import {
   findReleaseServerPid,
   readProcessSnapshot,
@@ -57,7 +60,8 @@ async function waitForRustChild(parentPid: number, timeoutMs = 10_000): Promise<
       const pid = findReleaseServerPid(parentPid, readProcessSnapshot(), process.platform)
       if (pid !== undefined) return pid
     } catch {
-      // The process table may be unavailable briefly while npm is starting.
+      // The process table may be unavailable briefly while the package
+      // manager is starting.
     }
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
@@ -133,12 +137,13 @@ describe('source runtime', () => {
     }
   })
 
-  it('starts the release Rust binary through npm start and serves the built SPA', async () => {
+  it('starts the release Rust binary through the detected package manager start script and serves the built SPA', async () => {
     homeDir = await mkdtemp(path.join(os.tmpdir(), 'freshell-source-runtime-'))
     const port = await findFreePort()
     const token = `source-runtime-${process.pid}`
-    const npm = resolveNpmCommand(['start'])
-    child = spawn(npm.command, npm.args, {
+    const manager = detectProjectManager(PROJECT_ROOT).manager
+    const startCommand = resolveManagerCommand({ manager, args: ['start'], env: process.env })
+    child = spawn(startCommand.command, startCommand.args, {
       cwd: PROJECT_ROOT,
       env: {
         ...process.env,
@@ -152,6 +157,7 @@ describe('source runtime', () => {
         FRESHELL_CLIENT_DIR: path.join(PROJECT_ROOT, 'dist', 'client'),
       },
       stdio: 'ignore',
+      shell: startCommand.viaShell ?? false,
     })
 
     await waitForHealth(`http://127.0.0.1:${port}`)
