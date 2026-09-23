@@ -213,17 +213,6 @@ export const RESERVE_RETRY_WINDOW_MS = 30_000
 export const RESERVE_RETRY_FLOOR_MS = 250
 export const INVALID_TERMINAL_LAUNCH_RETRY_MAX_ATTEMPTS = 5
 export const INVALID_TERMINAL_LAUNCH_RETRY_DELAY_MS = 500
-// Task 7 fence-heal follow-up (the vacant-recovery lane): the minimum
-// wall-clock spacing between a pane's automatic vacant-session
-// recoveries — bounds exit→recreate→exit crash loops (each recovery is
-// a fresh spawn; without the interval a CLI that dies instantly would
-// auto-respawn unboundedly). A single cross-device kill heals
-// immediately (the first recovery is never spaced); a kill inside the
-// window blocks that one attempt WITHOUT scheduling anything — the next
-// heal re-fires on the session's next owner transition, a user action,
-// or a reconnect (Task 7 review M1: the block is not a timer; the end
-// state is the honest exited pane with the user-driven affordance).
-export const VACANT_RECOVERY_MIN_INTERVAL_MS = 10_000
 const MOBILE_KEYBAR_HEIGHT_PX = 40
 const MOBILE_KEY_REPEAT_INITIAL_DELAY_MS = 320
 const MOBILE_KEY_REPEAT_INTERVAL_MS = 70
@@ -847,21 +836,29 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
   // id yet and the ordinary lifecycle flow owns it; a RUNNING pane is never
   // stolen off its own live terminal.
   const ownTerminalDeadOrAbsent = isTerminal && terminalContent?.status === 'exited'
+  // b8ke delta F1: the exit fold CLEARS the stored terminal id, but the
+  // convergence's own-terminal gate must still recognize the pane's OWN
+  // dead terminal. The kill's wire order (terminal.exit first, the stop
+  // commit's VACANT owner frame moments later) leaves the record still
+  // naming the pane's own dead terminal as the terminal-Live owner in the
+  // window between the two folds; converging onto it re-attached the dead
+  // handle, drew INVALID_TERMINAL_ID, and the reconnect recovery
+  // AUTO-RESUMED the killed session (the exact delta F1 hazard, racy on
+  // the render between the exit fold and the vacant fold).
+  // lastKnownTerminalIdRef (Ledger A2 — never cleared by recovery) carries
+  // the dead id here; a pane that never acquired a terminal keeps
+  // undefined and converges normally (a genuinely NEW authoritative
+  // terminal is never the pane's own dead one).
   const terminalOwnerConvergence = ownTerminalDeadOrAbsent
     && freshAgentOwnerDivergence === null
-    ? deriveTerminalOwnerConvergence(terminalRuntimeOwner, terminalContent?.terminalId)
+    ? deriveTerminalOwnerConvergence(
+      terminalRuntimeOwner,
+      terminalContent?.terminalId ?? lastKnownTerminalIdRef.current,
+    )
     : null
   const terminalOwnerConvergenceRef = useRef(terminalOwnerConvergence)
   terminalOwnerConvergenceRef.current = terminalOwnerConvergence
   const terminalConvergenceAdoptedRef = useRef<string | null>(null)
-
-  // Task 7 fence-heal follow-up (the vacant-recovery lane): the bridge to
-  // the lifecycle effect's resumeRecoveryCreate closure (re-published each
-  // effect run; consumed by the component-scope vacant-recovery effect
-  // declared after the lifecycle effect), and the last-auto-recovery
-  // timestamp enforcing the crash-loop quiet interval.
-  const resumeRecoveryCreateRef = useRef<((deadTerminalId?: string) => void) | null>(null)
-  const vacantRecoveryLastAtRef = useRef(0)
 
   // b8ke ext r11 F2: the convergence effect — the committed same-kind
   // owner broadcast drives the pane onto the new authoritative terminal.
@@ -3807,17 +3804,13 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
       }
 
       // b8ke fence-heal (Task 7 follow-up): the recovery-create lane shared
-      // by the INVALID_TERMINAL_ID reconnect recovery, the
+      // by the INVALID_TERMINAL_ID reconnect recovery and the
       // pane-terminal-scoped refused-arm refusal routing (the cross-device
-      // kill shape), and the vacant-recovery lane (an exited session pane
-      // whose canonical record folded vacant): mint a NEW createRequestId
+      // kill shape): mint a NEW createRequestId
       // (the r35 NEXT-decision fresh capture at send time), mark it restore
       // (the rate-limit exemption), clear the dead terminal's handles, and
       // let the lifecycle effect's createRequestId dependency re-fire the
-      // resume create. The dead terminal id is optional — the
-      // vacant-recovery lane's pane may know the death only from the exit
-      // fold (the id lives in lastKnownTerminalIdRef, absent in a fresh
-      // mount whose terminal came from storage).
+      // resume create.
       const resumeRecoveryCreate = (deadTerminalId?: string) => {
         writeLocalXtermNotice(term, '\r\n[Reconnecting...]\r\n')
         const newRequestId = nanoid()
@@ -3859,12 +3852,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
           dispatch(updateTab({ id: currentTab.id, updates: { status: 'creating' } }))
         }
       }
-      // Ref bridge (Task 7 vacant-recovery lane): the latest closure is
-      // re-published on every lifecycle effect run; the component-scope
-      // vacant-recovery effect (declared after this one) consumes it. The
-      // closure reads refs at call time, so a bridge call is safe across
-      // re-fires.
-      resumeRecoveryCreateRef.current = resumeRecoveryCreate
 
       // F9: the server no longer knows the terminal this still-launching pane
       // points at. Pump bounded same-requestId re-creates instead of minting a
@@ -5933,44 +5920,6 @@ function TerminalView({ tabId, paneId, paneContent, hidden, focusEpoch = 0 }: Te
     runRefreshAttach,
     syncContentRefWithSessionAssociation,
     writeLocalXtermNotice,
-  ])
-
-  // Task 7 fence-heal follow-up (the vacant-recovery lane): an EXITED
-  // session pane whose canonical session record folds VACANT (the
-  // cross-device kill shape — the pane folded its terminal.exit and the
-  // stop commit broadcast the vacant owner) previously had NO re-drive:
-  // the lifecycle effect's deps (createRequestId/reconcileEpoch) never
-  // changed, and the only observed heal was another device's
-  // attach-refusal broadcast racing the pane's pre-exit state (incidental
-  // and ~13% flaky). The pane now recovers from ITS OWN observation —
-  // the exit fold plus the vacant record — through the same
-  // recovery-create lane (the re-minted resume) the typed-refusal branch
-  // uses. Session panes only (a durable sessionRef — plain shells keep
-  // the user-driven reconnect affordance); a quiet interval bounds
-  // exit→recreate→exit crash loops; fresh-agent divergence keeps the
-  // cross-kind recovery card in charge. Declared AFTER the lifecycle
-  // effect so the ref bridge holds the latest closure when this runs.
-  useEffect(() => {
-    if (!isTerminal || !terminalContent) return
-    if (terminalContent.status !== 'exited') return
-    if (!terminalContent.sessionRef) return
-    if (freshAgentOwnerDivergenceRef.current !== null) return
-    if (terminalRuntimeOwner?.ownerKind !== 'vacant') return
-    const resumeRecovery = resumeRecoveryCreateRef.current
-    if (!resumeRecovery) return
-    const now = Date.now()
-    if (now - vacantRecoveryLastAtRef.current < VACANT_RECOVERY_MIN_INTERVAL_MS) return
-    vacantRecoveryLastAtRef.current = now
-    log.info('vacant-recovery: re-driving the recovery-create for the exited session pane', {
-      paneId,
-      sessionRef: terminalContent.sessionRef,
-    })
-    resumeRecovery(lastKnownTerminalIdRef.current ?? undefined)
-  }, [
-    isTerminal,
-    terminalContent?.status,
-    terminalContent?.sessionRef,
-    terminalRuntimeOwner?.ownerKind,
   ])
 
   useEffect(() => {
