@@ -405,6 +405,15 @@ struct OpencodeSession {
     /// the ambiguous-failure arm keeps the round-3 deferral; the
     /// no-writer flavors (timeout/undelivered) disarm + drain.
     abort_in_flight: Arc<AtomicU32>,
+    /// Focused episode 2 round 1, Major 3: REMEMBER a daemon idle that
+    /// arrives while an abort is in flight (the observation is deferred,
+    /// not discarded). If that abort then settles with an AMBIGUOUS
+    /// failure (HTTP 500 / Transport / Decode), the compact's only idle
+    /// edge has already fired — no later event can release the queue —
+    /// so the settlement arm consumes this memory as the proven quiesce
+    /// and delivers. Reset at every interrupt-window arming (teardown
+    /// start) so the memory is always scoped to ONE abort window.
+    daemon_idle_seen: Arc<AtomicBool>,
     /// PR-3: flipped `true` by the serve-stream bridge when it observes a `session.error`
     /// SSE event during the in-flight turn (`state.turnErrored`, adapter.ts:278-282,334-335).
     /// Reset to `false` at the top of every `handle_send`.
@@ -492,6 +501,7 @@ impl OpencodeSession {
             daemon_turn_accepted: Arc::new(AtomicBool::new(false)),
             orphaned_daemon_turn: Arc::new(AtomicBool::new(false)),
             abort_in_flight: Arc::new(AtomicU32::new(0)),
+            daemon_idle_seen: Arc::new(AtomicBool::new(false)),
             turn_errored: Arc::new(AtomicBool::new(false)),
             last_turn_complete_at: Arc::new(StdMutex::new(None)),
             serve_bridge: None,
@@ -2259,7 +2269,13 @@ impl FreshOpencodeState {
             // holds every drain trigger off until a later interrupt
             // PROVES the daemon quiesced (its abort succeeded); the
             // deferral is WARN-observable, the message is never lost.
-            if session.orphaned_daemon_turn.load(Ordering::SeqCst) {
+            if session.orphaned_daemon_turn.load(Ordering::SeqCst)
+                // Focused episode 2 round 1, Major 2: an unsettled abort
+                // request can still reach the daemon and cancel whatever
+                // it is doing — no drain may dispatch while ANY abort is
+                // in flight (the last settlement owns the release).
+                || session.abort_in_flight.load(Ordering::SeqCst) > 0
+            {
                 return;
             }
             if session
@@ -3897,6 +3913,7 @@ impl FreshOpencodeState {
             daemon_turn_accepted,
             orphaned_daemon_turn,
             abort_in_flight,
+            daemon_idle_seen,
         ) = {
             let mut session = session_arc.lock().await;
             session.turn_aborted.store(true, Ordering::SeqCst);
@@ -3909,6 +3926,9 @@ impl FreshOpencodeState {
             // Disarmed ONLY by the proven daemon quiesce (the abort
             // SUCCEEDS below); the Err arm keeps it armed + WARNs.
             session.orphaned_daemon_turn.store(true, Ordering::SeqCst);
+            // Focused episode 2 round 1, Major 3: a fresh abort window
+            // starts with a clean idle memory.
+            session.daemon_idle_seen.store(false, Ordering::SeqCst);
             // Delta-review round 6 (extension) Major 2: the abort request
             // is now in flight (or about to be) — the daemon-idle
             // release defers to this abort's settlement. Armed in the SAME
@@ -3927,6 +3947,7 @@ impl FreshOpencodeState {
                 session.daemon_turn_accepted.clone(),
                 session.orphaned_daemon_turn.clone(),
                 session.abort_in_flight.clone(),
+                session.daemon_idle_seen.clone(),
             )
         };
 
@@ -3954,9 +3975,20 @@ impl FreshOpencodeState {
         match manager.abort(&real_id, &route).await {
             Ok(()) => {
                 // Delta-review round 6 (extension) Major 2: the abort
-                // settled — its exclusive release ownership ends. Cleared
-                // FIRST so the drain below runs with the counter at zero.
-                abort_in_flight.fetch_sub(1, Ordering::SeqCst);
+                // settled. Focused episode 2 round 1, Major 2: the RELEASE
+                // is owned by the LAST in-flight abort — an
+                // earlier-settling abort must not clear the latch + drain
+                // while a sibling abort is still in flight (its late
+                // processing could cancel a freshly dispatched prompt
+                // after it left the queue).
+                let last = abort_in_flight.fetch_sub(1, Ordering::SeqCst) == 1;
+                // The daemon answered THIS abort — the session is idle
+                // right now; the status frame is truthful regardless of
+                // sibling aborts.
+                self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+                if !last {
+                    return;
+                }
                 // b8ke focused FR1: the daemon answered the abort — the
                 // daemon-side turn is settled; disarm the acceptance so a
                 // later handoff stop does not issue a redundant abort.
@@ -3965,7 +3997,7 @@ impl FreshOpencodeState {
                 // successful abort is the PROVEN daemon quiesce — clear
                 // any orphan marker a previously failed interrupt armed.
                 orphaned_daemon_turn.store(false, Ordering::SeqCst);
-                self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
+                let _ = daemon_idle_seen.swap(false, Ordering::SeqCst);
                 // send-during-compact queue: an interrupted compact never
                 // runs its own settle tail (the TurnTask doc — an aborted
                 // drive drops mid-await and never reaches its tail), so
@@ -3979,24 +4011,60 @@ impl FreshOpencodeState {
                 // Delta-review round 6 (extension) Major 2: the abort
                 // request settled (answered, failed, or timed out) — the
                 // counter must end its release ownership in EVERY arm.
-                abort_in_flight.fetch_sub(1, Ordering::SeqCst);
+                let last = abort_in_flight.fetch_sub(1, Ordering::SeqCst) == 1;
                 // Delta-review round 6 (extension) Major 1: the no-writer
-                // failure flavors. A RequestTimeout already KILLED the
+                // failure flavor. A RequestTimeout already KILLED the
                 // sidecar (DiscardOnTimeout::Yes → discard_running + Lost
                 // to every session — the bridge ignores Lost, the emitter
-                // closes, so NO later idle can ever release the latch:
-                // the old code stranded the queue forever); Undelivered
-                // never left the client (the daemon provably never saw
-                // the request). Both leave NO possible daemon-side
-                // writer — the orphan window is closed by construction,
-                // so the latch cannot survive them: disarm + drain. The
-                // parked message then either delivers (post-revival
-                // daemon) or fails with the normal typed send-failure
-                // path — it never strands silently.
-                if matches!(
-                    serve_err,
-                    ServeError::RequestTimeout { .. } | ServeError::Undelivered(_)
-                ) {
+                // closes, so no later idle can ever release the latch:
+                // the old code stranded the queue forever) — no daemon-
+                // side writer can remain, so the latch cannot survive it.
+                // (Focused episode 2 round 1, Major 1: Undelivered is
+                // NOT this flavor — a connect-phase refusal proves only
+                // that the ABORT never reached the daemon; the accepted
+                // daemon-side turn may still be running, so Undelivered
+                // takes the ambiguous-deferral path below with 500 /
+                // Transport / Decode.)
+                if matches!(serve_err, ServeError::RequestTimeout { .. }) {
+                    orphaned_daemon_turn.store(false, Ordering::SeqCst);
+                    turn_aborted.store(false, Ordering::SeqCst);
+                    let queued_depth = {
+                        let session = session_arc.lock().await;
+                        session.pending_sends.len()
+                    };
+                    tracing::warn!(target: "freshell_freshagent::opencode",
+                        session_id = %real_id,
+                        queued_depth = queued_depth,
+                        "fresh_agent_interrupt_abort_timeout_sidecar_discarded");
+                    // Focused episode 2 round 1, Major 2: the drain too is
+                    // owned by the LAST in-flight abort — a sibling abort
+                    // still in flight could cancel a freshly dispatched
+                    // prompt. The parked message then either delivers
+                    // (post-revival daemon, once the last abort settles)
+                    // or fails with the normal typed send-failure path —
+                    // it never strands silently.
+                    if last {
+                        Self::drain_detached(self, &real_id);
+                    }
+                    return;
+                }
+                // adapter.ts:525-528 -- the abort never landed, so the turn may still
+                // complete normally; clear the flag so a genuine completion isn't
+                // silently swallowed.
+                turn_aborted.store(false, Ordering::SeqCst);
+                // Focused episode 2 round 1, Major 2: a sibling abort
+                // still in flight owns the window — defer to ITS
+                // settlement.
+                if !last {
+                    return;
+                }
+                // Focused episode 2 round 1, Major 3: the ambiguous
+                // failure settling the LAST abort may carry a remembered
+                // daemon idle — the compact's only idle edge already
+                // fired during the abort window, and no later event can
+                // release the queue, so the observed idle IS the proven
+                // quiesce: consume the memory, disarm, deliver.
+                if daemon_idle_seen.swap(false, Ordering::SeqCst) {
                     orphaned_daemon_turn.store(false, Ordering::SeqCst);
                     let queued_depth = {
                         let session = session_arc.lock().await;
@@ -4005,14 +4073,10 @@ impl FreshOpencodeState {
                     tracing::warn!(target: "freshell_freshagent::opencode",
                         session_id = %real_id,
                         queued_depth = queued_depth,
-                        "fresh_agent_interrupt_abort_unreachable_queue_drains");
+                        "fresh_agent_interrupt_orphan_released_by_observed_idle");
                     Self::drain_detached(self, &real_id);
                     return;
                 }
-                // adapter.ts:525-528 -- the abort never landed, so the turn may still
-                // complete normally; clear the flag so a genuine completion isn't
-                // silently swallowed.
-                turn_aborted.store(false, Ordering::SeqCst);
                 // send-during-compact queue (delta-review round 3): the
                 // daemon-side turn may STILL be executing — the orphan
                 // marker (armed at the teardown start, above) STAYS
@@ -4021,9 +4085,10 @@ impl FreshOpencodeState {
                 // dispatches a parked prompt into the possibly-live
                 // daemon-side turn. A deferred message is WARN-observable
                 // and recoverable (a later interrupt whose abort succeeds
-                // disarms and delivers); a prompt fired into the
-                // interleaving window could be lost or reordered — the
-                // exact loss the queue exists to prevent.
+                // disarms and delivers, or a later daemon idle — round 4);
+                // a prompt fired into the interleaving window could be
+                // lost or reordered — the exact loss the queue exists to
+                // prevent.
                 let queued_depth = {
                     let session = session_arc.lock().await;
                     debug_assert!(session.orphaned_daemon_turn.load(Ordering::SeqCst));
@@ -6657,9 +6722,13 @@ impl FreshOpencodeState {
                 // cancel it after it left `pending_sends` (lost, no
                 // requeue, no correlated failure). The abort's own arms
                 // handle the release: Ok disarms + drains; ambiguous
-                // failure keeps the round-3 deferral for a LATER idle
-                // (the counter is zero by then); the no-writer flavors
-                // disarm + drain immediately.
+                // failure keeps the round-3 deferral unless THIS observed
+                // idle is remembered (focused episode 2 round 1, Major 3 —
+                // the compact's only idle edge must not be discarded when
+                // the settlement goes ambiguous); the timeout flavor
+                // disarms + drains at the last settlement.
+                // REMEMBER the idle for the settlement arm to consume.
+                session.daemon_idle_seen.store(true, Ordering::SeqCst);
                 false
             } else {
                 let released = session.orphaned_daemon_turn.swap(false, Ordering::SeqCst);
@@ -17589,8 +17658,8 @@ mod tests {
             assert!(
                 captured.iter().any(|e| e
                     .message
-                    .contains("fresh_agent_interrupt_abort_unreachable_queue_drains")),
-                "the timeout drain is WARN-observable"
+                    .contains("fresh_agent_interrupt_abort_timeout_sidecar_discarded")),
+                "the timeout's sidecar discard is WARN-observable"
             );
         }
         let session_arc = st.sessions.lock().await.get("ses_q14").cloned().unwrap();
@@ -17602,13 +17671,14 @@ mod tests {
         assert!(session.pending_sends.is_empty());
     }
 
-    /// Delta-review round 6 (extension) Major 1: an abort refused at the
-    /// connect phase (`Undelivered` — the daemon provably never saw the
-    /// request, the only no-side-effects failure class) likewise leaves no
-    /// daemon-side writer: the arm disarms + drains instead of deferring
-    /// forever.
+    /// Focused episode 2 round 1, Major 1: an abort refused at the connect
+    /// phase (`Undelivered`) proves only that the ABORT never reached the
+    /// daemon — it says nothing about the already-accepted daemon-side
+    /// turn, which may still be running. It must DEFER exactly like a
+    /// 500-answered abort (the round-3 semantics); a later daemon idle is
+    /// the proven quiesce that releases + delivers.
     #[tokio::test]
-    async fn an_undelivered_abort_cannot_orphan_and_still_drains() {
+    async fn an_undelivered_abort_defers_like_a_failed_abort() {
         let summarize_gate = Arc::new(tokio::sync::Notify::new());
         let (st, http, _rx) = compact_state_gated(
             r#"{"model":null}"#,
@@ -17627,7 +17697,7 @@ mod tests {
         await_summarize_posted(&http).await;
         let _ = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            st.handle_send(send_msg("ses_q15", "survives the refusal")),
+            st.handle_send(send_msg("ses_q15", "waits out the refusal")),
         )
         .await;
 
@@ -17645,17 +17715,217 @@ mod tests {
         .await
         .expect("interrupt answers after the refused abort");
 
-        await_prompt_posted(&http, "survives the refusal").await;
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "an undelivered abort defers like a failed one — the daemon-side turn may still be running"
+        );
         {
             let captured = events.lock().unwrap();
             assert!(
                 captured.iter().any(|e| e
                     .message
-                    .contains("fresh_agent_interrupt_abort_unreachable_queue_drains")),
-                "the undelivered drain is WARN-observable"
+                    .contains("fresh_agent_interrupt_abort_failed_queue_deferred")),
+                "the refusal keeps the round-3 deferral WARN"
             );
         }
         let session_arc = st.sessions.lock().await.get("ses_q15").cloned().unwrap();
+        assert!(
+            session_arc
+                .lock()
+                .await
+                .orphaned_daemon_turn
+                .load(Ordering::SeqCst),
+            "the deferral latch stays armed"
+        );
+
+        // The daemon later reports idle — the PROVEN quiesce releases +
+        // delivers (round-4 semantics).
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q15", "ses_q15").await;
+        await_prompt_posted(&http, "waits out the refusal").await;
+        let session_arc = st.sessions.lock().await.get("ses_q15").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    /// Focused episode 2 round 1, Major 2: with two rapid interrupts, the
+    /// FIRST abort to settle must NOT clear the latch + drain while the
+    /// second abort is still in flight — the second abort's late
+    /// processing could cancel the freshly dispatched prompt after it
+    /// left the queue. The LAST in-flight abort's settlement owns the
+    /// release.
+    #[tokio::test]
+    async fn the_last_in_flight_abort_owns_the_queue_release() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q16", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q16")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q16", "behind both aborts")),
+        )
+        .await;
+
+        // Interrupt A's abort parks on the one-shot gate (in flight);
+        // interrupt B's abort answers 200 immediately.
+        let abort_gate = http.arm_abort_gate();
+        let interrupt_a = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    st.handle_interrupt(FreshAgentInterrupt {
+                        provider: AgentProvider::Opencode,
+                        session_id: "ses_q16".to_string(),
+                        session_type: SessionType::Freshopencode,
+                        cwd: None,
+                    }),
+                )
+                .await
+            })
+        };
+        await_abort_posted(&http).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q16".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt B answers (abort 200)");
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "B's SUCCESSFUL abort must not drain while A's abort is still in flight — the LAST settlement owns the release"
+        );
+        {
+            let session_arc = st.sessions.lock().await.get("ses_q16").cloned().unwrap();
+            assert!(
+                session_arc
+                    .lock()
+                    .await
+                    .orphaned_daemon_turn
+                    .load(Ordering::SeqCst),
+                "the deferral latch stays armed until the last abort settles"
+            );
+        }
+
+        // A's abort settles 200 — the LAST settlement clears + drains.
+        abort_gate.notify_waiters();
+        interrupt_a
+            .await
+            .expect("interrupt A task lives")
+            .expect("interrupt A answers within the budget");
+        await_prompt_posted(&http, "behind both aborts").await;
+        let session_arc = st.sessions.lock().await.get("ses_q16").cloned().unwrap();
+        let session = session_arc.lock().await;
+        assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
+        assert!(session.pending_sends.is_empty());
+    }
+
+    /// Focused episode 2 round 1, Major 3: a daemon idle observed DURING
+    /// an abort window is remembered, not discarded — if the abort then
+    /// settles with an ambiguous failure (HTTP 500), the already-seen
+    /// idle is the proven quiesce that releases + delivers; without the
+    /// memory the queue would strand (the compact's only idle edge is
+    /// gone and no later event can release it).
+    #[tokio::test]
+    async fn an_idle_observed_during_an_abort_window_releases_on_its_ambiguous_failure() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q17", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q17")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q17", "waits for the memory")),
+        )
+        .await;
+
+        // The abort parks (in flight) AND will answer 500 when released.
+        let abort_gate = http.arm_abort_gate();
+        http.arm_abort_fail();
+        let interrupt = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    st.handle_interrupt(FreshAgentInterrupt {
+                        provider: AgentProvider::Opencode,
+                        session_id: "ses_q17".to_string(),
+                        session_type: SessionType::Freshopencode,
+                        cwd: None,
+                    }),
+                )
+                .await
+            })
+        };
+        await_abort_posted(&http).await;
+
+        // The daemon reports idle DURING the abort window — deferred
+        // (Major 2) but REMEMBERED (this fix).
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q17", "ses_q17").await;
+        for _ in 0..25 {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !http
+                .recorded()
+                .iter()
+                .any(|r| r.url.contains("prompt_async")),
+            "the release defers to the abort's settlement"
+        );
+
+        // The abort settles AMBIGUOUSLY (500) — the remembered idle is
+        // the proven quiesce: release + deliver (no stranding on the
+        // compact's only idle edge having already fired).
+        abort_gate.notify_waiters();
+        interrupt
+            .await
+            .expect("interrupt task lives")
+            .expect("interrupt answers within the budget");
+        await_prompt_posted(&http, "waits for the memory").await;
+        let session_arc = st.sessions.lock().await.get("ses_q17").cloned().unwrap();
         let session = session_arc.lock().await;
         assert!(!session.orphaned_daemon_turn.load(Ordering::SeqCst));
         assert!(session.pending_sends.is_empty());
