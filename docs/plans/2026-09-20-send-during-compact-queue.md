@@ -107,21 +107,27 @@ test('a raw send during a parked compaction is queued and delivered after the co
         (m: any) => m.requestId === 'e2e-queued-during-compact'))
       .toBe(true)
 
-    // SYNC 2 + the NEGATIVE HOLD: the gate FILE still existing PROVES the
-    // compact is still parked — the knob consumes/rm's the file the
-    // moment it appears, so `stat(gatePath)` succeeding ⟺ not yet
-    // released. (Counting audit events does NOT prove parked-ness: the
-    // fixture records many event kinds per session — listen,
-    // session_create_requested, config_get, status, transcript — the
-    // round-3 review's finding.) Dwell a bounded 1.5s inside that
+    // SYNC 2 + the NEGATIVE HOLD: no `session_idle_emitted` audit entry
+    // after the summarize receipt PROVES the compact is still parked —
+    // the idle emission is the exact artifact the knob parks, and an
+    // ungated or removed knob would land it long before this check (an
+    // ungated compact cannot survive the 1.5s dwell), so the check is
+    // anti-vacuous and server-independent. (The earlier sketch's
+    // `stat(gatePath)` form was unsatisfiable — the gate file exists only
+    // after the test writes it at release; adjudicated during execution,
+    // task-001-report.md Deviation 1.) Dwell a bounded 1.5s inside the
     // provably-parked window, then assert the queued prompt NEVER
     // posted. (A single immediate poll would be vacuous — absence after
     // positive syncs plus a bounded dwell while the gate is verifiably
     // held is the honest negative form.)
     await page.waitForTimeout(1_500)
-    expect(await fs.promises.stat(gatePath).then(() => true, () => false))
-      .toBe(true) // still parked
     const auditWhileParked = readOpencodeAudit(lane.auditLogPath)
+    const summarizeReceiptIx = auditWhileParked.findIndex((e) => e.event === 'summarize')
+    expect(
+      auditWhileParked.slice(summarizeReceiptIx + 1)
+        .filter((e) => e.event === 'session_idle_emitted'),
+      'no idle emission after the summarize receipt — the compact is still parked',
+    ).toHaveLength(0)
     expect(auditWhileParked.some(
       e => e.event === 'prompt_async' && e.prompt === 'sent while compacting')).toBe(false)
 
@@ -1423,7 +1429,7 @@ Expected: PASS.
 
 Run: `FRESHELL_E2E_BACKEND=cloud npm run test:e2e:cloud -- test/e2e-browser/specs/fresh-agent-control-rust.spec.ts`
 
-Expected: PASS on the cloud backend (the constraint's PR-readiness rule — the whole spec file, both new tests included).
+Expected: BOTH NEW TESTS PASS on the cloud backend (the constraint's PR-readiness rule — this run's affected specs). The whole file also contains two PRE-EXISTING BASE FAILURES — the kilroy crash-recovery test (:1193) and the codex wedged-sidecar test (:1928) — reproduced byte-identically against a base-built server (sha-pinned receipts, task-006-report.md); they are ledger-recorded pre-existing failures owned by the kilroy/codex lanes, NOT regressions of this run, and they do not gate it. Never add the spec to CLOUD_SKIP_SPECS to make them disappear.
 
 **Step 6: Commit the task**
 
