@@ -609,7 +609,7 @@ async fn undelivered_failures_bound_at_three_cycles_six_reads_and_exhaust_perman
     // by their constants; this hook only accelerates eligibility).
     crate::session_names::set_test_hooks(
         dir.path(),
-        vec![crate::session_names::TestHook::NativeRetryFloorMs(60)],
+        vec![crate::session_names::TestHook::NativeRetryFloorMs(2_000)],
     );
     let store = open_store(dir.path());
     let target = armed_pending(&store, "h-exhaust", "/h/.claude").await;
@@ -643,11 +643,15 @@ async fn undelivered_failures_bound_at_three_cycles_six_reads_and_exhaust_perman
             .is_none(),
         "not yet due consumes nothing"
     );
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    // The 2s floor gives the not-yet-due asserts above real margin: a
+    // parallel-workspace run can starve a single await well past a 60ms
+    // floor (observed twice under full-suite load), which made the
+    // "cycle 2 waits for the retry floor" assert fail on working code.
+    tokio::time::sleep(Duration::from_millis(2_050)).await;
 
     // Exhaust cycles 2 and 3 through the real dispatch loop.
     super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
-    tokio::time::sleep(Duration::from_millis(80)).await;
+    tokio::time::sleep(Duration::from_millis(2_050)).await;
     super::run_cycle(&store, backend.as_ref() as &dyn NativeNameBackend, &target).await;
     assert_eq!(backend.writes(), 3, "at most three writes per revision");
     assert_eq!(backend.reads(), 3);
@@ -1366,7 +1370,7 @@ async fn native_work_snapshot_reads_the_test_offset_aware_clock() {
     let dir = temp_data_dir();
     crate::session_names::set_test_hooks(
         dir.path(),
-        vec![crate::session_names::TestHook::NativeRetryFloorMs(60)],
+        vec![crate::session_names::TestHook::NativeRetryFloorMs(2_000)],
     );
     let store = open_store(dir.path());
     let target = armed_pending(&store, "h-clock", "/h/.claude").await;
@@ -1401,7 +1405,7 @@ async fn native_work_snapshot_reads_the_test_offset_aware_clock() {
     crate::session_names::set_test_hooks(
         dir.path(),
         vec![
-            crate::session_names::TestHook::NativeRetryFloorMs(60),
+            crate::session_names::TestHook::NativeRetryFloorMs(2_000),
             crate::session_names::TestHook::ClockOffsetMs(60_000),
         ],
     );
