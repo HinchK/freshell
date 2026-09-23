@@ -15,8 +15,10 @@ export type OutputFrameDecision =
        * implicit gap (known lost range + surface quarantine); the caller
        * must surface it honestly (local notice) instead of letting the
        * applied cursor advance silently across the missing instructions.
-       * Absent for legitimate session starts (attach.ready's effective
-       * from-seq) and contiguous frames.
+      * Absent for legitimate session starts (attach.ready's effective
+      * from-seq), a legacy ready's covered-window resume (the first live
+      * frame at exactly replayToSeq + 1 when the whole declared window is
+      * unconsumed), and contiguous frames.
        */
       implicitGap?: SeqRange
     }
@@ -237,13 +239,24 @@ export function onOutputFrame(
   // UNEXPLAINED forward jump — never a silent applied-cursor advance.
   // The hole is folded into the state exactly like an explicit gap
   // (known lost range + surface quarantine, pinning the applied cursor
-  // below it), with ONE exemption: a legitimate session start at
-  // attach.ready's effective from-seq (the pending replay window's
-  // first frame — e.g. a retention-adjusted resume) is the
-  // server-declared baseline, not a jump.
+  // below it), with TWO exemptions, both server-declared baselines:
+  // (1) a legitimate session start at attach.ready's effective from-seq
+  // (the pending replay window's first frame — e.g. a retention-adjusted
+  // resume), and (2) the LEGACY (non-negotiated) ready's covered window:
+  // its inline snapshot covers replayFromSeq..replayToSeq, so when no
+  // replay frame was consumed from the window and the live stream
+  // resumes at exactly replayToSeq + 1, that frame is contiguous with
+  // the covered baseline — the legacy mirror of the negotiated path's
+  // session-start exemption.
   const expectedNextSeq = effectiveState.highestObservedSeq + 1
+  const resumesAfterCoveredReplayWindow = Boolean(
+    effectiveState.pendingReplay
+      && seqStart === effectiveState.pendingReplay.toSeq + 1
+      && expectedNextSeq === effectiveState.pendingReplay.fromSeq
+  )
   const implicitGap: SeqRange | undefined = seqStart > expectedNextSeq
     && effectiveState.pendingReplay?.fromSeq !== seqStart
+    && !resumesAfterCoveredReplayWindow
     ? { fromSeq: expectedNextSeq, toSeq: seqStart - 1 }
     : undefined
   const gapFoldedState = implicitGap

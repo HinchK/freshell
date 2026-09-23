@@ -180,6 +180,50 @@ describe('terminal-attach-seq-state', () => {
     expect(decision.state.requiresSurfaceQuarantine).toBe(true)
   })
 
+  it('treats the first live frame at replayToSeq+1 after a legacy ready as contiguous', () => {
+    // A legacy (non-negotiated) attach.ready declares the replay window its
+    // inline snapshot covers. When no replay frames follow it, the live
+    // stream resumes at exactly replayToSeq + 1 — the server-declared
+    // baseline (mirroring the negotiated path's from-seq session-start
+    // exemption), never an unexplained jump: no implicit gap, no notice,
+    // no quarantine.
+    let state = beginAttach(createAttachSeqState({ lastSeq: 0 }))
+    state = onAttachReady(state, { headSeq: 4, replayFromSeq: 1, replayToSeq: 4 })
+    const decision = expectAcceptedFrame(onOutputFrame(state, { seqStart: 5, seqEnd: 5 }))
+    expect(decision.implicitGap).toBeUndefined()
+    expect(decision.state.knownLostRanges).toEqual([])
+    expect(decision.state.requiresSurfaceQuarantine).toBe(false)
+    expect(decision.state.surfaceSafeForDeltaReplay).toBe(true)
+    expect(decision.state.highestObservedSeq).toBe(5)
+    expect(decision.state.pendingReplay).toBeNull()
+  })
+
+  it('still quarantines a legacy forward jump beyond the declared replay window', () => {
+    // Only a resume at EXACTLY replayToSeq + 1 with the whole window
+    // unconsumed is the covered baseline. A jump further ahead is real
+    // unexplained loss and must quarantine honestly.
+    let state = beginAttach(createAttachSeqState({ lastSeq: 0 }))
+    state = onAttachReady(state, { headSeq: 4, replayFromSeq: 1, replayToSeq: 4 })
+    const decision = expectAcceptedFrame(onOutputFrame(state, { seqStart: 7, seqEnd: 7 }))
+    expect(decision.implicitGap).toEqual({ fromSeq: 1, toSeq: 6 })
+    expect(decision.state.knownLostRanges).toEqual([{ fromSeq: 1, toSeq: 6 }])
+    expect(decision.state.requiresSurfaceQuarantine).toBe(true)
+    expect(decision.state.surfaceSafeForDeltaReplay).toBe(false)
+  })
+
+  it('still quarantines a jump over replay frames that never arrived in a partially consumed window', () => {
+    // The covered-window resume only applies while the hole is exactly the
+    // declared window (nothing consumed from it). Once replay frames were
+    // accepted, a jump over the window's remaining tail is real loss.
+    let state = beginAttach(createAttachSeqState({ lastSeq: 0 }))
+    state = onAttachReady(state, { headSeq: 4, replayFromSeq: 1, replayToSeq: 4 })
+    state = expectAcceptedFrame(onOutputFrame(state, { seqStart: 1, seqEnd: 2 })).state
+    const decision = expectAcceptedFrame(onOutputFrame(state, { seqStart: 5, seqEnd: 5 }))
+    expect(decision.implicitGap).toEqual({ fromSeq: 3, toSeq: 4 })
+    expect(decision.state.knownLostRanges).toEqual([{ fromSeq: 3, toSeq: 4 }])
+    expect(decision.state.requiresSurfaceQuarantine).toBe(true)
+  })
+
   it('raises no implicit gap for contiguous frames', () => {
     const state = createAttachSeqState({ lastSeq: 5 })
     const decision = expectAcceptedFrame(onOutputFrame(state, { seqStart: 6, seqEnd: 7 }))
