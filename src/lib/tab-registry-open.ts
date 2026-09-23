@@ -32,6 +32,8 @@ import { sanitizeRestoreError } from '@shared/session-contract'
 import { sanitizeCodexDurabilityRef } from '@shared/codex-durability'
 import { normalizeFreshAgentSessionType, resolveFreshAgentRuntimeProvider } from '@shared/fresh-agent'
 import { normalizeFreshAgentStyleOverride } from '@shared/settings'
+import { isScopedNameSourceContent, parsePaneNamingIdentityInput, remapTabNameSource } from '@/lib/tab-name-source'
+import type { PaneContent } from '@/store/paneTypes'
 
 function parseSessionLocator(value: unknown): SessionLocator | undefined {
   if (!value || typeof value !== 'object') return undefined
@@ -108,6 +110,7 @@ export function sanitizePaneSnapshot(
       terminalId: includeLiveTerminal ? liveTerminal?.terminalId : undefined,
       serverInstanceId: includeLiveTerminal ? record.serverInstanceId : undefined,
       initialCwd: payload.initialCwd as string | undefined,
+      ...parsePaneNamingIdentityInput(payload),
     }
   }
   if (snapshot.kind === 'browser') {
@@ -167,6 +170,7 @@ export function sanitizePaneSnapshot(
       ...(style ? { style } : {}),
       settingsDismissed: typeof payload.settingsDismissed === 'boolean' ? payload.settingsDismissed : undefined,
       showTimecodes: typeof payload.showTimecodes === 'boolean' ? payload.showTimecodes : undefined,
+      ...parsePaneNamingIdentityInput(payload),
     }
   }
   if (snapshot.kind === 'extension') {
@@ -262,6 +266,14 @@ export function openRecordAsUnlinkedCopy(record: RegistryTabRecord, deps: OpenTa
   const { dispatch, localServerInstanceId, onOpened } = deps
   const tabId = nanoid()
   const paneSnapshots = record.panes || []
+  // Unified agent names (Task 6): the copy remints every pane id EXPLICITLY
+  // (initLayout/addPane accept the minted ids) so the old→new map exists to
+  // remap the tab's nameSource through — a stale recorded pane id must never
+  // survive into the new tab's pointer.
+  const paneIdMap = new Map<string, string>()
+  for (const pane of paneSnapshots) {
+    paneIdMap.set(pane.paneId, nanoid())
+  }
   const firstPane = paneSnapshots[0]
   const firstContent = firstPane
     ? sanitizePaneSnapshot(record, firstPane, localServerInstanceId)
@@ -273,11 +285,22 @@ export function openRecordAsUnlinkedCopy(record: RegistryTabRecord, deps: OpenTa
       mode: deriveModeFromRecord(record),
       status: 'creating',
       serverInstanceId: record.serverInstanceId,
+      ...(record.nameSource
+        ? { nameSource: remapTabNameSource(record.nameSource, paneIdMap) }
+        : {}),
     }),
   )
-  dispatch(initLayout({ tabId, content: firstContent }))
+  dispatch(initLayout({
+    tabId,
+    paneId: paneIdMap.get(firstPane?.paneId ?? '') ?? undefined,
+    content: firstContent,
+  }))
   for (const pane of paneSnapshots.slice(1)) {
-    dispatch(addPane({ tabId, newContent: sanitizePaneSnapshot(record, pane, localServerInstanceId) }))
+    dispatch(addPane({
+      tabId,
+      newContent: sanitizePaneSnapshot(record, pane, localServerInstanceId),
+      newPaneId: paneIdMap.get(pane.paneId),
+    }))
   }
   onOpened?.()
 }
@@ -289,10 +312,21 @@ export function openPaneInNewTab(
 ): void {
   const { dispatch, localServerInstanceId, onOpened } = deps
   const tabId = nanoid()
+  const content = sanitizePaneSnapshot(record, pane, localServerInstanceId)
+  // Unified agent names (Task 6): a scoped agent pane moved into its own tab
+  // OWNS that tab — never the composed `${record.tabName} · ${pane.title}`
+  // agent-group label. The pane's own title (or kind label) is the neutral
+  // fallback; the display reads the canonical session name once cached, and
+  // the lifecycle middleware resolves the tab's pointer from the created
+  // layout (that pane is the original pane). Non-agent panes keep the
+  // existing composed title.
+  const scopedPane = isScopedNameSourceContent(content as PaneContent)
   dispatch(
     addTab({
       id: tabId,
-      title: `${record.tabName} · ${pane.title || pane.kind}`,
+      title: scopedPane
+        ? (pane.title || paneKindLabel(pane.kind))
+        : `${record.tabName} · ${pane.title || pane.kind}`,
       mode: deriveModeFromRecord(record),
       status: 'creating',
       serverInstanceId: record.serverInstanceId,
@@ -301,7 +335,7 @@ export function openPaneInNewTab(
   dispatch(
     initLayout({
       tabId,
-      content: sanitizePaneSnapshot(record, pane, localServerInstanceId),
+      content,
     }),
   )
   onOpened?.()

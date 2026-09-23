@@ -1,14 +1,17 @@
 import { describe, it, expect } from 'vitest'
 import {
   deriveRemoteSessionActivity,
+  selectMergedClosedRecords,
   selectRemoteSessionActivity,
   selectSameDeviceSessionKeys,
+  selectTabsRegistryGroups,
 } from '@/store/selectors/tabsRegistrySelectors'
 import type {
   RegistryPaneSnapshot,
   RegistryTabRecord,
 } from '@/store/tabRegistryTypes'
 import type { RootState } from '@/store/store'
+import { sessionNameRefKey, type SessionNameRef } from '@shared/session-names'
 
 function makeRecord(overrides: Partial<RegistryTabRecord>): RegistryTabRecord {
   return {
@@ -185,5 +188,101 @@ describe('selectSameDeviceSessionKeys', () => {
     }).not.toThrow()
     expect(keys).toBeInstanceOf(Set)
     expect(keys?.size).toBe(0)
+  })
+})
+
+// Unified agent names (Task 6): the registry name-refresh overlay. A closed
+// or remote/same-device record's stored `tabName` is the last-known
+// projection at capture time; the record's own `nameSource` pane payload
+// carries the naming identity, so the live canonical cache overlays the
+// session's CURRENT name — a session renamed after close never shows stale.
+describe('registry name-refresh overlay', () => {
+  const REF: SessionNameRef = { kind: 'session', provider: 'claude', sessionId: 's1' }
+
+  function sessionNamesWith(
+    records: Array<{ ref: SessionNameRef; name: string; revision: number }>,
+    redirects: Record<string, { toKey: string; revision: number }> = {},
+  ) {
+    const byKey: Record<string, unknown> = {}
+    for (const { ref, name, revision } of records) {
+      byKey[sessionNameRefKey(ref)] = { ref, name, source: 'manual', revision }
+    }
+    return { records: byKey, redirects, nativeSync: {} }
+  }
+
+  it('overlays a CLOSED record with the canonical current name of its source session', () => {
+    const record = makeRecord({
+      tabName: 'Stale captured name',
+      status: 'closed',
+      closedAt: 5,
+      nameSource: { kind: 'session', paneId: 'pane-1' },
+      panes: [makePane({ nameRef: REF })],
+    })
+    const state = {
+      tabRegistry: { closed: [record], localClosed: {} },
+      sessionNames: sessionNamesWith([{ ref: REF, name: 'Renamed after close', revision: 7 }]),
+    } as unknown as RootState
+
+    expect(selectMergedClosedRecords(state)[0].tabName).toBe('Renamed after close')
+  })
+
+  it('refreshes remote-open and same-device-open records through the same overlay (sessionRef fallback identity)', () => {
+    const record = makeRecord({
+      tabName: 'Stale captured name',
+      nameSource: { kind: 'session', paneId: 'pane-1' },
+      panes: [makePane({ sessionRef: { provider: 'claude', sessionId: 's1' } })],
+    })
+    const state = {
+      tabs: { tabs: [] },
+      panes: { layouts: {}, paneTitles: {} },
+      connection: {},
+      tabRegistry: {
+        closed: [],
+        localClosed: {},
+        remoteOpen: [record],
+        sameDeviceOpen: [record],
+      },
+      sessionNames: sessionNamesWith([{ ref: REF, name: 'Renamed elsewhere', revision: 4 }]),
+    } as unknown as RootState
+
+    const groups = selectTabsRegistryGroups(state)
+    expect(groups.remoteOpen[0].tabName).toBe('Renamed elsewhere')
+    expect(groups.sameDeviceOpen[0].tabName).toBe('Renamed elsewhere')
+  })
+
+  it('keeps a pre-Task-6 record without nameSource untouched (no invented ownership)', () => {
+    const record = makeRecord({
+      tabName: 'Stored name',
+      status: 'closed',
+      closedAt: 5,
+      panes: [makePane({ sessionRef: { provider: 'claude', sessionId: 's1' } })],
+    })
+    const state = {
+      tabRegistry: { closed: [record], localClosed: {} },
+      sessionNames: sessionNamesWith([{ ref: REF, name: 'Renamed after close', revision: 7 }]),
+    } as unknown as RootState
+
+    expect(selectMergedClosedRecords(state)[0].tabName).toBe('Stored name')
+  })
+
+  it('resolves a stale pending identity through its pending→durable redirect', () => {
+    const durable: SessionNameRef = { kind: 'session', provider: 'codex', sessionId: 'd1' }
+    const pending: SessionNameRef = { kind: 'pending', id: 'nh-1' }
+    const record = makeRecord({
+      tabName: 'Stale captured name',
+      status: 'closed',
+      closedAt: 5,
+      nameSource: { kind: 'session', paneId: 'pane-1' },
+      panes: [makePane({ namingHandle: 'nh-1' })],
+    })
+    const state = {
+      tabRegistry: { closed: [record], localClosed: {} },
+      sessionNames: sessionNamesWith(
+        [{ ref: durable, name: 'Durable current name', revision: 9 }],
+        { [sessionNameRefKey(pending)]: { toKey: sessionNameRefKey(durable), revision: 2 } },
+      ),
+    } as unknown as RootState
+
+    expect(selectMergedClosedRecords(state)[0].tabName).toBe('Durable current name')
   })
 })

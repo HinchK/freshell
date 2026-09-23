@@ -38,7 +38,7 @@ vi.mock('@/lib/ws-client', () => ({
 
 
 import { configureStore } from '@reduxjs/toolkit'
-import tabsReducer, { addTab, closeTab } from '../../../../src/store/tabsSlice'
+import tabsReducer, { addTab, closeTab, reopenClosedTab, setTabNameSource } from '../../../../src/store/tabsSlice'
 import panesReducer, { addPane, initLayout } from '../../../../src/store/panesSlice'
 import tabRegistryReducer from '../../../../src/store/tabRegistrySlice'
 
@@ -145,5 +145,54 @@ describe('tabsSlice closed registry capture', () => {
 
     await store.dispatch(closeTab(tabId) as any)
     expect(Object.keys(store.getState().tabRegistry.localClosed)).toHaveLength(0)
+  })
+})
+
+describe('tabsSlice closed registry capture — unified agent names (Task 6)', () => {
+  it('stamps the closed snapshot with the tab nameSource and reopen restores it', async () => {
+    const store = configureStore({
+      reducer: {
+        tabs: tabsReducer,
+        panes: panesReducer,
+        tabRegistry: tabRegistryReducer,
+      },
+    })
+
+    store.dispatch(addTab({ title: 'Owned' }))
+    const tabId = store.getState().tabs.tabs[0]!.id
+    store.dispatch(initLayout({
+      tabId,
+      paneId: 'p-agent',
+      content: { kind: 'terminal', mode: 'claude' },
+    }))
+    // A second pane makes the closed tab registry-keepable (the single-pane
+    // short-lived rule would drop the snapshot).
+    store.dispatch(addPane({
+      tabId,
+      newContent: { kind: 'terminal', mode: 'shell' },
+    }))
+    // The lifecycle middleware is not registered in this harness; pin the
+    // pointer explicitly the way any resolved tab would carry it.
+    store.dispatch(setTabNameSource({
+      tabId,
+      nameSource: { kind: 'session', paneId: 'p-agent' },
+    }))
+
+    await store.dispatch(closeTab(tabId) as any)
+
+    // The closed registry record keeps the source relationship.
+    const closedRecords = Object.values(store.getState().tabRegistry.localClosed)
+    expect(closedRecords).toHaveLength(1)
+    expect(closedRecords[0]!.nameSource).toEqual({ kind: 'session', paneId: 'p-agent' })
+
+    // And the reopen stack restores a tab that keeps the pointer.
+    const { reopenStack } = store.getState().tabRegistry
+    expect(reopenStack).toHaveLength(1)
+    expect(reopenStack[0].tab.nameSource).toEqual({ kind: 'session', paneId: 'p-agent' })
+
+    await store.dispatch(reopenClosedTab() as any)
+    const reopened = store.getState().tabs.tabs.find((t) => t.id !== tabId)
+    expect(reopened).toBeTruthy()
+    expect(reopened?.nameSource).toEqual({ kind: 'session', paneId: 'p-agent' })
   })
 })

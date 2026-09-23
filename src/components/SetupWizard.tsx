@@ -519,7 +519,7 @@ export function SetupWizard({ onComplete, initialStep = 1, onNavigate, onFirewal
 
             {networkStatus?.devMode && networkStatus.firewall?.platform !== 'wsl2' && (
               <div className="rounded border border-yellow-200 bg-yellow-50 p-3 text-sm text-yellow-800 dark:border-yellow-800 dark:bg-yellow-950 dark:text-yellow-300" role="alert">
-                You&apos;re running in dev mode. Restart <code className="font-mono text-xs">npm run dev</code> for the Vite dev server to bind to the new address.
+                You&apos;re running in dev mode. Restart <code className="font-mono text-xs">pnpm run dev</code> for the Vite dev server to bind to the new address.
               </div>
             )}
 

@@ -272,6 +272,7 @@ fn opencode_fallback_hit_carries_title_and_floored_last_activity() {
             cwd: Some("/repo/beta".into()),
             title: Some("beta work".into()),
             last_activity_at: Some(1234),
+            database: None,
         }))
     };
     let out = resolve(SES_ID, Some(&[]), None, Some(&oc));
@@ -407,6 +408,7 @@ fn a_fallback_exact_hit_for_a_higher_priority_token_beats_an_indexed_exact_of_a_
             cwd: Some("/repo/oc".into()),
             title: None,
             last_activity_at: None,
+            database: None,
         }))
     };
     let out = resolve(
@@ -672,6 +674,7 @@ fn opencode_by_id_fallback_uses_row_directory_as_cwd() {
             cwd: Some("/repo/beta".to_string()),
             title: None,
             last_activity_at: None,
+            database: None,
         }))
     };
     let sessions = fixture_sessions();
@@ -704,6 +707,7 @@ fn opencode_fallback_hit_without_directory_omits_cwd() {
                 cwd: cwd_case.clone(),
                 title: Some(String::new()), // Node: `row.title || undefined`
                 last_activity_at: None,
+                database: None,
             }))
         };
         let sessions = fixture_sessions();
@@ -931,6 +935,7 @@ fn third_fallback_requiring_token_is_budget_gated_like_node() {
                 cwd: Some("/repo/x".to_string()),
                 title: None,
                 last_activity_at: None,
+                database: None,
             }))
         } else {
             Ok(None)
@@ -964,6 +969,7 @@ fn shape_gated_tokens_do_not_consume_the_fallback_budget() {
             cwd: Some("/repo/x".to_string()),
             title: None,
             last_activity_at: None,
+            database: None,
         }))
     };
     let sessions = fixture_sessions();

@@ -61,6 +61,7 @@ impl ServeHttp for ReqwestServeHttp {
             let method = match req.method {
                 HttpMethod::Get => reqwest::Method::GET,
                 HttpMethod::Post => reqwest::Method::POST,
+                HttpMethod::Patch => reqwest::Method::PATCH,
             };
             let mut builder = client.request(method, &req.url);
             // DEV-0001: the per-request timeout (the 2 s AbortController analog).

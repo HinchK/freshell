@@ -3,29 +3,43 @@
  *
  * The desktop application has one backend: the native Rust executable.  The
  * standalone Node runtime is deliberately kept as a client runtime for the
- * Claude SDK sidecar and the stdio MCP client only.  Keeping this layout in a
- * small, declarative producer makes it possible for the verifier and the
+ * Claude SDK sidecar and the stdio MCP client only.  The sidecar and MCP
+ * dependency trees are exported by pnpm's filtered production deploy into
+ * self-contained output directories, materialized into ordinary files, and
+ * only then staged beside the Rust binary.  Keeping this layout in a small,
+ * declarative producer makes it possible for the verifier and the
  * checkout-free integration test to inspect the exact same artifact.
  */
 
+import { spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
   chmodSync,
   cpSync,
   createWriteStream,
   existsSync,
+  lstatSync,
   mkdirSync,
-  readFileSync,
+  mkdtempSync,
   readdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
 } from 'node:fs'
 import http from 'node:http'
 import https from 'node:https'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { pipeline } from 'node:stream/promises'
+
+import {
+  detectProjectManager,
+  resolveManagerCommand,
+} from './lib/package-manager.js'
 
 /** Convert a module URL to its requested platform path dialect before joining files. */
 export function moduleDirectoryFromUrl(moduleUrl: string, windows = process.platform === 'win32'): string {
@@ -38,6 +52,7 @@ export const PROJECT_ROOT = path.resolve(__dirname, '..')
 
 export type ElectronRuntimePlatform = 'darwin' | 'linux' | 'win32'
 export type ElectronRuntimeArch = 'x64' | 'arm64'
+export type DeployableRuntimePackage = 'freshell-claude-sidecar' | 'freshell-mcp-runtime'
 
 export interface RuntimePaths {
   root: string
@@ -63,13 +78,12 @@ export const RUNTIME_LAYOUT = Object.freeze({
   nodeBinaryWindows: 'node/bin/node.exe',
   claudeEntry: 'claude-sidecar/index.mjs',
   claudeSessionSettings: 'claude-sidecar/session-settings.mjs',
+  claudeSessionNames: 'claude-sidecar/session-names.mjs',
   claudeModelCatalog: 'claude-sidecar/model-catalog.mjs',
   claudePackage: 'claude-sidecar/package.json',
-  claudeLock: 'claude-sidecar/package-lock.json',
   claudeDependencies: 'claude-sidecar/node_modules',
   mcpEntry: 'mcp/server.js',
   mcpPackage: 'mcp/package.json',
-  mcpLock: 'mcp/package-lock.json',
   mcpDependencies: 'mcp/node_modules',
   nodeClientRuntime: 'node-client-runtime',
   receipt: '.electron-runtime-receipt.json',
@@ -96,11 +110,12 @@ export interface RuntimeAllowlist {
 /**
  * The single runtime/artifact path contract shared by the producer and verifier.
  *
- * Recursive entries are intentional: client assets and the locked sidecar/MCP
- * dependency trees contain many files. Everything else must be named here or
- * the verifier rejects it, including an otherwise innocuous extra script. The
- * Electron-only entries account for the app archive, tray/chooser resources,
- * and the SDK package that electron-builder unpacks from the app archive.
+ * Recursive entries are intentional: client assets and the deployed
+ * sidecar/MCP dependency trees contain many files. Everything else must be
+ * named here or the verifier rejects it, including an otherwise innocuous
+ * extra script. The Electron-only entries account for the app archive,
+ * tray/chooser resources, and the SDK package that electron-builder unpacks
+ * from the app archive.
  */
 export function getRuntimeAllowlist(
   platform: ElectronRuntimePlatform | string,
@@ -118,13 +133,12 @@ export function getRuntimeAllowlist(
     RUNTIME_LAYOUT.clientIndex,
     RUNTIME_LAYOUT.claudeEntry,
     RUNTIME_LAYOUT.claudeSessionSettings,
+    RUNTIME_LAYOUT.claudeSessionNames,
     RUNTIME_LAYOUT.claudeModelCatalog,
     RUNTIME_LAYOUT.claudePackage,
-    RUNTIME_LAYOUT.claudeLock,
     `${RUNTIME_LAYOUT.claudeDependencies}/@anthropic-ai/claude-agent-sdk/package.json`,
     RUNTIME_LAYOUT.mcpEntry,
     RUNTIME_LAYOUT.mcpPackage,
-    RUNTIME_LAYOUT.mcpLock,
     `${RUNTIME_LAYOUT.mcpDependencies}/@modelcontextprotocol/sdk/package.json`,
     `${RUNTIME_LAYOUT.mcpDependencies}/zod/package.json`,
     `${RUNTIME_LAYOUT.nodeClientRuntime}/keys.js`,
@@ -200,22 +214,28 @@ export const FORBIDDEN_RUNTIME_NAMES = Object.freeze([
   'dist/server',
 ])
 
-interface LockPackage {
-  version?: string
-  dependencies?: Record<string, string>
-  optionalDependencies?: Record<string, string>
-  peerDependencies?: Record<string, string>
-  optional?: boolean
-  os?: string[]
-  cpu?: string[]
+export interface DeployRuntimeArgs {
+  packageName: DeployableRuntimePackage
+  destination: string
 }
 
-export interface NpmLockfile {
-  name?: string
-  version?: string
-  lockfileVersion?: number
-  requires?: boolean
-  packages?: Record<string, LockPackage>
+export interface ExportedPackageIdentity {
+  name: string
+  version: string
+}
+
+/**
+ * Exact pnpm argv for exporting a runtime package.  Normal filtered
+ * production deploy resolves from the shared workspace lock and installs
+ * the filtered graph frozen.  The hoisted node linker produces a flat,
+ * npm-style tree of ordinary files so the staged runtime needs no
+ * resolution-bearing links (the only links a hoisted deploy emits are
+ * relative .bin shims, which materialization replaces safely).  There is
+ * deliberately no `--` separator, no `--legacy`, and no mutable recovery
+ * path here.
+ */
+export function buildDeployArgs(packageName: DeployableRuntimePackage, destination: string): string[] {
+  return ['--filter', packageName, '--prod', '--config.node-linker=hoisted', 'deploy', destination]
 }
 
 export interface ElectronRuntimeStageOptions {
@@ -231,13 +251,8 @@ export interface ElectronRuntimeStageOptions {
   clientDir?: string
   /** A pre-downloaded Node executable, mainly useful for tests. */
   nodeBinary?: string
-  claudeSidecarDir?: string
   /** Root dist/tools directory containing freshell-mcp and node-client-runtime. */
   mcpDistDir?: string
-  rootNodeModulesDir?: string
-  rootPackageLockPath?: string
-  sidecarNodeModulesDir?: string
-  sidecarPackageLockPath?: string
   /** Injected archive downloader for offline/unit tests. */
   downloadNodeBinary?: (args: {
     version: string
@@ -245,6 +260,10 @@ export interface ElectronRuntimeStageOptions {
     arch: ElectronRuntimeArch
     destination: string
   }) => Promise<void>
+  /** Injected deploy runner for unit tests; defaults to a real pnpm deploy. */
+  deployRuntime?: (args: DeployRuntimeArgs) => void
+  /** Override for the receipt's package-manager version, mainly for tests. */
+  packageManagerVersion?: string
 }
 
 export interface ElectronRuntimeStageReceipt {
@@ -255,6 +274,9 @@ export interface ElectronRuntimeStageReceipt {
   arch: ElectronRuntimeArch
   releaseVersion: string
   nodeVersion: string
+  packageManager: { name: 'pnpm'; version: string }
+  sourceLockFingerprint: string
+  exportedPackages: ExportedPackageIdentity[]
   files: string[]
   fileHashes: Record<string, string>
 }
@@ -330,83 +352,6 @@ export function getNodeChecksumsUrl(version: string): string {
   return `https://nodejs.org/dist/v${version}/SHASUMS256.txt`
 }
 
-/**
- * Resolve an npm package location using npm lockfile v3's physical layout.
- * Starting at the importing package and walking parents mirrors Node's
- * node_modules lookup, including nested packages selected by npm.
- */
-function resolveLockedPackagePath(
-  packages: Record<string, LockPackage>,
-  packageName: string,
-  fromPackagePath = '',
-): string | undefined {
-  let parent = fromPackagePath
-  while (true) {
-    const candidate = parent
-      ? `${parent}/node_modules/${packageName}`
-      : `node_modules/${packageName}`
-    if (packages[candidate]) return candidate
-
-    const nestedMarker = parent.lastIndexOf('/node_modules/')
-    if (nestedMarker >= 0) {
-      parent = parent.slice(0, nestedMarker)
-    } else {
-      parent = ''
-    }
-    if (!parent && packages[`node_modules/${packageName}`]) {
-      return `node_modules/${packageName}`
-    }
-    if (!parent) return undefined
-  }
-}
-
-function packageNameFromLockPath(lockPath: string): string {
-  return lockPath.startsWith('node_modules/')
-    ? lockPath.slice('node_modules/'.length)
-    : lockPath
-}
-
-/**
- * Return the sorted physical package paths needed by the requested roots.
- * Peer dependencies are opt-in: MCP supplies zod as an explicit root, while
- * the sidecar asks for peers because its SDK declares them as peers.
- */
-export function collectProductionDependencyClosure(
-  lockfile: NpmLockfile,
-  roots: string[],
-  options: {
-    includePeerDependencies?: boolean
-    platform?: ElectronRuntimePlatform
-    arch?: ElectronRuntimeArch
-  } = {},
-): string[] {
-  const packages = lockfile.packages ?? {}
-  const queue: Array<{ name: string; from: string }> = roots.map((name) => ({ name, from: '' }))
-  const visited = new Set<string>()
-  const selected = new Set<string>()
-
-  while (queue.length > 0) {
-    const current = queue.shift()!
-    const lockPath = resolveLockedPackagePath(packages, current.name, current.from)
-    if (!lockPath || visited.has(lockPath)) continue
-    const metadata = packages[lockPath]
-    const compatibleOs = !metadata.os || metadata.os.length === 0 || metadata.os.includes(options.platform ?? process.platform)
-    const compatibleCpu = !metadata.cpu || metadata.cpu.length === 0 || metadata.cpu.includes(options.arch ?? process.arch)
-    if (!compatibleOs || !compatibleCpu) continue
-    visited.add(lockPath)
-    selected.add(lockPath)
-    for (const name of Object.keys(metadata.dependencies ?? {})) queue.push({ name, from: lockPath })
-    for (const name of Object.keys(metadata.optionalDependencies ?? {})) queue.push({ name, from: lockPath })
-    if (options.includePeerDependencies) {
-      for (const name of Object.keys(metadata.peerDependencies ?? {})) queue.push({ name, from: lockPath })
-    }
-  }
-
-  return [...selected]
-    .map(packageNameFromLockPath)
-    .sort((a, b) => a.localeCompare(b))
-}
-
 function removePath(targetPath: string): void {
   rmSync(targetPath, { recursive: true, force: true, maxRetries: 5, retryDelay: 250 })
 }
@@ -428,86 +373,266 @@ function copyRequiredDirectory(source: string, destination: string): void {
   cpSync(source, destination, { recursive: true })
 }
 
-function copyDirectoryContents(source: string, destination: string): void {
-  if (!existsSync(source)) throw new Error(`Required Electron runtime directory is missing: ${source}`)
-  mkdirSync(destination, { recursive: true })
-  for (const entry of readdirSync(source, { withFileTypes: true })) {
-    cpSync(path.join(source, entry.name), path.join(destination, entry.name), { recursive: entry.isDirectory() })
-  }
+function readJson(filePath: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(filePath, 'utf8')) as Record<string, unknown>
 }
 
-function packageSourcePath(nodeModulesDir: string, packagePath: string): string {
-  return path.join(nodeModulesDir, packagePath)
-}
-
-function copyDependencyClosure(
-  sourceNodeModulesDir: string,
-  destinationNodeModulesDir: string,
-  lockfile: NpmLockfile,
-  packageNames: string[],
-  options: {
-    includePeerDependencies?: boolean
-    platform?: ElectronRuntimePlatform
-    arch?: ElectronRuntimeArch
-  } = {},
-): string[] {
-  const packagePaths = collectProductionDependencyClosure(lockfile, packageNames, options)
-  for (const packagePath of packagePaths) {
-    copyRequiredDirectory(
-      packageSourcePath(sourceNodeModulesDir, packagePath),
-      path.join(destinationNodeModulesDir, packagePath),
+function resolvePnpm(rootDir: string, args: string[]) {
+  const selection = detectProjectManager(rootDir)
+  if (selection.manager !== 'pnpm') {
+    throw new Error(
+      `Electron runtime staging requires the pnpm workspace at ${rootDir}; ` +
+        `detected ${selection.manager} via ${selection.source}.`,
     )
   }
-  return packagePaths
+  return resolveManagerCommand({ manager: selection.manager, args, env: process.env })
 }
 
-function packageSpec(rootPackage: Record<string, unknown>, name: string, version: string): string {
-  const dependencies = rootPackage.dependencies
-  if (dependencies && typeof dependencies === 'object' && name in dependencies) {
-    const requested = (dependencies as Record<string, unknown>)[name]
-    if (typeof requested === 'string') return requested
+/**
+ * Export one runtime package with a real filtered production deploy.  Deploy
+ * resolves from the shared workspace lock and installs the filtered graph
+ * frozen, so no mutable recovery path is offered here.
+ */
+function deployRuntimeDefault(rootDir: string, args: DeployRuntimeArgs): void {
+  const command = resolvePnpm(rootDir, buildDeployArgs(args.packageName, args.destination))
+  const result = spawnSync(command.command, command.args, {
+    cwd: rootDir,
+    shell: command.viaShell ?? false,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    windowsHide: true,
+  })
+  if (result.error) {
+    throw new Error(`pnpm deploy failed to start for ${args.packageName}: ${result.error.message}`)
+  }
+  if (result.status !== 0) {
+    const stderrTail = (result.stderr ?? '')
+      .split(/\r?\n/)
+      .filter((line) => line.length > 0)
+      .slice(-10)
+      .join('\n')
+    throw new Error(
+      `pnpm deploy failed for ${args.packageName} with exit code ${String(result.status)}.\n${stderrTail}`,
+    )
+  }
+}
+
+function capturePackageManagerVersion(rootDir: string, override: string | undefined): string {
+  if (override) return override
+  const command = resolvePnpm(rootDir, ['--version'])
+  const result = spawnSync(command.command, command.args, {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+    windowsHide: true,
+  })
+  const version = result.status === 0 ? (result.stdout ?? '').trim() : ''
+  if (!version) {
+    throw new Error('Unable to capture the pinned pnpm version for the Electron runtime receipt.')
   }
   return version
 }
 
-function makeSubsetLockfile(
-  rootLockfile: NpmLockfile,
-  packagePaths: string[],
-  rootDependencies: string[],
-  packageJson: Record<string, unknown>,
-  releaseVersion: string,
-): NpmLockfile {
-  const sourcePackages = rootLockfile.packages ?? {}
-  const packages: Record<string, LockPackage> = {
-    '': {
-      version: releaseVersion,
-      dependencies: {},
-    },
+function readDeployIdentity(deployDir: string, expectedName: DeployableRuntimePackage): ExportedPackageIdentity {
+  const manifest = readJson(path.join(deployDir, 'package.json'))
+  const name = typeof manifest.name === 'string' ? manifest.name : undefined
+  const version = typeof manifest.version === 'string' && manifest.version.length > 0 ? manifest.version : undefined
+  if (name !== expectedName || !version) {
+    throw new Error(
+      `Unexpected package identity in the ${expectedName} deploy output: ${String(name)}@${String(version)}`,
+    )
   }
-  for (const packagePath of packagePaths) {
-    const lockPath = `node_modules/${packagePath}`
-    const metadata = sourcePackages[lockPath]
-    if (metadata) packages[lockPath] = metadata
-  }
-  for (const name of rootDependencies) {
-    const lockPath = `node_modules/${name}`
-    const metadata = sourcePackages[lockPath]
-    if (!metadata?.version || !packages[''].dependencies) {
-      throw new Error(`Locked package metadata is missing for MCP dependency ${name}`)
-    }
-    packages[''].dependencies[name] = packageSpec(packageJson, name, metadata.version)
-  }
-  return {
-    name: 'freshell',
-    version: releaseVersion,
-    lockfileVersion: 3,
-    requires: true,
-    packages,
+  return { name, version }
+}
+
+function structuredLinkError(
+  packageName: DeployableRuntimePackage,
+  message: string,
+  linkPath: string,
+): Error {
+  return new Error(`Electron runtime staging rejected a link in the ${packageName} deploy tree at ${linkPath}: ${message}`)
+}
+
+/**
+ * Copy a deploy-exported tree into the staging runtime, replacing every
+ * link with the ordinary content it resolves to.  Targets are resolved with
+ * realpath so broken and cyclic chains fail loudly, and every target must
+ * stay inside the deploy root so nothing can escape the exported closure.
+ */
+function materializeTree(
+  source: string,
+  destination: string,
+  deployRoot: string,
+  packageName: DeployableRuntimePackage,
+): void {
+  mkdirSync(destination, { recursive: true })
+  for (const entry of readdirSync(source, { withFileTypes: true })) {
+    materializeEntry(path.join(source, entry.name), path.join(destination, entry.name), deployRoot, packageName)
   }
 }
 
-function readJson(filePath: string): Record<string, unknown> {
-  return JSON.parse(readFileSync(filePath, 'utf8')) as Record<string, unknown>
+function materializeEntry(
+  source: string,
+  destination: string,
+  deployRoot: string,
+  packageName: DeployableRuntimePackage,
+): void {
+  const stats = lstatSync(source)
+  if (stats.isSymbolicLink()) {
+    let resolved: string
+    try {
+      resolved = realpathSync(source)
+    } catch {
+      throw structuredLinkError(packageName, 'the link target is broken or cyclic', source)
+    }
+    if (!resolved.startsWith(`${deployRoot}${path.sep}`)) {
+      throw structuredLinkError(packageName, `the link target escapes the deploy tree (${resolved})`, source)
+    }
+    const target = lstatSync(resolved)
+    if (target.isFile()) {
+      copyRequiredFile(resolved, destination)
+    } else if (target.isDirectory()) {
+      materializeTree(resolved, destination, deployRoot, packageName)
+    } else {
+      throw structuredLinkError(packageName, `the link target has an unsupported type (${resolved})`, source)
+    }
+    return
+  }
+  if (stats.isFile()) {
+    copyRequiredFile(source, destination)
+    return
+  }
+  if (stats.isDirectory()) {
+    materializeTree(source, destination, deployRoot, packageName)
+    return
+  }
+  throw new Error(`Electron runtime staging cannot copy the unsupported filesystem entry: ${source}`)
+}
+
+function assertNoLinks(root: string): void {
+  const walk = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const absolute = path.join(directory, entry.name)
+      const stats = lstatSync(absolute)
+      if (stats.isSymbolicLink()) {
+        throw new Error(`Electron runtime staging contains a link that was not materialized: ${absolute}`)
+      }
+      if (stats.isDirectory()) walk(absolute)
+    }
+  }
+  walk(root)
+}
+
+/**
+ * Stage fresh, run-owned compiled tool output into the MCP packaging
+ * project's ignored generated directory so the deploy export includes it.
+ * A stale or deleted generated tree cannot survive this copy.
+ */
+function stageGeneratedRuntimeTree(rootDir: string, mcpDistDir: string): void {
+  const generatedDir = path.join(rootDir, 'packages', 'freshell-mcp-runtime', 'generated')
+  const freshellMcpSource = path.join(mcpDistDir, 'freshell-mcp')
+  const nodeClientSource = path.join(mcpDistDir, 'node-client-runtime')
+  for (const required of [freshellMcpSource, nodeClientSource]) {
+    if (!existsSync(required)) {
+      throw new Error(`Required Electron runtime input is missing (run build:tools first): ${required}`)
+    }
+  }
+  removePath(generatedDir)
+  copyRequiredDirectory(freshellMcpSource, path.join(generatedDir, 'freshell-mcp'))
+  copyRequiredDirectory(nodeClientSource, path.join(generatedDir, 'node-client-runtime'))
+}
+
+/**
+ * Stage a deploy export's node_modules while dropping pnpm's install-state
+ * directory: in a hoisted deploy `node_modules/.pnpm` holds only the
+ * modules-state lock.yaml, not runtime content, and the installed runtime
+ * must not carry lock machinery (plan section 6.2, item 5).
+ */
+function stageDeployNodeModules(
+  source: string,
+  destination: string,
+  deployRoot: string,
+  packageName: DeployableRuntimePackage,
+): void {
+  for (const entry of readdirSync(source, { withFileTypes: true })) {
+    if (entry.name === '.pnpm') continue
+    materializeEntry(path.join(source, entry.name), path.join(destination, entry.name), deployRoot, packageName)
+  }
+}
+
+/**
+ * Map the sidecar deploy export onto claude-sidecar/.  Every root-level
+ * entry is copied except the deploy lock; node_modules is materialized so
+ * the staged sidecar has zero links.
+ */
+function stageSidecarFromDeploy(
+  deployDir: string,
+  destinationDir: string,
+  deployRoot: string,
+): void {
+  for (const entry of readdirSync(deployDir, { withFileTypes: true })) {
+    if (entry.name === 'pnpm-lock.yaml') continue
+    if (entry.name === 'node_modules') {
+      stageDeployNodeModules(path.join(deployDir, entry.name), path.join(destinationDir, 'node_modules'), deployRoot, 'freshell-claude-sidecar')
+      continue
+    }
+    materializeEntry(path.join(deployDir, entry.name), path.join(destinationDir, entry.name), deployRoot, 'freshell-claude-sidecar')
+  }
+  if (!existsSync(path.join(destinationDir, 'package.json'))) {
+    throw new Error('The freshell-claude-sidecar deploy output must include package.json')
+  }
+}
+
+/**
+ * pnpm's deploy writes peer-resolution annotations like "1.30.0(zod@4.3.6)"
+ * into the exported manifest's dependency specs.  The staged public metadata
+ * keeps plain specs; peer resolution is proven by execution, not by the
+ * installed runtime's manifest.
+ */
+function stripPeerSuffixAnnotation(spec: string): string {
+  return spec.replace(/\([^)]*\)$/, '')
+}
+
+/**
+ * Map the MCP runtime deploy export onto mcp/ and node-client-runtime/.
+ * The deploy's own package.json is the private packaging manifest; the
+ * staged metadata rewrites the public identity to name "freshell" with the
+ * release version so the MCP handshake keeps reporting the application
+ * version (the compiled server discovers its version by searching for that
+ * name).
+ */
+function stageMcpFromDeploy(
+  deployDir: string,
+  mcpDestinationDir: string,
+  nodeClientRuntimeDir: string,
+  releaseVersion: string,
+  deployRoot: string,
+): void {
+  const generatedDir = path.join(deployDir, 'generated')
+  const mcpGenerated = path.join(generatedDir, 'freshell-mcp')
+  const nodeClientGenerated = path.join(generatedDir, 'node-client-runtime')
+  for (const required of [mcpGenerated, nodeClientGenerated]) {
+    if (!existsSync(required)) {
+      throw new Error(`The freshell-mcp-runtime deploy output is missing the generated runtime tree: ${required}`)
+    }
+  }
+  materializeTree(mcpGenerated, mcpDestinationDir, deployRoot, 'freshell-mcp-runtime')
+  materializeTree(nodeClientGenerated, nodeClientRuntimeDir, deployRoot, 'freshell-mcp-runtime')
+  stageDeployNodeModules(path.join(deployDir, 'node_modules'), path.join(mcpDestinationDir, 'node_modules'), deployRoot, 'freshell-mcp-runtime')
+
+  const packaging = readJson(path.join(deployDir, 'package.json'))
+  const dependencies = packaging.dependencies && typeof packaging.dependencies === 'object'
+    ? packaging.dependencies as Record<string, unknown>
+    : {}
+  const stagedManifest = {
+    name: 'freshell',
+    version: releaseVersion,
+    private: true,
+    type: 'module',
+    dependencies: Object.fromEntries(
+      Object.entries(dependencies).map(([name, spec]) => [name, stripPeerSuffixAnnotation(String(spec))]),
+    ),
+  }
+  writeFileSync(path.join(mcpDestinationDir, 'package.json'), `${JSON.stringify(stagedManifest, null, 2)}\n`)
 }
 
 async function downloadFile(url: string, destination: string): Promise<void> {
@@ -628,14 +753,14 @@ async function ensureNodeBinary(
   platform: ElectronRuntimePlatform,
   arch: ElectronRuntimeArch,
   destination: string,
-  runtimeDir: string,
+  stagingDir: string,
 ): Promise<void> {
   if (options.nodeBinary) {
     copyRequiredFile(options.nodeBinary, destination)
     if (platform !== 'win32') ensureExecutable(destination)
     return
   }
-  const archivePath = path.join(runtimeDir, `.download-${getNodeArchiveName(version, platform, arch)}`)
+  const archivePath = path.join(stagingDir, `.download-${getNodeArchiveName(version, platform, arch)}`)
   try {
     await (options.downloadNodeBinary ?? (async ({ version: v, platform: p, arch: a, destination: d }) => {
       await downloadNodeArchive(v, p, a, archivePath)
@@ -646,82 +771,6 @@ async function ensureNodeBinary(
   }
   if (!existsSync(destination)) throw new Error(`Node runtime downloader did not produce ${destination}`)
   if (platform !== 'win32') ensureExecutable(destination)
-}
-
-function copySidecar(
-  sourceDir: string,
-  destinationDir: string,
-  sourceNodeModulesDir: string,
-  sourceLockfile: NpmLockfile,
-  platform: ElectronRuntimePlatform,
-  arch: ElectronRuntimeArch,
-): void {
-  for (const name of [
-    'index.mjs',
-    'permission-channel.mjs',
-    'session-settings.mjs',
-    'model-catalog.mjs',
-    'package.json',
-    'package-lock.json',
-  ]) {
-    const source = path.join(sourceDir, name)
-    if (existsSync(source)) copyRequiredFile(source, path.join(destinationDir, name))
-  }
-  const packageJson = path.join(destinationDir, 'package.json')
-  if (!existsSync(packageJson)) throw new Error('Claude sidecar package.json is required')
-  copyDependencyClosure(
-    sourceNodeModulesDir,
-    path.join(destinationDir, 'node_modules'),
-    sourceLockfile,
-    ['@anthropic-ai/claude-agent-sdk'],
-    { includePeerDependencies: true, platform, arch },
-  )
-}
-
-function copyMcp(
-  sourceDistDir: string,
-  destinationDir: string,
-  nodeClientRuntimeDir: string,
-  sourceNodeModulesDir: string,
-  sourceLockfile: NpmLockfile,
-  rootPackageJson: Record<string, unknown>,
-  releaseVersion: string,
-  platform: ElectronRuntimePlatform,
-  arch: ElectronRuntimeArch,
-): void {
-  // The compiled MCP entrypoint is intentionally rooted at mcp/server.js.
-  // Its imports use ./freshell-tool.js and ../node-client-runtime, so retain
-  // the two compiled directories' contents while dropping their source-only
-  // dist/tools parent.
-  copyDirectoryContents(path.join(sourceDistDir, 'freshell-mcp'), destinationDir)
-  copyDirectoryContents(path.join(sourceDistDir, 'node-client-runtime'), nodeClientRuntimeDir)
-
-  const packageNames = ['@modelcontextprotocol/sdk', 'zod']
-  const packagePaths = collectProductionDependencyClosure(sourceLockfile, packageNames, { platform, arch })
-  for (const packageName of packageNames) {
-    if (!packagePaths.includes(packageName)) {
-      throw new Error(`Locked MCP dependency is missing: ${packageName}`)
-    }
-  }
-  for (const packagePath of packagePaths) {
-    copyRequiredDirectory(
-      packageSourcePath(sourceNodeModulesDir, packagePath),
-      path.join(destinationDir, 'node_modules', packagePath),
-    )
-  }
-  const packageJson: Record<string, unknown> = {
-    name: 'freshell',
-    version: releaseVersion,
-    private: true,
-    type: 'module',
-    dependencies: {
-      '@modelcontextprotocol/sdk': packageSpec(rootPackageJson, '@modelcontextprotocol/sdk', sourceLockfile.packages?.['node_modules/@modelcontextprotocol/sdk']?.version ?? 'latest'),
-      zod: packageSpec(rootPackageJson, 'zod', sourceLockfile.packages?.['node_modules/zod']?.version ?? 'latest'),
-    },
-  }
-  mkdirSync(destinationDir, { recursive: true })
-  writeFileSync(path.join(destinationDir, 'package.json'), `${JSON.stringify(packageJson, null, 2)}\n`)
-  writeFileSync(path.join(destinationDir, 'package-lock.json'), `${JSON.stringify(makeSubsetLockfile(sourceLockfile, packagePaths, packageNames, packageJson, releaseVersion), null, 2)}\n`)
 }
 
 function listFiles(root: string): string[] {
@@ -746,8 +795,16 @@ export async function stageElectronRuntime(
   const arch = options.arch ?? process.arch
   assertPlatform(platform)
   assertArch(arch)
+  // pnpm deploy resolves host-native dependencies (including the Claude SDK's
+  // platform-specific optional package), so real staging must run on the
+  // native runner for the requested target.  Fixture tests inject deploys.
+  if (platform !== process.platform || arch !== process.arch) {
+    throw new Error(
+      `Electron runtime staging for ${platform}/${arch} must run on that native runner: ` +
+        'pnpm deploy installs host-native dependencies (stage on the target platform instead).',
+    )
+  }
   const runtimeDir = path.resolve(options.runtimeDir ?? path.join(rootDir, 'electron-runtime'))
-  const paths = getRuntimePaths(runtimeDir, platform)
   const rootPackageJsonPath = path.join(rootDir, 'package.json')
   const rootPackageJson = readJson(rootPackageJsonPath)
   const releaseVersion = options.releaseVersion
@@ -757,57 +814,84 @@ export async function stageElectronRuntime(
     ?? (readJson(path.join(rootDir, 'scripts', 'bundled-node-version.json')).version as string | undefined)
   if (!nodeVersion) throw new Error('bundled-node-version.json must contain a Node version')
 
-  const serverBinary = options.serverBinary
-    ?? path.join(rootDir, 'target', 'release', getRuntimeBinaryName(platform))
+  const serverBinary = options.serverBinary ?? path.join(rootDir, 'target', 'release', getRuntimeBinaryName(platform))
   const clientDir = options.clientDir ?? path.join(rootDir, 'dist', 'client')
-  const nodeBinary = options.nodeBinary
-  const sidecarDir = options.claudeSidecarDir ?? path.join(rootDir, 'crates', 'freshell-claude-sidecar')
   const mcpDistDir = options.mcpDistDir ?? path.join(rootDir, 'dist', 'tools')
-  const rootNodeModulesDir = options.rootNodeModulesDir ?? path.join(rootDir, 'node_modules')
-  const rootPackageLockPath = options.rootPackageLockPath ?? path.join(rootDir, 'package-lock.json')
-  const sourceRootLock = readJson(rootPackageLockPath) as NpmLockfile
-  const sidecarPackageLockPath = options.sidecarPackageLockPath ?? path.join(sidecarDir, 'package-lock.json')
-  const sidecarLock = existsSync(sidecarPackageLockPath)
-    ? readJson(sidecarPackageLockPath) as NpmLockfile
-    : { packages: {} }
-  const sidecarNodeModulesDir = options.sidecarNodeModulesDir ?? path.join(sidecarDir, 'node_modules')
+  const workspaceLockPath = path.join(rootDir, 'pnpm-lock.yaml')
+  if (!existsSync(workspaceLockPath)) {
+    throw new Error(`The pnpm workspace lock is required for Electron runtime staging: ${workspaceLockPath}`)
+  }
 
-  removePath(runtimeDir)
-  mkdirSync(runtimeDir, { recursive: true })
-  copyRequiredFile(serverBinary, paths.serverBinary)
-  if (platform !== 'win32') ensureExecutable(paths.serverBinary)
-  copyRequiredDirectory(clientDir, paths.clientDir)
-  await ensureNodeBinary(options, nodeVersion, platform, arch, paths.nodeBinary, runtimeDir)
-  copySidecar(sidecarDir, paths.claudeSidecarDir, sidecarNodeModulesDir, sidecarLock, platform, arch)
-  copyMcp(mcpDistDir, paths.mcpDir, paths.nodeClientRuntimeDir, rootNodeModulesDir, sourceRootLock, rootPackageJson, releaseVersion, platform, arch)
+  stageGeneratedRuntimeTree(rootDir, mcpDistDir)
 
-  for (const required of getRuntimeAllowlist(platform).requiredFiles) {
-    if (!existsSync(path.join(runtimeDir, required))) {
-      throw new Error(`Electron runtime staging is missing required file: ${required}`)
+  const deploy = options.deployRuntime ?? ((args: DeployRuntimeArgs) => deployRuntimeDefault(rootDir, args))
+  const sidecarDeployDir = mkdtempSync(path.join(tmpdir(), 'freshell-sidecar-deploy-'))
+  const mcpDeployDir = mkdtempSync(path.join(tmpdir(), 'freshell-mcp-deploy-'))
+  const stagingDir = `${runtimeDir}.staging`
+  try {
+    deploy({ packageName: 'freshell-claude-sidecar', destination: sidecarDeployDir })
+    deploy({ packageName: 'freshell-mcp-runtime', destination: mcpDeployDir })
+    const sidecarIdentity = readDeployIdentity(sidecarDeployDir, 'freshell-claude-sidecar')
+    const mcpIdentity = readDeployIdentity(mcpDeployDir, 'freshell-mcp-runtime')
+    const packageManagerVersion = capturePackageManagerVersion(rootDir, options.packageManagerVersion)
+    const sourceLockFingerprint = sha256File(workspaceLockPath)
+
+    removePath(stagingDir)
+    mkdirSync(stagingDir, { recursive: true })
+    const paths = getRuntimePaths(stagingDir, platform)
+    copyRequiredFile(serverBinary, paths.serverBinary)
+    if (platform !== 'win32') ensureExecutable(paths.serverBinary)
+    copyRequiredDirectory(clientDir, paths.clientDir)
+    await ensureNodeBinary(options, nodeVersion, platform, arch, paths.nodeBinary, stagingDir)
+    const sidecarDeployRoot = realpathSync(sidecarDeployDir)
+    const mcpDeployRoot = realpathSync(mcpDeployDir)
+    stageSidecarFromDeploy(sidecarDeployDir, paths.claudeSidecarDir, sidecarDeployRoot)
+    stageMcpFromDeploy(mcpDeployDir, paths.mcpDir, paths.nodeClientRuntimeDir, releaseVersion, mcpDeployRoot)
+
+    for (const required of getRuntimeAllowlist(platform).requiredFiles) {
+      if (!existsSync(path.join(stagingDir, required))) {
+        throw new Error(`Electron runtime staging is missing required file: ${required}`)
+      }
     }
-  }
+    const files = listFiles(stagingDir)
+    const unapproved = findUnapprovedRuntimePaths(files, platform)
+    if (unapproved.length > 0) {
+      throw new Error(`Electron runtime staging produced unapproved files: ${unapproved.join(', ')}`)
+    }
+    assertNoLinks(stagingDir)
 
-  const files = listFiles(runtimeDir)
-  const unapproved = findUnapprovedRuntimePaths(files, platform)
-  if (unapproved.length > 0) {
-    throw new Error(`Electron runtime staging produced unapproved files: ${unapproved.join(', ')}`)
+    const fileHashes = Object.fromEntries(
+      files.map((relativePath) => [relativePath, sha256File(path.join(stagingDir, relativePath))]),
+    )
+    const receipt: ElectronRuntimeStageReceipt = {
+      severity: 'info',
+      event: 'electron_runtime_prepared',
+      runtimeDir,
+      platform,
+      arch,
+      releaseVersion,
+      nodeVersion,
+      packageManager: { name: 'pnpm', version: packageManagerVersion },
+      sourceLockFingerprint,
+      exportedPackages: [
+        sidecarIdentity,
+        mcpIdentity,
+        { name: 'freshell', version: releaseVersion },
+      ],
+      files,
+      fileHashes,
+    }
+    writeFileSync(path.join(stagingDir, RUNTIME_LAYOUT.receipt), `${JSON.stringify(receipt, null, 2)}\n`)
+    removePath(runtimeDir)
+    renameSync(stagingDir, runtimeDir)
+    return receipt
+  } catch (error) {
+    removePath(stagingDir)
+    throw error
+  } finally {
+    removePath(sidecarDeployDir)
+    removePath(mcpDeployDir)
   }
-  const fileHashes = Object.fromEntries(
-    files.map((relativePath) => [relativePath, sha256File(path.join(runtimeDir, relativePath))]),
-  )
-  const receipt: ElectronRuntimeStageReceipt = {
-    severity: 'info',
-    event: 'electron_runtime_prepared',
-    runtimeDir,
-    platform,
-    arch,
-    releaseVersion,
-    nodeVersion,
-    files,
-    fileHashes,
-  }
-  writeFileSync(path.join(runtimeDir, '.electron-runtime-receipt.json'), `${JSON.stringify(receipt, null, 2)}\n`)
-  return receipt
 }
 
 function parseOption(args: string[], name: string): string | undefined {

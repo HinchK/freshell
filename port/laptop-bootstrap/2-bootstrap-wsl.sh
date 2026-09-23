@@ -33,13 +33,29 @@ if [ ! -d "$DEST/.git" ]; then
 fi
 cd "$DEST" && git fetch origin && git checkout "$BRANCH" && git pull --ff-only
 
-echo "== [5/7] npm deps + playwright chromium =="
-npm ci
-(cd crates/freshell-claude-sidecar && npm install)
-npx playwright install --with-deps chromium
+echo "== [5/7] JS deps + playwright chromium (manager follows the checked-out branch) =="
+USE_PNPM=false
+[ -f pnpm-lock.yaml ] && USE_PNPM=true
+if $USE_PNPM; then
+  # pnpm-era tree (current main): npm is only the pinned pnpm bootstrap, and
+  # the frozen workspace install covers the claude sidecar as a member.
+  npm install -g pnpm@10.34.5
+  pnpm install --frozen-lockfile
+  pnpm exec playwright install --with-deps chromium
+else
+  # Legacy npm-era branch (e.g. feat/rust-tauri-port): npm stays the manager
+  # and the sidecar installs separately.
+  npm ci
+  (cd crates/freshell-claude-sidecar && npm install)
+  npx playwright install --with-deps chromium
+fi
 
 echo "== [6/7] builds: client/tools + Rust linux + Rust windows exe =="
-npm run build
+if $USE_PNPM; then
+  pnpm run build
+else
+  npm run build
+fi
 cargo build --release -p freshell-server --target x86_64-pc-windows-gnu --locked
 cargo build -p freshell-tauri --locked || echo "WARN: tauri build failed — check GUI deps (HANDOFF §3); not fatal for server work"
 

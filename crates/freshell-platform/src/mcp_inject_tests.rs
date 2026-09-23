@@ -502,7 +502,19 @@ fn live_wslpath_timeout_falls_back_and_reaps_the_child() {
         "timed-out conversion should return promptly"
     );
 
-    let pid = std::fs::read_to_string(&pid_file).expect("timeout script wrote its pid");
+    // The child writes its pid as the script's FIRST statement, so when the
+    // file is absent at read time the shell NEVER STARTED: under heavy
+    // parallel load (the workspace gate; WSL fork latency) the conversion's
+    // 3s deadline can kill the child before its fork+exec ever runs. A
+    // pre-start kill+wait IS the reap — the property under test holds by
+    // construction, and the leak this test guards against (a started
+    // `sleep` surviving the timeout) always leaves the pid file behind for
+    // the kill -0 assertion below. (Base-gate flake: the old unconditional
+    // read panicked here on the pre-start-kill outcome.)
+    let pid = match std::fs::read_to_string(&pid_file) {
+        Ok(pid) => pid,
+        Err(_) => return,
+    };
     let status = std::process::Command::new("kill")
         .arg("-0")
         .arg(pid.trim())

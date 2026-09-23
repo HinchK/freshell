@@ -1,5 +1,5 @@
 {
-  "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `npm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
+  "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. Each entry in `schemas` is a self-contained JSON Schema for one exported Zod schema. The wire contract is frozen for the Rust port — changing it is out of scope.",
   "generator": "port/contract/generate-ws-contract.ts",
   "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
   "schemaCount": 84,
@@ -850,6 +850,10 @@
               "default": "shell",
               "type": "string"
             },
+            "namingHandle": {
+              "minLength": 1,
+              "type": "string"
+            },
             "observedEpoch": {
               "maximum": 9007199254740991,
               "minimum": 0,
@@ -1599,6 +1603,41 @@
                   "id": {
                     "type": "string"
                   },
+                  "nameSource": {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "const": "session",
+                            "type": "string"
+                          },
+                          "paneId": {
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "paneId"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "const": "legacy",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
                   "title": {
                     "type": "string"
                   }
@@ -1845,6 +1884,10 @@
                   "type": "null"
                 }
               ]
+            },
+            "namingHandle": {
+              "minLength": 1,
+              "type": "string"
             },
             "observedEpoch": {
               "maximum": 9007199254740991,
@@ -3288,6 +3331,10 @@
                 }
               ]
             },
+            "namingHandle": {
+              "minLength": 1,
+              "type": "string"
+            },
             "observedEpoch": {
               "maximum": 9007199254740991,
               "minimum": 0,
@@ -4281,6 +4328,10 @@
               "type": "null"
             }
           ]
+        },
+        "namingHandle": {
+          "minLength": 1,
+          "type": "string"
         },
         "observedEpoch": {
           "maximum": 9007199254740991,
@@ -8306,6 +8357,10 @@
           "default": "shell",
           "type": "string"
         },
+        "namingHandle": {
+          "minLength": 1,
+          "type": "string"
+        },
         "observedEpoch": {
           "maximum": 9007199254740991,
           "minimum": 0,
@@ -9172,6 +9227,41 @@
               },
               "id": {
                 "type": "string"
+              },
+              "nameSource": {
+                "oneOf": [
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "const": "session",
+                        "type": "string"
+                      },
+                      "paneId": {
+                        "minLength": 1,
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind",
+                      "paneId"
+                    ],
+                    "type": "object"
+                  },
+                  {
+                    "additionalProperties": false,
+                    "properties": {
+                      "kind": {
+                        "const": "legacy",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "kind"
+                    ],
+                    "type": "object"
+                  }
+                ]
               },
               "title": {
                 "type": "string"

@@ -508,6 +508,18 @@ const url = new URL(listenUrl)
 const host = url.hostname
 const port = Number(url.port)
 
+// Port-file mode (freshell-codex test support): bind a KERNEL-assigned
+// ephemeral port and report it back, eliminating the bind→drop→respawn
+// window where the kernel can hand the just-freed port to a sibling
+// fixture — ours then dies EADDRINUSE while the spawning test's probe
+// happily handshakes with the thief (the observed "live child has a
+// starttime" flake). Strictly opt-in via env; requires --listen port 0 so
+// a specific port can never be silently overridden.
+const portFile = process.env.FAKE_CODEX_APP_SERVER_PORT_FILE
+if (portFile && port !== 0) {
+  throw new Error('FAKE_CODEX_APP_SERVER_PORT_FILE requires --listen ws://127.0.0.1:0')
+}
+
 let nativeChild
 if (behavior.spawnNativeChild) {
   nativeChild = spawn(process.execPath, [new URL(import.meta.url).pathname, 'fake-native-child'], {
@@ -551,7 +563,15 @@ if (behavior.spawnDurableWriter) {
   }
 }
 
-const wss = new WebSocketServer({ host, port })
+const wss = portFile
+  ? new WebSocketServer({ host, port: 0 }, () => {
+      const address = wss.address()
+      if (!address || typeof address === 'string') {
+        throw new Error('fake app-server did not receive a loopback port')
+      }
+      fs.writeFileSync(portFile, `${address.port}\n`, 'utf8')
+    })
+  : new WebSocketServer({ host, port })
 const watches = new Map()
 const activeThreadIds = new Set()
 // kata 1wxv (LBC-1): thread/revert is paginated-only. Threads THIS process

@@ -3,13 +3,29 @@
 /** Build the Electron E2E client from this checkout before launching it. */
 
 import { execFileSync, spawnSync } from 'node:child_process'
+import { createRequire } from 'node:module'
 import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
+import {
+  buildRunScriptArgs,
+  detectProjectManager,
+  resolveManagerCommand,
+} from './lib/package-manager.js'
+
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url))
 const PROJECT_ROOT = path.resolve(SCRIPT_DIR, '..')
+const REQUIRE = createRequire(path.join(PROJECT_ROOT, 'package.json'))
 const CARGO_ARTIFACT_ROUTING_KEYS = new Set(['CARGO_TARGET_DIR', 'CARGO_BUILD_TARGET'])
+
+function resolveScriptCommand(
+  script: string,
+  env: NodeJS.ProcessEnv,
+): { command: string; args: string[]; viaShell?: boolean } {
+  const manager = detectProjectManager(PROJECT_ROOT).manager
+  return resolveManagerCommand({ manager, args: buildRunScriptArgs(manager, script, []), env })
+}
 
 /** The target platform determines the Rust executable's filename. */
 export function rustArtifactName(platform: NodeJS.Platform = process.platform): string {
@@ -101,12 +117,13 @@ export function runElectronE2ePreflight(root = PROJECT_ROOT): string {
   const buildId = resolveExactElectronE2eHead(root)
   const buildEnv = electronE2eBuildEnvironment(process.env, buildId)
 
-  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-  const result = spawnSync(npm, ['run', 'build:client'], {
+  const clientBuild = resolveScriptCommand('build:client', buildEnv)
+  const result = spawnSync(clientBuild.command, clientBuild.args, {
     cwd: root,
     env: buildEnv,
     stdio: 'inherit',
     windowsHide: true,
+    shell: clientBuild.viaShell ?? false,
   })
   if (result.status !== 0) {
     throw new Error(`Electron E2E client preflight failed (exit ${result.status ?? result.signal ?? 'unknown'})`)
@@ -115,11 +132,13 @@ export function runElectronE2ePreflight(root = PROJECT_ROOT): string {
   // The launcher itself is executed from dist/electron. Rebuild it too, so
   // the chooser lifecycle under test is the source checkout paired with the
   // freshly stamped client rather than a stale compiled main process.
-  const electronBuild = spawnSync(npm, ['run', 'build:electron'], {
+  const electronBuildCommand = resolveScriptCommand('build:electron', buildEnv)
+  const electronBuild = spawnSync(electronBuildCommand.command, electronBuildCommand.args, {
     cwd: root,
     env: buildEnv,
     stdio: 'inherit',
     windowsHide: true,
+    shell: electronBuildCommand.viaShell ?? false,
   })
   if (electronBuild.status !== 0) {
     throw new Error(`Electron E2E launcher preflight failed (exit ${electronBuild.status ?? electronBuild.signal ?? 'unknown'})`)
@@ -153,7 +172,9 @@ export function playwrightExitResult(result: { status: number | null; signal: No
 export function main(argv: string[] = process.argv.slice(2)): number | NodeJS.Signals {
   const buildId = runElectronE2ePreflight()
   const rustArtifact = rustArtifactPath(PROJECT_ROOT)
-  const playwright = path.join(PROJECT_ROOT, 'node_modules', '@playwright', 'test', 'cli.js')
+  // The @playwright/test exports map exposes './cli' (mapped to cli.js); the
+  // './cli.js' specifier itself is not exported, so resolve the mapped name.
+  const playwright = REQUIRE.resolve('@playwright/test/cli')
   const result = spawnSync(process.execPath, [playwright, 'test', '--config', 'test/e2e-electron/playwright.electron.config.ts', ...argv], {
     cwd: PROJECT_ROOT,
     env: electronE2eEnvironment(process.env, buildId, rustArtifact),

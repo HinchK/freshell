@@ -18,6 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex};
 
+use freshell_freshagent::naming::SessionNaming;
 use freshell_protocol::common::TerminalMetaRecord;
 use freshell_ws::identity::TerminalIdentity;
 
@@ -45,6 +46,30 @@ pub struct AutoTitleSweepState {
     /// change-gated/throttled refresh -- see [`GitMetaCache`] for the
     /// validator-A7 trigger-divergence rationale.
     pub git_meta_cache: GitMetaCache,
+    /// Unified agent names (Task 4): the ONE naming authority for scoped
+    /// coding-agent sessions (claude/codex/opencode). `None` leaves the
+    /// scoped branch degraded (no naming feed — the same degraded no-home
+    /// policy as everywhere else); the legacy ladder below then still
+    /// EXCLUDES scoped providers (never a competing settings title).
+    pub names: Option<Arc<crate::session_names::SessionNames>>,
+    /// Unified agent names (Task 4, review I3): the server's session
+    /// metadata store (`session-metadata.json`) — the discriminator the
+    /// naming plan names: a listing row whose known type is `kilroy` is a
+    /// Kilroy-only session (kilroy shares the Claude runtime, so its
+    /// transcripts list under provider `claude`) and never enters the
+    /// naming authority or the generator merely because its provider is
+    /// claude; it KEEPS the legacy ladder below. Cheap Arc/Mutex JSON —
+    /// the pass batch-reads the scoped rows' types once.
+    pub metadata: crate::session_metadata::SessionMetadataStore,
+    /// Task 4: the shared session index, consulted for the targeted
+    /// opencode first-message lookup (already-named opencode sessions carry
+    /// no first message in the bounded listing).
+    pub index: Option<Arc<freshell_sessions::directory_index::SessionIndex>>,
+    /// Task 4: whether the initial index hydration pass has run. The boot
+    /// snapshot installs free fallback records and ABSORBS observed
+    /// messages (no paid titles across history); later passes feed activity
+    /// so genuinely newly observed messages arm generation.
+    pub index_hydrated: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Minimum age before a cwd's git enrichment is re-run when its terminal-set
@@ -201,6 +226,66 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The sweep's session key (`provider:sessionId`) — the same shape the
+/// metadata store's `get_all()` flattens to.
+fn sweep_session_key(provider: &str, session_id: &str) -> String {
+    format!("{provider}:{session_id}")
+}
+
+/// Unified agent names (Task 4, review I3; generalized by delta-review
+/// round 4, finding 1): the pass's KILROY-ONLY sessions, answered by the
+/// ONE shared seam ([`crate::kilroy_lane`]) every server surface consults —
+/// a session is kilroy-only iff the metadata store types it `kilroy` AND
+/// the naming authority holds no canonical record for it AND no live
+/// terminal runs it in a scoped mode. Kilroy shares the Claude runtime, so
+/// its transcripts list under provider `claude`; a kilroy-only session
+/// never enters the naming authority or the generator merely because its
+/// provider is claude — it KEEPS the legacy ladder (the Global Constraint:
+/// kilroy retains its existing UI and generation behavior). The
+/// singular-record component is the Global Constraint's other half: a
+/// durable session opened BOTH as kilroy and through a supported mode has
+/// ONE canonical name — the supported-mode record owns it (never a
+/// competing kilroy record), so a kilroy-typed row that already holds a
+/// canonical record stays in the authority lane and the legacy ladder
+/// never writes it a competing settings title.
+async fn kilroy_only_session_keys(
+    state: &AutoTitleSweepState,
+    sessions: &[SweepSession],
+) -> HashSet<String> {
+    let has_scoped = sessions.iter().any(|s| {
+        freshell_freshagent::naming::named_provider_for(Some(&s.provider), None).is_some()
+    });
+    if !has_scoped {
+        return HashSet::new();
+    }
+    // One metadata read per pass (cheap Arc/Mutex JSON — cached after the
+    // first load, shared with the POST route), then the shared predicate.
+    let entries = state.metadata.get_all().await;
+    let candidates: Vec<crate::kilroy_lane::KilroyLaneCandidate> = sessions
+        .iter()
+        .filter(|s| {
+            freshell_freshagent::naming::named_provider_for(Some(&s.provider), None).is_some()
+        })
+        .map(|s| crate::kilroy_lane::KilroyLaneCandidate {
+            provider: s.provider.clone(),
+            session_id: s.session_id.clone(),
+            cwd: s.cwd.clone(),
+        })
+        .collect();
+    let naming = state
+        .names
+        .clone()
+        .map(|names| names as Arc<dyn SessionNaming>);
+    crate::kilroy_lane::kilroy_only_keys(
+        &entries,
+        naming.as_ref(),
+        &state.identity,
+        Some(&state.registry),
+        &candidates,
+    )
+    .await
+}
+
 /// Task 18: the sweep-time terminal-metadata refresh — Node's
 /// `applySessionMetadata` pass (`server/index.ts:854-866` ->
 /// `terminal-metadata-service.ts:183-201`), redesigned per validator-A7 (see
@@ -304,10 +389,164 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
     let overrides = state.settings.session_overrides(); // freshness-reloading read
     let mut changed = false;
 
+    // Unified agent names (Task 4, review I3): the kilroy-only rows for
+    // this pass — computed once, consulted by BOTH the scoped branch
+    // below (never hydrate/arm them) and the legacy-ladder gate (never
+    // strip their ladder).
+    let kilroy_only = kilroy_only_session_keys(state, sessions).await;
+
+    // Unified agent names (Task 4): scoped coding-agent sessions (the six
+    // unified modes' CLI half — claude/codex/opencode, which is also where
+    // resumed fresh sessions' transcripts surface) route to the ONE naming
+    // authority. The BOOT pass hydrates free fallback records and absorbs
+    // observed messages (never a paid title across history); later passes
+    // feed activity so a genuinely newly observed message arms generation —
+    // no live PTY or browser is required. A session explicitly open at boot
+    // (a live terminal match) gets its observed message armed too. Nothing
+    // here touches the settings ladder: a scoped session never acquires a
+    // competing settings title.
+    if let Some(names) = &state.names {
+        let hydrating = !state
+            .index_hydrated
+            .swap(true, std::sync::atomic::Ordering::SeqCst);
+        // Delta-review round 3, finding 2 — the per-pass settled memo:
+        // sessions this pass already PROVED settled on the adopted view
+        // (both store pre-checks answered no-op) never re-evaluate, so a
+        // repeated row in one pass costs nothing. Cleared every pass — a
+        // later pass re-proves against the (refreshed) view, so foreign
+        // changes always resurface through the existing refresh discipline.
+        let mut settled_this_pass: HashSet<String> = HashSet::new();
+        for s in sessions {
+            let Some(provider) =
+                freshell_freshagent::naming::named_provider_for(Some(&s.provider), None)
+            else {
+                continue;
+            };
+            let session_key = sweep_session_key(&s.provider, &s.session_id);
+            if kilroy_only.contains(&session_key) {
+                // A kilroy-only session keeps kilroy's existing UI and
+                // generation behavior: no naming-authority record, no
+                // generator arming — the legacy ladder below serves it.
+                continue;
+            }
+            if settled_this_pass.contains(&session_key) {
+                // Proven settled earlier in THIS pass: no transaction, no
+                // targeted lookup, no re-evaluation.
+                continue;
+            }
+            let target = freshell_protocol::SessionNameRef::Session {
+                provider,
+                session_id: s.session_id.clone(),
+            };
+            // OpenCode already-named sessions carry no first message in the
+            // bounded listing: the targeted lookup serves eligibility, but
+            // only while the session's generation can still use input (an
+            // exhausted or protected session never pays the read again).
+            let first_user_message = match s.first_user_message.clone() {
+                Some(message) => Some(message),
+                None => {
+                    if provider == freshell_protocol::session_names::NamedProvider::Opencode
+                        && names.needs_generation_input(&target)
+                    {
+                        if let Some(index) = state.index.clone() {
+                            let session_id = s.session_id.clone();
+                            tokio::task::spawn_blocking(move || {
+                                index.opencode_first_user_message(&session_id)
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+            };
+            let provider_title = if s.title_source.as_deref() == Some("provider-generated") {
+                s.title.clone()
+            } else {
+                None
+            };
+            // An explicitly open session (a live terminal match) at boot is
+            // the user opening it: hydration must NOT absorb the observed
+            // message (the explicit-open activity below arms generation).
+            let explicitly_open = !state
+                .identity
+                .find_all_by_session(&s.provider, &s.session_id, s.cwd.as_deref())
+                .is_empty();
+            let input = crate::session_name_generation::IndexedNameInput {
+                provider,
+                session_id: s.session_id.clone(),
+                cwd: s.cwd.clone(),
+                first_user_message: first_user_message.clone(),
+                provider_title,
+            };
+            // Delta-review round 3, finding 2 — the adopted-view pre-checks:
+            // a settled session (hydrated record, absorbed/duplicate message,
+            // no pending work) must not pay a strict cross-process store
+            // transaction per pass. `hydrate_indexed_pending`/
+            // `activity_pending` prove the no-op from the in-memory view
+            // (the same plan the transaction applies); a stale view can only
+            // make the pre-check transact unnecessarily, never skip real
+            // work — the store's own doc comments carry the full argument.
+            let mut transacted = false;
+            if names.hydrate_indexed_pending(&input) {
+                transacted = true;
+                if let Err(error) = names
+                    .hydrate_indexed(input.clone(), hydrating && !explicitly_open)
+                    .await
+                {
+                    freshell_freshagent::naming::log_name_error("hydrate_indexed", &target, &error);
+                }
+            }
+            // The boot pass arms only explicitly open sessions; every later
+            // pass feeds the newly observed message (the store's
+            // fingerprint absorbs duplicates, and an explicitly open
+            // session's Opened edge arms its absorbed unattempted
+            // series — the plan's "explicit open/resume may arm an
+            // unattempted series if a first user message exists").
+            let mut activity = None;
+            if first_user_message.is_some() && (!hydrating || explicitly_open) {
+                activity = Some(freshell_freshagent::naming::NameActivity {
+                    target: target.clone(),
+                    mode: s.provider.clone(),
+                    event_id: format!("{}:{}", s.provider, s.session_id),
+                    reason: if explicitly_open {
+                        freshell_freshagent::naming::NameActivityReason::Opened
+                    } else {
+                        freshell_freshagent::naming::NameActivityReason::IndexUserMessage
+                    },
+                    first_user_message,
+                    cwd: s.cwd.clone(),
+                });
+            }
+            if let Some(activity) = activity {
+                // Re-checked AFTER the hydrate above: a boot-pass hydration
+                // that just created/absorbed makes this a provable no-op on
+                // the now-current view (no duplicate arming transaction).
+                if names.activity_pending(&activity) {
+                    transacted = true;
+                    if let Err(error) = names.activity(activity).await {
+                        freshell_freshagent::naming::log_name_error("activity", &target, &error);
+                    }
+                }
+            }
+            if !transacted {
+                // Proven settled on the adopted view: memo so a repeated row
+                // later in THIS pass never re-evaluates.
+                settled_this_pass.insert(session_key);
+            }
+        }
+    }
+
     // Match sessions to live terminals ONCE — both the meta refresh and the
     // title pass consume the same fan-out. BOUNDED to live terminals only
     // (server/index.ts:885); Node passes session.cwd for the cwd-scoped
-    // claude match (index.ts:884, Task 3).
+    // claude match (index.ts:884, Task 3). The meta refresh below serves
+    // EVERY provider (git metadata is provider-agnostic); only the legacy
+    // TITLE ladder excludes scoped coding-agent sessions.
     let meta_work: Vec<(&SweepSession, Vec<TerminalIdentity>)> = sessions
         .iter()
         .filter_map(|s| {
@@ -337,6 +576,16 @@ pub async fn run_auto_title_pass(state: &AutoTitleSweepState, sessions: &[SweepS
 
     for (s, matching) in &meta_work {
         let key = format!("{}:{}", s.provider, s.session_id);
+        // The legacy title ladder is the EXCLUDED-provider path: scoped
+        // coding-agent sessions never write a competing settings title
+        // (their naming lives in the authority above) — EXCEPT the
+        // kilroy-only rows, which keep kilroy's existing ladder (review
+        // I3: the metadata-blind sweep here is what stripped it).
+        if freshell_freshagent::naming::named_provider_for(Some(&s.provider), None).is_some()
+            && !kilroy_only.contains(&key)
+        {
+            continue;
+        }
         let row = overrides.get(&key).and_then(|v| v.as_object());
         let override_title = row
             .and_then(|r| r.get("titleOverride"))
@@ -576,6 +825,7 @@ pub fn spawn_auto_title_sweep(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use freshell_freshagent::naming::SessionNaming;
     use serde_json::json;
 
     /// Registers a REAL (but throwaway) terminal in the shared
@@ -583,10 +833,22 @@ mod tests {
     /// (`registry.update_title`) has an actual entry to mutate. Copied from
     /// `sessions.rs`'s module-private helper of the same name (its doc
     /// explains why a minimal `sleep` child substitutes for the
-    /// crate-private `insert_headless`).
+    /// crate-private `insert_headless`). The registry row's MODE defaults
+    /// to `"shell"`; [`spawn_headless_terminal_with_mode_for_test`] stamps
+    /// a different one (review I3's scoped-mode proxy).
     fn spawn_headless_terminal_for_test(
         registry: &freshell_terminal::TerminalRegistry,
         terminal_id: &str,
+    ) {
+        spawn_headless_terminal_with_mode_for_test(registry, terminal_id, "shell");
+    }
+
+    /// The mode-stamping variant of [`spawn_headless_terminal_for_test`] —
+    /// review I3's singular-record proxy reads the live terminal's mode.
+    fn spawn_headless_terminal_with_mode_for_test(
+        registry: &freshell_terminal::TerminalRegistry,
+        terminal_id: &str,
+        mode: &str,
     ) {
         use freshell_platform::spawn::{SpawnSpec, DEFAULT_COLS, DEFAULT_ROWS};
         let spec = SpawnSpec {
@@ -603,7 +865,7 @@ mod tests {
                 &std::collections::BTreeMap::new(),
                 terminal_id.to_string(),
                 "stream-test".to_string(),
-                "shell",
+                mode,
                 None,
                 None,
                 None,
@@ -615,6 +877,18 @@ mod tests {
     fn sweep_state(
         dir: &std::path::Path,
         ai_key: Option<&str>,
+    ) -> (
+        AutoTitleSweepState,
+        tokio::sync::broadcast::Receiver<String>,
+    ) {
+        sweep_state_with(dir, ai_key, None, None)
+    }
+
+    fn sweep_state_with(
+        dir: &std::path::Path,
+        ai_key: Option<&str>,
+        names: Option<Arc<crate::session_names::SessionNames>>,
+        index: Option<Arc<freshell_sessions::directory_index::SessionIndex>>,
     ) -> (
         AutoTitleSweepState,
         tokio::sync::broadcast::Receiver<String>,
@@ -632,6 +906,10 @@ mod tests {
             pending_ai_titles: Default::default(),
             terminal_meta: Default::default(),
             git_meta_cache: Default::default(),
+            names,
+            metadata: crate::session_metadata::SessionMetadataStore::new(dir),
+            index,
+            index_hydrated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         (state, rx)
     }
@@ -724,12 +1002,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (state, _rx) = sweep_state(dir.path(), None);
         let changed =
-            run_auto_title_pass(&state, &[session("claude", "s1", "/x/proj", Some("hi"))]).await;
+            run_auto_title_pass(&state, &[session("amplifier", "s1", "/x/proj", Some("hi"))]).await;
         assert!(!changed);
         assert!(state
             .settings
             .session_overrides()
-            .get("claude:s1")
+            .get("amplifier:s1")
             .is_none());
     }
 
@@ -741,11 +1019,11 @@ mod tests {
         spawn_headless_terminal_for_test(&state.registry, tid);
         state
             .identity
-            .upsert(tid, Some("claude"), Some("s1"), Some("/x/proj"), 1);
+            .upsert(tid, Some("amplifier"), Some("s1"), Some("/x/proj"), 1);
         let changed = run_auto_title_pass(
             &state,
             &[session(
-                "claude",
+                "amplifier",
                 "s1",
                 "/x/proj",
                 Some("Fix the flux\nrest"),
@@ -754,7 +1032,7 @@ mod tests {
         .await;
         assert!(changed);
         let ov = state.settings.session_overrides();
-        let row = ov.get("claude:s1").unwrap();
+        let row = ov.get("amplifier:s1").unwrap();
         assert_eq!(row["titleOverride"], "Fix the flux");
         assert_eq!(row["titleSource"], "first-message");
         // terminal push + broadcast frame
@@ -782,14 +1060,14 @@ mod tests {
         spawn_headless_terminal_for_test(&state.registry, tid);
         state
             .identity
-            .upsert(tid, Some("claude"), Some("s1"), Some("/x/proj"), 1);
-        let s = [session("claude", "s1", "/x/proj", Some("Fix the flux"))];
+            .upsert(tid, Some("amplifier"), Some("s1"), Some("/x/proj"), 1);
+        let s = [session("amplifier", "s1", "/x/proj", Some("Fix the flux"))];
         run_auto_title_pass(&state, &s).await;
         // pass 1: dir placeholder persisted (never first-message when AI on)
         let row = state
             .settings
             .session_overrides()
-            .get("claude:s1")
+            .get("amplifier:s1")
             .cloned()
             .unwrap();
         assert_eq!(row["titleSource"], "dir");
@@ -799,7 +1077,7 @@ mod tests {
             let row = state
                 .settings
                 .session_overrides()
-                .get("claude:s1")
+                .get("amplifier:s1")
                 .cloned()
                 .unwrap();
             if row["titleSource"] == "ai" {
@@ -809,7 +1087,7 @@ mod tests {
         let row = state
             .settings
             .session_overrides()
-            .get("claude:s1")
+            .get("amplifier:s1")
             .cloned()
             .unwrap();
         assert_eq!(row["titleOverride"], "AI Title");
@@ -826,24 +1104,24 @@ mod tests {
         spawn_headless_terminal_for_test(&state.registry, tid);
         state
             .identity
-            .upsert(tid, Some("claude"), Some("s1"), Some("/x/proj"), 1);
+            .upsert(tid, Some("amplifier"), Some("s1"), Some("/x/proj"), 1);
         state
             .settings
             .patch_session_override(
-                "claude:s1",
+                "amplifier:s1",
                 &[
                     ("titleOverride", Some(json!("My Name"))),
                     ("titleSource", Some(json!("user"))),
                 ],
             )
             .await;
-        let mut s = session("claude", "s1", "/x/proj", Some("hi"));
+        let mut s = session("amplifier", "s1", "/x/proj", Some("hi"));
         s.title = Some("My Name".into()); // override-applied session title
         run_auto_title_pass(&state, &[s]).await;
         let row = state
             .settings
             .session_overrides()
-            .get("claude:s1")
+            .get("amplifier:s1")
             .cloned()
             .unwrap();
         assert_eq!(row["titleOverride"], "My Name"); // untouched
@@ -950,16 +1228,16 @@ mod tests {
         spawn_headless_terminal_for_test(&state.registry, tid);
         state
             .identity
-            .upsert(tid, Some("claude"), Some("s1"), Some("/x/proj"), 1);
+            .upsert(tid, Some("amplifier"), Some("s1"), Some("/x/proj"), 1);
         run_auto_title_pass(
             &state,
-            &[session("claude", "s1", "/x/proj", Some("Fix it"))],
+            &[session("amplifier", "s1", "/x/proj", Some("Fix it"))],
         )
         .await;
         let row = state
             .settings
             .session_overrides()
-            .get("claude:s1")
+            .get("amplifier:s1")
             .cloned()
             .unwrap();
         assert_eq!(row["titleSource"], "first-message"); // heuristic path, no Gemini
@@ -980,9 +1258,9 @@ mod tests {
         spawn_headless_terminal_for_test(&state.registry, tid);
         state
             .identity
-            .upsert(tid, Some("opencode"), Some("s1"), Some("/x/glowforge"), 1);
+            .upsert(tid, Some("amplifier"), Some("s1"), Some("/x/glowforge"), 1);
         let s = [session(
-            "opencode",
+            "amplifier",
             "s1",
             "/x/glowforge",
             Some("This is a quick naming test"),
@@ -992,7 +1270,7 @@ mod tests {
         let row = state
             .settings
             .session_overrides()
-            .get("opencode:s1")
+            .get("amplifier:s1")
             .cloned()
             .unwrap();
         assert_eq!(row["titleSource"], "dir");
@@ -1002,7 +1280,7 @@ mod tests {
             let row = state
                 .settings
                 .session_overrides()
-                .get("opencode:s1")
+                .get("amplifier:s1")
                 .cloned()
                 .unwrap();
             if row["titleSource"] == "ai" {
@@ -1012,7 +1290,7 @@ mod tests {
         let row = state
             .settings
             .session_overrides()
-            .get("opencode:s1")
+            .get("amplifier:s1")
             .cloned()
             .unwrap();
         assert_eq!(row["titleOverride"], "AI Title");
@@ -1031,17 +1309,17 @@ mod tests {
         spawn_headless_terminal_for_test(&state.registry, tid);
         state
             .identity
-            .upsert(tid, Some("opencode"), Some("s1"), Some("/x/proj"), 1);
+            .upsert(tid, Some("amplifier"), Some("s1"), Some("/x/proj"), 1);
         for _pass in 0..2 {
             // mirror spawn_auto_title_sweep's mapping: title is overlay-applied
             let overrides = state.settings.session_overrides();
             let title = overlay_session_title(
                 &overrides,
-                "opencode:s1",
+                "amplifier:s1",
                 Some("Fix login flow"),
                 Some("provider-generated"),
             );
-            let mut s = session("opencode", "s1", "/x/proj", Some("hello"));
+            let mut s = session("amplifier", "s1", "/x/proj", Some("hello"));
             s.title = title;
             s.title_source = Some("provider-generated".into());
             run_auto_title_pass(&state, &[s]).await;
@@ -1050,7 +1328,7 @@ mod tests {
         // no Gemini: nothing pending, no ai row (a dir row is claude-parity
         // behavior for provider-generated sessions and is shadow-suppressed)
         assert!(state.pending_ai_titles.lock().unwrap().is_empty());
-        if let Some(row) = state.settings.session_overrides().get("opencode:s1") {
+        if let Some(row) = state.settings.session_overrides().get("amplifier:s1") {
             assert_ne!(row["titleSource"], "ai");
         }
         // the provider name is what lands on the live terminal
@@ -1071,11 +1349,11 @@ mod tests {
         spawn_headless_terminal_for_test(&state.registry, tid);
         state
             .identity
-            .upsert(tid, Some("opencode"), Some("s1"), Some("/x/glowforge"), 1);
+            .upsert(tid, Some("amplifier"), Some("s1"), Some("/x/glowforge"), 1);
         state
             .settings
             .patch_session_override(
-                "opencode:s1",
+                "amplifier:s1",
                 &[
                     ("titleOverride", Some(json!("glowforge"))),
                     ("titleSource", Some(json!("dir"))),
@@ -1085,13 +1363,13 @@ mod tests {
         let overrides = state.settings.session_overrides();
         let title = overlay_session_title(
             &overrides,
-            "opencode:s1",
+            "amplifier:s1",
             Some("Quick naming test"),
             Some("provider-generated"),
         );
         // shadow guard: the stale dir row loses to the provider title
         assert_eq!(title.as_deref(), Some("Quick naming test"));
-        let mut s = session("opencode", "s1", "/x/glowforge", None);
+        let mut s = session("amplifier", "s1", "/x/glowforge", None);
         s.title = title;
         s.title_source = Some("provider-generated".into());
         run_auto_title_pass(&state, &[s]).await;
@@ -1110,11 +1388,11 @@ mod tests {
         spawn_headless_terminal_for_test(&state.registry, tid);
         state
             .identity
-            .upsert(tid, Some("opencode"), Some("s1"), Some("/x/proj"), 1);
+            .upsert(tid, Some("amplifier"), Some("s1"), Some("/x/proj"), 1);
         state
             .settings
             .patch_session_override(
-                "opencode:s1",
+                "amplifier:s1",
                 &[
                     ("titleOverride", Some(json!("My Name"))),
                     ("titleSource", Some(json!("user"))),
@@ -1124,13 +1402,13 @@ mod tests {
         let overrides = state.settings.session_overrides();
         let title = overlay_session_title(
             &overrides,
-            "opencode:s1",
+            "amplifier:s1",
             Some("Provider Title"),
             Some("provider-generated"),
         );
         // user rows are never shadowed
         assert_eq!(title.as_deref(), Some("My Name"));
-        let mut s = session("opencode", "s1", "/x/proj", Some("hello"));
+        let mut s = session("amplifier", "s1", "/x/proj", Some("hello"));
         s.title = title;
         s.title_source = Some("provider-generated".into());
         run_auto_title_pass(&state, &[s]).await;
@@ -1138,7 +1416,7 @@ mod tests {
         let row = state
             .settings
             .session_overrides()
-            .get("opencode:s1")
+            .get("amplifier:s1")
             .cloned()
             .unwrap();
         assert_eq!(row["titleOverride"], "My Name");
@@ -1204,7 +1482,18 @@ mod tests {
             Some("This is a quick naming test")
         );
 
-        let (state, _rx) = sweep_state(dir.path(), Some("key"));
+        // Unified agent names (Task 4): opencode is a SCOPED provider — the
+        // wire-through now lands in the naming authority (the first-message
+        // fallback record plus the armed generation series the worker will
+        // dispatch), and the settings ladder never acquires a competing
+        // scoped title.
+        let names = crate::session_names::SessionNames::open(dir.path().to_path_buf()).unwrap();
+        let (state, _rx) = sweep_state_with(
+            dir.path(),
+            Some("key"),
+            Some(names.clone()),
+            Some(std::sync::Arc::new(index)),
+        );
         let tid = "term-1";
         spawn_headless_terminal_for_test(&state.registry, tid);
         state.identity.upsert(
@@ -1237,33 +1526,722 @@ mod tests {
                 }
             })
             .collect();
+        // The session is explicitly open (a live terminal match), so the
+        // boot pass arms its series rather than absorbing.
         run_auto_title_pass(&state, &sessions).await;
-        let row = state
+        let target = freshell_protocol::SessionNameRef::Session {
+            provider: freshell_protocol::session_names::NamedProvider::Opencode,
+            session_id: "ses_1".to_string(),
+        };
+        let record = naming_record(&names, target.clone())
+            .await
+            .expect("the fixture session reached the naming authority");
+        assert_eq!(record.record.name, "This is a quick naming test");
+        assert_eq!(
+            record.record.source,
+            freshell_protocol::session_names::NameSource::FirstMessage
+        );
+        assert!(
+            names
+                .generation_work_snapshot()
+                .iter()
+                .any(|item| item.target == target),
+            "the scoped series is armed for the worker"
+        );
+        assert!(state
             .settings
             .session_overrides()
             .get("opencode:ses_1")
-            .cloned()
-            .unwrap();
-        assert_eq!(row["titleSource"], "dir"); // placeholder ADVANCES...
-        for _ in 0..50 {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            let row = state
-                .settings
-                .session_overrides()
-                .get("opencode:ses_1")
-                .cloned()
-                .unwrap();
-            if row["titleSource"] == "ai" {
-                break;
+            .is_none());
+    }
+
+    // -- Unified agent names (Task 4): the scoped branch feeds the naming
+    // authority — never the settings ladder ---------------------------------
+
+    async fn naming_record(
+        names: &Arc<crate::session_names::SessionNames>,
+        target: freshell_protocol::SessionNameRef,
+    ) -> Option<freshell_protocol::SessionNameUpdate> {
+        names
+            .get(vec![target])
+            .await
+            .expect("naming get")
+            .into_iter()
+            .next()
+    }
+
+    fn scoped_session_ref(provider: &str, id: &str) -> freshell_protocol::SessionNameRef {
+        freshell_protocol::SessionNameRef::Session {
+            provider: freshell_freshagent::naming::named_provider_for(Some(provider), None)
+                .expect("scoped provider"),
+            session_id: id.to_string(),
+        }
+    }
+
+    /// A scoped session routes to the naming authority: the boot pass
+    /// installs the free first-message fallback record and ABSORBS the
+    /// observed message (no paid title across history), and the settings
+    /// ladder never acquires a competing scoped title. A live terminal at
+    /// boot is the explicit-open signal that arms generation.
+    #[tokio::test]
+    async fn scoped_sessions_feed_the_naming_authority_never_the_settings_ladder() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = crate::session_names::SessionNames::open(dir.path().to_path_buf()).unwrap();
+        let (state, _rx) = sweep_state_with(dir.path(), None, Some(names.clone()), None);
+
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "claude",
+                "s-boot",
+                "/x/proj",
+                Some("Fix the flux capacitor"),
+            )],
+        )
+        .await;
+
+        // No live terminal: the record installs (free fallback) and the
+        // message is absorbed — the paid title is NOT scheduled.
+        let record = naming_record(&names, scoped_session_ref("claude", "s-boot"))
+            .await
+            .expect("the boot pass installed the record");
+        assert_eq!(record.record.name, "Fix the flux capacitor");
+        assert_eq!(
+            record.record.source,
+            freshell_protocol::session_names::NameSource::FirstMessage
+        );
+        assert!(
+            names.generation_work_snapshot().is_empty(),
+            "history alone never schedules the paid title"
+        );
+        // The settings ladder never acquired a competing scoped title.
+        assert!(state
+            .settings
+            .session_overrides()
+            .get("claude:s-boot")
+            .is_none());
+
+        // A live terminal at boot IS the explicit-open signal: the observed
+        // message arms generation for that session.
+        let names = crate::session_names::SessionNames::open(dir.path().to_path_buf()).unwrap();
+        let (state, _rx) = sweep_state_with(dir.path(), None, Some(names.clone()), None);
+        state
+            .index_hydrated
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        spawn_headless_terminal_for_test(&state.registry, "term-open");
+        state.identity.upsert(
+            "term-open",
+            Some("claude"),
+            Some("s-open"),
+            Some("/x/proj"),
+            1,
+        );
+        run_auto_title_pass(
+            &state,
+            &[session("claude", "s-open", "/x/proj", Some("Open me up"))],
+        )
+        .await;
+        assert!(
+            names
+                .generation_work_snapshot()
+                .iter()
+                .any(|item| item.target == scoped_session_ref("claude", "s-open")),
+            "a live terminal at boot arms the explicitly open session"
+        );
+        assert!(state
+            .settings
+            .session_overrides()
+            .get("claude:s-open")
+            .is_none());
+    }
+
+    /// After the boot snapshot, a genuinely newly observed message arms
+    /// generation — no terminal needed (a session that finishes without a
+    /// browser still gets its name).
+    #[tokio::test]
+    async fn a_session_observed_after_boot_arms_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = crate::session_names::SessionNames::open(dir.path().to_path_buf()).unwrap();
+        let (state, _rx) = sweep_state_with(dir.path(), None, Some(names.clone()), None);
+
+        // Boot pass: the historical session is absorbed.
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "codex",
+                "s-hist",
+                "/x/hist",
+                Some("Historical message"),
+            )],
+        )
+        .await;
+        assert!(names.generation_work_snapshot().is_empty());
+        // Re-feeding the same absorbed message is a no-op.
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "codex",
+                "s-hist",
+                "/x/hist",
+                Some("Historical message"),
+            )],
+        )
+        .await;
+        assert!(
+            names.generation_work_snapshot().is_empty(),
+            "the absorbed message never arms on a later pass"
+        );
+
+        // A session that first appears AFTER boot is newly observed: its
+        // message arms generation.
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "codex",
+                "s-new",
+                "/x/new",
+                Some("A brand new post-boot session"),
+            )],
+        )
+        .await;
+        assert!(
+            names
+                .generation_work_snapshot()
+                .iter()
+                .any(|item| item.target == scoped_session_ref("codex", "s-new")),
+            "a newly observed post-boot session arms generation"
+        );
+        let record = naming_record(&names, scoped_session_ref("codex", "s-new"))
+            .await
+            .expect("the new session hydrated");
+        assert_eq!(record.record.name, "A brand new post-boot session");
+    }
+
+    /// Delta-review round 3, finding 2: a SETTLED scoped session costs ZERO
+    /// store transactions on a later sweep pass. Steady state used to pay
+    /// hydrate_indexed + activity — each a strict cross-process transaction
+    /// locking/reading/digesting/parsing the whole session-names document —
+    /// for every scoped session on EVERY ~5s pass (O(H^2) per pass, forever).
+    /// The adopted-view pre-checks prove the no-op without transacting; the
+    /// convergence control proves a genuinely new session still reaches the
+    /// store (the pre-check only skips what the strict transaction would
+    /// have no-op'd — view staleness in the other direction just transacts).
+    #[tokio::test]
+    async fn settled_scoped_sessions_transact_zero_on_later_sweep_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = crate::session_names::SessionNames::open(dir.path().to_path_buf()).unwrap();
+        let (state, _rx) = sweep_state_with(dir.path(), None, Some(names.clone()), None);
+
+        // Boot pass: the scoped session hydrates (record + absorbed message).
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "claude",
+                "s-settled",
+                "/x/proj",
+                Some("Fix the flux capacitor"),
+            )],
+        )
+        .await;
+        assert!(
+            naming_record(&names, scoped_session_ref("claude", "s-settled"))
+                .await
+                .is_some(),
+            "the boot pass installed the record"
+        );
+
+        // Second pass (settled, message re-fed): ZERO transactions.
+        let before = crate::session_names::test_store_transaction_count(dir.path());
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "claude",
+                "s-settled",
+                "/x/proj",
+                Some("Fix the flux capacitor"),
+            )],
+        )
+        .await;
+        let after = crate::session_names::test_store_transaction_count(dir.path());
+        assert_eq!(
+            before, after,
+            "a settled scoped session (absorbed message, unopened) must not transact on a later pass"
+        );
+
+        // The explicitly-open variant settles too: the boot-pass Opened edge
+        // armed its series, and re-feeding the SAME message with Opened on an
+        // armed (Eligible, attempted-count 0 but non-Idle) series is a no-op.
+        spawn_headless_terminal_for_test(&state.registry, "term-open");
+        state.identity.upsert(
+            "term-open",
+            Some("claude"),
+            Some("s-open"),
+            Some("/x/open"),
+            1,
+        );
+        run_auto_title_pass(
+            &state,
+            &[session("claude", "s-open", "/x/open", Some("Open me up"))],
+        )
+        .await;
+        assert!(
+            names
+                .generation_work_snapshot()
+                .iter()
+                .any(|item| item.target == scoped_session_ref("claude", "s-open")),
+            "the open session's message armed generation"
+        );
+        let before_open = crate::session_names::test_store_transaction_count(dir.path());
+        run_auto_title_pass(
+            &state,
+            &[session("claude", "s-open", "/x/open", Some("Open me up"))],
+        )
+        .await;
+        let after_open = crate::session_names::test_store_transaction_count(dir.path());
+        assert_eq!(
+            before_open, after_open,
+            "a settled explicitly-open scoped session must not transact on a later pass"
+        );
+
+        // Convergence control: alongside the settled sessions, a genuinely
+        // NEW scoped session still reaches the store (a missing record is
+        // always pending work — the pre-check never over-skips).
+        let before_new = crate::session_names::test_store_transaction_count(dir.path());
+        run_auto_title_pass(
+            &state,
+            &[
+                session(
+                    "claude",
+                    "s-settled",
+                    "/x/proj",
+                    Some("Fix the flux capacitor"),
+                ),
+                session("claude", "s-fresh", "/x/fresh", Some("A brand new session")),
+            ],
+        )
+        .await;
+        let after_new = crate::session_names::test_store_transaction_count(dir.path());
+        assert!(
+            after_new > before_new,
+            "a new scoped session still transacts (hydrate + arm)"
+        );
+        assert!(
+            naming_record(&names, scoped_session_ref("claude", "s-fresh"))
+                .await
+                .is_some(),
+            "the new session's record installed"
+        );
+    }
+
+    /// An already-named opencode session carries no first message in the
+    /// bounded listing: the targeted lookup serves it, the provider title
+    /// installs at its own fallback rank, and the newly observed message
+    /// arms generation (the provider title never suppresses it).
+    #[tokio::test]
+    async fn an_already_named_opencode_session_gets_the_targeted_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(data_home.path()).unwrap();
+        let conn = rusqlite::Connection::open(data_home.path().join("opencode.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT);
+             CREATE TABLE session (
+                id TEXT PRIMARY KEY, directory TEXT, title TEXT,
+                time_created INTEGER, time_updated INTEGER, time_archived INTEGER,
+                project_id TEXT, parent_id TEXT
+             );
+             CREATE TABLE message (
+                id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
+             CREATE TABLE part (
+                id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, data TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session VALUES ('ses_named', '/x/named',
+                'Opencode named it', 1000, 5000, NULL, NULL, NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            r#"INSERT INTO message VALUES ('msg_1', 'ses_named', 100, '{"role":"user"}')"#,
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            r#"INSERT INTO part VALUES ('prt_1', 'msg_1', 'ses_named',
+                '{"type":"text","text":"The hidden first message"}')"#,
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let sources: Vec<std::sync::Arc<dyn freshell_sessions::directory_index::SessionSource>> =
+            vec![std::sync::Arc::new(
+                freshell_sessions::directory_index::OpencodeSource::new(
+                    data_home.path().to_path_buf(),
+                ),
+            )];
+        let index = std::sync::Arc::new(
+            freshell_sessions::directory_index::SessionIndex::with_ttl_and_cache_path(
+                sources,
+                std::time::Duration::from_millis(1_000),
+                None,
+            ),
+        );
+        let names = crate::session_names::SessionNames::open(dir.path().to_path_buf()).unwrap();
+        let (state, _rx) =
+            sweep_state_with(dir.path(), None, Some(names.clone()), Some(index.clone()));
+
+        // A NON-boot pass (post-boot observation of an already-named
+        // session): the targeted lookup supplies the message, the provider
+        // title installs at its own rank, and the message arms generation.
+        state
+            .index_hydrated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut s = session("opencode", "ses_named", "/x/named", None);
+        s.title = Some("Opencode named it".into());
+        s.title_source = Some("provider-generated".into());
+        run_auto_title_pass(&state, &[s]).await;
+
+        let record = naming_record(&names, scoped_session_ref("opencode", "ses_named"))
+            .await
+            .expect("the named session hydrated");
+        assert_eq!(record.record.name, "Opencode named it");
+        assert_eq!(
+            record.record.source,
+            freshell_protocol::session_names::NameSource::ProviderAi
+        );
+        assert!(
+            names
+                .generation_work_snapshot()
+                .iter()
+                .any(|item| item.target == scoped_session_ref("opencode", "ses_named")),
+            "the provider title never suppresses generation"
+        );
+        assert!(state
+            .settings
+            .session_overrides()
+            .get("opencode:ses_named")
+            .is_none());
+    }
+
+    /// Excluded providers keep the legacy ladder exactly: an amplifier
+    /// session with no key still finalizes the first-message heuristic
+    /// through the settings override row and pushes the live terminal.
+    #[tokio::test]
+    async fn excluded_providers_keep_the_legacy_ladder_exactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let names = crate::session_names::SessionNames::open(dir.path().to_path_buf()).unwrap();
+        let (state, mut rx) = sweep_state_with(dir.path(), None, Some(names.clone()), None);
+        let tid = "term-legacy";
+        spawn_headless_terminal_for_test(&state.registry, tid);
+        state
+            .identity
+            .upsert(tid, Some("amplifier"), Some("s1"), Some("/x/proj"), 1);
+
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "amplifier",
+                "s1",
+                "/x/proj",
+                Some("Fix the flux\nrest"),
+            )],
+        )
+        .await;
+
+        let ov = state.settings.session_overrides();
+        let row = ov.get("amplifier:s1").unwrap();
+        assert_eq!(row["titleOverride"], "Fix the flux");
+        assert_eq!(row["titleSource"], "first-message");
+        let mut saw_title_updated = false;
+        while let Ok(frame) = rx.try_recv() {
+            let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            if v["type"] == "terminal.title.updated" {
+                saw_title_updated = true;
             }
         }
+        assert!(saw_title_updated, "the legacy push still broadcasts");
+        assert!(
+            names.refresh_current().await.unwrap().is_empty(),
+            "excluded providers never enter the naming authority"
+        );
+    }
+
+    // -- Unified agent names (Task 4, review I3): kilroy-only sessions ----
+    // Kilroy shares the Claude runtime, so its transcripts are listed by
+    // the claude source under provider "claude". The metadata store's
+    // known `kilroy` type is the discriminator the plan names: a
+    // kilroy-only session never enters the naming authority or the
+    // generator merely because its provider is claude — it KEEPS the
+    // legacy ladder (the Global Constraint: kilroy retains its existing
+    // UI and generation behavior).
+
+    /// Shared setup: a sweep state with the naming authority wired, one
+    /// live terminal matching the session (provider `claude`), and the
+    /// metadata store's kilroy tag applied (or not, per `tag_kilroy`).
+    async fn kilroy_sweep_state(
+        tag_kilroy: bool,
+    ) -> (
+        tempfile::TempDir,
+        Arc<crate::session_names::SessionNames>,
+        AutoTitleSweepState,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let names = crate::session_names::SessionNames::open(dir.path().to_path_buf()).unwrap();
+        let (state, _rx) = sweep_state_with(dir.path(), None, Some(names.clone()), None);
+        if tag_kilroy {
+            state
+                .metadata
+                .set("claude", "s-kilroy", "kilroy", Some("explicit"))
+                .await
+                .unwrap();
+        }
+        let tid = "term-kilroy";
+        spawn_headless_terminal_for_test(&state.registry, tid);
+        state
+            .identity
+            .upsert(tid, Some("claude"), Some("s-kilroy"), Some("/x/proj"), 1);
+        (dir, names, state)
+    }
+
+    /// A provider-`claude` listing row the metadata store types as kilroy
+    /// (with only a non-scoped live terminal) never hydrates a
+    /// naming-authority record and never arms the generator — the boot
+    /// pass keeps kilroy's legacy ladder exactly (the first-message
+    /// heuristic through the settings override row).
+    #[tokio::test]
+    async fn a_kilroy_typed_claude_row_never_hydrates_and_keeps_the_ladder() {
+        let (_dir, names, state) = kilroy_sweep_state(true).await;
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "claude",
+                "s-kilroy",
+                "/x/proj",
+                Some("Fix the flux capacitor"),
+            )],
+        )
+        .await;
+
+        // KEEPS the legacy ladder: the first-message heuristic finalizes
+        // through the settings override row (no AI key configured).
         let row = state
             .settings
             .session_overrides()
-            .get("opencode:ses_1")
+            .get("claude:s-kilroy")
             .cloned()
+            .expect("the legacy ladder still serves the kilroy-only session");
+        assert_eq!(row["titleOverride"], "Fix the flux capacitor");
+        assert_eq!(row["titleSource"], "first-message");
+        // Never enters the naming authority — no record, no armed series.
+        assert!(
+            naming_record(&names, scoped_session_ref("claude", "s-kilroy"))
+                .await
+                .is_none(),
+            "a kilroy-only session never acquires a naming record"
+        );
+        assert!(
+            names.generation_work_snapshot().is_empty(),
+            "a kilroy-only session never arms the generator"
+        );
+    }
+
+    /// The same row AFTER boot: a live terminal at boot is the
+    /// explicit-open signal that would ARM the generator on a
+    /// metadata-blind sweep — a kilroy-only session still never arms, and
+    /// the ladder still writes.
+    #[tokio::test]
+    async fn a_kilroy_typed_claude_row_never_arms_generation_post_boot() {
+        let (_dir, names, state) = kilroy_sweep_state(true).await;
+        state
+            .index_hydrated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "claude",
+                "s-kilroy",
+                "/x/proj",
+                Some("Open the flux capacitor"),
+            )],
+        )
+        .await;
+        assert!(
+            names.generation_work_snapshot().is_empty(),
+            "a kilroy-only session never arms the generator, post-boot or not"
+        );
+        assert!(
+            naming_record(&names, scoped_session_ref("claude", "s-kilroy"))
+                .await
+                .is_none(),
+            "a kilroy-only session never acquires a naming record"
+        );
+        let row = state
+            .settings
+            .session_overrides()
+            .get("claude:s-kilroy")
+            .cloned()
+            .expect("the legacy ladder still serves the kilroy-only session");
+        assert_eq!(row["titleOverride"], "Open the flux capacitor");
+        assert_eq!(row["titleSource"], "first-message");
+    }
+
+    /// The same row WITHOUT the kilroy metadata entry behaves scoped: the
+    /// naming authority owns it (first-message fallback record, armed
+    /// generation) and the settings ladder never acquires a competing
+    /// title — the metadata consultation is the only discriminator.
+    #[tokio::test]
+    async fn the_same_row_without_the_kilroy_entry_behaves_scoped() {
+        let (_dir, names, state) = kilroy_sweep_state(false).await;
+        state
+            .index_hydrated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "claude",
+                "s-kilroy",
+                "/x/proj",
+                Some("Scoped session message"),
+            )],
+        )
+        .await;
+        let record = naming_record(&names, scoped_session_ref("claude", "s-kilroy"))
+            .await
+            .expect("the untagged claude session hydrates like any scoped row");
+        assert_eq!(record.record.name, "Scoped session message");
+        assert!(
+            names
+                .generation_work_snapshot()
+                .iter()
+                .any(|item| item.target == scoped_session_ref("claude", "s-kilroy")),
+            "the untagged claude session arms generation (explicitly open)"
+        );
+        assert!(
+            state
+                .settings
+                .session_overrides()
+                .get("claude:s-kilroy")
+                .is_none(),
+            "a scoped session never acquires a settings title"
+        );
+    }
+
+    /// The singular-record rule: a kilroy-typed row whose identical durable
+    /// session is ALSO open through a supported mode (a live terminal in
+    /// a scoped mode — here a `claude` CLI pane) still participates in
+    /// the naming authority: one canonical saved name, never a competing
+    /// kilroy record, and the ladder still excludes it.
+    #[tokio::test]
+    async fn a_kilroy_typed_row_with_a_live_scoped_terminal_participates_singularly() {
+        let (_dir, names, state) = kilroy_sweep_state(true).await;
+        // A SECOND live terminal in a scoped mode (a resumed claude CLI
+        // pane holding the same durable session) — the singular-record
+        // proxy that outvotes the kilroy-only skip.
+        spawn_headless_terminal_with_mode_for_test(&state.registry, "term-scoped", "claude");
+        state.identity.upsert(
+            "term-scoped",
+            Some("claude"),
+            Some("s-kilroy"),
+            Some("/x/proj"),
+            1,
+        );
+        state
+            .index_hydrated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "claude",
+                "s-kilroy",
+                "/x/proj",
+                Some("Dual mode session message"),
+            )],
+        )
+        .await;
+        let record = naming_record(&names, scoped_session_ref("claude", "s-kilroy"))
+            .await
+            .expect("the singular record serves the session also open through a supported mode");
+        assert_eq!(record.record.name, "Dual mode session message");
+        assert!(
+            names
+                .generation_work_snapshot()
+                .iter()
+                .any(|item| item.target == scoped_session_ref("claude", "s-kilroy")),
+            "the session also open through a supported mode arms generation"
+        );
+        assert!(
+            state
+                .settings
+                .session_overrides()
+                .get("claude:s-kilroy")
+                .is_none(),
+            "the singular scoped record keeps the ladder excluded"
+        );
+    }
+
+    /// Delta-review round 4, finding 1 (the seam's singular-record
+    /// component): a kilroy-typed row whose session ALREADY holds a
+    /// canonical record — with NO live scoped terminal — stays in the
+    /// naming-authority lane. The supported-mode record owns the session's
+    /// ONE singular name, so the legacy ladder never writes it a competing
+    /// settings title, and observed activity feeds the authority (arms
+    /// generation) exactly like any scoped row.
+    #[tokio::test]
+    async fn a_kilroy_typed_row_with_a_canonical_record_stays_in_the_authority_lane() {
+        let (_dir, names, state) = kilroy_sweep_state(true).await;
+        // The canonical record through the claude mode (the index-adopted
+        // hydration path) — the only live terminal is the non-scoped one
+        // `kilroy_sweep_state` registers, so the live-scoped-terminal
+        // component cannot be what keeps this row scoped.
+        names
+            .hydrate_indexed(
+                crate::session_name_generation::IndexedNameInput {
+                    provider: freshell_protocol::session_names::NamedProvider::Claude,
+                    session_id: "s-kilroy".to_string(),
+                    cwd: Some("/x/proj".to_string()),
+                    first_user_message: Some("Canonical first".to_string()),
+                    provider_title: None,
+                },
+                false,
+            )
+            .await
             .unwrap();
-        assert_eq!(row["titleOverride"], "AI Title"); // ...to the Gemini title
-        assert_eq!(row["titleSource"], "ai");
+        state
+            .index_hydrated
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        run_auto_title_pass(
+            &state,
+            &[session(
+                "claude",
+                "s-kilroy",
+                "/x/proj",
+                Some("A later scoped message"),
+            )],
+        )
+        .await;
+        // The legacy ladder never acquired a competing settings title.
+        assert!(
+            state
+                .settings
+                .session_overrides()
+                .get("claude:s-kilroy")
+                .is_none(),
+            "a record-holding kilroy-typed session keeps the ladder excluded"
+        );
+        // The authority keeps the session: the record survives with its
+        // name, and the later observed message fed the authority (armed
+        // generation) instead of the legacy ladder.
+        let record = naming_record(&names, scoped_session_ref("claude", "s-kilroy"))
+            .await
+            .expect("the canonical record keeps owning the session");
+        assert_eq!(record.record.name, "Canonical first");
+        assert!(
+            names
+                .generation_work_snapshot()
+                .iter()
+                .any(|item| item.target == scoped_session_ref("claude", "s-kilroy")),
+            "activity feeds the naming authority for a record-holding kilroy-typed row"
+        );
     }
 }

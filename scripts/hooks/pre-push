@@ -1,6 +1,8 @@
 # Freshell pre-push gate — the cheap local checks (cargo fmt, tsc typecheck,
 # cargo clippy) plus a targeted cargo test lane for rust changes, filtered by
 # what the push actually changes. See docs/development/pre-push-gate.md.
+# The typecheck manager (npm or pnpm) is selected from the pushing worktree
+# via scripts/hooks/prepush-manager.ts (plan 7.4).
 #
 # Bypass (emergencies only): git push --no-verify
 # Disable for one push:       FRESHELL_PREPUSH=0 git push ...
@@ -50,7 +52,7 @@ if [ "$full_gate" = 1 ]; then
   run_ts=1
 elif [ -n "$changed" ]; then
   printf '%s' "$changed" | grep -Eq '\.rs$|Cargo\.(toml|lock)$|rust-toolchain|^\.cargo/|^test/fixtures/' && run_rust=1
-  printf '%s' "$changed" | grep -Eq '\.(ts|tsx)$|package(-lock)?\.json$|tsconfig' && run_ts=1
+  printf '%s' "$changed" | grep -Eq '\.(ts|tsx)$|package(-lock)?\.json$|pnpm-lock\.yaml$|pnpm-workspace\.yaml$|\.npmrc$|tsconfig' && run_ts=1
 fi
 
 # The plan script lives next to this hook (the main checkout's copy —
@@ -159,18 +161,39 @@ fi
 
 if [ "$run_ts" = 1 ]; then
   if [ ! -e node_modules/.bin/tsc ]; then
-    echo "pre-push: node_modules missing (no tsc) — SKIPPING typecheck (npm install to enforce)" >&2
+    echo "pre-push: node_modules missing (no tsc) — SKIPPING typecheck (install dependencies to enforce)" >&2
+  elif [ -z "$TSX" ]; then
+    echo "pre-push: no tsx — SKIPPING typecheck (install dependencies to enforce)" >&2
   else
-    # npm (and node) can live in nvm, which stripped-environment hook contexts
-    # (ssh, agents, IDEs, cron) don't always load — source the loader if absent.
-    if ! command -v npm >/dev/null 2>&1; then
-      [ -s "$HOME/.nvm/nvm.sh" ] && \. "$HOME/.nvm/nvm.sh" >/dev/null 2>&1
-    fi
-    if command -v npm >/dev/null 2>&1; then
-      echo "pre-push: ts gate — npm run typecheck" >&2
-      npm run --silent typecheck || fail "npm run typecheck"
+    # Manager selection comes from the PUSHING worktree (the hook's CWD),
+    # never from the hook owner or npm_execpath: the shared hook runs
+    # against npm-era and pnpm-era branches alike (plan 7.4).
+    mgr_out=$("$TSX" "$HOOK_DIR/prepush-manager.ts" "$(pwd)" 2>/dev/null) || mgr_out=""
+    mgr_manager="" mgr_command="" mgr_args="" mgr_remediation=""
+    while IFS='=' read -r key value; do
+      case "$key" in
+        manager) mgr_manager="$value" ;;
+        command) mgr_command="$value" ;;
+        args) mgr_args="$value" ;;
+        remediation) mgr_remediation="$value" ;;
+      esac
+    done <<< "$mgr_out"
+    if [ "$mgr_manager" != "pnpm" ] && [ "$mgr_manager" != "npm" ]; then
+      echo "pre-push: package-manager selection failed — SKIPPING typecheck (install dependencies to enforce)" >&2
     else
-      echo "pre-push: npm not on PATH (nvm loader tried) — SKIPPING typecheck" >&2
+      # npm (and node) can live in nvm, which stripped-environment hook
+      # contexts (ssh, agents, IDEs, cron) don't always load — source the
+      # loader if absent. pnpm has no loader; a missing binary falls
+      # through to the remediation skip below.
+      if [ "$mgr_manager" = "npm" ] && ! command -v npm >/dev/null 2>&1; then
+        [ -s "$HOME/.nvm/nvm.sh" ] && \. "$HOME/.nvm/nvm.sh" >/dev/null 2>&1
+      fi
+      if command -v "$mgr_manager" >/dev/null 2>&1; then
+        echo "pre-push: ts gate — $mgr_command $mgr_args" >&2
+        "$mgr_command" $mgr_args || fail "$mgr_command $mgr_args"
+      else
+        echo "pre-push: $mgr_manager not on PATH — SKIPPING typecheck ($mgr_remediation to enforce)" >&2
+      fi
     fi
   fi
 fi

@@ -72,13 +72,23 @@ pub(crate) fn spawn_own_shell_child(
 
 /// A loopback `ws://` URL on an ephemeral port NOTHING listens on (bound,
 /// read, dropped) — probe dials fail fast with connection-refused. Never
-/// port 3001.
+/// port 3001. For dial-fail records ONLY: the freed port can in principle
+/// be re-issued by the kernel to a concurrent listener within the test's
+/// window (never observed). Fixture spawns must NOT use this — they use
+/// the fixture's port-file protocol ([`FIXTURE_PORT_FILE_ENV`]) instead,
+/// which has no free-port window at all.
 pub(crate) fn unused_loopback_ws_url() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let port = listener.local_addr().expect("local_addr").port();
     drop(listener);
     format!("ws://127.0.0.1:{port}")
 }
+
+/// Opt-in port-report mode of the fake app-server fixture: when set, the
+/// fixture binds a kernel-assigned ephemeral port (`--listen
+/// ws://127.0.0.1:0`) and writes the actual port (newline-terminated) to
+/// the named file once listening.
+pub(crate) const FIXTURE_PORT_FILE_ENV: &str = "FAKE_CODEX_APP_SERVER_PORT_FILE";
 
 /// A record carrying a spawned child's REAL `/proc` evidence.
 pub(crate) fn record_for_child(
@@ -90,8 +100,19 @@ pub(crate) fn record_for_child(
         record_version: SIDECAR_RECORD_VERSION,
         ownership_id: ownership_id.to_string(),
         pid,
-        starttime: proc_starttime(pid as i32).expect("live child has a starttime"),
-        cmdline: proc_cmdline(pid as i32).expect("live child has a cmdline"),
+        starttime: proc_starttime(pid as i32).unwrap_or_else(|| {
+            panic!(
+                "no /proc/{pid}/stat starttime for the fixture child (pid {pid}) — \
+                 it was expected to be live; it most likely exited first \
+                 (e.g. EADDRINUSE when another fixture won the port)"
+            )
+        }),
+        cmdline: proc_cmdline(pid as i32).unwrap_or_else(|| {
+            panic!(
+                "no /proc/{pid}/cmdline for the fixture child (pid {pid}) — \
+                 it was expected to be live; it most likely exited first"
+            )
+        }),
         ws_url: unused_loopback_ws_url(),
         session_id: session_id.map(str::to_string),
         terminal_id: None,
@@ -114,9 +135,17 @@ pub(crate) fn fake_app_server_fixture() -> std::path::PathBuf {
         .join("../../test/fixtures/coding-cli/codex-app-server/fake-app-server.mjs")
 }
 
-/// Spawn THIS TEST'S OWN fake app-server on a loopback ephemeral port and
-/// wait for its WS listener to accept. `kill_on_drop(true)` guarantees
-/// cleanup kills ONLY this recorded child, even on panic.
+/// Spawn THIS TEST'S OWN fake app-server on a kernel-assigned loopback
+/// ephemeral port and wait for its WS listener to accept. The fixture
+/// reports its actual port through the [`FIXTURE_PORT_FILE_ENV`]
+/// port-file protocol: there is NO pre-allocated free port for a sibling
+/// fixture to steal. (The pre-fix helper allocated a port via bind-drop;
+/// the randomized kernel allocator can hand the just-freed port to a
+/// concurrent test's fixture, killing ours with EADDRINUSE while our
+/// probe handshakes with the thief — the observed once-off
+/// "live child has a starttime" flake.)
+/// `kill_on_drop(true)` guarantees cleanup kills ONLY this recorded child,
+/// even on panic.
 pub(crate) async fn spawn_own_fake_app_server(
     ownership_id: &str,
 ) -> (tokio::process::Child, String) {
@@ -130,14 +159,18 @@ pub(crate) async fn spawn_own_fake_app_server_with_behavior(
     ownership_id: &str,
     behavior_json: Option<&str>,
 ) -> (tokio::process::Child, String) {
-    // Allocate a free loopback ephemeral port for the fixture to listen on.
-    let ws_url = unused_loopback_ws_url();
+    // The fixture overwrites this file with its actual listening port.
+    // NamedTempFile gives a unique path and removes it on drop, even on
+    // panic.
+    let port_file = tempfile::NamedTempFile::new().expect("create fixture port file");
+    let port_file_path = port_file.path().to_owned();
     let mut command = tokio::process::Command::new("node");
     command
         .arg(fake_app_server_fixture())
         .arg("--listen")
-        .arg(&ws_url)
+        .arg("ws://127.0.0.1:0")
         .env(crate::durability::CODEX_SIDECAR_OWNERSHIP_ENV, ownership_id)
+        .env(FIXTURE_PORT_FILE_ENV, &port_file_path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -149,6 +182,25 @@ pub(crate) async fn spawn_own_fake_app_server_with_behavior(
         .spawn()
         .expect("spawn this test's own fake app-server");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    // Phase 1: the fixture reports the port the kernel assigned IT — the
+    // assignment is atomic with the bind, so no other fixture can hold or
+    // steal it; the reported URL always belongs to this test's own child.
+    let ws_url = loop {
+        if let Ok(report) = std::fs::read_to_string(&port_file_path) {
+            if let Ok(port) = report.trim().parse::<u16>() {
+                break format!("ws://127.0.0.1:{port}");
+            }
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            panic!("fake app-server exited before reporting its port: {status}");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fake app-server never reported its listening port"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    // Phase 2: verify the reported port accepts a WS handshake.
     loop {
         if let Ok(Ok((probe, _response))) = tokio::time::timeout(
             Duration::from_secs(1),

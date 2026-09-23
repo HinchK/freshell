@@ -75,9 +75,10 @@ function renderTerminalEvent(provider, event) {
 
 /**
  * @param {{ provider: string,
- *           detectLaunch?: (argv: string[], sessionId: string) => object }} opts
+ *           detectLaunch?: (argv: string[], sessionId: string) => object,
+ *           onStdinLine?: (line: string) => void }} opts
  */
-export async function runTerminalCli({ provider, detectLaunch = defaultDetectLaunch }) {
+export async function runTerminalCli({ provider, detectLaunch = defaultDetectLaunch, onStdinLine }) {
   const argv = process.argv.slice(2)
   const env = process.env
   appendLaunchLedger({ provider, argv, env })
@@ -105,6 +106,10 @@ export async function runTerminalCli({ provider, detectLaunch = defaultDetectLau
   await engine.start()
 
   lineDriver(async (line) => {
+    // A fixture hook for the durable-metadata events the naming lanes
+    // consume (e.g. fake-claude's transcript records). Runs BEFORE the
+    // event program so the artifact materializes with the first input.
+    if (onStdinLine) onStdinLine(line)
     // A matching rule OWNS the turn (its author controls the full event
     // shape); the canned busy->BEL completion pair is the default only for
     // lines no rule matched.

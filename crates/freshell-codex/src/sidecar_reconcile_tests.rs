@@ -640,6 +640,58 @@ async fn reattach_shutdown_kills_only_after_reverification() {
 }
 
 // ---------------------------------------------------------------------------
+// Port-file protocol regression: fixture spawns once pre-allocated the
+// listening port via bind-drop, leaving a window where the kernel hands
+// the just-freed port to a concurrent test's fixture — ours dies
+// EADDRINUSE while our probe handshakes with the thief, and evidence
+// capture then panics ("live child has a starttime"). The port-file
+// protocol (fixture binds port 0 and reports the real port) removes the
+// window; this test recreates the dense concurrent-spawn shape and asserts
+// every child stays live and every reported port is distinct.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn concurrent_fixture_spawns_stay_live_and_report_distinct_ports() {
+    const N: usize = 12;
+    let mut jobs = Vec::new();
+    for i in 0..N {
+        let ownership = format!("codex-sidecar-a6000210-ffff-4fff-8fff-fffffffff{i:03x}");
+        jobs.push(tokio::spawn(async move {
+            spawn_own_fake_app_server(&ownership).await
+        }));
+    }
+    let mut children = Vec::new();
+    let mut ports = std::collections::HashSet::new();
+    for (i, job) in jobs.into_iter().enumerate() {
+        let (child, ws_url) = job.await.expect("join spawn task");
+        // The exact capture the flake broke: /proc evidence for every
+        // child, immediately after the helper returned it as live.
+        let record = record_for_child(
+            &format!("codex-sidecar-a6000211-ffff-4fff-8fff-fffffffff{i:03x}"),
+            child.id().expect("live fixture pid"),
+            Some(SESSION),
+        );
+        assert!(record.starttime > 0, "starttime evidence captured");
+        let port = ws_url
+            .rsplit(':')
+            .next()
+            .expect("ws_url port suffix")
+            .to_string();
+        assert!(
+            ports.insert(port),
+            "two concurrent fixtures reported the same port"
+        );
+        children.push(child);
+    }
+    for mut child in children {
+        child
+            .kill()
+            .await
+            .expect("cleanup: kill this test's own fixture");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Task 7: the plan-aware selection seam ([`crate::runtime_select`]).
 //
 // The spawn arm is asserted BEHAVIORALLY without ever spawning: the returned

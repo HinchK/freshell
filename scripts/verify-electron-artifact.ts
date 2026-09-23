@@ -3,6 +3,7 @@
 import { spawnSync } from 'node:child_process'
 import {
   existsSync,
+  lstatSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -14,9 +15,11 @@ import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 import {
   FORBIDDEN_RUNTIME_NAMES,
+  RUNTIME_LAYOUT,
   findUnapprovedRuntimePaths,
   getRuntimeAllowlist,
   getRuntimePaths,
+  sha256File,
   type ElectronRuntimeArch,
   type ElectronRuntimePlatform,
 } from './prepare-electron-runtime.js'
@@ -42,6 +45,8 @@ export interface VerifyElectronArtifactOptions {
   probe?: (command: string, options: ElectronArtifactProbeOptions) => ElectronArtifactProbeResult
   probeTimeoutMs?: number
   hostPlatform?: NodeJS.Platform
+  /** Expected artifact architecture; matched against the staging receipt when provided. */
+  arch?: ElectronRuntimeArch | string
 }
 
 export interface ElectronArtifactVerificationReceipt {
@@ -139,6 +144,138 @@ function readPackageName(packageJsonPath: string): string | undefined {
   }
 }
 
+function readPackageVersion(packageJsonPath: string): string | undefined {
+  try {
+    const value = JSON.parse(readFileSync(packageJsonPath, 'utf8')) as { version?: unknown }
+    return typeof value.version === 'string' && value.version.length > 0 ? value.version : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The staged runtime is produced with zero links, and Electron-builder's
+ * copier can only preserve what it is given; a link in a final artifact
+ * means the tree was corrupted or partially moved, which can invalidate
+ * resolution exactly where it hurts.  Reject links outright: broken,
+ * cyclic, and escaping targets are all covered by refusing links at all.
+ */
+function assertNoArtifactLinks(root: string): void {
+  const walk = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const absolute = path.join(directory, entry.name)
+      const stats = lstatSync(absolute)
+      if (stats.isSymbolicLink()) {
+        throw new Error(`Electron artifact contains a link: ${absolute}`)
+      }
+      if (stats.isDirectory()) walk(absolute)
+    }
+  }
+  walk(root)
+}
+
+interface ExportedIdentity {
+  name?: unknown
+  version?: unknown
+}
+
+/**
+ * Validate the artifact against the stager's receipt: package-manager
+ * identity, recorded platform/arch, release metadata cross-checked against
+ * the actual staged manifests, and a content-hash comparison for every
+ * file the stager recorded.  The artifact may contain additional
+ * electron-builder resources (the allowlist governs those); it must not
+ * lose or alter any staged runtime file.
+ */
+function validateArtifactReceipt(
+  root: string,
+  paths: ReturnType<typeof getRuntimePaths>,
+  platform: ElectronRuntimePlatform,
+  options: VerifyElectronArtifactOptions,
+  stagedMcpVersion: string | undefined,
+): void {
+  const receiptPath = path.join(root, RUNTIME_LAYOUT.receipt)
+  let receipt: Record<string, unknown>
+  try {
+    receipt = JSON.parse(readFileSync(receiptPath, 'utf8')) as Record<string, unknown>
+  } catch {
+    throw new Error(`Electron artifact is missing a parsable staging receipt: ${RUNTIME_LAYOUT.receipt}`)
+  }
+
+  const failures: string[] = []
+  if (receipt.severity !== 'info') failures.push('staging receipt severity must be "info"')
+  if (receipt.event !== 'electron_runtime_prepared') failures.push('staging receipt event must be "electron_runtime_prepared"')
+  if (receipt.platform !== platform) {
+    failures.push(`staging receipt platform ${String(receipt.platform)} does not match the artifact platform ${platform}`)
+  }
+  if (options.arch !== undefined && receipt.arch !== options.arch) {
+    failures.push(`staging receipt arch ${String(receipt.arch)} does not match the requested arch ${String(options.arch)}`)
+  }
+
+  const packageManager = receipt.packageManager
+  if (
+    !packageManager || typeof packageManager !== 'object'
+    || (packageManager as { name?: unknown }).name !== 'pnpm'
+    || typeof (packageManager as { version?: unknown }).version !== 'string'
+    || (packageManager as { version?: unknown }).version === ''
+  ) {
+    failures.push('staging receipt packageManager must be { name: "pnpm", version: <string> }')
+  }
+
+  const releaseVersion = typeof receipt.releaseVersion === 'string' && receipt.releaseVersion.length > 0
+    ? receipt.releaseVersion
+    : undefined
+  if (!releaseVersion) {
+    failures.push('staging receipt releaseVersion must be a nonempty string')
+  } else {
+    if (stagedMcpVersion && releaseVersion !== stagedMcpVersion) {
+      failures.push(`staging receipt releaseVersion ${releaseVersion} does not match the staged MCP version ${stagedMcpVersion}`)
+    }
+  }
+
+  const exported = Array.isArray(receipt.exportedPackages) ? receipt.exportedPackages as ExportedIdentity[] : []
+  const stagedIdentity = exported.find((identity) => identity?.name === 'freshell')
+  if (!stagedIdentity || stagedIdentity.version !== releaseVersion) {
+    failures.push('staging receipt exportedPackages must include { name: "freshell" } with the staged release version')
+  }
+  const sidecarIdentity = exported.find((identity) => identity?.name === 'freshell-claude-sidecar')
+  const sidecarVersion = readPackageVersion(path.join(paths.claudeSidecarDir, 'package.json'))
+  if (!sidecarIdentity || typeof sidecarIdentity.version !== 'string' || !sidecarVersion || sidecarIdentity.version !== sidecarVersion) {
+    failures.push(`staging receipt freshell-claude-sidecar identity ${String(sidecarIdentity?.version)} does not match the staged sidecar manifest ${String(sidecarVersion)}`)
+  }
+
+  const fileHashes = receipt.fileHashes
+  if (!fileHashes || typeof fileHashes !== 'object' || Array.isArray(fileHashes)) {
+    failures.push('staging receipt fileHashes must be an object')
+  } else {
+    const entries = Object.entries(fileHashes as Record<string, unknown>)
+    if (entries.length === 0) {
+      failures.push('staging receipt fileHashes must not be empty')
+    }
+    for (const [relative, expected] of entries) {
+      // Stager receipts use posix keys only; any other spelling (absolute,
+      // backslash, or ..-traversal) is malformed input, rejected outright so
+      // it can never reach a path join on any platform.
+      if (typeof expected !== 'string' || relative.includes('\\') || relative.startsWith('/') || relative.split('/').includes('..')) {
+        failures.push(`staging receipt lists an invalid path: ${relative}`)
+        continue
+      }
+      const target = path.join(root, relative)
+      if (!existsSync(target)) {
+        failures.push(`staging receipt file is missing from the artifact: ${relative}`)
+        continue
+      }
+      if (sha256File(target) !== expected) {
+        failures.push(`staging receipt hash mismatch for ${relative}`)
+      }
+    }
+  }
+
+  if (failures.length > 0) {
+    throw new Error(`Electron artifact staging receipt validation failed: ${failures.join('; ')}`)
+  }
+}
+
 export function verifyElectronArtifact(
   artifactPath: string,
   platform: ElectronRuntimePlatform,
@@ -162,21 +299,15 @@ export function verifyElectronArtifact(
     }
   })()
   if (!mcpVersion) throw new Error('Electron MCP package metadata must include a release version')
-  try {
-    const lock = JSON.parse(readFileSync(path.join(root, 'mcp', 'package-lock.json'), 'utf8')) as { name?: unknown; version?: unknown }
-    if (lock.name !== 'freshell' || lock.version !== mcpVersion) {
-      throw new Error('MCP package-lock metadata does not match the staged package version')
-    }
-  } catch (error) {
-    if (error instanceof Error && error.message.startsWith('MCP package-lock metadata')) throw error
-    throw new Error('MCP package-lock metadata is invalid')
-  }
+
+  assertNoArtifactLinks(root)
 
   const artifactFiles = walkFiles(root)
   const forbidden = artifactFiles.filter(isForbidden)
   if (forbidden.length > 0) throw new Error(`Electron artifact contains forbidden files: ${forbidden.join(', ')}`)
   const unapproved = findUnapprovedRuntimePaths(artifactFiles, platform)
   if (unapproved.length > 0) throw new Error(`Electron artifact contains unapproved files: ${unapproved.join(', ')}`)
+  validateArtifactReceipt(root, paths, platform, options, mcpVersion)
 
   const serverBinary = path.join(root, allowlist.serverBinary)
   checkBinaryFormat(serverBinary, platform)
@@ -273,13 +404,18 @@ function main(): void {
   const platformArgIndex = args.indexOf('--platform')
   const platform = parsePlatform(platformArgIndex >= 0 ? args[platformArgIndex + 1] : undefined)
   const archArgIndex = args.indexOf('--arch')
+  const archArg = archArgIndex >= 0 ? args[archArgIndex + 1] : undefined
   const artifactOverride = pathArg ?? process.env.ELECTRON_ARTIFACT_PATH
   const artifactPath = resolveArtifactPath(
     artifactOverride,
     platform,
-    archArgIndex >= 0 ? args[archArgIndex + 1] : undefined,
+    archArg,
   )
-  const receipt = verifyElectronArtifact(artifactPath, platform)
+  const receipt = verifyElectronArtifact(
+    artifactPath,
+    platform,
+    archArg !== undefined ? { arch: parseArch(archArg) } : {},
+  )
   process.stdout.write(`${JSON.stringify({ severity: 'info', event: 'electron_artifact_verified', ...receipt })}\n`)
 }
 

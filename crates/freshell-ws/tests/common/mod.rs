@@ -305,7 +305,342 @@ pub async fn spawn_server_with_specs(
     (format!("ws://{addr}/ws", addr = addr), registry)
 }
 
-/// [`spawn_server_with_specs`], additionally handing back the receiver half
+// ── unified agent names (Task 2): the naming-wired harness ──────────────────
+
+/// A store-mirror naming fake for the ws integration tests (the freshagent
+/// crate has its own in-crate recording sink; test fakes cannot be shared
+/// across crates): `ensure_pending` fabricates the directory-basename
+/// fallback record, `bind_pending` transfers the accepted name (registering
+/// the redirect), `get` follows redirects, and `rename` records its input
+/// verbatim. The activity/observation/acquisition seams answer the current
+/// record (their acceptance policy is the real store's own).
+pub struct NamingProbeSink {
+    pub renames: std::sync::Mutex<Vec<freshell_freshagent::naming::RenameNameInput>>,
+    records: std::sync::Mutex<
+        std::collections::HashMap<String, freshell_protocol::session_names::SessionNameRecord>,
+    >,
+    redirects: std::sync::Mutex<
+        std::collections::HashMap<String, freshell_protocol::session_names::SessionNameRef>,
+    >,
+}
+
+impl Default for NamingProbeSink {
+    fn default() -> Self {
+        Self {
+            renames: std::sync::Mutex::new(Vec::new()),
+            records: std::sync::Mutex::new(std::collections::HashMap::new()),
+            redirects: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+fn name_key(target: &freshell_protocol::session_names::SessionNameRef) -> String {
+    freshell_freshagent::naming::name_ref_debug_key(target)
+}
+
+impl NamingProbeSink {
+    fn resolve(
+        &self,
+        target: &freshell_protocol::session_names::SessionNameRef,
+    ) -> freshell_protocol::session_names::SessionNameRef {
+        let redirects = self.redirects.lock().unwrap();
+        redirects
+            .get(&name_key(target))
+            .cloned()
+            .unwrap_or_else(|| target.clone())
+    }
+
+    fn record_of(
+        &self,
+        target: &freshell_protocol::session_names::SessionNameRef,
+    ) -> Option<freshell_protocol::session_names::SessionNameRecord> {
+        let resolved = self.resolve(target);
+        self.records
+            .lock()
+            .unwrap()
+            .get(&name_key(&resolved))
+            .cloned()
+    }
+
+    fn update_for(
+        &self,
+        record: freshell_protocol::session_names::SessionNameRecord,
+        changed: bool,
+    ) -> freshell_protocol::session_names::SessionNameUpdate {
+        freshell_protocol::session_names::SessionNameUpdate {
+            redirects: Vec::new(),
+            record,
+            document_generation: 1,
+            changed,
+            native_sync: None,
+        }
+    }
+}
+
+impl freshell_freshagent::naming::SessionNaming for NamingProbeSink {
+    fn get(
+        &self,
+        refs: Vec<freshell_protocol::session_names::SessionNameRef>,
+    ) -> freshell_freshagent::naming::NameFuture<
+        Vec<freshell_protocol::session_names::SessionNameUpdate>,
+    > {
+        let updates = refs
+            .iter()
+            .filter_map(|target| self.record_of(target).map(|r| self.update_for(r, false)))
+            .collect();
+        Box::pin(async move { Ok(updates) })
+    }
+
+    fn ensure_pending(
+        &self,
+        input: freshell_freshagent::naming::PendingNameInput,
+    ) -> freshell_freshagent::naming::NameFuture<freshell_protocol::session_names::SessionNameUpdate>
+    {
+        use freshell_protocol::session_names::{NameSource, SessionNameRef};
+        let target = SessionNameRef::Pending {
+            id: input.handle.clone(),
+        };
+        if let Some(existing) = self.record_of(&target) {
+            let update = self.update_for(existing, false);
+            return Box::pin(async move { Ok(update) });
+        }
+        let fallback = input
+            .cwd
+            .as_deref()
+            .and_then(|cwd| {
+                cwd.rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| input.provider.display_label().to_string());
+        let record = freshell_protocol::session_names::SessionNameRecord {
+            name_ref: target.clone(),
+            name: fallback,
+            source: NameSource::Directory,
+            revision: 1,
+            manual_revision: None,
+            renamed_at: None,
+            legacy_origin: None,
+        };
+        let update = self.update_for(record.clone(), true);
+        self.records
+            .lock()
+            .unwrap()
+            .insert(name_key(&target), record);
+        Box::pin(async move { Ok(update) })
+    }
+
+    fn bind_pending(
+        &self,
+        input: freshell_freshagent::naming::BindNameInput,
+    ) -> freshell_freshagent::naming::NameFuture<freshell_protocol::session_names::SessionNameUpdate>
+    {
+        use freshell_protocol::native_location::NativePersistence;
+        if input.acquisition.persistence != NativePersistence::Verified {
+            return Box::pin(async move {
+                Err(freshell_freshagent::naming::NameError::IdentityAmbiguous(
+                    "prospective evidence cannot bind".into(),
+                ))
+            });
+        }
+        let mut record = self.record_of(&input.pending).unwrap_or_else(|| {
+            freshell_protocol::session_names::SessionNameRecord {
+                name_ref: input.target.clone(),
+                name: "bound".into(),
+                source: freshell_protocol::session_names::NameSource::Directory,
+                revision: 1,
+                manual_revision: None,
+                renamed_at: None,
+                legacy_origin: None,
+            }
+        });
+        record.name_ref = input.target.clone();
+        record.revision += 1;
+        let update = self.update_for(record.clone(), true);
+        self.redirects
+            .lock()
+            .unwrap()
+            .insert(name_key(&input.pending), input.target);
+        self.records
+            .lock()
+            .unwrap()
+            .insert(name_key(&update.record.name_ref), record);
+        Box::pin(async move { Ok(update) })
+    }
+
+    fn rename(
+        &self,
+        input: freshell_freshagent::naming::RenameNameInput,
+    ) -> freshell_freshagent::naming::NameFuture<freshell_protocol::session_names::SessionNameUpdate>
+    {
+        use freshell_protocol::session_names::{NameIntent, NameSource};
+        self.renames.lock().unwrap().push(input.clone());
+        let Some(mut record) = self.record_of(&input.target) else {
+            return Box::pin(async move {
+                Err(freshell_freshagent::naming::NameError::NotFound(format!(
+                    "no naming record for {}",
+                    freshell_freshagent::naming::name_ref_debug_key(&input.target)
+                )))
+            });
+        };
+        record.name = input.name.clone();
+        record.source = if input.intent == NameIntent::User {
+            NameSource::Manual
+        } else {
+            NameSource::ProviderAi
+        };
+        record.revision += 1;
+        let update = self.update_for(record.clone(), true);
+        self.records
+            .lock()
+            .unwrap()
+            .insert(name_key(&record.name_ref), record);
+        Box::pin(async move { Ok(update) })
+    }
+
+    fn activity(
+        &self,
+        input: freshell_freshagent::naming::NameActivity,
+    ) -> freshell_freshagent::naming::NameFuture<freshell_protocol::session_names::SessionNameUpdate>
+    {
+        let answer = match self.record_of(&input.target) {
+            Some(record) => Ok(self.update_for(record, false)),
+            None => Err(freshell_freshagent::naming::NameError::NotFound(
+                "no record".into(),
+            )),
+        };
+        Box::pin(async move { answer })
+    }
+
+    fn observe_native(
+        &self,
+        input: freshell_freshagent::naming::NativeNameObservation,
+    ) -> freshell_freshagent::naming::NameFuture<freshell_protocol::session_names::SessionNameUpdate>
+    {
+        let answer = match self.record_of(&input.target) {
+            Some(record) => Ok(self.update_for(record, false)),
+            None => Err(freshell_freshagent::naming::NameError::NotFound(
+                "no record".into(),
+            )),
+        };
+        Box::pin(async move { answer })
+    }
+
+    fn record_acquisition(
+        &self,
+        target: freshell_protocol::session_names::SessionNameRef,
+        _acquisition: freshell_protocol::native_location::NativeAcquisition,
+    ) -> freshell_freshagent::naming::NameFuture<freshell_protocol::session_names::SessionNameUpdate>
+    {
+        let answer = match self.record_of(&target) {
+            Some(record) => Ok(self.update_for(record, false)),
+            None => Err(freshell_freshagent::naming::NameError::NotFound(
+                "no record".into(),
+            )),
+        };
+        Box::pin(async move { answer })
+    }
+}
+
+/// [`spawn_server_with_specs`] with the ONE naming authority wired into the
+/// shared identity registry (and the fresh-agent state sinks) the way
+/// `freshell-server`'s `main` wires the real store. Returns the sink so
+/// tests can pre-seed records and inspect renames.
+pub async fn spawn_server_with_specs_and_naming(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+) -> (
+    String,
+    freshell_terminal::TerminalRegistry,
+    Arc<NamingProbeSink>,
+) {
+    let _ = isolate_amplifier_home();
+    let auth_token = Arc::new(AUTH_TOKEN.to_string());
+    let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
+    let settings =
+        Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
+    let registry = freshell_terminal::TerminalRegistry::new();
+    let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+    let sink = Arc::new(NamingProbeSink::default());
+    identity.set_session_naming(sink.clone());
+
+    let state = WsState {
+        ownership: None,
+        layout: Default::default(),
+        terminal_meta: Default::default(),
+        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
+        identity,
+        auth_token: Arc::clone(&auth_token),
+        server_instance_id: Arc::new("srv-test".to_string()),
+        boot_id: Arc::new("boot-test".to_string()),
+        settings,
+        handshake_settings: handshake_settings_lock(),
+        broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+        auto_resume_cancels: Default::default(),
+        fresh_codex: {
+            let fresh_codex = freshell_freshagent::FreshCodexState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+                serde_json::json!({ "freshAgent": { "enabled": false } }),
+            );
+            fresh_codex.set_session_naming(sink.clone());
+            fresh_codex
+        },
+        fresh_claude: {
+            let fresh_claude =
+                freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+            fresh_claude.set_session_naming(sink.clone());
+            fresh_claude
+        },
+        fresh_opencode: {
+            let fresh_opencode = freshell_freshagent::FreshOpencodeState::new(
+                freshell_freshagent::FreshAgentState::new(
+                    Arc::clone(&auth_token),
+                    Arc::clone(&broadcast_tx),
+                ),
+            );
+            fresh_opencode.set_session_naming(sink.clone());
+            fresh_opencode
+        },
+        registry: registry.clone(),
+        tabs: freshell_ws::tabs::TabsRegistry::new(),
+        screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
+        subagent_interest: Default::default(),
+        host_stats: Default::default(),
+        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        cli_commands: Arc::new(cli_commands),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
+        ping_interval_ms: 30_000,
+        hello_timeout_ms: 5_000,
+        allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
+        ws_max_payload_bytes: 16 * 1024 * 1024,
+        term09: freshell_ws::backpressure::Term09Config::default(),
+        create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
+        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        config_fallback: None,
+        opencode_locator: None,
+        codex_locator: None,
+        activity: None,
+        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+        fresh_agent_respawn_counts: Default::default(),
+    };
+
+    let router = freshell_ws::router(state);
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    (format!("ws://{addr}/ws", addr = addr), registry, sink)
+}
 /// of `WsState.auto_resume_tx` (Lane D1) so tests can drain the CrashEvents
 /// the PTY exit hook sends — the "take_auto_resume_rx" accessor of this
 /// free-function harness. Identical `WsState` otherwise.
@@ -858,6 +1193,127 @@ pub async fn spawn_server_with_specs_activity_and_codex_locator(
     });
 
     (format!("ws://{addr}/ws", addr = addr), registry)
+}
+
+/// [`spawn_server_with_specs_activity_and_codex_locator`], additionally
+/// wiring the ONE `NamingProbeSink` naming authority into the identity
+/// registry and the fresh states (the `spawn_server_with_specs_and_naming`
+/// composition) and returning it — the unified-agent-names lane tests drive
+/// the real CLI identity-transition lanes against a naming authority they can
+/// seed and inspect.
+#[allow(dead_code)] // not every test binary uses the naming+locator variant
+pub async fn spawn_server_with_specs_activity_codex_locator_and_naming(
+    cli_commands: Vec<freshell_platform::CliCommandSpec>,
+    codex_sessions_root: &std::path::Path,
+) -> (
+    String,
+    freshell_terminal::TerminalRegistry,
+    Arc<NamingProbeSink>,
+    WsState,
+) {
+    let _ = isolate_amplifier_home();
+    let auth_token = Arc::new(AUTH_TOKEN.to_string());
+    let broadcast_tx = Arc::new(tokio::sync::broadcast::channel::<String>(64).0);
+    let settings =
+        Arc::new(serde_json::from_value(test_settings_value()).expect("valid settings fixture"));
+    let registry = freshell_terminal::TerminalRegistry::new();
+    let identity = freshell_ws::identity::TerminalIdentityRegistry::new();
+    let sink = Arc::new(NamingProbeSink::default());
+    identity.set_session_naming(sink.clone());
+
+    let activity_hub =
+        freshell_ws::activity::ActivityHub::new(std::sync::Arc::clone(&broadcast_tx), None);
+    registry.set_activity_observer(activity_hub.registry_observer());
+
+    let state = WsState {
+        ownership: None,
+        layout: Default::default(),
+        terminal_meta: Default::default(),
+        pane_ledger: std::sync::Arc::new(freshell_ws::pane_ledger::PaneLedger::disabled()),
+        identity,
+        auth_token: Arc::clone(&auth_token),
+        server_instance_id: Arc::new("srv-test".to_string()),
+        boot_id: Arc::new("boot-test".to_string()),
+        settings,
+        handshake_settings: handshake_settings_lock(),
+        broadcast_tx: Arc::clone(&broadcast_tx),
+        auto_resume_tx: tokio::sync::mpsc::unbounded_channel().0,
+        auto_resume_cancels: Default::default(),
+        fresh_codex: {
+            let fresh_codex = freshell_freshagent::FreshCodexState::new(
+                Arc::clone(&auth_token),
+                Arc::clone(&broadcast_tx),
+                serde_json::json!({ "freshAgent": { "enabled": false } }),
+            );
+            fresh_codex.set_session_naming(sink.clone());
+            fresh_codex
+        },
+        fresh_claude: {
+            let fresh_claude =
+                freshell_freshagent::FreshClaudeState::new(Arc::clone(&broadcast_tx));
+            fresh_claude.set_session_naming(sink.clone());
+            fresh_claude
+        },
+        fresh_opencode: {
+            let fresh_opencode = freshell_freshagent::FreshOpencodeState::new(
+                freshell_freshagent::FreshAgentState::new(
+                    Arc::clone(&auth_token),
+                    Arc::clone(&broadcast_tx),
+                ),
+            );
+            fresh_opencode.set_session_naming(sink.clone());
+            fresh_opencode
+        },
+        registry: registry.clone(),
+        tabs: freshell_ws::tabs::TabsRegistry::new(),
+        screenshots: freshell_ws::screenshot::ScreenshotBroker::new(Arc::clone(&broadcast_tx)),
+        subagent_interest: Default::default(),
+        host_stats: Default::default(),
+        terminals_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        sessions_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        cli_commands: Arc::new(cli_commands),
+        shutdown: Arc::new(tokio::sync::Notify::new()),
+        ping_interval_ms: 30_000,
+        hello_timeout_ms: 5_000,
+        allowed_origins: Arc::new(freshell_ws::origin::default_allowed_origins()),
+        ws_max_payload_bytes: 16 * 1024 * 1024,
+        term09: freshell_ws::backpressure::Term09Config::default(),
+        create_protect: freshell_ws::create_limit::CreateProtectConfig::default(),
+        spawn_gate: std::sync::Arc::new(freshell_ws::spawn_gate::SpawnGate::new(4, 64)),
+        shutdown_started: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        create_dedupe: std::sync::Arc::new(freshell_ws::create_dedupe::CreateDedupe::default()),
+        config_fallback: None,
+        opencode_locator: None,
+        codex_locator: Some(std::sync::Arc::new(
+            freshell_sessions::codex_locator::CodexLocator::new(codex_sessions_root.to_path_buf()),
+        )),
+        activity: Some(activity_hub.clone()),
+        session_existence: std::sync::Arc::new(freshell_ws::existence::NoIndexProbe::default()),
+        reconcile_deferral_budget_ms: freshell_ws::reconcile::RECONCILE_DEFERRAL_BUDGET_MS_DEFAULT,
+        fresh_agent_respawn_counts: Default::default(),
+    };
+
+    // Mirrors main.rs's sweep wiring; 150 ms is re-declared here because
+    // main.rs's LOCATOR_SWEEP_INTERVAL is private to the server binary.
+    freshell_ws::codex_association::spawn_codex_locator_sweep(
+        state.clone(),
+        std::time::Duration::from_millis(150),
+    );
+    let router = freshell_ws::router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral loopback port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+
+    (
+        format!("ws://{addr}/ws", addr = addr),
+        registry,
+        sink,
+        state,
+    )
 }
 
 /// [`spawn_server`] variant with injectable `terminal.create` protection

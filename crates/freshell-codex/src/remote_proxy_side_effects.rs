@@ -657,6 +657,104 @@ pub fn extract_fs_changed_repair_trigger(raw: &[u8]) -> SideEffectResult<FsChang
     })
 }
 
+// ── unified agent names (Task 3): native name observation + initialize root ─────────
+
+/// A forwarded `thread/name/set` client request, observed by the proxy as a
+/// NATIVE NAME EVENT (unified-agent-names Task 3). Codex's automatic and
+/// human callers send the same public request — direction, timing,
+/// authentication and prior emptiness cannot prove intent — so the
+/// observation is always automatic; only a declared Freshell user intent
+/// (`nameIntent: user` on the naming routes) promotes a record to manual.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadNameSetRequest {
+    pub thread_id: String,
+    pub name: String,
+}
+
+/// Extract a forwarded `thread/name/set` REQUEST frame
+/// (`{id?, method:'thread/name/set', params:{threadId, name}}`). `None` for
+/// any other frame (never an error — this is an observation probe, not a
+/// gate); `Err` only for unsafe/malformed shapes that must be treated as
+/// "could not observe".
+pub fn extract_thread_name_set_request(
+    raw: &[u8],
+) -> SideEffectResult<Option<ThreadNameSetRequest>> {
+    let Ok(root) = scan_root_object(raw) else {
+        return Ok(None);
+    };
+    if has_any_duplicate_key(&root.entries, &["method", "params"]) {
+        return Err(SideEffectError::UnsafeDuplicateKey);
+    }
+    let Ok(method) = extract_method(raw, &root.entries) else {
+        return Ok(None);
+    };
+    if method != "thread/name/set" {
+        return Ok(None);
+    }
+    let params = extract_params_object(raw, &root.entries)?;
+    if has_any_duplicate_key(&params.entries, &["threadId", "name"]) {
+        return Err(SideEffectError::UnsafeDuplicateKey);
+    }
+    let thread_id = extract_required_string(raw, &params.entries, "threadId")?;
+    let name = extract_required_string(raw, &params.entries, "name")?;
+    Ok(Some(ThreadNameSetRequest { thread_id, name }))
+}
+
+/// Extract the `codexHome` an upstream `initialize` RESPONSE carries
+/// (T2-M6: the remote-proxy initialize/candidate-path correlation). The
+/// codex app-server reports `codexHome` ONLY on the initialize result, so a
+/// response frame carrying a non-empty `result.codexHome` IS the initialized
+/// root this connection's rollouts live under — captured per proxied
+/// connection and used by the native lanes' rollout walk instead of ambient
+/// env. `None` for any other frame.
+pub fn extract_initialize_codex_home(raw: &[u8]) -> SideEffectResult<Option<String>> {
+    let Ok(root) = scan_root_object(raw) else {
+        return Ok(None);
+    };
+    if has_any_duplicate_key(&root.entries, &["result"]) {
+        return Err(SideEffectError::UnsafeDuplicateKey);
+    }
+    let Some(result_entry) = find_entry(&root.entries, "result") else {
+        return Ok(None);
+    };
+    if result_entry.value_kind != ValueKind::Object {
+        return Ok(None);
+    }
+    let result = scan_object(raw, result_entry.value_start, MAX_SCANNED_TOKEN_BYTES)?;
+    if has_any_duplicate_key(&result.entries, &["codexHome"]) {
+        return Err(SideEffectError::UnsafeDuplicateKey);
+    }
+    let home = extract_optional_string(raw, &result.entries, "codexHome")?;
+    Ok(home.filter(|home| !home.is_empty()))
+}
+
+/// Extract an upstream `thread/name/updated` NOTIFICATION frame's
+/// `{threadId, name}` (Task 3 native names). `None` for any other frame;
+/// `Err` for an unsafe/malformed shape.
+pub fn extract_upstream_thread_name_updated(
+    raw: &[u8],
+) -> SideEffectResult<Option<(String, String)>> {
+    let Ok(root) = scan_root_object(raw) else {
+        return Ok(None);
+    };
+    if has_any_duplicate_key(&root.entries, &["method", "params"]) {
+        return Err(SideEffectError::UnsafeDuplicateKey);
+    }
+    let Ok(method) = extract_method(raw, &root.entries) else {
+        return Ok(None);
+    };
+    if method != "thread/name/updated" {
+        return Ok(None);
+    }
+    let params = extract_params_object(raw, &root.entries)?;
+    if has_any_duplicate_key(&params.entries, &["threadId", "name"]) {
+        return Err(SideEffectError::UnsafeDuplicateKey);
+    }
+    let thread_id = extract_required_string(raw, &params.entries, "threadId")?;
+    let name = extract_required_string(raw, &params.entries, "name")?;
+    Ok(Some((thread_id, name)))
+}
+
 // ── rewriteThreadForkRequestExcludeTurns (json-rpc-side-effects.ts:193-242) ──────────
 
 /// Rewrite a `thread/fork` REQUEST so `params.excludeTurns` is forced to `true` — the TUI

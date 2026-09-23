@@ -12,6 +12,11 @@ import {
   parsePersistedLayoutRaw,
   readRecoverablePersistedLayoutRaw,
 } from './persistedState.js'
+import {
+  ensureLegacyNameCapturesForFlush,
+  stripScopedPaneTitleMetadata,
+  stripSessionOwnedTabFreezeFlags,
+} from '@/lib/session-name-migration'
 import { PANES_STORAGE_KEY, TAB_RECENCY_STORAGE_KEY, TURN_COMPLETION_STORAGE_KEY } from './storage-keys'
 import {
   getWindowFreshAgentBackupKey,
@@ -439,18 +444,24 @@ function migratePanesData(parsed: any): any | null {
           droppedTabIds.add(tabId)
         }
       }
-      // Already up to date, but ensure paneTitles/paneTitleSetByUser exist
+      // Already up to date, but ensure paneTitles/paneTitleSetByUser exist.
+      // Unified agent names (Task 7): the legacy v2 load path passes the ONE
+      // client sanitizer — a scoped agent pane's title/user-flag never
+      // re-enters state from a legacy envelope.
       return {
         ...parsed,
         layouts: sanitizedLayouts,
         activePane: Object.fromEntries(
           Object.entries(parsed.activePane || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
         ),
-        paneTitles: Object.fromEntries(
-          Object.entries(parsed.paneTitles || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
-        ),
-        paneTitleSetByUser: Object.fromEntries(
-          Object.entries(parsed.paneTitleSetByUser || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+        ...stripScopedPaneTitleMetadata(
+          sanitizedLayouts,
+          Object.fromEntries(
+            Object.entries(parsed.paneTitles || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+          ) as Record<string, Record<string, string>>,
+          Object.fromEntries(
+            Object.entries(parsed.paneTitleSetByUser || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+          ) as Record<string, Record<string, boolean>>,
         ),
       }
     }
@@ -514,11 +525,16 @@ function migratePanesData(parsed: any): any | null {
       activePane: Object.fromEntries(
         Object.entries(parsed.activePane || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
       ),
-      paneTitles: Object.fromEntries(
-        Object.entries(paneTitles).filter(([tabId]) => !droppedTabIds.has(tabId)),
-      ),
-      paneTitleSetByUser: Object.fromEntries(
-        Object.entries(parsed.paneTitleSetByUser || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+      // Unified agent names (Task 7): the migrated legacy load passes the
+      // ONE client sanitizer (see the already-current exit above).
+      ...stripScopedPaneTitleMetadata(
+        sanitizedLayouts,
+        Object.fromEntries(
+          Object.entries(paneTitles).filter(([tabId]) => !droppedTabIds.has(tabId)),
+        ) as Record<string, Record<string, string>>,
+        Object.fromEntries(
+          Object.entries(parsed.paneTitleSetByUser || {}).filter(([tabId]) => !droppedTabIds.has(tabId)),
+        ) as Record<string, Record<string, boolean>>,
       ),
       version: PANES_SCHEMA_VERSION,
     }
@@ -637,69 +653,96 @@ export const persistMiddleware: Middleware<{}, PersistState> = (store) => {
       }
 
       if (tabsDirty || panesDirty) {
-        // Prune tombstones older than 1 hour
-        const TOMBSTONE_MAX_AGE_MS = 60 * 60 * 1000
-        const tombstoneCutoff = Date.now() - TOMBSTONE_MAX_AGE_MS
-        const tombstones = (state.tabs?.tombstones || []).filter((t: { deletedAt: number }) => t.deletedAt > tombstoneCutoff)
+        // Unified agent names (Task 7 review M2) — the capture gate: this
+        // flush rewrites capture-source keys, and it may do so ONLY once
+        // the current raw bytes are durably captured in a migration
+        // envelope. While the evidence capture keeps failing (e.g.
+        // quota), defer the layout write — evicting uncaptured legacy
+        // labels is unrecoverable evidence loss. The debounced retry
+        // re-attempts the capture first (the gate is O(1) once healthy).
+        if (!ensureLegacyNameCapturesForFlush()) {
+          log.error(
+            'Deferring the layout flush: the legacy-name evidence capture is still ' +
+              'failing; uncaptured legacy labels stay in their source keys for retry.',
+            { reason: 'legacy_name_capture_pending' },
+          )
+        } else {
+          // Prune tombstones older than 1 hour
+          const TOMBSTONE_MAX_AGE_MS = 60 * 60 * 1000
+          const tombstoneCutoff = Date.now() - TOMBSTONE_MAX_AGE_MS
+          const tombstones = (state.tabs?.tombstones || []).filter((t: { deletedAt: number }) => t.deletedAt > tombstoneCutoff)
 
-        const sanitizedLayouts: Record<string, any> = {}
-        if (state.panes?.layouts) {
-          for (const [tabId, node] of Object.entries(state.panes.layouts)) {
-            sanitizedLayouts[tabId] = stripEditorContentFromNode(node)
+          const sanitizedLayouts: Record<string, any> = {}
+          if (state.panes?.layouts) {
+            for (const [tabId, node] of Object.entries(state.panes.layouts)) {
+              sanitizedLayouts[tabId] = stripEditorContentFromNode(node)
+            }
           }
-        }
 
-        let persistablePanesSection: Record<string, any> = {
-          layouts: sanitizedLayouts,
-          version: PANES_SCHEMA_VERSION,
-        }
-        if (state.panes) {
-          const {
-            renameRequestTabId: _rrt,
-            renameRequestPaneId: _rrp,
-            zoomedPane: _zp,
-            refreshRequestsByPane: _rrbp,
-            restoreFallbackAttemptsByPane: _rfabp,
-            deadSessionAdjudication: _dsa,
-            reconcileWarming: _rw,
-            reconcilePendingPanes: _rpp,
-            focusEpochByPaneId: _febp,
-            closingTabs: _ct,
-            closingPanes: _cp,
-            ...persistablePanes
-          } = state.panes
-          persistablePanesSection = {
-            ...persistablePanes,
+          let persistablePanesSection: Record<string, any> = {
             layouts: sanitizedLayouts,
             version: PANES_SCHEMA_VERSION,
           }
-        }
+          if (state.panes) {
+            const {
+              renameRequestTabId: _rrt,
+              renameRequestPaneId: _rrp,
+              zoomedPane: _zp,
+              refreshRequestsByPane: _rrbp,
+              restoreFallbackAttemptsByPane: _rfabp,
+              deadSessionAdjudication: _dsa,
+              reconcileWarming: _rw,
+              reconcilePendingPanes: _rpp,
+              focusEpochByPaneId: _febp,
+              closingTabs: _ct,
+              closingPanes: _cp,
+              ...persistablePanes
+            } = state.panes
+            persistablePanesSection = {
+              ...persistablePanes,
+              layouts: sanitizedLayouts,
+              version: PANES_SCHEMA_VERSION,
+            }
+          }
 
-        const layoutPayload = {
-          persistedAt: Date.now(),
-          version: LAYOUT_SCHEMA_VERSION,
-          machineId: selectStampMachineId(state),
-          tabs: {
-            activeTabId: state.tabs?.activeTabId ?? null,
-            tabs: (state.tabs?.tabs ?? []).map(stripTabVolatileFields),
-          },
-          panes: persistablePanesSection,
-          tombstones,
-        }
+          const sanitizedPaneMetadata = stripScopedPaneTitleMetadata(
+            sanitizedLayouts,
+            (persistablePanesSection as Record<string, any>).paneTitles ?? {},
+            (persistablePanesSection as Record<string, any>).paneTitleSetByUser ?? {},
+          )
+          const layoutPayload = {
+            persistedAt: Date.now(),
+            version: LAYOUT_SCHEMA_VERSION,
+            machineId: selectStampMachineId(state),
+            tabs: {
+              activeTabId: state.tabs?.activeTabId ?? null,
+              // Unified agent names (Task 7): the flush gate — a session-owned
+              // tab's freeze flag is a retired alias and never flushes.
+              tabs: stripSessionOwnedTabFreezeFlags(
+                (state.tabs?.tabs ?? []).map(stripTabVolatileFields),
+              ) as Array<Record<string, unknown>>,
+            },
+            panes: {
+              ...persistablePanesSection,
+              ...sanitizedPaneMetadata,
+            },
+            tombstones,
+          }
 
-        const raw = JSON.stringify(layoutPayload)
-        localStorage.setItem(getWindowLayoutKey(), raw)
-        localStorage.removeItem(getWindowFreshAgentBackupKey())
-        localStorage.removeItem(getWindowFreshAgentCommitMarkerKey())
-        localStorage.removeItem(getWindowFreshAgentPendingMarkerKey())
-        broadcastPersistedRaw(getWindowLayoutKey(), raw)
-        // Durable boundary (e2r5 review finding 1): an armed post-rebuild
-        // pre-migration evidence clear is consumed ONLY here — after the
-        // rebuilt envelope is durably written. A reload before this line
-        // (debounce never fired) or a throwing setItem (caught below, which
-        // skips this line and keeps the arm) leaves the evidence intact, so
-        // the next boot still classifies corrupt and rebuilds again.
-        consumeArmedPreMigrationEvidenceClear()
+          const raw = JSON.stringify(layoutPayload)
+          localStorage.setItem(getWindowLayoutKey(), raw)
+          localStorage.removeItem(getWindowFreshAgentBackupKey())
+          localStorage.removeItem(getWindowFreshAgentCommitMarkerKey())
+          localStorage.removeItem(getWindowFreshAgentPendingMarkerKey())
+          broadcastPersistedRaw(getWindowLayoutKey(), raw)
+          // Durable boundary (e2r5 review finding 1): an armed post-rebuild
+          // pre-migration evidence clear is consumed ONLY here — after the
+          // rebuilt envelope is durably written. A reload before this line
+          // (debounce never fired) or a throwing setItem (caught below, which
+          // skips this line and keeps the arm) leaves the evidence intact, so
+          // the next boot still classifies corrupt and rebuilds again.
+          consumeArmedPreMigrationEvidenceClear()
+        }
       }
 
       if (tabRecencyDirty) {

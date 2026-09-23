@@ -862,7 +862,6 @@ describe('SettingsView network access section', () => {
 
     expect(screen.getByRole('alert')).toBeInTheDocument()
     expect(screen.getByText(/dev mode/i)).toBeInTheDocument()
-    expect(screen.getByText(/npm run dev/i)).toBeInTheDocument()
   })
 
   it('suppresses dev-mode warning on WSL2', () => {

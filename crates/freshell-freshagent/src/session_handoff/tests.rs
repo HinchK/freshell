@@ -757,6 +757,7 @@ async fn unsupported_atomic_handoff_refuses_before_mutation_and_clear_bypasses_p
 
 fn create_msg(sid: &str) -> FreshAgentCreate {
     FreshAgentCreate {
+        naming_handle: None,
         request_id: format!("handoff-create-{}", uuid::Uuid::new_v4()),
         session_type: SessionType::Freshclaude,
         cwd: Some("/tmp".to_string()),
@@ -6291,20 +6292,29 @@ async fn the_claude_handoff_target_binding_carries_the_handoff_generation() {
 
     // The target resume's sidecar init adoption writes the binding row
     // (async to the runner's commit) — bounded-poll until it lands.
+    // DEFLAKE (wait-depth): the loop previously broke on ANY matching row,
+    // but an interim unfenced row (observed pair None) can land FIRST —
+    // the runner's under-ticket adoption (the row this test asserts on)
+    // follows it. Poll for the SETTLED row — one stamped with the supplied
+    // handoff pair — so the assertions below never read an interim row.
+    // The r27 regression shape (the adoption writing None and never the
+    // pair) still fails here at the deadline, with the full dump.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     loop {
-        if fake
-            .bindings
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|b| b.provider == "claude" && b.session_id == sid && b.mode == "freshclaude")
-        {
+        if fake.bindings.lock().unwrap().iter().any(|b| {
+            b.provider == "claude"
+                && b.session_id == sid
+                && b.mode == "freshclaude"
+                && b.observed_epoch == Some(rig.ownership.boot_epoch())
+                && b.observed_generation == Some(committed_generation)
+        }) {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the target resume's session-init adoption never wrote its binding row"
+            "the under-ticket adoption never stamped its binding row with the supplied \
+             handoff pair — bindings: {:?}",
+            fake.bindings.lock().unwrap()
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
@@ -6938,6 +6948,7 @@ const FRESH_CREATE_DURABLE_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
 fn fresh_create_msg(session_type: SessionType) -> FreshAgentCreate {
     FreshAgentCreate {
+        naming_handle: None,
         request_id: format!("handoff-create-fresh-{}", uuid::Uuid::new_v4()),
         session_type,
         cwd: Some("/tmp".to_string()),

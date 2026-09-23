@@ -1,5 +1,6 @@
 import type { Middleware } from '@reduxjs/toolkit'
 import { updatePaneTitleByTerminalId } from '@/store/panesSlice'
+import { isUnifiedAgentMode } from '@shared/session-names'
 import type { RootState } from '@/store'
 
 type FoldStore = {
@@ -30,9 +31,14 @@ function paneTitleDiffersForTerminal(panes: RootState['panes'], terminalId: stri
     if (!layout) continue
     const walk = (node: unknown): boolean => {
       if (!node || typeof node !== 'object') return false
-      const n = node as { type?: string; id?: string; content?: { kind?: string; terminalId?: string }; children?: unknown[] }
+      const n = node as { type?: string; id?: string; content?: { kind?: string; terminalId?: string; mode?: string }; children?: unknown[] }
       if (n.type === 'leaf') {
         if (n.content?.kind === 'terminal' && n.content.terminalId === terminalId) {
+          // Unified agent names (Task 5): a scoped coding-agent terminal pane
+          // (claude/codex/opencode) displays its canonical session name from
+          // the sessionNames cache — the terminal-level title pipeline never
+          // folds an unrevisioned registry title into it.
+          if (isUnifiedAgentMode(n.content.mode, undefined)) return false
           if (panes.paneTitleSetByUser?.[tabId]?.[n.id ?? '']) return false
           if (((panes.paneTitles?.[tabId]?.[n.id ?? '']) ?? '') !== title) return true
         }

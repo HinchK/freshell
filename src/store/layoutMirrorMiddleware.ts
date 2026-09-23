@@ -45,6 +45,10 @@ export const layoutMirrorMiddleware: Middleware = (store) => {
           id: t.id,
           title: t.title,
           ...(fallbackSessionRef ? { fallbackSessionRef } : {}),
+          // Unified agent names (Task 6): the stable naming-source
+          // relationship round-trips ui.layout.sync; omitted when unresolved
+          // so pre-Task-6 payloads stay byte-identical.
+          ...(t.nameSource ? { nameSource: t.nameSource } : {}),
         }
       }),
       activeTabId: state.tabs.activeTabId,
