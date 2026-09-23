@@ -636,6 +636,18 @@ pub struct TerminalKill {
     pub observed_epoch: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observed_generation: Option<u64>,
+    /// Wedge-backstop Task 2: WHY the client is killing this terminal.
+    /// `Some("stuck-recovery")` = the "Agent appears stuck" card's
+    /// restart action — the server runs the process-only kill and
+    /// deliberately SKIPS the durable pane-close envelope (and the
+    /// session-identity retirement) so the follow-up respawn can resume the
+    /// session (the card's start-fresh action sends no reason — the
+    /// abandoned identity must be retired by the full close). `None` (or
+    /// any other value) keeps today's full pane-close
+    /// semantics byte-for-byte. Additive optional; no version bump (older
+    /// servers accept-and-strip it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 // --- *.activity.list --------------------------------------------------------

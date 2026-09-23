@@ -1347,6 +1347,9 @@
               "minimum": 0,
               "type": "integer"
             },
+            "reason": {
+              "type": "string"
+            },
             "requestId": {
               "minLength": 1,
               "type": "string"
@@ -8596,6 +8599,9 @@
           "minimum": 0,
           "type": "integer"
         },
+        "reason": {
+          "type": "string"
+        },
         "requestId": {
           "minLength": 1,
           "type": "string"
@@ -8918,6 +8924,35 @@
         "terminalId",
         "cols",
         "rows"
+      ],
+      "type": "object"
+    },
+    "TerminalStuckSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "at": {
+          "maximum": 9007199254740991,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stuck": {
+          "type": "boolean"
+        },
+        "terminalId": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "type": {
+          "const": "terminal.stuck",
+          "type": "string"
+        }
+      },
+      "required": [
+        "type",
+        "terminalId",
+        "at",
+        "stuck"
       ],
       "type": "object"
     },

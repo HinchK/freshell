@@ -49,7 +49,7 @@
   "description": "Auto-generated from shared/ws-protocol.ts. DO NOT EDIT BY HAND. Regenerate with `pnpm run contract:generate`. `type` discriminants for every message in each direction, resolved from the ClientMessage and ServerMessage union types via the TypeScript type checker.",
   "generator": "port/contract/generate-ws-contract.ts",
   "serverToClient": {
-    "count": 66,
+    "count": 67,
     "types": [
       "amplifier.activity.list.response",
       "amplifier.activity.updated",
@@ -113,6 +113,7 @@
       "terminal.session.associated",
       "terminal.status",
       "terminal.stream.changed",
+      "terminal.stuck",
       "terminal.title.updated",
       "terminal.turn.complete",
       "terminals.changed",

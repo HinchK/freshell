@@ -99,6 +99,7 @@ screenshot-baselines.spec.ts:48
 tab-bar-resize.spec.ts:40
 stress.spec.ts:40
 fresh-agent-centralization-smoke.spec.ts:32
+fresh-agent-error-turn-attention.spec.ts:120
 freshopencode-db-history.spec.ts:24
 term28-path-shadow-rust.spec.ts:40
 sidebar-opencode-rail.spec.ts:20

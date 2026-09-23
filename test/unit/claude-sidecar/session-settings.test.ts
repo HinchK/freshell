@@ -152,12 +152,16 @@ describe('Claude sidecar configuration protocol', () => {
     expect(bridge.frames.some((frame) => frame.type === 'sdk.exit')).toBe(false)
   })
 
-  it('surfaces failed turn details without emitting a success notification', async () => {
+  it('surfaces failed turn details and rings the unified attention edge', async () => {
     const bridge = sidecar()
     bridge.send({ type: 'create', requestId: 'create', model: 'opus' })
     const { sessionId } = await bridge.waitFor('created')
     bridge.send({ type: 'send', sessionId, text: '__fail__' })
     expect(await bridge.waitFor('sdk.error')).toMatchObject({ message: 'Request timed out', turnFailure: true })
-    expect(bridge.frames.some((frame) => frame.type === 'sdk.turn.complete')).toBe(false)
+    // Unified needs-attention contract: EVERY result subtype rings — the
+    // failed turn's edge is identical to a success turn's (no outcome rides
+    // the wire); only a result consumed by a pending accepted user-interrupt
+    // mark stays silent (turn-complete-gate.mjs).
+    expect(await bridge.waitFor('sdk.turn.complete')).toMatchObject({ sessionId })
   })
 })

@@ -1,9 +1,11 @@
 import { makeFreshAgentSessionKey } from '@shared/fresh-agent'
+import { TerminalStuckSchema } from '@shared/ws-protocol'
 import { collectPaneEntries } from '@/lib/pane-utils'
 import { resolveFreshAgentSessionKey } from '@/lib/pane-activity'
 import type { FreshAgentPaneContent, PaneNode } from './paneTypes'
 import { selectTabPaneByTerminalId } from './selectors/paneTerminalSelectors'
 import { recordTerminalIdle, recordTurnComplete } from './turnCompletionSlice'
+import { clearTerminalStuck, recordTerminalStuck } from './terminalLifecycleSlice'
 import type { AppDispatch, RootState } from './store'
 
 export type ApplyServerIdlePayload = {
@@ -35,6 +37,45 @@ export function applyServerIdle(payload: ApplyServerIdlePayload) {
   }
 }
 
+export type ApplyTerminalStuckPayload = {
+  type: 'terminal.stuck'
+  terminalId: string
+  at: number
+  stuck: boolean
+}
+
+/**
+ * Server-authoritative wedged-agent flag (`terminal.stuck`) for terminal-mode
+ * agent panes — the terminal-mode twin of freshcodex's `freshAgent.status:
+ * 'stuck'` deadman. Parses the frame with TerminalStuckSchema, resolves the
+ * owning tab/pane by terminalId (the applyServerIdle precedent), and folds
+ * the flag into terminalLifecycleSlice keyed by paneId. NEVER dispatches a
+ * turnCompletion/* action: the stuck card is surface-only — a wedged pane
+ * must not fabricate a completion edge (green/sound), mirroring the
+ * freshcodex deadman contract.
+ */
+export function applyTerminalStuck(payload: ApplyTerminalStuckPayload) {
+  return (dispatch: AppDispatch, getState: () => RootState): void => {
+    const parsed = TerminalStuckSchema.safeParse(payload)
+    if (!parsed.success) return
+    const { terminalId, at, stuck } = parsed.data
+
+    const state = getState()
+    const location = selectTabPaneByTerminalId(state, terminalId)
+    if (!location) return
+
+    if (stuck) {
+      dispatch(recordTerminalStuck({
+        paneId: location.paneId,
+        terminalId,
+        at,
+      }))
+    } else {
+      dispatch(clearTerminalStuck({ paneId: location.paneId }))
+    }
+  }
+}
+
 export type ApplyFreshAgentCompletionPayload = {
   provider: string
   sessionId: string
@@ -43,14 +84,17 @@ export type ApplyFreshAgentCompletionPayload = {
 
 /**
  * Server-authoritative fresh-agent turn completion. The provider adapters emit a
- * discrete turn-complete edge ONLY on a positive completion, so the client no longer
- * derives green/sound from the busy level. We resolve the owning tab/pane from the
- * `provider:sessionId` session key and fold the event into the GREEN/SOUND pipeline
- * via the `at`-monotonic dedupe regime (no completionSeq). The discrete edge is never
- * replayed from a snapshot, so a reconnect cannot re-green, and a stale/older `at` is
- * dropped. Across a real server restart the client clears the per-terminal `at`
- * baselines (resetCompletionDedupeBaselines), so a resumed durable session whose fresh
- * process stamps a lower wall-clock `at` is not swallowed.
+ * discrete turn-complete edge for ANY turn end except a user-initiated interrupt —
+ * successes, errors, max-turns, crashes, deadman fires, and mid-turn stream
+ * exceptions all ring the same unified attention signal — so the client never
+ * derives green/sound from the busy level or the turn's outcome. We resolve the
+ * owning tab/pane from the `provider:sessionId` session key and fold the event into
+ * the GREEN/SOUND pipeline via the `at`-monotonic dedupe regime (no completionSeq).
+ * The discrete edge is never replayed from a snapshot, so a reconnect cannot
+ * re-green, and a stale/older `at` is dropped. Across a real server restart the
+ * client clears the per-terminal `at` baselines (resetCompletionDedupeBaselines),
+ * so a resumed durable session whose fresh process stamps a lower wall-clock `at`
+ * is not swallowed.
  */
 export function applyFreshAgentCompletion(payload: ApplyFreshAgentCompletionPayload) {
   return (dispatch: AppDispatch, getState: () => RootState): void => {
@@ -78,7 +122,8 @@ export type ApplyFreshAgentWaitingPayload = {
  * Server-authoritative fresh-agent "waiting for approval/question" edge. Mirrors
  * applyFreshAgentCompletion but records under a distinct `#waiting` terminalId so the
  * approval attention can never poison (or be poisoned by) the turn-complete dedupe
- * bucket via the monotonic `at` guard. Only Claude/kilroy ever emit this today.
+ * bucket via the monotonic `at` guard. Claude/kilroy and codex controls emit
+ * this edge on their own 0→≥1 pending approval/question transitions.
  *
  * Like the completion edge, the server buffers and replays this only to the FIRST
  * subscriber of a session (so a create-then-attach gap still greens once); a

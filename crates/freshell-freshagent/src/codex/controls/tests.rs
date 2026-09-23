@@ -192,6 +192,31 @@ async fn codex_user_controls_resolved_and_interrupted_requests_clear_without_com
     );
     event(&mut rx).await;
     event(&mut rx).await;
+    // The user interrupts the turn through the REAL lane — handle_interrupt
+    // arms the user-interrupt marker before its `turn/interrupt` RPC, so the
+    // interrupted completion below stays silent under the unified guard.
+    let interrupt = tokio::spawn({
+        let state = state.clone();
+        async move {
+            state
+                .handle_interrupt(FreshAgentInterrupt {
+                    provider: freshell_protocol::AgentProvider::Codex,
+                    session_id: "thread-1".to_string(),
+                    session_type: freshell_protocol::SessionType::Freshcodex,
+                    cwd: None,
+                })
+                .await;
+        }
+    });
+    let (mut id, mut method, _) = peer.expect_request().await;
+    if method == "initialize" {
+        peer.respond(&id, json!({}));
+        peer.expect_notification().await;
+        (id, method, _) = peer.expect_request().await;
+    }
+    assert_eq!(method, "turn/interrupt");
+    peer.respond(&id, json!({}));
+    interrupt.await.expect("interrupt task");
     peer.emit_notification(
         "turn/completed",
         json!({"threadId":"thread-1","turnId":"turn-1","status":"interrupted"}),

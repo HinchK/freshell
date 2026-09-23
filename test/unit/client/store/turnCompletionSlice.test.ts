@@ -67,6 +67,7 @@ describe('turnCompletionSlice', () => {
     expect(state.pendingEvents.at(-1)?.paneId).toBe('pane-9')
     expect(state.pendingEvents.at(-1)?.terminalId).toBe('term-2')
     expect(state.pendingEvents.at(-1)?.at).toBe(123)
+    expect(state.pendingEvents.at(-1)?.source).toBe('freshAgent')
     expect(state.pendingEvents).toHaveLength(1)
     expect(state.pendingEvents[0]?.seq).toBe(1)
   })
@@ -176,6 +177,7 @@ describe('turnCompletionSlice', () => {
       pendingEvents: [],
       attentionByTab: {},
       attentionByPane: {},
+      watchedCompletionByTab: {},
     }
     // Should return exact same state reference — no draft modification
     expect(state).toEqual(initial)
@@ -375,6 +377,10 @@ describe('turnCompletionSlice', () => {
         terminalId: 'term-1',
         at: 1_000,
         seq: 1,
+        source: 'terminal',
+        // DR5-3: the receipt-time witness bit (no receipt middleware in
+        // this test's store — the un-stamped default: unwitnessed).
+        watched: false,
       }])
       expect(store.getState().turnCompletion.lastIdleAtByTerminalId?.['term-1']).toBe(1_000)
     })
@@ -407,6 +413,7 @@ describe('turnCompletionSlice', () => {
         terminalId: 't1',
         at: 1_000,
         seq: 1,
+        source: 'terminal',
       })
       expect(state.lastIdleAtByTerminalId?.['t1']).toBe(1_000)
     })
