@@ -1398,7 +1398,7 @@ impl SessionHandoffRunner {
             .start_target(&req, &operation_id, generation, target_spawn_watch)
             .await
         {
-            Ok(owner) => {
+            Ok((owner, opencode_committed)) => {
                 // The cancellation-safety window: a spawned-but-uncommitted
                 // target is reaped by the guard if the runner is aborted
                 // before the commit (round-1 review). The precise identity
@@ -1633,6 +1633,106 @@ impl SessionHandoffRunner {
                             "ownership.handoff.done",
                             TransitionLevel::Info,
                         );
+                        // fresheyes ep2-r4 Major (daemon loss in the
+                        // handoff pre-commit window): the under-ticket
+                        // continuation (`start_target` →
+                        // `opencode_resume_for_handoff`) installs its
+                        // generation-fenced bridge and runs its own
+                        // transitional rescue BEFORE this runner's single
+                        // `Live` commit — and between the two, this
+                        // runner can still await
+                        // `current_flavor()`/`stage()` while the
+                        // coordinator key remains `Handoff`. A daemon
+                        // loss in that interval kills the fresh bridge
+                        // with every recovery trigger spent: the
+                        // successor's `Started` revival pass deliberately
+                        // skips the transitional owner (the
+                        // foreign-transition rule), this commit emits no
+                        // new daemon signal, and the finished rescue is
+                        // never rerun — the handoff would answer plain
+                        // success over an A-generation dead bridge. The
+                        // ESTABLISHED post-commit rescue pattern (the
+                        // fork/resume tails) closes the window from the
+                        // commit's own side: re-run the SAME
+                        // ownership-coordinator-gated guarded-restart
+                        // seam for the freshopencode target.
+                        // `own_lifecycle_window = false`: this commit IS
+                        // the window's end, so the seam observes the
+                        // runner's own `Live{FreshAgent}` and arms the
+                        // adopt guard across the restart (the revival
+                        // pass's exact discipline). A bridge alive
+                        // against the CURRENT daemon is the quiet no-op;
+                        // a dead/lost-generation bridge is restarted
+                        // against the successor and the client gets its
+                        // one recovery snapshot; a REFUSAL — the session
+                        // was killed or re-transitioned between the
+                        // commit and this tail, the mover's teardown
+                        // owning the cleanup — surfaces the typed
+                        // ownership-changed failure, never success over
+                        // the retired session. A bounded respawn failure
+                        // stays WARN-only (the seam's ep2-r2 contract).
+                        //
+                        // fresheyes ep2-r5: the re-check is bound to the
+                        // identity THIS runner committed — the under-
+                        // ticket continuation's session instance (carried
+                        // out of `start_target`) and this commit's own
+                        // `(epoch, generation)` fence. A same-key
+                        // REPLACEMENT (the target killed and another
+                        // resume's brand-new session installed under the
+                        // same durable id during the awaited post-commit
+                        // work) can never satisfy the instance binding or
+                        // the fence equality, so the runner surfaces the
+                        // typed failure instead of answering success
+                        // carrying its obsolete generation.
+                        if req.target_kind == RuntimeOwnerKind::FreshAgent
+                            && req.session_type.as_deref() == Some("freshopencode")
+                            && match opencode_committed.as_ref() {
+                                Some(committed) => matches!(
+                                    self.fresh_opencode
+                                        .rescue_transitional_bridge_after_commit(
+                                            &req.session_id,
+                                            false,
+                                            committed,
+                                            Some(ObservedFence {
+                                                epoch: self.ownership.boot_epoch(),
+                                                generation,
+                                            }),
+                                        )
+                                        .await,
+                                    crate::opencode_ws::TransitionalBridgeRescue::Refused
+                                ),
+                                // Unreachable for a freshopencode target
+                                // (the under-ticket resume hands its
+                                // committed instance out on every Ok) —
+                                // fail CLOSED: an instance the runner
+                                // cannot verify must never answer
+                                // success.
+                                None => true,
+                            }
+                        {
+                            tracing::warn!(target: "freshell_freshagent::opencode",
+                                operation_id = %operation_id,
+                                provider = %req.provider, session_id = %req.session_id,
+                                generation,
+                                "freshagent.opencode.handoff_bridge_recheck_refused: the \
+                                 freshopencode target committed but the session was retired \
+                                 or re-transitioned before the handoff answered — the \
+                                 mover's teardown owns the cleanup; the handoff surfaces \
+                                 the typed ownership-changed failure (ep2-r4)"
+                            );
+                            let current = self
+                                .ownership
+                                .observe(&req.provider, &req.session_id)
+                                .generation;
+                            return typed_failure(
+                                "STALE_GENERATION",
+                                "ownership changed during handoff; the freshopencode target \
+                                 committed but the session was retired or re-transitioned \
+                                 before the handoff could answer — refresh and retry",
+                                true,
+                                current,
+                            );
+                        }
                         json!({
                             "ok": true,
                             "operationId": operation_id,
@@ -3840,13 +3940,26 @@ impl SessionHandoffRunner {
     /// that does not serve the canonical `(provider, req.session_id)` is a
     /// `TARGET_SPAWN_FAILED` — never accept a respawned-new-thread runtime
     /// as handoff success, never mint a new session id.
+    ///
+    /// ep2-r5: the Ok payload additionally carries the freshopencode
+    /// target's committed session INSTANCE
+    /// ([`crate::opencode_ws::OpencodeSessionHandle`]) — `None` for every
+    /// other target kind — so the runner's post-commit rescue re-check can
+    /// verify the exact `Arc` its under-ticket continuation installed
+    /// (a same-key replacement can never satisfy it).
     async fn start_target(
         &self,
         req: &HandoffRequest,
         operation_id: &str,
         generation: u64,
         target_spawn_watch: Option<crate::terminal_tabs::HandoffSpawnWatch>,
-    ) -> Result<OwnerIdentity, (String, String)> {
+    ) -> Result<
+        (
+            OwnerIdentity,
+            Option<crate::opencode_ws::OpencodeSessionHandle>,
+        ),
+        (String, String),
+    > {
         // b8ke ext r23 F2: the attempt marker — start_target was ENTERED
         // (the spawn/resume is being attempted on this call). The
         // spawn-failure tests assert this event so a regression that
@@ -3964,55 +4077,55 @@ impl SessionHandoffRunner {
                 if let Some(hooks) = self.test_hooks.as_ref() {
                     hooks.record("TargetStarted");
                 }
-                Ok(owner)
+                Ok((owner, None))
             }
             RuntimeOwnerKind::FreshAgent => match req.session_type.as_deref() {
-                Some("freshcodex") | None => {
-                    self.fresh_codex
-                        .resume_for_handoff(
-                            &req.session_id,
-                            req.cwd.as_deref(),
-                            operation_id,
-                            generation,
-                        )
-                        .await
-                }
-                Some("freshopencode") => {
-                    self.fresh_opencode
-                        .opencode_resume_for_handoff(
-                            &req.session_id,
-                            req.cwd.as_deref(),
-                            operation_id,
-                            generation,
-                        )
-                        .await
-                }
+                Some("freshcodex") | None => self
+                    .fresh_codex
+                    .resume_for_handoff(
+                        &req.session_id,
+                        req.cwd.as_deref(),
+                        operation_id,
+                        generation,
+                    )
+                    .await
+                    .map(|owner| (owner, None)),
+                Some("freshopencode") => self
+                    .fresh_opencode
+                    .opencode_resume_for_handoff(
+                        &req.session_id,
+                        req.cwd.as_deref(),
+                        operation_id,
+                        generation,
+                    )
+                    .await
+                    .map(|(owner, committed)| (owner, Some(committed))),
                 // Round-2 review: BOTH claude-lane flavors — the flavor is a
                 // param (claude.rs), so a kilroy session resumes as kilroy
                 // (the created/owner frames keep the flavor) and a freshclaude
                 // session as freshclaude. Never map by provider alone.
-                Some("freshclaude") => {
-                    self.fresh_claude
-                        .resume_for_handoff(
-                            "freshclaude",
-                            &req.session_id,
-                            req.cwd.as_deref(),
-                            operation_id,
-                            generation,
-                        )
-                        .await
-                }
-                Some("kilroy") => {
-                    self.fresh_claude
-                        .resume_for_handoff(
-                            "kilroy",
-                            &req.session_id,
-                            req.cwd.as_deref(),
-                            operation_id,
-                            generation,
-                        )
-                        .await
-                }
+                Some("freshclaude") => self
+                    .fresh_claude
+                    .resume_for_handoff(
+                        "freshclaude",
+                        &req.session_id,
+                        req.cwd.as_deref(),
+                        operation_id,
+                        generation,
+                    )
+                    .await
+                    .map(|owner| (owner, None)),
+                Some("kilroy") => self
+                    .fresh_claude
+                    .resume_for_handoff(
+                        "kilroy",
+                        &req.session_id,
+                        req.cwd.as_deref(),
+                        operation_id,
+                        generation,
+                    )
+                    .await
+                    .map(|owner| (owner, None)),
                 Some(other) => Err(("unsupported sessionType".to_string(), other.to_string())),
             },
         }

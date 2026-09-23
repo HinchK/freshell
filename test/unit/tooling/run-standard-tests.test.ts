@@ -1,3 +1,5 @@
+import os from 'node:os'
+import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -5,6 +7,8 @@ import {
   createStandardTestPlan,
   resolveDesktopWorkerPlan,
   resolvePriorityValue,
+  resolveScriptPhaseCommand,
+  type StandardTestRun,
 } from '../../../scripts/run-standard-tests.js'
 import { buildSourceRuntimePhases } from '../../../scripts/testing/run-source-runtime-tests.js'
 
@@ -145,6 +149,56 @@ describe('run-standard-tests', () => {
       { command: 'npm', args: ['run', 'build:tools'] },
       { command: 'cargo', args: ['build', '--release', '-p', 'freshell-server', '--locked'] },
     ])
+  })
+
+  describe('resolveScriptPhaseCommand', () => {
+    const sourceRuntimeRun: StandardTestRun = {
+      name: 'source-runtime',
+      runner: 'npm',
+      script: 'test:source-runtime',
+      priority: 'background',
+    }
+    const rustRun: StandardTestRun = {
+      name: 'rust',
+      runner: 'npm',
+      script: 'test:rust',
+      priority: 'background',
+    }
+    const pnpmEntry = path.join(os.tmpdir(), 'freshell-pnpm-entry', 'pnpm.cjs')
+    const npmEntry = path.join(os.tmpdir(), 'freshell-npm-entry', 'npm-cli.js')
+
+    it('forwards source-runtime selectors through pnpm without a separator', () => {
+      const command = resolveScriptPhaseCommand(
+        sourceRuntimeRun,
+        ['test/integration/tooling/source-runtime-rust.test.ts'],
+        'pnpm',
+        { npm_execpath: pnpmEntry },
+      )
+      expect(command).toEqual({
+        command: process.execPath,
+        args: [pnpmEntry, 'run', 'test:source-runtime', 'test/integration/tooling/source-runtime-rust.test.ts'],
+      })
+    })
+
+    it('preserves the npm separator for source-runtime selectors in legacy npm roots', () => {
+      const command = resolveScriptPhaseCommand(
+        sourceRuntimeRun,
+        ['test/integration/tooling/source-runtime-rust.test.ts'],
+        'npm',
+        { npm_execpath: npmEntry },
+      )
+      expect(command).toEqual({
+        command: process.execPath,
+        args: [npmEntry, 'run', 'test:source-runtime', '--', 'test/integration/tooling/source-runtime-rust.test.ts'],
+      })
+    })
+
+    it('never forwards selectors to the rust lane under either manager', () => {
+      expect(resolveScriptPhaseCommand(rustRun, ['test/server/ws-protocol.test.ts'], 'pnpm', { npm_execpath: pnpmEntry }))
+        .toEqual({ command: process.execPath, args: [pnpmEntry, 'run', 'test:rust'] })
+      expect(resolveScriptPhaseCommand(rustRun, ['test/server/ws-protocol.test.ts'], 'npm', { npm_execpath: npmEntry }))
+        .toEqual({ command: process.execPath, args: [npmEntry, 'run', 'test:rust'] })
+    })
   })
 
   describe('resolvePriorityValue', () => {

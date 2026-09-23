@@ -114,7 +114,7 @@ export async function runVisibleFirstAudit(
     build: {
       nodeVersion: process.version,
       browserVersion,
-      command: 'npm run perf:audit:visible-first',
+      command: 'pnpm run perf:audit:visible-first',
     },
     profiles: AUDIT_PROFILES.filter((profile) => profileIds.includes(profile.id)),
     scenarios,

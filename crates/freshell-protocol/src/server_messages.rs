@@ -269,7 +269,7 @@ pub const SERVER_MESSAGE_TYPES: [&str; 66] = [
 /// `terminal.codex.durability.updated` (codex-sidecar durability); the
 /// name collision is nearest-neighbor only. If the client ever grows a
 /// consumer, add the Zod schema to `shared/ws-protocol.ts`, run
-/// `npm run contract:generate`, and promote this into
+/// `pnpm run contract:generate`, and promote this into
 /// [`SERVER_MESSAGE_TYPES`]. Shape pinned by `tests/activity_extension.rs`.
 pub const EXTENSION_SERVER_MESSAGE_TYPES: [&str; 1] = ["durability.degraded"];
 

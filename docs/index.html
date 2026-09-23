@@ -1652,7 +1652,7 @@ const content = {
   ],
 
   'ws-bottom': [
-    { typed: true, prompt: P, command: 'npm test', delay: 400 },
+    { typed: true, prompt: P, command: 'pnpm test', delay: 400 },
     { html: '', delay: 600 },
     { html: ' <span class="t-success">✓</span> server/auth.test.ts <span class="t-dim">(4)</span> <span class="t-dim">12ms</span>', delay: 60 },
     { html: '   <span class="t-success">✓</span> <span class="t-dim">validates correct tokens</span>', delay: 30 },
@@ -1685,7 +1685,7 @@ const content = {
     { html: '' },
     { html: '<span class="t-dim"># Or clone and run from source</span>', delay: 100 },
     { typed: true, prompt: P, command: 'git clone https://github.com/danshapiro/freshell', delay: 500 },
-    { typed: true, prompt: P, command: 'cd freshell && npm install && npm run dev', delay: 400 },
+    { typed: true, prompt: P, command: 'cd freshell && pnpm install && pnpm run dev', delay: 400 },
     { html: '', delay: 400 },
     { html: '<span class="t-success">✓</span> <span class="t-dim">Client:</span> <span class="t-cyan">http://localhost:5173</span>', delay: 60 },
     { html: '<span class="t-success">✓</span> <span class="t-dim">Server:</span> <span class="t-cyan">http://localhost:3000</span>', delay: 60 },

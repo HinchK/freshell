@@ -42,7 +42,7 @@ const ZOD_BACKED_SERVER_MESSAGES = [
  * These tests regenerate the language-neutral contract artifacts in-memory and
  * assert they are byte-for-byte identical to the committed files under
  * `port/contract/`. If someone edits `shared/ws-protocol.ts` (or a sibling
- * schema module) without re-running `npm run contract:generate`, these tests
+ * schema module) without re-running `pnpm run contract:generate`, these tests
  * fail — which is exactly the "frozen contract" guarantee the Rust port and the
  * equivalence oracle depend on.
  *

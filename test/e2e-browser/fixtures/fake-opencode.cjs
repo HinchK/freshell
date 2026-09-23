@@ -680,6 +680,34 @@ appendAudit({
   dbPath,
 })
 
+// Daemon-death self-heal e2e (plan Task 7, the 2026-09-20 incident class):
+// scripted UNREQUESTED daemon death by SELF-exit. Armed ONLY for the managed
+// fresh-agent serve daemon (`opencode serve --hostname H --port P` — argv[0]
+// === 'serve' and never '--pure', so the catalog probe's short-lived
+// `serve --pure` sidecars are excluded). When FAKE_OPENCODE_SELF_EXIT_MARKER
+// names a file that APPEARS, this daemon consumes the marker (one-shot, the
+// same gate-file precedent as FAKE_OPENCODE_TUI_PARITY_CHILD_EVENT_GATE) and
+// exits ON ITS OWN via process.exit — the spec never signals any PID
+// (PROCESS-KILL SAFETY: creating/writing the marker file is the test's only
+// death-triggering action). The respawned daemon re-arms the poll, but the
+// marker is already consumed, so it stays up. With the env unset (every other
+// spec) none of this code runs.
+const selfExitMarkerPath = process.env.FAKE_OPENCODE_SELF_EXIT_MARKER
+if (selfExitMarkerPath && command === 'serve' && !argv.includes('--pure')) {
+  const selfExitInterval = setInterval(() => {
+    if (!fs.existsSync(selfExitMarkerPath)) return
+    clearInterval(selfExitInterval)
+    try {
+      fs.rmSync(selfExitMarkerPath, { force: true })
+    } catch {
+      // ignore
+    }
+    appendAudit({ event: 'self_exit', rootSessionId, childSessionId })
+    process.exit(1)
+  }, 50)
+  selfExitInterval.unref?.()
+}
+
 process.stdout.write(`fake opencode ready root=${rootSessionId} child=${childSessionId}\n`)
 process.stdin.setEncoding('utf8')
 process.stdin.on('data', (data) => {

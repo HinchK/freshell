@@ -1,9 +1,9 @@
-#!/usr/bin/env npx tsx
+#!/usr/bin/env -S pnpm exec tsx
 /**
  * Measure session payload bandwidth: uncompressed vs compressed, full vs paginated.
  *
  * Usage:
- *   FRESHELL_URL=http://localhost:3001 FRESHELL_TOKEN=... npx tsx scripts/measure-bandwidth.ts
+ *   FRESHELL_URL=http://localhost:3001 FRESHELL_TOKEN=... pnpm exec tsx scripts/measure-bandwidth.ts
  */
 import { deflateRawSync } from 'node:zlib'
 

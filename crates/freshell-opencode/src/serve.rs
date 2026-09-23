@@ -23,7 +23,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -581,6 +581,17 @@ pub struct ServeConfig {
     /// 600 s opencode turn budget that also bounds the compact's await-idle
     /// tail (`opencode_ws.rs`'s `DEFAULT_TURN_TIMEOUT`).
     pub compact_timeout: Duration,
+    /// Daemon exit-watcher poll cadence (`Task 3`): how often the running
+    /// daemon's `exited()` is consulted between request traffic.
+    pub daemon_watch_interval: Duration,
+    /// Re-warm backoff: the initial delay before the first respawn attempt
+    /// after a daemon loss, doubling per failed attempt, capped at
+    /// [`ServeConfig::re_warm_backoff_max_ms`].
+    pub re_warm_backoff_initial_ms: u64,
+    /// Re-warm backoff ceiling: the escalation stops here (a crash-looping
+    /// daemon retries at this interval forever — it self-heals when e.g.
+    /// disk frees).
+    pub re_warm_backoff_max_ms: u64,
 }
 
 impl Default for ServeConfig {
@@ -598,6 +609,9 @@ impl Default for ServeConfig {
             required_idle_status_polls: 2,
             request_timeout: Duration::from_millis(30_000),
             compact_timeout: Duration::from_millis(600_000),
+            daemon_watch_interval: Duration::from_millis(1_000),
+            re_warm_backoff_initial_ms: 2_000,
+            re_warm_backoff_max_ms: 60_000,
         }
     }
 }
@@ -640,10 +654,62 @@ pub enum SessionSignal {
 
 const SESSION_CHANNEL_CAPACITY: usize = 256;
 
+/// The daemon-level channel capacity for [`DaemonSignal`] broadcasts.
+const DAEMON_CHANNEL_CAPACITY: usize = 16;
+
+/// A daemon-lifecycle edge broadcast by the manager (the client-facing
+/// runtime's Task-4 revival design consumes this): `Lost` when the shared
+/// daemon is gone (a requested discard with its reason, or an unrequested
+/// process exit), `Started` on every successful COLD start (not on the
+/// fast-path return of an already-running daemon).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DaemonSignal {
+    /// The running daemon is gone. `reason` is the loss class: `"process_exit"`
+    /// for an unrequested exit, the discard's reason (e.g. `"request_timeout"`)
+    /// for a requested kill.
+    Lost { reason: &'static str },
+    /// A previously-lost (or never-started) daemon completed a cold start and
+    /// is healthy again.
+    Started,
+}
+
+/// Which loss arm is running the shared exactly-once path
+/// ([`OpencodeServeManager::lose_daemon`]).
+enum LossArm<'a> {
+    /// The exit watcher observed an unrequested process exit. `ownership_id`
+    /// gates staleness (a watcher for a superseded daemon must not run the
+    /// loss path on its successor); `base_url` rides the crash WARN.
+    Watcher {
+        base_url: &'a str,
+        ownership_id: &'a str,
+    },
+    /// A requested discard (kill). `dispatched_base` is the base URL the
+    /// timed-out request was actually sent to — the discard takes+kills
+    /// ONLY the daemon at that base; a STALE timeout (its daemon already
+    /// lost, a replacement owns the entry) no-ops with the same silence as
+    /// a `None` take, never killing the innocent replacement. The watcher
+    /// is aborted first (a requested kill never raises the crash event);
+    /// `reason` names the discard cause and rides both the WARN and the
+    /// `Lost` signal.
+    Discard {
+        reason: &'static str,
+        dispatched_base: &'a str,
+    },
+}
+
 struct RunningServe {
     base_url: String,
-    process: Box<dyn ServeProcess>,
+    /// The shared daemon handle. `Arc` (LB-06): the exit watcher keeps a clone
+    /// that outlives this entry — the watcher polls ITS Arc, the entry keeps
+    /// its own, nothing is moved out.
+    process: Arc<dyn ServeProcess>,
+    /// THIS daemon's spawn identity: the stale-watcher gate (a watcher for a
+    /// superseded daemon must not run the loss path on its successor).
+    ownership_id: String,
     _event_handle: Box<dyn EventStreamHandle>,
+    /// The exit watcher's abort handle — aborted on the requested-loss paths
+    /// (discard/shutdown) so a killed daemon never raises the crash event.
+    _exit_watch: Option<tokio::task::AbortHandle>,
 }
 
 struct Inner {
@@ -652,6 +718,37 @@ struct Inner {
     shutdown: AtomicBool,
     running: tokio::sync::Mutex<Option<Arc<RunningServe>>>,
     session_emitters: Mutex<HashMap<String, broadcast::Sender<SessionSignal>>>,
+    daemon_signals: broadcast::Sender<DaemonSignal>,
+    /// The re-warm backoff's attempt counter: incremented per re-warm attempt
+    /// and reset when a loss is a FRESH incident (see
+    /// [`OpencodeServeManager::schedule_re_warm`]) — each new incident starts
+    /// at the initial delay while a crash-looping daemon still escalates to
+    /// and retries at the capped interval.
+    re_warm_attempts: AtomicUsize,
+    /// The DISPATCH ERA (ep2-r2 fresheyes Major — cross-generation event
+    /// contamination; HARDENED ep2-r3 — the check-to-dispatch TOCTOU): a
+    /// monotonic counter retired (incremented) by every running-entry TAKE
+    /// under the `running` lock — the two `lose_daemon` arms and `shutdown`.
+    /// Each daemon's dispatch sink captures the era at its connect (inside
+    /// the cold-start critical section, so no take can interleave) and
+    /// [`dispatch_event_on_era`] re-verifies it UNDER the `session_emitters`
+    /// mutex, atomically with sender-selection + send: no event originating
+    /// from a daemon whose loss has been taken can dispatch into the
+    /// successor era, even when the sink's fast-path check passed before a
+    /// preemption straddled the take.
+    event_era: AtomicU64,
+    /// ep2-r3 test seam (`cfg(test)`-only): when armed, the dispatch sink
+    /// parks AFTER passing its era check and BEFORE dispatching — the exact
+    /// preempted-callback window the ep2-r3 fresheyes Major pins (a check
+    /// that is not atomic with dispatch can pass, be preempted, and then
+    /// deliver into a successor era's registration). Never compiled into
+    /// production builds. See
+    /// [`OpencodeServeManager::arm_dispatch_park_for_tests`].
+    #[cfg(test)]
+    test_dispatch_park: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// When the running daemon completed its (healthy) cold start — the
+    /// fresh-incident clock for the re-warm backoff.
+    last_cold_start_at: Mutex<Option<Instant>>,
 }
 
 /// The opencode serve sidecar client. Cheap to clone (`Arc`-backed).
@@ -669,6 +766,12 @@ impl OpencodeServeManager {
                 shutdown: AtomicBool::new(false),
                 running: tokio::sync::Mutex::new(None),
                 session_emitters: Mutex::new(HashMap::new()),
+                daemon_signals: broadcast::Sender::new(DAEMON_CHANNEL_CAPACITY),
+                re_warm_attempts: AtomicUsize::new(0),
+                event_era: AtomicU64::new(0),
+                #[cfg(test)]
+                test_dispatch_park: Mutex::new(None),
+                last_cold_start_at: Mutex::new(None),
             }),
         }
     }
@@ -685,6 +788,22 @@ impl OpencodeServeManager {
             .await
             .as_ref()
             .map(|r| r.base_url.clone())
+    }
+
+    /// The CURRENT running daemon's spawn identity: the `ownership_id`
+    /// minted at its cold start — unique per daemon GENERATION, stable
+    /// across `ensure_started` fast paths, `None` while no daemon runs.
+    /// The freshopencode runtime's daemon-generation fence (Task 4 delta
+    /// round 2): a session bridge stamped with any other id was spawned
+    /// against a SUPERSEDED daemon and is dead for revival purposes even
+    /// while its task is still draining.
+    pub async fn ownership_id(&self) -> Option<String> {
+        self.inner
+            .running
+            .lock()
+            .await
+            .as_ref()
+            .map(|r| r.ownership_id.clone())
     }
 
     /// Idempotent start: allocate a loopback port, spawn the ownership-tagged sidecar,
@@ -734,7 +853,7 @@ impl OpencodeServeManager {
             OPENCODE_CONFIG_CONTENT_ENV.to_string(),
             merged_opencode_config_content(inherited.as_deref()),
         ));
-        let process = self
+        let process: Arc<dyn ServeProcess> = self
             .inner
             .deps
             .spawner
@@ -742,18 +861,26 @@ impl OpencodeServeManager {
                 command: self.config().command.clone(),
                 hostname: endpoint.hostname.clone(),
                 port: endpoint.port,
-                ownership_id,
+                ownership_id: ownership_id.clone(),
                 env,
                 pure: false,
                 cwd: None,
             })
-            .map_err(ServeError::Spawn)?;
+            .map_err(ServeError::Spawn)?
+            .into();
 
         if let Err(e) = self.wait_for_health(&base_url, process.as_ref()).await {
             process.kill();
             return Err(e);
         }
 
+        // Arm the exit watcher BEFORE storing the entry — the spawn is
+        // synchronous (the guard is never held across an await here) and the
+        // watcher's first action is a sleep, so by the time it first consults
+        // `exited()` the entry is stored; its loss path still re-verifies
+        // ownership, so a store-visibility race can only no-op, never mis-fire.
+        let watch =
+            self.spawn_exit_watch(base_url.clone(), Arc::clone(&process), ownership_id.clone());
         let sink = self.make_dispatch_sink();
         let handle = self
             .inner
@@ -764,8 +891,20 @@ impl OpencodeServeManager {
         *guard = Some(Arc::new(RunningServe {
             base_url: base_url.clone(),
             process,
+            ownership_id,
             _event_handle: handle,
+            _exit_watch: Some(watch),
         }));
+        // The fresh-incident clock for the re-warm backoff: this daemon's
+        // healthy-service lifetime starts now.
+        *self
+            .inner
+            .last_cold_start_at
+            .lock()
+            .expect("cold-start clock mutex") = Some(Instant::now());
+        // COLD-start edge only — the fast path above (already running) never
+        // re-broadcasts this.
+        let _ = self.inner.daemon_signals.send(DaemonSignal::Started);
         Ok(base_url)
     }
 
@@ -833,13 +972,315 @@ impl OpencodeServeManager {
         })
     }
 
+    /// The per-connection dispatch sink, ERA-GATED (ep2-r2 fresheyes Major —
+    /// cross-generation event contamination; HARDENED ep2-r3 — the
+    /// check-to-dispatch TOCTOU): the sink captures the CURRENT
+    /// [`Inner::event_era`] at its daemon's connect (called from
+    /// `ensure_started` inside the cold-start `running` critical section,
+    /// so no take can interleave with the capture) and hands it to
+    /// [`dispatch_event_on_era`], which re-verifies the era UNDER the
+    /// `session_emitters` mutex, atomically with selection+send. The
+    /// load-compare here is only the CHEAP FAST PATH (the common
+    /// already-retired case drops without touching the emitter map) — it
+    /// is NOT the fence: an event that passes it can still be preempted
+    /// before dispatch, and only the under-lock re-verification stops a
+    /// stale event from reaching a successor-era registration after its
+    /// era was retired, its emitters swept, and the successor registered a
+    /// replacement sender. Every daemon removal is a TAKE under that same
+    /// `running` lock (`lose_daemon`'s two arms, `shutdown`), each take
+    /// retires the era via [`Self::retire_event_era`] BEFORE its sweep
+    /// claims the emitter mutex — so by construction NO event originating
+    /// from a daemon whose loss has been taken can dispatch into the
+    /// successor era: a buffered/late `session.idle` from the lost
+    /// generation can never satisfy the successor's `await_idle` (the
+    /// false `freshAgent.turn.complete` the no-chime-on-loss contract
+    /// forbids), and no other late event can contaminate a successor-era
+    /// bridge. The authoritative gate lives at DISPATCH — under the
+    /// emitter mutex — because dropping the [`EventStreamHandle`] only
+    /// ABORTS the transport's reader task (`SseHandle`'s drop), and a
+    /// check that is not atomic with dispatch can be preempted past both.
     fn make_dispatch_sink(&self) -> EventSink {
         let weak = Arc::downgrade(&self.inner);
+        let era = self.inner.event_era.load(Ordering::Acquire);
         Arc::new(move |event: ParsedServeEvent| {
-            if let Some(inner) = weak.upgrade() {
-                dispatch_event_on(&inner, event);
+            let Some(inner) = weak.upgrade() else {
+                return;
+            };
+            if inner.event_era.load(Ordering::Acquire) != era {
+                // A superseded generation's late/buffered event: dropped at
+                // the gate, never reaching the successor era's emitters.
+                return;
             }
+            // ep2-r3 test seam (`cfg(test)`-only): hold the callback in the
+            // exact window the fresheyes finding names — the era check has
+            // PASSED and the dispatch has not yet run — so a test can
+            // retire the era and register a successor-era sender while this
+            // callback is parked. See
+            // [`Self::arm_dispatch_park_for_tests`].
+            #[cfg(test)]
+            if let Some(park) = inner
+                .test_dispatch_park
+                .lock()
+                .expect("test dispatch park mutex")
+                .clone()
+            {
+                park();
+            }
+            dispatch_event_on_era(&inner, event, Some(era));
         })
+    }
+
+    /// Arm or clear the `cfg(test)`-only dispatch park (ep2-r3): the armed
+    /// closure is invoked by every dispatch sink AFTER passing its era
+    /// check and BEFORE dispatching, so a test can hold an in-flight
+    /// callback while it retires the era (a daemon loss take) and
+    /// registers a successor-era sender — the preempted-callback
+    /// interleaving the era verification's dispatch-time atomicity must
+    /// survive. Production builds never see the seam.
+    #[cfg(test)]
+    pub(crate) fn arm_dispatch_park_for_tests(&self, park: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self
+            .inner
+            .test_dispatch_park
+            .lock()
+            .expect("test dispatch park mutex") = park;
+    }
+
+    /// Retire the current dispatch era — the take-side half of the era gate
+    /// ([`Self::make_dispatch_sink`]). Called ONLY while the `running` lock
+    /// is held for a take (the two `lose_daemon` arms, `shutdown`): from
+    /// this moment no event from the daemon being taken can dispatch into
+    /// the session-emitter map, whatever its SSE connection still buffers —
+    /// a successor era's emitters can never be contaminated by the lost
+    /// generation, and a successor (which can only cold-start after the
+    /// lock releases) always connects a strictly newer era.
+    fn retire_event_era(&self) {
+        self.inner.event_era.fetch_add(1, Ordering::Release);
+    }
+
+    /// Spawn the daemon exit watcher for one cold-started daemon (Task 3,
+    /// the shared-daemon adaptation of the freshcodex onExit self-heal): poll
+    /// the SHARED process Arc's `exited()` every `daemon_watch_interval`; on
+    /// `Some` run the staleness-gated loss path and end. The manager clone is
+    /// cheap (`Arc`-backed); the process Arc and ownership id move in with
+    /// the task — the running entry keeps its own Arc (LB-06: share, never
+    /// move the daemon out of the entry).
+    fn spawn_exit_watch(
+        &self,
+        base_url: String,
+        process: Arc<dyn ServeProcess>,
+        ownership_id: String,
+    ) -> tokio::task::AbortHandle {
+        let manager = self.clone();
+        let interval = self.config().daemon_watch_interval;
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                if process.exited().is_some() {
+                    manager
+                        .lose_daemon(LossArm::Watcher {
+                            base_url: &base_url,
+                            ownership_id: &ownership_id,
+                        })
+                        .await;
+                    return;
+                }
+            }
+        });
+        handle.abort_handle()
+    }
+
+    /// The shared exactly-once daemon-loss path: a daemon that died on its own
+    /// (the watcher arm) or was discarded (the requested-kill arm) must not
+    /// leave a poisoned running entry (the 2026-09-20 incident's silent
+    /// half). **Exactly-once (LB-07):** the running-entry take is the race
+    /// arbiter — a `None` take means the other arm already handled this loss,
+    /// and the whole path is a silent no-op: no log, no Lost, no re-warm. The
+    /// arm selects the pre-take gate and the structured WARN (a requested kill
+    /// never raises the crash event; a watcher's WARN names the dead daemon).
+    ///
+    /// **Sweep fencing (ep2-r1 fresheyes Major):** the session-emitter sweep
+    /// is part of the SAME `running` critical section as the take, BEFORE the
+    /// lock releases. A successor daemon cannot cold-start while this lock is
+    /// held (`ensure_started` needs it), so every sender claimed by the sweep
+    /// was necessarily registered against the daemon being lost (or against
+    /// no daemon at all — an in-flight `once_idle` whose request was going to
+    /// fail anyway); any registration that happens after the release belongs
+    /// to a SUCCESSOR and is never swept by this loss. Pre-fix, the sweep ran
+    /// after the lock release (kill/reap → `emit_lost_for_all`), so a fenced
+    /// attach that cold-started daemon B in that window had B's fresh bridge
+    /// sender wiped by A's late cleanup — B's bridge then drained its closed
+    /// channel and exited with no recovery trigger left (B's `Started` pass
+    /// had already seen a live B-stamped bridge, the `Lost` pass never
+    /// revives, and A's re-warm takes B's fast path silently) — the exact
+    /// dead-ended pane this recovery exists to heal.
+    ///
+    /// **Era retirement (ep2-r2 fresheyes Major):** the take also retires
+    /// the lost daemon's DISPATCH ERA inside the same critical section
+    /// ([`Self::retire_event_era`]) — the taken daemon's event sink drops
+    /// every event from this moment on, so a buffered/late event from the
+    /// lost generation can never dispatch into the successor era's
+    /// emitters (the cross-generation `session.idle` that would falsely
+    /// satisfy a successor's `await_idle` and produce a chime). See
+    /// [`Self::make_dispatch_sink`].
+    async fn lose_daemon(&self, arm: LossArm<'_>) {
+        let (taken, lost_senders) = {
+            let mut running = self.inner.running.lock().await;
+            match arm {
+                LossArm::Watcher {
+                    base_url: _,
+                    ownership_id,
+                } => match running.as_ref() {
+                    // Still OUR daemon: retire its dispatch era, take it
+                    // (the loss is ours to handle) and sweep the shared
+                    // session-emitter map while no successor can be
+                    // starting.
+                    Some(r) if r.ownership_id == ownership_id => {
+                        self.retire_event_era();
+                        let senders = self.take_session_emitters();
+                        (running.take(), senders)
+                    }
+                    // Stale watcher — a newer daemon owns the entry: no-op.
+                    _ => return,
+                },
+                LossArm::Discard {
+                    reason: _,
+                    dispatched_base,
+                } => match running.as_ref() {
+                    // The wedged request's OWN daemon: abort the watcher
+                    // FIRST (inside the lock, before the take and the
+                    // WARN/kill sequence) — the requested kill must never
+                    // raise the crash event. After the take the watcher can
+                    // never win its own take; if it already won, our take
+                    // below is the silent no-op.
+                    Some(r) if r.base_url == dispatched_base => {
+                        if let Some(watch) = &r._exit_watch {
+                            watch.abort();
+                        }
+                        // The take retires the taken daemon's dispatch era
+                        // under the same lock (the era-gate invariant).
+                        self.retire_event_era();
+                        let senders = self.take_session_emitters();
+                        (running.take(), senders)
+                    }
+                    // Stale timeout — the request's daemon is already gone
+                    // and a replacement owns the entry: no-op (no kill, no
+                    // log, no Lost, no re-warm), the same silence as a
+                    // `None` take. The gate is the base URL captured at
+                    // dispatch — the exact address the wedged request was
+                    // sent to — so a mismatch means the entry is a
+                    // different (re-warmed) daemon the request never used.
+                    _ => return,
+                },
+            }
+        };
+        let Some(running) = taken else {
+            return;
+        };
+        let reason = match arm {
+            LossArm::Watcher { base_url, .. } => {
+                tracing::warn!(
+                    reason = "process_exit",
+                    base_url = %base_url,
+                    "freshagent.opencode.daemon_crash_detected"
+                );
+                "process_exit"
+            }
+            LossArm::Discard { reason, .. } => {
+                tracing::warn!(reason = reason, "freshagent.opencode.daemon_discarded");
+                reason
+            }
+        };
+        // The watcher arm's kill is reaper parity only (the process already
+        // exited); the discard arm's kill is the requested kill. Either way
+        // kill() reaps the /proc-scoped ownership tree.
+        running.process.kill();
+        // The sweep already ran INSIDE the take critical section, so
+        // `lost_senders` is exactly the set of THIS daemon's emitters it
+        // claimed: the Lost edge goes only to the sessions the lost daemon
+        // served, and a successor's post-release registration is not in it
+        // and stays live.
+        for sender in lost_senders {
+            let _ = sender.send(SessionSignal::Lost);
+        }
+        let _ = self
+            .inner
+            .daemon_signals
+            .send(DaemonSignal::Lost { reason });
+        self.schedule_re_warm();
+    }
+
+    /// Schedule the backoff-guarded respawn after a daemon loss: a RETRY loop
+    /// that sleeps `re_warm_backoff_initial_ms * 2^(attempts-1)` (capped at
+    /// `re_warm_backoff_max_ms`), then calls `ensure_started`. A FAILED
+    /// attempt logs and schedules the next (escalating) attempt — a transient
+    /// spawn/health failure (e.g. disk pressure) must not strand the daemon
+    /// permanently absent. A SUCCESSFUL attempt ends the loop; the fresh
+    /// daemon's own exit watcher is armed by `ensure_started`. Never spawns
+    /// (nor retries) once shutdown is set.
+    ///
+    /// **Fresh-incident gate** (the round-2 "no permanent 60 s first delay"
+    /// finding, reconciled with the behavior list's crash-loop escalation):
+    /// a daemon that OUTLIVED the whole backoff ladder makes this loss a NEW
+    /// incident — the attempt counter resets so its re-warm starts at the
+    /// initial delay. A daemon that died faster KEEPS the accumulated
+    /// escalation: a daemon dying immediately after every successful start
+    /// must climb the ladder (50→100→200→400 ms…), never respawn at the
+    /// floor every cycle. The counter therefore persists across re-warm
+    /// successes and resets only here, at the next loss, when the lost
+    /// daemon's healthy lifetime reached the ladder's cap.
+    fn schedule_re_warm(&self) {
+        if self.inner.shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+        let fresh_incident = {
+            let last_cold_start = *self
+                .inner
+                .last_cold_start_at
+                .lock()
+                .expect("cold-start clock mutex");
+            last_cold_start
+                .map(|started_at| {
+                    started_at.elapsed()
+                        >= Duration::from_millis(self.config().re_warm_backoff_max_ms)
+                })
+                .unwrap_or(true)
+        };
+        if fresh_incident {
+            self.inner.re_warm_attempts.store(0, Ordering::SeqCst);
+        }
+        let manager = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let attempts = manager
+                    .inner
+                    .re_warm_attempts
+                    .fetch_add(1, Ordering::SeqCst)
+                    + 1;
+                let delay_ms = (manager
+                    .config()
+                    .re_warm_backoff_initial_ms
+                    .saturating_mul(1u64 << (attempts - 1).min(16)))
+                .min(manager.config().re_warm_backoff_max_ms);
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                if manager.inner.shutdown.load(Ordering::SeqCst) {
+                    return;
+                }
+                match manager.ensure_started().await {
+                    Ok(_) => {
+                        tracing::info!(attempt = attempts, "freshagent.opencode.daemon_re_warm");
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            attempt = attempts,
+                            error = %err,
+                            "freshagent.opencode.daemon_re_warm"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     async fn require_base(&self) -> Result<String, ServeError> {
@@ -847,8 +1288,9 @@ impl OpencodeServeManager {
     }
 
     /// One JSON request/response through the transport, bounded by the config's
-    /// `request_timeout`. On a timeout the running sidecar is discarded
-    /// (`discardRunning('request_timeout')`, `serve-manager.ts:320-324`).
+    /// `request_timeout`. On a timeout the sidecar the request was dispatched
+    /// against is discarded (`discardRunning('request_timeout')`,
+    /// `serve-manager.ts:320-324`) — never a re-warmed replacement.
     /// `not_found_value` mirrors `json`'s 404 handling.
     async fn json_request(
         &self,
@@ -923,7 +1365,11 @@ impl OpencodeServeManager {
         {
             Err(_) => {
                 if discard_on_timeout == DiscardOnTimeout::Yes {
-                    self.discard_running("request_timeout").await;
+                    // Gate on the daemon THIS request was dispatched against:
+                    // a stale timeout (its daemon already discarded, a
+                    // re-warmed replacement installed) must never kill the
+                    // replacement — the discard no-ops on a base mismatch.
+                    self.discard_running("request_timeout", &base).await;
                 }
                 return Err(ServeError::RequestTimeout {
                     method: method_str,
@@ -1164,9 +1610,24 @@ impl OpencodeServeManager {
     /// compact path consumes only its `model` key (probed on 1.18.18: present,
     /// string-or-null) as the model-pair fallback when a session carries no splittable
     /// model of its own.
+    ///
+    /// A slow config read must never kill the shared daemon — the FR2 read rule
+    /// (b8ke): capture the base once (spawn-on-demand is preserved), then
+    /// transport over the captured base with `DiscardOnTimeout::No`.
     pub async fn get_config(&self, route: &Route) -> Result<Value, ServeError> {
+        let base = self.require_base().await?;
         let path = with_route("/config", route);
-        self.json_request(HttpMethod::Get, &path, None, None).await
+        self.json_request_over_base(
+            HttpMethod::Get,
+            &path,
+            None,
+            None,
+            base,
+            DiscardOnTimeout::No,
+            &[],
+            None,
+        )
+        .await
     }
 
     /// `POST /session/:id/summarize` — the compact RPC. VALIDATED opencode 1.18.18
@@ -1217,11 +1678,22 @@ impl OpencodeServeManager {
         if let Some(w) = accepted_witness {
             witnesses.push(w);
         }
-        self.json_request_maybe_witnessed(
+        // 2026-09-20 incident: the summarize POST used the discard-on-timeout
+        // lane, so a 600 s budget exceeded on a healthy-but-busy daemon KILLED
+        // the one shared daemon for every freshopencode session. Mirror the
+        // FR2 captured-base transport (`get_session_at`): a timed-out compact
+        // answers `RequestTimeout` and NEVER kills the shared daemon. The
+        // redo-destroy classification is unchanged — `RequestTimeout` stays
+        // outside `never_dispatched()` (a timed-out POST may have reached the
+        // daemon).
+        let base = self.require_base().await?;
+        self.json_request_over_base(
             HttpMethod::Post,
             &path,
             Some(json!({ "providerID": provider_id, "modelID": model_id })),
             None,
+            base,
+            DiscardOnTimeout::No,
             &witnesses,
             // The summarize handler runs the whole LLM turn before answering;
             // use its dedicated timeout rather than the generic request bound.
@@ -1321,36 +1793,75 @@ impl OpencodeServeManager {
         self.emitter_for(session_id).subscribe()
     }
 
-    /// Feed one parsed SSE event into the per-session fan-out. This is the ingestion
-    /// point the [`EventSource`] sink calls (`dispatchEvent`, `serve-manager.ts:429-432`).
+    /// Subscribe to the daemon-level lifecycle stream ([`DaemonSignal`]).
+    ///
+    /// NOTE (LB-02a, source-verified at the locked tokio version): tokio
+    /// broadcast does NOT replay history to late subscribers — a receiver
+    /// created here starts at the channel's current TAIL and observes only
+    /// signals sent AFTER this call. Consumers (Task 4's bridge revival) must
+    /// therefore be LEVEL-TRIGGERED (query daemon state on receipt), never
+    /// event-history-dependent.
+    pub fn subscribe_daemon_signals(&self) -> broadcast::Receiver<DaemonSignal> {
+        self.inner.daemon_signals.subscribe()
+    }
+
+    /// Feed one parsed SSE event into the per-session fan-out. This is the
+    /// generation-less ingestion seam (`dispatchEvent`,
+    /// `serve-manager.ts:429-432`) — test-facing in practice. It is
+    /// deliberately UNGATED (no era): the era fence guards the REAL
+    /// per-connection sinks (see [`Self::make_dispatch_sink`] and
+    /// [`dispatch_event_on_era`]); a production caller must ingest through
+    /// a sink, not this seam.
     pub fn dispatch_event(&self, event: ParsedServeEvent) {
         dispatch_event_on(&self.inner, event);
     }
 
+    /// Collect every registered session-emitter sender and CLEAR the shared
+    /// map — the sweep half of [`Self::emit_lost_for_all`], split out so the
+    /// daemon-loss path can run it INSIDE the `running` critical section
+    /// that removes the dead daemon (see [`Self::lose_daemon`]): while that
+    /// lock is held no successor daemon can cold-start (`ensure_started`
+    /// needs it), so every sender claimed here belongs to the daemon being
+    /// lost, and anything registered later (a successor's bridge) is never
+    /// swept by this loss.
+    fn take_session_emitters(&self) -> Vec<broadcast::Sender<SessionSignal>> {
+        let mut map = self
+            .inner
+            .session_emitters
+            .lock()
+            .expect("session emitters mutex");
+        let senders = map.values().cloned().collect();
+        map.clear();
+        senders
+    }
+
     /// Signal every subscriber that the sidecar was lost (`emitLostForAllSessions`,
-    /// `serve-manager.ts:126-132`). Exposed for the sidecar-loss liveness path/tests.
+    /// `serve-manager.ts:126-132`). Exposed for the sidecar-loss liveness path/tests
+    /// and the shutdown teardown. The daemon-LOSS path does NOT use this method:
+    /// it sweeps via [`Self::take_session_emitters`] inside its own `running`
+    /// critical section (see [`Self::lose_daemon`]) so a successor daemon's
+    /// fresh senders can never be wiped by a predecessor's late cleanup; this
+    /// whole-map form is correct only where no successor remains to protect
+    /// (final shutdown, liveness tests).
     pub fn emit_lost_for_all(&self) {
-        let emitters: Vec<broadcast::Sender<SessionSignal>> = {
-            let mut map = self
-                .inner
-                .session_emitters
-                .lock()
-                .expect("session emitters mutex");
-            let senders = map.values().cloned().collect();
-            map.clear();
-            senders
-        };
-        for sender in emitters {
+        for sender in self.take_session_emitters() {
             let _ = sender.send(SessionSignal::Lost);
         }
     }
 
-    async fn discard_running(&self, _reason: &str) {
-        let taken = self.inner.running.lock().await.take();
-        if let Some(running) = taken {
-            running.process.kill();
-        }
-        self.emit_lost_for_all();
+    /// The requested-loss arm: discard the running daemon the timed-out
+    /// request at `dispatched_base` was sent to (a Yes-lane request
+    /// timeout, …), WARN the Task-2 structured event, then run the shared
+    /// exactly-once loss path (Lost signal + backoff re-warm). A STALE
+    /// timeout — one whose daemon was already replaced — no-ops silently.
+    /// `reason` is `&'static` because it rides the [`DaemonSignal::Lost`]
+    /// broadcast to daemon-signal subscribers.
+    async fn discard_running(&self, reason: &'static str, dispatched_base: &str) {
+        self.lose_daemon(LossArm::Discard {
+            reason,
+            dispatched_base,
+        })
+        .await;
     }
 
     // ── the IDLE edge (once_idle / await_idle, serve-manager.ts:440-520) ─────────
@@ -1509,8 +2020,22 @@ impl OpencodeServeManager {
     /// the dropped handle), and signal all sessions lost (`shutdown`, `serve-manager.ts:573-591`).
     pub async fn shutdown(&self) {
         self.inner.shutdown.store(true, Ordering::SeqCst);
-        let taken = self.inner.running.lock().await.take();
+        let taken = {
+            let mut running = self.inner.running.lock().await;
+            // The take retires the dispatch era under the lock — the same
+            // era-gate invariant as the loss path (a late event from the
+            // daemon being taken must never dispatch past the take).
+            self.retire_event_era();
+            running.take()
+        };
         if let Some(running) = taken {
+            // The requested-loss discipline: abort the watcher so the shutdown
+            // kill never raises the crash event. No `Lost` signal, no re-warm —
+            // the shutdown flag set above blocks `schedule_re_warm`, and the
+            // server is going down.
+            if let Some(watch) = &running._exit_watch {
+                watch.abort();
+            }
             running.process.kill();
         }
         self.emit_lost_for_all();
@@ -1518,19 +2043,54 @@ impl OpencodeServeManager {
 }
 
 fn dispatch_event_on(inner: &Arc<Inner>, event: ParsedServeEvent) {
+    dispatch_event_on_era(inner, event, None);
+}
+
+/// The era-verified dispatch (ep2-r3 fresheyes Major — the check-to-dispatch
+/// TOCTOU): era verification is ATOMIC with dispatch. `Some(era)` (the sink
+/// path, carrying the era its daemon connected under) is re-verified UNDER
+/// the `session_emitters` mutex, and the mutex is held across the
+/// check → sender-selection → send — the review's required invariant,
+/// exactly: an event dispatches into a session's sender only if the event's
+/// daemon era matches the CURRENT era, verified under the lock the sweep
+/// itself must take. The take retires the era (an atomic increment) BEFORE
+/// its sweep claims the emitters mutex, so a callback that re-verifies under
+/// this lock either sees the retired era (the event is dropped BEFORE any
+/// entry is selected or created — a retired-era event can never mint an
+/// emitter entry) or holds the lock ahead of the sweep, in which case every
+/// entry it selects was registered in its OWN era (the sweep clears the map
+/// at every retirement). Either way no stale-era event can reach a
+/// successor-era registration, whatever the OS scheduler does between a
+/// sink's fast-path check and this dispatch.
+///
+/// `None` (the pub [`OpencodeServeManager::dispatch_event`] seam) is the
+/// generation-less legacy lane, deliberately ungated — its callers are tests
+/// and test helpers; if a production caller ever appears it must go through
+/// a sink (or carry an era here).
+fn dispatch_event_on_era(inner: &Arc<Inner>, event: ParsedServeEvent, era: Option<u64>) {
     let Some(session_id) = event.session_id.clone() else {
         return;
     };
-    let sender = {
-        let mut emitters = inner
-            .session_emitters
-            .lock()
-            .expect("session emitters mutex");
-        emitters
-            .entry(session_id)
-            .or_insert_with(|| broadcast::Sender::new(SESSION_CHANNEL_CAPACITY))
-            .clone()
-    };
+    let mut emitters = inner
+        .session_emitters
+        .lock()
+        .expect("session emitters mutex");
+    if let Some(era) = era {
+        if inner.event_era.load(Ordering::Acquire) != era {
+            // The era this event originated from was retired while the
+            // callback was in flight (after its sink passed the check,
+            // before this lock): drop it under the lock — never dispatched,
+            // never an entry.
+            return;
+        }
+    }
+    let sender = emitters
+        .entry(session_id)
+        .or_insert_with(|| broadcast::Sender::new(SESSION_CHANNEL_CAPACITY))
+        .clone();
+    // The send rides inside the same critical section: the selected sender
+    // is the era-verified one, and `broadcast::Sender::send` is a
+    // non-blocking enqueue (no re-entrancy into this mutex).
     let _ = sender.send(SessionSignal::Event(event));
 }
 
@@ -1617,7 +2177,7 @@ fn encode_path_segment(segment: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     // ── display_error_chain (transport diagnostics preservation) ─────────────
 
@@ -1774,18 +2334,24 @@ mod tests {
     // ── compact (POST /session/:id/summarize) + get_config (GET /config) ────────
 
     /// A `ServeHttp` fake that records every request (`METHOD url body?`) and scripts
-    /// responses: healthy probes, summarize per `summarize_status`, fork per
-    /// `fork_status`/`fork_body`, `/config` per `config_body`, everything else a
+    /// responses: healthy probes, summarize per `summarize_status` (or a NEVER-resolving
+    /// response when `summarize_pending` — the wedged shape from
+    /// `tests/serve_health_bounded.rs`), fork per `fork_status`/`fork_body`, `/config`
+    /// per `config_body` (or never-resolving when `config_pending`), `/prompt_async`
+    /// never-resolving when `prompt_pending`, everything else a
     /// benign 200 `{}`. Per-request timeouts land in the index-aligned
     /// [`RecordingHttp::timeouts`] vec (`requests[i]`'s timeout is `timeouts[i]`).
     struct RecordingHttp {
         requests: Mutex<Vec<(String, String, Option<String>)>>,
         timeouts: Mutex<Vec<Option<Duration>>>,
         summarize_status: u16,
+        summarize_pending: bool,
         fork_status: u16,
         fork_body: Vec<u8>,
         config_body: Vec<u8>,
+        config_pending: bool,
         revert_status: u16,
+        prompt_pending: bool,
     }
 
     impl RecordingHttp {
@@ -1794,10 +2360,13 @@ mod tests {
                 requests: Mutex::new(Vec::new()),
                 timeouts: Mutex::new(Vec::new()),
                 summarize_status: 200,
+                summarize_pending: false,
                 fork_status: 200,
                 fork_body: br#"{"id":"ses_child","directory":"/tmp/x"}"#.to_vec(),
                 config_body: br#"{"model":null}"#.to_vec(),
+                config_pending: false,
                 revert_status: 200,
+                prompt_pending: false,
             }
         }
 
@@ -1839,6 +2408,14 @@ mod tests {
                 return Box::pin(async { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) });
             }
             if req.url.contains("/summarize") {
+                if self.summarize_pending {
+                    // A genuine wedge: the response NEVER resolves — only the
+                    // caller's per-request bound can settle it.
+                    return Box::pin(async {
+                        std::future::pending::<()>().await;
+                        unreachable!()
+                    });
+                }
                 let status = self.summarize_status;
                 let body = if status == 200 {
                     // VALIDATED 1.18.18 contract: the summarize success body is a boolean.
@@ -1863,8 +2440,24 @@ mod tests {
                 return Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) });
             }
             if req.url.contains("/config") {
+                if self.config_pending {
+                    // A genuine wedge: the response NEVER resolves — only the
+                    // caller's per-request bound can settle it.
+                    return Box::pin(async {
+                        std::future::pending::<()>().await;
+                        unreachable!()
+                    });
+                }
                 let body = self.config_body.clone();
                 return Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) });
+            }
+            if req.url.contains("/prompt_async") && self.prompt_pending {
+                // A genuine wedge: the response NEVER resolves — only the
+                // caller's per-request bound can settle it.
+                return Box::pin(async {
+                    std::future::pending::<()>().await;
+                    unreachable!()
+                });
             }
             Box::pin(async move { Ok(ServeHttpResponse::new(200, b"{}".to_vec())) })
         }
@@ -1898,11 +2491,56 @@ mod tests {
         }
     }
 
+    /// A never-exiting serve process whose `kill()` calls are COUNTED — the
+    /// discard-on-timeout assertion seam (the `tests/serve_health_bounded.rs`
+    /// `NeverExitsProcess` pattern).
+    struct KillCountingProcess {
+        killed: Arc<AtomicUsize>,
+    }
+    impl ServeProcess for KillCountingProcess {
+        fn exited(&self) -> Option<i32> {
+            None
+        }
+        fn take_fatal_startup_error(&self) -> Option<String> {
+            None
+        }
+        fn kill(&self) {
+            self.killed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct KillCountingSpawner {
+        killed: Arc<AtomicUsize>,
+    }
+    impl ProcessSpawner for KillCountingSpawner {
+        fn spawn(&self, _req: SpawnRequest) -> Result<Box<dyn ServeProcess>, String> {
+            Ok(Box::new(KillCountingProcess {
+                killed: self.killed.clone(),
+            }))
+        }
+    }
+
     struct NoopHandle;
     impl EventStreamHandle for NoopHandle {}
     struct NoopEventSource;
     impl EventSource for NoopEventSource {
         fn connect(&self, _url: String, _sink: EventSink) -> Box<dyn EventStreamHandle> {
+            Box::new(NoopHandle)
+        }
+    }
+
+    /// An [`EventSource`] that RECORDS every sink it is handed (one per cold
+    /// start, in connect order) — the REAL per-connection dispatch closures
+    /// the manager mints at each daemon's connect, so a test can call a
+    /// daemon generation's sink directly, carrying that generation's
+    /// identity (the `tests/serve_daemon_selfheal.rs`
+    /// `RecordingEventSource` shape, unit-side).
+    struct RecordingEventSource {
+        sinks: Mutex<Vec<EventSink>>,
+    }
+    impl EventSource for RecordingEventSource {
+        fn connect(&self, _url: String, sink: EventSink) -> Box<dyn EventStreamHandle> {
+            self.sinks.lock().expect("recorded sinks mutex").push(sink);
             Box::new(NoopHandle)
         }
     }
@@ -1917,6 +2555,26 @@ mod tests {
     ) -> OpencodeServeManager {
         let deps = ServeDeps {
             spawner: Arc::new(FakeSpawner),
+            http,
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let mgr = OpencodeServeManager::new(deps, config);
+        mgr.ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        mgr
+    }
+
+    /// [`started_recording_manager_with_config`] with a kill-counting spawner,
+    /// for the lanes that must NEVER kill the shared daemon.
+    async fn started_recording_manager_counting_kills(
+        http: Arc<RecordingHttp>,
+        config: ServeConfig,
+        killed: Arc<AtomicUsize>,
+    ) -> OpencodeServeManager {
+        let deps = ServeDeps {
+            spawner: Arc::new(KillCountingSpawner { killed }),
             http,
             ports: Arc::new(FakeAllocator),
             events: Arc::new(NoopEventSource),
@@ -2135,6 +2793,53 @@ mod tests {
         }
     }
 
+    // 2026-09-20 incident: a compact timeout (600 s budget) ran the
+    // DiscardOnTimeout::Yes arm and KILLED the one shared `opencode serve`
+    // daemon for every freshopencode session. The compact lane must degrade
+    // like the FR2 snapshot lane: the POST times out, the daemon survives.
+    #[tokio::test]
+    async fn compact_timeout_does_not_kill_the_shared_daemon() {
+        let killed = Arc::new(AtomicUsize::new(0));
+        let http = Arc::new(RecordingHttp {
+            summarize_pending: true,
+            ..RecordingHttp::new()
+        });
+        let config = ServeConfig {
+            compact_timeout: Duration::from_millis(50),
+            ..ServeConfig::default()
+        };
+        let mgr =
+            started_recording_manager_counting_kills(http.clone(), config, killed.clone()).await;
+
+        let err = mgr
+            .compact("ses_timeout", "prov-a", "mdl-x", &None, None, None)
+            .await
+            .expect_err("the summarize POST must time out");
+        assert!(
+            matches!(err, ServeError::RequestTimeout { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            killed.load(Ordering::SeqCst),
+            0,
+            "a compact timeout must NEVER kill the shared daemon"
+        );
+        assert!(
+            mgr.base_url().await.is_some(),
+            "the running entry must survive a compact timeout"
+        );
+        // The compact-timeout POST must still carry the dedicated budget.
+        let requests = http.recorded();
+        let summarize_index = requests
+            .iter()
+            .position(|(method, url, _)| method == "POST" && url.contains("/summarize"))
+            .expect("a summarize POST was recorded");
+        assert_eq!(
+            http.recorded_timeout(summarize_index),
+            Some(Duration::from_millis(50))
+        );
+    }
+
     #[tokio::test]
     async fn get_config_returns_the_raw_config_body() {
         let http = Arc::new(RecordingHttp {
@@ -2153,6 +2858,40 @@ mod tests {
             .find(|(method, url, _)| method == "GET" && url.contains("/config"))
             .expect("a /config GET was recorded");
         assert!(body.is_none(), "GET /config carries no body");
+    }
+
+    // The compact drive's pre-flight model-pair resolution reads /config; a slow
+    // config GET is the same defect class (a read must never kill the daemon).
+    #[tokio::test]
+    async fn get_config_timeout_does_not_kill_the_shared_daemon() {
+        let killed = Arc::new(AtomicUsize::new(0));
+        let http = Arc::new(RecordingHttp {
+            config_pending: true,
+            ..RecordingHttp::new()
+        });
+        let config = ServeConfig {
+            request_timeout: Duration::from_millis(50),
+            ..ServeConfig::default()
+        };
+        let mgr = started_recording_manager_counting_kills(http, config, killed.clone()).await;
+
+        let err = mgr
+            .get_config(&None)
+            .await
+            .expect_err("config GET must time out");
+        assert!(
+            matches!(err, ServeError::RequestTimeout { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(
+            killed.load(Ordering::SeqCst),
+            0,
+            "a config read timeout must NEVER kill the shared daemon"
+        );
+        assert!(
+            mgr.base_url().await.is_some(),
+            "the running entry must survive a config read timeout"
+        );
     }
 
     // ── fork (POST /session/:id/fork) ────────────────────────────────────────
@@ -2752,6 +3491,341 @@ mod tests {
             "no content substring survives into the warning: {:?}",
             events[0]
         );
+    }
+
+    /// 2026-09-20 incident: the daemon discard that killed the shared serve left
+    /// ZERO log trace (its reason parameter went unused), so the shared-daemon
+    /// death was undiagnosable from the structured JSONL log. The discard must
+    /// be observable: a WARN `freshagent.opencode.daemon_discarded` naming its
+    /// reason. Driven through `prompt_async` — a deliberate
+    /// `DiscardOnTimeout::Yes` lane — so a pending prompt POST times out and
+    /// takes the discard path.
+    #[tokio::test]
+    async fn discard_running_emits_a_structured_warn_with_its_reason() {
+        let killed = Arc::new(AtomicUsize::new(0));
+        let http = Arc::new(RecordingHttp {
+            prompt_pending: true,
+            ..RecordingHttp::new()
+        });
+        let config = ServeConfig {
+            request_timeout: Duration::from_millis(50),
+            ..ServeConfig::default()
+        };
+        let (events, _guard) = config_capture::capture();
+        let mgr = started_recording_manager_counting_kills(http, config, killed.clone()).await;
+
+        let err = mgr
+            .prompt_async(
+                "ses_discard",
+                build_prompt_body("hi", None, None),
+                &None,
+                None,
+            )
+            .await
+            .expect_err("the prompt POST must time out");
+        assert!(
+            matches!(err, ServeError::RequestTimeout { .. }),
+            "got {err:?}"
+        );
+        // The discard itself ran: the Yes-lane timeout took the daemon down.
+        assert_eq!(
+            killed.load(Ordering::SeqCst),
+            1,
+            "the discard must actually kill the running daemon here"
+        );
+        let events = events.lock().expect("capture lock");
+        let discard = events
+            .iter()
+            .find(|fields| {
+                fields.get("message").map(String::as_str)
+                    == Some("freshagent.opencode.daemon_discarded")
+            })
+            .expect("a daemon discard must emit freshagent.opencode.daemon_discarded");
+        assert_eq!(
+            discard.get("reason").map(String::as_str),
+            Some("request_timeout"),
+            "the discard warn carries its reason: {discard:?}"
+        );
+    }
+
+    // ── Task 3: the daemon exit watcher's loss path (unit side) ──────────────
+
+    /// A serve whose "exit" is test-controlled: `exited()` reports `Some(0)`
+    /// once the shared flag is set (the `tests/serve_daemon_selfheal.rs`
+    /// `FlagExitProcess` shape, unit-side).
+    struct FlagExitProcess {
+        exited: Arc<AtomicBool>,
+        killed: Arc<AtomicUsize>,
+    }
+    impl ServeProcess for FlagExitProcess {
+        fn exited(&self) -> Option<i32> {
+            self.exited.load(Ordering::SeqCst).then_some(0)
+        }
+        fn take_fatal_startup_error(&self) -> Option<String> {
+            None
+        }
+        fn kill(&self) {
+            self.killed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct FlagExitSpawner {
+        exited: Arc<AtomicBool>,
+        killed: Arc<AtomicUsize>,
+    }
+    impl ProcessSpawner for FlagExitSpawner {
+        fn spawn(&self, _req: SpawnRequest) -> Result<Box<dyn ServeProcess>, String> {
+            Ok(Box::new(FlagExitProcess {
+                exited: self.exited.clone(),
+                killed: self.killed.clone(),
+            }))
+        }
+    }
+
+    /// The watcher's unrequested-exit arm must WARN
+    /// `freshagent.opencode.daemon_crash_detected` with the loss reason and
+    /// the dead daemon's base URL — the diagnosability complement of the
+    /// Task-2 discard log (a silent shared-daemon death was the incident's
+    /// undiagnosable half). The watcher task runs on this current-thread
+    /// runtime, so the thread-local capture sees its WARN; awaiting the
+    /// `DaemonSignal::Lost` edge first guarantees the loss path already ran.
+    #[tokio::test]
+    async fn unrequested_daemon_exit_warns_daemon_crash_detected_with_reason_and_base_url() {
+        let exited = Arc::new(AtomicBool::new(false));
+        let killed = Arc::new(AtomicUsize::new(0));
+        let deps = ServeDeps {
+            spawner: Arc::new(FlagExitSpawner {
+                exited: exited.clone(),
+                killed: killed.clone(),
+            }),
+            http: Arc::new(RecordingHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            daemon_watch_interval: Duration::from_millis(5),
+            re_warm_backoff_initial_ms: 5,
+            re_warm_backoff_max_ms: 50,
+            ..ServeConfig::default()
+        };
+        let mgr = OpencodeServeManager::new(deps, config);
+        mgr.ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        let mut signals = mgr.subscribe_daemon_signals();
+        let (events, _guard) = config_capture::capture();
+
+        exited.store(true, Ordering::SeqCst); // the daemon "exits"
+        let signal = tokio::time::timeout(Duration::from_secs(2), signals.recv())
+            .await
+            .expect("loss signal within budget")
+            .expect("channel alive");
+        assert!(
+            matches!(
+                signal,
+                DaemonSignal::Lost {
+                    reason: "process_exit"
+                }
+            ),
+            "got {signal:?}"
+        );
+        assert!(
+            killed.load(Ordering::SeqCst) >= 1,
+            "the already-exited daemon is still kill()ed for /proc-reaper parity"
+        );
+
+        let events = events.lock().expect("capture lock");
+        let warn = events
+            .iter()
+            .find(|fields| {
+                fields.get("message").map(String::as_str)
+                    == Some("freshagent.opencode.daemon_crash_detected")
+            })
+            .expect("an unrequested daemon exit must WARN daemon_crash_detected");
+        assert_eq!(
+            warn.get("reason").map(String::as_str),
+            Some("process_exit"),
+            "the crash warn names the loss reason: {warn:?}"
+        );
+        assert_eq!(
+            warn.get("base_url").map(String::as_str),
+            Some("http://127.0.0.1:1"),
+            "the crash warn names the dead daemon's base URL: {warn:?}"
+        );
+    }
+
+    // ── ep2-r3 fresheyes Major: the check-to-dispatch TOCTOU ──────────────
+
+    /// The era check is not atomic with dispatch into `session_emitters`
+    /// (ep2-r3 fresheyes Major — the check-to-dispatch TOCTOU): a callback
+    /// can pass the check, be preempted before `dispatch_event_on` acquires
+    /// the emitter mutex, and resume only after its daemon's loss was
+    /// TAKEN (the era retired, the emitters swept) and the successor
+    /// registered a replacement sender — the stale event is then delivered
+    /// into the successor's registration; a stale `session.idle` would
+    /// falsely satisfy the successor's `await_idle` (the false
+    /// `freshAgent.turn.complete` precursor).
+    ///
+    /// The interleaving, forced deterministically through the
+    /// `cfg(test)` dispatch park: A's REAL sink passes the era check and
+    /// PARKS; while held, A is lost through the REAL watcher arm (take +
+    /// era retire + sweep) and the successor B re-warms (its own sink
+    /// connected); a B-era `await_idle` is subscribed and IN FLIGHT for
+    /// the durable session; only then is the parked callback released —
+    /// its era check ALREADY PASSED, so only a re-verification atomic
+    /// with dispatch can stop it. The stale A-era event must NOT satisfy
+    /// B's await. A GENUINE B-era idle through B's own sink still must
+    /// (the gate is an era fence, not a broken dispatch). Pre-fix, the
+    /// released callback dispatched straight into B's fresh registration
+    /// and the successor's await resolved Ok.
+    #[tokio::test]
+    async fn a_preempted_era_checked_event_never_reaches_the_successors_registration() {
+        let exited = Arc::new(AtomicBool::new(false));
+        let killed = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(RecordingEventSource {
+            sinks: Mutex::new(Vec::new()),
+        });
+        let deps = ServeDeps {
+            spawner: Arc::new(FlagExitSpawner {
+                exited: exited.clone(),
+                killed: killed.clone(),
+            }),
+            http: Arc::new(RecordingHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: events.clone(),
+        };
+        let config = ServeConfig {
+            daemon_watch_interval: Duration::from_millis(5),
+            re_warm_backoff_initial_ms: 5,
+            re_warm_backoff_max_ms: 50,
+            ..ServeConfig::default()
+        };
+        let mgr = OpencodeServeManager::new(deps, config);
+        mgr.ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        let mut signals = mgr.subscribe_daemon_signals();
+        let sink_a = events
+            .sinks
+            .lock()
+            .expect("recorded sinks mutex")
+            .first()
+            .expect("A's cold start connected its event stream")
+            .clone();
+
+        // The park: `entered` fires once the callback has passed A's era
+        // check; dropping `release_tx` resumes it. The release receiver
+        // rides a Mutex because the park closure must be `Sync` (an
+        // `EventSink` requirement) and only the parked callback ever
+        // touches it.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        mgr.arm_dispatch_park_for_tests(Some(Arc::new(move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.lock().expect("release latch mutex").recv();
+        })));
+
+        // The preempted A-era callback, on its own OS thread: the sink is
+        // synchronous, and the runtime must stay free to run the loss and
+        // the re-warm while the callback is held.
+        let done = Arc::new(AtomicBool::new(false));
+        let done_thread = done.clone();
+        let idle_event = || {
+            crate::events::parse_serve_event(&serde_json::json!({
+                "type": "session.idle",
+                "properties": { "sessionID": "ses_race" }
+            }))
+            .expect("parseable serve event")
+        };
+        let sink_thread = std::thread::spawn(move || {
+            sink_a(idle_event());
+            done_thread.store(true, Ordering::SeqCst);
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the sink parks after passing the era check, before dispatch");
+
+        // While the callback is held: A dies through the REAL watcher arm —
+        // the take retires the dispatch era and sweeps the emitters inside
+        // the same running-lock critical section.
+        exited.store(true, Ordering::SeqCst);
+        let lost = tokio::time::timeout(Duration::from_secs(2), signals.recv())
+            .await
+            .expect("loss signal within budget")
+            .expect("channel alive");
+        assert!(
+            matches!(
+                lost,
+                DaemonSignal::Lost {
+                    reason: "process_exit"
+                }
+            ),
+            "got {lost:?}"
+        );
+        // The successor B re-warms — a NEW generation with its own sink.
+        exited.store(false, Ordering::SeqCst);
+        let started = tokio::time::timeout(Duration::from_secs(2), signals.recv())
+            .await
+            .expect("re-warm within budget")
+            .expect("channel alive");
+        assert!(matches!(started, DaemonSignal::Started), "got {started:?}");
+        let sink_b = events
+            .sinks
+            .lock()
+            .expect("recorded sinks mutex")
+            .get(1)
+            .expect("B's cold start connected its event stream")
+            .clone();
+
+        // The B-era registration the stale event must not reach: an
+        // in-flight `await_idle` for the durable session.
+        let rx = mgr.subscribe("ses_race");
+        let idle_manager = mgr.clone();
+        let mut await_idle = tokio::spawn(async move {
+            idle_manager
+                .await_idle("ses_race", rx, Duration::from_secs(5), None)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Release the preempted callback: the era check already passed —
+        // only an ATOMIC re-verification at dispatch can stop it now.
+        drop(release_tx);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !done.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "the parked callback must complete after the release"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+
+        // THE assertion: the stale A-era event must NOT satisfy B's await —
+        // the successor stays pending through the grace window.
+        match tokio::time::timeout(Duration::from_millis(300), &mut await_idle).await {
+            Err(_still_pending) => {}
+            Ok(Ok(Ok(()))) => panic!(
+                "the preempted A-era event — era-checked BEFORE the take, \
+                 dispatched AFTER the successor registered — satisfied the \
+                 successor's await_idle: the false freshAgent.turn.complete \
+                 precursor (ep2-r3 check-to-dispatch TOCTOU)"
+            ),
+            other => panic!("await_idle settled unexpectedly: {other:?}"),
+        }
+
+        // Positive control: a GENUINE B-era idle through B's OWN sink still
+        // satisfies it — the gate is an era fence, not a broken dispatch.
+        mgr.arm_dispatch_park_for_tests(None);
+        sink_b(idle_event());
+        let outcome = tokio::time::timeout(Duration::from_secs(2), await_idle)
+            .await
+            .expect("the genuine B-era idle resolves within budget");
+        assert!(
+            matches!(outcome, Ok(Ok(()))),
+            "the successor's own idle edge must satisfy await_idle, got {outcome:?}"
+        );
+        sink_thread.join().expect("the sink thread ends cleanly");
     }
 
     /// Spawn-level: a config-supplied inline document is MERGED into the launch

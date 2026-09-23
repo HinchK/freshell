@@ -22,6 +22,11 @@
       "role": "test-gate"
     },
     {
+      "id": "workflow-demos",
+      "path": ".github/workflows/demos.yml",
+      "role": "test-gate"
+    },
+    {
       "id": "electron-builder-config",
       "path": "config/electron-builder.yml",
       "role": "packaging-config"
@@ -279,11 +284,6 @@
     {
       "id": "scripts-cloud-exec-id-test",
       "path": "scripts/test/cloud-exec-id-parse.test.sh",
-      "role": "test-coordinator"
-    },
-    {
-      "id": "scripts-cloud-vitest-entrypoint-test",
-      "path": "scripts/test/cloud-vitest-entrypoint.test.sh",
       "role": "test-coordinator"
     },
     {

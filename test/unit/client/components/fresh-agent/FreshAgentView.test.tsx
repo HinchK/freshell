@@ -168,9 +168,11 @@ function createStore(tabTitleSetByUser = false, extraMiddleware: Middleware[] = 
 function StoreBackedFreshAgentView({
   tabId,
   paneId,
+  hidden = false,
 }: {
   tabId: string
   paneId: string
+  hidden?: boolean
 }) {
   const paneContent = useAppSelector((state) => {
     const layout = state.panes.layouts[tabId]
@@ -179,7 +181,7 @@ function StoreBackedFreshAgentView({
     }
     return layout.content
   })
-  return <FreshAgentView tabId={tabId} paneId={paneId} paneContent={paneContent} />
+  return <FreshAgentView tabId={tabId} paneId={paneId} paneContent={paneContent} hidden={hidden} />
 }
 
 function StoreBackedFreshAgentSettingsButton({
@@ -1927,6 +1929,358 @@ describe('FreshAgentView', () => {
     })
     expect(sentFreshAgentMessages('freshAgent.create')).toHaveLength(0)
     expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(1)
+  })
+
+  // 2026-09-20 incident (log-validated): the daemon died, the snapshot GET
+  // answered the typed 409 RESTORE_UNAVAILABLE for the pane's OWN stale
+  // Live{FreshAgent, gen 1} claim, and the pane dead-ended on a dismiss-only
+  // banner forever. The documented recovery is the generation-fenced attach +
+  // refetch — drive it once.
+  // LB-09: the mount attach already sends ONE freshAgent.attach on mount, so a
+  // bare length assertion is vacuous — read the baseline AFTER the mount
+  // settles and assert the POST-409 delta.
+  it('recovers a freshopencode pane from a snapshot 409 with one fenced attach and a refetch', async () => {
+    const store = createStore()
+    // Seed the runtime-owner record and make the 409 name a NEWER generation —
+    // the recovery attach MUST carry the 409's generation (fence bound to the
+    // refusal, not the possibly-stale record), or the wired server refuses it
+    // with FENCE_REQUIRED and the dead-end persists.
+    store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'opencode',
+      sessionId: 'ses_live',
+      epoch: 1,
+      generation: 1,
+      ownerKind: 'fresh-agent',
+      operationId: 'incident-live-claim',
+      transition: 'handoff-committed',
+    }))
+    // DEFER the first rejection until after the baseline is read — an
+    // immediately-rejected mock races the mount fetch (the recovery attach may
+    // land before the test snapshots the count).
+    let rejectFirstSnapshot!: (error: unknown) => void
+    apiMock.getFreshAgentThreadSnapshot
+      .mockImplementationOnce(() => new Promise<never>((_, reject) => {
+        rejectFirstSnapshot = reject
+      }))
+      .mockResolvedValue({
+        ...freshopencodeSnapshot('recovered transcript', 7),
+        threadId: 'ses_live',
+        sessionId: 'ses_live',
+      })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-live-409',
+        sessionId: 'ses_live',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_live' },
+        status: 'connected',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+    // The mount attach, settled (LB-09 baseline).
+    const attachCountBeforeRecovery = sentFreshAgentMessages('freshAgent.attach').length
+    expect(attachCountBeforeRecovery).toBe(1)
+    await act(async () => {
+      rejectFirstSnapshot(new ApiError(409, 'Session ses_live is still running on the server.', {
+        code: 'RESTORE_UNAVAILABLE',
+        ownerKind: 'fresh-agent',
+        ownerGeneration: 2,
+      }))
+    })
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(attachCountBeforeRecovery + 1)
+      const recoveryAttach = sentFreshAgentMessages('freshAgent.attach').at(-1)
+      expect(recoveryAttach?.observedEpoch).toBe(1) // the record's epoch
+      expect(recoveryAttach?.observedGeneration).toBe(2) // the 409's CURRENT generation, not the stale record's 1
+    })
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2) // exactly one recovery refetch
+    })
+    // The pane kept its identity (the 409 is NOT the 404 lost-thread reset):
+    expect(getFreshAgentPaneContent(store).sessionId).toBe('ses_live')
+    expect(getFreshAgentPaneContent(store).createRequestId).toBe('req-live-409')
+    // And no dead-end banner for the recovered pane:
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument())
+  })
+
+  // Task 5 review M2: a pane holding a superseded (alias) session id must
+  // fold the 409's refusal fence onto the CANONICAL owner record — the same
+  // record the recovery attach's fence read (selectPaneOwnerFence) resolves
+  // through the stored aliasOf chain. Folding the pane's RAW id lands on the
+  // inert alias mirror, the attach goes out with the canonical record's
+  // STALE generation, and the wired server refuses it with FENCE_REQUIRED.
+  it('recovers an aliased freshopencode pane from a snapshot 409 by folding the refusal onto the canonical owner record', async () => {
+    const store = createStore()
+    store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'opencode',
+      sessionId: 'ses_canonical',
+      epoch: 1,
+      generation: 1,
+      ownerKind: 'fresh-agent',
+      operationId: 'incident-live-claim',
+      transition: 'handoff-committed',
+    }))
+    // The rekey alias mirror (selectors-runtime-owner seeding pattern): the
+    // pane's superseded id resolves through the stored aliasOf chain to the
+    // canonical key.
+    store.dispatch(applyRuntimeOwner({
+      type: 'session.runtimeOwner',
+      provider: 'opencode',
+      sessionId: 'ses_alias',
+      epoch: 1,
+      generation: 1,
+      ownerKind: 'fresh-agent',
+      operationId: 'rekey-mirror',
+      transition: 'handoff-committed',
+      aliasOf: 'ses_canonical',
+    }))
+    let rejectFirstSnapshot!: (error: unknown) => void
+    apiMock.getFreshAgentThreadSnapshot
+      .mockImplementationOnce(() => new Promise<never>((_, reject) => {
+        rejectFirstSnapshot = reject
+      }))
+      .mockResolvedValue({
+        ...freshopencodeSnapshot('recovered transcript', 7),
+        threadId: 'ses_alias',
+        sessionId: 'ses_alias',
+      })
+    store.dispatch(initLayout({
+      tabId: 'tab-1',
+      paneId: 'pane-1',
+      content: {
+        kind: 'fresh-agent',
+        sessionType: 'freshopencode',
+        provider: 'opencode',
+        createRequestId: 'req-alias-409',
+        sessionId: 'ses_alias',
+        sessionRef: { provider: 'opencode', sessionId: 'ses_alias' },
+        status: 'connected',
+      },
+    }))
+
+    render(
+      <Provider store={store}>
+        <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+      </Provider>,
+    )
+    await waitFor(() => expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1))
+    // The mount attach, settled (LB-09 baseline).
+    const attachCountBeforeRecovery = sentFreshAgentMessages('freshAgent.attach').length
+    expect(attachCountBeforeRecovery).toBe(1)
+    await act(async () => {
+      rejectFirstSnapshot(new ApiError(409, 'Session ses_alias is still running on the server.', {
+        code: 'RESTORE_UNAVAILABLE',
+        ownerKind: 'fresh-agent',
+        ownerGeneration: 2,
+      }))
+    })
+    await waitFor(() => {
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(attachCountBeforeRecovery + 1)
+      const recoveryAttach = sentFreshAgentMessages('freshAgent.attach').at(-1)
+      expect(recoveryAttach?.observedEpoch).toBe(1) // the canonical record's epoch
+      expect(recoveryAttach?.observedGeneration).toBe(2) // the 409's CURRENT generation, not the canonical record's stale 1
+    })
+    // The fold landed on the CANONICAL record; the alias mirror stays inert.
+    const owners = store.getState().freshAgent.runtimeOwners
+    expect(owners['opencode:ses_canonical'].generation).toBe(2)
+    expect(owners['opencode:ses_alias'].generation).toBe(1)
+    await waitFor(() => {
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2) // exactly one recovery refetch
+    })
+    // The pane kept its identity (the 409 is NOT the 404 lost-thread reset):
+    expect(getFreshAgentPaneContent(store).sessionId).toBe('ses_alias')
+    expect(getFreshAgentPaneContent(store).createRequestId).toBe('req-alias-409')
+    // And no dead-end banner for the recovered pane:
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument())
+  })
+
+  it('does not loop recovery fetches on repeated 409s', async () => {
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+      // Every GET rejects with the same real ApiError (an Error instance) so
+      // handleSnapshotError preserves the 409's own message on the banner.
+      apiMock.getFreshAgentThreadSnapshot.mockRejectedValue(new ApiError(409, 'Session ses_live is still running on the server.', {
+        code: 'RESTORE_UNAVAILABLE',
+        ownerKind: 'fresh-agent',
+        ownerGeneration: 2,
+      }))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          createRequestId: 'req-live-409-loop',
+          sessionId: 'ses_live',
+          sessionRef: { provider: 'opencode', sessionId: 'ses_live' },
+          status: 'connected',
+        },
+      }))
+      render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      // Settle the mount fetch and the single recovery refetch (the second 409
+      // falls through to the honest banner — the recovery guard already
+      // consumed this pane identity). Advance the fake clock deterministically
+      // (the wall-clock debounce races under parallel suites — the sibling
+      // scheduler tests' note).
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      const baseline = sentFreshAgentMessages('freshAgent.attach').length
+      expect(screen.getByText(/still running on the server/i)).toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(baseline) // one recovery total, not per fetch (LB-03)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls.length).toBeLessThanOrEqual(3) // mount + recovery only — no loop
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      vi.useRealTimers()
+    }
+  })
+
+  // Task 5 review M3 (LB-04): a 409 arriving on the REVEAL lane (snapshotDirty
+  // armed by a hidden reconnect) must recover through requestRevealRefresh —
+  // the success-path reveal-dirty clear only runs for reveal-tagged
+  // refreshes, so a 'manual' refetch would leave the pane behind the
+  // "Refreshing conversation" overlay forever. Fake timers drive the
+  // debounced scheduler deterministically (the sibling loop test's pattern —
+  // the wall-clock debounce races under parallel suites).
+  it('recovers a reveal-lane 409 with snapshotDirty armed through the reveal refresh and clears the overlay', async () => {
+    vi.useFakeTimers()
+    try {
+      const store = createStore()
+      store.dispatch(applyRuntimeOwner({
+        type: 'session.runtimeOwner',
+        provider: 'opencode',
+        sessionId: 'ses_reveal',
+        epoch: 1,
+        generation: 1,
+        ownerKind: 'fresh-agent',
+        operationId: 'incident-live-claim',
+        transition: 'handoff-committed',
+      }))
+      let reconnectHandler: (() => void) | undefined
+      wsMock.onReconnect.mockImplementation((handler: () => void) => {
+        reconnectHandler = handler
+        return () => {}
+      })
+      let rejectRevealSnapshot!: (error: unknown) => void
+      let resolveRecoverySnapshot!: (value: unknown) => void
+      apiMock.getFreshAgentThreadSnapshot
+        .mockImplementationOnce(() => Promise.resolve({
+          ...freshopencodeSnapshot('hidden transcript', 5),
+          threadId: 'ses_reveal',
+          sessionId: 'ses_reveal',
+        }))
+        .mockImplementationOnce(() => new Promise<never>((_, reject) => {
+          rejectRevealSnapshot = reject
+        }))
+        .mockImplementationOnce(() => new Promise<unknown>((resolve) => {
+          resolveRecoverySnapshot = resolve
+        }))
+      store.dispatch(initLayout({
+        tabId: 'tab-1',
+        paneId: 'pane-1',
+        content: {
+          kind: 'fresh-agent',
+          sessionType: 'freshopencode',
+          provider: 'opencode',
+          createRequestId: 'req-reveal-409',
+          sessionId: 'ses_reveal',
+          sessionRef: { provider: 'opencode', sessionId: 'ses_reveal' },
+          status: 'connected',
+        },
+      }))
+
+      const view = render(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" hidden />
+        </Provider>,
+      )
+      // The hidden mount fetch (delay-0 'identity' trigger) lands its snapshot
+      // BEFORE the reconnect arms the reveal-dirty marker (its revision
+      // becomes the base the recovery refresh must beat). The 500ms drain
+      // settles the hidden mount attach's rebind-queue slot (the sibling
+      // hidden-rebind tests' pattern).
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(screen.getByText('hidden transcript')).toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(500) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      act(() => { reconnectHandler?.() })
+      // Still hidden: the reconnect defers the refresh to reveal — no fetch.
+      await act(async () => { await vi.advanceTimersByTimeAsync(0) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(1)
+      view.rerender(
+        <Provider store={store}>
+          <StoreBackedFreshAgentView tabId="tab-1" paneId="pane-1" />
+        </Provider>,
+      )
+      // Reveal drives the reveal-tagged refresh (the 250ms debounce fires
+      // within the advance; the reconnect attach's queue slot drains too).
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(2)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[1][3]).toMatchObject({ trigger: 'reveal' })
+      // The mount + reconnect attaches are settled (LB-09 baseline).
+      const attachCountBeforeRecovery = sentFreshAgentMessages('freshAgent.attach').length
+      expect(attachCountBeforeRecovery).toBe(2)
+      await act(async () => {
+        rejectRevealSnapshot(new ApiError(409, 'Session ses_reveal is still running on the server.', {
+          code: 'RESTORE_UNAVAILABLE',
+          ownerKind: 'fresh-agent',
+          ownerGeneration: 2,
+        }))
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      // The recovery attach carries the 409's CURRENT generation...
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(attachCountBeforeRecovery + 1)
+      const recoveryAttach = sentFreshAgentMessages('freshAgent.attach').at(-1)
+      expect(recoveryAttach?.observedEpoch).toBe(1)
+      expect(recoveryAttach?.observedGeneration).toBe(2)
+      // ...and the recovery refetch is REVEAL-tagged (LB-04), not manual.
+      await act(async () => { await vi.advanceTimersByTimeAsync(SNAPSHOT_DEBOUNCE_MS) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3)
+      expect(apiMock.getFreshAgentThreadSnapshot.mock.calls[2][3]).toMatchObject({ trigger: 'reveal' })
+      // The reveal-dirty overlay is up while the recovery refresh is pending...
+      expect(screen.getByRole('status', { name: 'Refreshing conversation' })).toBeInTheDocument()
+      await act(async () => {
+        resolveRecoverySnapshot({
+          ...freshopencodeSnapshot('recovered transcript', 7),
+          threadId: 'ses_reveal',
+          sessionId: 'ses_reveal',
+        })
+        await vi.advanceTimersByTimeAsync(0)
+      })
+      // ...and clears when the reveal refresh lands — a 'manual' refetch would
+      // leave it up forever.
+      expect(screen.queryByRole('status', { name: 'Refreshing conversation' })).not.toBeInTheDocument()
+      expect(screen.getByText('recovered transcript')).toBeInTheDocument()
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3) // mount + reveal + recovery reveal
+      // No spontaneous extra fetches or attaches beyond the one recovery.
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+      expect(apiMock.getFreshAgentThreadSnapshot).toHaveBeenCalledTimes(3)
+      expect(sentFreshAgentMessages('freshAgent.attach')).toHaveLength(attachCountBeforeRecovery + 1)
+    } finally {
+      cleanup()
+      resetSnapshotSchedulerForTests()
+      vi.useRealTimers()
+    }
   })
 
   it('attaches materialized FreshOpenCode panes with durable route metadata on mount and reconnect', async () => {

@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { chmodSync, mkdtempSync, mkdirSync, lstatSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -10,14 +11,26 @@ vi.mock('node:fs', async (importOriginal) => {
 })
 
 import {
-  collectProductionDependencyClosure,
+  RUNTIME_LAYOUT,
+  buildDeployArgs,
   findUnapprovedRuntimePaths,
+  getRuntimeAllowlist,
+  getNodeBinaryName,
   getNodeDownloadUrl,
   getRuntimeBinaryName,
   getRuntimePaths,
   moduleDirectoryFromUrl,
   stageElectronRuntime,
+  type DeployRuntimeArgs,
 } from '../../../scripts/prepare-electron-runtime.js'
+
+function nativePlatform(): 'darwin' | 'linux' | 'win32' {
+  return process.platform as 'darwin' | 'linux' | 'win32'
+}
+
+function nativeArch(): 'x64' | 'arm64' {
+  return process.arch as 'x64' | 'arm64'
+}
 
 function temporaryRoot(): string {
   return mkdtempSync(path.join(tmpdir(), 'freshell-electron-runtime-'))
@@ -33,72 +46,171 @@ function createSourceFixture(root: string): {
   serverBinary: string
   clientDir: string
   nodeBinary: string
-  claudeSidecarDir: string
   mcpDistDir: string
-  nodeModulesDir: string
-  packageLockPath: string
 } {
-  writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'freshell', version: '0.7.5', dependencies: { '@modelcontextprotocol/sdk': '^1.0.0', zod: '^4.0.0' } }))
+  writeFileSync(path.join(root, 'package.json'), JSON.stringify({
+    name: 'freshell',
+    version: '0.7.5',
+    packageManager: 'pnpm@10.34.5',
+  }))
+  writeFileSync(path.join(root, 'pnpm-lock.yaml'), "lockfileVersion: '10.0'\n")
+  writeFileSync(path.join(root, 'pnpm-workspace.yaml'), 'packages:\n  - crates/*\n  - packages/*\n')
+  const packagingDir = path.join(root, 'packages', 'freshell-mcp-runtime')
+  mkdirSync(packagingDir, { recursive: true })
+  writeFileSync(path.join(packagingDir, 'package.json'), JSON.stringify({
+    name: 'freshell-mcp-runtime',
+    version: '0.1.0',
+    private: true,
+    type: 'module',
+    dependencies: {
+      '@modelcontextprotocol/sdk': '1.30.0',
+      zod: '4.3.6',
+    },
+    files: ['generated'],
+  }))
+  const sidecarDir = path.join(root, 'crates', 'freshell-claude-sidecar')
+  mkdirSync(sidecarDir, { recursive: true })
+  writeFileSync(path.join(sidecarDir, 'package.json'), JSON.stringify({
+    name: 'freshell-claude-sidecar',
+    version: '0.1.0',
+    type: 'module',
+  }))
+
   const serverBinary = path.join(root, 'target', 'release', 'freshell-server')
   const clientDir = path.join(root, 'dist', 'client')
   const nodeBinary = path.join(root, 'node-bin', 'node')
-  const claudeSidecarDir = path.join(root, 'crates', 'freshell-claude-sidecar')
   const mcpDistDir = path.join(root, 'dist', 'tools')
-  const nodeModulesDir = path.join(root, 'node_modules')
 
   writeExecutable(serverBinary)
   mkdirSync(clientDir, { recursive: true })
   writeFileSync(path.join(clientDir, 'index.html'), '<!doctype html><title>Freshell</title>')
   writeExecutable(nodeBinary)
-  mkdirSync(claudeSidecarDir, { recursive: true })
-  writeFileSync(path.join(claudeSidecarDir, 'index.mjs'), [
-    "import { configureSession } from './session-settings.mjs'",
-    "import { probeModelCatalog } from './model-catalog.mjs'",
-    "console.log(JSON.stringify({ configureSession: typeof configureSession, probeModelCatalog: typeof probeModelCatalog }))",
-  ].join('\n') + '\n')
-  writeFileSync(path.join(claudeSidecarDir, 'permission-channel.mjs'), 'export {}\n')
-  writeFileSync(path.join(claudeSidecarDir, 'session-settings.mjs'), 'export const configureSession = () => ({ staged: true })\n')
-  writeFileSync(path.join(claudeSidecarDir, 'model-catalog.mjs'), 'export const probeModelCatalog = () => [{ value: "staged-model" }]\n')
-  writeFileSync(path.join(claudeSidecarDir, 'package.json'), JSON.stringify({ name: 'freshell-claude-sidecar', version: '0.1.0' }))
-  writeFileSync(path.join(claudeSidecarDir, 'package-lock.json'), JSON.stringify({
-    lockfileVersion: 3,
-    packages: {
-      'node_modules/@anthropic-ai/claude-agent-sdk': { version: '1.0.0' },
-    },
-  }))
-  mkdirSync(path.join(claudeSidecarDir, 'node_modules', '@anthropic-ai', 'claude-agent-sdk'), { recursive: true })
-  writeFileSync(path.join(claudeSidecarDir, 'node_modules', '@anthropic-ai', 'claude-agent-sdk', 'package.json'), JSON.stringify({ name: '@anthropic-ai/claude-agent-sdk', version: '1.0.0' }))
-
   mkdirSync(path.join(mcpDistDir, 'freshell-mcp'), { recursive: true })
   mkdirSync(path.join(mcpDistDir, 'node-client-runtime'), { recursive: true })
   writeFileSync(path.join(mcpDistDir, 'freshell-mcp', 'server.js'), 'import "@modelcontextprotocol/sdk/server/stdio.js"\n')
   writeFileSync(path.join(mcpDistDir, 'freshell-mcp', 'freshell-tool.js'), 'export const executeAction = () => ({})\n')
-  writeFileSync(path.join(mcpDistDir, 'node-client-runtime', 'keys.js'), 'export {}\n')
-  writeFileSync(path.join(mcpDistDir, 'node-client-runtime', 'action-capabilities.js'), 'export {}\n')
+  writeFileSync(path.join(mcpDistDir, 'node-client-runtime', 'keys.js'), 'export const keys = 1\n')
+  writeFileSync(path.join(mcpDistDir, 'node-client-runtime', 'action-capabilities.js'), 'export const caps = 2\n')
 
-  const packageLock = {
-    name: 'freshell',
-    version: '0.7.5',
-    lockfileVersion: 3,
-    packages: {
-      '': { name: 'freshell', version: '0.7.5' },
-      'node_modules/@modelcontextprotocol/sdk': { version: '1.0.0', dependencies: { zod: '^4.0.0', transitive: '^1.0.0' } },
-      'node_modules/zod': { version: '4.0.0' },
-      'node_modules/transitive': { version: '1.0.0', dependencies: { leaf: '^1.0.0' } },
-      'node_modules/leaf': { version: '1.0.0' },
-      'node_modules/unrelated': { version: '1.0.0' },
+  return { serverBinary, clientDir, nodeBinary, mcpDistDir }
+}
+
+function writeBinShim(root: string, packageDir: string, binName: string, binRelative: string): void {
+  // Hoisted deploys emit relative .bin shims; everything else is ordinary files.
+  writeExecutable(path.join(root, 'node_modules', packageDir, binRelative), '#!/usr/bin/env node\nconsole.log("shim")\n')
+  mkdirSync(path.join(root, 'node_modules', '.bin'), { recursive: true })
+  symlinkSync(path.join('..', packageDir, binRelative), path.join(root, 'node_modules', '.bin', binName))
+}
+
+function sidecarDeployFixture(destination: string): void {
+  writeFileSync(path.join(destination, 'index.mjs'), [
+    "import { configureSession } from './session-settings.mjs'",
+    "import { probeModelCatalog } from './model-catalog.mjs'",
+    "console.log(JSON.stringify({ configureSession: typeof configureSession, probeModelCatalog: typeof probeModelCatalog }))",
+  ].join('\n') + '\n')
+  writeFileSync(path.join(destination, 'permission-channel.mjs'), 'export {}\n')
+  writeFileSync(path.join(destination, 'session-settings.mjs'), 'export const configureSession = () => ({ staged: true })\n')
+  writeFileSync(path.join(destination, 'model-catalog.mjs'), 'export const probeModelCatalog = () => [{ value: "staged-model" }]\n')
+  writeFileSync(path.join(destination, 'package.json'), JSON.stringify({ name: 'freshell-claude-sidecar', version: '0.1.0', type: 'module' }))
+  writeFileSync(path.join(destination, 'pnpm-lock.yaml'), "lockfileVersion: '10.0'\n")
+  const sdkDir = path.join(destination, 'node_modules', '@anthropic-ai', 'claude-agent-sdk')
+  mkdirSync(sdkDir, { recursive: true })
+  writeFileSync(path.join(sdkDir, 'package.json'), JSON.stringify({ name: '@anthropic-ai/claude-agent-sdk', version: '0.3.237' }))
+  writeBinShim(destination, 'which', 'node-which', 'bin/node-which')
+  mkdirSync(path.join(destination, 'node_modules', '.pnpm'), { recursive: true })
+  writeFileSync(path.join(destination, 'node_modules', '.pnpm', 'lock.yaml'), 'inert pnpm install state\n')
+}
+
+function mcpDeployFixture(destination: string, generatedSource: string): void {
+  writeFileSync(path.join(destination, 'package.json'), JSON.stringify({
+    name: 'freshell-mcp-runtime',
+    version: '0.1.0',
+    private: true,
+    type: 'module',
+    dependencies: {
+      // pnpm's deploy annotates peer resolutions in the exported manifest.
+      '@modelcontextprotocol/sdk': '1.30.0(zod@4.3.6)',
+      zod: '4.3.6',
     },
+    files: ['generated'],
+  }))
+  writeFileSync(path.join(destination, 'pnpm-lock.yaml'), "lockfileVersion: '10.0'\n")
+  const generatedDir = path.join(destination, 'generated')
+  mkdirSync(generatedDir, { recursive: true })
+  for (const name of ['freshell-mcp', 'node-client-runtime']) {
+    const source = path.join(generatedSource, name)
+    for (const entry of readdirSync(source)) {
+      const from = path.join(source, entry)
+      const to = path.join(generatedDir, name, entry)
+      mkdirSync(path.dirname(to), { recursive: true })
+      writeFileSync(to, readFileSync(from))
+    }
   }
-  const packageLockPath = path.join(root, 'package-lock.json')
-  writeFileSync(packageLockPath, JSON.stringify(packageLock, null, 2))
-  for (const [name, version] of [['@modelcontextprotocol/sdk', '1.0.0'], ['zod', '4.0.0'], ['transitive', '1.0.0'], ['leaf', '1.0.0'], ['unrelated', '1.0.0']]) {
-    const packageDir = path.join(nodeModulesDir, name)
-    mkdirSync(packageDir, { recursive: true })
-    writeFileSync(path.join(packageDir, 'package.json'), JSON.stringify({ name, version }))
-    writeFileSync(path.join(packageDir, 'index.js'), `export const version = ${JSON.stringify(version)}\n`)
-  }
+  const sdkDir = path.join(destination, 'node_modules', '@modelcontextprotocol', 'sdk')
+  mkdirSync(sdkDir, { recursive: true })
+  writeFileSync(path.join(sdkDir, 'package.json'), JSON.stringify({ name: '@modelcontextprotocol/sdk', version: '1.30.0' }))
+  const zodDir = path.join(destination, 'node_modules', 'zod')
+  mkdirSync(zodDir, { recursive: true })
+  writeFileSync(path.join(zodDir, 'package.json'), JSON.stringify({ name: 'zod', version: '4.3.6' }))
+  writeBinShim(destination, 'which', 'node-which', 'bin/node-which')
+  mkdirSync(path.join(destination, 'node_modules', '.pnpm'), { recursive: true })
+  writeFileSync(path.join(destination, 'node_modules', '.pnpm', 'lock.yaml'), 'inert pnpm install state\n')
+}
 
-  return { serverBinary, clientDir, nodeBinary, claudeSidecarDir, mcpDistDir, nodeModulesDir, packageLockPath }
+function createRecordingDeploySeam(root: string): { calls: DeployRuntimeArgs[]; deployRuntime: (args: DeployRuntimeArgs) => void } {
+  const calls: DeployRuntimeArgs[] = []
+  const deployRuntime = (args: DeployRuntimeArgs): void => {
+    calls.push(args)
+    if (args.packageName === 'freshell-claude-sidecar') {
+      sidecarDeployFixture(args.destination)
+      return
+    }
+    mcpDeployFixture(args.destination, path.join(root, 'packages', 'freshell-mcp-runtime', 'generated'))
+  }
+  return { calls, deployRuntime }
+}
+
+function collectFiles(root: string): string[] {
+  const files: string[] = []
+  const walk = (directory: string, prefix: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name
+      const absolute = path.join(directory, entry.name)
+      if (lstatSync(absolute).isDirectory()) walk(absolute, relative)
+      else files.push(relative)
+    }
+  }
+  walk(root, '')
+  return files.sort()
+}
+
+function collectLinks(root: string): string[] {
+  const links: string[] = []
+  const walk = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const absolute = path.join(directory, entry.name)
+      const stats = lstatSync(absolute)
+      if (stats.isSymbolicLink()) links.push(absolute)
+      else if (stats.isDirectory()) walk(absolute)
+    }
+  }
+  walk(root, '')
+  return links.sort()
+}
+
+function stageFixture(root: string, runtimeDir: string, extra: { deployRuntime?: (args: DeployRuntimeArgs) => void } = {}) {
+  const fixture = createSourceFixture(root)
+  return stageElectronRuntime({
+    rootDir: root,
+    runtimeDir,
+    platform: nativePlatform(),
+    arch: nativeArch(),
+    releaseVersion: '9.9.9',
+    nodeVersion: '22.12.0',
+    packageManagerVersion: '10.34.5',
+    ...fixture,
+    ...extra,
+  })
 }
 
 describe('prepare-electron-runtime staging', () => {
@@ -135,69 +247,280 @@ describe('prepare-electron-runtime staging', () => {
     expect(findUnapprovedRuntimePaths(['elevate.exe'], 'win32')).toEqual([])
   })
 
-  it('resolves the locked production closure without pulling unrelated packages', () => {
-    const lock = {
-      packages: {
-        '': {},
-        'node_modules/@modelcontextprotocol/sdk': { dependencies: { zod: '^4.0.0', transitive: '^1.0.0' } },
-        'node_modules/zod': {},
-        'node_modules/transitive': { dependencies: { leaf: '^1.0.0' } },
-        'node_modules/leaf': {},
-        'node_modules/unrelated': {},
-      },
-    }
-    expect(collectProductionDependencyClosure(lock, ['@modelcontextprotocol/sdk', 'zod'])).toEqual([
-      '@modelcontextprotocol/sdk',
-      'leaf',
-      'transitive',
-      'zod',
-    ])
+  it('requires no lock files in the staged runtime layout', () => {
+    expect(Object.keys(RUNTIME_LAYOUT).filter((key) => /lock/i.test(key))).toEqual([])
+    const allowlist = getRuntimeAllowlist('linux')
+    expect(allowlist.requiredFiles.filter((file) => /lock/i.test(file))).toEqual([])
+    expect(allowlist.requiredFiles).toContain('claude-sidecar/node_modules/@anthropic-ai/claude-agent-sdk/package.json')
+    expect(allowlist.requiredFiles).toContain('mcp/node_modules/@modelcontextprotocol/sdk/package.json')
+    // A stray lock inside a recursive runtime directory is not an allowlist violation.
+    expect(findUnapprovedRuntimePaths(['claude-sidecar/package-lock.json'], 'linux')).toEqual([])
   })
 
-  it('stages only Rust, client, Node, Claude, and checkout-free MCP resources', async () => {
+  it('builds the exact filtered production deploy argv for both runtime packages', () => {
+    expect(buildDeployArgs('freshell-claude-sidecar', '/tmp/sidecar-out')).toEqual([
+      '--filter', 'freshell-claude-sidecar', '--prod', '--config.node-linker=hoisted', 'deploy', '/tmp/sidecar-out',
+    ])
+    expect(buildDeployArgs('freshell-mcp-runtime', '/tmp/mcp-out')).toEqual([
+      '--filter', 'freshell-mcp-runtime', '--prod', '--config.node-linker=hoisted', 'deploy', '/tmp/mcp-out',
+    ])
+    for (const args of [
+      buildDeployArgs('freshell-claude-sidecar', '/tmp/sidecar-out'),
+      buildDeployArgs('freshell-mcp-runtime', '/tmp/mcp-out'),
+    ]) {
+      expect(args).not.toContain('--')
+      expect(args).not.toContain('--legacy')
+      expect(args).not.toContain('--frozen-lockfile')
+    }
+  })
+
+  it('stages the portable runtime from pnpm deploy exports', async () => {
     const sourceRoot = temporaryRoot()
     const outputRoot = path.join(temporaryRoot(), 'electron-runtime')
-    const fixture = createSourceFixture(sourceRoot)
+    createSourceFixture(sourceRoot)
+    const { calls, deployRuntime } = createRecordingDeploySeam(sourceRoot)
 
-    const receipt = await stageElectronRuntime({
-      rootDir: sourceRoot,
-      runtimeDir: outputRoot,
-      platform: 'linux',
-      arch: 'x64',
-      releaseVersion: '9.9.9',
-      nodeVersion: '22.12.0',
-      ...fixture,
-    })
+    const receipt = await stageFixture(sourceRoot, outputRoot, { deployRuntime })
+    const serverName = getRuntimeBinaryName(nativePlatform())
+    const nodeName = getNodeBinaryName(nativePlatform())
 
-    expect(readFileSync(path.join(outputRoot, 'bin', 'freshell-server'), 'utf8')).toContain('exit 0')
+    expect(calls.map((call) => call.packageName)).toEqual(['freshell-claude-sidecar', 'freshell-mcp-runtime'])
+    expect(calls.map((call) => call.destination)).toEqual(calls.map((call) => path.resolve(call.destination)))
+
+    expect(readFileSync(path.join(outputRoot, 'bin', serverName), 'utf8')).toContain('exit 0')
     expect(readFileSync(path.join(outputRoot, 'client', 'index.html'), 'utf8')).toContain('Freshell')
-    expect(readFileSync(path.join(outputRoot, 'node', 'bin', 'node'), 'utf8')).toContain('exit 0')
+    expect(readFileSync(path.join(outputRoot, 'node', 'bin', nodeName), 'utf8')).toContain('exit 0')
     expect(JSON.parse(execFileSync('node', [path.join(outputRoot, 'claude-sidecar', 'index.mjs')], { encoding: 'utf8' }))).toEqual({
       configureSession: 'function',
       probeModelCatalog: 'function',
     })
     expect(readFileSync(path.join(outputRoot, 'claude-sidecar', 'session-settings.mjs'), 'utf8')).toContain('staged')
     expect(readFileSync(path.join(outputRoot, 'claude-sidecar', 'model-catalog.mjs'), 'utf8')).toContain('staged-model')
-    expect(receipt.files).toEqual(expect.arrayContaining([
-      'claude-sidecar/session-settings.mjs',
-      'claude-sidecar/model-catalog.mjs',
-    ]))
     expect(readFileSync(path.join(outputRoot, 'mcp', 'server.js'), 'utf8')).toContain('modelcontextprotocol')
     expect(readFileSync(path.join(outputRoot, 'node-client-runtime', 'keys.js'), 'utf8')).toContain('export')
+
+    const stagedManifest = JSON.parse(readFileSync(path.join(outputRoot, 'mcp', 'package.json'), 'utf8'))
+    expect(stagedManifest).toEqual({
+      name: 'freshell',
+      version: '9.9.9',
+      private: true,
+      type: 'module',
+      dependencies: {
+        '@modelcontextprotocol/sdk': '1.30.0',
+        zod: '4.3.6',
+      },
+    })
+
+    const stagedFiles = collectFiles(outputRoot)
+    expect(stagedFiles.filter((file) =>
+      file.endsWith('package-lock.json') || file.endsWith('pnpm-lock.yaml') || file.includes('/.pnpm/'))).toEqual([])
+    expect(stagedFiles.some((file) => file.includes('.pnpm'))).toBe(false)
+    expect(collectLinks(outputRoot)).toEqual([])
+    expect(lstatSync(path.join(outputRoot, 'mcp', 'node_modules', '@modelcontextprotocol', 'sdk')).isSymbolicLink()).toBe(false)
+    expect(lstatSync(path.join(outputRoot, 'claude-sidecar', 'node_modules', '@anthropic-ai', 'claude-agent-sdk')).isSymbolicLink()).toBe(false)
+    expect(readFileSync(path.join(outputRoot, 'claude-sidecar', 'node_modules', '@anthropic-ai', 'claude-agent-sdk', 'package.json'), 'utf8')).toContain('0.3.237')
+
     expect(receipt).toMatchObject({ severity: 'info', event: 'electron_runtime_prepared' })
     expect(receipt.files).toEqual([...receipt.files].sort())
     expect(Object.keys(receipt.fileHashes)).toEqual(receipt.files)
-    expect(receipt.fileHashes['bin/freshell-server']).toMatch(/^[a-f0-9]{64}$/)
+    expect(receipt.fileHashes[`bin/${serverName}`]).toMatch(/^[a-f0-9]{64}$/)
+    expect(receipt.packageManager).toEqual({ name: 'pnpm', version: '10.34.5' })
+    const expectedFingerprint = createHash('sha256')
+      .update(readFileSync(path.join(sourceRoot, 'pnpm-lock.yaml')))
+      .digest('hex')
+    expect(receipt.sourceLockFingerprint).toBe(expectedFingerprint)
+    expect(receipt.exportedPackages).toEqual([
+      { name: 'freshell-claude-sidecar', version: '0.1.0' },
+      { name: 'freshell-mcp-runtime', version: '0.1.0' },
+      { name: 'freshell', version: '9.9.9' },
+    ])
     expect(JSON.parse(readFileSync(path.join(outputRoot, '.electron-runtime-receipt.json'), 'utf8'))).toMatchObject({
       severity: 'info',
       event: 'electron_runtime_prepared',
+      packageManager: { name: 'pnpm', version: '10.34.5' },
       fileHashes: receipt.fileHashes,
     })
-    expect(JSON.parse(readFileSync(path.join(outputRoot, 'mcp', 'package.json'), 'utf8'))).toMatchObject({ name: 'freshell', version: '9.9.9' })
-    expect(readFileSync(path.join(outputRoot, 'mcp', 'node_modules', 'leaf', 'index.js'), 'utf8')).toContain('1.0.0')
     expect(() => readFileSync(path.join(outputRoot, 'dist', 'server', 'index.js'))).toThrow()
     expect(() => readFileSync(path.join(outputRoot, 'server-node-modules', 'index.js'))).toThrow()
     expect(() => readFileSync(path.join(outputRoot, 'node-pty', 'index.js'))).toThrow()
+  })
+
+  it('refreshes the generated runtime tree before the MCP deploy consumes it', async () => {
+    const sourceRoot = temporaryRoot()
+    const outputRoot = path.join(temporaryRoot(), 'electron-runtime')
+    createSourceFixture(sourceRoot)
+    const staleGenerated = path.join(sourceRoot, 'packages', 'freshell-mcp-runtime', 'generated', 'stale.txt')
+    mkdirSync(path.dirname(staleGenerated), { recursive: true })
+    writeFileSync(staleGenerated, 'stale output from a previous run\n')
+    const { deployRuntime } = createRecordingDeploySeam(sourceRoot)
+
+    await stageFixture(sourceRoot, outputRoot, { deployRuntime })
+
+    expect(() => readFileSync(staleGenerated)).toThrow()
+    const refreshed = path.join(sourceRoot, 'packages', 'freshell-mcp-runtime', 'generated', 'freshell-mcp', 'server.js')
+    expect(readFileSync(refreshed, 'utf8')).toContain('modelcontextprotocol')
+    expect(readFileSync(path.join(outputRoot, 'mcp', 'server.js'), 'utf8')).toContain('modelcontextprotocol')
+  })
+
+  it('fails before deploying when compiled tool output is missing', async () => {
+    const sourceRoot = temporaryRoot()
+    const outputRoot = path.join(temporaryRoot(), 'electron-runtime')
+    const fixture = createSourceFixture(sourceRoot)
+    mkdirSync(outputRoot, { recursive: true })
+    writeFileSync(path.join(outputRoot, 'sentinel.txt'), 'previous runtime\n')
+    rmSync(path.join(sourceRoot, 'dist', 'tools', 'freshell-mcp'), { recursive: true, force: true })
+    const { calls, deployRuntime } = createRecordingDeploySeam(sourceRoot)
+
+    await expect(stageElectronRuntime({
+      rootDir: sourceRoot,
+      runtimeDir: outputRoot,
+      platform: nativePlatform(),
+      arch: nativeArch(),
+      releaseVersion: '9.9.9',
+      nodeVersion: '22.12.0',
+      packageManagerVersion: '10.34.5',
+      deployRuntime,
+      ...fixture,
+    })).rejects.toThrow(/missing/i)
+    expect(calls).toEqual([])
+    expect(collectFiles(outputRoot)).toEqual(['sentinel.txt'])
+  })
+
+  it('materializes deploy links into ordinary files while preserving content and permissions', async () => {
+    const sourceRoot = temporaryRoot()
+    const outputRoot = path.join(temporaryRoot(), 'electron-runtime')
+    createSourceFixture(sourceRoot)
+    const deployRuntime = (args: DeployRuntimeArgs): void => {
+      if (args.packageName === 'freshell-claude-sidecar') {
+        sidecarDeployFixture(args.destination)
+        const storeTool = path.join(args.destination, 'node_modules', '.pnpm', 'tool@1.0.0', 'bin', 'tool')
+        writeExecutable(storeTool, '#!/bin/sh\necho tool\n')
+        const binDir = path.join(args.destination, 'node_modules', '.bin')
+        mkdirSync(binDir, { recursive: true })
+        symlinkSync('../.pnpm/tool@1.0.0/bin/tool', path.join(binDir, 'tool'))
+        const sharedDir = path.join(args.destination, 'node_modules', '.pnpm', 'shared@1.0.0', 'shared')
+        mkdirSync(sharedDir, { recursive: true })
+        writeFileSync(path.join(sharedDir, 'nested.js'), 'export const nested = true\n')
+        symlinkSync(sharedDir, path.join(args.destination, 'node_modules', 'shared-link'))
+        return
+      }
+      mcpDeployFixture(args.destination, path.join(sourceRoot, 'packages', 'freshell-mcp-runtime', 'generated'))
+    }
+
+    await stageFixture(sourceRoot, outputRoot, { deployRuntime })
+
+    expect(collectLinks(outputRoot)).toEqual([])
+    const materializedTool = path.join(outputRoot, 'claude-sidecar', 'node_modules', '.bin', 'tool')
+    expect(lstatSync(materializedTool).isFile()).toBe(true)
+    expect(readFileSync(materializedTool, 'utf8')).toContain('echo tool')
+    if (process.platform !== 'win32') {
+      expect(statSync(materializedTool).mode & 0o111).not.toBe(0)
+    }
+    expect(readFileSync(path.join(outputRoot, 'claude-sidecar', 'node_modules', 'shared-link', 'nested.js'), 'utf8')).toContain('nested = true')
+  })
+
+  it('rejects escaping, broken, and cyclic deploy links', async () => {
+    const outsideRoot = temporaryRoot()
+    writeFileSync(path.join(outsideRoot, 'outside.txt'), 'outside the deploy tree\n')
+
+    const cases: Array<{ name: string; plant: (deployDir: string) => void; pattern: RegExp }> = [
+      {
+        name: 'escaping',
+        plant: (deployDir) => {
+          symlinkSync(path.join(outsideRoot, 'outside.txt'), path.join(deployDir, 'node_modules', '@anthropic-ai', 'escape-link'))
+        },
+        pattern: /escape/i,
+      },
+      {
+        name: 'broken',
+        plant: (deployDir) => {
+          symlinkSync('does-not-exist-anywhere', path.join(deployDir, 'node_modules', '@anthropic-ai', 'broken-link'))
+        },
+        pattern: /broken|cyclic/i,
+      },
+      {
+        name: 'cyclic',
+        plant: (deployDir) => {
+          const linkDir = path.join(deployDir, 'node_modules', '@anthropic-ai')
+          symlinkSync('cyclic-b', path.join(linkDir, 'cyclic-a'))
+          symlinkSync('cyclic-a', path.join(linkDir, 'cyclic-b'))
+        },
+        pattern: /broken|cyclic/i,
+      },
+    ]
+    for (const { name, plant, pattern } of cases) {
+      const sourceRoot = temporaryRoot()
+      const outputRoot = path.join(temporaryRoot(), 'electron-runtime')
+      createSourceFixture(sourceRoot)
+      mkdirSync(outputRoot, { recursive: true })
+      writeFileSync(path.join(outputRoot, 'sentinel.txt'), 'previous runtime\n')
+      const deployRuntime = (args: DeployRuntimeArgs): void => {
+        if (args.packageName === 'freshell-claude-sidecar') {
+          sidecarDeployFixture(args.destination)
+          plant(args.destination)
+          return
+        }
+        mcpDeployFixture(args.destination, path.join(sourceRoot, 'packages', 'freshell-mcp-runtime', 'generated'))
+      }
+
+      await expect(stageFixture(sourceRoot, outputRoot, { deployRuntime })).rejects.toThrow(pattern)
+      expect(readFileSync(path.join(outputRoot, 'sentinel.txt'), 'utf8')).toContain('previous runtime')
+      expect(collectLinks(outputRoot)).toEqual([])
+      const stagingPath = `${outputRoot}.staging`
+      expect(lstatSafe(stagingPath)).toBeUndefined()
+    }
+  })
+
+  it('refuses cross-target staging before any deploy', async () => {
+    const sourceRoot = temporaryRoot()
+    const outputRoot = path.join(temporaryRoot(), 'electron-runtime')
+    const fixture = createSourceFixture(sourceRoot)
+    const { calls, deployRuntime } = createRecordingDeploySeam(sourceRoot)
+    const foreignPlatform = process.platform === 'win32' ? 'darwin' : 'win32'
+    const foreignArch = process.arch === 'x64' ? 'arm64' : 'x64'
+
+    await expect(stageElectronRuntime({
+      rootDir: sourceRoot,
+      runtimeDir: outputRoot,
+      platform: foreignPlatform,
+      arch: nativeArch(),
+      releaseVersion: '9.9.9',
+      nodeVersion: '22.12.0',
+      packageManagerVersion: '10.34.5',
+      deployRuntime,
+      ...fixture,
+    })).rejects.toThrow(/native/i)
+    await expect(stageElectronRuntime({
+      rootDir: sourceRoot,
+      runtimeDir: outputRoot,
+      platform: nativePlatform(),
+      arch: foreignArch,
+      releaseVersion: '9.9.9',
+      nodeVersion: '22.12.0',
+      packageManagerVersion: '10.34.5',
+      deployRuntime,
+      ...fixture,
+    })).rejects.toThrow(/native/i)
+    expect(calls).toEqual([])
+  })
+
+  it('keeps the previous runtime when the deploy fails mid-staging', async () => {
+    const sourceRoot = temporaryRoot()
+    const outputRoot = path.join(temporaryRoot(), 'electron-runtime')
+    createSourceFixture(sourceRoot)
+    mkdirSync(outputRoot, { recursive: true })
+    writeFileSync(path.join(outputRoot, 'sentinel.txt'), 'previous runtime\n')
+    const deployRuntime = (args: DeployRuntimeArgs): void => {
+      if (args.packageName === 'freshell-claude-sidecar') {
+        sidecarDeployFixture(args.destination)
+        return
+      }
+      throw new Error('pnpm deploy failed for freshell-mcp-runtime with exit code 1.')
+    }
+
+    await expect(stageFixture(sourceRoot, outputRoot, { deployRuntime })).rejects.toThrow(/freshell-mcp-runtime/)
+    expect(readFileSync(path.join(outputRoot, 'sentinel.txt'), 'utf8')).toContain('previous runtime')
+    expect(lstatSafe(`${outputRoot}.staging`)).toBeUndefined()
   })
 
   it('ensures staged POSIX binaries are executable even when inputs are not', async () => {
@@ -206,25 +529,36 @@ describe('prepare-electron-runtime staging', () => {
     const fixture = createSourceFixture(sourceRoot)
     chmodSync(fixture.serverBinary, 0o644)
     chmodSync(fixture.nodeBinary, 0o644)
+    const { deployRuntime } = createRecordingDeploySeam(sourceRoot)
 
     await stageElectronRuntime({
       rootDir: sourceRoot,
       runtimeDir: outputRoot,
-      platform: 'linux',
-      arch: 'x64',
+      platform: nativePlatform(),
+      arch: nativeArch(),
       releaseVersion: '9.9.9',
       nodeVersion: '22.12.0',
+      packageManagerVersion: '10.34.5',
+      deployRuntime,
       ...fixture,
     })
 
     for (const [source, binary] of [
-      [fixture.serverBinary, path.join(outputRoot, 'bin', 'freshell-server')],
-      [fixture.nodeBinary, path.join(outputRoot, 'node', 'bin', 'node')],
+      [fixture.serverBinary, path.join(outputRoot, 'bin', getRuntimeBinaryName(nativePlatform()))],
+      [fixture.nodeBinary, path.join(outputRoot, 'node', 'bin', getNodeBinaryName(nativePlatform()))],
     ]) {
-      // Windows does not retain POSIX executable bits. Verify the permission
-      // operation on every host and its filesystem effect on POSIX hosts.
-      expect(chmodSync).toHaveBeenCalledWith(binary, (statSync(source).mode & 0o777) | 0o111)
-      if (process.platform !== 'win32') expect(statSync(binary).mode & 0o111).not.toBe(0)
+      // POSIX exec bits only apply to POSIX targets. The stager deliberately
+      // skips the permission operation for win32 targets (Windows executability
+      // comes from the .exe extension; the filesystem does not retain the
+      // bit), so a win32 host staging a win32 runtime must show NO operation,
+      // while POSIX hosts show the operation AND its filesystem effect.
+      const expectedMode = (statSync(source).mode & 0o777) | 0o111
+      const stagedBinary = path.join(`${outputRoot}.staging`, path.relative(outputRoot, binary))
+      expect(
+        vi.mocked(chmodSync).mock.calls.some(([target, mode]) =>
+          (target === binary || target === stagedBinary) && mode === expectedMode),
+      ).toBe(nativePlatform() !== 'win32')
+      if (nativePlatform() !== 'win32') expect(statSync(binary).mode & 0o111).not.toBe(0)
     }
   })
 
@@ -234,3 +568,11 @@ describe('prepare-electron-runtime staging', () => {
     expect(getNodeDownloadUrl('22.12.0', 'win32', 'x64')).toBe('https://nodejs.org/dist/v22.12.0/node-v22.12.0-win-x64.zip')
   })
 })
+
+function lstatSafe(target: string): string | undefined {
+  try {
+    return lstatSync(target).isDirectory() ? target : undefined
+  } catch {
+    return undefined
+  }
+}

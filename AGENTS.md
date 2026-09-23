@@ -12,7 +12,7 @@ Freshell is a self-hosted, browser-accessible terminal multiplexer and session o
 
 ## Repo Rules
 
-Proposed package-manager migration: [pnpm migration plan](docs/plans/2026-09-19-pnpm-migration.md). This is a planning artifact, not a change to the current npm workflow.
+Package manager: this repo runs on pnpm, pinned exactly (see [Package Manager (pnpm)](#package-manager-pnpm) below). History and rationale: [pnpm migration plan](docs/plans/2026-09-19-pnpm-migration.md).
 
 - Always work in a worktree (in \.worktrees\)
 - Pull before starting major work: `git fetch origin` and bring local `main` to `origin/main` (fast-forward) so new work always bases on the latest merged state.
@@ -25,21 +25,33 @@ Proposed package-manager migration: [pnpm migration plan](docs/plans/2026-09-19-
 - Many agents may be working in the worktree at the same time. If you see activity from other agents (for example test runs or file changes), respect it.
 - Specific user instructions override ALL other instructions, including the above, and including superpowers or skills
 - TypeScript tooling and Electron use NodeNext/ESM; relative imports must include `.js` extensions.
-- Always consider checking logs for debugging; Rust server logs and client/Electron logs are in the owning process stdout/stderr (for example, `npm run dev` or `npm start`). The standalone Rust launcher also writes JSONL logs under `~/.freshell/logs/`.
+- Always consider checking logs for debugging; Rust server logs and client/Electron logs are in the owning process stdout/stderr (for example, `pnpm run dev` or `pnpm run start`). The standalone Rust launcher also writes JSONL logs under `~/.freshell/logs/`.
 - Debug logging toggle (UI Settings → Debugging → Debug logging) enables debug-level logs and perf logging; keep OFF outside perf investigations.
 - When adding new user-facing features or making significant UI changes, update `docs/index.html` to reflect them. It's a nonfunctional mock of the default experience, so only major changes need to be added.
+
+## Package Manager (pnpm)
+
+- **Exact pin:** pnpm 10.34.5 everywhere (root, demos, CI, Docker, sandbox, native Windows) via the root and demo `packageManager` fields. `packageManagerStrictVersion` makes any other version fail. Bootstrap once with `npm install --global pnpm@10.34.5` — npm is a legitimate bootstrap tool and remains the manager for unrelated globally installed coding CLIs. On Corepack-enabled hosts, that bootstrap installs the REAL binary and replaces the Corepack shim (a shim silently downloads whatever version the manifest names, so version checks must run against the real binary, not a shim).
+- **Frozen installs:** normal checkout, CI, staging, and deployment-preparation installs use `pnpm install --frozen-lockfile`. A mismatched or missing lock fails; there is no silent mutable recovery. Intentional dependency edits use `pnpm add`/`pnpm update` plus a manifest/lock diff review. Never run `npm ci`/`npm install` in a pnpm-era tree — it would destroy the pnpm layout.
+- **Workspace boundaries:** the root workspace is the root package plus `crates/freshell-claude-sidecar` and `packages/freshell-mcp-runtime` only. The three demos under `examples/demo-projects/` are independent projects, each with its own `pnpm-lock.yaml` and demo-local `pnpm-workspace.yaml`; install them from their own directories. A root install never pulls demo dependencies.
+- **Lock authority:** `pnpm-lock.yaml` plus the three demo locks are the only lockfiles. The npm-era `package-lock.json` files were removed by the migration's final step (they remain in Git history for old branches); never install from them.
+- **Build-script policy:** dependency install scripts are allow-listed in `pnpm-workspace.yaml` via `allowBuilds` (currently `electron` and `esbuild`). Unlisted scripts are blocked with a warning, not auto-approved.
+- **Argument forwarding:** `pnpm run <script> <args...>` forwards args directly — NO npm-style `--` separator (e.g. `pnpm run test:vitest run test/unit/foo.test.ts --config config/vitest/vitest.config.ts`, `pnpm run test:e2e --local`). The coordinator still tolerates an old leading `--` from npm-era callers; new examples omit it. Run installed binaries with `pnpm exec <bin>` (e.g. `pnpm exec tsx scripts/foo.ts`) instead of `npx`. `scripts/base-gate.sh` picks the manager after entering its scratch worktree and, for a pnpm-era base, strips exactly one leading `--`.
+- **Native Windows:** bootstrap pnpm on the Windows side too (`npm install --global pnpm@10.34.5`), then `pnpm install --frozen-lockfile` and `pnpm run ...` — see [docs/development/windows-electron-build.md](docs/development/windows-electron-build.md).
+- **Old worktrees/branches:** `core.hooksPath` is shared, so the pre-push hook selects the manager from the PUSHING worktree (`scripts/hooks/prepush-manager.ts`; `packageManager` authoritative, lock presence fallback). npm-era worktrees keep working unchanged (npm typecheck + nvm PATH recovery); pnpm-era ones get `pnpm run --silent typecheck` and a pinned-pnpm-install remediation hint.
 
 ## Test Coordination
 - Broad repo-supported test runs wait for the shared coordinator gate; if another agent holds it, wait rather than kill a foreign holder.
 - Pre-worktree green-base checks (and any broad gate intended to validate `origin/main` itself, as opposed to a branch under test) go through `scripts/base-gate.sh` (e.g. `scripts/base-gate.sh test`), which runs the command from a clean scratch worktree at `origin/main`. The main checkout accumulates untracked litter; the cloud runners treat that as a non-addressable `-dirty` image and pay a ~13 min cold rebuild every time, whereas a clean worktree uses the content-addressed commit tag — built at most once per commit and shared by every later run.
+- Agent-launched broad gates should export `GCLOUD_ROBOT_REQUIRE=1` (the recommended default): fail closed when no robot identity resolves, instead of silently running as a possibly-stale human identity. Machines with a standard gcloud-robot install don't need `GCLOUD_ROBOT_HOME` exported — the lanes probe the well-known install locations (`~/.codex/skills/gcloud-robot`, `~/.claude/skills/gcloud-robot`, `~/code/skill-gcloud-robot/gcloud-robot`) when it's unset, and non-TTY (agent) invocations disable gcloud prompts and preflight the credential so a dead identity fails in seconds instead of hanging. To guarantee the robot identity itself — rather than the selector's first passing candidate — export `GCLOUD_ROBOT_ACCOUNT=<robot>`: the selector probes that account first, so no other identity (including an ambient human with lane permissions) can win; for PTY-launched agent lanes (Freshell terminal panes, where prompts are deliberately NOT disabled) this also prevents the selector from ever minting the ambient human credential.
 - Set `FRESHELL_TEST_SUMMARY` when you want holder/status output to show a human-meaningful reason for a broad run.
-- Use `npm run test:status` to inspect the current holder, recent results, and any advisory reusable baseline.
-- Use `npm run test:vitest -- ...` for a repo-owned direct Vitest path. Raw `npx vitest` is not a coordinated workflow.
+- Use `pnpm run test:status` to inspect the current holder, recent results, and any advisory reusable baseline.
+- Use `pnpm run test:vitest run <paths...> --config <config>` for a repo-owned direct Vitest path. Raw `pnpm exec vitest` / `npx vitest` is not a coordinated workflow.
 - `test:unit` is the exact default-config `test/unit` workload, `test:integration` runs Rust workspace integration tests, and `test:server` is the Cargo-backed Rust `freshell-server` lane. Zero-argument and explicit broad `--run` server/integration invocations are coordinated; narrowed Cargo selectors are delegated.
 - Ambient proxy vars (`HTTP(S)_PROXY`, either case) and `FRESHELL_BIND_HOST` are stripped by `config/vitest/sanitize-test-env.ts` at Vitest config load, including source-runtime and packaged-runtime lanes. The exact `FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1` escape hatch preserves proxy egress but still removes `FRESHELL_BIND_HOST`.
 
 ## Destructive Test Sandbox
-- Process-kill, config-corruption, and restart-storm suites run inside a disposable Docker sandbox, never directly on host: `scripts/sandbox-test.sh "<command>"` (or `npm run test:sandbox -- "<command>"`).
+- Process-kill, config-corruption, and restart-storm suites run inside a disposable Docker sandbox, never directly on host: `scripts/sandbox-test.sh "<command>"` (or `pnpm run test:sandbox "<command>"`).
 - See `docs/development/test-sandbox.md` for the safety guarantees, the `--corpus` read-only real-data flag, and cache-volume management.
 
 ## Amplifier Skills Deployment (machine note)
@@ -63,9 +75,9 @@ Proposed package-manager migration: [pnpm migration plan](docs/plans/2026-09-19-
 
 - Never use broad kill patterns (for example `pkill -f vite` or `pkill node`).
 - Start manual worktree servers on a unique port and record their PID, then stop only that PID.
-- Dev mode example (Vite client HMR plus the Rust server): `PORT=3344 VITE_PORT=5174 npm run dev > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid`, then open `http://localhost:5174/?token=<AUTH_TOKEN from .env>` (Vite proxies `/api` and `/ws` to the Rust server on port 3344).
-  - Server-only development (without the Vite UI): `PORT=3344 npm run dev:server > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid`.
-- Production mode example (built Rust binary): `PORT=3344 npm start > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid`.
+- Dev mode example (Vite client HMR plus the Rust server): `PORT=3344 VITE_PORT=5174 pnpm run dev > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid`, then open `http://localhost:5174/?token=<AUTH_TOKEN from .env>` (Vite proxies `/api` and `/ws` to the Rust server on port 3344).
+  - Server-only development (without the Vite UI): `PORT=3344 pnpm run dev:server > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid`.
+- Production mode example (built Rust binary): `PORT=3344 pnpm run start > /tmp/freshell-3344.log 2>&1 & echo $! > /tmp/freshell-3344.pid`.
 - The Rust binary is `target/release/freshell-server` (or `.exe` on Windows). It is the only Freshell backend executable.
 - Example stop: `kill "$(cat /tmp/freshell-3344.pid)" && rm -f /tmp/freshell-3344.pid`
 - Before stopping any process, verify it belongs to the worktree (`ps -fp <pid>` and confirm cwd/path includes `.worktrees/...`).
@@ -122,44 +134,44 @@ Key facts:
 
 ### Development
 ```bash
-npm run dev                 # Run Vite + the Rust server with hot reload
-npm run dev:client          # Vite dev server only (port 5173)
-npm run dev:server          # Rust server only
+pnpm run dev                 # Run Vite + the Rust server with hot reload
+pnpm run dev:client          # Vite dev server only (port 5173)
+pnpm run dev:server          # Rust server only
 ```
 
 ### Building
 ```bash
-npm run build               # Full build (client + tools + Rust server)
-npm run build:client        # Vite build → dist/client
-npm run build:tools         # TypeScript build → dist/tools
-npm run build:rust          # Release freshell-server binary
-npm run serve               # Build and run the Rust server
-# `npm run serve` prompts before serving from a non-main branch; use
-# `FRESHELL_ALLOW_NON_MAIN_SERVE=1 npm run serve` only when intentional.
+pnpm run build               # Full build (client + tools + Rust server)
+pnpm run build:client        # Vite build → dist/client
+pnpm run build:tools         # TypeScript build → dist/tools
+pnpm run build:rust          # Release freshell-server binary
+pnpm run serve               # Build and run the Rust server
+# `pnpm run serve` prompts before serving from a non-main branch; use
+# `FRESHELL_ALLOW_NON_MAIN_SERVE=1 pnpm run serve` only when intentional.
 # Note: broad source-runtime/build verification is guarded and fails closed
 # before writing artifacts if a production server is detected on the configured
-# PORT. Use `npm run typecheck:client` for a no-write check, or run it from a
+# PORT. Use `pnpm run typecheck:client` for a no-write check, or run it from a
 # linked worktree.
 ```
 
-**On WSL machines, "the desktop app" means the Windows app.** Always build, install, and launch the Windows Electron app (`npm run electron:build:win` + the NSIS installer) — never a Linux AppImage/deb under WSLg. The Windows build must run as a native Windows process so Cargo produces a native `freshell-server.exe`; drive it from WSL by rsyncing to a Windows-local dir and running Windows npm via `cmd.exe` — see [docs/development/windows-electron-build.md](docs/development/windows-electron-build.md).
+**On WSL machines, "the desktop app" means the Windows app.** Always build, install, and launch the Windows Electron app (`pnpm run electron:build:win` + the NSIS installer) — never a Linux AppImage/deb under WSLg. The Windows build must run as a native Windows process so Cargo produces a native `freshell-server.exe`; drive it from WSL by rsyncing to a Windows-local dir and running Windows pnpm (bootstrapped there with `npm install --global pnpm@10.34.5`) via `cmd.exe` — see [docs/development/windows-electron-build.md](docs/development/windows-electron-build.md).
 
 ### Testing
 Pre-push gate: every `git push` runs the cheap local checks (cargo fmt, typecheck, clippy, plus targeted `cargo test` for the changed Rust crates and their dependents when the push touches Rust) filtered by what the push changes — see [docs/development/pre-push-gate.md](docs/development/pre-push-gate.md). Bypass: `git push --no-verify`. Server-side backstop: PRs touching Rust must pass the required `rust-gate` check (workspace `cargo test`, `.github/workflows/rust-tests.yml`); PRs with no Rust changes pass it instantly. Merge-time bypass for a red `rust-gate`: `gh pr merge <n> --merge` from the owner account (ruleset `pull_request`-mode bypass actor).
 Backend fallback policy: never silently fall back from the configured cloud test backend to local — if the cloud path fails, fix it; a local-backend run may substitute only when the cloud path cannot be fixed AND the user explicitly approves.
 
 ```bash
-npm test                    # Coordinated client, Rust, and Electron suite
-npm run check               # Typecheck, then coordinated full suite
-npm run verify              # Build, then coordinated full suite
-npm run test:coverage       # Coordinated default-config coverage run
-npm run test:status         # Show active holder, latest results, and advisory baseline info
-npm run test:vitest -- ...  # Repo-owned direct Vitest path for focused passthrough work
+pnpm run test                # Coordinated client, Rust, and Electron suite
+pnpm run check               # Typecheck, then coordinated full suite
+pnpm run verify              # Build, then coordinated full suite
+pnpm run test:coverage       # Coordinated default-config coverage run
+pnpm run test:status         # Show active holder, latest results, and advisory baseline info
+pnpm run test:vitest run ... # Repo-owned direct Vitest path for focused passthrough work
 ```
 
 External provider contract tests (`test/integration/real/`) exercise the real Amplifier CLI, not Freshell code. When the documented opt-in enables this tree, the version smoke runs when `amplifier` is available; tests that adopt a session or make a model call additionally require provider setup. The tree is excluded from the default suite to avoid blocking the coordinated run on environment-dependent external-tool behavior:
 ```bash
-FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 npm run test:vitest -- \
+FRESHELL_RUN_REAL_PROVIDER_CONTRACTS=1 pnpm run test:vitest \
   run test/integration/real/ --config config/vitest/vitest.config.ts
 ```
 
@@ -170,8 +182,8 @@ Vitest client/tooling suites can run locally or on Google Cloud Run Jobs. The `F
 - **`"cloud"`**: run on Cloud Run Jobs (4 shards, ~2-3 min wall time vs ~5 min local, ~$0.02/run)
 
 ```bash
-npm run test:cloud          # Run Vitest on Cloud Run Jobs
-npm run test:cloud:build    # Build and push the Docker image to Artifact Registry
+pnpm run test:cloud          # Run Vitest on Cloud Run Jobs
+pnpm run test:cloud:build    # Build and push the Docker image to Artifact Registry
 ```
 
 **If `FRESHELL_VITEST_BACKEND` is not set, ask the user which way to set it** before running cloud vitest tests. Explain that cloud is faster (parallel shards, ~2-3 min vs ~5 min) but is a paid Google Cloud service (~$0.02/run); local is free but slower. Once the user chooses, set it permanently in their `~/.bashrc` (or equivalent) so agents don't need to ask again.
@@ -180,10 +192,12 @@ npm run test:cloud:build    # Build and push the Docker image to Artifact Regist
 
 **Identity:** cloud lanes never require an interactive `gcloud auth login`.
 They resolve a gcloud identity lazily, in this order: `--account=` flag >
-`FRESHELL_GCP_ACCOUNT` > `GCLOUD_IDENT` > gcloud-robot probe (needs
-`GCLOUD_ROBOT_HOME`, the installed gcloud-robot skill directory) > ambient
-gcloud (with a one-line stderr note). Provisioning, rotation, and revocation
-live in [docs/development/gcloud-robot.md](docs/development/gcloud-robot.md).
+`FRESHELL_GCP_ACCOUNT` > `GCLOUD_IDENT` > gcloud-robot probe (via
+`GCLOUD_ROBOT_HOME`, or the first well-known gcloud-robot skill install:
+`~/.codex/skills/gcloud-robot`, `~/.claude/skills/gcloud-robot`,
+`~/code/skill-gcloud-robot/gcloud-robot`) > ambient gcloud (with a one-line
+stderr note). Provisioning, rotation, and revocation live in
+[docs/development/gcloud-robot.md](docs/development/gcloud-robot.md).
 `GCLOUD_ROBOT_REQUIRE=1` fails closed when no robot identity resolves.
 
 ### E2E Test Backend (Cloud Run Jobs)
@@ -193,9 +207,9 @@ Playwright e2e tests can run locally or on Google Cloud Run Jobs. The `FRESHELL_
 - **`"cloud"`**: run on Cloud Run Jobs (4 shards, ~2-3 min wall time vs ~28 min local, ~$0.03/run)
 
 ```bash
-npm run test:e2e            # Uses FRESHELL_E2E_BACKEND (default: local)
-npm run test:e2e:local      # Force local
-npm run test:e2e:cloud      # Force cloud
+pnpm run test:e2e            # Uses FRESHELL_E2E_BACKEND (default: local)
+pnpm run test:e2e:local      # Force local
+pnpm run test:e2e:cloud      # Force cloud
 ```
 
 **If `FRESHELL_E2E_BACKEND` is not set, ask the user which way to set it** before running e2e tests. Explain that cloud is much faster (parallel shards, ~2-3 min vs ~28 min) but is a paid Google Cloud service (~$0.03/run); local is free but slower. Once the user chooses, set it permanently in their `~/.bashrc` (or equivalent) so agents don't need to ask again.
@@ -204,10 +218,12 @@ npm run test:e2e:cloud      # Force cloud
 
 **Identity:** cloud lanes never require an interactive `gcloud auth login`.
 They resolve a gcloud identity lazily, in this order: `--account=` flag >
-`FRESHELL_GCP_ACCOUNT` > `GCLOUD_IDENT` > gcloud-robot probe (needs
-`GCLOUD_ROBOT_HOME`, the installed gcloud-robot skill directory) > ambient
-gcloud (with a one-line stderr note). Provisioning, rotation, and revocation
-live in [docs/development/gcloud-robot.md](docs/development/gcloud-robot.md).
+`FRESHELL_GCP_ACCOUNT` > `GCLOUD_IDENT` > gcloud-robot probe (via
+`GCLOUD_ROBOT_HOME`, or the first well-known gcloud-robot skill install:
+`~/.codex/skills/gcloud-robot`, `~/.claude/skills/gcloud-robot`,
+`~/code/skill-gcloud-robot/gcloud-robot`) > ambient gcloud (with a one-line
+stderr note). Provisioning, rotation, and revocation live in
+[docs/development/gcloud-robot.md](docs/development/gcloud-robot.md).
 `GCLOUD_ROBOT_REQUIRE=1` fails closed when no robot identity resolves.
 
 ## Architecture
@@ -232,7 +248,7 @@ live in [docs/development/gcloud-robot.md](docs/development/gcloud-robot.md).
 
 ### Standalone clients and Claude sidecar
 
-- Build the CLI and MCP client with `npm run build:tools`. The CLI entrypoint is
+- Build the CLI and MCP client with `pnpm run build:tools`. The CLI entrypoint is
   `dist/tools/freshell-cli/index.js`; its `freshell` package bin sends requests
   to the Rust server configured by `FRESHELL_URL` and `FRESHELL_TOKEN`.
 - The MCP entrypoint is `dist/tools/freshell-mcp/server.js`. It is a stdio
@@ -260,7 +276,7 @@ live in [docs/development/gcloud-robot.md](docs/development/gcloud-robot.md).
 
 **Rename scope contract:** pane/tab labels are layout-local; only an explicit session rename writes a durable session title (terminal renames are terminal-scoped). The four name scopes and the reset-to-provider-title flow live in [docs/development/rename-scope-contract.md](docs/development/rename-scope-contract.md).
 
-**Agent Status Indicators:** Blue/busy status is derived from provider activity slices through `resolvePaneActivity`; green/needs-attention and the idle sound flow through `recordTurnComplete` and `useTurnCompletionNotifications`. Turn-complete (green/sound) is server-authoritative everywhere: terminal CLIs via `terminal.turn.complete`, and fresh-agent panes (freshclaude/kilroy/freshcodex/freshopencode) via a discrete `freshAgent.turn.complete` edge emitted only on a positive completion — freshclaude/kilroy on the SDK `result` with `subtype === 'success'`, freshopencode on the success-only `emitStatus(idle)` path, and freshcodex on `turn/completed` only when `params.turn.status === 'completed'` (the notification also fires on interrupt). The client folds it in via `applyFreshAgentCompletion` using the `at`-monotonic dedupe regime (wall-clock `at`, no per-session counter, so a resumed durable session can't swallow completions across a server restart). The waiting-for-approval edge is ALSO server-authoritative: the Claude/kilroy `SdkBridge` emits a discrete `freshAgent.turn.waiting` edge on the 0→≥1 pending permission/question transition (only Claude/kilroy raise approvals/questions), and the client folds it in via `applyFreshAgentWaiting` under a distinct `${provider}:${sessionId}#waiting` dedupe namespace so it can never poison (or be poisoned by) the turn-complete bucket. The fragile client-side busy→idle derivation AND the client-side waiting-edge hook (`useAgentSessionTurnCompletion`) were both removed — all green/sound edges are now server-emitted. freshcodex additionally self-heals a crashed/disconnected codex sidecar by consuming the runtime `onExit` hook in `subscribe()`, emitting `sdk.status:'exited'` to clear BLUE (no chime — a crash is not a positive completion). freshcodex also runs a wedged-sidecar deadman: after a bounded quiet window (default 10 min, env `FRESHELL_FRESHCODEX_QUIET_WINDOW_MS`) with a turn in flight and no sidecar events, the server stops asserting busy and marks the pane `stuck`, and the client shows an amber "Agent appears stuck" card (`role="alert"`) with "Restart sidecar" (kill + resume re-mint) and "Start new conversation" actions; the deadman never fabricates a turn-complete (no green/chime). `freshopencode` still runs on a shared long-lived `opencode serve` sidecar and uses server-pushed `session.idle`/`session.status` events to drive busy. Gemini and Kimi terminal modes are status-in... [truncated] Separately, the sidebar shows cross-device remote status rings around a session row's icon: a green ring means the session is open on another device, a blue ring means it is busy on another device (blue wins over green), and rings are suppressed entirely when the session is open on this device (derived from `tabs.sync` registry snapshots — producing clients stamp pane payloads with `sessionKeys`/`busySessionKeys`, consumers re-query remote snapshots on a 30s interval, and the server partitions same-device records into `sameDeviceOpen`, which never produces rings).
+**Agent Status Indicators:** Blue/busy status is derived from provider activity slices through `resolvePaneActivity`; green/needs-attention and the idle sound flow through `recordTurnComplete` and `useTurnCompletionNotifications`. Turn-complete (green/sound) is server-authoritative everywhere: terminal CLIs via `terminal.turn.complete`, and fresh-agent panes (freshclaude/kilroy/freshcodex/freshopencode) via a discrete `freshAgent.turn.complete` edge emitted only on a positive completion — freshclaude/kilroy on the SDK `result` with `subtype === 'success'`, freshopencode on the success-only `emitStatus(idle)` path, and freshcodex on `turn/completed` only when `params.turn.status === 'completed'` (the notification also fires on interrupt). The client folds it in via `applyFreshAgentCompletion` using the `at`-monotonic dedupe regime (wall-clock `at`, no per-session counter, so a resumed durable session can't swallow completions across a server restart). The waiting-for-approval edge is ALSO server-authoritative: the Claude/kilroy `SdkBridge` emits a discrete `freshAgent.turn.waiting` edge on the 0→≥1 pending permission/question transition (only Claude/kilroy raise approvals/questions), and the client folds it in via `applyFreshAgentWaiting` under a distinct `${provider}:${sessionId}#waiting` dedupe namespace so it can never poison (or be poisoned by) the turn-complete bucket. The fragile client-side busy→idle derivation AND the client-side waiting-edge hook (`useAgentSessionTurnCompletion`) were both removed — all green/sound edges are now server-emitted. freshcodex additionally self-heals a crashed/disconnected codex sidecar by consuming the runtime `onExit` hook in `subscribe()`, emitting `sdk.status:'exited'` to clear BLUE (no chime — a crash is not a positive completion). freshcodex also runs a wedged-sidecar deadman: after a bounded quiet window (default 10 min, env `FRESHELL_FRESHCODEX_QUIET_WINDOW_MS`) with a turn in flight and no sidecar events, the server stops asserting busy and marks the pane `stuck`, and the client shows an amber "Agent appears stuck" card (`role="alert"`) with "Restart sidecar" (kill + resume re-mint) and "Start new conversation" actions; the deadman never fabricates a turn-complete (no green/chime). `freshopencode` still runs on a shared long-lived `opencode serve` sidecar and uses server-pushed `session.idle`/`session.status` events to drive busy, and the runtime self-heals a shared-daemon death (the 2026-09-20 incident class): daemon loss fans a typed `freshAgent.error{code:"OPENCODE_DAEMON_LOST"}` edge out to exactly one frame per materialized session (the client's generic `sessionError` banner + busy-clear; NO chime — a crash is never a positive completion), the manager respawns the daemon on a backoff ladder (fresh-incident reset, crash-loop escalation), every successful cold start drives a level-triggered revival pass that restarts dead session bridges and pushes `freshAgent.session.snapshot{status:"idle"}` (the client's transcript-refetch trigger) while respecting the ownership coordinator (retired, transitioned, or terminal-owned sessions are never revived), and a generation-fenced `freshAgent.attach` is itself a recovery verb that respawns the daemon before re-bridging. Client-side, a snapshot GET that still answers the typed 409 `RESTORE_UNAVAILABLE` for the pane's own stale fresh-agent claim (e.g. the pane loaded while the server was restarting) does not dead-end on the dismiss-only banner: the pane drives the documented recovery ONCE per pane identity — it refreshes the observed owner fence from the refusal's own `ownerGeneration` (preserving the record's epoch), sends one generation-fenced `freshAgent.attach`, and refetches through the reveal path when reveal-dirty (so the "Refreshing conversation" overlay can clear) or via `manual` otherwise; a suppressed attach restores the once-guard, and repeated 409s fall through to the honest error banner — terminal-owned refusals stay out of this path (their recovery door is the session-directory handoff). Gemini and Kimi terminal modes are status-in... [truncated] Separately, the sidebar shows cross-device remote status rings around a session row's icon: a green ring means the session is open on another device, a blue ring means it is busy on another device (blue wins over green), and rings are suppressed entirely when the session is open on this device (derived from `tabs.sync` registry snapshots — producing clients stamp pane payloads with `sessionKeys`/`busySessionKeys`, consumers re-query remote snapshots on a 30s interval, and the server partitions same-device records into `sameDeviceOpen`, which never produces rings).
 
 **Fresh-Agent Orchestration:** The Rust REST agent API (`/api/tabs`, `/api/panes/:id/split`, `/api/panes/:id/send-keys`, `/api/panes/:id/capture`, `/api/panes/:id/wait-for`) and the standalone Node MCP client accept `agent`/`model`/`effort` parameters where the Rust contract supports them. The Rust orchestration layer dispatches to the registered fresh-agent runtimes. On MCP `new-tab`, resume sugar (`resume`/`resumeSessionId`) is honored for `agent: "opencode"`; terminal-mode resume uses an explicit provider-matched `sessionRef` (raw Codex resume IDs are rejected because they are not sufficient restore identity). Unsupported legacy actions return a deterministic unavailable result instead of contacting a removed backend route.
 
@@ -294,8 +310,8 @@ All components **must** be accessible for browser-use automation and WCAG compli
 - Never rely on selectors for automation; fix accessibility instead
 
 **Linting:**
-- Run `npm run lint` to check a11y violations (eslint-plugin-jsx-a11y)
-- Fix with `npm run lint:fix` for auto-fixable issues
+- Run `pnpm run lint` to check a11y violations (eslint-plugin-jsx-a11y)
+- Fix with `pnpm run lint:fix` for auto-fixable issues
 - A11y linting is CI requirement before merging
 
 ## Path Aliases

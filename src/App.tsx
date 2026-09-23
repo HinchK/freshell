@@ -2278,9 +2278,10 @@ export default function App() {
             </p>
             <p className="text-sm text-muted-foreground mb-2">From your freshell install directory:</p>
             <pre className="bg-muted rounded-md p-3 text-xs overflow-x-auto mb-3">{`git pull
-npm install
-npm run build
-npm run serve`}</pre>
+npm install -g pnpm@10.34.5   # one-time: install the pinned pnpm (skip if you have it)
+pnpm install --frozen-lockfile
+pnpm run build
+pnpm run serve`}</pre>
             <p className="text-sm text-muted-foreground mb-4">
               You can also restart and accept the startup auto-update prompt.
             </p>

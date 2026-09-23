@@ -37,8 +37,14 @@
 
 ## Quick Start
 
+There are two ways to run Freshell from a checkout. They use different
+package managers — pick one recipe and follow only its steps.
+
+### Stable release (v0.7.5 — npm era)
+
+The latest published release tag was built with npm. Use npm for it:
+
 ```bash
-# Clone the repository at the latest stable release
 git clone --branch v0.7.5 https://github.com/danshapiro/freshell.git
 cd freshell
 
@@ -49,34 +55,67 @@ npm install
 npm run serve
 ```
 
-On first run, `npm run serve`, `npm run dev`, `npm run dev:server`, and the
-Rust launcher create a private `.env` file with a secure random `AUTH_TOKEN` if
+### Development main (pnpm)
+
+Development on `main` uses pnpm, pinned to one exact version. npm is only
+used to install pnpm itself, once:
+
+```bash
+git clone https://github.com/danshapiro/freshell.git
+cd freshell
+
+# One-time bootstrap: install the pinned pnpm
+npm install --global pnpm@10.34.5
+
+# Install dependencies exactly as locked
+pnpm install --frozen-lockfile
+
+# Build the client, tools, and Rust server, then run it
+pnpm run serve
+```
+
+When the first pnpm-built release is published, the release recipe above
+will move to that tag and the two recipes will converge.
+
+To update a source checkout you already have: `git pull`, then run the
+install step again (`pnpm install --frozen-lockfile`, or `npm install` on
+the v0.7.5 release) so new dependencies land, then rebuild and run with
+`pnpm run serve` (or `npm run serve` on the release).
+
+On first run, the `serve`, `dev`, and `dev:server` commands and the Rust
+launcher create a private `.env` file with a secure random `AUTH_TOKEN` if
 one is not already supplied. Existing environment variables and `.env` values
 are preserved. The Rust server prints the URL at startup — open it to connect.
 
-For a development checkout, use `npm run dev` for Vite plus the Rust server,
-or `PORT=3499 npm run dev:server` for the Rust server without Vite. For a
+For a development checkout, use `pnpm run dev` for Vite plus the Rust server,
+or `PORT=3499 pnpm run dev:server` for the Rust server without Vite. For a
 previously built checkout, `scripts/launch-rust.sh --port 3499` builds and
 starts an isolated Rust instance; use a port other than the live self-hosted
 port when testing a worktree.
 
 ## Prerequisites
 
-Node.js 22.5+ and Rust stable are required. Node is used for the client,
-standalone CLI/MCP tools, and Electron build; the Rust toolchain builds the
+Building from source needs Node.js 22.5+ and Rust stable. Development main
+also needs pnpm 10.34.5 — install it once with
+`npm install --global pnpm@10.34.5` (the v0.7.5 release recipe above uses npm
+instead and does not need pnpm). Node is used for the client, standalone
+CLI/MCP tools, and Electron build; the Rust toolchain builds the
 `freshell-server` binary and owns PTY support. Platform-specific build tools
 are documented in [Building the Windows Electron App](docs/development/windows-electron-build.md).
+
+The installed desktop app is different from a source checkout: it bundles
+its own Node runtime and needs none of these tools.
 
 > **Note:** On native Windows, terminals default to WSL. Set `WINDOWS_SHELL=cmd` or `WINDOWS_SHELL=powershell` to use a native Windows shell instead.
 
 ## Usage
 
 ```bash
-npm run dev     # Vite + Rust server with hot reload
-npm run serve   # Build and run the Rust server
+pnpm run dev     # Vite + Rust server with hot reload
+pnpm run serve   # Build and run the Rust server
 ```
 
-`npm run serve` is intended for `main`. If you run it from another branch, Freshell asks for confirmation in an interactive terminal and refuses in non-interactive shells unless `FRESHELL_ALLOW_NON_MAIN_SERVE=1` is set.
+`pnpm run serve` is intended for `main`. If you run it from another branch, Freshell asks for confirmation in an interactive terminal and refuses in non-interactive shells unless `FRESHELL_ALLOW_NON_MAIN_SERVE=1` is set.
 
 For unattended operation, build `freshell-server` and install the optional
 user service in [`installers/systemd/freshell-rust.service`](installers/systemd/freshell-rust.service).
@@ -201,7 +240,7 @@ under `tools/` are clients: they connect to an already-running Rust server and
 do not start one.
 
 ```bash
-npm run build:tools
+pnpm run build:tools
 FRESHELL_URL=http://localhost:3001 FRESHELL_TOKEN=<token> \
   node dist/tools/freshell-cli/index.js list-tabs
 FRESHELL_URL=http://localhost:3001 FRESHELL_TOKEN=<token> \
