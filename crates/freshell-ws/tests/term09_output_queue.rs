@@ -931,32 +931,61 @@ async fn eviction_and_supersede_without_sends_still_close() {
     // be delivered — the teardown surfaces as a bare stream end or error.
     // The decision is proven server-side by the capture assert below
     // (exactly one ws.terminal_stream.catastrophic_close event); a write-
-    // timeout or keepalive close would produce none. The observation budget
-    // below must stay under the 60 s write timeout (the next-closest closer,
-    // which cannot fire before ~60 s from the wedged send) so a termination
-    // observed in this window is the monitor's. The budget is a starvation
-    // fail-safe for a single-event wait on a quiet connection: it can only
-    // fail if the close never arrives (a dead monitor) — never merely
-    // because the box is slow.
-    let deadline = started + Duration::from_secs(60);
-    let mut closed = false;
-    while tokio::time::Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(remaining.max(Duration::from_millis(1)), stuck.next()).await {
-            Ok(Some(Ok(WsMessage::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => {
-                closed = true;
-                break;
-            }
+    // timeout or keepalive close would produce none.
+    //
+    // The observation is PROGRESS-BASED, per the standing test discipline
+    // that wall-clock budgets must never fail working code: a prior fixed
+    // 60 s total window still blew out under 3x box oversubscription. The
+    // monitor's decision is observable through the capture layer, so the
+    // wait tracks it: poll for the decision event while reading the
+    // socket. The only fixed bounds are true-stall caps — 300 s if the
+    // monitor NEVER decides (a dead monitor under any load), 120 s if a
+    // decided close is never delivered to this now-reading client (a
+    // wedged teardown). A slow box delays the decision AND the close; it
+    // can never trip either stall cap.
+    let decision_deadline = started + Duration::from_secs(300);
+    let mut decided_at: Option<tokio::time::Instant> = None;
+    loop {
+        let now = tokio::time::Instant::now();
+        match decided_at {
+            None => assert!(
+                now < decision_deadline,
+                "the catastrophic monitor never decided on a zero-send stuck \
+                 connection — a dead monitor (progress-based wait saw no \
+                 ws.terminal_stream.catastrophic_close event in the capture \
+                 within 300 s)"
+            ),
+            Some(at) => assert!(
+                at.elapsed() < Duration::from_secs(120),
+                "the monitor decided but its close was never delivered to the \
+                 now-reading client within 120 s — a wedged teardown, not a \
+                 slow box"
+            ),
+        }
+        if decided_at.is_none()
+            && events
+                .lock()
+                .expect("capture lock")
+                .iter()
+                .any(|e| e.message == "ws.terminal_stream.catastrophic_close")
+        {
+            decided_at = Some(now);
+        }
+        let tick = if decided_at.is_some() {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(250)
+        };
+        // The loop's only non-panic exit is the close observation itself:
+        // every other path is a stall-cap panic carrying the failure's
+        // exact context, so the connection-must-close requirement is
+        // enforced structurally.
+        match tokio::time::timeout(tick, stuck.next()).await {
+            Ok(Some(Ok(WsMessage::Close(_)))) | Ok(None) | Ok(Some(Err(_))) => break,
             Ok(Some(Ok(_))) => {}
-            Err(_) => break, // timed out
+            Err(_) => continue, // tick elapsed with no frame: re-check progress
         }
     }
-    assert!(
-        closed,
-        "a connection with zero completed sends for the whole stall window — \
-         whose queue bytes shrank only via eviction and a superseding attach — \
-         must still be closed by the catastrophic monitor"
-    );
 
     // Task-007 review M3 (landed by task-010): the catastrophic-close event
     // must be diagnosable from the log line ALONE. `sends_in_window` is the
