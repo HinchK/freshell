@@ -15,12 +15,12 @@
 //! | `freshAgent.create {provider:'opencode',…}` | mint a `freshopencode-<requestId>` **placeholder** session (NO serve spawn, NO durable session yet — `adapter.ts:419-431`), broadcast `freshAgent.created` |
 //! | `freshAgent.send {sessionId,text,…}` | **materialize-or-send** (`adapter.ts:324-361`): create the durable `ses_*` session ONLY the first time (THE continuity fix — see below), broadcast `freshAgent.session.materialized` exactly once, then broadcast `freshAgent.send.accepted` and run the turn |
 //! | `freshAgent.kill` | remove the session (both its placeholder and durable keys), abort any in-flight turn task, broadcast `freshAgent.killed` — the SHARED `opencode serve` sidecar is NEVER touched (`adapter.ts kill()` has no `serveManager.shutdown()` call) |
-//! | `freshAgent.interrupt` | best-effort: abort the in-flight turn task + issue `serveManager.abort()` against the real session (`adapter.ts interrupt()` / `abortForState`) |
-//! | `freshAgent.compact` | AGENT-04 (approval-respond Task 4): `POST /session/:id/summarize` with EXACTLY `{providerID, modelID}` (the VALIDATED 1.18.18 contract), sized between a running snapshot and an idle snapshot + gated turn-complete chime |
+//! | `freshAgent.interrupt` | set the suppression flag + TAKE the in-flight turn task (a compact aborts+settles inside the take; a SEND drive is only taken), issue `serveManager.abort()` against the real session (`adapter.ts interrupt()` / `abortForState`): on a LANDED abort, abort+settle the taken send task before answering (silent); on a FAILED abort, clear the flag and preserve the taken send task's observation — restore it (only into the empty slot) so the still-running daemon turn's later natural end rings, or mint ONE recovery edge for a settle the flag suppressed during the RPC window (DR5-1) |
+//! | `freshAgent.compact` | AGENT-04 (approval-respond Task 4): `POST /session/:id/summarize` with EXACTLY `{providerID, modelID}` (the VALIDATED 1.18.18 contract), sized between a running snapshot and an idle snapshot + the turn-complete attention edge (gated only on a user-initiated interrupt) |
 //! | `freshAgent.fork` | AGENT-07 (approval-respond Task 5): `POST /session/:id/fork` (optional `messageID` when the client pins a `^msg` turn), then register the child (bridge + binding row) and answer `freshAgent.forked` ON THE REQUESTING CONNECTION — every failure path also answers on that sink, never silence |
 //!
 //! PR-3 bridges the serve SSE stream into `freshAgent.event` frames (status snapshots +
-//! the status-guarded `freshAgent.turn.complete` chime). PR-4 adds `freshAgent.attach`
+//! the `freshAgent.turn.complete` attention edge, gated only on a user-initiated interrupt). PR-4 adds `freshAgent.attach`
 //! (reload-rehydrate): a known session re-emits a status snapshot and restarts its
 //! serve-SSE bridge if it died; an unknown session emits the `INVALID_SESSION_ID` shape
 //! the client folds into `markSessionLost` instead of hanging.
@@ -264,8 +264,35 @@ struct TurnTask {
     compact_settled_rx: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
-/// Focused ep4-r5 (opencode_ws.rs:1155): the pre-drive redo destroy must be
-/// restored when the compact drive dies without ever dispatching the
+/// What [`FreshOpencodeState::handle_interrupt`]'s take block captured —
+/// decides the RPC leg's handling (DR5-1, delta round 5).
+enum InterruptedOp {
+    /// No registered task (a not-yet-materialized session can never hold
+    /// one — the send path registers the turn task and the real id in one
+    /// locked section, and an idle session simply has none).
+    None,
+    /// A COMPACT drive: aborted + settled INSIDE the take block, exactly as
+    /// pre-DR5-1 (ep4-r6 F2 — the redo compensation must LAND before the
+    /// interrupt answers, and the D2-F1 send-refusal window must never
+    /// open: the compact drive is a LOCAL pipeline, not the daemon-turn
+    /// observer DR5-1 preserves).
+    CompactSettled,
+    /// A SEND turn drive: TAKEN but NOT aborted — the take block hands it
+    /// to the RPC leg, which decides its fate. Carries the session's
+    /// shared turn-complete clock, the clock's value snapshot taken BEFORE
+    /// the flag store (any later mint advances it — the "nothing rang in
+    /// the window" oracle), and whether the task was already finished at
+    /// take (a turn that ended before the interrupt must never ring twice —
+    /// the 12989 pin).
+    SendTaken {
+        task: TurnTask,
+        clock: Arc<StdMutex<Option<i64>>>,
+        clock_at_flag: Option<i64>,
+        finished_at_take: bool,
+    },
+}
+
+/// Focused ep4-r5 (opencode_ws.rs:1155): the pre-drive redo destroy must be/// restored when the compact drive dies without ever dispatching the
 /// summarize POST — INCLUDING the kill/interrupt-during-cold-start leg that
 /// drops the drive task before `manager.compact()` even returns (the match
 /// arm never runs for a dropped future). Owned by the drive task; `disarm()`
@@ -3843,13 +3870,43 @@ impl FreshOpencodeState {
 
     // ── freshAgent.interrupt (WS) ────────────────────────────────────────
 
-    /// Handle a `freshAgent.interrupt` for opencode: mark the turn aborted (BEFORE
-    /// aborting, so a racing in-flight completion sees the flag — adapter.ts:521), abort
-    /// the in-flight turn task, and issue a best-effort `serveManager.abort()` against
-    /// the real session (`adapter.ts interrupt()` / `abortForState`). Always broadcasts
-    /// the resulting idle status (`emitStatus(state,'idle')`, adapter.ts:530) — even for
-    /// a not-yet-materialized session (`abortForState` no-ops when there's no
-    /// `realSessionId`, but the reference still emits idle unconditionally).
+    /// Handle a `freshAgent.interrupt` for opencode (DR5-1, delta round 5):
+    /// set the suppression flag, TAKE the registered turn task, then issue
+    /// the best-effort `serveManager.abort()` against the real session
+    /// (`adapter.ts interrupt()` / `abortForState`) — and let the RPC's
+    /// outcome decide the taken task:
+    ///
+    /// - Ok (the abort LANDED — the user's interrupt genuinely ended the
+    ///   daemon-side turn): abort + settle the taken SEND task NOW, so the
+    ///   ep4-r6 F2 invariant holds (the interrupt's answer still never
+    ///   precedes the settle) and the DR2-1 silence contract stands — no
+    ///   edge for the user's own stop. Broadcasts the idle snapshot.
+    ///
+    /// - Err (the abort FAILED — the daemon-side turn is STILL RUNNING): its
+    ///   LATER REAL natural end is a turn end the user did not witness (the
+    ///   user believes the interrupt stopped it) and MUST ring. The take
+    ///   block no longer aborts the only observer of that end: the Err arm
+    ///   clears the flag (so any settle from there on rings naturally) and
+    ///   either RESTORES the still-running task into the session's slot
+    ///   (restore-only-if-empty — a concurrent send may have installed its
+    ///   own task during the RPC await; never clobber it, and in that corner
+    ///   the old turn's abort-handle is lost even though its end still
+    ///   rings through its own settle tail, because the concurrent send's
+    ///   dispatch cleared the flag) or, for a task that settled INSIDE the
+    ///   RPC window with the flag suppressing it, mints EXACTLY ONE
+    ///   recovery edge — a REAL completion the finished drive observed, NOT
+    ///   the DR2-1-banned fabricated detachment edge (that ban removed a
+    ///   mint for a turn whose observer the take had DESTROYED; this mint
+    ///   rings only for an observer that provably FINISHED, and only when
+    ///   the clock proves nothing else rang in the window). A task already
+    ///   finished AT TAKE ended before the interrupt's flag could suppress
+    ///   it (its settle rang then, or was lost in the flag-store→take
+    ///   nano-window — the 12989 no-second-edge pin forbids minting for it).
+    ///
+    /// DELTA-R2 DR2-1 (unchanged): the interrupt EVENT is SILENT on both
+    /// arms — "a user-initiated interrupt is silent" has NO success
+    /// qualifier; the user initiated (and witnessed) this stop, so an edge
+    /// at interrupt time would be a false alarm for the user's own action.
     pub async fn handle_interrupt(&self, msg: FreshAgentInterrupt) {
         let session_arc = {
             let guard = self.sessions.lock().await;
@@ -3860,25 +3917,70 @@ impl FreshOpencodeState {
             return;
         };
 
-        let (real_id, route, turn_aborted, daemon_turn_accepted) = {
+        let (real_id, route, turn_aborted, daemon_turn_accepted, taken) = {
             let mut session = session_arc.lock().await;
+            // DR5-1: snapshot the turn-complete clock BEFORE the flag store.
+            // A settle tail that already passed its flag check rings and
+            // stamps the clock at any instant; snapshotting first makes the
+            // Err arm's "clock unchanged since the take" comparison a sound
+            // "nothing rang during the window" oracle (the 12989/13122
+            // no-double-bell pins).
+            let clock = session.last_turn_complete_at.clone();
+            let clock_at_flag = *clock.lock().expect("last_turn_complete_at mutex");
             session.turn_aborted.store(true, Ordering::SeqCst);
-            if let Some(task) = session.turn_task.take() {
-                // ep4-r6 F2: join + await the compact's pre-drive-redo settle
-                // — the interrupt's answer must never precede the restore.
-                task.abort_and_settle().await;
-            }
+            let taken = match session.turn_task.take() {
+                None => InterruptedOp::None,
+                Some(task) if task.kind == TurnTaskKind::Compact => {
+                    // ep4-r6 F2: join + await the compact's pre-drive-redo
+                    // settle — the interrupt's answer must never precede the
+                    // restore, and a send arriving in any window this hold
+                    // would open must stay refused (D2-F1). The compact is a
+                    // LOCAL pipeline; aborting it here does not touch the
+                    // daemon-turn observation DR5-1 preserves.
+                    task.abort_and_settle().await;
+                    InterruptedOp::CompactSettled
+                }
+                Some(task) => {
+                    let finished_at_take = task.is_finished();
+                    InterruptedOp::SendTaken {
+                        task,
+                        clock,
+                        clock_at_flag,
+                        finished_at_take,
+                    }
+                }
+            };
             (
                 session.real_session_id.clone(),
                 session.cwd.clone(),
                 session.turn_aborted.clone(),
                 session.daemon_turn_accepted.clone(),
+                taken,
             )
         };
 
         let Some(real_id) = real_id else {
-            // Not yet materialized: `abortForState` is a no-op, but `emitStatus('idle')`
-            // still fires (adapter.ts:530), stamped with whatever id the client sent.
+            // Not yet materialized: `abortForState` is a no-op, but
+            // `emitStatus('idle')` still fires (adapter.ts:530), stamped
+            // with whatever id the client sent. The registration atomicity
+            // above means `taken` can only be `None`/`CompactSettled` here;
+            // if a future writer ever hands the interrupt a live SEND task
+            // with no real id, preserve its observation exactly like the Err
+            // arm (clear the flag + restore-if-empty) instead of strangling
+            // it.
+            if let InterruptedOp::SendTaken {
+                task,
+                clock: _,
+                clock_at_flag: _,
+                ..
+            } = taken
+            {
+                turn_aborted.store(false, Ordering::SeqCst);
+                let mut session = session_arc.lock().await;
+                if session.turn_task.is_none() && !session.killed.load(Ordering::SeqCst) {
+                    session.turn_task = Some(task);
+                }
+            }
             self.broadcast(&event_frame(
                 &msg.session_id,
                 snapshot_event(&msg.session_id, "idle"),
@@ -3893,13 +3995,101 @@ impl FreshOpencodeState {
                 // daemon-side turn is settled; disarm the acceptance so a
                 // later handoff stop does not issue a redundant abort.
                 daemon_turn_accepted.store(false, Ordering::SeqCst);
+                // DR5-1: the abort LANDED — the user's interrupt genuinely
+                // ended the turn. Abort + settle the taken SEND task NOW:
+                // ep4-r6 F2 preserved (the handler still answers only after
+                // the settle lands) and DR2-1 silence holds (no edge for the
+                // user's own stop; the aborted drive's settle tail never
+                // runs). COMPACT drives settled inside the take block.
+                if let InterruptedOp::SendTaken { task, .. } = taken {
+                    task.abort_and_settle().await;
+                }
                 self.broadcast(&event_frame(&real_id, snapshot_event(&real_id, "idle")));
             }
             Err(_) => {
-                // adapter.ts:525-528 -- the abort never landed, so the turn may still
-                // complete normally; clear the flag so a genuine completion isn't
-                // silently swallowed.
+                // DR5-1: the abort FAILED — the daemon-side turn is STILL
+                // RUNNING, and its later real natural end is an unwitnessed
+                // turn end that MUST ring. Clear the flag FIRST so any
+                // settle from this moment on rings naturally, then preserve
+                // the taken task's observation.
                 turn_aborted.store(false, Ordering::SeqCst);
+                if let InterruptedOp::SendTaken {
+                    task,
+                    clock,
+                    clock_at_flag,
+                    finished_at_take,
+                } = taken
+                {
+                    if !finished_at_take {
+                        if task.is_finished() {
+                            // The task settled DURING the RPC await. If
+                            // nothing rang in the window (the clock is
+                            // unchanged since the flag store), its own tail
+                            // was suppressed by the flag — mint ONE recovery
+                            // edge for the REAL completion this finished
+                            // drive observed. This is NOT the DR2-1-banned
+                            // fabricated detachment edge: that mint rang at
+                            // interrupt time for a turn whose observer the
+                            // take had destroyed; THIS rings at the Err arm,
+                            // for an observer that provably finished, and
+                            // only when the clock proves no natural ring
+                            // happened in the window (the 13122 pin).
+                            let clock_now = *clock.lock().expect("last_turn_complete_at mutex");
+                            if clock_now == clock_at_flag {
+                                let session_gone = {
+                                    let session = session_arc.lock().await;
+                                    session.killed.load(Ordering::SeqCst)
+                                };
+                                if !session_gone {
+                                    mint_turn_complete_edge(&self.fresh_agent, &real_id, &clock);
+                                    tracing::debug!(
+                                        provider = PROVIDER,
+                                        session_id = %real_id,
+                                        "opencode.interrupt_abort_failed_suppressed_settle_recovered"
+                                    );
+                                }
+                            }
+                        } else {
+                            // The daemon turn is still running and its
+                            // observer is still live: RESTORE it so the
+                            // later natural settle rings (the flag is clear)
+                            // and a later interrupt/kill can still abort it.
+                            // Restore ONLY into the empty slot: a concurrent
+                            // send may have installed its own task during
+                            // the RPC await — clobbering it would disconnect
+                            // kill/interrupt from the NEW turn. In that
+                            // corner the old turn's abort-handle is lost
+                            // (accepted bounded corner), though its end
+                            // still rings through its own settle tail (the
+                            // concurrent send's dispatch cleared the flag).
+                            let mut session = session_arc.lock().await;
+                            if session.killed.load(Ordering::SeqCst) {
+                                // The pane is going away (handle_kill won a
+                                // race inside the window): never resurrect a
+                                // handle into a condemned record; the kill
+                                // owns the teardown silence.
+                            } else if session.turn_task.is_none() {
+                                session.turn_task = Some(task);
+                                tracing::debug!(
+                                    provider = PROVIDER,
+                                    session_id = %real_id,
+                                    "opencode.interrupt_abort_failed_turn_task_restored"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    provider = PROVIDER,
+                                    session_id = %real_id,
+                                    "opencode.interrupt_abort_failed_restore_slot_occupied"
+                                );
+                            }
+                        }
+                    }
+                }
+                tracing::debug!(
+                    provider = PROVIDER,
+                    session_id = %real_id,
+                    "opencode.interrupt_abort_failed_silent"
+                );
             }
         }
     }
@@ -3926,9 +4116,9 @@ impl FreshOpencodeState {
     /// the model pair (the serve crate stores no session metadata, so resolution lives
     /// here: the session's model split via `split_opencode_model`, else `GET /config`'s
     /// `model`, else a LOUD error), POST, await idle, and settle with the SAME
-    /// idle-snapshot + gated `freshAgent.turn.complete` chime as a send turn. A serve
-    /// error still returns the pane to idle and surfaces the error loudly — never a
-    /// false completion.
+    /// idle-snapshot + unified `freshAgent.turn.complete` edge as a send turn. A
+    /// serve error still returns the pane to idle, rings the same unified edge
+    /// (the turn still ended), and surfaces the error loudly.
     ///
     /// TURN-SCOPED LIFECYCLE (delta-review round 1, D1-F1): the composer stays
     /// interactive while a session is busy (queued sends) and the `/compact` slash
@@ -4311,10 +4501,11 @@ impl FreshOpencodeState {
                 }
             };
 
-            // adapter.ts:386-393 — the same settle tail as a send turn (idle snapshot
-            // unconditionally + the gated chime); a serve error additionally surfaces
-            // loudly (the SAME nested envelope `emit_fresh_agent_error` builds) and
-            // never produces a false turn-complete.
+            // adapter.ts:386-393 — the same settle tail as a send turn (idle
+            // snapshot unconditionally + the unified attention edge: any turn
+            // end except a user interrupt); a serve error additionally
+            // surfaces loudly (the SAME nested envelope `emit_fresh_agent_error`
+            // builds).
             //
             // b8ke focused round-2 review R2-5: the accepted-daemon-operation
             // witness settles with the SAME discipline the send drive uses —
@@ -6549,9 +6740,11 @@ impl FreshOpencodeState {
                                 session_id,
                                 message,
                             } => {
-                                // adapter.ts:278-282 -- a turn error means the in-flight
-                                // turn did not positively complete; consulted by the
-                                // send task's completion gating once idle resolves.
+                                // adapter.ts:278-282 -- a turn error ended the
+                                // in-flight turn without a clean outcome; under
+                                // the unified contract it gates nothing -- it
+                                // only feeds the settle tail's non-clean-outcome
+                                // debug marker (`settle_turn_outcome`).
                                 turn_errored.store(true, Ordering::SeqCst);
                                 error_event(session_id, message)
                             }
@@ -6580,8 +6773,9 @@ impl FreshOpencodeState {
                         fresh_agent.broadcast(&event_frame(&real_id, inner));
                     }
                     // The sidecar was lost; `run_turn`'s own `await_idle` independently
-                    // surfaces `ServeError::SidecarLost`, which already excludes the
-                    // turn from a positive completion. Nothing further to bridge here.
+                    // surfaces `ServeError::SidecarLost`, whose failed settle still
+                    // rings the unified attention edge (`settle_turn_outcome`,
+                    // succeeded=false). Nothing further to bridge here.
                     Ok(SessionSignal::Lost) => {}
                     Err(RecvError::Lagged(_)) => {}
                     Err(RecvError::Closed) => break,
@@ -7309,18 +7503,43 @@ fn error_event(session_id: &str, message: &str) -> Value {
     json!({ "type": "freshAgent.error", "sessionId": session_id, "message": message })
 }
 
-/// `sdk.turn.complete → freshAgent.turn.complete` (sdk-events.ts:71-72; the status-guarded
-/// positive-completion chime, adapter.ts:377-381).
+/// `sdk.turn.complete → freshAgent.turn.complete` (sdk-events.ts:71-72; the
+/// unified turn-end attention edge — emitted for ANY turn end except a
+/// user-initiated interrupt, deliberately diverging from the legacy
+/// status-guarded positive-completion chime of adapter.ts:377-381).
 fn turn_complete_event(session_id: &str, at: i64) -> Value {
     json!({ "type": "freshAgent.turn.complete", "sessionId": session_id, "at": at })
+}
+
+/// Stamp the session's strictly-monotonic turn-complete clock and broadcast the
+/// unified `freshAgent.turn.complete` edge — the shared mint of
+/// [`settle_turn_outcome`]'s tail, so a later edge can never collide with or
+/// regress below an earlier one on the same session.
+fn mint_turn_complete_edge(
+    fresh_agent: &FreshAgentState,
+    real_id: &str,
+    last_turn_complete_at: &StdMutex<Option<i64>>,
+) {
+    let at = {
+        let mut guard = last_turn_complete_at
+            .lock()
+            .expect("last_turn_complete_at mutex");
+        let at = next_monotonic_turn_complete_at(*guard, now_ms());
+        *guard = Some(at);
+        at
+    };
+    fresh_agent.broadcast(&event_frame(real_id, turn_complete_event(real_id, at)));
 }
 
 /// The shared settle tail of a turn-scoped opencode pipeline (a send turn, a compact):
 /// broadcast the idle snapshot UNCONDITIONALLY (`emitStatus(state, 'idle')`,
 /// adapter.ts:371/384 — it flows whether the turn succeeded or errored), then the
-/// positive-completion `freshAgent.turn.complete` chime gated on a clean finish
-/// (`succeeded && !turn_aborted && !turn_errored`, adapter.ts:377), stamped by the
-/// session's monotonic turn-complete clock.
+/// UNIFIED `freshAgent.turn.complete` attention edge gated only on
+/// "the user did not interrupt" (`!turn_aborted`). A clean finish, a
+/// `session.error` turn (`turn_errored`), and a failed settle (`succeeded=false`:
+/// prompt-POST failure, `IdleTimeout`, `SidecarLost`) all ended a turn the user
+/// may not have been watching — one identical edge, no outcome on the wire —
+/// stamped by the session's monotonic turn-complete clock.
 fn settle_turn_outcome(
     fresh_agent: &FreshAgentState,
     real_id: &str,
@@ -7330,17 +7549,18 @@ fn settle_turn_outcome(
     last_turn_complete_at: &StdMutex<Option<i64>>,
 ) {
     fresh_agent.broadcast(&event_frame(real_id, snapshot_event(real_id, "idle")));
-    if succeeded && !turn_aborted.load(Ordering::SeqCst) && !turn_errored.load(Ordering::SeqCst) {
-        let at = {
-            let mut guard = last_turn_complete_at
-                .lock()
-                .expect("last_turn_complete_at mutex");
-            let at = next_monotonic_turn_complete_at(*guard, now_ms());
-            *guard = Some(at);
-            at
-        };
-        fresh_agent.broadcast(&event_frame(real_id, turn_complete_event(real_id, at)));
+    // Unified "needs attention": ANY turn end rings except a user-initiated
+    // interrupt (turn_aborted). A clean finish, a session.error turn
+    // (turn_errored), and a failed settle (succeeded=false: prompt-POST
+    // failure, IdleTimeout, SidecarLost) all ended a turn the user may not
+    // have been watching — one identical edge, no outcome on the wire.
+    if turn_aborted.load(Ordering::SeqCst) {
+        return;
     }
+    if !succeeded || turn_errored.load(Ordering::SeqCst) {
+        tracing::debug!(provider = PROVIDER, session_id = %real_id, "turn.settled_non_clean_unified_edge");
+    }
+    mint_turn_complete_edge(fresh_agent, real_id, last_turn_complete_at);
 }
 
 /// `freshAgent.session.materialized` (legacy reference: server/ws-handler.ts's
@@ -7710,6 +7930,200 @@ mod tests {
                 b"{}".to_vec()
             };
             Box::pin(async move { Ok(ServeHttpResponse::new(200, body)) })
+        }
+    }
+
+    /// The failed-settle fake: like [`StatusPollFakeHttp`] (create mints a fresh
+    /// `ses_N`, everything else a benign 200 `{}`), but the send path's
+    /// `POST /session/:id/prompt_async` answers 500 — the deterministic
+    /// prompt-POST failure (`ServeError::Http`) that settles a turn with
+    /// `succeeded=false`, with no `session.error` SSE ever arriving.
+    struct PromptFailFakeHttp {
+        next_session: AtomicUsize,
+    }
+    impl PromptFailFakeHttp {
+        fn new() -> Self {
+            Self {
+                next_session: AtomicUsize::new(0),
+            }
+        }
+    }
+    impl ServeHttp for PromptFailFakeHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let is_prompt = req.url.contains("/prompt_async")
+                && matches!(req.method, freshell_opencode::serve::HttpMethod::Post);
+            // Precise create-match (the same predicate discipline as
+            // [`StatusPollFakeHttp`]): a loose `/session` contains() would also
+            // swallow the prompt POST this fake exists to fail.
+            let is_create = !is_prompt
+                && matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            let (status, body) = if is_prompt {
+                (500, b"prompt exploded".to_vec())
+            } else if is_create {
+                let n = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+                (
+                    200,
+                    serde_json::to_vec(&json!({ "id": format!("ses_{n}"), "directory": null }))
+                        .unwrap(),
+                )
+            } else {
+                (200, b"{}".to_vec())
+            };
+            Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) })
+        }
+    }
+
+    /// The failed-interrupt fixture (the-usual SDD delta-r1; silence
+    /// contract per delta-r2 DR2-1): like [`StatusPollFakeHttp`] (create
+    /// mints a fresh `ses_N`; status polls go busy → idle), but the
+    /// per-session `POST /session/:id/abort` answers 500 — the deterministic
+    /// `ServeError::Http` that drives
+    /// [`FreshOpencodeState::handle_interrupt`]'s Err arm (the SILENT
+    /// failed-abort path — a user-initiated interrupt never rings) while
+    /// the local turn task has already been taken + aborted.
+    struct AbortFailFakeHttp {
+        next_session: AtomicUsize,
+        last_created: StdMutex<Option<String>>,
+        status_polls: AtomicUsize,
+        busy_polls: usize,
+    }
+    impl AbortFailFakeHttp {
+        fn new(busy_polls: usize) -> Self {
+            Self {
+                next_session: AtomicUsize::new(0),
+                last_created: StdMutex::new(None),
+                status_polls: AtomicUsize::new(0),
+                busy_polls,
+            }
+        }
+    }
+    impl ServeHttp for AbortFailFakeHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let is_abort = req.url.contains("/abort")
+                && matches!(req.method, freshell_opencode::serve::HttpMethod::Post);
+            let is_status = req.url.contains("/session/status");
+            // Precise create-match (the same predicate discipline as
+            // [`StatusPollFakeHttp`]): a loose `/session` contains() would also
+            // swallow the abort POST this fake exists to fail.
+            let is_create = !is_status
+                && !is_abort
+                && matches!(req.method, freshell_opencode::serve::HttpMethod::Post)
+                && (req.url.ends_with("/session") || req.url.contains("/session?"));
+            let (status, body) = if is_abort {
+                (500, b"abort exploded".to_vec())
+            } else if is_create {
+                let n = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+                let id = format!("ses_{n}");
+                *self.last_created.lock().unwrap() = Some(id.clone());
+                (
+                    200,
+                    serde_json::to_vec(&json!({ "id": id, "directory": null })).unwrap(),
+                )
+            } else if is_status {
+                let poll_n = self.status_polls.fetch_add(1, Ordering::SeqCst);
+                let last = self.last_created.lock().unwrap().clone();
+                if poll_n < self.busy_polls {
+                    let id = last.unwrap_or_default();
+                    (
+                        200,
+                        serde_json::to_vec(&json!({ id: { "type": "busy" } })).unwrap(),
+                    )
+                } else {
+                    (200, b"{}".to_vec())
+                }
+            } else {
+                (200, b"{}".to_vec())
+            };
+            Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) })
+        }
+    }
+
+    /// The focused-r2 FR2-3 fixture: models the DAEMON-SIDE turn lifecycle the
+    /// finding describes, on three test-controlled knobs.
+    /// - `POST /session/:id/abort` sets `abort_started` IMMEDIATELY (the test's
+    ///   deterministic signal that the interrupt's take block finished and the
+    ///   RPC leg began), then sleeps `abort_delay_ms`, then answers 500 — a
+    ///   slow-FAILING abort that keeps the Err arm pending while other traffic
+    ///   proceeds.
+    /// - `GET /session/status` reports `ses_1` busy while `daemon_busy` holds,
+    ///   `{}` after the test clears it — a session-AWARE status map (unlike
+    ///   [`AbortFailFakeHttp`]'s global poll counter, two consecutive drives
+    ///   each observe their own busy→idle transition), counted so the test can
+    ///   wait for a specific poll.
+    /// - Everything else answers 200 `{}` (the prompt POST fallback).
+    struct SlowAbortSessionFakeHttp {
+        abort_started: AtomicBool,
+        abort_delay_ms: u64,
+        daemon_busy: AtomicBool,
+        status_polls: AtomicUsize,
+    }
+    impl SlowAbortSessionFakeHttp {
+        fn new(abort_delay_ms: u64) -> Self {
+            Self {
+                abort_started: AtomicBool::new(false),
+                abort_delay_ms,
+                daemon_busy: AtomicBool::new(true),
+                status_polls: AtomicUsize::new(0),
+            }
+        }
+    }
+    impl ServeHttp for SlowAbortSessionFakeHttp {
+        fn request<'a>(
+            &'a self,
+            req: ServeHttpRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<ServeHttpResponse, ServeHttpError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let is_abort = req.url.contains("/abort")
+                && matches!(req.method, freshell_opencode::serve::HttpMethod::Post);
+            let is_status = req.url.contains("/session/status");
+            if is_abort {
+                self.abort_started.store(true, Ordering::SeqCst);
+                let delay_ms = self.abort_delay_ms;
+                return Box::pin(async move {
+                    if delay_ms > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                    Ok(ServeHttpResponse::new(500, b"abort exploded".to_vec()))
+                });
+            }
+            let (status, body) = if is_status {
+                self.status_polls.fetch_add(1, Ordering::SeqCst);
+                if self.daemon_busy.load(Ordering::SeqCst) {
+                    (
+                        200,
+                        serde_json::to_vec(&json!({ "ses_1": { "type": "busy" } })).unwrap(),
+                    )
+                } else {
+                    (200, b"{}".to_vec())
+                }
+            } else {
+                (200, b"{}".to_vec())
+            };
+            Box::pin(async move { Ok(ServeHttpResponse::new(status, body)) })
         }
     }
 
@@ -13893,8 +14307,977 @@ mod tests {
         );
     }
 
+    /// The-usual SDD delta-r2 DR2-1 (REVERSAL of delta-r1's D1-1): a
+    /// user-initiated interrupt is SILENT even when the abort RPC fails. The
+    /// binding constraint "A user-initiated interrupt is silent" has NO
+    /// success qualifier — the user initiated and witnessed this turn end, so
+    /// a "needs attention" edge for the user's own action would be a false
+    /// alarm regardless of whether the abort RPC landed — and a user stop is
+    /// NOT among the enumerated unwitnessed outcomes
+    /// (finished/errored/max-turns/crashed/wedged-stuck/approval). This test
+    /// REPLACES `interrupt_with_a_failed_abort_rpc_rings_the_unified_attention_edge`,
+    /// which codified the refuted D1-1 interpretation (mint the detachment
+    /// because the local settle path is gone); do not re-invert it without the
+    /// delta-r2 ledger.
+    ///
+    /// DR5-1 (delta round 5) EXTENDS the contract to the full shape: the
+    /// silence covers only the INTERRUPT EVENT itself. The abort RPC FAILED,
+    /// so the daemon-side turn NEVER DIED — its LATER REAL natural end is a
+    /// turn end the user did not witness (the user believes the interrupt
+    /// stopped it) and MUST ring the identical unified edge. Pre-DR5-1 the
+    /// take block aborted the registered task — the ONLY observer of the
+    /// daemon-side turn's eventual idle — strangling that bell forever; the
+    /// fix takes the task WITHOUT aborting and restores it on the Err arm so
+    /// its own settle tail rings when the daemon goes idle.
+    ///
+    /// The cleared-flag property still holds: the Err arm resets
+    /// `turn_aborted` so a LATER turn's genuine settle rings, stamped fresh
+    /// on the session's monotonic turn-complete clock.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interrupt_with_a_failed_abort_rpc_is_silent() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        // The session-aware failed-abort fixture: `daemon_busy` holds the
+        // first turn deterministically LIVE (it can never settle on its own
+        // while busy — the turn task is provably live when the interrupt
+        // lands), and the per-session /abort POST answers 500 immediately —
+        // the handler deterministically takes the Err arm.
+        let http = Arc::new(SlowAbortSessionFakeHttp::new(0));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-int-silent"), None).await;
+        let placeholder = "freshopencode-req-int-silent";
+        // Hand-materialize (the FR1-2 test discipline — the session-aware
+        // fixture models the daemon-side turn lifecycle and does not mint
+        // create ids) so the send drives the durable `ses_1` directly.
+        {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("session tracked").clone();
+            drop(sessions);
+            session_arc.lock().await.real_session_id = Some("ses_1".to_string());
+        }
+        st.handle_send(send_msg(placeholder, "hello")).await;
+
+        // Interrupt promptly, while the turn task is deterministically LIVE
+        // (daemon_busy holds): the handler takes the LIVE turn task and the
+        // abort RPC fails (500).
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        st.handle_interrupt(FreshAgentInterrupt {
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        // INTERRUPT-EVENT SILENCE (DR2-1): no `freshAgent.turn.complete` may
+        // fire for the interrupt itself. The daemon turn is still busy (the
+        // restored drive keeps observing), so any edge inside this window
+        // could only be an interrupt-time mint, which the corrected
+        // contract forbids.
+        let mut edges = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+            {
+                edges += 1;
+            }
+        }
+        assert_eq!(
+            edges, 0,
+            "a user-initiated interrupt is silent even when the abort RPC fails — no \
+             freshAgent.turn.complete may fire at interrupt time"
+        );
+
+        // The interrupt-time silence is total: the session's monotonic
+        // turn-complete clock is STILL UNSET — nothing minted for the
+        // interrupt event (checked here, before the natural end lands).
+        // Lock order: clone the session Arc out, drop the map guard, THEN
+        // lock the session.
+        {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("session tracked").clone();
+            drop(sessions);
+            let clock = session_arc
+                .lock()
+                .await
+                .last_turn_complete_at
+                .lock()
+                .expect("last_turn_complete_at mutex")
+                .is_none();
+            assert!(
+                clock,
+                "the silent interrupt must leave the session's turn-complete clock unset — \
+                 nothing minted an edge at interrupt time"
+            );
+        }
+
+        // DR5-1: the daemon turn's REAL natural completion MUST RING. The
+        // abort RPC failed, so the daemon-side turn kept running; the
+        // preserved (restored) observer drive polls to its natural idle
+        // (the test clears `daemon_busy` — the daemon-side turn ends) and
+        // its settle tail — with the Err arm's flag clear — rings the
+        // identical unified edge for the unwitnessed end. Bounded wait ~5s.
+        // Against pre-DR5-1 code this NEVER rings (the take block aborted
+        // the only observer).
+        http.daemon_busy.store(false, Ordering::SeqCst);
+        let first_at = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Ok(raw) => {
+                        let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                        if frame["type"] == "freshAgent.event"
+                            && frame["event"]["type"] == "freshAgent.turn.complete"
+                        {
+                            return frame["event"]["at"].as_i64().expect("numeric at");
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await
+                    }
+                }
+            }
+        })
+        .await
+        .expect(
+            "the daemon turn's later REAL natural end after the failed abort is an \
+             unwitnessed turn end that MUST ring (DR5-1)",
+        );
+        assert!(
+            first_at > 0,
+            "the daemon turn's recovered edge carries a finite positive monotonic `at`: {first_at}"
+        );
+
+        // The cleared-flag property (DR2-1's surviving purpose): a subsequent
+        // send's own settle must ring (the interrupt's stale flag must not
+        // swallow it) — stamped strictly monotonic AFTER the recovered first
+        // edge. Re-arm the daemon's busy state so the later drive observes
+        // genuine running activity before its idle (the fixture's busy map
+        // is the drive's only activity source), then end it.
+        http.daemon_busy.store(true, Ordering::SeqCst);
+        let poll_baseline = http.status_polls.load(Ordering::SeqCst);
+        st.handle_send(send_msg(placeholder, "second")).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while http.status_polls.load(Ordering::SeqCst) <= poll_baseline {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the later send never polled the daemon status"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        http.daemon_busy.store(false, Ordering::SeqCst);
+        let second_at = wait_for_turn_complete_at(&mut rx).await.expect(
+            "a later turn's genuine completion must not be swallowed by the stale interrupt flag",
+        );
+        assert!(
+            second_at > first_at,
+            "the later turn's edge is strictly monotonic after the recovered first edge: \
+             first={first_at} second={second_at}"
+        );
+    }
+
+    /// Wait (bounded) for the next `freshAgent.turn.complete` edge and return
+    /// its numeric `at`; `None` when none arrives inside the budget.
+    async fn wait_for_turn_complete_at(
+        rx: &mut tokio::sync::broadcast::Receiver<String>,
+    ) -> Option<i64> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                continue;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+            {
+                return frame["event"]["at"].as_i64();
+            }
+        }
+    }
+
+    /// The-usual SDD delta-r2 DR2-1 (kept from delta-r1's bounded-mint era
+    /// under the corrected contract): interrupting a session whose turn
+    /// already ENDED (the registered task is finished — its settle rang the
+    /// natural end) must ring NO further edge even when the abort RPC fails.
+    /// Two protected properties: the earlier turn's natural edge was NOT
+    /// swallowed (it rang once, before the interrupt), and "a user-initiated
+    /// interrupt is silent" — no success qualifier — means nothing may add a
+    /// second bell for it.
     #[tokio::test]
-    async fn errored_turn_emits_no_turn_complete_but_forwards_the_error() {
+    async fn interrupt_with_a_failed_abort_rpc_after_the_turn_ended_rings_no_second_edge() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        // A short busy-poll count so the first turn settles on its own quickly;
+        // the /abort POST still answers 500 for the later interrupt.
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(AbortFailFakeHttp::new(2)),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-int-done"), None).await;
+        let placeholder = "freshopencode-req-int-done";
+        st.handle_send(send_msg(placeholder, "hello")).await;
+
+        // Wait for the turn's own settle edge — the natural end rang once.
+        let first_at = {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    panic!("the first turn never rang its natural settle edge");
+                }
+                let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                    continue;
+                };
+                let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                if frame["type"] == "freshAgent.event"
+                    && frame["event"]["type"] == "freshAgent.turn.complete"
+                {
+                    break frame["event"]["at"].as_i64().expect("numeric at");
+                }
+            }
+        };
+
+        // Deterministic finish barrier: the registered task handle (whose tail
+        // emitted the edge above) must read FINISHED before the interrupt runs,
+        // so the interrupt's take observes an already-finished task — no live
+        // turn to detach. Lock order: clone the session Arc out, drop the map
+        // guard, THEN lock the session.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let session_arc = st.sessions.lock().await.get(placeholder).cloned();
+            let finished = match session_arc {
+                Some(session_arc) => {
+                    let session = session_arc.lock().await;
+                    session
+                        .turn_task
+                        .as_ref()
+                        .is_none_or(|task| task.is_finished())
+                }
+                None => true,
+            };
+            if finished {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the turn task never reported finished"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Interrupt the ENDED session with the abort RPC failing: the
+        // interrupt must stay silent — no second bell for a turn that
+        // already rang.
+        st.handle_interrupt(FreshAgentInterrupt {
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        let mut second_edge: Option<serde_json::Value> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+            {
+                second_edge = Some(frame);
+                break;
+            }
+        }
+        assert!(
+            second_edge.is_none(),
+            "a failed interrupt after the turn already ended must not mint a second edge \
+             (first edge at {first_at}): {second_edge:?}"
+        );
+    }
+
+    /// The-usual SDD delta-r2 DR2-1, reshaped for DR5-1 (delta round 5): a
+    /// turn whose natural settle rings DURING the interrupt's pending abort
+    /// RPC rings EXACTLY ONCE — its own natural edge, and the failed-abort
+    /// Err arm's DR5-1 suppressed-settle recovery mint adds NOTHING. The
+    /// DR5-1 Err arm mints ONLY when the taken task settled with the flag
+    /// set AND nothing rang in the window (the session clock unchanged since
+    /// the take); a tail that already passed its `turn_aborted` check rings
+    /// on its own and advances the clock, which is precisely the evidence
+    /// the Err arm's mint gate consumes to stay silent. Do not re-invert
+    /// this without the delta-r2 ledger.
+    ///
+    /// The mid-tail race window (a tail reading `turn_aborted` just before
+    /// the interrupt sets it — microseconds) cannot be hit deterministically;
+    /// this test injects the natural ring through the REAL mint helper at
+    /// the exact point the window covers — after the take block (proven via
+    /// the fake's `abort_started` knob, which flips only once the interrupt's
+    /// RPC leg begins) and before the Err arm runs (the slow abort's delay) —
+    /// modeling a settle tail that already passed its `turn_aborted` check
+    /// when the interrupt set the flag, whose mint an abort can no longer
+    /// un-ring.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interrupt_abort_failure_adds_no_edge_when_the_natural_settle_rings_during_the_join() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        // The slow-FAILING abort: `abort_started` flips the moment the
+        // interrupt's RPC leg begins (the take block is done — under DR5-1
+        // the take no longer aborts, so this knob is the deterministic
+        // interlock), then the POST sleeps 400ms before answering 500 — the
+        // Err arm runs only once the test has staged the raced natural ring.
+        let http = Arc::new(SlowAbortSessionFakeHttp::new(400));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-int-join"), None).await;
+        let placeholder = "freshopencode-req-int-join";
+
+        // The raced shape, built deterministically: a materialized session
+        // whose LIVE Send-kind turn task parks on a probe channel. Releasing
+        // the probe models the settle tail's COMPLETION during the pending
+        // RPC await (a finished drive observed its end); the tail's mint
+        // itself is staged below through the real mint helper, modeling a
+        // tail that already passed its `turn_aborted` check. Lock order:
+        // clone the session Arc out, drop the map guard, THEN lock the
+        // session.
+        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel::<()>();
+        let clock = {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("session tracked").clone();
+            drop(sessions);
+            let mut session = session_arc.lock().await;
+            session.real_session_id = Some("ses_1".to_string());
+            session.turn_task = Some(TurnTask {
+                kind: TurnTaskKind::Send,
+                handle: tokio::spawn(async move {
+                    let _ = probe_rx.await;
+                }),
+                compact_settled_rx: None,
+            });
+            session.last_turn_complete_at.clone()
+        };
+
+        let interrupt = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_interrupt(FreshAgentInterrupt {
+                    provider: AgentProvider::Opencode,
+                    session_id: placeholder.to_string(),
+                    session_type: SessionType::Freshopencode,
+                    cwd: None,
+                })
+                .await
+            })
+        };
+
+        // Wait until the interrupt's RPC leg began: `abort_started` flips
+        // only after the take block's synchronous prefix (the flag set +
+        // the take WITHOUT an abort under DR5-1), so this is proof the
+        // interrupt holds the taken task and is parked inside the abort
+        // RPC's pending window.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !http.abort_started.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the interrupt never reached its abort RPC"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The raced NATURAL edge: a settle tail already past its
+        // `turn_aborted` check when the interrupt set the flag rings DURING
+        // the pending RPC window — the tail's own mint, which nothing can
+        // un-ring. The injection runs the real mint helper (the same
+        // clock-stamped broadcast the tail's mint segment performs).
+        mint_turn_complete_edge(&st.fresh_agent, "ses_1", &clock);
+
+        // The tail completes inside the window (a finished drive observed
+        // its end), then the abort RPC fails and the Err arm runs — with the
+        // clock ADVANCED, its suppressed-settle recovery mint must stay
+        // silent.
+        let _ = probe_tx.send(());
+        interrupt.await.expect("interrupt task");
+
+        // Exactly ONE edge total — the raced natural one. The Err arm must
+        // add NOTHING for a turn end that already rang.
+        let mut edges = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+            {
+                edges += 1;
+            }
+        }
+        assert_eq!(
+            edges, 1,
+            "the raced natural settle rang once; the failed-interrupt Err arm's recovery mint \
+             must add no second edge for a turn end that already rang"
+        );
+    }
+
+    /// The-usual SDD delta round 5 DR5-1 (reshaping delta-r2 DR2-1's
+    /// exactly-one-edge expectation, which reshaped focused-r2 FR2-3): a
+    /// LATER send can legitimately start and settle during a slow/failed
+    /// abort (the interrupt handler releases the session lock across the
+    /// abort-RPC await). Under DR5-1 the earlier turn was only TAKEN, not
+    /// aborted — and the abort FAILED, so its daemon-side turn never died.
+    /// When the daemon goes idle BOTH real drives observe the end and BOTH
+    /// settles ring (the later send's dispatch-clear of `turn_aborted`
+    /// un-suppresses the earlier drive's tail): the earlier turn's later
+    /// REAL natural end after a failed abort is an unwitnessed turn end
+    /// that MUST ring — the adjudicated contract — and the later turn's end
+    /// rings its own. The interrupt EVENT itself and the Err arm add
+    /// NOTHING: the occupied restore slot is the documented DR5-1 corner
+    /// (the later send installed its own task during the RPC await, so the
+    /// earlier task is never put back — its end still rings through its own
+    /// settle tail, but the slot's abort-handle is lost), and the Err arm's
+    /// recovery mint stays silent because both natural rings advanced the
+    /// session clock inside the window.
+    ///
+    /// Built deterministically on the session-aware slow-abort fixture: the
+    /// earlier turn is a REAL send drive parked on daemon-busy status polls;
+    /// the fake's `abort_started` knob proves the interrupt's take block
+    /// finished (the take happened, the session lock released) and the RPC
+    /// leg began; a REAL second send then starts DURING the pending abort
+    /// RPC, and the daemon-side turn goes idle (the test clears
+    /// `daemon_busy`) so BOTH drives settle legitimately. Exactly TWO edges
+    /// total — one per real turn end, none from the Err arm.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn interrupt_abort_failure_rings_both_real_turn_ends_and_the_err_arm_adds_nothing() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let http = Arc::new(SlowAbortSessionFakeHttp::new(400));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-int-fr23"), None).await;
+        let placeholder = "freshopencode-req-int-fr23";
+        // Hand-materialize (the FR1-2 test discipline) so both sends drive
+        // the durable id directly.
+        {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("session tracked").clone();
+            drop(sessions);
+            session_arc.lock().await.real_session_id = Some("ses_1".to_string());
+        }
+
+        // The EARLIER turn: a REAL send drive, parked on daemon-busy status
+        // polls (daemon_busy holds — the drive can never settle on its own,
+        // so it is deterministically still live when the interrupt takes it).
+        st.handle_send(send_msg(placeholder, "first")).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        let interrupt = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_interrupt(FreshAgentInterrupt {
+                    provider: AgentProvider::Opencode,
+                    session_id: placeholder.to_string(),
+                    session_type: SessionType::Freshopencode,
+                    cwd: None,
+                })
+                .await
+            })
+        };
+
+        // Deterministic wait: the fake's `abort_started` knob flips the
+        // moment the interrupt's take block finished and the RPC leg began —
+        // the earlier drive is necessarily still live at that point (it
+        // cannot settle while daemon_busy holds).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !http.abort_started.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the interrupt never reached its abort RPC"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The LATER send: issued DURING the pending (slow, failing) abort
+        // RPC, exactly as the finding describes — the handler released the
+        // session lock across the await. Its dispatch clears the interrupt's
+        // stale `turn_aborted` flag, which is exactly what un-suppresses the
+        // earlier drive's settle tail below.
+        st.handle_send(send_msg(placeholder, "second")).await;
+
+        // Deterministic busy→idle: wait for the later send's first status
+        // poll (observed daemon activity, while daemon_busy still holds),
+        // then clear daemon_busy — the next polls read idle and BOTH drives
+        // settle legitimately, each ringing its own natural edge and
+        // advancing the session clock DURING the abort RPC's pending
+        // window.
+        let poll_baseline = http.status_polls.load(Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while http.status_polls.load(Ordering::SeqCst) <= poll_baseline {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the later send never polled the daemon status"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        http.daemon_busy.store(false, Ordering::SeqCst);
+
+        // BOTH natural rings land inside the pending window (bounded wait):
+        // the earlier turn's recovered end AND the later turn's own end —
+        // two identical unified edges, one per real unwitnessed turn end.
+        let mut edges_before_err = 0;
+        let mut ats: Vec<i64> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while edges_before_err < 2 {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+            {
+                edges_before_err += 1;
+                ats.push(frame["event"]["at"].as_i64().expect("numeric at"));
+            }
+        }
+        assert_eq!(
+            edges_before_err, 2,
+            "both real turn ends ring during the pending abort window: the earlier turn's \
+             later REAL natural end after the failed abort (the DR5-1 adjudication) and the \
+             later turn's own end"
+        );
+        assert_eq!(ats.len(), 2);
+        assert!(
+            ats[1] > ats[0],
+            "the two edges share the session's strictly-monotonic clock: {ats:?}"
+        );
+
+        // The abort RPC fails after its delay; the Err arm runs and adds
+        // NOTHING: its recovery mint sees the clock ADVANCED (both natural
+        // rings stamped it inside the window) and stays silent, and the
+        // occupied restore slot (the later send's task) is the documented
+        // corner.
+        interrupt.await.expect("interrupt task");
+
+        let mut extra_edges = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+            {
+                extra_edges += 1;
+            }
+        }
+        assert_eq!(
+            extra_edges, 0,
+            "the failed-interrupt Err arm adds no edge once both real turn ends already rang"
+        );
+    }
+
+    /// The-usual SDD delta round 5 DR5-1 (reshaping delta-r2 DR2-1's
+    /// `a_suppressed_settle_during_the_interrupt_take_stays_silent_when_the_abort_fails`,
+    /// which reshaped focused-r2 FR2-2a's flag-REACTIVE silence): the Err
+    /// arm's suppressed-settle recovery mint. A REAL opencode drive never
+    /// ends as a reaction to `turn_aborted` — it ends by OBSERVING the
+    /// daemon (idle, error, timeout). A drive that observes its end and
+    /// settles DURING the pending (failed) abort RPC reads the interrupt's
+    /// flag TRUE at settle time, so its own tail is suppressed — but the
+    /// daemon turn's end was REAL and unwitnessed (the abort FAILED; the
+    /// user believes the interrupt stopped it), so the Err arm mints
+    /// EXACTLY ONE edge through the shared `mint_turn_complete_edge`.
+    ///
+    /// Distinction from the DR2-1-banned fabricated edge: the banned mint
+    /// rang for a turn whose observer the take block had DESTROYED (no
+    /// completion was ever observed — a fabricated edge at interrupt time).
+    /// THIS mint rings at the Err arm, only for a task that provably
+    /// FINISHED during the RPC await (a finished drive observed its end)
+    /// and only when NOTHING else rang in the window (the session clock
+    /// unchanged since the take) — one bell for one real observed turn end.
+    /// The interrupt EVENT itself stays silent (pinned by
+    /// `interrupt_with_a_failed_abort_rpc_is_silent`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_settle_suppressed_during_the_failed_abort_rpc_await_rings_once_via_the_err_arm() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        // The slow-FAILING abort: `abort_started` flips once the interrupt's
+        // RPC leg begins (the take is done — under DR5-1 the take no longer
+        // aborts), then the POST sleeps 400ms before answering 500 — the
+        // suppressed settle lands deterministically INSIDE the pending
+        // window, before the Err arm runs.
+        let http = Arc::new(SlowAbortSessionFakeHttp::new(400));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-int-fr22a"), None).await;
+        let placeholder = "freshopencode-req-int-fr22a";
+
+        // The suppressed-settle shape, built deterministically: a LIVE
+        // Send-kind task parked on a probe channel. Releasing the probe
+        // after `abort_started` flips models a real drive that OBSERVED the
+        // daemon turn's end and settled inside the RPC window — a finished
+        // drive whose own tail was suppressed by the interrupt's flag (the
+        // raw parked future never mints; the suppression is what the flag
+        // would have done to the real tail). Lock order: clone the session
+        // Arc out, drop the map guard, THEN lock the session.
+        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel::<()>();
+        {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("session tracked").clone();
+            drop(sessions);
+            let mut session = session_arc.lock().await;
+            session.real_session_id = Some("ses_1".to_string());
+            session.turn_task = Some(TurnTask {
+                kind: TurnTaskKind::Send,
+                handle: tokio::spawn(async move {
+                    let _ = probe_rx.await;
+                }),
+                compact_settled_rx: None,
+            });
+        }
+
+        let interrupt = {
+            let st = st.clone();
+            tokio::spawn(async move {
+                st.handle_interrupt(FreshAgentInterrupt {
+                    provider: AgentProvider::Opencode,
+                    session_id: placeholder.to_string(),
+                    session_type: SessionType::Freshopencode,
+                    cwd: None,
+                })
+                .await
+            })
+        };
+
+        // Deterministic wait: the RPC leg began (the take block is done),
+        // and the taken task is deterministically still live at that point.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !http.abort_started.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the interrupt never reached its abort RPC"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The suppressed settle: the drive observes its end and finishes
+        // INSIDE the pending RPC window — its own tail rings nothing (the
+        // flag holds), and the Err arm's recovery mint must ring exactly
+        // once for it.
+        let _ = probe_tx.send(());
+        interrupt.await.expect("interrupt task");
+
+        // EXACTLY ONE edge — the Err arm's recovery mint for the real,
+        // observed, unwitnessed turn end (never two: the interrupted event
+        // itself is silent, and nothing else rang in the window).
+        let mut edges = 0;
+        let mut saw_at: Option<i64> = None;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+            {
+                edges += 1;
+                saw_at = frame["event"]["at"].as_i64();
+            }
+        }
+        assert_eq!(
+            edges, 1,
+            "a settle suppressed by the interrupt's flag during the failed-abort RPC window \
+             rings EXACTLY ONCE via the Err arm's recovery mint"
+        );
+        let at = saw_at.expect("the recovery mint carries an at");
+        assert!(
+            at > 0,
+            "the recovery mint's `at` is a positive monotonic stamp: {at}"
+        );
+
+        // The mint stamped the session's shared clock (the strictly-
+        // monotonic timeline the next edge must follow).
+        {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("session tracked").clone();
+            drop(sessions);
+            let stamped = *session_arc
+                .lock()
+                .await
+                .last_turn_complete_at
+                .lock()
+                .expect("last_turn_complete_at mutex");
+            assert_eq!(
+                stamped,
+                Some(at),
+                "the recovery mint stamped the session's shared monotonic clock"
+            );
+        }
+    }
+
+    /// The-usual SDD delta round 5 DR5-1 (the Err arm's RESTORE branch): a
+    /// turn still RUNNING when the abort RPC fails is the daemon turn that
+    /// NEVER DIED — the interrupt must put its observer task BACK so the
+    /// later real natural end rings. The take (no abort) leaves the drive
+    /// alive; the Err arm clears the flag and restores the taken task into
+    /// the (empty) slot; when the daemon then goes idle the restored
+    /// drive's own settle tail rings the identical unified edge. Against
+    /// pre-DR5-1 code the take block aborted the observer, so the slot
+    /// stays empty and the daemon's idle NEVER rings.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_abort_restores_the_live_turn_task_so_its_later_natural_settle_rings() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        // The session-aware slow-abort fixture: `daemon_busy` holds the
+        // drive deterministically live (it can never settle on its own while
+        // busy), `abort_started` is the take-done interlock, and the /abort
+        // POST fails after its delay.
+        let http = Arc::new(SlowAbortSessionFakeHttp::new(200));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: http.clone(),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-int-restore"), None).await;
+        let placeholder = "freshopencode-req-int-restore";
+        // Hand-materialize (the FR1-2 test discipline) so the send drives
+        // the durable id directly.
+        {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("session tracked").clone();
+            drop(sessions);
+            session_arc.lock().await.real_session_id = Some("ses_1".to_string());
+        }
+
+        // The REAL send drive, parked on daemon-busy status polls —
+        // deterministically still live when the interrupt takes it and
+        // when the Err arm runs.
+        st.handle_send(send_msg(placeholder, "first")).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+
+        st.handle_interrupt(FreshAgentInterrupt {
+            provider: AgentProvider::Opencode,
+            session_id: placeholder.to_string(),
+            session_type: SessionType::Freshopencode,
+            cwd: None,
+        })
+        .await;
+
+        // The RESTORE pin: after the interrupt answered (the Err arm ran —
+        // the RPC failed after its delay), the taken task is BACK in the
+        // session's slot, still live. Lock order: clone the session Arc
+        // out, drop the map guard, THEN lock the session.
+        {
+            let sessions = st.sessions.lock().await;
+            let session_arc = sessions.get(placeholder).expect("session tracked").clone();
+            drop(sessions);
+            let session = session_arc.lock().await;
+            let task = session
+                .turn_task
+                .as_ref()
+                .expect("the Err arm restored the taken live turn task");
+            assert!(
+                !task.is_finished(),
+                "the restored task is the still-running observer drive"
+            );
+        }
+
+        // The daemon-side turn ends for real: clear `daemon_busy` — the
+        // restored drive's next status polls observe idle, its settle tail
+        // runs with the Err arm's flag CLEAR, and the unwitnessed end rings
+        // EXACTLY ONCE. Against pre-DR5-1 code the observer was aborted at
+        // take and this NEVER rings.
+        http.daemon_busy.store(false, Ordering::SeqCst);
+        let first_at = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Ok(raw) => {
+                        let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                        if frame["type"] == "freshAgent.event"
+                            && frame["event"]["type"] == "freshAgent.turn.complete"
+                        {
+                            return frame["event"]["at"].as_i64().expect("numeric at");
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the restored observer's natural settle rings the daemon turn's real end (DR5-1)");
+        assert!(
+            first_at > 0,
+            "the restored settle's edge carries a positive monotonic `at`: {first_at}"
+        );
+
+        // Exactly-once: a further 300ms window hears NO second edge.
+        let mut extra_edges = 0;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] == "freshAgent.event"
+                && frame["event"]["type"] == "freshAgent.turn.complete"
+            {
+                extra_edges += 1;
+            }
+        }
+        assert_eq!(
+            extra_edges, 0,
+            "the restored observer's natural end rings exactly once — no Err-arm mint on top"
+        );
+    }
+
+    #[tokio::test]
+    async fn errored_turn_emits_the_error_and_the_unified_attention_edge() {
         let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
         let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
         let deps = ServeDeps {
@@ -13937,7 +15320,7 @@ mod tests {
         });
 
         let mut saw_error = false;
-        let mut saw_complete = false;
+        let mut complete_at: Vec<i64> = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -13956,7 +15339,13 @@ mod tests {
                     assert_eq!(frame["event"]["message"], "boom");
                     saw_error = true;
                 }
-                Some("freshAgent.turn.complete") => saw_complete = true,
+                Some("freshAgent.turn.complete") => {
+                    // Unified signal: an errored turn end the user didn't witness
+                    // rings the SAME edge as a clean one — the pane resolves, the
+                    // at is monotonic.
+                    complete_at.push(frame["event"]["at"].as_i64().expect("numeric at"));
+                    break; // the turn's terminal frame; stop draining.
+                }
                 _ => {}
             }
         }
@@ -13965,9 +15354,93 @@ mod tests {
             saw_error,
             "the session.error SSE event must be forwarded as freshAgent.error"
         );
+        assert_eq!(
+            complete_at.len(),
+            1,
+            "an errored turn must emit the unified attention edge"
+        );
         assert!(
-            !saw_complete,
-            "an errored turn must never emit turn.complete"
+            complete_at[0] > 0,
+            "at must be a positive monotonic timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_settle_emits_the_unified_attention_edge() {
+        let (tx, mut rx) = tokio::sync::broadcast::channel::<String>(64);
+        let fresh_agent = FreshAgentState::new(Arc::new("tok".to_string()), Arc::new(tx));
+        let deps = ServeDeps {
+            spawner: Arc::new(TrackedSpawner {
+                killed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }),
+            http: Arc::new(PromptFailFakeHttp::new()),
+            ports: Arc::new(FakeAllocator),
+            events: Arc::new(NoopEventSource),
+        };
+        let config = ServeConfig {
+            idle_poll_interval: Duration::from_millis(15),
+            ..ServeConfig::default()
+        };
+        let manager = OpencodeServeManager::new(deps, config);
+        manager
+            .ensure_started()
+            .await
+            .expect("healthy fake serve starts");
+        fresh_agent.set_manager_for_test(manager).await;
+        let st = FreshOpencodeState::new(fresh_agent);
+
+        st.handle_create(create_msg("req-fail"), None).await;
+        let placeholder = "freshopencode-req-fail";
+        st.handle_send(send_msg(placeholder, "hello")).await;
+
+        // The prompt POST answers 500, so `run_turn` fails BEFORE any idle await
+        // and the settle tail runs with succeeded=false — the failed-settle leg
+        // of the unified signal (prompt-POST failure; IdleTimeout and
+        // SidecarLost settle through this same tail).
+        let mut saw_idle = false;
+        let mut complete_at: Vec<i64> = Vec::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok(Ok(raw)) = tokio::time::timeout(remaining, rx.recv()).await else {
+                break;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if frame["type"] != "freshAgent.event" {
+                continue;
+            }
+            match frame["event"]["type"].as_str() {
+                Some("freshAgent.session.snapshot") => {
+                    if let Some("idle") = frame["event"]["status"].as_str() {
+                        saw_idle = true;
+                    }
+                }
+                Some("freshAgent.turn.complete") => {
+                    // Unified signal: a turn that died mid-drive still ENDED —
+                    // the user may not have watched it, so it rings the SAME
+                    // edge as a clean finish, with a monotonic at.
+                    complete_at.push(frame["event"]["at"].as_i64().expect("numeric at"));
+                    break; // the turn's terminal frame; stop draining.
+                }
+                _ => {}
+            }
+        }
+
+        assert!(
+            saw_idle,
+            "a failed settle must still broadcast the idle snapshot"
+        );
+        assert_eq!(
+            complete_at.len(),
+            1,
+            "a failed settle must emit the unified attention edge"
+        );
+        assert!(
+            complete_at[0] > 0,
+            "at must be a positive monotonic timestamp"
         );
     }
 
@@ -16447,7 +17920,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_serve_error_broadcasts_idle_and_a_loud_error_without_a_chime() {
+    async fn compact_serve_error_broadcasts_idle_a_loud_error_and_the_unified_chime() {
         let (st, http, mut rx) =
             compact_state(r#"{"model":null}"#, SummarizeOutcome::Answered500).await;
         insert_compact_session(&st, "ses_1", Some("prov-a/mdl-x")).await;
@@ -16455,7 +17928,8 @@ mod tests {
         st.handle_compact(compact_msg("ses_1")).await;
 
         // The failure settles on the detached drive (D1-F1): the terminal frame
-        // is the loud error (idle precedes it inside the settle tail).
+        // is the loud error (idle — and now the unified chime — precede it
+        // inside the settle tail).
         let frames = frames_until(&mut rx, |f| is_event(f, "freshAgent.error", None)).await;
         assert_eq!(http.summarize_requests().len(), 1, "the POST did land");
         assert!(
@@ -16485,12 +17959,15 @@ mod tests {
                 .contains("summarize exploded"),
             "the serve error text crosses the wire: {error_frame}"
         );
-        assert!(
-            !frames
-                .iter()
-                .any(|f| is_event(f, "freshAgent.turn.complete", None)),
-            "a serve error never fabricates a completion: {frames:?}"
-        );
+        // Unified signal: a compact that died on a serve error still ENDED a
+        // turn the user may not have watched — the SAME edge rings (before the
+        // loud error, inside the settle tail), with a monotonic at.
+        let chime = frames
+            .iter()
+            .find(|f| is_event(f, "freshAgent.turn.complete", None))
+            .expect("a failed settle must emit the unified attention edge");
+        let at = chime["event"]["at"].as_i64().expect("numeric at");
+        assert!(at > 0, "at must be a positive monotonic timestamp: {chime}");
     }
 
     // ── D1-F1: compact is turn-scoped — busy refusal + kill/interrupt ──────

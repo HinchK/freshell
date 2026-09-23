@@ -15,8 +15,13 @@
 //        sdk.turn.waiting {sessionId,at}             (approval edge; before assistant)
 //        sdk.assistant {sessionId,content:[<blocks>],model}
 //        sdk.result {sessionId,result:<subtype>,durationMs,costUsd,usage}
-//        sdk.turn.complete {sessionId,at}            ONLY when result==='success'
-//        sdk.exit {sessionId}                        (interrupt: aborted stream end)
+//        sdk.turn.complete {sessionId,at}            on EVERY result subtype — success,
+//                                                  error, … — EXCEPT one consumed by a
+//                                                  pending accepted user-interrupt mark
+//                                                  (the REAL gate, imported from
+//                                                  crates/freshell-claude-sidecar/)
+//        sdk.interrupt_settled {sessionId,ok}        (interrupt; the interrupted turn's
+//                                                  own non-success sdk.result follows)
 //
 // Every inbound request is appended to FAKE_KILROY_LOG as JSONL
 // ({pid,t,msg}) BEFORE handling — "records Kilroy invocations".
@@ -24,23 +29,37 @@
 // Knobs (env):
 //   FAKE_KILROY_LOG                 JSONL request ledger path
 //   FAKE_KILROY_CLI_SESSION_ID      fixed durable UUID (default: per-process random)
-//   FAKE_KILROY_HOLD_TURN=1         send starts running and never completes
+//   FAKE_KILROY_HOLD_TURN=1         send starts running and never completes on its
+//                                   own (interrupt is the only turn exit; its result
+//                                   is consumed by the armed gate)
 //   FAKE_KILROY_APPROVAL=1          send surfaces sdk.turn.waiting first, then
 //                                   auto-allows after FAKE_KILROY_APPROVAL_DELAY_MS
 //                                   (default 250) — the real sidecar's waiting-edge
 //                                   shape ("surfaced, then allowed")
-//   FAKE_KILROY_FAIL_RESULT=1       result subtype 'error' — NO turn.complete
+//   FAKE_KILROY_FAIL_RESULT=1       result subtype 'error' — rings the unified
+//                                   attention edge like any error turn end
 //   FAKE_KILROY_CRASH_ON_SEND=1     process.exit(3) mid-turn — no completion ever
+//                                   (a real crash screams no protocol frame; the
+//                                   Rust unrequested-death synthesis rings for it)
 //
 // Turn semantics mirror the real sidecar exactly: sdk.result carries the
-// subtype in `result`; sdk.turn.complete fires ONLY on 'success'; interrupt
-// aborts the stream -> sdk.exit (no result, no completion, session dropped).
-// `at` clocks are per-session monotonic (never go backwards).
+// subtype in `result`; the unified attention edge `sdk.turn.complete` fires on
+// EVERY result subtype unless the REAL gate's pending accepted user-interrupt
+// mark consumes it (an interrupt arms the mark only while a turn is awaiting a
+// terminal frame; the settle is ok:true — the SDK contract documents
+// RESOLUTION, not rejection — and the interrupted turn's own NON-SUCCESS
+// result follows, silently). Interrupt ends the TURN, never the session: NO
+// sdk.exit, the session stays alive, and the NEXT turn rings again. `at`
+// clocks are per-session monotonic via the sidecar package's shared
+// monotonic-clock.mjs (never go backwards, strictly increasing across
+// same-ms edges).
 
 import readline from 'node:readline'
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomBytes, randomUUID } from 'node:crypto'
+import { createTurnCompleteGate } from '../../../crates/freshell-claude-sidecar/turn-complete-gate.mjs'
+import { nextMonotonic } from '../../../crates/freshell-claude-sidecar/monotonic-clock.mjs'
 
 const LOG = process.env.FAKE_KILROY_LOG
 const HOLD_TURN = process.env.FAKE_KILROY_HOLD_TURN === '1'
@@ -68,11 +87,24 @@ function logRequest(msg) {
   fs.appendFileSync(LOG, `${JSON.stringify({ pid: process.pid, t: Date.now(), msg })}\n`)
 }
 
-// sessionId -> { cliSessionId, cwd, lastTurnCompleteAt?, lastWaitingAt? }
+// sessionId -> { cliSessionId, cwd, lastTurnCompleteAt?, lastWaitingAt?,
+//                turnCompleteGate, pendingResults, turnOpen, sendInFlight,
+//                interrupted }
 const sessions = new Map()
 
-function nextMonotonic(last, now) {
-  return last != null && now <= last ? last + 1 : now
+/** Unified per-session attention bookkeeping (mirrors the real sidecar and
+ * the claude-SDK e2e fake): the REAL gate, the accepted-sends counter, the
+ * last minted monotonic `at`, and the in-flight/interrupt render flags. */
+function unifiedSessionState(cliSessionId, cwd) {
+  return {
+    cliSessionId,
+    cwd,
+    turnCompleteGate: createTurnCompleteGate(),
+    pendingResults: 0,
+    turnOpen: false,
+    sendInFlight: false,
+    interrupted: false,
+  }
 }
 
 const rl = readline.createInterface({ input: process.stdin })
@@ -92,7 +124,7 @@ async function handle(msg) {
     const sessionId = nanoid()
     const cliSessionId = msg.resumeSessionId ?? CLI_SESSION_ID
     const cwd = msg.cwd ?? process.cwd()
-    sessions.set(sessionId, { cliSessionId, cwd })
+    sessions.set(sessionId, unifiedSessionState(cliSessionId, cwd))
     // `created` MUST be the first line written for this request.
     emit({ type: 'created', requestId: msg.requestId, sessionId })
     emit({
@@ -111,53 +143,117 @@ async function handle(msg) {
   }
 
   if (msg.type === 'send') {
-    const st = sessions.get(msg.sessionId) ?? { cliSessionId: CLI_SESSION_ID, cwd: process.cwd() }
+    const st = sessions.get(msg.sessionId) ?? unifiedSessionState(CLI_SESSION_ID, process.cwd())
     sessions.set(msg.sessionId, st)
     emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'running' })
     if (CRASH_ON_SEND) {
       process.stderr.write('[fake-kilroy] FAKE_KILROY_CRASH_ON_SEND: exiting 3 mid-turn\n')
       process.exit(3)
     }
-    if (HOLD_TURN) return // wedged mid-turn; interrupt/kill are the only exits
+    // The send is ACCEPTED (mirrors the real sidecar's pendingResults
+    // bookkeeping): a turn is open until its terminal frame, so an interrupt
+    // arriving mid-render arms the REAL gate against it.
+    st.pendingResults += 1
+    st.turnOpen = true
+    if (HOLD_TURN) return // wedged mid-turn; interrupt is the only turn exit
 
-    if (APPROVAL) {
-      const at = nextMonotonic(st.lastWaitingAt, Date.now())
-      st.lastWaitingAt = at
-      emit({ type: 'sdk.turn.waiting', sessionId: msg.sessionId, at })
-      await new Promise((r) => setTimeout(r, APPROVAL_DELAY_MS))
-    }
+    st.sendInFlight = true
+    try {
+      if (APPROVAL) {
+        const at = nextMonotonic(st.lastWaitingAt, Date.now())
+        st.lastWaitingAt = at
+        emit({ type: 'sdk.turn.waiting', sessionId: msg.sessionId, at })
+        await new Promise((r) => setTimeout(r, APPROVAL_DELAY_MS))
+      }
 
-    emit({
-      type: 'sdk.assistant',
-      sessionId: msg.sessionId,
-      content: [{ type: 'text', text: `kilroy fixture reply: ${msg.text}` }],
-      model: 'claude-opus-4-6',
-    })
-    const subtype = FAIL_RESULT ? 'error' : 'success'
-    emit({
-      type: 'sdk.result',
-      sessionId: msg.sessionId,
-      result: subtype,
-      durationMs: 1,
-      costUsd: 0,
-      usage: { input_tokens: 1, output_tokens: 1 },
-    })
-    if (subtype === 'success') {
-      const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
-      st.lastTurnCompleteAt = at
-      emit({ type: 'sdk.turn.complete', sessionId: msg.sessionId, at })
+      emit({
+        type: 'sdk.assistant',
+        sessionId: msg.sessionId,
+        content: [{ type: 'text', text: `kilroy fixture reply: ${msg.text}` }],
+        model: 'claude-opus-4-6',
+      })
+      let subtype = FAIL_RESULT ? 'error' : 'success'
+      if (st.interrupted) {
+        // An in-flight interrupt deferred to this scripted completion: the
+        // interrupted turn's own terminal result is non-success (the real SDK
+        // contract — an interrupted turn never ends 'success').
+        subtype = 'error_during_execution'
+        st.interrupted = false
+      }
+      st.pendingResults = Math.max(0, st.pendingResults - 1)
+      emit({
+        type: 'sdk.result',
+        sessionId: msg.sessionId,
+        result: subtype,
+        durationMs: 1,
+        costUsd: 0,
+        usage: { input_tokens: 1, output_tokens: 1 },
+      })
+      // Unified attention edge (the REAL gate): every result subtype rings
+      // unless a pending accepted user-interrupt mark consumed it. The `at`
+      // clamps through the sidecar package's shared monotonic clock — two
+      // same-ms edges stay strictly increasing or the client's `at <= last`
+      // dedupe silently drops the second ring.
+      if (st.turnCompleteGate.resultEmitsAttention()) {
+        const at = nextMonotonic(st.lastTurnCompleteAt, Date.now())
+        st.lastTurnCompleteAt = at
+        emit({ type: 'sdk.turn.complete', sessionId: msg.sessionId, at })
+      }
+      st.turnOpen = false
+      emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' })
+    } finally {
+      st.sendInFlight = false
     }
-    emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' })
     return
   }
 
   if (msg.type === 'interrupt') {
-    // Mirror the real sidecar's aborted-stream tail: sdk.exit, no result, no
-    // turn.complete, and the session is dropped.
-    if (sessions.has(msg.sessionId)) {
-      sessions.delete(msg.sessionId)
-      emit({ type: 'sdk.exit', sessionId: msg.sessionId })
+    const st = sessions.get(msg.sessionId)
+    if (!st) {
+      // Real-sidecar parity (index.mjs handleInterrupt): an interrupt against
+      // an unknown session is a session-scoped error frame, never a silent
+      // drop.
+      emit({ type: 'sdk.error', sessionId: msg.sessionId, message: 'session not found', sessionNotFound: true })
+      return
     }
+    if (st.pendingResults > 0) {
+      // A turn is plausibly awaiting a terminal frame — arm the REAL gate
+      // BEFORE the "interrupt()" call (real-sidecar parity:
+      // `if (st.pendingResults > 0) st.turnCompleteGate.noteInterruptRequest()`),
+      // then settle ok:true (the SDK contract documents RESOLUTION, not
+      // rejection, for interrupting — sdk.d.ts:2384-2394). The interrupted
+      // turn's own NON-SUCCESS result follows with its ring consumed by the
+      // mark — the interrupt stays silent while the next turn rings again.
+      // NEVER an sdk.exit: interrupt ends the TURN, never the session.
+      st.turnCompleteGate.noteInterruptRequest()
+      st.pendingResults = 0
+      // Force the interrupted turn's eventual completion to the non-success
+      // subtype (the real SDK contract — an interrupted turn never ends
+      // 'success'), for BOTH exits below: the deferred in-flight render and
+      // the synthesized held-turn result.
+      st.interrupted = true
+      emit({ type: 'sdk.interrupt_settled', sessionId: msg.sessionId, ok: true })
+      if (st.sendInFlight) {
+        // The scripted turn is still mid-render (the approval lane's await):
+        // its completion lands next with the forced non-success subtype and
+        // the gate-consumed ring — do not synthesize a second terminal frame.
+        return
+      }
+      // Held turn: nothing else will end it, so synthesize the interrupted
+      // turn's own non-success terminal result — the armed gate consumes its
+      // ring — then idle. Still NEVER an sdk.exit.
+      st.interrupted = false
+      st.turnOpen = false
+      emit({ type: 'sdk.result', sessionId: msg.sessionId, result: 'error_during_execution' })
+      st.turnCompleteGate.resultEmitsAttention()
+      emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' })
+      return
+    }
+    // No turn awaits a terminal frame — the SDK RESOLVES an idle-session
+    // interrupt, so the settle lands ok:true and NOTHING arms: no stray mark
+    // may survive to eat the NEXT unrelated turn's ring.
+    emit({ type: 'sdk.interrupt_settled', sessionId: msg.sessionId, ok: true })
+    emit({ type: 'sdk.status', sessionId: msg.sessionId, status: 'idle' })
     return
   }
 

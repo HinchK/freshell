@@ -4,18 +4,14 @@ import {
   consumeTurnCompleteEvents,
   markTabAttention,
   markPaneAttention,
+  markTabWatchedCompletion,
   type TurnCompleteEvent,
 } from '@/store/turnCompletionSlice'
 import { dismissTabGreen } from '@/store/turnCompletionAttention'
 import { useNotificationSound } from '@/hooks/useNotificationSound'
+import { isWindowFocused } from '@/lib/window-focus'
 
 const EMPTY_PENDING_EVENTS: TurnCompleteEvent[] = []
-
-function isWindowFocused(): boolean {
-  if (typeof document === 'undefined') return true
-  const hasFocus = typeof document.hasFocus === 'function' ? document.hasFocus() : true
-  return hasFocus && !document.hidden
-}
 
 export function useTurnCompletionNotifications() {
   const dispatch = useAppDispatch()
@@ -45,19 +41,49 @@ export function useTurnCompletionNotifications() {
   useEffect(() => {
     if (pendingEvents.length === 0) return
 
-    const windowFocused = isWindowFocused()
+    // DR5-3 (delta round 5): the watched classification was stamped at
+    // EVENT-RECEIPT time (turnCompletionReceiptMiddleware read the CURRENT
+    // focus + active-tab + visibility at the dispatch that queued the
+    // event) — consume the stamped bit. Recomputing HERE would classify the
+    // ending by the drain-time witness state instead: a focus or active-tab
+    // change between receipt and this passive effect's run would re-classify
+    // an ending that already happened (an unwitnessed ending silenced, or a
+    // watched ending rung).
+    const isWatched = (event: TurnCompleteEvent) => event.watched
+    const markAttention = (event: TurnCompleteEvent) => {
+      dispatch(markTabAttention({ tabId: event.tabId }))
+      dispatch(markPaneAttention({ paneId: event.paneId }))
+    }
     let highestHandledSeq = lastHandledSeqRef.current
-    let shouldPlay = false
+    let terminalShouldPlay = false
 
     for (const event of pendingEvents) {
       if (event.seq <= lastHandledSeqRef.current) continue
       highestHandledSeq = Math.max(highestHandledSeq, event.seq)
-      dispatch(markTabAttention({ tabId: event.tabId }))
-      dispatch(markPaneAttention({ paneId: event.paneId }))
-      if (windowFocused && activeTabId === event.tabId) {
+
+      if (event.source === 'terminal') {
+        // TERMINAL partition — today's behavior, unchanged: always mark tab+pane
+        // attention (watched endings included), suppress only the sound when
+        // watched, and coalesce the whole batch into ONE play().
+        markAttention(event)
+        if (isWatched(event)) {
+          continue
+        }
+        terminalShouldPlay = true
         continue
       }
-      shouldPlay = true
+
+      // FRESH-AGENT partition — the unified attention rules.
+      if (isWatched(event)) {
+        // Watched ending: tab-strip-only mark, no sound, no attention flags
+        // (attentionByTab also drives the sidebar row highlight, which must
+        // stay dark for a watched ending).
+        dispatch(markTabWatchedCompletion({ tabId: event.tabId }))
+        continue
+      }
+      // Unwitnessed ending: full attention marks and one audible ring per event.
+      markAttention(event)
+      play()
     }
 
     if (highestHandledSeq > lastHandledSeqRef.current) {
@@ -65,10 +91,10 @@ export function useTurnCompletionNotifications() {
       dispatch(consumeTurnCompleteEvents({ throughSeq: highestHandledSeq }))
     }
 
-    if (shouldPlay) {
+    if (terminalShouldPlay) {
       play()
     }
-  }, [activeTabId, dispatch, pendingEvents, play])
+  }, [dispatch, pendingEvents, play])
 
   // 'click' mode: clear attention only when the user *switches* to a tab that has attention.
   // If a completion arrives on the already-active tab, the indicator persists until the user
