@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
-import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
+import { chmodSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 
@@ -15,7 +16,62 @@ function artifactRoot(): string {
   return mkdtempSync(path.join(tmpdir(), 'freshell-electron-artifact-'))
 }
 
-function writeArtifact(root: string, platform: 'darwin' | 'linux' | 'win32' = 'linux'): string {
+const AUTH_REFUSAL = 'AUTH_TOKEN is required. Refusing to start without authentication.'
+
+function refusingProbe() {
+  return () => ({ status: 1, stdout: '', stderr: AUTH_REFUSAL })
+}
+
+function writeReceipt(
+  root: string,
+  platform: string,
+  arch: 'x64' | 'arm64' = 'x64',
+  overrides: Record<string, unknown> = {},
+): void {
+  const files: string[] = []
+  const walk = (directory: string, prefix: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      const relative = prefix ? `${prefix}/${entry.name}` : entry.name
+      const absolute = path.join(directory, entry.name)
+      if (statSync(absolute).isDirectory()) walk(absolute, relative)
+      else if (entry.name !== '.electron-runtime-receipt.json') files.push(relative)
+    }
+  }
+  walk(root, '')
+  files.sort()
+  const fileHashes: Record<string, string> = {}
+  for (const relative of files) {
+    fileHashes[relative] = createHash('sha256').update(readFileSync(path.join(root, relative))).digest('hex')
+  }
+  const mcp = JSON.parse(readFileSync(path.join(root, 'mcp', 'package.json'), 'utf8')) as { version: string }
+  const sidecar = JSON.parse(readFileSync(path.join(root, 'claude-sidecar', 'package.json'), 'utf8')) as { version: string }
+  const receipt = {
+    severity: 'info',
+    event: 'electron_runtime_prepared',
+    runtimeDir: root,
+    platform,
+    arch,
+    releaseVersion: mcp.version,
+    nodeVersion: '22.12.0',
+    packageManager: { name: 'pnpm', version: '10.34.5' },
+    sourceLockFingerprint: 'a'.repeat(64),
+    exportedPackages: [
+      { name: 'freshell-claude-sidecar', version: sidecar.version },
+      { name: 'freshell-mcp-runtime', version: '0.1.0' },
+      { name: 'freshell', version: mcp.version },
+    ],
+    files,
+    fileHashes,
+    ...overrides,
+  }
+  writeFileSync(path.join(root, '.electron-runtime-receipt.json'), `${JSON.stringify(receipt, null, 2)}\n`)
+}
+
+function writeArtifact(
+  root: string,
+  platform: 'darwin' | 'linux' | 'win32' = 'linux',
+  receiptOverrides: Record<string, unknown> = {},
+): string {
   const binary = path.join(root, 'bin', platform === 'win32' ? 'freshell-server.exe' : 'freshell-server')
   mkdirSync(path.dirname(binary), { recursive: true })
   const magic = platform === 'win32'
@@ -32,7 +88,7 @@ function writeArtifact(root: string, platform: 'darwin' | 'linux' | 'win32' = 'l
   mkdirSync(path.join(root, 'claude-sidecar', 'node_modules', '@anthropic-ai', 'claude-agent-sdk'), { recursive: true })
   writeFileSync(path.join(root, 'claude-sidecar', 'index.mjs'), 'process.stdin.resume()')
   writeFileSync(path.join(root, 'claude-sidecar', 'package.json'), JSON.stringify({ name: 'freshell-claude-sidecar', version: '0.1.0' }))
-  writeFileSync(path.join(root, 'claude-sidecar', 'package-lock.json'), JSON.stringify({ lockfileVersion: 3 }))
+  writeFileSync(path.join(root, 'claude-sidecar', 'permission-channel.mjs'), 'export {}\n')
   writeFileSync(path.join(root, 'claude-sidecar', 'session-settings.mjs'), 'export const configureSession = () => ({})\n')
   // The runtime allowlist requires the session-names helper (the unified
   // naming writeback's sidecar entry) — the artifact contract includes it,
@@ -44,12 +100,12 @@ function writeArtifact(root: string, platform: 'darwin' | 'linux' | 'win32' = 'l
   mkdirSync(path.join(root, 'mcp', 'node_modules', 'zod'), { recursive: true })
   writeFileSync(path.join(root, 'mcp', 'server.js'), 'process.stdin.resume()')
   writeFileSync(path.join(root, 'mcp', 'package.json'), JSON.stringify({ name: 'freshell', version: '0.7.5' }))
-  writeFileSync(path.join(root, 'mcp', 'package-lock.json'), JSON.stringify({ name: 'freshell', version: '0.7.5', lockfileVersion: 3, packages: {} }))
   writeFileSync(path.join(root, 'mcp', 'node_modules', '@modelcontextprotocol', 'sdk', 'package.json'), '{}')
   writeFileSync(path.join(root, 'mcp', 'node_modules', 'zod', 'package.json'), '{}')
   mkdirSync(path.join(root, 'node-client-runtime'), { recursive: true })
   writeFileSync(path.join(root, 'node-client-runtime', 'keys.js'), 'export {}\n')
   writeFileSync(path.join(root, 'node-client-runtime', 'action-capabilities.js'), 'export {}\n')
+  writeReceipt(root, platform, 'x64', receiptOverrides)
   return binary
 }
 
@@ -59,7 +115,6 @@ describe('verify-electron-artifact', () => {
     const binary = writeArtifact(root, nativePlatform)
     mkdirSync(path.join(root, 'client', 'assets'), { recursive: true })
     writeFileSync(path.join(root, 'client', 'assets', 'index-hash.js'), 'export {}\n')
-    writeFileSync(path.join(root, '.electron-runtime-receipt.json'), '{}\n')
     const probe = vi.fn((command: string, options: { cwd: string; env: NodeJS.ProcessEnv; timeout: number }) => {
       expect(command).toBe(binary)
       expect(options.cwd).not.toBe(root)
@@ -73,6 +128,105 @@ describe('verify-electron-artifact', () => {
     expect(probe).toHaveBeenCalledTimes(1)
   })
 
+  it('rejects an artifact without a staging receipt', () => {
+    const root = artifactRoot()
+    writeArtifact(root, nativePlatform)
+    rmSync(path.join(root, '.electron-runtime-receipt.json'))
+
+    expect(() => verifyElectronArtifact(root, nativePlatform, { probe: refusingProbe() })).toThrow(/staging receipt/)
+  })
+
+  it('rejects an artifact whose receipt lists a file with a different hash', () => {
+    const root = artifactRoot()
+    writeArtifact(root, nativePlatform)
+    writeFileSync(path.join(root, 'mcp', 'node_modules', 'zod', 'package.json'), '{"name":"zod"}')
+
+    expect(() => verifyElectronArtifact(root, nativePlatform, { probe: refusingProbe() })).toThrow(/hash mismatch for mcp\/node_modules\/zod\/package\.json/)
+  })
+
+  it('rejects an artifact that lost a receipt-listed file', () => {
+    const root = artifactRoot()
+    writeArtifact(root, nativePlatform)
+    rmSync(path.join(root, 'claude-sidecar', 'permission-channel.mjs'))
+
+    expect(() => verifyElectronArtifact(root, nativePlatform, { probe: refusingProbe() })).toThrow(/receipt file is missing from the artifact: claude-sidecar\/permission-channel\.mjs/)
+  })
+
+  it('rejects a receipt recorded for a different platform', () => {
+    const root = artifactRoot()
+    // The mismatched platform must differ from the HOST platform on every
+    // runner: hardcoding 'win32' only mismatches on POSIX hosts, and the
+    // verifier correctly accepts a matching receipt on a Windows runner.
+    const otherPlatform = nativePlatform === 'win32' ? 'linux' : 'win32'
+    writeArtifact(root, nativePlatform, { platform: otherPlatform })
+
+    expect(() => verifyElectronArtifact(root, nativePlatform, { probe: refusingProbe() })).toThrow(/receipt platform/)
+  })
+
+  it('rejects a receipt whose release version disagrees with the staged MCP metadata', () => {
+    const root = artifactRoot()
+    writeArtifact(root, nativePlatform, { releaseVersion: '9.9.9' })
+
+    expect(() => verifyElectronArtifact(root, nativePlatform, { probe: refusingProbe() })).toThrow(/releaseVersion/)
+  })
+
+  it('rejects a receipt whose sidecar identity disagrees with the staged sidecar manifest', () => {
+    const root = artifactRoot()
+    writeArtifact(root, nativePlatform, {
+      exportedPackages: [
+        { name: 'freshell-claude-sidecar', version: '0.2.0' },
+        { name: 'freshell-mcp-runtime', version: '0.1.0' },
+        { name: 'freshell', version: '0.7.5' },
+      ],
+    })
+
+    expect(() => verifyElectronArtifact(root, nativePlatform, { probe: refusingProbe() })).toThrow(/freshell-claude-sidecar/)
+  })
+
+  it('rejects a receipt without the pinned package-manager identity', () => {
+    const root = artifactRoot()
+    writeArtifact(root, nativePlatform, { packageManager: { name: 'npm', version: '11.0.0' } })
+
+    expect(() => verifyElectronArtifact(root, nativePlatform, { probe: refusingProbe() })).toThrow(/packageManager/)
+  })
+
+  it('rejects a receipt with a missing package-manager identity and unsafe receipted paths', () => {
+    const missingManagerRoot = artifactRoot()
+    writeArtifact(missingManagerRoot, nativePlatform, { packageManager: undefined })
+
+    expect(() => verifyElectronArtifact(missingManagerRoot, nativePlatform, { probe: refusingProbe() })).toThrow(/packageManager/)
+
+    const escapingRoot = artifactRoot()
+    writeArtifact(escapingRoot, nativePlatform, {
+      fileHashes: { '..\\evil.txt': 'a'.repeat(64), '/etc/passwd': 'a'.repeat(64), 'ok/../../evil': 'a'.repeat(64) },
+    })
+
+    expect(() => verifyElectronArtifact(escapingRoot, nativePlatform, { probe: refusingProbe() })).toThrow(/invalid path/)
+  })
+
+  it('rejects any link inside the artifact, wherever it points', () => {
+    const outside = artifactRoot()
+    writeFileSync(path.join(outside, 'outside.txt'), 'outside the artifact\n')
+    for (const plant of [
+      (root: string) => symlinkSync(path.join(outside, 'outside.txt'), path.join(root, 'claude-sidecar', 'node_modules', 'evil')),
+      (root: string) => symlinkSync('session-settings.mjs', path.join(root, 'claude-sidecar', 'relative-link')),
+    ]) {
+      const root = artifactRoot()
+      writeArtifact(root, nativePlatform)
+      plant(root)
+
+      expect(() => verifyElectronArtifact(root, nativePlatform, { probe: refusingProbe() })).toThrow(/contains a link/)
+    }
+  })
+
+  it('rejects a receipt whose architecture disagrees with the requested one, and accepts a matching one', () => {
+    const root = artifactRoot()
+    writeArtifact(root, nativePlatform)
+
+    expect(() => verifyElectronArtifact(root, nativePlatform, { arch: 'arm64', probe: refusingProbe() })).toThrow(/arch/)
+    expect(verifyElectronArtifact(root, nativePlatform, { arch: 'x64', probe: refusingProbe() })).toMatchObject({ ok: true })
+  })
+
   it('rejects every forbidden backend or native-module path', () => {
     const forbidden = ['dist/server/index.js', 'server-node-modules/index.js', 'bundled-node/bin/node', 'native-modules/pty.node', 'node_modules/node-pty/index.js']
     for (const relative of forbidden) {
@@ -81,7 +235,7 @@ describe('verify-electron-artifact', () => {
       const target = path.join(root, relative)
       mkdirSync(path.dirname(target), { recursive: true })
       writeFileSync(target, 'forbidden')
-      expect(() => verifyElectronArtifact(root, 'linux', { probe: () => ({ status: 1, stdout: '', stderr: 'AUTH_TOKEN is required. Refusing to start without authentication.' }) })).toThrow(/forbidden/i)
+      expect(() => verifyElectronArtifact(root, 'linux', { probe: refusingProbe() })).toThrow(/forbidden/i)
     }
   })
 
@@ -91,7 +245,7 @@ describe('verify-electron-artifact', () => {
     rmSync(path.join(root, 'claude-sidecar', 'model-catalog.mjs'))
 
     expect(() => verifyElectronArtifact(root, 'linux', {
-      probe: () => ({ status: 1, stdout: '', stderr: 'AUTH_TOKEN is required. Refusing to start without authentication.' }),
+      probe: refusingProbe(),
     })).toThrow(/missing required file.*model-catalog\.mjs/i)
   })
 
@@ -103,7 +257,7 @@ describe('verify-electron-artifact', () => {
     writeFileSync(extra, 'export {}\n')
 
     expect(() => verifyElectronArtifact(root, 'linux', {
-      probe: () => ({ status: 1, stdout: '', stderr: 'AUTH_TOKEN is required. Refusing to start without authentication.' }),
+      probe: refusingProbe(),
     })).toThrow(/unapproved/i)
   })
 
@@ -174,7 +328,7 @@ describe('verify-electron-artifact', () => {
   it.each([
     { status: 0, stdout: 'listening', stderr: '' },
     { status: 1, stdout: '', stderr: 'unrelated startup failure' },
-    { status: 1, stdout: 'listening on port 3001', stderr: 'AUTH_TOKEN is required. Refusing to start without authentication.' },
+    { status: 1, stdout: '', stderr: 'listening on port 3001\nAUTH_TOKEN is required. Refusing to start without authentication.' },
   ])('rejects an invalid native probe result: %j', (result) => {
     const root = artifactRoot()
     writeArtifact(root, nativePlatform)

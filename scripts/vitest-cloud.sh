@@ -425,7 +425,7 @@ cmd_run() {
       configs="config/vitest/vitest.config.ts"
       ;;
     server)
-      echo "[vitest-cloud] ERROR: the retired Node server config is unavailable; use npm run test:server for the Rust cargo lane." >&2
+      echo "[vitest-cloud] ERROR: the retired Node server config is unavailable; use pnpm run test:server for the Rust cargo lane." >&2
       exit 2
       ;;
     all)
@@ -454,7 +454,7 @@ cmd_run() {
     local exit_code=0
     for config in $configs; do
       echo "[vitest-cloud] Running vitest: $config ${vt_args[*]-}"
-      npx vitest run --config "$config" "${vt_args[@]+"${vt_args[@]}"}" || exit_code=$?
+      pnpm exec vitest run --config "$config" "${vt_args[@]+"${vt_args[@]}"}" || exit_code=$?
     done
     exit "$exit_code"
   fi

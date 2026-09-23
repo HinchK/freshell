@@ -5,7 +5,13 @@ import { createRequire } from 'node:module'
 import { availableParallelism, constants as osConstants, setPriority } from 'node:os'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { resolveNpmCommand } from './testing/coordinator-upstream.js'
+
+import {
+  buildRunScriptArgs,
+  detectProjectManager,
+  resolveManagerCommand,
+  type PackageManagerKind,
+} from './lib/package-manager.js'
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url))
 const PROJECT_ROOT = resolve(SCRIPT_DIR, '..')
@@ -87,6 +93,17 @@ export function buildVitestArgs({ configPath, maxWorkers, forwardedArgs }: Vites
   return [...args, ...forwardedArgs]
 }
 
+export function resolveScriptPhaseCommand(
+  run: StandardTestRun,
+  forwardedArgs: string[],
+  manager: PackageManagerKind,
+  env: NodeJS.ProcessEnv = process.env,
+): { command: string; args: string[]; viaShell?: boolean } {
+  const forwarded = run.name === 'source-runtime' ? forwardedArgs : []
+  const scriptArgs = buildRunScriptArgs(manager, run.script!, forwarded)
+  return resolveManagerCommand({ manager, args: scriptArgs, env })
+}
+
 function classifySuitePath(token: string): SuiteName | null {
   if (token.startsWith('-')) return null
   const normalizedToken = token.replace(/\\/g, '/')
@@ -132,8 +149,8 @@ function detectRequestedSuites(forwardedArgs: string[]): SuiteName[] | null {
     if (suite) suites.add(suite)
   }
   if (suites.size === 0) return null
-  return ['client', 'source-runtime', 'rust', 'electron', 'electron-runtime']
-    .filter((suite): suite is SuiteName => suites.has(suite))
+  const suiteOrder: SuiteName[] = ['client', 'source-runtime', 'rust', 'electron', 'electron-runtime']
+  return suiteOrder.filter((suite) => suites.has(suite))
 }
 
 function buildRuns(
@@ -195,8 +212,9 @@ export function createStandardTestPlan({
     : runs
 
   // Each phase owns its prerequisites and artifacts. The source-runtime
-  // wrapper begins with npm run prebuild, so the broad check/verify path keeps
-  // the same live-server build guard as a direct source-runtime invocation.
+  // wrapper begins with the prebuild script run through the detected project
+  // manager, so the broad check/verify path keeps the same live-server build
+  // guard as a direct source-runtime invocation.
   // Keeping the phases in order also prevents a source-runtime build and Cargo
   // from racing over the same target/dist directories while retaining one
   // coordinator gate for the full suite.
@@ -222,6 +240,7 @@ function applyPriority(run: StandardTestRun, child: ChildProcess): void {
 function startRun(run: StandardTestRun, forwardedArgs: string[]): ChildProcess {
   let command: string
   let args: string[]
+  let viaShell = false
   if (run.runner === 'vitest') {
     command = process.execPath
     args = [VITEST_ENTRYPOINT, ...buildVitestArgs({
@@ -230,11 +249,11 @@ function startRun(run: StandardTestRun, forwardedArgs: string[]): ChildProcess {
       forwardedArgs,
     })]
   } else {
-    args = ['run', run.script!]
-    if (run.name === 'source-runtime' && forwardedArgs.length > 0) args.push('--', ...forwardedArgs)
-    const npm = resolveNpmCommand(args)
-    command = npm.command
-    args = npm.args
+    const manager = detectProjectManager(PROJECT_ROOT).manager
+    const resolved = resolveScriptPhaseCommand(run, forwardedArgs, manager)
+    command = resolved.command
+    args = resolved.args
+    viaShell = resolved.viaShell === true
   }
 
   log('info', 'Starting test phase', {
@@ -248,6 +267,7 @@ function startRun(run: StandardTestRun, forwardedArgs: string[]): ChildProcess {
     env: process.env,
     stdio: 'inherit',
     windowsHide: true,
+    ...(viaShell ? { shell: true } : {}),
   })
   applyPriority(run, child)
   return child

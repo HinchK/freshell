@@ -506,7 +506,7 @@ cmd_run() {
   if $local_mode; then
     echo "[e2e-cloud] Running locally... (config: test/e2e-browser/playwright.config.ts; CLOUD_SKIP_SPECS does not apply on this lane; backend=local; source: ${backend_source})"
     cd "$ROOT"
-    exec npx playwright test \
+    exec pnpm exec playwright test \
       --config test/e2e-browser/playwright.config.ts \
       "${pw_args[@]}"
   fi

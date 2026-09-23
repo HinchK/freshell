@@ -10,7 +10,6 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { UpstreamPhase } from '../../../../scripts/testing/coordinator-command-matrix.js'
 import {
   assertNoCoordinatorRecursion,
-  resolveNpmCommand,
   resolveVitestCommand,
   runUpstreamPhase,
 } from '../../../../scripts/testing/coordinator-upstream.js'
@@ -23,24 +22,43 @@ const require = createRequire(import.meta.url)
 
 let tempDir: string
 let captureFile: string
+let fakePnpmEntry: string
+let fakeNpmEntry: string
 
 beforeEach(async () => {
   tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'freshell-coordinator-upstream-'))
   captureFile = path.join(tempDir, 'capture.jsonl')
+  fakePnpmEntry = path.join(tempDir, 'pnpm.cjs')
+  fakeNpmEntry = path.join(tempDir, 'npm-cli.js')
+  await fsp.writeFile(fakePnpmEntry, '')
+  await fsp.writeFile(fakeNpmEntry, '')
 })
 
 afterEach(async () => {
   await fsp.rm(tempDir, { recursive: true, force: true })
 })
 
-function fakeEnv(behavior: Record<string, unknown> = {}): NodeJS.ProcessEnv {
+interface FakeEnvOptions {
+  repoRoot?: string
+  npmExecpath?: string
+}
+
+function fakeEnv(behavior: Record<string, unknown> = {}, options: FakeEnvOptions = {}): NodeJS.ProcessEnv {
   return {
     ...process.env,
     FRESHELL_TEST_COORDINATOR_FAKE_UPSTREAM: FIXTURE_PATH,
     FRESHELL_TEST_COORDINATOR_FAKE_BEHAVIOR: JSON.stringify(behavior),
     FRESHELL_TEST_COORDINATOR_CAPTURE_FILE: captureFile,
-    FRESHELL_TEST_COORDINATOR_REPO_ROOT: REPO_ROOT,
+    FRESHELL_TEST_COORDINATOR_REPO_ROOT: options.repoRoot ?? REPO_ROOT,
+    npm_execpath: options.npmExecpath ?? fakePnpmEntry,
   }
+}
+
+async function makeRepoRootFixture(manifest: Record<string, unknown>): Promise<string> {
+  const repoRoot = path.join(tempDir, 'repo-root')
+  await fsp.mkdir(repoRoot, { recursive: true })
+  await fsp.writeFile(path.join(repoRoot, 'package.json'), JSON.stringify(manifest))
+  return repoRoot
 }
 
 async function readCaptureLines() {
@@ -58,21 +76,6 @@ describe('coordinator-upstream', () => {
 
     expect(command.command).toBe(process.execPath)
     expect(command.args).toEqual([require.resolve('vitest/vitest.mjs')])
-  })
-
-  it('prefers the npm CLI JavaScript entrypoint when npm exposes it', () => {
-    const command = resolveNpmCommand(['run', 'test:balanced'], {
-      npm_execpath: path.join(REPO_ROOT, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
-    })
-
-    expect(command).toEqual({
-      command: process.execPath,
-      args: [
-        path.join(REPO_ROOT, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
-        'run',
-        'test:balanced',
-      ],
-    })
   })
 
   it('passes delegated help and watch invocations through the repo-local vitest entry with the recursion guard env set', async () => {
@@ -137,5 +140,33 @@ describe('coordinator-upstream', () => {
     expect(() => assertNoCoordinatorRecursion({
       FRESHELL_TEST_COORDINATOR_ACTIVE: '1',
     })).toThrow(/recursive/i)
+  })
+
+  it('runs script phases through pnpm without a separator when the repo root pins pnpm', async () => {
+    const repoRoot = await makeRepoRootFixture({ packageManager: 'pnpm@10.34.5' })
+    const phase: UpstreamPhase = { runner: 'npm', script: 'test:balanced', args: ['--reporter=dot'] }
+
+    expect(await runUpstreamPhase(phase, fakeEnv({}, { repoRoot }))).toBe(0)
+
+    const [capture] = await readCaptureLines()
+    expect(capture).toMatchObject({
+      selector: 'npm:test:balanced --reporter=dot',
+      command: process.execPath,
+      args: [fakePnpmEntry, 'run', 'test:balanced', '--reporter=dot'],
+    })
+  })
+
+  it('keeps the npm separator for script phases in a repo root without the packageManager field', async () => {
+    const repoRoot = await makeRepoRootFixture({ name: 'legacy-repo' })
+    const phase: UpstreamPhase = { runner: 'npm', script: 'test:balanced', args: ['--reporter=dot'] }
+
+    expect(await runUpstreamPhase(phase, fakeEnv({}, { repoRoot, npmExecpath: fakeNpmEntry }))).toBe(0)
+
+    const [capture] = await readCaptureLines()
+    expect(capture).toMatchObject({
+      selector: 'npm:test:balanced --reporter=dot',
+      command: process.execPath,
+      args: [fakeNpmEntry, 'run', 'test:balanced', '--', '--reporter=dot'],
+    })
   })
 })

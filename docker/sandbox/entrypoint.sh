@@ -11,7 +11,7 @@ TARGET_GID="$(id -g sandbox)"
 
 cd /workspace
 
-# /home/sandbox/.cache is where npm postinstall scripts (electron,
+# /home/sandbox/.cache is where npm/pnpm postinstall scripts (electron,
 # playwright, ...) create their OWN cache subdirectories on demand — it must
 # be sandbox-owned itself, not just the ms-playwright volume mounted below,
 # or a plain `mkdir` for a sibling dir (e.g. .cache/electron) gets EACCES.
@@ -36,10 +36,129 @@ for dir in "${VOLUME_DIRS[@]}"; do
   fi
 done
 
-if [ -f package-lock.json ] && [ ! -f node_modules/.sandbox-npm-ci-done ]; then
-  echo "[sandbox] populating sandbox-owned node_modules via npm ci (first use of this volume)..." >&2
-  gosu sandbox npm ci --no-audit --no-fund
-  gosu sandbox touch node_modules/.sandbox-npm-ci-done
+# pnpm workspace members with their own dependencies (the sidecar and the
+# private MCP runtime package) each get a sandbox-owned node_modules
+# layered over the bind-mounted repo — scripts/sandbox-test.sh mounts
+# named volumes there. Unlike the paths above, docker creates these mount
+# points itself and a foreign tree may not contain the members at all, so
+# never mkdir here (that would litter the bind mount) and only fix
+# ownership of actual mounts: member dir present AND volume mounted.
+is_mount_point() {
+  awk '{print $5}' /proc/self/mountinfo | grep -qxF "$1"
+}
+if [ -f pnpm-workspace.yaml ]; then
+  for dir in \
+    crates/freshell-claude-sidecar/node_modules \
+    packages/freshell-mcp-runtime/node_modules; do
+    if [ -d "$(dirname "/workspace/${dir}")" ] && is_mount_point "/workspace/${dir}"; then
+      if [ "$(stat -c %u "/workspace/${dir}")" != "${TARGET_UID}" ]; then
+        chown -R "${TARGET_UID}:${TARGET_GID}" "/workspace/${dir}"
+      fi
+    fi
+  done
+fi
+
+# --- dependency prep (fingerprinted, dual-manager) ------------------------
+# Replaces the one-shot `.sandbox-npm-ci-done` marker: the sandbox serves
+# both pnpm-era trees (packageManager pin; plan §7.3) and legacy npm-era
+# branches (package-lock.json only), so the manager is selected per tree and
+# the install is keyed by a fingerprint over the actual dependency inputs.
+# The state file lives inside the install volume (node_modules is a named
+# volume under scripts/sandbox-test.sh), so wiping the volume wipes the
+# state. The old marker never satisfies this state: an npm-era volume, a
+# stale marker, or a manager switch all trigger a fresh install.
+if [ -f package.json ]; then
+  # Manager selection precedence mirrors scripts/lib/package-manager.ts
+  # (detectProjectManager): the packageManager field is authoritative; a
+  # missing or unrecognized field falls back to lock presence, npm's
+  # package-lock.json first so legacy branches keep their `npm ci` path
+  # while both lock styles exist transiently in migrated trees.
+  DEPS_PM_FIELD="$(node -e 'try{process.stdout.write(JSON.parse(require("fs").readFileSync("package.json","utf8")).packageManager||"")}catch{}' 2>/dev/null || true)"
+  DEPS_MANAGER=""
+  case "${DEPS_PM_FIELD%%@*}" in
+    pnpm) DEPS_MANAGER=pnpm ;;
+    npm) DEPS_MANAGER=npm ;;
+  esac
+  if [ -z "${DEPS_MANAGER}" ]; then
+    if [ -f package-lock.json ]; then
+      DEPS_MANAGER=npm
+    elif [ -f pnpm-lock.yaml ]; then
+      DEPS_MANAGER=pnpm
+    fi
+  fi
+
+  if [ -n "${DEPS_MANAGER}" ]; then
+    if ! command -v "${DEPS_MANAGER}" >/dev/null 2>&1; then
+      echo "[sandbox] ERROR: this tree selects ${DEPS_MANAGER}, which is not installed in the sandbox image" >&2
+      exit 1
+    fi
+
+    if [ "${DEPS_MANAGER}" = pnpm ]; then
+      # The explicit --store-dir is load-bearing: pnpm's default store-path
+      # resolution (storePathRelativeToHome) probes the project root's
+      # writability by touching a _tmp_ file next to the root manifest. The
+      # bind-mounted repo is not writable by the sandbox user, so the probe
+      # EACCES would kill every install. The path is the same canonical
+      # per-user location pnpm would pick itself (/home/sandbox is
+      # sandbox-owned by construction).
+      DEPS_POLICY=(install --frozen-lockfile --store-dir /home/sandbox/.local/share/pnpm/store)
+      DEPS_LOCKS=(pnpm-lock.yaml pnpm-workspace.yaml)
+    else
+      DEPS_POLICY=(ci --no-audit --no-fund)
+      DEPS_LOCKS=(package-lock.json)
+    fi
+    DEPS_MANAGER_VERSION="$(gosu sandbox "${DEPS_MANAGER}" --version 2>/dev/null || true)"
+
+    # Fingerprint over the selected manager's identity, the install policy
+    # flags, the root manifest, the selected manager's lock/config files,
+    # and the workspace member manifests when present. Absent files are
+    # skipped; changing any input forces a reinstall on the next start.
+    DEPS_FINGERPRINT="$(
+      {
+        printf 'manager=%s@%s\n' "${DEPS_MANAGER}" "${DEPS_MANAGER_VERSION}"
+        printf 'policy=%s\n' "${DEPS_POLICY[*]}"
+        for f in package.json "${DEPS_LOCKS[@]}" \
+                 crates/freshell-claude-sidecar/package.json \
+                 packages/freshell-mcp-runtime/package.json; do
+          if [ -f "$f" ]; then
+            sha256sum "$f"
+          fi
+        done
+      } | sha256sum | cut -d' ' -f1
+    )"
+
+    DEPS_STATE="node_modules/.sandbox-deps-state"
+    DEPS_RECORDED=""
+    if [ -f "${DEPS_STATE}" ]; then
+      DEPS_RECORDED="$(grep '^fingerprint=' "${DEPS_STATE}" | cut -d= -f2 || true)"
+    fi
+
+    if [ -n "${DEPS_RECORDED}" ] && [ "${DEPS_RECORDED}" = "${DEPS_FINGERPRINT}" ]; then
+      echo "[sandbox] deps: reusing sandbox-owned node_modules (${DEPS_MANAGER} fingerprint ${DEPS_FINGERPRINT} unchanged)" >&2
+    else
+      echo "[sandbox] deps: installing via ${DEPS_MANAGER} ${DEPS_POLICY[*]} (fingerprint ${DEPS_FINGERPRINT}, recorded ${DEPS_RECORDED:-none})" >&2
+      # Purge the previous contents before installing: the recorded state
+      # may be another manager's layout (an npm-created tree is
+      # incompatible with pnpm and vice versa), a marker-era leftover, or a
+      # half-failed install. `npm ci` reinstalls from scratch anyway; pnpm
+      # needs the clean slate. Only volume mounts are purged — a direct
+      # docker run without the wrapper's named volumes must never delete
+      # the user's real node_modules through the bind mount; such runs
+      # fail closed on the install instead.
+      for dir in \
+        node_modules \
+        crates/freshell-claude-sidecar/node_modules \
+        packages/freshell-mcp-runtime/node_modules; do
+        if [ -d "${dir}" ] && is_mount_point "/workspace/${dir}"; then
+          find "${dir}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+        fi
+      done
+      gosu sandbox "${DEPS_MANAGER}" "${DEPS_POLICY[@]}"
+      printf 'manager=%s\nmanager_version=%s\nfingerprint=%s\n' \
+        "${DEPS_MANAGER}" "${DEPS_MANAGER_VERSION}" "${DEPS_FINGERPRINT}" \
+        | gosu sandbox tee "${DEPS_STATE}" >/dev/null
+    fi
+  fi
 fi
 
 exec gosu sandbox "$@"
