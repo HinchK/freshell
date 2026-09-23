@@ -12,7 +12,7 @@ const SDK_NAME = '@anthropic-ai/claude-agent-sdk'
 const SDK_VERSION = '0.3.237'
 const PNPM_VERSION = '10.34.5'
 const PINNED_PNPM_REMEDIATION = 'npm install --global pnpm@10.34.5'
-const INSTALL_ARGS = ['install', '--filter', 'freshell-claude-sidecar', '--frozen-lockfile']
+const INSTALL_ARGS = ['install', '--filter', 'freshell-claude-sidecar', '--frozen-lockfile', '--config.confirmModulesPurge=false']
 const CANONICAL_INSTALL_COMMAND = ['pnpm', ...INSTALL_ARGS]
 const READY_RECEIPT_FILENAME = '.claude-sidecar-ready.json'
 

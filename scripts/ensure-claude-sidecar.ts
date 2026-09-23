@@ -24,7 +24,16 @@ import { detectProjectManager, resolveManagerCommand } from './lib/package-manag
 
 const SIDECAR_PACKAGE_NAME = 'freshell-claude-sidecar'
 const SDK_PACKAGE_NAME = '@anthropic-ai/claude-agent-sdk'
-const FROZEN_FILTERED_INSTALL_ARGS = ['install', '--filter', SIDECAR_PACKAGE_NAME, '--frozen-lockfile']
+// --config.confirmModulesPurge=false: pnpm 10.34.5 stops a FILTERED install
+// to ask about touching module state outside the filter ("If you are running
+// pnpm in CI ... set confirmModulesPurge to 'false'"), and a non-interactive
+// child refuses with exit 1. The flag means "proceed WITHOUT purging modules
+// outside the filter" — exactly the bootstrap's intent: it must never prune
+// the root tree. Reproduced: the source-runtime start-script lane timed out
+// (30s health window) in fresh checkouts because this refusal killed the
+// prestart; with the flag the cold filtered install completes in seconds and
+// the root node_modules stays intact.
+const FROZEN_FILTERED_INSTALL_ARGS = ['install', '--filter', SIDECAR_PACKAGE_NAME, '--frozen-lockfile', '--config.confirmModulesPurge=false']
 const READY_RECEIPT_FILENAME = '.claude-sidecar-ready.json'
 const NATIVE_PLATFORMS = new Set<NodeJS.Platform>(['linux', 'darwin', 'win32'])
 
