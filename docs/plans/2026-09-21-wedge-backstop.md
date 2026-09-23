@@ -168,8 +168,14 @@ fn stuck_detection_clears_on_meaningful_output() {
 
 #[test]
 fn stuck_detection_clears_on_user_input() {
-    // Input bumps BOTH clocks (registry.rs:1818-1820) and returns
-    // `InputOutcome` (NOT a Result — do not unwrap).
+    // EPISODE-3 FOCUSED-REVIEW AMENDMENT: this sketch asserted the WRONG
+    // contract — keystrokes refresh the reaper clock
+    // (`last_meaningful_activity_at`) only; the wedge clock advances
+    // exclusively via NoiseScanner-accepted output, so typing at a
+    // wedged pane does NOT un-wedge it. The implemented test is
+    // `stuck_detection_survives_user_input`; the assertions below are
+    // pre-implementation history. `input` returns `InputOutcome`
+    // (NOT a Result — do not unwrap).
     let reg = stuck_test_registry("opencode");
     flag_stuck_row(&reg);
     let _ = reg.input("T", b"x"); // InputOutcome — assert the row-clock variant if desired
@@ -337,7 +343,7 @@ with the freshness const next to the window consts:
 pub const STUCK_ACTIVITY_FRESH_MS: i64 = 300_000;
 ```
 
-Note `is_agent_mode` is a private fn in the same file — call it directly. Do NOT touch `enforce_idle_kills` or `idle_noise.rs`. The predicate is the TWO-CLOCK DIFFERENTIAL — meaningful-clock staleness AND activity-clock freshness together (the User Request's Explicit constraint names exactly this signal; the round-1 review caught the staleness-only variant flagging prompt-idle panes, which would alter non-wedged panes). Deliberately NO busy/turn-in-flight gate (the zombie class attaches to aborted sessions with no reliable turn state; a busy gate would produce false negatives on exactly the target class).
+Note `is_agent_mode` is a private fn in the same file — call it directly. Do NOT touch `enforce_idle_kills` or `idle_noise.rs`. The predicate is the TWO-CLOCK DIFFERENTIAL — meaningful-clock staleness AND activity-clock freshness together (the User Request's Explicit constraint names exactly this signal; the round-1 review caught the staleness-only variant flagging prompt-idle panes, which would alter non-wedged panes). Deliberately NO busy/turn-in-flight gate (the zombie class attaches to aborted sessions with no reliable turn state; a busy gate would produce false negatives on exactly the target class). (Episode-3 focused-review amendment: the staleness conjunct reads the output-only wedge clock `last_meaningful_output_at`, and keystrokes refresh the reaper clock only — the wedge clock advances exclusively via NoiseScanner-accepted output, so typing at / Ctrl+C-ing a wedged pane does not clear or postpone the stuck state.)
 
 - [ ] **Step 4: Run the focused test**
 
@@ -363,6 +369,8 @@ Expected: PASS (zero failures; pre-existing suite untouched).
 git add crates/freshell-terminal/src/registry.rs crates/freshell-terminal/src/idle_noise.rs
 git commit -m "feat(terminal): registry stuck sweep flags agent panes past meaningful-idle window"
 ```
+
+**Episode-3 focused-review amendment:** the review loop corrected Task 1's input/clearing semantics after the sketches were written: keystrokes refresh the reaper clock (`last_meaningful_activity_at`) only; the wedge clock (`last_meaningful_output_at`, the round-4 output-only twin the implemented sweep reads) advances exclusively via NoiseScanner-accepted output in `ingest`, and typing at / Ctrl+C-ing a genuinely wedged pane does not un-wedge it (a healthy engaged pane's keystroke echo arrives via `ingest` and keeps the wedge clock fresh through output anyway). The predicate note above and the `stuck_detection_clears_on_user_input` sketch's comment state the corrected contract; the implemented test is `stuck_detection_survives_user_input`, and the sketch's old name/assertions and the other code blocks (e.g. the `stuck_since` doc sketch's "cleared by the first meaningful activity", which reads "first meaningful output") remain pre-implementation history per this plan's rules.
 
 ---
 

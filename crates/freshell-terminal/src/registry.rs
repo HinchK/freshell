@@ -246,16 +246,21 @@ struct TerminalShared {
     /// backgrounded terminal gets a full idle threshold of reap grace.
     last_meaningful_activity_at: i64,
     /// The wedge-backstop clock (delta-review round 4, Finding 1): last
-    /// MEANINGFUL PTY OUTPUT or user keystroke — refreshed ONLY by
-    /// genuinely-new content (the `noise.observe` arm in `ingest`) and
-    /// `input`. NEVER by the detach/socket-close grace bumps, because a
-    /// page refresh must not reset wedge detection: those grace bumps
-    /// exist for the idle reaper's threshold only, and a page refresh is
-    /// exactly what a user performs on a stuck UI. Read by
+    /// MEANINGFUL PTY OUTPUT — refreshed ONLY by genuinely-new content as
+    /// classified by [`NoiseScanner::observe`] in `ingest`. NEVER by
+    /// keystrokes (`input`), the detach/socket-close grace bumps, or
+    /// anything else: the wedge signal is the classifier's judgment of the
+    /// pane's OUTPUT, so typing at / Ctrl+C-ing a genuinely wedged pane
+    /// (the natural first response) does not clear or postpone the stuck
+    /// state (a healthy engaged pane's keystroke echo arrives via `ingest`
+    /// and keeps this clock fresh through output anyway), and a page
+    /// refresh must not reset wedge detection either (the grace bumps exist
+    /// for the idle reaper's threshold only, and a page refresh is exactly
+    /// what a user performs on a stuck UI). Read by
     /// `enforce_stuck_detection` (the two-clock stuck differential).
     last_meaningful_output_at: i64,
     /// Set (epoch ms) while `enforce_stuck_detection` flags this row stuck;
-    /// cleared by the first meaningful activity. Surface-only state.
+    /// cleared by the first meaningful output. Surface-only state.
     stuck_since: Option<i64>,
     /// Current PTY geometry + epoch (`§5.3`): epoch starts 1, +1 only on a real change after the first client geometry record.
     cols: u16,
@@ -2089,12 +2094,20 @@ impl TerminalRegistry {
                     let mut s = handle.shared.lock().expect("terminal lock");
                     let now = now_ms();
                     s.last_activity_at = now;
-                    // User keystrokes are always meaningful (DEV-0009) — for
-                    // BOTH the reaper clock and the wedge-backstop output
-                    // clock (typing into a wedged pane genuinely un-wedges
-                    // its stuck state).
+                    // User keystrokes are always meaningful for the IDLE
+                    // REAPER's clock (DEV-0009 —
+                    // `input_write_resets_the_idle_reap_clock` pins that
+                    // half). The wedge-backstop output clock
+                    // (`last_meaningful_output_at`) is deliberately NOT
+                    // bumped (episode-3 focused review, Finding 1): the
+                    // wedge signal is meaningful PTY OUTPUT — the
+                    // classifier's judgment of the pane's OUTPUT — so a
+                    // user typing at / Ctrl+C-ing a genuinely wedged pane
+                    // (the natural first response) must not clear or
+                    // postpone the stuck state. A healthy engaged pane's
+                    // keystroke echo arrives through `ingest`, which keeps
+                    // the wedge clock fresh through output anyway.
                     s.last_meaningful_activity_at = now;
-                    s.last_meaningful_output_at = now;
                     (true, s.mode != "shell")
                 }
                 None => (false, false),
@@ -3718,7 +3731,8 @@ fn ingest(shared: &Arc<Mutex<TerminalShared>>, msg: ServerMessage) {
     // holds for every consumer except the reaper) but must not exempt a
     // detached terminal from enforce_idle_kills forever. The same arm also
     // refreshes the wedge-backstop output clock — genuine output is the
-    // only thing (besides `input`) that may un-wedge a stuck pane.
+    // ONLY thing that may un-wedge a stuck pane (episode-3 focused review:
+    // keystrokes refresh the reaper clock alone, never this one).
     if s.noise.observe(&frame.data) {
         s.last_meaningful_activity_at = s.last_activity_at;
         s.last_meaningful_output_at = s.last_activity_at;
@@ -6100,16 +6114,38 @@ mod tests {
         assert!(!cleared[0].stuck);
     }
 
+    /// Episode-3 focused review, Finding 1: the wedge signal is meaningful
+    /// PTY OUTPUT — the classifier's judgment of the pane's OUTPUT. A user
+    /// typing at / Ctrl+C-ing a genuinely wedged pane (the natural first
+    /// response) must NOT clear or postpone the stuck state: the process
+    /// is still wedged regardless of what the user types. Keystrokes keep
+    /// their DEV-0009 meaning for the REAPER clock only (pinned by
+    /// `input_write_resets_the_idle_reap_clock`); the wedge clock advances
+    /// exclusively via NoiseScanner-accepted output (the
+    /// `stuck_detection_clears_on_meaningful_output` door). `input` returns
+    /// `InputOutcome` (NOT a Result — no unwrap).
     #[test]
-    fn stuck_detection_clears_on_user_input() {
-        // Input bumps BOTH clocks (registry.rs:1818-1820) and returns
-        // `InputOutcome` (NOT a Result — no unwrap).
+    fn stuck_detection_survives_user_input() {
         let reg = stuck_test_registry("opencode");
         flag_stuck_row(&reg);
         assert!(reg.input("T", b"x").found);
-        let cleared = reg.enforce_stuck_detection();
-        assert_eq!(cleared.len(), 1);
-        assert!(!cleared[0].stuck);
+        // The sweep must emit NO clear transition — the row still matches
+        // the wedge predicate (meaningful output stale, activity fresh).
+        assert!(
+            reg.enforce_stuck_detection().is_empty(),
+            "typing at a wedged pane must not un-wedge it"
+        );
+        // And the flag SURVIVED: a fresh subscriber's attach-time stuck
+        // truth still reports stuck:true (the page_refresh test's probe
+        // shape).
+        let (sink, seen) = collector();
+        assert!(
+            reg.attach("T", 1, sink, Some("att-surv".into()), 0, false, None, None)
+                .found
+        );
+        let stuck = stuck_frames(&seen);
+        assert_eq!(stuck.len(), 1);
+        assert!(stuck[0].stuck, "the stuck flag survived the user input");
     }
 
     #[test]
@@ -6450,9 +6486,9 @@ mod tests {
 
     #[test]
     fn attach_reconciles_a_late_clear_for_a_reconnecting_client() {
-        // Flag the row, attach (sink A sees stuck:true), then user input
-        // clears the flag (next sweep), then a FRESH sink B attaches: it
-        // must see stuck:false — a client that missed the stuck:false
+        // Flag the row, attach (sink A sees stuck:true), then meaningful
+        // output clears the flag (next sweep), then a FRESH sink B attaches:
+        // it must see stuck:false — a client that missed the stuck:false
         // broadcast reconciles its stale card on re-attach.
         let reg = stuck_test_registry("opencode");
         flag_stuck_row(&reg);
@@ -6462,9 +6498,11 @@ mod tests {
         assert_eq!(stuck_a.len(), 1);
         assert!(stuck_a[0].stuck, "precondition: sink A saw the flag");
 
-        // User input bumps BOTH clocks (the Task 1 clear path), then the
-        // sweep emits the true→false transition.
-        assert!(reg.input("T", b"x").found);
+        // Genuinely-new output refreshes the meaningful clocks (the
+        // ingest path — the ONLY un-wedge door per the episode-3 focused
+        // review; typing no longer clears), then the sweep emits the
+        // true→false transition.
+        reg.feed("T", frame(9, "meaningful new text line\n", "S"));
         let cleared = reg.enforce_stuck_detection();
         assert_eq!(cleared.len(), 1);
         assert!(!cleared[0].stuck);
