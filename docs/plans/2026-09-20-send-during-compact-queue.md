@@ -967,6 +967,16 @@ struct TurnTask {
         // succeeds proves the quiesce, disarms, and delivers in FIFO
         // order. Test:
         // a_failed_daemon_abort_defers_the_drain_until_a_successful_interrupt.)
+        // (Delta-review round 4 amendment: the deferral is NOT permanent —
+        // the serve bridge's IDLE observation (the daemon's own
+        // session-idle event, the proven end of the orphaned turn)
+        // releases the latch and delivers the parked queue AUTOMATICALLY
+        // (`observe_daemon_idle`, wired into the bridge's Snapshot::Idle
+        // arm AFTER the idle frame goes out); the unmaterialized-session
+        // early return CLEARS the latch so a later compact queue can
+        // never be poisoned. Tests:
+        // the_daemon_idle_observation_releases_the_interrupt_deferral_and_delivers;
+        // an_unmaterialized_interrupt_does_not_poison_the_deferral_latch.)
         Self::drain_detached(self, &real_id);
 ```
 

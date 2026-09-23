@@ -183,11 +183,12 @@ struct OpencodeCreateRecord {
 
 /// What the session's registered driving task is running (delta-review round 2,
 /// D2-F1): every [`OpencodeSession::turn_task`] entry is tagged so
-/// [`FreshOpencodeState::handle_send`] can REFUSE to overwrite an in-flight
-/// COMPACT's handle (the overwrite would disconnect kill/interrupt from the
-/// still-running compact drive and let ONE idle edge settle both operations into a
-/// false/duplicate completion) while preserving the pre-existing
-/// send-overwrites-send behavior.
+/// [`FreshOpencodeState::handle_send`] can recognize an in-flight COMPACT —
+/// since the send-during-compact queue, such a send QUEUES behind the drive
+/// (never overwriting its handle: the overwrite would disconnect
+/// kill/interrupt from the still-running compact drive and let ONE idle edge
+/// settle both operations into a false/duplicate completion) — while
+/// preserving the pre-existing send-overwrites-send behavior.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum TurnTaskKind {
     /// A `freshAgent.send` turn drive (`handle_send`'s `run_turn` task).
@@ -3905,6 +3906,12 @@ impl FreshOpencodeState {
         let Some(real_id) = real_id else {
             // Not yet materialized: `abortForState` is a no-op, but `emitStatus('idle')`
             // still fires (adapter.ts:530), stamped with whatever id the client sent.
+            // Delta-review round 4: the teardown-start latch arming is
+            // undone here — an unmaterialized session has NO daemon-side
+            // turn, so nothing can be orphaned; leaving the latch armed
+            // would poison a later compact queue after materialization
+            // (the drain would refuse forever).
+            orphaned_daemon_turn.store(false, Ordering::SeqCst);
             self.broadcast(&event_frame(
                 &msg.session_id,
                 snapshot_event(&msg.session_id, "idle"),
@@ -6474,6 +6481,11 @@ impl FreshOpencodeState {
         turn_errored: Arc<AtomicBool>,
     ) -> tokio::task::JoinHandle<()> {
         let fresh_agent = self.fresh_agent.clone();
+        // Delta-review round 4: the bridge's idle observation releases the
+        // failed-interrupt deferral latch — it needs the sessions map, so
+        // the bridge captures the state handle (the same Arc-based clone
+        // every detached trigger uses).
+        let this = self.clone();
         let mut rx = manager.subscribe(&real_id);
         tokio::spawn(async move {
             loop {
@@ -6510,6 +6522,24 @@ impl FreshOpencodeState {
                             }
                         };
                         fresh_agent.broadcast(&event_frame(&real_id, inner));
+                        // Delta-review round 4: the daemon reporting this
+                        // session IDLE is the PROVEN end of any orphaned
+                        // daemon-side turn (a failed daemon-side interrupt
+                        // abort left the deferral latch armed) — AFTER the
+                        // idle frame is out (the emission-order contract:
+                        // the daemon's idle precedes the next queued
+                        // send's running), release the latch and arm the
+                        // automatic queue delivery. The helper is
+                        // self-gating: a no-op when nothing was deferred.
+                        if matches!(
+                            mapped,
+                            SdkProviderEvent::Snapshot {
+                                status: SnapshotStatus::Idle,
+                                ..
+                            }
+                        ) {
+                            Self::observe_daemon_idle(&this, &real_id).await;
+                        }
                     }
                     // The sidecar was lost; `run_turn`'s own `await_idle` independently
                     // surfaces `ServeError::SidecarLost`, which already excludes the
@@ -6520,6 +6550,33 @@ impl FreshOpencodeState {
                 }
             }
         })
+    }
+
+    /// Delta-review round 4: the serve bridge observed the daemon report
+    /// this session IDLE — the PROVEN end of any orphaned daemon-side
+    /// turn (a failed daemon-side interrupt abort left the deferral
+    /// latch armed; without this release the parked queue would strand
+    /// until a manual interrupt). The bridge has ALREADY broadcast its
+    /// idle frame when this runs (the emission-order contract: the
+    /// daemon's idle precedes the next queued send's running). Clears
+    /// the latch (WARN-observable on the release) and arms the detached
+    /// drain — the parked messages deliver automatically, in FIFO
+    /// order. The drain is self-gating: the always-spawn is a no-op
+    /// when nothing was deferred.
+    async fn observe_daemon_idle(this: &Self, real_id: &str) {
+        let session_arc = {
+            let guard = this.sessions.lock().await;
+            guard.get(real_id).cloned()
+        };
+        if let Some(session_arc) = session_arc {
+            let mut session = session_arc.lock().await;
+            if session.orphaned_daemon_turn.swap(false, Ordering::SeqCst) {
+                tracing::warn!(target: "freshell_freshagent::opencode",
+                    session_id = %real_id,
+                    "fresh_agent_interrupt_orphan_released_by_daemon_idle");
+            }
+        }
+        Self::drain_detached(this, real_id);
     }
 }
 
@@ -16828,6 +16885,147 @@ mod tests {
         assert!(
             session_arc.lock().await.pending_sends.is_empty(),
             "the recovered queue drains completely"
+        );
+    }
+
+    /// Delta-review round 4: the deferral is NOT permanent. The serve
+    /// bridge observes the daemon's own session-IDLE event — the proven
+    /// end of the orphaned daemon-side turn — and
+    /// [`FreshOpencodeState::observe_daemon_idle`] (the exact function
+    /// the bridge calls on a `Snapshot::Idle`) releases the latch and
+    /// delivers the parked queue AUTOMATICALLY, FIFO, with the release
+    /// WARN-observable. No manual interrupt required.
+    #[tokio::test]
+    async fn the_daemon_idle_observation_releases_the_interrupt_deferral_and_delivers() {
+        let summarize_gate = Arc::new(tokio::sync::Notify::new());
+        let (st, http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            Some(summarize_gate.clone()),
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q9", Some("prov/model")).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_compact(compact_msg("ses_q9")),
+        )
+        .await
+        .expect("compact registers");
+        await_summarize_posted(&http).await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q9", "first auto")),
+        )
+        .await;
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_send(send_msg("ses_q9", "second auto")),
+        )
+        .await;
+
+        let (events, _guard) = info_capture::capture();
+        http.arm_abort_fail();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q9".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (abort fails)");
+        {
+            let captured = events.lock().unwrap();
+            assert!(
+                captured.iter().any(|e| e
+                    .message
+                    .contains("fresh_agent_interrupt_abort_failed_queue_deferred")),
+                "the deferral is WARN-observable"
+            );
+        }
+
+        // The daemon-side compact eventually settles; the bridge observes
+        // the session's idle — the AUTOMATIC release + delivery:
+        FreshOpencodeState::observe_daemon_idle(&st, "ses_q9").await;
+        await_prompt_posted(&http, "first auto").await;
+        await_prompt_posted(&http, "second auto").await;
+        {
+            let captured = events.lock().unwrap();
+            assert!(
+                captured.iter().any(|e| e
+                    .message
+                    .contains("fresh_agent_interrupt_orphan_released_by_daemon_idle")),
+                "the release is WARN-observable"
+            );
+        }
+        let recorded = http.recorded();
+        let first_ix = recorded
+            .iter()
+            .position(|r| r.url.contains("prompt_async") && r_body_contains(r, "first auto"))
+            .expect("first auto delivered");
+        let second_ix = recorded
+            .iter()
+            .position(|r| r.url.contains("prompt_async") && r_body_contains(r, "second auto"))
+            .expect("second auto delivered");
+        assert!(first_ix < second_ix, "the released queue delivers FIFO");
+        let session_arc = st.sessions.lock().await.get("ses_q9").cloned().unwrap();
+        assert!(
+            session_arc.lock().await.pending_sends.is_empty(),
+            "the released queue drains completely"
+        );
+    }
+
+    /// Delta-review round 4: an interrupt on an UNMATERIALIZED session
+    /// takes the early-return path — the teardown-start latch arming is
+    /// undone there, so a later compact queue can never be poisoned by a
+    /// deferral latch with no daemon-side turn behind it.
+    #[tokio::test]
+    async fn an_unmaterialized_interrupt_does_not_poison_the_deferral_latch() {
+        let (st, _http, _rx) = compact_state_gated(
+            r#"{"model":null}"#,
+            SummarizeOutcome::OkAnswered,
+            None,
+            None,
+        )
+        .await;
+        insert_compact_session(&st, "ses_q10", Some("prov/model")).await;
+        let session_arc = st.sessions.lock().await.get("ses_q10").cloned().unwrap();
+        // Unmaterialize white-box: no real durable id → the interrupt's
+        // early-return path.
+        session_arc.lock().await.real_session_id = None;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            st.handle_interrupt(FreshAgentInterrupt {
+                provider: AgentProvider::Opencode,
+                session_id: "ses_q10".to_string(),
+                session_type: SessionType::Freshopencode,
+                cwd: None,
+            }),
+        )
+        .await
+        .expect("interrupt answers (unmaterialized early return)");
+        {
+            let session = session_arc.lock().await;
+            assert!(
+                !session.orphaned_daemon_turn.load(Ordering::SeqCst),
+                "the latch is not left armed by the unmaterialized early return"
+            );
+        }
+        // And the drain still works afterward (the poisoning regression's
+        // observable): park an entry white-box and drive it.
+        {
+            let mut session = session_arc.lock().await;
+            session
+                .pending_sends
+                .push_back(send_msg("ses_q10", "after the early return"));
+        }
+        st.drain_pending_sends("ses_q10").await;
+        assert!(
+            session_arc.lock().await.pending_sends.is_empty(),
+            "a later queue is not poisoned — the drain drives"
         );
     }
 
