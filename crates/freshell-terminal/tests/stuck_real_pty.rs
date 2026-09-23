@@ -15,6 +15,21 @@
 //! active-phase cadence (~250 ms/unit), then keeps repainting them forever,
 //! then switches to genuinely-new text lines once a sentinel file appears.
 //!
+//! DEPENDENCY-FREE EMITTER (episode-3 r4, review Finding 4): the pty child
+//! is THIS TEST BINARY re-exec'd — the parent spawns
+//! `std::env::current_exe()` with `--exact stuck_real_pty_emitter_child`
+//! and `FRESHELL_STUCK_TEST_EMITTER=1` (the standard Rust self-reexec
+//! pattern), so the child's harness runs ONLY the embedded emitter test,
+//! which writes the embedded units to raw stdout at the cadence when the
+//! magic env var is set (and no-ops in a normal harness run). No python3 —
+//! not a documented prerequisite on the supported native-Windows/macOS dev
+//! hosts — no fixture files, no network. The child's libtest banner
+//! ("running 1 test", "test stuck_real_pty_emitter_child ... ") precedes
+//! the units on the pty stream: it is plain text (a one-time meaningful
+//! refresh at t≈0, before the census firsts) and shows up as at most a
+//! couple of banner-only frames ahead of the unit stream — counted under
+//! `non_unit` in the framing report below.
+//!
 //! The load-bearing asserts: after the ring warms through REAL reads,
 //! `enforce_stuck_detection` FLAGS the row — the wedge differential holds
 //! through production framing (the classifier treats the real repaint
@@ -31,20 +46,27 @@
 //! 20, 21, 23, 25, 26, 27, 29; verified by an independent `NoiseScanner`
 //! reimplementation over these exact 60 units: exactly those 14 classify
 //! meaningful, ring peak 14/32, every replay noise), so the test needs no
-//! access to the capture file. The emitter script below is generated at
-//! runtime into a temp dir from these embedded bytes.
+//! access to the capture file.
 //!
-//! Observed framing is also checked and reported: at the capture's natural
-//! cadence each 87-466 B unit lands in its own blocking read (one frame per
-//! unit), so every warm-up frame must be a single complete synchronized-
-//! update unit; coalesced reads (2+ units in one frame) are tolerated up to
-//! a small fraction and counted, and any partial (split) unit fails loudly.
+//! Observed framing is checked and REPORTED (episode-3 r4, review
+//! Finding 3): a PTY read may LEGALLY split a child write, and the
+//! scanner's persistent cross-frame VT state machine stitches mid-unit
+//! splits — so SPLIT frames are tolerated and recorded (counters +
+//! eprintln), never a hard precondition. What IS asserted away is
+//! SUSTAINED multi-unit coalescing — frames carrying two-or-more full
+//! units must stay a small minority (the documented fail-open regime: a
+//! two-unit frame is a novel fingerprint that refreshes the meaningful
+//! clock; if most frames coalesced, the ring could never warm and the
+//! load-bearing flag assert would fail — this assert names that regime
+//! explicitly instead of leaving it to the flag assert's message). All
+//! counters are eprintln'd for diagnostics.
 //!
 //! SAFETY: a local scratch PTY child only, SIGKILLed via the registry's own
 //! `kill` (group kill) before the temp dir drops. This test never touches
 //! the user's live server (:3001) and binds nothing.
 
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -57,11 +79,19 @@ use freshell_terminal::{
 /// The capture's measured active-phase cadence: ~3.3-3.9 units/s.
 const UNIT_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Warm-up bound: the 60 embedded units plus at least two census replays,
-/// so the ring provably holds every census composition before the flag.
-const WARMUP_MIN_FRAMES: usize = 62;
+/// Warm-up bound: the 60 embedded units plus at least two census replays.
+/// Counted in COMPLETE units observed across frames (not raw frames), so
+/// the re-exec child's libtest banner frames (see the module docs) cannot
+/// eat into the margin.
+const WARMUP_MIN_UNITS: usize = 62;
 const WARMUP_DEADLINE: Duration = Duration::from_secs(24);
 const RECOVERY_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Coalescing tolerance (r4 Finding 3): frames carrying 2+ full units
+/// ("multi-unit" frames — the LB-1 fail-open regime) must stay a small
+/// minority of observed frames; a sustained majority would mean the reader
+/// runs behind the emitter and the ring could never warm.
+const COALESCED_FRACTION_DENOM: usize = 10;
 
 /// Tiny window for a wall-clock test: far under the 5-minute freshness
 /// bound (the merely-exists regime), and — load-bearing for the CLEAR
@@ -71,6 +101,14 @@ const REAL_PTY_TEST_WINDOW_MS: i64 = 1_000;
 
 const SYNC_BEGIN: &str = "\u{1b}[?2026h";
 const SYNC_END: &str = "\u{1b}[?2026l";
+
+/// Self-reexec contract (module docs): the parent spawns `current_exe()`
+/// with `--exact <EMITTER_TEST_NAME>` and these env vars, so the child
+/// harness runs ONLY the emitter test; the emitter performs the child role
+/// when [`EMITTER_ENV`] is set and no-ops in a normal harness run.
+const EMITTER_TEST_NAME: &str = "stuck_real_pty_emitter_child";
+const EMITTER_ENV: &str = "FRESHELL_STUCK_TEST_EMITTER";
+const EMITTER_SWITCH_ENV: &str = "FRESHELL_STUCK_TEST_EMITTER_SWITCH";
 
 /// The capture's first 60 synchronized-update units, verbatim (see the module
 /// provenance docs above). Extracted read-only from the 2026-09-20 wedged-
@@ -138,50 +176,45 @@ const OPENCODE_CAPTURE_FIRST_60_UNITS: [&str; 60] = [
     "\x1b[?2026h\x1b[?25l\x1b[38;4H\x1b[38;2;27;40;59m\x1b[48;2;10;10;10m⬝⬝⬝⬝⬝⬝⬝⬝\x1b[0m\x1b[0m\x1b[34;6H\x1b[?25h\x1b[?2026l",
 ];
 
-/// The runtime-generated emitter: splits the units blob on the capture's
-/// own synchronized-update wrappers (the documented capture split), plays
-/// the 60 units in order at the natural cadence, loops them forever, and —
-/// once the sentinel file appears — switches to genuinely-new text lines
-/// (a fresh fingerprint per line, so each refreshes the meaningful clock).
-/// `os.write(1, ...)` is an unbuffered raw syscall: one write per unit.
-/// The first 60 units contain no `\n`/`\r`/TAB (only ESC), so the pty's
-/// default OPOST/ONLCR output processing is a no-op and the writes are
-/// byte-faithful to the capture.
-const EMITTER_SCRIPT: &str = r#"import os
-import sys
-import time
-
-data = open(sys.argv[2], 'rb').read()
-BEGIN = b'\x1b[?2026h'
-END = b'\x1b[?2026l'
-units = []
-i = 0
-while True:
-    b = data.find(BEGIN, i)
-    if b < 0:
-        break
-    e = data.find(END, b)
-    if e < 0:
-        break
-    units.append(data[b:e + len(END)])
-    i = e + len(END)
-if not units:
-    raise SystemExit(2)
-
-switch = sys.argv[1]
-n = 0
-meaningful = False
-while True:
-    if not meaningful and os.path.exists(switch):
-        meaningful = True
-    if meaningful:
-        line = 'recovery line %d: genuinely new content %d\r\n' % (n, n)
-        os.write(1, line.encode('utf-8'))
-    else:
-        os.write(1, units[n % len(units)])
-    n = n + 1
-    time.sleep(0.25)
-"#;
+/// The emitter child role (module docs): when the parent re-execs this test
+/// binary as the pty child, the harness runs only this test; the magic env
+/// var routes it to the child role — write the embedded units to raw stdout
+/// at the capture cadence forever, then switch to genuinely-new text lines
+/// once the sentinel file appears (each line a fresh fingerprint, so each
+/// refreshes the meaningful clock). In a NORMAL harness run (the flag
+/// unset) it is a fast no-op. `write_all` + `flush` on the locked stdout is
+/// one unbuffered write per unit (the units contain no `\n`, so the
+/// LineWriter cannot split early; `io::Write` bypasses libtest's per-test
+/// output capture and hits fd 1 directly — exactly the raw
+/// `os.write(1, ...)` contract the retired python emitter had). The first
+/// 60 units contain no `\n`/`\r`/TAB (only ESC), so the pty's default
+/// OPOST/ONLCR output processing is a no-op on them and the writes are
+/// byte-faithful to the capture; the recovery lines end `\r\n` as before.
+#[test]
+fn stuck_real_pty_emitter_child() {
+    if std::env::var_os(EMITTER_ENV).is_none() {
+        return;
+    }
+    let switch = std::env::var_os(EMITTER_SWITCH_ENV).unwrap_or_else(|| {
+        panic!("{EMITTER_SWITCH_ENV} not set — miswired self-reexec parent spawn")
+    });
+    let switch = std::path::PathBuf::from(switch);
+    let mut out = std::io::stdout().lock();
+    let mut n: usize = 0;
+    loop {
+        let bytes: Vec<u8> = if switch.exists() {
+            format!("recovery line {n}: genuinely new content {n}\r\n").into_bytes()
+        } else {
+            OPENCODE_CAPTURE_FIRST_60_UNITS[n % OPENCODE_CAPTURE_FIRST_60_UNITS.len()]
+                .as_bytes()
+                .to_vec()
+        };
+        out.write_all(&bytes).expect("emitter stdout write");
+        out.flush().expect("emitter stdout flush");
+        n += 1;
+        std::thread::sleep(UNIT_INTERVAL);
+    }
+}
 
 fn collector() -> (FrameSink, Arc<Mutex<Vec<ServerMessage>>>) {
     let seen: Arc<Mutex<Vec<ServerMessage>>> = Arc::new(Mutex::new(Vec::new()));
@@ -190,14 +223,6 @@ fn collector() -> (FrameSink, Arc<Mutex<Vec<ServerMessage>>>) {
         sink_seen.lock().unwrap().push(msg);
     });
     (sink, seen)
-}
-
-fn output_frame_count(seen: &Arc<Mutex<Vec<ServerMessage>>>) -> usize {
-    seen.lock()
-        .unwrap()
-        .iter()
-        .filter(|m| matches!(m, ServerMessage::TerminalOutput(_)))
-        .count()
 }
 
 fn output_frame_data(seen: &Arc<Mutex<Vec<ServerMessage>>>) -> Vec<String> {
@@ -211,6 +236,37 @@ fn output_frame_data(seen: &Arc<Mutex<Vec<ServerMessage>>>) -> Vec<String> {
         .collect()
 }
 
+/// How many complete `SYNC_BEGIN..SYNC_END` synchronized-update units live
+/// FULLY inside one production-read frame. Units never nest (each wraps
+/// itself exactly once), so a left-to-right span walk is exact; a unit the
+/// pty split across frames contributes zero here (its halves are counted
+/// as fragments by [`frame_fragments`]).
+fn complete_units_in(data: &str) -> usize {
+    let mut units = 0;
+    let mut rest = data;
+    while let Some(b) = rest.find(SYNC_BEGIN) {
+        let after = &rest[b + SYNC_BEGIN.len()..];
+        match after.find(SYNC_END) {
+            Some(e) => {
+                units += 1;
+                rest = &after[e + SYNC_END.len()..];
+            }
+            None => break,
+        }
+    }
+    units
+}
+
+/// How many sync markers live in the frame OUTSIDE its complete units —
+/// the fragments of a unit the pty split across reads (a dangling
+/// `SYNC_BEGIN` head, an orphan `SYNC_END` tail). Zero for whole-unit
+/// frames and plain-text frames alike.
+fn frame_fragments(data: &str) -> usize {
+    let begins = data.matches(SYNC_BEGIN).count();
+    let ends = data.matches(SYNC_END).count();
+    begins + ends - 2 * complete_units_in(data)
+}
+
 /// One whole test, in order: warm the ring through real reads, flag, then
 /// clear on meaningful output. ~18 s nominal, hard-bounded under 30 s.
 #[test]
@@ -222,27 +278,28 @@ fn real_pty_capture_stream_flags_stuck_and_clears_on_meaningful() {
         "precondition: the window sits inside the merely-exists regime"
     );
 
-    // Hermetic scratch dir: emitter script + units blob + sentinel.
+    // Hermetic scratch dir: the sentinel file only — the python-era emitter
+    // script and units blob are gone; the re-exec child carries the embedded
+    // units in this very binary.
     let dir = tempfile::tempdir().expect("temp dir");
-    let units_path = dir.path().join("capture-units.bin");
-    let mut blob = String::new();
-    for unit in OPENCODE_CAPTURE_FIRST_60_UNITS {
-        blob.push_str(unit);
-    }
-    std::fs::write(&units_path, blob).expect("write units blob");
     let switch_path = dir.path().join("switch-to-meaningful");
-    let script_path = dir.path().join("emitter.py");
-    std::fs::write(&script_path, EMITTER_SCRIPT).expect("write emitter script");
 
-    // The REAL path: create (spawn + reader-thread wiring), mode opencode.
+    // The REAL path, dependency-free (r4 Finding 4): re-exec THIS test
+    // binary as the pty child. `--exact` makes the child's harness run
+    // ONLY the embedded emitter test; the magic env var routes it to the
+    // child role (module docs). An absolute `current_exe()` needs no PATH
+    // resolution.
+    let exe = std::env::current_exe().expect("current exe");
     let spec = SpawnSpec {
-        program: "python3".to_string(),
-        args: vec![
-            script_path.to_string_lossy().into_owned(),
-            switch_path.to_string_lossy().into_owned(),
-            units_path.to_string_lossy().into_owned(),
-        ],
-        env_overrides: BTreeMap::new(),
+        program: exe.to_string_lossy().into_owned(),
+        args: vec!["--exact".to_string(), EMITTER_TEST_NAME.to_string()],
+        env_overrides: BTreeMap::from([
+            (EMITTER_ENV.to_string(), "1".to_string()),
+            (
+                EMITTER_SWITCH_ENV.to_string(),
+                switch_path.to_string_lossy().into_owned(),
+            ),
+        ]),
         cwd: Some(dir.path().to_string_lossy().into_owned()),
         cols: 120,
         rows: 30,
@@ -278,54 +335,57 @@ fn real_pty_capture_stream_flags_stuck_and_clears_on_meaningful() {
         .found
     );
 
-    // Warm-up: 60 units + census replays through real read boundaries.
+    // Warm-up: the 60 units + census replays through real read boundaries,
+    // counted in COMPLETE units observed across frames — the re-exec child's
+    // libtest banner frames are plain text and must not eat the margin.
     let warmup_deadline = Instant::now() + WARMUP_DEADLINE;
-    loop {
-        let n = output_frame_count(&seen);
-        if n >= WARMUP_MIN_FRAMES {
-            break;
+    let frames = loop {
+        let frames = output_frame_data(&seen);
+        let units_seen: usize = frames.iter().map(|d| complete_units_in(d)).sum();
+        if units_seen >= WARMUP_MIN_UNITS {
+            break frames;
         }
         assert!(
             Instant::now() < warmup_deadline,
-            "warm-up stalled: only {n} frames in {WARMUP_DEADLINE:?} \
+            "warm-up stalled: only {units_seen} complete units in {WARMUP_DEADLINE:?} \
              (emitter or reader wedged?)"
         );
         std::thread::sleep(UNIT_INTERVAL);
-    }
+    };
 
-    // Production-framing observation: every warm-up frame must be one
-    // complete synchronized-update unit. A coalesced read (2+ units in one
-    // frame) is tolerated up to a small fraction (expected zero at this
-    // cadence; sustained coalescing is the LB-1 fail-open hazard); any
-    // PARTIAL (split) unit is a framing defect and fails loudly.
-    let frames = output_frame_data(&seen);
-    let warmup_total = frames.len();
+    // Production-framing observation (r4 Finding 3): PTY reads may legally
+    // split a child write, and the scanner's persistent cross-frame VT
+    // state machine stitches mid-unit splits — so SPLIT frames are
+    // tolerated and recorded, never a hard precondition. What must not
+    // happen is SUSTAINED multi-unit coalescing: a frame carrying two or
+    // more FULL units is the LB-1 fail-open regime.
     let mut single_unit = 0usize;
-    let mut coalesced = 0usize;
-    let mut partial = 0usize;
+    let mut multi_unit = 0usize;
+    let mut split = 0usize;
+    let mut non_unit = 0usize;
     for data in &frames {
-        let begins = data.matches(SYNC_BEGIN).count();
-        let full_shape = data.starts_with(SYNC_BEGIN) && data.ends_with(SYNC_END);
-        if full_shape && begins == 1 {
+        let units = complete_units_in(data);
+        if units >= 2 {
+            multi_unit += 1;
+        } else if frame_fragments(data) > 0 {
+            split += 1;
+        } else if units == 1 {
             single_unit += 1;
-        } else if full_shape {
-            coalesced += 1;
         } else {
-            partial += 1;
+            non_unit += 1;
         }
     }
-    assert_eq!(
-        partial, 0,
-        "a real read split a capture unit mid-frame — framing defect"
-    );
+    let warmup_total = frames.len();
     assert!(
-        coalesced * 10 <= warmup_total,
-        "unexpected read coalescing: {coalesced}/{warmup_total} frames"
+        multi_unit * COALESCED_FRACTION_DENOM <= warmup_total,
+        "sustained read coalescing (the fail-open regime): {multi_unit}/{warmup_total} \
+         frames carry two or more full units"
     );
     eprintln!(
         "stuck_real_pty framing: {warmup_total} frames, {single_unit} single-unit, \
-         {coalesced} coalesced, {partial} partial — real reads {} unit-aligned",
-        if coalesced == 0 {
+         {multi_unit} multi-unit, {split} split (tolerated), \
+         {non_unit} non-unit (child harness banner) — real reads {} unit-aligned",
+        if multi_unit == 0 && split == 0 {
             "stayed"
         } else {
             "mostly stayed"
