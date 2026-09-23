@@ -1,8 +1,9 @@
 // @vitest-environment node
 import { describe, it, expect, afterAll } from 'vitest'
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { spawnSync } from 'node:child_process'
 import {
   selectPackageManager,
   buildTypecheckInvocation,
@@ -155,5 +156,19 @@ describe('formatTypecheckSelection (the stdout protocol the bash hook parses)', 
     expect(out).toContain('manager=npm')
     expect(out).toContain('command=npm')
     expect(out).toContain('args=run --silent typecheck')
+  })
+})
+
+describe('pre-push hook execution contract (git runs hooks without a shell)', () => {
+  const hookPath = path.resolve(__dirname, '../../../scripts/hooks/pre-push')
+
+  it('declares a bash interpreter: git execs the hook directly, so without a shebang the OS runs it under sh/dash, whose parser rejects the hook\'s bashisms (herestring at the manager block)', () => {
+    const firstLine = readFileSync(hookPath, 'utf-8').split('\n')[0]
+    expect(firstLine).toBe('#!/usr/bin/env bash')
+  })
+
+  it('stays parseable by bash', () => {
+    const res = spawnSync('bash', ['-n', hookPath], { encoding: 'utf-8' })
+    expect(res.status, res.stderr).toBe(0)
   })
 })
